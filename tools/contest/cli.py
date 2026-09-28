@@ -2365,7 +2365,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             if expected is not None and run.agent.name not in expected:
                 continue
             try:
-                text = leg_record(run, run.workspace, leg_out).read_text(
+                text = leg_record(run, run.workspace, leg_out,
+                                  ticket_path=result.ticket_path).read_text(
                     encoding="utf-8").strip()
             except Exception as exc:  # noqa: BLE001 — a record failing never fails a round
                 print(f"warn: could not write the leg record of {run.agent.name}: {exc}",

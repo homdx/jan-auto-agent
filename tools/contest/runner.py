@@ -245,6 +245,7 @@ __all__ = [
     "CONTINUE_PROMPT",
     "leg_message",
     "leg_record",
+    "LEG_RECORD_MAX_LINES",
     "round_prompt",
     "run_agent",
     "run_leg",
@@ -5441,7 +5442,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             "reasons": [r.code for r in verdict.reasons],
                             "elapsed": round(verdict.elapsed, 1),
                             "waited": round(verdict.waited, 1),
+                            "tests_run": _harvest_tests_run(verdict),
                         }
+                        # KC-74: the leg record is written after the session is
+                        # closed, so the last words are saved here, off the
+                        # transcript, not read back out of a live session
+                        turn["last_message"] = _last_assistant_text(backend, session)
                         # KC-30: the harvest names the branch's one commit itself
                         # when no row claims it, so there is no fallback to add
                         # here — the sha comes from the verdict, one line as the
@@ -5494,7 +5500,14 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             turn["harvest"] = {"verdict": verdict.verdict,
                                "reasons": [r.code for r in verdict.reasons],
                                "elapsed": round(verdict.elapsed, 1),
-                               "waited": round(verdict.waited, 1)}
+                               "waited": round(verdict.waited, 1),
+                               # KC-74: the roots the judge ran, kept on the
+                               # turn so the leg record can name them after the
+                               # session is closed — it was dropped before
+                               "tests_run": _harvest_tests_run(verdict)}
+            # KC-74: as the salvage harvest above — the record cannot ask the
+            # session for this, the session is closed when it is written
+            turn["last_message"] = _last_assistant_text(backend, session)
             run.commit = verdict.commit
             label = "tests" if run_tests else "harvest"
             elapsed_str = f"({label} {_age(verdict.elapsed)})"
@@ -5732,39 +5745,377 @@ def _leg_files(ws: Workspace) -> list:
     return [(path, *found[path]) for path in sorted(found)]
 
 
-def leg_record(run: AgentRun, ws: Workspace, out_dir) -> Path:
-    """KC-43: write `<out_dir>/<agent>.leg.md` — what the leg left, and nothing more.
+#: KC-74: the record's line cap. The records are pasted into the next leg's prompt,
+#: so a leg that talked a lot must not cost the next leg a whole session of context:
+#: over the cap the two model fields are cut and the mechanical ones are never cut.
+LEG_RECORD_MAX_LINES = 80
 
-    Mechanical only: the files touched with a diffstat (committed and not), the
-    commit the leg ended on — KC-41's deadline commit or the model's — and the
-    harvest verdict with its reason codes when one ran. A field with nothing in it
-    says `none`, never blank, so a leg that produced nothing at all still hands the
-    next one a record. The agent's own last message, the pytest roots and "what is
-    left" are KC-74's. Returns the path.
+#: KC-74: the last message's own cap, applied before the record's cap.
+_LEG_MESSAGE_LINES = 20
+
+#: KC-74: where a model field was cut to fit the record's cap.
+_LEG_CUT = "… cut"
+
+#: KC-74: pytest's short summary row — the node id, xdist's `@group` suffix and the
+#: ` - message` dropped, as the judge drops them in `gates._failures`.
+_LEG_FAIL_LINE = re.compile(r"^(?:FAILED|ERROR) (\S+?)(?:@[^\s\[]+)?(?: - .*)?$")
+
+#: KC-74: the stats line is the one pytest prints with a duration,
+#: `=== 1 failed, 41 passed in 2.34s ===`. Searched, not anchored: the line carries
+#: its `===` frame, and under `-q` it starts at column one.
+_LEG_STATS_LINE = re.compile(r"\bin [\d.]+[smh]?\b")
+
+#: KC-74: one `N passed` / `N failed` / `N errors` of that line.
+_LEG_COUNT = re.compile(r"\b(\d+) (passed|failed|errors?)\b")
+
+#: KC-74: a shell token, for the roots a `bash` call named.
+_LEG_CMD_TOKEN = re.compile(r"[^\s;|&<>]+")
+
+#: KC-74: the wrappers and prefixes a pytest command is wrapped in — the agents run
+#: theirs `timeout 1500 python3 -m pytest tests` most often.
+_LEG_PIECE_SPLIT = re.compile(r"\s*(?:&&|\|\||[;|&])\s*")
+_LEG_WRAPPER = frozenset({
+    "timeout", "nohup", "env", "nice", "time", "exec", "command", "stdbuf", "ionice",
+    "sudo", "bash", "sh", "dash", "/bin/bash", "/bin/sh",
+})
+_LEG_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_LEG_PYTHON = re.compile(r"^python\d*(?:\.\d+)?$")
+
+#: KC-74: pytest options that swallow the next token, which is their value, not a
+#: root — `-n 4` is a worker count, `.smoke_tests` is the root.
+_LEG_VALUE_FLAGS = frozenset({
+    "-n", "--workers", "--dist", "--dist-load", "--timeout", "--durations",
+    "--maxfail", "--max-fail", "--maxprocesses", "-k", "--keywords", "-m",
+    "--markers", "--deselect", "--stepwise", "--max-worker-restart", "--new-first",
+})
+
+#: KC-74: an option that narrows the selection — with it a run is a slice of a root,
+#: not the root, so it names none.
+_LEG_SELECT_FLAGS = frozenset({
+    "-k", "--keywords", "-m", "--markers", "--deselect", "--co", "--collect-only",
+    "--lf", "--last-failed", "--nf", "--new-first", "--ff", "--failed-first",
+    "--stepwise",
+})
+
+
+def _harvest_tests_run(verdict) -> str:
+    """KC-74: the harvest's `tests_run` fact for the turn record, `""` when there
+    is none.
+
+    `facts["tests_run"]` is the judge's one line per root — `tests:3✗` or
+    `skipped: no_progress_row` — and it used to die with the verdict. The record
+    is written after the session is closed, so it is kept on the turn for the
+    record to show. A verdict without facts is `""`, never a KeyError.
+    """
+    facts = getattr(verdict, "facts", None)
+    if isinstance(facts, dict):
+        raw = facts.get("tests_run")
+        if isinstance(raw, str) and raw.strip():
+            return raw
+    return ""
+
+
+def _leg_pytest_roots(command) -> list:
+    """KC-74: the pytest roots one shell *command* names.
+
+    `python3 -m pytest tests -n 4` is one, `timeout 1500 python3 -m pytest
+    tests tests_bugfix` is two, and a bare `pytest -n 4` is the worktree's own
+    `.`. Nothing is named when the piece runs no pytest — `ls pytest tests` says
+    the word, it does not run it — when it names a test file or a `::node` or a
+    marker, which is a slice of a root rather than the root, and never raises: a
+    command the record cannot parse is no root, never an exception into a round.
+    """
+    if not isinstance(command, str) or not ("pytest" in command or "py.test" in command):
+        return []
+    try:
+        for piece in _LEG_PIECE_SPLIT.split(command):
+            tokens = _LEG_CMD_TOKEN.findall(piece)
+            start = None
+            prev = ""
+            for i, token in enumerate(tokens):
+                head = token.rsplit("/", 1)[-1]
+                if head in ("pytest", "py.test"):
+                    start = i
+                    break
+                if token == "-m" and i + 1 < len(tokens) and tokens[i + 1] == "pytest":
+                    start = i + 1                            # `python3 -m pytest`
+                    break
+                if head.isdigit() and prev in _LEG_WRAPPER:
+                    prev = head
+                    continue                           # `timeout`'s own duration
+                if (head in _LEG_WRAPPER or _LEG_ENV_ASSIGN.match(token)
+                        or _LEG_PYTHON.match(head)):
+                    prev = head
+                    continue
+                break                                  # something else: no pytest here
+            if start is None:
+                continue
+            roots = []
+            rejected = False
+            value = False
+            for token in tokens[start + 1:]:
+                head = token.rsplit("/", 1)[-1]
+                if value:
+                    value = False
+                    continue
+                if head.startswith("-"):
+                    value = head in _LEG_VALUE_FLAGS
+                    if head in _LEG_SELECT_FLAGS:
+                        rejected = True
+                    continue
+                if "::" in token or head.endswith(".py"):
+                    rejected = True
+                    continue
+                if head.isdigit():                     # an option's value without a flag
+                    continue
+                root = token[2:] if token.startswith("./") else token
+                if root and root not in roots:
+                    roots.append(root)
+            if rejected:                               # a slice of a root, not a root
+                return []
+            return roots or ["."]
+        return []
+    except Exception:  # noqa: BLE001 — a record must not die on a command it cannot read
+        return []
+
+
+def _leg_pytest_result(output) -> tuple:
+    """KC-74: `(passed, failed, failing node ids)` off one pytest run's output.
+
+    The counts are pytest's own stats line — the last line that names a number of
+    seconds, `1 failed, 41 passed in 2.34s`, its `===` frame or not; errors add to
+    the failures, as the judge counts them. Under `-qq` pytest prints no stats line
+    and the counts stay `0`, the ids alone. The ids are the short summary's `FAILED`
+    and `ERROR` rows, first occurrence first. Nothing pytest did not print is
+    invented: no stats line and no summary is `(0, 0, [])`.
+    """
+    lines = str(output or "").splitlines()
+    ids = []
+    for line in lines:
+        match = _LEG_FAIL_LINE.match(line.strip())
+        if match and match.group(1) not in ids:
+            ids.append(match.group(1))
+    passed = failed = 0
+    for line in reversed(lines):
+        if not _LEG_STATS_LINE.search(line):
+            continue
+        for count, kind in _LEG_COUNT.findall(line):
+            if kind == "passed":
+                passed = int(count)
+            else:
+                failed += int(count)
+        break
+    return passed, failed, ids
+
+
+def _leg_pytest_runs(events_log) -> list:
+    """KC-74: `[(root, counts, failing ids)]` of the roots the agent ran itself.
+
+    Read off the leg's event log: every `bash` part that finished, whose command
+    names roots, with the counts and the failing node ids of its output. The last
+    update of a part id wins — the streaming ones carry no output. `[]` when the
+    log is absent, unreadable or holds no pytest run: a broken artifact is
+    `tests: none`, never an exception into a round.
+    """
+    try:
+        raw = Path(events_log).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    finals: dict = {}
+    for line in raw.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        event = entry.get("event") if isinstance(entry, dict) else None
+        props = event.get("properties") if isinstance(event, dict) else None
+        part = props.get("part") if isinstance(props, dict) else None
+        if not isinstance(part, dict) or part.get("type") != "tool" \
+                or part.get("tool") != "bash":
+            continue
+        state = part.get("state")
+        if not isinstance(state, dict) or state.get("status") in ("running", "pending"):
+            continue
+        finals[part.get("id") or len(finals)] = state
+    found: list = []
+    for state in finals.values():
+        input_ = state.get("input")
+        command = input_.get("command") if isinstance(input_, dict) else None
+        roots = _leg_pytest_roots(command)
+        if not roots:
+            continue
+        passed, failed, failing = _leg_pytest_result(state.get("output"))
+        counts = f"{passed}✓ {failed}✗"
+        for root in roots:
+            if any(item[0] == root for item in found):
+                continue
+            found.append((root, counts, failing))
+    return found
+
+
+def _leg_declared(ticket_path) -> list:
+    """KC-74: the ticket's declared files, `[]` when the path is not readable."""
+    if not ticket_path:
+        return []
+    try:
+        return list(declared_files(ticket_path))
+    except OSError:
+        return []
+
+
+def _leg_tests(run: AgentRun, events_log) -> list:
+    """KC-74: `[(root, counts, failing ids)]` of the roots the leg ran.
+
+    The agent's own runs from the event log first — they carry the counts and the
+    failing node ids — and the judge's roots off the turns' `tests_run` for every
+    root the agent did not name itself: the judge runs all of them, the agent
+    usually only a few. Newest turn first, so a rework's run is what it reports,
+    and first name wins: a root is reported once. `skipped: …`, the tier check and
+    the checkout failure are not roots and are dropped.
+    """
+    runs: dict = {}
+    for root, counts, failing in _leg_pytest_runs(events_log):
+        runs.setdefault(root, (root, counts, failing))
+    turns = getattr(run, "turns", None) or []
+    for turn in reversed(turns):
+        harvest = turn.get("harvest") if isinstance(turn, dict) else None
+        raw = harvest.get("tests_run") if isinstance(harvest, dict) else None
+        if not isinstance(raw, str):
+            continue
+        for token in raw.split():
+            if ":" not in token:
+                continue
+            root, detail = token.split(":", 1)
+            if not root or not detail or root in ("skipped", "tiers") or root in runs:
+                continue
+            runs[root] = (root, detail, [])
+    return list(runs.values())
+
+
+def _leg_last_message(run: AgentRun) -> str:
+    """KC-74: the newest turn's saved last assistant text, `""` when none was saved."""
+    for turn in reversed(getattr(run, "turns", None) or []):
+        text = turn.get("last_message") if isinstance(turn, dict) else None
+        if isinstance(text, str) and text.strip():
+            return text
+    return ""
+
+
+def _leg_lines(text) -> list:
+    """The non-blank lines of *text*, trimmed — the shape both model fields are cut to."""
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()]
+
+
+def _leg_block(name: str, lines: list, cap: int) -> list:
+    """KC-74: the record's field for *name*.
+
+    `name: none` when there is no text; otherwise the header, the first *cap*
+    lines quoted, and the `… cut` marker when the cap dropped any — including a
+    cap of zero, where the marker is all that is left of the field.
+    """
+    if not lines:
+        return [f"{name}: none"]
+    block = [f"{name}:"]
+    block.extend("  > " + line for line in lines[:max(0, cap)])
+    if cap < len(lines):
+        block.append("  " + _LEG_CUT)
+    return block
+
+
+def _leg_cap(count: int, budget: int, ceiling: int) -> int:
+    """KC-74: how many of *count* lines fit in *budget* record lines at most *ceiling*.
+
+    A field is its header, its kept lines and — only when something was dropped —
+    the `… cut` marker, so *budget* must hold `1 + kept`, or `2 + kept` when the
+    marker goes in. `0` when the budget cannot hold a single line.
+    """
+    if count <= 0 or budget <= 0:
+        return 0
+    if count <= ceiling:
+        return count if 1 + count <= budget else max(0, budget - 1)
+    return ceiling if 2 + ceiling <= budget else max(0, budget - 2)
+
+
+def _leg_model_fields(message: str, summary: str, budget: int) -> list:
+    """KC-74: the two model fields, cut to fit *budget* record lines.
+
+    The last message keeps its own 20 lines first and the summary takes whatever
+    is left: the summary has no cap of its own, so it is the one that gives ground
+    when the record runs out, and the mechanical fields never yield a line. Both
+    empty is the two `none` lines, so the field is never blank.
+    """
+    message_lines = _leg_lines(message)
+    summary_lines = _leg_lines(summary)
+    if not message_lines and not summary_lines:
+        return ["last message: none", "summary: none"]
+    message_block = _leg_block("last message", message_lines,
+                               _leg_cap(len(message_lines), max(0, budget), _LEG_MESSAGE_LINES))
+    summary_block = _leg_block("summary", summary_lines,
+                               _leg_cap(len(summary_lines),
+                                        max(0, budget) - len(message_block),
+                                        LEG_RECORD_MAX_LINES))
+    return message_block + summary_block
+
+
+def leg_record(run: AgentRun, ws: Workspace, out_dir, ticket_path=None) -> Path:
+    """KC-43 + KC-74: write `<out_dir>/<agent>.leg.md` — what the leg left.
+
+    The mechanical fields are KC-43's: the files touched with a diffstat (committed
+    and not), the commit the leg ended on — KC-41's deadline commit or the model's —
+    and the newest harvest verdict with its reason codes. KC-74 adds, after them:
+    the pytest roots the leg ran with their counts, the agent's last message quoted
+    to 20 lines, KC-40's summary when the leg has one, and what is left — the
+    ticket's declared files not touched yet plus the failing test names.
+
+    Only the last message and the summary come from a model; every other field comes
+    from git and the logs, and an empty mechanical field says `none`, never prose.
+    The whole record stays inside `LEG_RECORD_MAX_LINES`: over it the two model
+    fields are cut, in order, and the mechanical fields are never cut.
+    *ticket_path* is the ticket the leg worked; `None` leaves "what is left" to the
+    failing tests. Returns the path.
     """
     out_dir = Path(out_dir)
     files = _leg_files(ws)
+    lines: list = []
     if files:
         added = sum(f[1] for f in files)
         deleted = sum(f[2] for f in files)
-        lines = [f"files: {len(files)} (+{added} -{deleted})"]
+        lines.append(f"files: {len(files)} (+{added} -{deleted})")
         for path, plus, minus, untracked in files[:_LEG_FILES_SHOWN]:
             lines.append(f"  {path}  +{plus} -{minus}" + (" (new)" if untracked else ""))
         if len(files) > _LEG_FILES_SHOWN:
             lines.append(f"  ... and {len(files) - _LEG_FILES_SHOWN} more")
     else:
-        lines = ["files: none"]
+        lines.append("files: none")
     # where the branch ended, for the record only — KC-30's rule stands: the runner
     # never reads a sha to stand in for a claim, and no verdict is built from this one
     commit = git(ws.path, "log", "-1", "--format=%H") if _commits_above(ws) > 0 else ""
     verdict = ""
-    for turn in reversed(run.turns):
+    for turn in reversed(getattr(run, "turns", None) or []):
         h = turn.get("harvest") if isinstance(turn, dict) else None
         if h:
             verdict = " ".join([str(h.get("verdict", ""))]
                                + [str(c) for c in h.get("reasons", [])]).strip()
             break
     lines += [f"commit: {commit or 'none'}", f"harvest: {verdict or 'none'}"]
+    tests = _leg_tests(run, out_dir / run.agent.name / "events.jsonl")
+    if tests:
+        lines.append("tests:")
+        lines += [f"  {root}: {counts}" for root, counts, _ in tests]
+    else:
+        lines.append("tests: none")
+    # the mechanical fields are whole now — the title, files, commit, harvest,
+    # tests, and the "what is left" line below — so they alone set the cap the two
+    # model fields may take. They are never cut: the records are pasted into the
+    # next leg's prompt, and a chatty leg must not cost the next one a session of
+    # context.
+    failing = [node for _, _, nodes in tests for node in nodes]
+    touched = {path for path, *_ in files}
+    left = [path for path in _leg_declared(ticket_path) if path not in touched] + failing
+    # minus the title line and the "what is left" line written below it
+    lines += _leg_model_fields(_leg_last_message(run), getattr(run, "summary", "") or "",
+                               LEG_RECORD_MAX_LINES - len(lines) - 2)
+    lines.append("what is left: " + (", ".join(left) if left else "none"))
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"{run.agent.name}.leg.md"
     path.write_text(f"leg {out_dir.name} — {run.agent.name}\n" + "\n".join(lines) + "\n",

@@ -68,10 +68,13 @@ from tools.contest.runner import (  # noqa: E402
     CONTEXT_FULL_SHARE,
     CUT_OFF_MESSAGE,
     TreeReadError,
+    LEG_RECORD_MAX_LINES,
     _diff_signature,
     _cut_off,
     _finished_replies,
     _is_overflow,
+    _leg_pytest_result,
+    _leg_pytest_roots,
     _reap_worktree,
     _retry_backoff,
     _retry_reason,
@@ -7550,7 +7553,9 @@ def test_leg_record_of_a_leg_that_produced_nothing_says_none(tmp_path):
 
     assert path == out / "agent-a.leg.md"
     lines = path.read_text(encoding="utf-8").splitlines()
-    assert lines[1:] == ["files: none", "commit: none", "harvest: none"]
+    assert lines[1:] == ["files: none", "commit: none", "harvest: none",
+                         "tests: none", "last message: none", "summary: none",
+                         "what is left: none"]
     assert all(line.strip() for line in lines)
 
 
@@ -7805,3 +7810,248 @@ def test_the_idle_before_a_queued_nudge_is_not_the_nudges_turn(tmp_path, monkeyp
     assert run.turns[0]["queued_waits"] == 1
     assert run.continues == 0
     assert len(_prompts(fake)) == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-74: the record carries the tests, the last word, the summary, what is left
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+#: KC-74: the red root the ticket describes — one failure, its short-summary row
+#: with the node id, and the stats line with both counts.
+_REDFIXTURE = ("FAILED tests/test_thing.py::test_red - AssertionError: assert 42 == 40\n"
+               "==== 1 failed, 41 passed in 2.34s ====\n")
+
+
+def _leg_log(out_dir: Path, output: str,
+             command: str = "python3 -m pytest tests -n 4") -> None:
+    """One finished `bash` part in the leg's event log, in the tap's own shape."""
+    _write(out_dir / "agent-a" / "events.jsonl", json.dumps({
+        "t": time.time(),
+        "event": {"type": "message.part.updated",
+                  "properties": {"sessionID": "ses_one",
+                                 "part": {"id": "p1", "type": "tool", "tool": "bash",
+                                          "state": {"status": "completed",
+                                                     "input": {"command": command},
+                                                     "output": output}}}}}) + "\n")
+
+
+def test_leg_record_of_a_red_root_names_the_counts_and_the_failing_test(tmp_path):
+    """`tests` is the agent's own run with its counts and the judge's roots for the
+    root the agent never ran; `what is left` names the failing node id and the
+    declared file not touched, and never the file that was touched."""
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    _work(str(ws.path), test=False, claim=False)
+    out = tmp_path / "legs" / "45.1"
+    _leg_log(out, _REDFIXTURE)
+    turns = [{"kind": "initial", "harvest": {
+        "verdict": "REWORK", "reasons": ["no_test"],
+        "tests_run": "tests:1✗ tests_bugfix:absent"}}]
+
+    text = leg_record(_leg_run(sb, turns=turns), ws, out,
+                      ticket_path=sb.ticket_path).read_text(encoding="utf-8")
+
+    assert text.splitlines()[0] == "leg 45.1 — agent-a"
+    assert "  tests: 41✓ 1✗" in text                       # the agent's own run
+    assert "  tests_bugfix: absent" in text                 # the judge's other root
+    assert "harvest: REWORK no_test" in text
+    assert "last message: none" in text and "summary: none" in text
+    left = text.rsplit("what is left:", 1)[1]
+    assert "tests/test_thing.py" in left
+    assert "tests/test_thing.py::test_red" in left
+    assert "pkg/thing.py" not in left                       # already touched
+    assert text.splitlines()[-1].startswith("what is left:")
+
+
+def test_leg_record_that_ran_nothing_says_none_in_every_field(tmp_path):
+    """No pytest, no last words, no KC-40 summary: the three fields say `none`,
+    `what is left` still names the declared files, and a field is never blank."""
+    sb = Sandbox(tmp_path)
+
+    text = leg_record(_leg_run(sb), sb.ws("agent-a"), tmp_path / "legs" / "45.1",
+                       ticket_path=sb.ticket_path).read_text(encoding="utf-8")
+
+    assert "files: none" in text and "commit: none" in text and "harvest: none" in text
+    assert "tests: none" in text
+    assert "last message: none" in text
+    assert "summary: none" in text
+    assert text.endswith("what is left: pkg/thing.py, tests/test_thing.py\n")
+    assert all(line.strip() for line in text.splitlines())
+
+
+def test_leg_record_keeps_its_cap_when_the_last_message_is_500_lines(tmp_path):
+    """The mechanical fields stay whole and the message gives ground: the records are
+    pasted into the next leg's prompt, so a chatty leg must not cost it a session."""
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    _work(str(ws.path), test=False, claim=False)
+    out = tmp_path / "legs" / "45.1"
+    _leg_log(out, _REDFIXTURE)
+    turns = [{"kind": "initial", "harvest": {
+        "verdict": "REWORK", "reasons": ["no_test"], "tests_run": "tests:1✗"},
+        "last_message": "\n".join(f"line {i}" for i in range(500))}]
+
+    text = leg_record(_leg_run(sb, turns=turns), ws, out,
+                      ticket_path=sb.ticket_path).read_text(encoding="utf-8")
+
+    assert len(text.splitlines()) <= LEG_RECORD_MAX_LINES
+    assert "  > line 0" in text and "  > line 19" in text
+    assert "  > line 20" not in text                        # the message's own 20 lines
+    assert "  … cut" in text
+    assert "  tests: 41✓ 1✗" in text                       # mechanical, never cut
+    assert "harvest: REWORK no_test" in text
+    assert "commit: none" not in text
+    assert "summary: none" in text
+    assert "tests/test_thing.py::test_red" in text
+
+
+def test_leg_record_cuts_the_summary_before_it_touches_the_message(tmp_path):
+    """The summary has no cap of its own, so it is the field that gives ground when
+    the record runs out: the message keeps its lines and the marker is the
+    summary's."""
+    sb = Sandbox(tmp_path)
+    turns = [{"kind": "initial", "harvest": {"verdict": "REWORK", "reasons": []},
+              "last_message": "the change is in pkg/thing.py\nnext: the test file"}]
+
+    text = leg_record(_leg_run(sb, turns=turns,
+                               summary="\n".join(f"summary line {i}" for i in range(500))),
+                      sb.ws("agent-a"), tmp_path / "legs" / "45.1",
+                      ticket_path=sb.ticket_path).read_text(encoding="utf-8")
+
+    assert len(text.splitlines()) <= LEG_RECORD_MAX_LINES
+    assert "  > the change is in pkg/thing.py" in text      # the message is whole
+    assert "  > next: the test file" in text
+    assert "  > summary line 0" in text
+    assert text.splitlines()[-2] == "  … cut"               # the marker is the summary's
+    assert text.splitlines()[-1] == "what is left: pkg/thing.py, tests/test_thing.py"
+
+
+def test_leg_record_carries_kc40s_summary_verbatim(tmp_path):
+    """KC-40's summary, when the leg has one, is in the record word for word."""
+    sb = Sandbox(tmp_path)
+    summary = ("Changed pkg/thing.py to return 42; the ticket's test file is the one "
+               "thing left. `thing()` is now the value the tests assert.")
+    turns = [{"kind": "initial", "harvest": {"verdict": "REWORK", "reasons": []},
+              "last_message": "asking for the summary"}]
+
+    text = leg_record(_leg_run(sb, turns=turns, summary=summary),
+                      sb.ws("agent-a"), tmp_path / "legs" / "45.1",
+                      ticket_path=sb.ticket_path).read_text(encoding="utf-8")
+
+    assert "summary: none" not in text
+    assert "  > " + summary in text
+    assert "… cut" not in text                              # it fit, nothing was cut
+
+
+def test_the_next_legs_prompt_has_the_newest_record_first(tmp_path):
+    """Leg 3 meets leg 2's record before leg 1's — the relay reads newest first."""
+    sb = Sandbox(tmp_path)
+    one = leg_record(_leg_run(sb, turns=[{"kind": "initial",
+                                          "harvest": {"verdict": "REWORK", "reasons": []},
+                                          "last_message": "leg one ends here"}]),
+                     sb.ws("agent-a"), tmp_path / "legs" / "45.1",
+                     ticket_path=sb.ticket_path).read_text(encoding="utf-8").strip()
+    two = one.replace("leg one ends here", "leg two ends here")
+
+    prompt = leg_message(3, sb.ticket_path, [two, one])
+
+    assert "leg 3 of a relay" in prompt
+    assert prompt.index("leg two ends here") < prompt.index("leg one ends here")
+
+
+def test_leg_record_of_a_broken_log_and_a_bad_ticket_is_no_data_not_an_error(tmp_path):
+    """A log that cannot be parsed is `tests: none`, a ticket path that cannot be
+    read leaves `what is left` to the failing tests, the old call without
+    `ticket_path` still writes the record, and none of it raises into a round."""
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    out = tmp_path / "legs" / "45.1"
+    _write(out / "agent-a" / "events.jsonl", "{not json\nalso not json\n")
+    turns = [{"kind": "initial", "harvest": {
+        "verdict": "REWORK", "reasons": [], "tests_run": "skipped: no_progress_row"}}]
+
+    text = leg_record(_leg_run(sb, turns=turns), ws, out,
+                      ticket_path=out / "no-such-ticket.md").read_text(encoding="utf-8")
+    assert "tests: none" in text
+    assert "what is left: none" in text
+    assert "skipped" not in text                            # not a root, dropped
+
+    again = leg_record(_leg_run(sb), ws, out).read_text(encoding="utf-8")
+    assert "tests: none" in again and "what is left: none" in again
+
+
+def test_the_roots_reader_names_only_whole_pytest_roots():
+    """A `timeout`, a wrapper, an env assign, a bare `pytest` and a `./` prefix are
+    one run each; a file, a `::node` and a marker are a slice of a root, not one;
+    and a piece that merely mentions pytest names none."""
+    cases = [
+        ("python3 -m pytest tests -n 4", ["tests"]),
+        ("timeout 1500 python3 -m pytest tests tests_bugfix", ["tests", "tests_bugfix"]),
+        ("python3 -m pytest tests -n 4 --dist=loadgroup", ["tests"]),
+        ("pytest", ["."]),
+        ("python3 -m pytest", ["."]),
+        ("env PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest .smoke_tests",
+            [".smoke_tests"]),
+        ("python3 -m pytest ./tests", ["tests"]),
+        ("cd repo && python3 -m pytest tests -n 4", ["tests"]),
+        # the ticket's own acceptance command: one `bash` part, the first piece
+        ("python3 -m pytest tests -n 4 -q --timeout=180 && "
+         "python3 -m pytest tests_bugfix -n 4 -q --timeout=180", ["tests"]),
+        ("python3 -m pytest tests/test_thing.py::test_red", []),
+        ("python3 -m pytest tests -k thing", []),
+        ("ls pytest tests", []),
+        ("python3 -m", []),
+        ("echo done", []),
+        (None, []),
+    ]
+    for command, roots in cases:
+        assert _leg_pytest_roots(command) == roots, command
+
+
+def test_the_result_reader_reads_pytests_counts_and_the_failing_ids():
+    """Counts from the stats line, with or without its `===` frame, errors folded
+    into the failures, and the ids from the short summary, first occurrence first.
+    Pytest printed neither is `(0, 0, [])` — never an invented number."""
+    assert _leg_pytest_result(_REDFIXTURE) == (41, 1, ["tests/test_thing.py::test_red"])
+    assert _leg_pytest_result("3 failed, 1 error, 40 passed in 2.00s") == (40, 4, [])
+    assert _leg_pytest_result("1 error in 0.12s") == (0, 1, [])
+    assert _leg_pytest_result("FAILED tests/a.py::t1 - assert 1\n"
+                              "FAILED tests/a.py::t1 - assert 1\n") \
+        == (0, 0, ["tests/a.py::t1"])
+    assert _leg_pytest_result("41 passed in 1.00s\n1 failed, 41 passed in 2.34s") \
+        == (41, 1, [])                                      # the last stats line wins
+    assert _leg_pytest_result("collected 3 items") == (0, 0, [])
+    assert _leg_pytest_result("") == (0, 0, [])
+    assert _leg_pytest_result(None) == (0, 0, [])
+
+
+def test_the_turn_keeps_the_roots_and_the_last_words_for_the_record(tmp_path, monkeypatch):
+    """The record is written after the session is closed, so the turn saves the
+    judge's roots and the session's last words while it is still alive — and the
+    record, written with the session gone, shows both."""
+    import tools.contest.harvest as harvest_module
+
+    sb = Sandbox(tmp_path)
+    monkeypatch.setattr(harvest_module, "run_tests_detail",
+                        lambda cwd, **kw: ("tests:1✗ tests_bugfix:absent", []))
+    ws = sb.ws("agent-a")
+    # a test file, so the judge runs the suite — the harvest skips roots it has
+    # nowhere to run them in
+    _work(str(ws.path), test=True, claim=True)
+    assistant = "the change is in pkg/thing.py; the red test is tests/test_thing.py::test_red"
+    config = make_config(["agent-a"], max_rework=0)
+    with _BenchFake({"turns": [{"events": ["busy", "idle"], "assistant": assistant}]}) as fake:
+        state = run_leg(config, ROUND, sb.ticket_path, list(sb.workspaces),
+                        make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir,
+                        leg=1, run_tests=True)
+
+    (run,) = state.agents
+    turn = run.turns[-1]
+    assert turn["harvest"]["tests_run"] == "tests:1✗ tests_bugfix:absent"
+    assert assistant in turn["last_message"]
+
+    text = leg_record(run, ws, sb.out_dir, ticket_path=sb.ticket_path).read_text(
+        encoding="utf-8")
+    assert "  tests: 1✗" in text and "  tests_bugfix: absent" in text
+    assert "  > " + assistant in text
