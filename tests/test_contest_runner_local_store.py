@@ -581,13 +581,13 @@ def _empty_state() -> RoundState:
 
 
 def test_the_heartbeat_names_the_neighbours_above_the_threshold(monkeypatch):
-    """The line gains ` · kilo neighbours N` only when the count is above the
+    """The line gains a `kilo neighbours N` line only when the count is above the
     threshold; below it, and without a pid, it is today's line."""
     state = _empty_state()
     monkeypatch.setattr(runner_module, "kilo_neighbours",
                         lambda pid, proc_root="/proc": (5, "/home/op/.local/share/kilo"))
     line = _Heartbeat(state, {}, 60.0, server_pid=100, neighbour_warn=4).line()
-    assert line.endswith("· kilo neighbours 5"), line
+    assert line.endswith("\n  kilo neighbours 5"), line
 
     monkeypatch.setattr(runner_module, "kilo_neighbours",
                         lambda pid, proc_root="/proc": (3, "/home/op/.local/share/kilo"))

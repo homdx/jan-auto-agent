@@ -4588,7 +4588,7 @@ def test_heartbeat_names_the_waiting_agent_and_its_time_in_state(tmp_path, caplo
     beats = _lines(caplog, f"round {ROUND} ")
     assert beats, caplog.text
     assert any("agent-a WAITING" in b and "1 live" in b for b in beats)
-    assert all(b.endswith(" live") for b in beats)
+    assert all(" live:\n" in b for b in beats)
     assert not [t for t in threading.enumerate() if t.name.startswith("contest-progress")]
 
 
@@ -4917,7 +4917,7 @@ def test_heartbeat_line_with_two_agents_and_ready(tmp_path):
     hb, rm, f, c = _make_heartbeat([run_a, run_b, run_c],
                                     {"agent-a": 1, "agent-b": 3})
     try:
-        line = hb.line()
+        line = " ".join(hb.line().split())
         assert "agent-a WAITING" in line
         assert "30%" in line
         assert "1f" in line
@@ -5040,7 +5040,7 @@ def _real_run(ws: Workspace, state: AgentState, attempt: int = 0, turns=()) -> A
 
 
 def _part(line: str, name: str) -> str:
-    return next(p for p in line.split(" · ") if p.split(": ")[-1].startswith(name + " "))
+    return next(" ".join(p.split()) for p in line.splitlines()[1:] if p.split()[0] == name)
 
 
 def test_the_heartbeat_reads_real_worktrees_with_no_helper_mocked(tmp_path):
@@ -5072,6 +5072,23 @@ def test_the_packs_median_is_not_floored(tmp_path):
     line = _real_line([a, b])
     assert "40% 1f" in _part(line, "aa"), line
     assert "60% 2f" in _part(line, "bb"), line
+
+
+def test_the_heartbeat_puts_one_agent_per_line_in_aligned_columns(tmp_path):
+    """Round 83: one agent per line, name and state padded to the widest, so the
+    age, the bar and the per cent start in the same column on every line."""
+    names = ["sensenova-6-8-flash-lite-var1", "mimo-v2-5", "glm"]
+    states = [AgentState.WAITING, AgentState.HARVESTING, AgentState.WAITING]
+    runs = [_real_run(_real_worktree(tmp_path, n, dirty=i + 1), st)
+            for i, (n, st) in enumerate(zip(names, states))]
+    line = _real_line(runs)
+    head, *rows = line.splitlines()
+    assert head.startswith(f"round {ROUND} ") and head.endswith(", 3 live:"), line
+    assert [r.split()[0] for r in rows] == names, line
+    assert all(r.startswith("  ") for r in rows), line
+    for mark in ("[", "%"):
+        assert len({r.index(mark) for r in rows}) == 1, line
+    assert rows[1][2 + len(names[0]) + 1:].startswith("HARVESTING"), line
 
 
 # ─────────────────────────────────────────────────────────────────────────────

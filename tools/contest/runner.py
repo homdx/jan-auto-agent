@@ -6439,10 +6439,14 @@ class _Heartbeat:
                     working_files.append(f)
         median = max(1.0, statistics.median(working_files)) if working_files else 1.0
 
+        # One agent per line, name and state padded to the widest so the ages
+        # and the bars stand in one column down the round.
+        name_w = max((len(run.agent.name) for run in self.state.agents), default=0)
+        state_w = max((len(run.state.value) for run in self.state.agents), default=0)
         for run in self.state.agents:
-            part = f"{run.agent.name} {run.state.value}"
+            part = f"{run.agent.name:<{name_w}} {run.state.value:<{state_w}}"
             if not run.terminal:
-                part += f" {_age(now - self.since.get(run.agent.name, now))}"
+                part += f" {_age(now - self.since.get(run.agent.name, now)):>4}"
                 files = files_by_name.get(run.agent.name, 0)
                 if run.state in (AgentState.WAITING, AgentState.REWORK):
                     committed = _commits_above(run.workspace) > 0 and run.attempt == 0
@@ -6450,7 +6454,7 @@ class _Heartbeat:
                     committed = False
                 pct = _progress(run.state, files, median, committed)
                 if pct is not None:
-                    part += f" {_bar(pct)} {pct}% {files}f"
+                    part += f" {_bar(pct)} {pct:>3}% {files}f"
                 # KC-36: a turn running past its nominal clock says so, so an
                 # extended agent is not mistaken for a hung round. The suffix
                 # rides the attempt marker when there is one.
@@ -6463,16 +6467,16 @@ class _Heartbeat:
             note = self._harvest_note(run) or self._suite_note(run)
             if note:
                 part += f" {note}"
-            parts.append(part)
+            parts.append(part.rstrip())
 
         live = sum(1 for run in self.state.agents if not run.terminal)
         age = _age(time.time() - self.state.started_at)
-        text = f"round {self.state.label} {age}: " + " · ".join(parts) + f" — {live} live"
+        text = f"round {self.state.label} {age}, {live} live:" + "".join(f"\n  {p}" for p in parts)
         count = self._kilo_neighbours()
         if count is not None:
             # KC-62: a store this busy is what ends agents on `Failed to execute
             # statement` — the operator needs to see the crowd, not just the states.
-            text += f" · kilo neighbours {count}"
+            text += f"\n  kilo neighbours {count}"
         return text
 
     def _kilo_neighbours(self) -> int | None:
