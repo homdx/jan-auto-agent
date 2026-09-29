@@ -2,6 +2,7 @@
 
 **Status:** open
 **File:** `calc.py`, `tests/test_calc.py`
+**Symbol:** `Calc.__eq__`
 **Size:** S
 **Source:** operator demo — part 2 of the 2-ticket relay validating external-repo contest support
 

@@ -2,6 +2,7 @@
 
 **Status:** open
 **File:** `calc.py`, `tests/test_calc.py`
+**Symbol:** `Calc.__repr__`
 **Size:** S
 **Source:** operator demo — validating external-repo contest support
 

@@ -140,3 +140,11 @@ def test_check_fails_when_leg_2_rewrote_leg_1(tmp_path):
     r = _check(_two_leg_history(tmp_path, leg2_touches_repr=True))
     assert r.returncode == 1
     assert "FAIL  leg 2 built on leg 1" in r.stdout
+
+
+@pytest.mark.parametrize("name", COMMITTED[5:])
+def test_demo_tickets_pass_intake_labels(name):
+    from tools.contest.cli import _missing_labels, _status_of
+    body = (LEGS / name).read_text()
+    assert _missing_labels(body) == [], name
+    assert _status_of(body) == "open"
