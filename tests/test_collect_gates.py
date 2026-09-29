@@ -25,6 +25,8 @@ from tools.collect.scanner import scan_repo
 
 REPO_ROOT = Path(__file__).parent.parent
 
+pytestmark = pytest.mark.xdist_group(name="collect_gates")
+
 
 @pytest.fixture(scope="session")
 def gates_entries():
@@ -49,15 +51,15 @@ def _by_name(entries):
 # ── COLLECT-15 ACs, verbatim ────────────────────────────────────────────────
 
 
-def test_verdict_gate_is_fail_open_with_parse_verdict_soft():
-    entries = _by_name(build_gates_map())
+def test_verdict_gate_is_fail_open_with_parse_verdict_soft(gates_entries):
+    entries = _by_name(gates_entries)
     verdict = entries["verdict"]
     assert verdict.fail_mode == "open"
     assert verdict.parser == "_parse_verdict_soft"
 
 
-def test_theme_gate_is_opt_in_via_theme_check_creative():
-    entries = _by_name(build_gates_map())
+def test_theme_gate_is_opt_in_via_theme_check_creative(gates_entries):
+    entries = _by_name(gates_entries)
     theme = entries["theme"]
     assert theme.config_switch == "[validator_agent] theme_check_creative"
     assert theme.config_default == "false"
@@ -66,19 +68,17 @@ def test_theme_gate_is_opt_in_via_theme_check_creative():
 # ── Shape / determinism ─────────────────────────────────────────────────────
 
 
-def test_all_seven_named_gates_present():
-    entries = build_gates_map()
-    names = {e.name for e in entries}
+def test_all_seven_named_gates_present(gates_entries):
+    names = {e.name for e in gates_entries}
     assert names == {"gate1", "verdict", "continuity", "theme", "fact", "canon", "language"}
 
 
-def test_entries_sorted_by_name():
-    entries = build_gates_map()
-    assert [e.name for e in entries] == sorted(e.name for e in entries)
+def test_entries_sorted_by_name(gates_entries):
+    assert [e.name for e in gates_entries] == sorted(e.name for e in gates_entries)
 
 
-def test_every_entry_is_gate_entry_with_valid_fail_mode():
-    for e in build_gates_map():
+def test_every_entry_is_gate_entry_with_valid_fail_mode(gates_entries):
+    for e in gates_entries:
         assert isinstance(e, GateEntry)
         assert e.fail_mode in FAIL_MODES
 
@@ -97,9 +97,8 @@ def test_gate_entry_rejects_invalid_fail_mode():
         )
 
 
-def test_to_dict_round_trips_all_fields():
-    entries = build_gates_map()
-    gate1 = _by_name(entries)["gate1"]
+def test_to_dict_round_trips_all_fields(gates_entries):
+    gate1 = _by_name(gates_entries)["gate1"]
     d = gate1.to_dict()
     assert d["name"] == "gate1"
     assert d["fail_mode"] == "closed"
@@ -110,14 +109,14 @@ def test_to_dict_round_trips_all_fields():
 # ── Fail-mode / extra-LLM-call spot checks beyond the two literal ACs ──────
 
 
-def test_gate1_is_fail_closed():
+def test_gate1_is_fail_closed(gates_entries):
     # Gate 1's own docstring: "Fail-closed: an unparseable response ...
     # is treated as a *rejection*".
-    entries = _by_name(build_gates_map())
+    entries = _by_name(gates_entries)
     assert entries["gate1"].fail_mode == "closed"
 
 
-def test_language_gate_is_fail_open_and_spends_no_llm_call():
+def test_language_gate_is_fail_open_and_spends_no_llm_call(gates_entries):
     """The language gate accepts what it cannot tokenize — measured, not assumed.
 
     This test previously asserted fail_mode == "closed".  It compared the seed
@@ -139,27 +138,27 @@ def test_language_gate_is_fail_open_and_spends_no_llm_call():
     table was wrong.  See tests/test_gates_fail_mode_truth.py, which pins every
     fail_mode against the real implementation so the two cannot drift again.
     """
-    entries = _by_name(build_gates_map())
+    entries = _by_name(gates_entries)
     language = entries["language"]
     assert language.fail_mode == "open"
     assert language.extra_llm_call is False
 
 
-def test_verdict_gate_spends_no_extra_llm_call():
+def test_verdict_gate_spends_no_extra_llm_call(gates_entries):
     # The verdict gate IS the base Gate-2 call every attempt already
     # makes — it is not layered on top of anything.
-    entries = _by_name(build_gates_map())
+    entries = _by_name(gates_entries)
     assert entries["verdict"].extra_llm_call is False
 
 
-def test_opt_in_gates_all_spend_an_extra_llm_call():
-    entries = _by_name(build_gates_map())
+def test_opt_in_gates_all_spend_an_extra_llm_call(gates_entries):
+    entries = _by_name(gates_entries)
     for name in ("gate1", "continuity", "theme", "fact", "canon"):
         assert entries[name].extra_llm_call is True, name
 
 
-def test_canon_gate_switch_is_a_cadence_not_a_boolean():
-    entries = _by_name(build_gates_map())
+def test_canon_gate_switch_is_a_cadence_not_a_boolean(gates_entries):
+    entries = _by_name(gates_entries)
     canon = entries["canon"]
     assert canon.config_switch == "[auto] canon_check_every"
     assert canon.config_default == "3"
