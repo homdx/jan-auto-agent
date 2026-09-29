@@ -872,6 +872,8 @@ def test_harvest_names_the_branch_commit_when_no_row_claims_it(round_, tmp_path)
     _record(one, ticket.name, outcome="DONE", commit=sha)
     h = harvest(one, ticket)
     assert h.verdict == "READY" and h.commit == sha
+    # the agent's own commit is not the runner's deadline commit (KC-41)
+    assert h.facts["deadline_commit"] is False
 
     two = _worktree(repo, base, tmp_path, agent="two")
     _accepting(two)

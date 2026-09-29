@@ -1665,6 +1665,8 @@ def test_the_deadline_commit_and_its_row_are_what_the_harvest_scores(tmp_path, c
     verdict = _runner_module._harvest(ws, sb.ticket_path, False, _stall_config())
     assert verdict.verdict == "READY", [r.code for r in verdict.reasons]
     assert verdict.commit == sha
+    # the harvest reads it off the commit itself, so a resume or a replay sees it too
+    assert verdict.facts["deadline_commit"] is True
     assert _runner_has(caplog, f"agent-a: deadline commit {sha[:12]}")
 
 

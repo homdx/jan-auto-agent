@@ -37,6 +37,7 @@ from tools.git_run import run_git
 
 __all__ = [
     "BRIDGE",
+    "DEADLINE_COMMIT_EMAIL",
     "TEST_ROOTS",
     "declared_files",
     "extract_shrink",
@@ -49,6 +50,12 @@ __all__ = [
 
 #: The gate-1 file the round is scored on — `_shrink` must stay byte-identical.
 BRIDGE = "tools/auto/collect_bridge.py"
+
+#: The committer email of the runner's own deadline commit (KC-41). Here, the
+#: module both `runner.py` and `harvest.py` import, so the harvest can tell that
+#: commit from the agent's by the commit itself — on a `--resume`, in a replay
+#: or by hand — without importing the runner, which imports the harvest.
+DEADLINE_COMMIT_EMAIL = "contest@localhost"
 
 #: Four separate invocations — combining the roots collides in conftest.
 TEST_ROOTS = ["tests", "tests_bugfix", ".smoke_tests", ".regression_tests"]

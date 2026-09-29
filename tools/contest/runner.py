@@ -217,7 +217,7 @@ from typing import Callable
 from tools.backoff import save_state
 from tools.contest import context_memory
 from tools.contest.backend import ContestBackend, ContestBackendError
-from tools.contest.gates import declared_files, git
+from tools.contest.gates import DEADLINE_COMMIT_EMAIL, declared_files, git
 from tools.contest.harvest import harvest, rework_message
 from tools.contest.kilo_client import (
     AGENT_TEST_TIMEOUT_MS,
@@ -2296,7 +2296,7 @@ def _deadline_commit(ws: Workspace, *, reason: str, ticket=None) -> str | None:
         # for the same reason in the other direction — a hook the agent's own
         # work trips must not cost the round the commit that keeps that work.
         commit = run_git(["git", "-c", "user.name=contest runner",
-                          "-c", "user.email=contest@localhost",
+                          "-c", f"user.email={DEADLINE_COMMIT_EMAIL}",
                           "-c", "commit.gpgsign=false",
                           "commit", "-q", "--no-verify",
                           "-m", subject, "-m", body],

@@ -43,6 +43,7 @@ from typing import Literal
 
 from tools.contest.gates import (
     BRIDGE,
+    DEADLINE_COMMIT_EMAIL,
     declared_files,
     git,
     judge_worktree,
@@ -475,6 +476,12 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     # ── the facts: the mechanical scorecard row ───────────────────────────
     facts = judge_worktree(ws.agent, str(ws.path), ws.base_sha, list(declared),
                            want_tests=False)
+    # KC-41: a fact, not a reason — whether the one commit is the runner's
+    # deadline commit rather than the agent's. A READY reached that way is a
+    # different signal for SUMMARY and the judge than one the model claimed.
+    facts["deadline_commit"] = (
+        facts.get("commits") == 1
+        and git(str(ws.path), "log", "-1", "--format=%ce", "HEAD") == DEADLINE_COMMIT_EMAIL)
 
     if "commits" not in facts:
         # A path that is not a git worktree has nothing to score; there is no
