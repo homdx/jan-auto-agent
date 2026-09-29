@@ -997,7 +997,11 @@ def test_the_prompt_of_a_resumed_session_lists_the_scratch_roots(tmp_path):
 
 
 def test_three_questions_in_one_turn_stall_and_abort(tmp_path):
-    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy"], "questions": 3, "delay": 0.5}]}
+    # No on_prompt: the reject of question 3 unblocks the fake, which then runs
+    # on_prompt on its own thread while the runner's terminal branch reads the
+    # tree (KC-41). Files written in that window get a deadline commit and the
+    # stall ends READY. This test is about the question stall, not the work.
+    scenario = {"turns": [{"events": ["busy"], "questions": 3, "delay": 0.5}]}
     sb, fake, _h, run, aborted = _run_one(tmp_path, scenario)
     assert run.state is AgentState.STALLED and aborted
     assert run.questions == 3 and "questions" in run.last_error
