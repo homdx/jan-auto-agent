@@ -945,6 +945,55 @@ def test_bash_deny_beats_no_path_rule(tmp_path):
     assert gate.calls == []
 
 
+#: KC-28/KC-119: the ``*>*`` ask fires on every ``2>&1`` and ``>/dev/null``,
+#: but geometry settles them without the gate — ``&1`` is no path and
+#: ``/dev/null`` is not scanned as one — so no allow rule is needed in the
+#: session rules. A proposal to add ``*2>&1`` allows after the deny rules
+#: would have let Kilo's last match wave ``git push … 2>&1`` through; these
+#: pin both halves: the harmless tail costs no gate call, and the tail never
+#: launders the head of the command.
+_ROUND_ROOTS = ("/tmp/kilo/*",)
+
+
+@pytest.mark.parametrize("command", [
+    "python3 -m pytest tests -q 2>&1",
+    "head -60 ./a.py 2>/dev/null",
+    "ls >/dev/null 2>&1",
+    "git log --oneline 2>/dev/null | head",
+])
+def test_harmless_stderr_redirect_is_settled_without_the_gate(tmp_path, command):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(deny_commands=("git push*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, make_event(permission="bash", patterns=[command],
+                                         command=command),
+                      tmp_path, tmp_roots=_ROUND_ROOTS)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert gate.calls == []
+
+
+@pytest.mark.parametrize("command, layer", [
+    ("git push origin HEAD 2>&1", "mechanical"),
+    ("rm -rf /* 2>/dev/null", "mechanical"),
+    ("cat x > /etc/foo 2>&1", "gate-failed"),
+    ("echo x > ../out; ls >/dev/null", "gate-failed"),
+])
+def test_stderr_redirect_tail_does_not_launder_the_command(tmp_path, command, layer):
+    """A deny or an outside write before the tail is still rejected; with the
+    gate down it fails closed."""
+    policy = Policy(make_config(deny_commands=("git push*",)),
+                    completion_fn=StubGate(TimeoutError("timed out")),
+                    clock=FakeClock(step=0.1), sleep=NO_SLEEP)
+
+    decision = decide(policy, make_event(permission="bash", patterns=[command],
+                                         command=command),
+                      tmp_path, tmp_roots=_ROUND_ROOTS)
+
+    assert (decision.reply, decision.layer) == ("reject", layer)
+
+
 def test_external_directory_no_paths_still_gates(tmp_path):
     """An external_directory event with no paths still goes to the gate."""
     event = make_event(
