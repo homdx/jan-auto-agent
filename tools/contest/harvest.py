@@ -502,7 +502,10 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
                 f"{ticket} shipped no test file — add one under tests/ that fails "
                 "without the change",
             ))
-        if facts["shrink"] != "same":
+        # `?` = the base has no bridge at all — an external `--target` repo
+        # (KC-76). There is nothing to keep byte-identical, so only a bridge
+        # the base had and the commit changed or dropped is a reason.
+        if facts["shrink"] in ("CHANGED", "GONE"):
             reasons.append(Reason(
                 "shrink_changed",
                 f"CollectBridge._shrink in {BRIDGE} is {facts['shrink']} against the "

@@ -332,6 +332,17 @@ def test_harvest_does_not_call_the_file_line_path_off_ticket(round_, tmp_path):
     assert _reason(h, "off_ticket_files").text.endswith("declared list: tools/auto/other.py")
 
 
+def test_harvest_skips_the_shrink_gate_when_the_base_has_no_bridge(round_, tmp_path):
+    """KC-76 --target: an external repo has no collect_bridge.py — not `shrink_changed`."""
+    repo, base, ticket = round_
+    _git(repo, "rm", "-q", "tools/auto/collect_bridge.py")
+    _git(repo, "commit", "-q", "-m", "no bridge")
+    base = _git(repo, "rev-parse", "HEAD")
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, commit=_accepting(wt))
+    assert "shrink_changed" not in _codes(harvest(wt, ticket))
+
+
 def test_ticket_for_round_still_finds_and_titles(round_):
     repo, base, ticket = round_
     name, title, declared = ticket_for_round(str(ticket.parent), 1)

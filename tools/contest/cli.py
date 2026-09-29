@@ -782,9 +782,51 @@ def _missing_hint_lines(missing) -> list:
 
 
 def _roster_path(repo, roster: str) -> Path:
-    """`--roster` as a path: absolute as given, else relative to the repo."""
+    """`--roster` as a path: absolute as given, else relative to the CWD.
+
+    KC-76: the CWD is where the operator stands and the repo is the `--target`,
+    so a relative roster is "my contest.ini", not "the target's". Without
+    `--target` the repo is the CWD and nothing changes. *repo* stays in the
+    signature for the callers; it no longer takes part in the resolution.
+    """
     path = Path(roster)
-    return path if path.is_absolute() else repo / path
+    return path if path.is_absolute() else Path.cwd() / path
+
+
+#: KC-76: what the agents' prompt runs inside their clone of the target — the
+#: prompt names both scripts, so a base without them fails on the first turn.
+_TARGET_FILES = ("scripts/next_task.py", "scripts/append_task.py")
+
+
+def _target_repo(target) -> Path:
+    """The repo the round runs on: `--target` resolved, else the CWD (KC-76)."""
+    return Path(target).expanduser().resolve() if target else Path.cwd().resolve()
+
+
+def _target_failures(repo, base_ref: str) -> list:
+    """Intake lines for a `--target` whose base tree cannot host a round.
+
+    The repo must be a git repo whose *base_ref* holds the two scripts the
+    prompt runs and an `epic-tasks/` (KC-76 §8). An unresolvable base is
+    skipped: `intake` reports it in its own words.
+    """
+    repo = Path(repo)
+    if not repo.is_dir():
+        return [f"--target {repo} is not a directory"]
+    if not gates.git(str(repo), "rev-parse", "--is-inside-work-tree"):
+        return [f"--target {repo} is not a git repository"]
+    if not gates.git(str(repo), "rev-parse", "--verify", f"{base_ref}^{{commit}}"):
+        return []
+    missing = []
+    for rel in (*_TARGET_FILES, "epic-tasks"):
+        listed = gates.git(str(repo), "ls-tree", "--name-only", base_ref, "--", rel)
+        if not listed:
+            missing.append(rel)
+    if not missing:
+        return []
+    return [f"--target {repo}: {base_ref} lacks {', '.join(missing)} — the agents run "
+            "scripts/next_task.py and scripts/append_task.py in their clone and read "
+            "epic-tasks/ there; copy the scripts from jan-auto-agent and commit them"]
 
 
 def _round_out_dir(repo, config: ContestConfig, round_no: int) -> Path:
@@ -2241,8 +2283,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     # decisions.jsonl. This command adds no key check; KC-7's intake does.
     os.environ.setdefault("CONTEST_GATE_API_KEY", "unset-for-the-round")
 
-    repo = Path.cwd().resolve()
+    repo = _target_repo(args.target)
     tasks_dir = repo / TASKS_DIR
+
+    if args.target:
+        failures = _target_failures(repo, args.base)
+        if failures:
+            for line in failures:
+                print(f"intake: {line}", file=sys.stderr)
+            return EXIT_FAILED
 
     try:
         # `--backend` goes into `load_roster`, not into `_apply_flags`: the
@@ -2571,9 +2620,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--ticket", type=int, required=True, metavar="NN",
                      help="the ticket number, NN from epic-tasks/NN-*.md")
+    run.add_argument("--target", default=None, metavar="REPO_PATH",
+                     help="the git repo the round runs on (default: the current "
+                          "directory). Its epic-tasks/ holds the ticket and its base "
+                          "must carry scripts/next_task.py and scripts/append_task.py; "
+                          "worktrees, out_dir and rounds_dir resolve against it")
     run.add_argument("--roster", default=DEFAULT_ROSTER,
-                     help="the roster ini (default contest.ini at the repo root; "
-                          "contest.local.ini next to it overrides it)")
+                     help="the roster ini (default contest.ini in the current "
+                          "directory; a relative path is taken from the current "
+                          "directory, not from --target; contest.local.ini next to "
+                          "it overrides it)")
     run.add_argument("--base", default="HEAD",
                      help="the base ref the worktrees start from (default HEAD)")
     run.add_argument("--models", default="",

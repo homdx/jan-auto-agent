@@ -646,6 +646,107 @@ def test_intake_refuses_a_park_that_is_not_committed(tmp_path, monkeypatch, caps
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# KC-76: --target REPO_PATH and _roster_path resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _target_sandbox(tmp_path):
+    """A CWD dir (has contest.ini + no tickets) and a separate target repo
+    (has epic-tasks/ + scripts/ but no contest.ini).  Used to verify that
+    --target points at the target, --roster resolves against CWD."""
+    cwd_dir = tmp_path / "cwd"
+    target_dir = tmp_path / "target"
+    rounds_dir = tmp_path / "rounds"
+    cwd_dir.mkdir()
+    target_dir.mkdir()
+    rounds_dir.mkdir()
+    kilo = tmp_path / "kilo"
+    kilo.write_text("", encoding="utf-8")
+
+    # --- target repo ---
+    _write(target_dir / "epic-tasks" / TICKET_01, _ticket("01", "target-first"))
+    _write(target_dir / "scripts" / "next_task.py", "# stub\n")
+    _write(target_dir / "scripts" / "append_task.py", "# stub\n")
+    _write(target_dir / "tools" / "auto" / "collect_bridge.py", BRIDGE)
+    _write(target_dir / ".gitignore", "contest-out/\nruns/\n__pycache__/")
+    _git(target_dir, "init", "-q", "-b", "main")
+    _git(target_dir, "config", "user.email", "t@example.invalid")
+    _git(target_dir, "config", "user.name", "t")
+    _git(target_dir, "add", "-A")
+    _git(target_dir, "commit", "-q", "-m", "base")
+
+    # --- CWD dir (just needs contest.ini) ---
+    roster_ini = f"""[contest]
+kilo_bin = {kilo}
+server = spawn
+max_parallel = 1
+max_rework = 1
+turn_timeout_sec = 60
+idle_event_timeout_sec = 900
+max_questions_per_turn = 3
+tmp_roots = /nowhere/*
+gate_llm_profile = contest_gate_llm
+gate_max_calls_per_session = 20
+out_dir = contest-out
+rounds_dir = {rounds_dir}
+
+[contest_gate_llm]
+base_url = http://127.0.0.1:1/v1
+api_key = ${{CONTEST_GATE_API_KEY}}
+model = test/gate
+api_format = openai
+response_format = true
+
+[contest.agent.agent-a]
+model = kenary/agent-a:free
+"""
+    _write(cwd_dir / "contest.ini", roster_ini)
+
+    return cwd_dir, target_dir
+
+
+def test_target_flag_resolves_repo_to_the_given_path(tmp_path, monkeypatch, capsys):
+    """--target /some/path makes cmd_run use that path as `repo`, not CWD."""
+    cwd_dir, target_dir = _target_sandbox(tmp_path)
+    monkeypatch.chdir(cwd_dir)
+
+    # The target has the ticket; without --target, intake would look in CWD
+    # (which has no epic-tasks/) and fail with "no ticket numbered 1".
+    # With --target, intake finds it in the target.
+    code = cli.main(["run", "--ticket", "1", "--target", str(target_dir),
+                     "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    # intake finds no Kilo binary (the stub path) → fails at the server step,
+    # but it has already passed the ticket check — no "no ticket" line
+    assert "no ticket numbered 1" not in captured.err
+
+
+def test_target_flag_absent_uses_cwd(tmp_path, monkeypatch, capsys):
+    """Without --target, the repo is CWD — regression: behaviour unchanged."""
+    sb = Sandbox(tmp_path)
+    monkeypatch.chdir(sb.repo)
+
+    code = cli.main(["run", "--ticket", "1", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    # The CWD sandbox has the ticket, so intake passes the ticket check
+    assert "no ticket numbered 1" not in captured.err
+
+
+def test_roster_resolves_against_cwd_not_target(tmp_path, monkeypatch):
+    """A relative --roster is found in CWD, not in the --target repo."""
+    cwd_dir, target_dir = _target_sandbox(tmp_path)
+    # contest.ini is in cwd_dir; there is none in target_dir
+    monkeypatch.chdir(cwd_dir)
+
+    result = cli._roster_path(cwd_dir, "contest.ini")
+    assert result == cwd_dir / "contest.ini"
+    assert result.is_file()
+
+    # same check with an absolute path: unchanged
+    abs_path = str(cwd_dir / "contest.ini")
+    assert cli._roster_path(cwd_dir, abs_path) == Path(abs_path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # KC-25: the roster's provider/model pairs against GET /provider
 # ─────────────────────────────────────────────────────────────────────────────
 
