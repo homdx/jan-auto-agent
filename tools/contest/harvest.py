@@ -466,11 +466,22 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
             elif sha is not None and _is_ancestor(ws.path, sha):
                 resolved = sha
             else:
+                # Round 119: the agent amended after writing its row, so the row
+                # named a commit the amend had dropped. "rebase it" sent it to
+                # check out the orphan and rebase for two legs; the row was the
+                # stale part. HEAD above the base is most likely the same work,
+                # so the first step named is the row, the cherry-pick second.
                 head = git(str(ws.path), "rev-parse", "--short", "HEAD")
+                head_is_change = bool(head) and not _at_or_under_base(ws, head)
+                if head_is_change:
+                    fix = (f"if HEAD holds your change (amended?), append_task.py "
+                           f"--commit {head}; else cherry-pick it")
+                else:
+                    fix = "rebase it onto the branch"
                 reasons.append(Reason(
                     "commit_not_on_branch",
                     f"commit {(sha or claimed_commit)[:12]} is not an ancestor of HEAD "
-                    f"({head or 'unresolved'}) on {ws.branch} — rebase it onto the branch",
+                    f"({head or 'unresolved'}) on {ws.branch} — {fix}",
                 ))
 
     # ── the facts: the mechanical scorecard row ───────────────────────────

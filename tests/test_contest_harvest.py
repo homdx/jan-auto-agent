@@ -1100,8 +1100,47 @@ def test_harvest_off_branch_sha_is_rejected_with_no_commit(round_, tmp_path):
         h = harvest(wt, ticket)
         assert _codes(h) == ["commit_not_on_branch"]
         text = _reason(h, "commit_not_on_branch").text
-        assert side[:7] in text and "not an ancestor of HEAD" in text and "rebase" in text
+        assert side[:7] in text and "not an ancestor of HEAD" in text
+        # HEAD is the agent's change here, so the row is named first (round 119)
+        head = _git(wt.path, "rev-parse", "--short", "HEAD")
+        assert f"append_task.py --commit {head}" in text and "cherry-pick" in text
         assert h.commit is None
+
+
+def test_harvest_a_row_left_behind_by_an_amend_names_head(round_, tmp_path):
+    """Round 119: the agent recorded its commit, then amended it. The row names
+    the dropped sha; the hint must name HEAD for the row, not send the agent to
+    rebase the orphan (it did, for two legs). Rewriting the row makes it READY."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    first = _accepting(wt)
+    _record(wt, ticket.name, outcome="DONE", commit=first)
+    _git(wt.path, "commit", "-q", "--amend", "-m", "amended")
+    head = _git(wt.path, "rev-parse", "--short", "HEAD")
+    assert _git(wt.path, "rev-parse", "HEAD") != first
+
+    h = harvest(wt, ticket)
+    assert _codes(h) == ["commit_not_on_branch"]
+    text = _reason(h, "commit_not_on_branch").text
+    assert first[:12] in text and f"append_task.py --commit {head}" in text
+    assert "rebase it" not in text and len(text) <= TEXT_LIMIT
+
+    _record(wt, ticket.name, outcome="DONE", commit=head)
+    assert harvest(wt, ticket).verdict == "READY"
+
+
+def test_harvest_off_branch_sha_with_nothing_on_the_branch_says_rebase(round_, tmp_path):
+    """No change on the branch yet: HEAD is the base, so there is no row to point
+    at HEAD — the claimed commit itself has to come onto the branch."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _git(wt.path, "checkout", "-q", "-b", "side", base)
+    _edit(wt, "side.txt", "side\n")
+    side = _commit(wt, "side")
+    _git(wt.path, "checkout", "-q", wt.branch)
+    _record(wt, ticket.name, outcome="DONE", commit=side)
+    text = _reason(harvest(wt, ticket), "commit_not_on_branch").text
+    assert "rebase it onto the branch" in text and "append_task" not in text
 
 
 def test_harvest_not_a_sha_sentence_stays_within_the_budget(round_, tmp_path):
