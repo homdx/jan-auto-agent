@@ -16,8 +16,6 @@ for _p in (str(REPO_ROOT), str(TESTS_DIR)):
 import test_contest_kilo_client as tk  # noqa: E402
 from tools.contest.kilo_client import _child_session  # noqa: E402
 
-# every test binds the fake's ephemeral port, as test_contest_kilo_client does
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 #: round 87's ask, as mimo-v2-5's subagent made it at 301 s
 TOOL_OUTPUT_ASK = {

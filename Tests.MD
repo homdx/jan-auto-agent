@@ -209,8 +209,10 @@ repo-scanning work, since those dominate the heavy tier.
 
 - `pytest.ini` sets `-n auto --dist=loadgroup`. The `loadgroup` part is
   load-bearing: tests marked `@pytest.mark.xdist_group("port_bound_http_servers")`
-  bind real `127.0.0.1` ports, and plain `--dist=load` scatters them across
-  workers, which races for OS-level TCP ports. Don't drop it.
+  start `kilo serve` on a port `kilo_client._free_port` picked and let go of,
+  and plain `--dist=load` scatters them across workers, where two such spawns
+  can be handed the same port. Don't drop it. A server bound on port 0 in the
+  test's own process takes a port the kernel hands out once, and needs no group.
 - `_pass_a_stub.py` and `fixtures/` are linked into **both** tiers; tests
   in each import them.
 - Keep stray files out of the repository root. A stray copy of a test file

@@ -31,8 +31,6 @@ from tools.contest.variant import (  # noqa: E402
     with_retries,
 )
 
-# the CLI half binds the fake's ephemeral port, as test_contest_cli does
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 # the fixtures of the CLI tests, reused as they are
 gate_key = tc.gate_key

@@ -36,8 +36,10 @@ the heavy explanatory comment style of the existing code; no new formatter is co
 
 ## Testing Guidelines
 
-Use pytest with `pytest.ini` defaults (`-n auto --dist=loadgroup`); tests binding local
-HTTP ports must carry `@pytest.mark.xdist_group("port_bound_http_servers")`. Name files
+Use pytest with `pytest.ini` defaults (`-n auto --dist=loadgroup`); a test that hands a
+port to another process (`kilo_client._free_port` picks it, `kilo serve` binds it) must
+carry `@pytest.mark.xdist_group("port_bound_http_servers")`; a server bound on port 0
+in the test's own process needs no group. Name files
 `tests/test_<area>_<feature>.py` and add a one-line docstring. New feature tests go in
 `tests/` and must be tiered via `scripts/sync_test_tiers.py`.
 

@@ -52,7 +52,8 @@ from tools.contest import cli, export  # noqa: E402
 from tools.contest.kilo_client import KiloServer  # noqa: E402
 from tools.contest.runner import RoundState  # noqa: E402
 
-# every test binds an ephemeral-port HTTP server: one xdist worker for all of them
+# the intake tests start `kilo serve` (the stub) on the port
+# kilo_client._free_port picked and let go of — see test_contest_cli.py
 pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 TICKET_01_BODY = _ticket("01", "first")

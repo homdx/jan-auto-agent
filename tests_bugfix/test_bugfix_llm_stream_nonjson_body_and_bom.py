@@ -37,10 +37,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.llm_stream import request_completion
 
-# AUTO-XDIST-PORT-RACE-1: this module binds a real http.server on an
-# OS-assigned ephemeral port. See tests_bugfix/test_llm_stream_empty_choices.py
-# for why every port-binding module shares this group name.
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 _HEADERS = {"Content-Type": "application/json"}
 _PAYLOAD = {"model": "x", "messages": []}

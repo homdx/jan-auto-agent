@@ -61,7 +61,6 @@ from tools.contest.runner import (  # noqa: E402
     SUMMARY_CONTINUES_NOTE, SUMMARY_FELL_BACK_NOTE, SUMMARY_PROMPT,
 )
 
-pytestmark = pytest.mark.xdist_group("port_bound_http_servers")
 
 #: The window the fallback sizes a model against — `contest.ini`'s `FALLBACK`.
 FALLBACK = 32_768

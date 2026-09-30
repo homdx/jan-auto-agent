@@ -11,8 +11,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = Path(__file__).resolve().parent
 for _p in (str(REPO_ROOT), str(TESTS_DIR)):
@@ -24,8 +22,6 @@ from test_contest_cli import (  # noqa: E402
     spawn_holder,  # noqa: F401
 )
 from tools.contest import cli  # noqa: E402
-
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 
 def _commit_scripts(sb) -> None:

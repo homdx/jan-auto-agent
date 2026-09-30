@@ -43,7 +43,11 @@ from tools.contest.roster import AgentSpec, load_roster  # noqa: E402
 from tools.contest.runner import AgentRun, AgentState, RoundState  # noqa: E402
 from tools.contest.workspace import Workspace, prepare_round  # noqa: E402
 
-# every test binds an ephemeral-port HTTP server: one xdist worker for all of them
+# The tests that get as far as KiloServer.spawn start `kilo serve` (the stub)
+# on the port kilo_client._free_port picked and let go of: a port handed to
+# another process can be handed out again before it is bound, so the file
+# keeps to the one worker of the group. A server bound on port 0 in-process
+# needs no group.
 pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 ROUND = 1
