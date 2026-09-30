@@ -1,6 +1,6 @@
 # KC-80 — A drafted ticket is reviewed by the gate model, committed, and can start the round
 
-**Status:** queued
+**Status:** open
 **Severity:** MEDIUM
 **File:** `tools/contest/draft.py`
 **Symbol:** `review_ticket`, `commit_ticket`
