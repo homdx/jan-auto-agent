@@ -586,3 +586,25 @@ class TestMakeDeltaValidator:
         b = make_delta_validator(_cfg())
         assert a is not b
         assert a.max_delta_revisions == b.max_delta_revisions
+
+
+class TestConstructorAndInputs:
+    """Taken from the other round-129 entries: pins the entry points' shape."""
+
+    def test_constructor_cap_defaults_to_one(self):
+        # sensenova-6-7-var1: the only default make_delta_validator does not pass through
+        assert DeltaValidator().max_delta_revisions == 1
+        assert DeltaValidator(max_delta_revisions=3).max_delta_revisions == 3
+
+    def test_constructor_and_factory_options_are_keyword_only(self):
+        # bynara: a positional cap or task_mode is a TypeError, not a silent misread
+        with pytest.raises(TypeError):
+            DeltaValidator(3)
+        with pytest.raises(TypeError):
+            make_delta_validator(_cfg(), "code")
+
+    def test_none_text_fails_open(self, validator, repo):
+        # laguna: a coder that returned nothing reaches the fail-open branch
+        verdict = validator.check(None, repo, rel_path="CHANGELOG.md")
+        assert verdict.approved is True
+        assert verdict.reason.startswith("error: ")
