@@ -147,7 +147,7 @@ def lint_of(text, artifact, repo, round_no=1):
 
 
 def _roster(tmp_path: Path, *, with_draft: bool = True, budget: int | None = None,
-            with_gate: bool = True) -> Path:
+            with_gate: bool = True, gate_model: str = "stub/gate") -> Path:
     """A contest.ini with a draft and a gate profile of stub values — never dialed."""
     lines = ["[contest]"]
     if with_draft:
@@ -169,7 +169,7 @@ def _roster(tmp_path: Path, *, with_draft: bool = True, budget: int | None = Non
             "[gate_model]",
             "base_url = http://127.0.0.1:2/v1",
             "api_key = unset-in-the-test",
-            "model = stub/gate",
+            f"model = {gate_model}",
         ]
     lines += [
         "",
@@ -1049,3 +1049,26 @@ def test_the_review_sends_a_draft_back_at_most_three_times_by_default():
     """Three rework rounds by default, the committed ini says so too."""
     assert draft_mod.DEFAULT_REVIEW_ROUNDS == 3
     assert ContestConfig().draft_review_rounds == 3
+
+
+def test_cmd_draft_refuses_a_reviewer_that_is_the_drafter(collected, tmp_path, monkeypatch, capsys):
+    """Two profiles naming one model is one model: nothing is drafted, exit 1."""
+    roster = _roster(tmp_path, gate_model="Stub/Draft")
+    calls = []
+    monkeypatch.setattr(draft_mod, "llm_call_for",
+                        lambda settings, system=None: (lambda p: calls.append(p)))
+    code = contest_cli.cmd_draft(_args(collected, roster=roster))
+    assert code == contest_cli.EXIT_FAILED
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "the review model is the draft model (stub/draft)" in err
+    assert _tickets(collected) == []
+
+
+def test_cmd_draft_no_review_allows_one_model(collected, tmp_path, monkeypatch, capsys):
+    """--no-review has no reviewer, so one model for both profiles is no conflict."""
+    roster = _roster(tmp_path, gate_model="stub/draft")
+    monkeypatch.setattr(draft_mod, "llm_call_for",
+                        lambda settings, system=None: (lambda p: ticket_text()))
+    code = contest_cli.cmd_draft(_args(collected, roster=roster, no_review=True))
+    assert code == 0

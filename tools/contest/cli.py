@@ -2576,6 +2576,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     return EXIT_OK if ready else EXIT_NO_READY
 
 
+def _same_model(a, b) -> bool:
+    """Whether two LlmSettings name one model id — whatever the provider.
+
+    The same weights behind two URLs are still the same reviewer, so the base
+    URL does not make them different.
+    """
+    if a is None or b is None:
+        return False
+    model_a = str(getattr(a, "model", "") or "").strip().lower()
+    model_b = str(getattr(b, "model", "") or "").strip().lower()
+    return bool(model_a) and model_a == model_b
+
+
 def cmd_draft(args: argparse.Namespace) -> int:
     """`draft --target REPO "brief" [--round NN] [--out FILE] [--run] [--no-review]`.
 
@@ -2629,6 +2642,16 @@ def cmd_draft(args: argparse.Namespace) -> int:
             print("draft: [contest] gate_llm_profile is not set — the review runs on "
                   "the gate's model, so name it in " + LOCAL_FILENAME +
                   " as run does, or pass --no-review", file=sys.stderr)
+            return EXIT_FAILED
+        # A model reviewing its own ticket approves its own blind spots: the
+        # reviewer must be a different model from the drafter, not just a
+        # different section naming the same one.
+        if _same_model(config.gate_settings, config.draft_settings):
+            print("draft: the review model is the draft model ("
+                  + str(getattr(config.draft_settings, "model", "")) + ") — set a "
+                  "different model under [contest] gate_llm_profile or "
+                  "draft_llm_profile in " + LOCAL_FILENAME + ", or pass --no-review",
+                  file=sys.stderr)
             return EXIT_FAILED
         review_call = draft.llm_call_for(config.gate_settings,
                                          system=draft.REVIEW_SYSTEM_PROMPT)
