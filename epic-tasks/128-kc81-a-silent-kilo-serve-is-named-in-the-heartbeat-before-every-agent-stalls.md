@@ -1,6 +1,6 @@
 # KC-81 — A silent Kilo server is named in the heartbeat before every agent stalls
 
-**Status:** queued
+**Status:** open
 **Severity:** MEDIUM
 **File:** `tools/contest/runner.py`
 **Symbol:** `_Heartbeat`
