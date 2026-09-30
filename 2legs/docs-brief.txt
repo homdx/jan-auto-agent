@@ -1,0 +1,15 @@
+Bring the documentation up to date with the code.
+
+1. Read README.md and docs/ and check every claim against the live code:
+   commands, flags, config keys, file paths, function names, default values,
+   examples. List what is wrong or missing in `docs/DOCS-AUDIT.md`
+   (file, line, what the doc says, what the code does).
+2. Fix the docs so they match the code. Never change code to match the docs.
+3. Add `tests/test_docs_current.py`: it parses the docs and asserts that every
+   file path they name exists and every CLI flag they name appears in the
+   argument parser (or the equivalent for this repo). It must fail on the old
+   docs and pass on the new ones.
+4. One commit: subject `docs: bring <area> up to date with the code`.
+
+On a later leg: read docs/DOCS-AUDIT.md first and continue with the items not
+yet fixed.
