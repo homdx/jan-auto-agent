@@ -115,6 +115,7 @@ CONTEST_KEYS = (
     "provider_retry_max_wait_sec",
     "quota_patterns",
     "progress_every_sec",
+    "kilo_silent_sec",
     "harvest_budget_sec",
     "deadline_commit",
     "agent_suite_slots",
@@ -366,6 +367,9 @@ class ContestConfig:
     #: not live here — they belong to KC-19's retry path.
     quota_patterns: str = ""
     progress_every_sec: int = 60
+    #: KC-81: seconds of *both* no live agent event and a still kilo-serve.log
+    #: before the heartbeat names the server as hung. 0 turns the check off.
+    kilo_silent_sec: float = 600.0
     #: KC-57: the wall-clock budget for one harvest's pytest roots.
     #: 0 turns it off, which keeps today's unbounded behaviour.
     harvest_budget_sec: int = 900
@@ -707,6 +711,18 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     def list_(key: str) -> tuple[str, ...]:
         return _split_list(parser.get("contest", key, fallback=""))
 
+    def _kilo_silent_sec(parser) -> float:
+        """KC-81: ``[contest] kilo_silent_sec``, fail-open.
+
+        Absent is the 600 s default; a negative or non-finite value is 0 (off);
+        a malformed key falls back to the default rather than raising into a
+        round — same spirit as ``num``'s memory reads.
+        """
+        value = safe_getfloat(parser, "contest", "kilo_silent_sec", fallback=600.0)
+        if not math.isfinite(value) or value < 0:
+            return 0.0
+        return value
+
     def flag(key: str, default: bool) -> bool:
         """KC-41: an on/off key, fail-open in both directions.
 
@@ -933,6 +949,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         provider_retry_max_wait_sec=seconds("provider_retry_max_wait_sec", 300.0),
         quota_patterns=scalar("quota_patterns", ""),
         progress_every_sec=limit("progress_every_sec", 60),
+        # KC-81: fail-open — absent is the 600 s default, a negative or a
+        # non-finite value is 0 (off), and a malformed key never raises.
+        kilo_silent_sec=_kilo_silent_sec(parser),
         harvest_budget_sec=max(0, limit("harvest_budget_sec", 900)),
         deadline_commit=flag("deadline_commit", True),
         agent_suite_slots=agent_suite_slots,

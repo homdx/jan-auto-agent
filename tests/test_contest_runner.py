@@ -4412,19 +4412,22 @@ def work_passing_test(directory, text):
 
 
 def test_run_round_run_tests_is_keyword_only_with_a_false_default():
-    """KC-16 adds one keyword to `run_round` and KC-62 another (`server_pid`, for
-    the heartbeat's neighbour count); nothing else about it moves."""
+    """KC-16 adds one keyword to `run_round`, KC-62 another (`server_pid`, for
+    the heartbeat's neighbour count) and KC-81 a third (`log_path`, for the
+    silent-server check); nothing else about it moves."""
     import inspect
 
     params = inspect.signature(run_round).parameters
     assert list(params) == ["config", "round_no", "ticket_path", "workspaces",
                             "make_backend", "out_dir", "resume", "run_tests",
-                            "server_pid"]
-    for name in ("make_backend", "out_dir", "resume", "run_tests", "server_pid"):
+                            "server_pid", "log_path"]
+    for name in ("make_backend", "out_dir", "resume", "run_tests", "server_pid",
+                 "log_path"):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
     assert params["resume"].default is None
     assert params["run_tests"].default is False
     assert params["server_pid"].default is None
+    assert params["log_path"].default is None
     assert inspect.signature(run_agent).parameters["run_tests"].default is False
 
 
@@ -6599,6 +6602,270 @@ def test_the_heartbeat_names_the_suite_queue_and_its_ceiling(tmp_path, monkeypat
     assert "agent-a WAITING" in line and "(suite queued 12m, 2 ahead)" in line, line
     assert "(suite 10m)" in line, line
     assert "(suite 16m, over the ceiling)" in line, line
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-81: the heartbeat names a silent kilo serve — once per silent spell, never
+# a kill, never an abort; state.json carries server_silent
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _kilo_silent_harness(tmp_path, agents=("agent-a",), *, silent_sec=0.3, every=0.1,
+                         log_path=True, server_pid=None, events_for=()):
+    """A `_Heartbeat` wired like `run_leg` wires one, over a fresh Sandbox.
+
+    *log_path* True writes a still `kilo-serve.log` under the round's out dir;
+    False is the "server the round did not start" shape. *events_for* names the
+    agents that already have an `events.jsonl` with one old event on disk.
+    Returns `(sb, hb, state, saved, log_file_or_None)`.
+    """
+    names = tuple(agents)
+    sb = Sandbox(tmp_path, names)
+    log_file = None
+    if log_path:
+        log_file = sb.out_dir / "kilo-serve.log"
+        log_file.write_text("kilo serve starting\n", encoding="utf-8")
+    for name in events_for:
+        p = sb.out_dir / name / "events.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('{"t": 1.0, "event": {"type": "busy"}}\n', encoding="utf-8")
+    specs = make_config(list(names)).agents
+    runs = [AgentRun(agent=s, workspace=sb.ws(s.name), state=AgentState.PROMPTED)
+            for s in specs]
+    state = RoundState(round_no=ROUND, ticket=TICKET, base_sha="0" * 40,
+                       started_at=time.time() - 30, agents=runs)
+    saved: list = []
+
+    def save():
+        saved.append(state.to_dict())
+        _write(sb.out_dir / "state.json", json.dumps(state.to_dict()))
+
+    hb = _runner_module._Heartbeat(
+        state, {r.agent.name: time.monotonic() for r in runs}, every,
+        server_pid=server_pid if server_pid is not None else os.getpid(),
+        kilo_silent_sec=silent_sec,
+        log_path=str(log_file) if log_file is not None else None,
+        events_root=str(sb.out_dir),
+        save=save,
+    )
+    # the heartbeat line reads real worktrees; keep it off the git path here
+    orig_files, orig_commits = _runner_module._worktree_files, _runner_module._commits_above
+    _runner_module._worktree_files = lambda ws: 0
+    _runner_module._commits_above = lambda ws: 0
+    return sb, hb, state, saved, log_file, (orig_files, orig_commits)
+
+
+def _silent_warnings(caplog):
+    return [r.message for r in caplog.records
+            if r.levelno >= logging.WARNING and "kilo serve silent" in r.message]
+
+
+def _wait_for(pred, timeout=3.0, step=0.05):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(step)
+    return pred()
+
+
+def test_kilo_silent_warns_once_when_events_and_log_are_still(tmp_path, caplog):
+    """KC-81: prompted agents, no event, a still log — exactly one WARNING naming
+    the pid and the log's last-change time; state.json carries server_silent."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path)
+    try:
+        hb.start()
+        assert _wait_for(lambda: _silent_warnings(caplog), timeout=4.0), caplog.text
+        hb.stop()
+    finally:
+        _runner_module._worktree_files, _runner_module._commits_above = restore
+    warns = _silent_warnings(caplog)
+    assert len(warns) == 1, warns
+    note = warns[0]
+    assert f"pid {os.getpid()}" in note, note
+    assert "cpu " in note, note
+    mtime = os.stat(log_file).st_mtime
+    idle_since = time.strftime("%H:%M:%S", time.localtime(mtime))
+    assert f"log idle since {idle_since}" in note, note
+    assert "1 live agent without an event" in note, note
+    assert "the server looks hung" in note and "--fresh" in note, note
+    # state.json has server_silent: the seconds and the pid
+    data = json.loads((sb.out_dir / "state.json").read_text(encoding="utf-8"))
+    assert data.get("server_silent") == {"seconds": hb.kilo_silent_sec,
+                                         "pid": os.getpid()}, data
+    # reloaded round state keeps the key for `contest status`
+    assert RoundState.from_dict(data).server_silent == {"seconds": hb.kilo_silent_sec,
+                                                        "pid": os.getpid()}
+    # the check never aborts: there is nothing here that could, and the state
+    # is still PROMPTED — no terminal state was forced on any session
+    assert all(r.state is AgentState.PROMPTED for r in state.agents)
+    assert hb.server_pid == os.getpid()
+
+
+def test_kilo_silent_stays_quiet_while_the_log_grows(tmp_path, caplog):
+    """KC-81: the same still events, but kilo-serve.log keeps growing — the
+    server is fine, so no warning."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path)
+    stop = threading.Event()
+
+    def grow():
+        while not stop.is_set():
+            with log_file.open("a", encoding="utf-8") as fh:
+                fh.write(f"beat {time.time()}\n")
+            time.sleep(0.05)
+
+    writer = threading.Thread(target=grow, daemon=True)
+    writer.start()
+    try:
+        hb.start()
+        time.sleep(1.0)  # several silent-window multiples
+        hb.stop()
+    finally:
+        stop.set()
+        writer.join(2.0)
+        _runner_module._worktree_files, _runner_module._commits_above = restore
+    assert not _silent_warnings(caplog), caplog.text
+    assert state.server_silent is None
+    assert not saved
+
+
+def test_kilo_silent_stays_quiet_while_an_agent_gets_events(tmp_path, caplog):
+    """KC-81: one live agent keeps receiving events — the log side alone never
+    warns; a quiet agent among busy ones is the stall logic's business."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(
+        tmp_path, agents=("agent-a", "agent-b"), events_for=("agent-b",))
+    # agent-b already has an events.jsonl; keep appending to agent-a's instead
+    busy = sb.out_dir / "agent-a" / "events.jsonl"
+    busy.parent.mkdir(parents=True, exist_ok=True)
+    stop = threading.Event()
+
+    def talk():
+        while not stop.is_set():
+            with busy.open("a", encoding="utf-8") as fh:
+                fh.write('{"t": %s, "event": {"type": "busy"}}\n' % time.time())
+            time.sleep(0.05)
+
+    writer = threading.Thread(target=talk, daemon=True)
+    writer.start()
+    try:
+        hb.start()
+        time.sleep(1.0)
+        hb.stop()
+    finally:
+        stop.set()
+        writer.join(2.0)
+        _runner_module._worktree_files, _runner_module._commits_above = restore
+    assert not _silent_warnings(caplog), caplog.text
+
+
+def test_kilo_silent_warns_again_after_a_second_spell(tmp_path, caplog):
+    """KC-81: a silent spell, then an event, then a second silent spell — two
+    WARNING lines, once per spell."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path)
+    event = sb.out_dir / "agent-a" / "events.jsonl"
+    event.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        hb.start()
+        assert _wait_for(lambda: len(_silent_warnings(caplog)) >= 1, timeout=4.0), caplog.text
+        # something moves: one event ends the spell
+        event.write_text('{"t": %s, "event": {"type": "busy"}}\n' % time.time(),
+                         encoding="utf-8")
+        assert _wait_for(lambda: hb._silent_warned is False, timeout=2.0)
+        # silence again: the second spell warns on its own
+        assert _wait_for(lambda: len(_silent_warnings(caplog)) >= 2, timeout=4.0), caplog.text
+        hb.stop()
+    finally:
+        _runner_module._worktree_files, _runner_module._commits_above = restore
+    warns = _silent_warnings(caplog)
+    assert len(warns) == 2, warns
+    assert warns[0] == warns[1]
+
+
+def test_kilo_silent_zero_never_warns(tmp_path, caplog):
+    """KC-81: `kilo_silent_sec = 0` is the check off — a still server and a
+    still log produce no warning at all."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path, silent_sec=0)
+    try:
+        hb.start()
+        time.sleep(0.5)
+        hb.stop()
+    finally:
+        _runner_module._worktree_files, _runner_module._commits_above = restore
+    assert not _silent_warnings(caplog), caplog.text
+    assert state.server_silent is None
+
+
+def test_kilo_silent_without_a_log_path_says_log_unknown(tmp_path, caplog):
+    """KC-81: a server the round did not start — only the event side counts and
+    the line says `log ?`."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path, log_path=False)
+    assert log_file is None
+    try:
+        hb.start()
+        assert _wait_for(lambda: _silent_warnings(caplog), timeout=4.0), caplog.text
+        hb.stop()
+    finally:
+        _runner_module._worktree_files, _runner_module._commits_above = restore
+    (note,) = _silent_warnings(caplog)
+    assert "log ?" in note, note
+    assert f"pid {os.getpid()}" in note, note
+    # no log file was ever opened or created by the check
+    assert not (sb.out_dir / "kilo-serve.log").exists()
+
+
+def test_kilo_silent_never_kills_or_aborts_in_a_round(tmp_path, caplog):
+    """KC-81: a hung-server round warns and writes server_silent; the check
+    itself never aborts a session. The turn scripts one busy event and then a
+    delay with nothing — long enough for the silent spell to fire — and then
+    idles on its own, so the stall edge is never what ends the agent."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    cfg = make_config(["agent-a"], max_parallel=1,
+                      progress_every_sec=0.15, kilo_silent_sec=0.4)
+    # busy, then 2 s of nothing, then idle: the silent window opens in the gap
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy"],
+                           "delay": 2.0}]}
+    sb = Sandbox(tmp_path)
+    log_file = sb.out_dir / "kilo-serve.log"
+    log_file.write_text("kilo serve starting\n", encoding="utf-8")
+    with _BenchFake(scenario) as fake:
+        state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
+                          make_backend=_make_backend(fake, sb.out_dir),
+                          out_dir=sb.out_dir,
+                          server_pid=os.getpid(),
+                          log_path=str(log_file))
+        # the fake server is still alive: its HTTP listener never took a signal
+        assert fake._httpd is not None
+        # and no abort was sent — not by the silent check, not by the stall edge
+        assert not _aborted(fake), fake.calls(path="/abort")
+    warns = _silent_warnings(caplog)
+    assert warns, caplog.text
+    assert any(f"pid {os.getpid()}" in w for w in warns)
+    data = json.loads((sb.out_dir / "state.json").read_text(encoding="utf-8"))
+    assert "server_silent" in data and data["server_silent"]["pid"] == os.getpid()
+    (run,) = state.agents
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+
+
+def test_the_round_state_round_trips_server_silent():
+    """KC-81: server_silent rides state.json — written only when set, read back
+    by `from_dict` for `contest status`."""
+    state = RoundState(round_no=ROUND, ticket=TICKET, base_sha="0" * 40,
+                       started_at=1.0, agents=[])
+    assert "server_silent" not in state.to_dict()
+    assert RoundState.from_dict(state.to_dict()).server_silent is None
+    state.server_silent = {"seconds": 600.0, "pid": 1866424}
+    data = state.to_dict()
+    assert data["server_silent"] == {"seconds": 600.0, "pid": 1866424}
+    assert RoundState.from_dict(data).server_silent == {"seconds": 600.0, "pid": 1866424}
+    # a state.json written before the key still loads, with no warning field
+    stale = {"round_no": 1, "ticket": "t.md", "base_sha": "0" * 40, "started_at": 1.0,
+             "agents": []}
+    assert RoundState.from_dict(stale).server_silent is None
 
 
 def test_parts_say_working_sees_a_running_bash_and_a_recent_edit():

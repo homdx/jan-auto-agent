@@ -1840,7 +1840,8 @@ def test_backend_flag_builds_an_openrouter_backend_without_a_kilo_server(
         return type("Backend", (), {})()
 
     def fake_run_round(config, ticket, ticket_path, workspaces, *, make_backend,
-                       out_dir, resume=None, run_tests=True, server_pid=None):
+                       out_dir, resume=None, run_tests=True, server_pid=None,
+                       log_path=None):
         backends.extend(make_backend(workspace) for workspace in workspaces)
         specs = {spec.name: spec for spec in config.agents}
         return RoundState(

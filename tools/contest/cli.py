@@ -2476,19 +2476,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         # the agents this leg runs: every one on leg 1, then only those that ran out
         expected = (None if prior is None else
                     {run.agent.name for run in prior.agents if run.state in RELAY_STATES})
+        # KC-81: the log the round started its server with, so the heartbeat can
+        # name a hung one. An attached server (or openrouter's none) has no log
+        # of this round — `None` is "log ?", events side only.
+        server_log = getattr(server, "log_path", None) if server is not None else None
         try:
             if relay:
                 state = run_leg(config, args.ticket, result.ticket_path, workspaces,
                                 make_backend=make_backend, out_dir=leg_out, leg=leg,
                                 carry=prior, records=leg_records, run_tests=run_tests,
                                 server_pid=server.pid if server else None,
-                                legs=legs, legs_from=legs_from)
+                                legs=legs, legs_from=legs_from,
+                                log_path=server_log)
             else:
                 # KC-44: a round of one leg is the round `run_round` has always
                 # been — no legs keys in its `state.json`
                 state = run_round(config, args.ticket, result.ticket_path, workspaces,
                                   make_backend=make_backend, out_dir=leg_out, resume=resume,
-                                  run_tests=run_tests, server_pid=server.pid if server else None)
+                                  run_tests=run_tests, server_pid=server.pid if server else None,
+                                  log_path=server_log)
         finally:
             if server is not None:
                 server.close()
