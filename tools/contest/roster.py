@@ -69,6 +69,7 @@ __all__ = [
     "DEFAULTS",
     "DEFAULTS_GATE",
     "DEFAULTS_OPENROUTER",
+    "DEFAULTS_DRAFT",
     "LOCAL_FILENAME",
     "AgentSpec",
     "ContestConfig",
@@ -149,6 +150,8 @@ CONTEST_KEYS = (
     "compact_at_percent",
     "summary_at_percent",
     "context_limit_fallback",
+    "draft_llm_profile",
+    "draft_map_budget",
 )
 
 #: Every key an agent section may carry.
@@ -193,6 +196,22 @@ DEFAULTS_OPENROUTER = LlmSettings(
     model="",
     api_format="openai",
     temperature=0.2,
+    max_tokens=4096,
+    response_format=False,
+)
+
+#: KC-79: the draft model's own profile defaults. A ticket writer wants room
+#: for prose — the whole brief, the three collect maps and the ticket's own
+#: format in one reply — so ``max_tokens`` is wide and ``response_format`` is
+#: off: the answer is Markdown, not JSON. ``model`` is empty on purpose, so a
+#: profile section that omits its model fails at load time rather than
+#: silently inheriting the gate's or an agent's id.
+DEFAULTS_DRAFT = LlmSettings(
+    base_url="",
+    api_key="",
+    model="",
+    api_format="openai",
+    temperature=0.3,
     max_tokens=4096,
     response_format=False,
 )
@@ -476,6 +495,15 @@ class ContestConfig:
     openrouter_settings: LlmSettings | None = None
     #: The profile name that ``openrouter_settings`` was resolved from.
     openrouter_llm_profile: str = ""
+    #: KC-79: the profile name behind ``[contest] draft_llm_profile`` — the
+    #: model ``contest draft`` writes tickets with. ``draft_settings`` is its
+    #: resolved form and ``None`` when the key is unset or the section cannot
+    #: be resolved: ``run`` never fails on it, only ``draft`` refuses.
+    draft_llm_profile: str = ""
+    draft_settings: LlmSettings | None = None
+    #: KC-79: the character budget each collect map gets in the draft's prompt.
+    #: A budget the operator sets, never a model window hard-coded in the code.
+    draft_map_budget: int = 8000
 
     def session_rules(self) -> list[dict]:
         """The rule list ``KiloClient.create_session`` sends, per session.
@@ -843,6 +871,27 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         except ValueError as exc:
             raise RosterError(f"[contest] openrouter_llm_profile: {exc}") from exc
 
+    # KC-79: the draft's own profile. Unlike the gate's and OpenRouter's, a
+    # typo here must not refuse a round that never drafts — the resolution is
+    # fail-open and `contest draft` is the one command that reports it,
+    # naming the key. The section's own ${ENV} references are expanded only
+    # when the key is set, so a ${CONTEST_DRAFT_API_KEY} nobody exported
+    # costs nothing to a kilo round.
+    draft_profile = scalar("draft_llm_profile", "")
+    draft_settings = None
+    if draft_profile:
+        try:
+            _expand(parser, (draft_profile,))
+            draft_settings, _ = resolve_llm_profile(
+                parser, "contest", "draft_llm_profile", defaults=DEFAULTS_DRAFT
+            )
+        except (ValueError, RosterError) as exc:
+            _log.warning("[contest] draft_llm_profile: %s — `contest draft` will refuse to run",
+                         exc)
+    draft_map_budget = safe_getint(parser, "contest", "draft_map_budget", fallback=8000)
+    if draft_map_budget <= 0:
+        draft_map_budget = 8000
+
     return ContestConfig(
         kilo_bin=scalar("kilo_bin", "auto"),
         server=scalar("server", "spawn"),
@@ -911,6 +960,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         backend=backend,
         openrouter_settings=openrouter_settings,
         openrouter_llm_profile=openrouter_profile,
+        draft_llm_profile=draft_profile,
+        draft_settings=draft_settings,
+        draft_map_budget=draft_map_budget,
     )
 
 

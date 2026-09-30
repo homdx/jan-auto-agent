@@ -74,7 +74,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from tools.contest import context_memory, export, gates, probe_memory
+from tools.contest import context_memory, draft, export, gates, probe_memory
 from tools.contest.backend import KiloBackend, OpenRouterBackend
 from tools.contest.kilo_client import (
     KiloClient,
@@ -141,6 +141,7 @@ __all__ = [
     "Intake",
     "agents_from_models",
     "cmd_run",
+    "cmd_draft",
     "cmd_status",
     "export_patches",
     "gate_model_refusals",
@@ -2568,6 +2569,66 @@ def cmd_run(args: argparse.Namespace) -> int:
     return EXIT_OK if ready else EXIT_NO_READY
 
 
+def cmd_draft(args: argparse.Namespace) -> int:
+    """`draft --target REPO "brief" [--round NN] [--out FILE]` — one brief, one ticket.
+
+    KC-79: `draft.draft_ticket` over the target — `action_collect` there (Pass A
+    only, no Pass B, no LLM), the three maps cut to `[contest] draft_map_budget`,
+    one call to the profile `[contest] draft_llm_profile` names, the lint, one
+    rework with the problem list appended, then `epic-tasks/<NN>-<slug>.md`.
+    Nothing here commits and no branch moves: KC-80 does that.
+
+    Exit 0 with the path written, 2 with the lint's problems one per line and the
+    last draft saved as `.rejected.md` next to the output, 1 on a target or a
+    roster problem — including a draft profile that is unset or does not resolve,
+    which names `[contest] draft_llm_profile` and makes no LLM call.
+    """
+    repo = _target_repo(args.target)
+    if not repo.is_dir():
+        print(f"draft: --target {repo} is not a directory", file=sys.stderr)
+        return EXIT_FAILED
+    try:
+        config = load_roster(_roster_path(repo, args.roster))
+    except RosterError as exc:
+        print(f"draft: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    if config.draft_settings is None:
+        # `run` needs no draft profile: the refusal is here, not at load time, so
+        # a round never fails because someone typed the profile's section wrong.
+        if not config.draft_llm_profile:
+            reason = ("[contest] draft_llm_profile is not set — name an LlmSettings "
+                      "section (base_url, api_key, model) in " + LOCAL_FILENAME +
+                      " and set it under [contest]")
+        else:
+            reason = ("[contest] draft_llm_profile = " + config.draft_llm_profile +
+                      " does not resolve — that section needs base_url, api_key "
+                      "and model")
+        print("draft: " + reason + " — `run` needs no draft profile", file=sys.stderr)
+        return EXIT_FAILED
+    try:
+        result = draft.draft_ticket(
+            args.brief,
+            repo=repo,
+            config=config,
+            round_no=args.round,
+            out=args.out,
+            llm_call=draft.llm_call_for(config.draft_settings),
+        )
+    except ValueError as exc:
+        print(f"draft: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    if result.rejected:
+        for problem in result.problems:
+            print(f"draft: {problem}", file=sys.stderr)
+        if result.rejected_path:
+            print(f"draft: rejected draft saved to {result.rejected_path}", file=sys.stderr)
+        # EXIT_NO_READY is 2: the lint refused, the problems are printed, the
+        # operator fixes the draft or the repo and re-runs the same brief.
+        return EXIT_NO_READY
+    print(result.path)
+    return EXIT_OK
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """`status --ticket NN [--out DIR]` — the SUMMARY table off `<out>/state.json`.
 
@@ -2694,6 +2755,32 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--out", default=None, metavar="DIR",
                         help="the round's output directory (default <out_dir>/<NN>)")
     status.set_defaults(func=cmd_status)
+
+    drafting = sub.add_parser(
+        "draft",
+        help="write one ticket from a plain brief, grounded in the collect maps",
+        description="`--collect` over the target (Pass A only, no Pass B), the three "
+                    "maps cut to [contest] draft_map_budget, one call to the profile "
+                    "[contest] draft_llm_profile names, the lint, one rework — then "
+                    "epic-tasks/<NN>-<slug>.md. No commit, no branch change.",
+    )
+    drafting.add_argument("--target", default=None, metavar="REPO_PATH",
+                          help="the git repo the brief is about (default: the current "
+                               "directory); `--collect` runs there and epic-tasks/ is "
+                               "written there")
+    drafting.add_argument("brief", metavar="BRIEF",
+                          help="the task in one line, verbatim — the brief is never "
+                               "rewritten into a different task")
+    drafting.add_argument("--round", dest="round", type=int, default=None, metavar="NN",
+                          help="the ticket number (default: the next free one in "
+                               "epic-tasks/)")
+    drafting.add_argument("--out", default=None, metavar="FILE",
+                          help="where the ticket goes (default "
+                               "epic-tasks/<NN>-<slug>.md, from the ticket's own title)")
+    drafting.add_argument("--roster", default=DEFAULT_ROSTER,
+                          help="the roster ini [contest] draft_llm_profile is read from "
+                               "(default contest.ini in the current directory)")
+    drafting.set_defaults(func=cmd_draft)
     return parser
 
 
