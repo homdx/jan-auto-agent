@@ -85,6 +85,7 @@ __all__ = [
     "DraftResult",
     "ReviewResult",
     "brief_sources",
+    "repo_rules",
     "build_prompt",
     "build_review_prompt",
     "commit_ticket",
@@ -527,8 +528,29 @@ def brief_sources(repo, brief: str, budget) -> list:
     return pairs
 
 
+#: The repo's own guide for agents, first one found wins.
+RULES_FILES = ("AGENTS.md", "CLAUDE.md")
+
+
+def repo_rules(repo, budget) -> Optional[tuple]:
+    """The repo's agent guide as ``(name, text)``, cut to *budget*, or ``None``.
+
+    Round 129's ticket ran `pytest` where the repo says `python3 -m pytest` and
+    never said a new test file is tiered with `scripts/sync_test_tiers.py`,
+    which the pre-commit hook refuses without: the drafter had not seen the
+    repo's rules, so the ticket could not carry them.
+    """
+    for name in RULES_FILES:
+        try:
+            body = Path(repo).joinpath(name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        return name, _cut(body, _as_budget(budget))
+    return None
+
+
 def build_prompt(brief: str, maps: list, *, round_no: int, format_spec: str = None,
-                 sources: list = None) -> str:
+                 sources: list = None, rules: Optional[tuple] = None) -> str:
     """The one prompt the draft call gets: the brief, the maps, the format.
 
     *maps* is `maps_text`, already cut. The brief is copied verbatim and the
@@ -545,6 +567,11 @@ def build_prompt(brief: str, maps: list, *, round_no: int, format_spec: str = No
         f"It lands in `epic-tasks/{int(round_no):02d}-<slug>.md`; write "
         f"`**Round:** {int(round_no)}`.",
     ]
+    if rules:
+        name, body = rules
+        parts += ["", f"## The repo's own rules (`{name}`) — `## Acceptance` and "
+                  "`## Rules` use its commands and name every step it requires "
+                  "for this change", "", body.strip()]
     for rel, body in sources or ():
         parts += ["", f"## Source of `{rel}` — name the cases from it", "",
                   "```", body.rstrip(), "```"]
@@ -941,7 +968,8 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     if number is None:
         number = next_round(tasks_dir)
     prompt = build_prompt(brief, maps, round_no=number, format_spec=format_spec,
-                          sources=brief_sources(repo, brief, budget))
+                          sources=brief_sources(repo, brief, budget),
+                          rules=repo_rules(repo, budget))
 
     text = _call(llm_call, prompt)
     problems = lint_ticket(text, artifact, repo=repo, tasks_dir=tasks_dir, round_no=number)

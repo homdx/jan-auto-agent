@@ -1115,3 +1115,24 @@ def test_brief_sources_says_outright_what_it_cut(tmp_path):
     shown, note = text.split("\n[... ", 1)
     assert set(shown.splitlines()) == {"y = 22"}
     assert "NOT shown" in note and "claim nothing" in note
+
+
+def test_the_prompt_carries_the_repos_own_rules(collected):
+    """Round 129 ran bare `pytest` and skipped tiering: the drafter never saw AGENTS.md."""
+    (collected / "AGENTS.md").write_text("Run `python3 -m pytest`; tier new tests.\n")
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text()
+
+    draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=fake)
+    assert "## The repo's own rules (`AGENTS.md`)" in prompts[0]
+    assert "tier new tests." in prompts[0]
+
+
+def test_no_rules_file_no_rules_section(tmp_path):
+    """A repo with neither guide gives no section, not an empty one."""
+    assert draft_mod.repo_rules(tmp_path, 8000) is None
+    (tmp_path / "CLAUDE.md").write_text("c")
+    assert draft_mod.repo_rules(tmp_path, 8000) == ("CLAUDE.md", "c")
