@@ -488,6 +488,11 @@ def ticket_format_spec() -> str:
     return "\n".join(lines)
 
 
+#: The least a named file's source is cut to in the draft prompt, whatever the
+#: map budget: a ticket must not name cases from half a file.
+SOURCE_BUDGET = 40000
+
+
 #: `tools/auto/delta_validator.py` in a brief → a candidate repo path.
 _BRIEF_PATH_RE = re.compile(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+")
 
@@ -499,7 +504,10 @@ def brief_sources(repo, brief: str, budget) -> list:
     test file the brief asks for does not exist yet and is skipped. The maps say
     where things are; this is what the drafter needs to name the cases.
     """
-    budget = _as_budget(budget)
+    # The map budget is for maps: a source cut at it lost round 129's last line
+    # (`return validator`, 47 characters past 8000) and the drafter invented a
+    # `return val` NameError to fix. Sources get their own, larger floor.
+    budget = max(_as_budget(budget), SOURCE_BUDGET)
     repo = Path(repo)
     pairs, seen = [], set()
     for rel in _BRIEF_PATH_RE.findall(brief or ""):
@@ -511,7 +519,11 @@ def brief_sources(repo, brief: str, budget) -> list:
             body = (repo / rel).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        pairs.append((rel, _cut(body, budget)))
+        if len(body) > budget:
+            body = body[:budget].rsplit("\n", 1)[0] + (
+                f"\n[... the rest of this file is NOT shown ({len(body) - budget}+ "
+                "characters) — claim nothing about code you did not see ...]\n")
+        pairs.append((rel, body))
     return pairs
 
 

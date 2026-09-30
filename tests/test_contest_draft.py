@@ -1099,3 +1099,19 @@ def test_the_prompt_carries_the_source_and_asks_for_cases(collected):
     assert target.read_text().strip().splitlines()[0] in prompts[0]
     assert "concrete cases" in draft_mod.DRAFT_SYSTEM_PROMPT
     assert "not the brief restated" in draft_mod.REVIEW_CHECKLIST
+
+
+def test_brief_sources_keeps_a_file_past_the_map_budget_whole(tmp_path):
+    """Round 129: an 8047-character module cut at 8000 lost `return validator`."""
+    body = "x = 1\n" * 1400 + "    return validator\n"
+    (tmp_path / "mod.py").write_text(body)
+    assert draft_mod.brief_sources(tmp_path, "tests for mod.py", 8000) == [("mod.py", body)]
+
+
+def test_brief_sources_says_outright_what_it_cut(tmp_path):
+    """Past the source budget the cut is on a line and says the rest is unseen."""
+    (tmp_path / "big.py").write_text("y = 22\n" * (draft_mod.SOURCE_BUDGET // 5))
+    [(rel, text)] = draft_mod.brief_sources(tmp_path, "big.py", 8000)
+    shown, note = text.split("\n[... ", 1)
+    assert set(shown.splitlines()) == {"y = 22"}
+    assert "NOT shown" in note and "claim nothing" in note
