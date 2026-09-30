@@ -48,6 +48,9 @@ REFERENCED_FILES = (
 _HELP_COMMANDS = (
     ["-m", "tools.contest", "run", "--help"],
     ["-m", "tools.contest", "status", "--help"],
+    # stage D: `contest draft` and the `--collect` it runs (main.py's flag)
+    ["-m", "tools.contest", "draft", "--help"],
+    ["main.py", "--help"],
     ["-m", "tools.contest.workspace", "prepare", "--help"],
     ["contest-bench/harness/setup_worktrees.py", "--help"],
     ["scripts/judge_epic_round.py", "--help"],
