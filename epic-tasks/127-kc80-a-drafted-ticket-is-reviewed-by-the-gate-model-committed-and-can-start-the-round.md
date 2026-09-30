@@ -1,6 +1,6 @@
 # KC-80 — A drafted ticket is reviewed by the gate model, committed, and can start the round
 
-**Status:** open
+**Status:** landed `57bd1a8` on 2026-09-30 — round 127, winner 19/19 on contest-bench/kc80 taken as-is
 **Severity:** MEDIUM
 **File:** `tools/contest/draft.py`
 **Symbol:** `review_ticket`, `commit_ticket`
