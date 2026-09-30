@@ -4163,28 +4163,39 @@ def test_max_parallel_two_overlaps_two_agents(tmp_path):
     # cores pushed the second `POST /session` past it — the overlap looked
     # missing though max_parallel=2 was honoured. With the hold, load only makes
     # the test slower: a runner that serialises the agents never opens the
-    # second session while the first is held, the hold runs out, the first turn
-    # finishes first and the assertion below fails as it should. The fake's
-    # hook heartbeat keeps the held turn busy, so no silence window fires.
+    # second session while the first is held, the hold runs out, and that turn
+    # records it never saw two sessions. The fake's hook heartbeat keeps the
+    # held turn busy, so no silence window fires.
+    #
+    # The proof is what each held turn saw, not the request order: the runner
+    # reads `GET /session/<id>/message` right after it creates a session, before
+    # the prompt, so on a loaded box that read can come before the second
+    # `POST /session` though the first turn has not even started —
+    # `_creates_and_reads` took it for the first agent finishing.
     fake = None
+    saw_both: list = []
 
     def work_once_both_open(directory, text):
         deadline = time.monotonic() + 30.0
+        both = False
         while time.monotonic() < deadline:
             if len([r for r in list(fake.requests)
                     if r["method"] == "POST" and r["path"] == "/session"]) >= 2:
+                both = True
                 break
             time.sleep(0.05)
+        saw_both.append(both)
         work_ready(directory, text)
 
     with _BenchFake({"turns": [{"on_prompt": work_once_both_open, "events": ["busy"]}]}) as fake:
         state = _round(sb, fake, make_config(["agent-a", "agent-b"], max_parallel=2))
-        between, finished_first = _creates_and_reads(fake)
+        between, _finished_first = _creates_and_reads(fake)
     for name in ("agent-a", "agent-b"):
         _assert_ready(_by_name(state)[name], sb.ws(name))
-    # the second session opened before the first finished — overlap proven from
-    # the request order, not from a wall-clock bound that a loaded box breaks.
-    assert not finished_first, between
+    # both turns ran while both sessions existed — the second session opened
+    # before the first turn could finish; a serialised runner leaves the first
+    # turn's entry False
+    assert saw_both == [True, True], (saw_both, between)
 
 
 def test_three_agents_rework_in_parallel_and_state_json_is_always_whole(tmp_path):
@@ -6753,11 +6764,22 @@ def test_kilo_silent_stays_quiet_while_an_agent_gets_events(tmp_path, caplog):
     """KC-81: one live agent keeps receiving events — the log side alone never
     warns; a quiet agent among busy ones is the stall logic's business."""
     caplog.set_level(logging.WARNING, logger=LOGGER)
+    # A 2 s window, not 0.3 s: under three concurrent `pytest -n 8` runs the
+    # writer thread below was starved past a 0.3 s window and the busy agent
+    # read as silent ("kilo serve silent 0s"). The still sides are backdated a
+    # minute so the window stays the only thing between quiet and a warning.
     sb, hb, state, saved, log_file, restore = _kilo_silent_harness(
-        tmp_path, agents=("agent-a", "agent-b"), events_for=("agent-b",))
-    # agent-b already has an events.jsonl; keep appending to agent-a's instead
+        tmp_path, agents=("agent-a", "agent-b"), events_for=("agent-b",),
+        silent_sec=2.0)
+    old = time.time() - 60
+    os.utime(log_file, (old, old))
+    os.utime(sb.out_dir / "agent-b" / "events.jsonl", (old, old))
+    # agent-b already has an events.jsonl; keep appending to agent-a's instead.
+    # It exists before the heartbeat starts: an absent file reads as idle since
+    # the round started, so a first tick ahead of the writer would warn.
     busy = sb.out_dir / "agent-a" / "events.jsonl"
     busy.parent.mkdir(parents=True, exist_ok=True)
+    busy.write_text('{"t": %s, "event": {"type": "busy"}}\n' % time.time(), encoding="utf-8")
     stop = threading.Event()
 
     def talk():
@@ -6770,7 +6792,7 @@ def test_kilo_silent_stays_quiet_while_an_agent_gets_events(tmp_path, caplog):
     writer.start()
     try:
         hb.start()
-        time.sleep(1.0)
+        time.sleep(3.0)  # past the 2 s window: a still agent-a would warn
         hb.stop()
     finally:
         stop.set()
