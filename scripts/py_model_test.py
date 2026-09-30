@@ -249,11 +249,11 @@ def cap_jobs(args, proc_root: str = "/proc") -> None:
     args.parallel = JOBS_NEXT_TO_A_ROUND
 
 
-def run(cmd: list, cwd: str, timeout: int) -> tuple[str, str, int | None]:
+def run(cmd: list, cwd: str, timeout: int, env: dict | None = None) -> tuple[str, str, int | None]:
     """stdout, stderr, exit code (None = timeout). On timeout the whole process
     group is killed: `kilo run` starts its own server, which must not be left behind."""
     p = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+                         stderr=subprocess.PIPE, text=True, start_new_session=True, env=env)
     try:
         out, err = p.communicate(timeout=timeout)
         return out, err, p.returncode
@@ -264,6 +264,63 @@ def run(cmd: list, cwd: str, timeout: int) -> tuple[str, str, int | None]:
             pass
         out, err = p.communicate()
         return out, err, None
+
+
+# `kilo run --format json` prints one event per line: the answer is the
+# "text" parts, the spend is on every "step_finish" part (tokens, and kilo's
+# own cost, which is 0 for a model kilo has no price for).
+RETRY_RE = re.compile(r"\b429\b|too many requests|rate.?limit|forbidden|\b403\b|"
+                      r"temporarily unavailable|overloaded", re.I)
+CTX_RE = re.compile(r"maximum context length is (\d+).*?at least (\d+) input", re.I | re.S)
+CTX_MARGIN = 2000  # the agent's prompt grows by a few turns after the first one
+
+
+def parse_events(out: str) -> tuple[str, dict, str]:
+    """(answer text, spend {in, out, cost}, error messages) from kilo's json events."""
+    texts, errs = [], []
+    spend = {"in": 0, "out": 0, "cost": 0.0}
+    for line in out.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        part = ev.get("part") or {}
+        if ev.get("type") == "text":
+            texts.append(part.get("text") or "")
+        elif ev.get("type") == "step_finish":
+            tok = part.get("tokens") or {}
+            spend["in"] += tok.get("input") or 0
+            spend["out"] += (tok.get("output") or 0) + (tok.get("reasoning") or 0)
+            spend["cost"] += part.get("cost") or 0
+        elif ev.get("type") == "error":
+            e = ev.get("error") or {}
+            errs.append(str((e.get("data") or {}).get("message") or e.get("name") or e))
+    return "\n".join(texts), spend, " | ".join(errs)
+
+
+def vercel_prices() -> dict:
+    """model id -> (usd per input token, usd per output token) off the public list."""
+    prices = {}
+    for m in get_json(VERCEL_API)["data"]:
+        pr = m.get("pricing") or {}
+        try:
+            prices[m["id"]] = (float(pr.get("input") or 0), float(pr.get("output") or 0))
+        except (TypeError, ValueError):
+            pass
+    return prices
+
+
+def with_output_limit(model: str, context: int, output: int) -> str:
+    """KILO_CONFIG_CONTENT with *model*'s limit set, merged over the one in the env."""
+    try:
+        cfg = json.loads(os.environ.get("KILO_CONFIG_CONTENT") or "{}")
+    except ValueError:
+        cfg = {}
+    provider, _, mid = model.partition("/")
+    entry = (cfg.setdefault("provider", {}).setdefault(provider, {})
+             .setdefault("models", {}).setdefault(mid, {"name": mid}))
+    entry["limit"] = {"context": context, "output": output}
+    return json.dumps(cfg)
 
 
 def pick_code(raw: str) -> str:
@@ -568,6 +625,8 @@ def main() -> int:
                     help="add a direct-API provider for --find-free (repeatable)")
     ap.add_argument("--parallel", "-j", metavar="N", type=int, default=1,
                     help="run N models in parallel (default: 1 = sequential)")
+    ap.add_argument("--retries", type=int, default=10,
+                    help="attempts per model on 429/403/rate limit (default 10)")
     ap.add_argument("--force", action="store_true",
                     help=f"ignore a live round: do not cap -j to {JOBS_NEXT_TO_A_ROUND} "
                          "next to a running kilo serve")
@@ -605,6 +664,20 @@ def main() -> int:
 
     import threading
     print_lock = threading.Lock()
+    prices: dict = {}
+    if not direct and any(m.lower().startswith("vercel") for m in args.models):
+        try:
+            prices = vercel_prices()
+        except Exception as e:  # noqa: BLE001
+            print(f"  vercel prices: could not read {e}", file=sys.stderr)
+    spent: dict = {}
+
+    def price_of(model: str, spend: dict) -> float:
+        """kilo's cost when it knows one, else tokens at the provider's list price."""
+        if spend["cost"]:
+            return spend["cost"]
+        pin, pout = prices.get(model.partition("/")[2], (0.0, 0.0))
+        return spend["in"] * pin + spend["out"] * pout
 
     def run_one(model: str, work: str, checker: str) -> tuple[str, str, float, str]:
         """Run one model; return (model, score, took, why). Thread-safe stdout."""
@@ -634,9 +707,34 @@ def main() -> int:
                     print("\n".join(lines), flush=True)
                 return model, "-", took, err_msg
         else:
-            out, err, rc = run([kilo, "run", "--pure", "-m", model, PROMPT], mdir, args.timeout)
+            env = dict(os.environ)
+            spend = {"in": 0, "out": 0, "cost": 0.0}
+            for attempt in range(1, max(1, args.retries) + 1):
+                out, err, rc = run([kilo, "run", "--pure", "--format", "json", "-m", model, PROMPT],
+                                   mdir, args.timeout, env)
+                raw, got, ev_err = parse_events(ANSI_RE.sub("", out))
+                for k in spend:
+                    spend[k] += got[k]
+                err = (ev_err + "\n" + err) if ev_err else err
+                if pick_code(raw) or rc is None or attempt == args.retries:
+                    break
+                ctx = CTX_RE.search(err)
+                if ctx:
+                    # the model's window can't hold kilo's default output budget:
+                    # ask again with what is left after the prompt
+                    context, used = int(ctx.group(1)), int(ctx.group(2))
+                    env["KILO_CONFIG_CONTENT"] = with_output_limit(
+                        model, context, max(1024, context - used - CTX_MARGIN))
+                    lines.append(f"  retry {attempt}: context {context}, output limit "
+                                 f"{context - used - CTX_MARGIN}")
+                    continue
+                if not RETRY_RE.search(err):
+                    break
+                wait = min(30 * attempt, 300)
+                lines.append(f"  retry {attempt}: {tail(err, 1)[:120]} — wait {wait}s")
+                time.sleep(wait)
             took = time.time() - start
-            raw = ANSI_RE.sub("", out)
+            spent[model] = (spend["in"], spend["out"], price_of(model, spend))
             if args.keep:
                 os.makedirs("py_model_test_out", exist_ok=True)
                 safe = model.replace("/", "_").replace(":", "_")
@@ -701,9 +799,15 @@ def main() -> int:
             results.sort(key=lambda r: order.get(r[0], 0))
 
     print()
-    print("model".ljust(44), "score", " time", " reason")
+    print("model".ljust(44), "score", " time", "   in_tok", " out_tok", "      usd", " reason")
+    total = 0.0
     for model, score, took, why in results:
-        print(model.ljust(44), score.ljust(5), f"{took:4.0f}s", "", why)
+        tin, tout, usd = spent.get(model, (0, 0, 0.0))
+        total += usd
+        print(model.ljust(44), score.ljust(5), f"{took:4.0f}s", f"{tin:>8}", f"{tout:>8}",
+              f"{usd:>9.4f}", "", why)
+    if spent:
+        print(f"\ntotal spent: ${total:.4f}")
     return 0 if all(s not in ("-", "crash") for _, s, _, _ in results) else 1
 
 
