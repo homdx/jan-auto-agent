@@ -49,14 +49,14 @@ _BUDGETS = (200, 400, 600, 900, 1200, 1717, 3000)
 
 
 @pytest.fixture(scope="module")
-def live_model() -> CollectModel:
+def live_model(live_collect_model) -> CollectModel:
     """This repo's graph and test map, built from the source the way the
     producer builds them."""
     modules = scanner_mod.scan_repo(REPO_ROOT)
     edges = graph_mod.import_edges(modules)
     reverse = graph_mod.imported_by(edges)
     tmap = test_map_mod.build_test_map(REPO_ROOT, modules)
-    return CollectModel(
+    return live_collect_model(
         status=STATUS_FRESH,
         modules=tuple(modules),
         import_edges={k: tuple(sorted(v)) for k, v in edges.items()},

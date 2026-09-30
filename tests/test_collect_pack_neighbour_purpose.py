@@ -882,7 +882,7 @@ def test_a_collected_repo_gains_the_row_when_summaries_are_present(collected_rep
 
 
 @pytest.fixture(scope="module")
-def live_model() -> CollectModel:
+def live_model(live_collect_model) -> CollectModel:
     """This repo's graph and test map, built straight from the source tree.
 
     `.collect/` is gitignored and rebuilt per machine, so loading the artifact
@@ -895,7 +895,7 @@ def live_model() -> CollectModel:
     edges = build_edges(modules)
     reverse = reverse_index(edges)
     tmap = build_test_map(REPO_ROOT, modules)
-    return CollectModel(
+    return live_collect_model(
         status=STATUS_FRESH,
         modules=tuple(modules),
         import_edges={key: tuple(sorted(value)) for key, value in edges.items()},

@@ -339,6 +339,45 @@ def _cached_repo_defined_names(modules, root):
 _gates._repo_defined_names = _cached_repo_defined_names
 
 
+# ── 1d. A live CollectModel answers from indexes built once ───────────────────
+#
+# `CollectModel` rebuilds `_modules_by_path()` / `_test_paths()` on every query
+# on purpose (loader.py: a frozen dataclass kept free of a mutable cache). That
+# costs nothing in a round and dominates a sweep: the live-tree tests render
+# every module of this repo at up to seven budgets, ~10^5 queries over one
+# model, and spent ~40 % of their time rebuilding those two indexes. A fixture
+# that builds such a model once and never changes it takes its class from
+# `live_collect_model`: the same fields and the same answers, the two indexes
+# kept per instance -- outside it, so `vars(model)` is still exactly the
+# dataclass's fields (a test spreads it into a new model).
+_live_indexes: dict = {}
+
+
+@pytest.fixture(scope="session")
+def live_collect_model():
+    """The `CollectModel` class for a model of this tree that is never changed."""
+    import weakref
+    from tools.collect.loader import CollectModel
+
+    class LiveCollectModel(CollectModel):
+        def _live_index(self, name, build):
+            slot = _live_indexes.get(id(self))
+            if slot is None:
+                slot = _live_indexes[id(self)] = {}
+                weakref.finalize(self, _live_indexes.pop, id(self), None)
+            if name not in slot:
+                slot[name] = build()
+            return slot[name]
+
+        def _modules_by_path(self):
+            return self._live_index("modules_by_path", super()._modules_by_path)
+
+        def _test_paths(self):
+            return self._live_index("test_paths", super()._test_paths)
+
+    return LiveCollectModel
+
+
 # ── 2a. Custom collector ───────────────────────────────────────────────────────
 
 def _is_script_test(p: Path) -> bool:
