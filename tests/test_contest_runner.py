@@ -6736,7 +6736,13 @@ def test_kilo_silent_stays_quiet_while_the_log_grows(tmp_path, caplog):
     """KC-81: the same still events, but kilo-serve.log keeps growing — the
     server is fine, so no warning."""
     caplog.set_level(logging.WARNING, logger=LOGGER)
-    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path)
+    # A 2 s window, not 0.3 s: under a loaded box (three `pytest -n 8` runs of
+    # tests/) the writer thread below was starved past 0.3 s, the log read as
+    # still for one tick and the check warned ("kilo serve silent 0s"). The
+    # agent has no events.jsonl, so it reads idle since the round started
+    # (30 s ago) — the growing log is the only thing that keeps it quiet.
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(
+        tmp_path, silent_sec=2.0)
     stop = threading.Event()
 
     def grow():
@@ -6749,7 +6755,7 @@ def test_kilo_silent_stays_quiet_while_the_log_grows(tmp_path, caplog):
     writer.start()
     try:
         hb.start()
-        time.sleep(1.0)  # several silent-window multiples
+        time.sleep(3.0)  # past the 2 s window: a still log would warn
         hb.stop()
     finally:
         stop.set()
