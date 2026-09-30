@@ -15,6 +15,7 @@ All paths are from the repo root. `python` is not on PATH — use `python3`.
 
 | # | stage | who | command | you take away |
 |---|---|---|---|---|
+| D | **draft** | a draft model + a review model | `python3 -m tools.contest draft --target REPO "brief"` | `epic-tasks/NN-<slug>.md`, committed |
 | R | **reset** | you, per round | `scripts/contest_reset.sh NN [base_ref]` | one checkout per agent at the base |
 | RUN | **run** | the runner, N models | `python3 -m tools.contest run --ticket NN` | `contest-out/NN/`: one patch per agent, `entrants.json`, `SUMMARY.md` |
 | — | *watch* | you, mid-round | `python3 -m tools.contest status --ticket NN` | the same table, off `state.json` — touches nothing |
@@ -39,6 +40,7 @@ round N, the way `RUN-THE-EPIC-COMPETITION.md` says it must.
 |---|---|---|
 | the roster | `contest.ini` (committed) | the limits, one `[contest.agent.<name>]` per competing model, and the gate's profile name — no keys |
 | the gate's key | `contest.local.ini` next to it (git-ignored) | `[contest_gate_llm] api_key`. The committed file carries `${CONTEST_GATE_API_KEY}` and the `some/model` placeholder; without the local file the gate fails closed, per ask |
+| the drafter's key | `contest.local.ini` | `[contest_draft_llm] base_url / api_key / model` for `contest draft`. It must be a **different model (another account) from `[contest_gate_llm]`**: the gate reviews the draft, and a model reviewing its own draft passes its own mistakes |
 | the Kilo extension | `kilo_bin = auto` | the newest VS Code extension copy; the contest spawns its own `kilo serve` and never touches the extension's own |
 | the model ids | `kilo models` | one `providerID/modelID` line per model. The roster's `model =` is exactly that string, split at the FIRST `/` — `kilo/~anthropic/x` is provider `kilo`, not `~anthropic` |
 
@@ -48,6 +50,63 @@ there, is refused with the id to use — before any worktree is built. A model
 the provider serves but Kilo's list lacks is not a failure: `--register-missing`
 adds it for the round alone through `KILO_CONFIG_CONTENT` (KC-35) and says so
 in the plan.
+
+---
+
+## Stage D — draft the ticket
+
+Auto mode writes the ticket; nobody edits it by hand. A ticket the round
+cannot use is a bug in the drafter, fixed there, and the ticket redrafted.
+
+```bash
+python3 -m tools.contest draft --target . "add tests/test_auto_delta_validator.py covering DeltaValidator"
+```
+
+What it does, in order:
+
+1. `--collect` Pass A over `--target` — the MODULE / TEST / RISK maps, each
+   cut to `[contest] draft_map_budget` characters. A file the brief names is
+   given whole, never cut; a cut says the rest was not seen.
+2. The repo's own `AGENTS.md` goes into the prompt, so Acceptance and Rules
+   use the repo's own commands (tiers, smoke gate, hooks).
+3. One call to `[contest] draft_llm_profile` (`[contest_draft_llm]`), the
+   lint, one rework on lint errors.
+4. The review by `[contest] gate_llm_profile` (`[contest_gate_llm]`): one
+   round of problems at a time, at most `draft_review_rounds` (3) rounds.
+5. The ticket is committed in `--target` as `epic-tasks/NN-<slug>.md`, with
+   `--round NN` or the next free number.
+
+**Two accounts, two models.** Both profiles live in the git-ignored
+`contest.local.ini`, never in `contest.ini` (that one carries only
+`${CONTEST_DRAFT_API_KEY}` / `${CONTEST_GATE_API_KEY}`):
+
+```ini
+[contest_draft_llm]
+base_url = https://<provider A>/v1
+api_key  = <key of account A>
+model    = <model A>
+
+[contest_gate_llm]
+base_url = https://<provider B>/v1
+api_key  = <key of account B>
+model    = <model B>      ; not model A
+```
+
+The same model in both sections is a self-review and is not allowed.
+`--no-review` skips step 4 and says so on stderr; use it only to debug the
+drafter.
+
+**The size decides the legs.** The draft writes `**Size:** XS|S|M|L`. `run`
+reads it: `[contest] legs_by_size` (default `L=3`, the rest 1) gives the
+number of legs when no `--legs` is passed — see *`--legs N`* under Stage RUN.
+An L ticket that comes out to one leg is refused unless `--legs 1` says so.
+
+`--run` starts the round right after the commit with the run flags given to
+`draft` (`--max-parallel`, `--legs`, `--fresh`, …). Without it, go to Stage R.
+
+For a task on another repository, or a task split into several tickets that
+run one after another (ticket 01 → winner lands → ticket 02 on top), see
+`2legs/MULTI-LEG-RUNBOOK.md`.
 
 ---
 
