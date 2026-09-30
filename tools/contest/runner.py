@@ -6318,7 +6318,10 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
                            neighbour_warn=int(getattr(config, "neighbour_kilo_warn", 4) or 0),
                            # KC-81: `getattr` so a config written before the key
                            # degrades to "check off", never a raise into a round.
-                           kilo_silent_sec=float(getattr(config, "kilo_silent_sec", 0) or 0),
+                           # An OpenRouter round has no `kilo serve` to hang.
+                           kilo_silent_sec=(float(getattr(config, "kilo_silent_sec", 0) or 0)
+                                            if getattr(config, "backend", "kilo") == "kilo"
+                                            else 0.0),
                            log_path=log_path,
                            events_root=str(out_dir),
                            save=save)
@@ -6438,6 +6441,13 @@ def _proc_cpu_ticks(pid: int, proc_root: str = "/proc") -> int | None:
         return int(fields[11]) + int(fields[12])
     except (OSError, ValueError, IndexError):
         return None
+
+
+#: KC-81: the states of an agent with a turn in flight — the ones waiting on
+#: `kilo serve` for their next event. HARVESTING is not among them: the session
+#: is over and the work is pytest in the worktree, so a quiet server then is
+#: idle by design. (From round 128's sensenova-6-7-flash-lite-var1.)
+_EVENT_WANTED = (AgentState.PROMPTED, AgentState.WAITING, AgentState.REWORK)
 
 
 class _Heartbeat:
@@ -6661,12 +6671,22 @@ class _Heartbeat:
     def _server_silent_note(self, cpu: str) -> str | None:
         """KC-81: the one WARNING line of a silent spell, or None.
 
-        Silent means *both* hold for `kilo_silent_sec`: no live agent has had
-        an event, and `kilo-serve.log` (when the round started a server) has
-        not grown. Either side moving ends the spell and re-arms the warning;
-        the next spell warns again. `kilo_silent_sec <= 0` or no event data
-        is the check off — never a raise into a round, never a kill, never an
-        abort of a session: the agents' own stall edge is untouched.
+        Silent means *both* hold for `kilo_silent_sec`: no agent waiting on the
+        server has had an event, and `kilo-serve.log` (when the round started a
+        server) has not grown. Either side moving ends the spell and re-arms the
+        warning; the next spell warns again and replaces `server_silent`. `kilo_silent_sec <= 0` or no event data is the check off — never
+        a raise into a round, never a kill, never an abort of a session: the
+        agents' own stall edge is untouched.
+
+        Only an agent with a turn in flight is waiting on the server
+        (`_EVENT_WANTED`). A round whose live agents are all HARVESTING runs
+        pytest in the worktrees with no session speaking, so a quiet server
+        there is idle by design, not hung, and the check says nothing.
+
+        The line and `server_silent` carry how long the server has actually
+        been silent — the newer of the last event and the log's last change —
+        not the window, so a spell that has run for an hour reads `1h`-ish,
+        not `10m` forever.
         """
         try:
             window = float(self.kilo_silent_sec or 0)
@@ -6674,18 +6694,19 @@ class _Heartbeat:
             return None
         if window <= 0 or not self.events_root:
             return None
-        live = [run for run in self.state.agents if not run.terminal]
-        if not live:
-            self._silent_warned = False
-            return None
+        waiting = [run for run in self.state.agents
+                   if not run.terminal and run.state in _EVENT_WANTED]
+        if not waiting:
+            return self._end_spell()
         wall = time.time()
         # The log is checked only when the events have gone quiet; one quiet
         # agent among busy ones is the stall logic's business, not this one.
-        for run in live:
+        silent_for = None
+        for run in waiting:
             idle = self._event_idle(run, wall)
             if idle is None or idle < window:
-                self._silent_warned = False
-                return None
+                return self._end_spell()
+            silent_for = idle if silent_for is None else min(silent_for, idle)
         log_note = "log ?"
         if self.log_path:
             try:
@@ -6697,34 +6718,45 @@ class _Heartbeat:
                     self._log_size = st.st_size
                 elif st.st_size != self._log_size:
                     self._log_size = st.st_size
-                    self._silent_warned = False
-                    return None
+                    return self._end_spell()
                 when = time.strftime("%H:%M:%S", time.localtime(st.st_mtime))
                 log_note = f"log idle since {when}"
                 if wall - st.st_mtime < window:
-                    self._silent_warned = False
-                    return None
+                    return self._end_spell()
+                silent_for = min(silent_for, wall - st.st_mtime)
         if self._silent_warned:
             return None
         self._silent_warned = True
         pid = self.server_pid
         pid_note = f"pid {pid}" if pid else "pid ?"
         kill_pid = str(pid) if pid else "<pid>"
-        count = len(live)
+        count = len(waiting)
         plural = "agent" if count == 1 else "agents"
         note = (
-            f"kilo serve silent {_age(window)}: {pid_note}, cpu {cpu}, {log_note}, "
+            f"kilo serve silent {_age(silent_for)}: {pid_note}, cpu {cpu}, {log_note}, "
             f"{count} live {plural} without an event — the server looks hung; "
             f"stop it (kill {kill_pid}, kill -9 if it stays) and restart the round "
             f"with --fresh"
         )
-        self.state.server_silent = {"seconds": window, "pid": pid}
+        self.state.server_silent = {"seconds": int(silent_for), "pid": pid}
+        self._save_state()
+        return note
+
+    def _end_spell(self) -> None:
+        """KC-81: something moved (or nobody is waiting): re-arm the warning.
+
+        `server_silent` stays on the state as the record of the last spell, so
+        `contest status` still shows it after the round; the next spell's
+        warning replaces it."""
+        self._silent_warned = False
+        return None
+
+    def _save_state(self) -> None:
         if self.save is not None:
             try:
                 self.save()
             except Exception:  # noqa: BLE001 — a failed save is not a round failure
                 _log.debug("server_silent: state save failed", exc_info=True)
-        return note
 
     def _loop(self) -> None:
         while not self._stop.wait(self.every):

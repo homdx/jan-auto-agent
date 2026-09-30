@@ -28,6 +28,7 @@ import configparser
 import json
 import logging
 import os
+import re
 import select
 import signal
 import subprocess
@@ -6689,13 +6690,15 @@ def test_kilo_silent_warns_once_when_events_and_log_are_still(tmp_path, caplog):
     assert f"log idle since {idle_since}" in note, note
     assert "1 live agent without an event" in note, note
     assert "the server looks hung" in note and "--fresh" in note, note
-    # state.json has server_silent: the seconds and the pid
+    # state.json has server_silent: the seconds the server has actually been
+    # silent (whole seconds, at least the window) and the pid
     data = json.loads((sb.out_dir / "state.json").read_text(encoding="utf-8"))
-    assert data.get("server_silent") == {"seconds": hb.kilo_silent_sec,
-                                         "pid": os.getpid()}, data
+    silent = data.get("server_silent")
+    assert silent and silent["pid"] == os.getpid(), data
+    assert isinstance(silent["seconds"], int), silent
+    assert silent["seconds"] >= int(hb.kilo_silent_sec), silent
     # reloaded round state keeps the key for `contest status`
-    assert RoundState.from_dict(data).server_silent == {"seconds": hb.kilo_silent_sec,
-                                                        "pid": os.getpid()}
+    assert RoundState.from_dict(data).server_silent == silent
     # the check never aborts: there is nothing here that could, and the state
     # is still PROMPTED — no terminal state was forced on any session
     assert all(r.state is AgentState.PROMPTED for r in state.agents)
@@ -6781,7 +6784,11 @@ def test_kilo_silent_warns_again_after_a_second_spell(tmp_path, caplog):
         _runner_module._worktree_files, _runner_module._commits_above = restore
     warns = _silent_warnings(caplog)
     assert len(warns) == 2, warns
-    assert warns[0] == warns[1]
+    # the same server, the same log; only how long it was silent and the cpu of
+    # that interval differ between the two spells
+    def shape(w):
+        return re.sub(r"cpu \S+,", "cpu N,", re.sub(r"silent \S+:", "silent N:", w))
+    assert shape(warns[0]) == shape(warns[1]), warns
 
 
 def test_kilo_silent_zero_never_warns(tmp_path, caplog):
@@ -6866,6 +6873,85 @@ def test_the_round_state_round_trips_server_silent():
     stale = {"round_no": 1, "ticket": "t.md", "base_sha": "0" * 40, "started_at": 1.0,
              "agents": []}
     assert RoundState.from_dict(stale).server_silent is None
+
+
+
+def test_kilo_silent_is_quiet_while_every_live_agent_harvests(tmp_path, caplog):
+    """KC-81: live agents all in HARVESTING run pytest with no session speaking —
+    a quiet server then is idle by design, and the check says nothing."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path)
+    for run in state.agents:
+        run.state = AgentState.HARVESTING
+    try:
+        hb.start()
+        time.sleep(1.0)
+        hb.stop()
+    finally:
+        _runner_module._worktree_files, _runner_module._commits_above = restore
+    assert not _silent_warnings(caplog), caplog.text
+    assert state.server_silent is None
+
+
+def test_kilo_silent_line_and_state_carry_how_long_it_has_been_silent(tmp_path, caplog):
+    """KC-81: the line and `server_silent.seconds` are the real silence — here
+    the log went still 40 s ago and no event ever came — not the window."""
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path)
+    past = time.time() - 40
+    os.utime(log_file, (past, past))
+    try:
+        hb.start()
+        assert _wait_for(lambda: _silent_warnings(caplog), timeout=4.0), caplog.text
+        hb.stop()
+    finally:
+        _runner_module._worktree_files, _runner_module._commits_above = restore
+    note = _silent_warnings(caplog)[0]
+    assert re.search(r"kilo serve silent (29|3\d|4\d)s:", note), note
+    assert 29 <= state.server_silent["seconds"] <= 50, state.server_silent
+
+
+def test_kilo_silent_is_off_on_an_openrouter_round(tmp_path, monkeypatch):
+    """KC-81: an OpenRouter round has no `kilo serve` to hang — the heartbeat is
+    built with the check off whatever the roster says."""
+    seen: dict = {}
+    real = _runner_module._Heartbeat
+
+    def capture(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_runner_module, "_Heartbeat", capture)
+    sb = Sandbox(tmp_path)
+    for backend, want in (("openrouter", 0.0), ("kilo", 600.0)):
+        seen.clear()
+        cfg = replace(make_config([]), backend=backend, kilo_silent_sec=600.0)
+        run_round(cfg, ROUND, sb.ticket_path, [], make_backend=lambda ws: None,
+                  out_dir=sb.out_dir)
+        assert seen["kilo_silent_sec"] == want, (backend, seen)
+
+
+
+def test_contest_status_names_a_silent_spell(tmp_path):
+    """KC-81: `contest status` prints one line under the table when state.json
+    carries `server_silent`, and none when it does not."""
+    state = RoundState(round_no=ROUND, ticket=TICKET, base_sha="0" * 40,
+                       started_at=1.0, agents=[])
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def status() -> str:
+        r = subprocess.run([sys.executable, "-m", "tools.contest", "status",
+                            "--ticket", str(ROUND), "--out", str(out)],
+                           cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        return r.stdout
+
+    _write(out / "state.json", json.dumps(state.to_dict()))
+    assert "kilo serve silent" not in status()
+    state.server_silent = {"seconds": 612, "pid": 1866424}
+    _write(out / "state.json", json.dumps(state.to_dict()))
+    assert "kilo serve silent 10m: pid 1866424" in status()
 
 
 def test_parts_say_working_sees_a_running_bash_and_a_recent_edit():

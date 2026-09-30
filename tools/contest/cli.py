@@ -99,6 +99,7 @@ from tools.contest.roster import (
 )
 from tools.contest.runner import (
     WORKERS_FILE,
+    _age,
     RELAY_STATES,
     AgentState,
     RoundState,
@@ -2688,6 +2689,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     where it is the whole round — the same table `SUMMARY.md` carries, so the two
     cannot disagree about who ended how.
 
+    KC-81 adds one line, not a table row, when `state.json` carries
+    `server_silent` — the spell the heartbeat named and its pid — so a hung
+    server is visible without the round's log. `SUMMARY.md` has no such line, so
+    the two still agree on the table.
+
     `--out` names the round's folder outright; without it the default
     `<out_dir>/<NN>` is derived from the roster exactly as `run` does. Exit 1 with
     one line when there is no `state.json` to read: a round that never started has
@@ -2714,6 +2720,17 @@ def cmd_status(args: argparse.Namespace) -> int:
         return EXIT_FAILED
     for line in export.render_table(state, export.round_patches(out_dir, state)):
         print(line)
+    # KC-81: the heartbeat's silent-spell record, so a hung server shows up here
+    # without opening the round's log. One line, not a table row — SUMMARY.md has
+    # no line for it either, and `state.json` is the only source.
+    silent = state.server_silent
+    if isinstance(silent, dict):
+        try:
+            age = _age(float(silent.get("seconds")))
+        except (TypeError, ValueError):
+            age = "?"
+        print(f"kilo serve silent {age}: pid {silent.get('pid') or '?'} — the heartbeat "
+              f"saw no event and a log that had not grown; the server may be hung")
     return EXIT_OK
 
 
