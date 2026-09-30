@@ -603,7 +603,8 @@ def test_a_bad_review_rounds_keeps_the_default(collected):
                                     review_call=lambda p: REFUSALS[0],
                                     config=ContestConfig(draft_review_rounds=-1))
     assert result.rejected is True
-    assert len(prompts) == 3, f"{draft_mod.DEFAULT_REVIEW_ROUNDS} rounds, not none"
+    assert len(prompts) == draft_mod.DEFAULT_REVIEW_ROUNDS + 1, \
+        f"{draft_mod.DEFAULT_REVIEW_ROUNDS} rounds, not none"
 
 
 def test_zero_review_rounds_still_reviews_once(collected):
@@ -944,7 +945,7 @@ def test_cmd_draft_exits_2_when_the_review_refuses(collected, tmp_path, monkeypa
         prompts.append(prompt)
         return ticket_text(severity="HIGH")
 
-    refusals = [REFUSALS[0], REFUSALS[1], _refusal(2, "the size does not fit the change")]
+    refusals = [REFUSALS[0], REFUSALS[1], REFUSALS[1], _refusal(2, "the size does not fit the change")]
     monkeypatch.setattr(draft_mod, "llm_call_for",
                         lambda settings, system=None: fake if system != draft_mod.REVIEW_SYSTEM_PROMPT
                         else (lambda p: refusals[len(prompts) - 1]))
@@ -960,7 +961,7 @@ def test_cmd_draft_exits_2_when_the_review_refuses(collected, tmp_path, monkeypa
     assert rejected.exists()
     assert _tickets(collected) == []
     assert _branch(collected) != draft_mod.LEG_BRANCH
-    assert len(prompts) == 3, "the review refused three times, the rework happened twice"
+    assert len(prompts) == 4, "the review refused four times, the rework happened three times"
 
 
 def test_cmd_draft_refuses_a_dirty_repo_before_any_llm_call(collected, tmp_path, monkeypatch, capsys):
@@ -1042,3 +1043,9 @@ def test_cmd_draft_takes_the_flag_round_when_it_is_free(collected, tmp_path, mon
     assert "run --ticket 7" in out
     assert _git_out(collected, "log", "-1", "--format=%s") == \
         "contest: ticket 07-kc-90-speed-up-a-and-b"
+
+
+def test_the_review_sends_a_draft_back_at_most_three_times_by_default():
+    """Three rework rounds by default, the committed ini says so too."""
+    assert draft_mod.DEFAULT_REVIEW_ROUNDS == 3
+    assert ContestConfig().draft_review_rounds == 3

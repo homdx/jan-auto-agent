@@ -127,9 +127,9 @@ OPEN = "open"
 DEFAULT_MAP_BUDGET = 8000
 
 #: The rework rounds the review may send a draft back for when
-#: `[contest] draft_review_rounds` is unset. 2 = one review, then at most two
+#: `[contest] draft_review_rounds` is unset. 3 = one review, then at most three
 #: rounds of problems -> rework -> lint -> review; 0 = one review, no rework.
-DEFAULT_REVIEW_ROUNDS = 2
+DEFAULT_REVIEW_ROUNDS = 3
 
 #: The branch a drafted ticket is committed to: the same branch
 #: `2legs/prepare_task.sh` commits onto, so a drafted round and a hand-made one
@@ -839,7 +839,7 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     lint's clean ticket is judged against the brief and the checklist, and a
     refusal sends the problems back to the drafter, then the lint, then the
     review again, at most *review_rounds* rounds (else
-    `[contest] draft_review_rounds`, else 2). Without it the ticket is exactly
+    `[contest] draft_review_rounds`, else 3). Without it the ticket is exactly
     KC-79's: lint and stop. *review_rounds* may also be given outright, which
     wins over the config.
 
