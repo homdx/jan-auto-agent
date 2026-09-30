@@ -67,7 +67,8 @@ os.environ.setdefault("PYTHONPYCACHEPREFIX", _PYCACHE_PREFIX)
 # up -- caching that call would silently return stale results and defeat
 # the test. So this only ever caches root == this repo's own ROOT with
 # config is None; every other call (tmp_path roots, explicit configs)
-# goes straight to the real, uncached scan_repo, unchanged.
+# goes straight to the real, uncached scan_repo (an explicit config on
+# ROOT itself reuses the default scan's per-file records, 1b-4).
 #
 # Only this test session's imported reference is wrapped -- the on-disk
 # tools/collect/scanner.py is untouched, so `collect` CLI runs are unaffected.
@@ -120,48 +121,182 @@ def _tree_fingerprint() -> str:
     return h.hexdigest()[:24]
 
 
-def _scan_repo_shared(config=None):
-    """`scan_repo(ROOT)` computed once per unchanged tree, across processes."""
+_tree_key: list = []            # the fingerprint, once per process (1b: no mid-run edits)
+_shared_values: dict = {}       # name -> what this process built or loaded
+
+
+def _shared(name: str, compute):
+    """`compute()` once per unchanged tree, across processes.
+
+    `<fingerprint>.<name>.pkl` in one temp dir per checkout, one flock per
+    name: N workers asking together build it once, and a worker loading one
+    table never queues behind another being built. A miss, a truncated
+    pickle or a cache that cannot be written is only a recompute -- the cache
+    must never fail a test -- and `compute`'s own exceptions reach the caller
+    exactly as they would without it. A pickle is code to load: a cache dir
+    another user made, or anyone may write to, is not read at all.
+    """
+    if name in _shared_values:
+        return _shared_values[name]
     import pickle
     try:
         import fcntl
-    except ImportError:                     # non-POSIX: per-process cache only
-        return _real_scan_repo(ROOT, config=config)
-    try:
         cache_dir = Path(tempfile.gettempdir()) / f"{ROOT.name}-scan-cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        target = cache_dir / f"{_tree_fingerprint()}.pkl"
-        with open(cache_dir / ".lock", "a+") as lock:
+        cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        st = cache_dir.stat()                # another user's dir in the shared /tmp
+        if st.st_uid != os.getuid() or st.st_mode & 0o002:
+            raise PermissionError(f"{cache_dir} is not this user's")
+        if not _tree_key:
+            _tree_key.append(_tree_fingerprint())
+        target = cache_dir / f"{_tree_key[0]}.{name}.pkl"
+        lock = open(cache_dir / f".{name}.lock", "a+")
+    except Exception:                       # non-POSIX / no temp dir: this process only
+        _shared_values[name] = compute()
+        return _shared_values[name]
+    with lock:                              # closing the file drops the flock
+        try:
             fcntl.flock(lock, fcntl.LOCK_EX)
+        except OSError:                     # no locks here (NFS): at worst built twice
+            pass
+        try:
+            value = pickle.loads(target.read_bytes())
+        except Exception:                   # missing / truncated / stale class
+            value = compute()
             try:
-                try:
-                    return pickle.loads(target.read_bytes())
-                except Exception:           # missing / truncated / stale class
-                    pass
-                result = _real_scan_repo(ROOT, config=config)
                 tmp = target.with_suffix(f".{os.getpid()}.tmp")
-                tmp.write_bytes(pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+                tmp.write_bytes(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
                 os.replace(tmp, target)
-                for old in sorted(cache_dir.glob("*.pkl"),
-                                  key=lambda q: q.stat().st_mtime, reverse=True)[3:]:
-                    old.unlink(missing_ok=True)
-                return result
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
-    except Exception:                       # the cache must never fail a test
-        return _real_scan_repo(ROOT, config=config)
+                _prune_shared(cache_dir)
+            except Exception:
+                pass
+    _shared_values[name] = value
+    return value
+
+
+def _prune_shared(cache_dir: Path, keep: int = 3) -> None:
+    """Every table of all but the `keep` newest trees goes."""
+    newest: dict = {}
+    for f in cache_dir.glob("*.pkl"):
+        key = f.name.split(".", 1)[0]
+        newest[key] = max(newest.get(key, 0.0), f.stat().st_mtime)
+    for key in sorted(newest, key=newest.get, reverse=True)[keep:]:
+        for f in cache_dir.glob(f"{key}.*"):
+            f.unlink(missing_ok=True)
+
+
+def _scan_repo_shared(config=None):
+    """`scan_repo(ROOT)` computed once per unchanged tree, across processes."""
+    return _shared("scan_repo", lambda: _real_scan_repo(ROOT, config=config))
 
 
 def _cached_scan_repo(root, *, config=None):
     resolved = Path(root).resolve()
-    if config is not None or resolved != ROOT:
+    if resolved != ROOT:
         return _real_scan_repo(root, config=config)
+    if config is not None:
+        return _scan_root_with_config(root, config)
     if resolved not in _repo_scan_cache:
         _repo_scan_cache[resolved] = _scan_repo_shared(config=config)
     return _repo_scan_cache[resolved]
 
 
+# ── 1b-4. ...and a config scan of this tree reuses the default scan's files ───
+#
+# A scan of ROOT with an explicit config (test_collect_config_languages reads
+# the shipped agents.ini) walks its own file set -- the config's languages and
+# limits decide which files -- but every Python file it shares with the
+# default scan gets the same record: `scan_module(source, path)` is a pure
+# function of the file's text and path, and the text is the tree 1b pins. So
+# for the length of that one scan `scan_module` answers those files from the
+# default scan and parses only the rest -- the one uncached ~7 s scan of the
+# suite (~20 s under `-n 8`) down to the handful of files the default scan
+# does not have. The walk, the language filters and every record the config
+# scan adds or drops are still the real scan_repo's. A test that patches
+# `scan_module` itself replaces this for its own duration.
+_real_scan_module = _scanner.scan_module
+_module_seed: dict = {}
+
+
+def _seeded_scan_module(source, module_path):
+    record = _module_seed.get(module_path)
+    return record if record is not None else _real_scan_module(source, module_path)
+
+
+def _scan_root_with_config(root, config):
+    from tools.collect.lang import Language
+
+    _module_seed.update((m.path, m) for m in _cached_scan_repo(ROOT)
+                        if m.language == Language.PYTHON)
+    try:
+        return _real_scan_repo(root, config=config)
+    finally:
+        _module_seed.clear()
+
+
 _scanner.scan_repo = _cached_scan_repo
+_scanner.scan_module = _seeded_scan_module
+
+
+# ── 1b-3. ...and the tables the live-tree tests derive from that scan ─────────
+#
+# The scan is not the only answer this suite rebuilds from scratch file after
+# file: nine files' live fixtures build `build_test_map(ROOT, scan)`, five
+# build `build_fail_open_registry(scan, root=ROOT)`, and every in-process
+# `main.main()` with a config re-parses tools/ for its typed-config call sites
+# (`_scan_typed_config_call_sites`, 33 times a full run) -- 0.5-1 s each on a
+# quiet core, two to three times that under `-n 8`, the same answer every
+# time. They go through 1b-2's per-tree pickle: one worker builds, the rest
+# load. Scoped like 1b: only ROOT, only the session's own scan list (checked
+# by identity -- a filtered or rebuilt list is another question and goes to
+# the real function), and every caller gets its own copy of the container.
+from tools.collect import registries as _registries
+from tools.collect import test_map as _test_map
+
+_real_build_test_map = _test_map.build_test_map
+_real_build_fail_open_registry = _registries.build_fail_open_registry
+
+
+def _is_the_live_scan(root, modules) -> bool:
+    return (root is not None and modules is not None
+            and modules is _repo_scan_cache.get(ROOT)
+            and Path(root).resolve() == ROOT)
+
+
+def _cached_build_test_map(root, modules):
+    if not _is_the_live_scan(root, modules):
+        return _real_build_test_map(root, modules)
+    return dict(_shared("build_test_map", lambda: _real_build_test_map(root, modules)))
+
+
+def _cached_build_fail_open_registry(modules, root=None):
+    if not _is_the_live_scan(root, modules):
+        return _real_build_fail_open_registry(modules, root=root)
+    return list(_shared("build_fail_open_registry",
+                        lambda: _real_build_fail_open_registry(modules, root=root)))
+
+
+_test_map.build_test_map = _cached_build_test_map
+_registries.build_fail_open_registry = _cached_build_fail_open_registry
+
+
+def pytest_collection_modifyitems(session, config, items):
+    """1b-3's third table. `main.py` is this repo's entry point, not a package
+    module, so its call-site scan is wrapped once the tests that import it
+    are collected; a run that never imports it has nothing to wrap."""
+    main = sys.modules.get("main")
+    real = getattr(main, "_scan_typed_config_call_sites", None)
+    if real is None or getattr(real, "_shared_on_root", False):
+        return
+    if Path(getattr(main, "__file__", "") or "").resolve() != ROOT / "main.py":
+        return
+
+    def _cached_typed_config_call_sites(repo_root):
+        if Path(repo_root).resolve() != ROOT:
+            return real(repo_root)
+        return list(_shared("typed_config_call_sites", lambda: real(repo_root)))
+
+    _cached_typed_config_call_sites._shared_on_root = True
+    main._scan_typed_config_call_sites = _cached_typed_config_call_sites
 
 
 # ── 1c. Cache gates._repo_defined_names(modules, ROOT) across the session ──────
