@@ -212,6 +212,16 @@ def test_an_acceptance_without_a_command_yields_one_problem(collected):
     assert "Acceptance" in problems[0]
 
 
+def test_an_indented_acceptance_command_is_a_code_block(collected):
+    """The KC tickets' own style — a 4-space indented command — is a code
+    block too; an indented list item is not."""
+    artifact = draft_mod.load_artifact(collected / draft_mod.COLLECT_DIR)
+    assert lint_of(ticket_text(acceptance="    python3 -m pytest tests -q"),
+                   artifact, collected) == []
+    problems = lint_of(ticket_text(acceptance="    - check it by eye"), artifact, collected)
+    assert len(problems) == 1 and "Acceptance" in problems[0]
+
+
 def test_a_taken_round_yields_one_problem(collected):
     (collected / draft_mod.TASKS_DIR / "01-taken.md").write_text("# KC-1 — taken\n")
     artifact = draft_mod.load_artifact(collected / draft_mod.COLLECT_DIR)

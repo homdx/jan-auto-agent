@@ -297,12 +297,26 @@ def _section(text: str, name: str) -> Optional[str]:
 
 
 def _has_command(body: str) -> bool:
-    """Whether *body* holds a fenced code block with a line in it."""
+    """Whether *body* holds a code block with a line in it.
+
+    Markdown has two code blocks: the fence and the 4-space (or tab) indent.
+    The indent is the KC tickets' own house style — KC-79's `## Acceptance`
+    is one — so a draft written the way its own ticket is must not be
+    refused. An indented line counts only outside a fence and when it is not
+    a list item's continuation (a `-`/`*`/`1.` marker after the indent).
+    """
     for block in _FENCE_RE.findall(body or ""):
         for line in block.splitlines():
             stripped = line.strip()
             if stripped and not stripped.startswith("#"):
                 return True
+    for line in _FENCE_RE.sub("", body or "").splitlines():
+        if not (line.startswith("    ") or line.startswith("\t")):
+            continue
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") \
+                and not re.match(r"(?:[-*+]|\d+[.)])\s", stripped):
+            return True
     return False
 
 
