@@ -76,13 +76,88 @@ from tools.collect import scanner as _scanner
 _real_scan_repo = _scanner.scan_repo
 _repo_scan_cache: dict = {}
 
+# ── 1b-2. ...and share that one scan between the xdist workers ────────────────
+#
+# The per-process cache above is per *process*: under `-n N` every worker
+# re-walks and re-parses the whole tree once (~9 s on a quiet core, several
+# times that on a loaded one), so a run pays N scans where it needs one --
+# and with `--dist=loadgroup` a file's tests scatter over all N workers, so
+# no worker can be spared it. The first worker to need the scan now writes it
+# to a pickle under the system temp dir and the others load it (0.04 s).
+#
+# The cache is only ever a *hit* when the scan's inputs are provably
+# unchanged, so it cannot serve a stale result (the failure mode the block
+# above warns about): the key is a fingerprint of (relpath, size, mtime_ns)
+# for every file in the tree outside .git and the caches, plus the
+# interpreter and the optional Java-parser versions, which change what
+# `scan_repo` returns. Any edit -- source or test -- is a new key and a fresh
+# scan. A flock serialises the writers so N workers starting together do one
+# scan, not N; an unreadable or truncated pickle is treated as a miss.
+_SCAN_SKIP_DIRS = frozenset({".git", "__pycache__", ".pytest_cache", "contest-out",
+                             "node_modules", ".venv", "venv"})
+
+
+def _tree_fingerprint() -> str:
+    import hashlib
+    from importlib import metadata
+
+    h = hashlib.sha256()
+    h.update(sys.version.encode())
+    for dist in ("tree-sitter", "tree-sitter-java"):
+        try:
+            h.update(f"{dist}={metadata.version(dist)}".encode())
+        except metadata.PackageNotFoundError:
+            h.update(f"{dist}=absent".encode())
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SCAN_SKIP_DIRS)
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.stat(full)          # follows the tier symlinks
+                h.update(f"{os.path.relpath(full, ROOT)}|{st.st_size}|{st.st_mtime_ns}\n".encode())
+            except OSError:
+                h.update(f"{os.path.relpath(full, ROOT)}|missing\n".encode())
+    return h.hexdigest()[:24]
+
+
+def _scan_repo_shared(config=None):
+    """`scan_repo(ROOT)` computed once per unchanged tree, across processes."""
+    import pickle
+    try:
+        import fcntl
+    except ImportError:                     # non-POSIX: per-process cache only
+        return _real_scan_repo(ROOT, config=config)
+    try:
+        cache_dir = Path(tempfile.gettempdir()) / f"{ROOT.name}-scan-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / f"{_tree_fingerprint()}.pkl"
+        with open(cache_dir / ".lock", "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                try:
+                    return pickle.loads(target.read_bytes())
+                except Exception:           # missing / truncated / stale class
+                    pass
+                result = _real_scan_repo(ROOT, config=config)
+                tmp = target.with_suffix(f".{os.getpid()}.tmp")
+                tmp.write_bytes(pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+                os.replace(tmp, target)
+                for old in sorted(cache_dir.glob("*.pkl"),
+                                  key=lambda q: q.stat().st_mtime, reverse=True)[3:]:
+                    old.unlink(missing_ok=True)
+                return result
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+    except Exception:                       # the cache must never fail a test
+        return _real_scan_repo(ROOT, config=config)
+
 
 def _cached_scan_repo(root, *, config=None):
     resolved = Path(root).resolve()
     if config is not None or resolved != ROOT:
         return _real_scan_repo(root, config=config)
     if resolved not in _repo_scan_cache:
-        _repo_scan_cache[resolved] = _real_scan_repo(root, config=config)
+        _repo_scan_cache[resolved] = _scan_repo_shared(config=config)
     return _repo_scan_cache[resolved]
 
 
@@ -237,3 +312,23 @@ class ScriptTestFailed(Exception):
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+# ── 4. `-n auto` sizes the pool for waiting, not for CPUs ──────────────────────
+#
+# pytest.ini asks for `-n auto`, which xdist resolves to the CPU count. This
+# suite is not CPU-bound: the contest tests deliberately sit out real silence
+# windows (a 3 s `idle_event_timeout_sec`, FL-1, kept wide so a loaded box does
+# not flake), and ~40 % of the wall time of a run is a process asleep. With one
+# worker per core those sleeps queue up behind each other; with more workers
+# than cores they overlap. Measured on ONE core, full suite: 580 s at -n 0 /
+# `-n auto`, 353 s at -n 6 -- no flake attributable to the load.
+#
+# The floor is 4 (the hook only affects `-n auto`; an explicit `-n N` or
+# `-n 0` is honoured exactly). JAN_TEST_WORKERS overrides it for a machine
+# that wants fewer (a shared CI runner) or more.
+def pytest_xdist_auto_num_workers(config):
+    forced = os.environ.get("JAN_TEST_WORKERS", "").strip()
+    if forced.isdigit() and int(forced) > 0:
+        return int(forced)
+    return max(4, os.cpu_count() or 1)

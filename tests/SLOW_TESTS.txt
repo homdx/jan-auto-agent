@@ -17,7 +17,11 @@
 # manifest (sync_test_tiers.py would otherwise flag them as stale: it only
 # looks for files inside tests/). Their cost is gone from both tiers, not
 # just relabelled. Timings below are pre-split and due for a re-measure.
-
+# FL-9 (test speed): seven files moved in from the smoke tier because they are
+# anything but fast -- test_contest_runner.py alone is 314 tests, ~45 of which
+# sit out a real 3 s silence window (~150 s of wall time by themselves), and
+# the two *_v2_* collect files each re-scan the repo in a module fixture.
+# The 2.0 s-per-FILE rule above was already being broken by all of them.
 test_architect_domain.py
 test_architect_resilience.py
 test_auto_1.py
@@ -30,22 +34,29 @@ test_auto_g11.py
 test_auto_g9.py
 test_auto_h1.py
 test_auto_h5_empty_response_retry.py
+test_check_test_clocks.py
 test_collect_already_safe_query.py
 test_collect_ast_symbols.py
+test_collect_block_budget_keeps_fact_rows.py
+test_collect_block_v2_preserves_pre_v2_facts.py
 test_collect_config_languages.py
 test_collect_config_reads.py
+test_collect_context_block_v2_live_facts.py
 test_collect_contracts.py
 test_collect_fail_open_registry.py
 test_collect_gates.py
-test_collect_graph_from_import_module_alias.py
 test_collect_graph.py
+test_collect_graph_from_import_module_alias.py
 test_collect_guarded_access.py
 test_collect_risk.py
 test_collect_test_map.py
 test_collect_test_map_all_roots.py
 test_collect_verifier_contradiction.py
+test_contest_cli.py
+test_contest_harvest.py
+test_contest_pytest_workers_plugin.py
+test_contest_runner.py
 test_faq_agent_validate.py
 test_gate1_presence_llm_profile.py
 test_llm_stream_response_format.py
 test_llm_stream_think_effort.py
-test_collect_block_budget_keeps_fact_rows.py
