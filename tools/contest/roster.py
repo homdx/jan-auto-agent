@@ -152,6 +152,7 @@ CONTEST_KEYS = (
     "context_limit_fallback",
     "draft_llm_profile",
     "draft_map_budget",
+    "draft_review_rounds",
 )
 
 #: Every key an agent section may carry.
@@ -504,6 +505,11 @@ class ContestConfig:
     #: KC-79: the character budget each collect map gets in the draft's prompt.
     #: A budget the operator sets, never a model window hard-coded in the code.
     draft_map_budget: int = 8000
+    #: KC-80: the rework rounds the gate model's review may send the draft back
+    #: for. 2 = one review, then at most two rounds of problems -> rework ->
+    #: lint -> review; 0 = one review with no rework at all. Read fail-open the
+    #: way the map budget is: a typo keeps the default, it does not stop a draft.
+    draft_review_rounds: int = 2
 
     def session_rules(self) -> list[dict]:
         """The rule list ``KiloClient.create_session`` sends, per session.
@@ -891,6 +897,12 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     draft_map_budget = safe_getint(parser, "contest", "draft_map_budget", fallback=8000)
     if draft_map_budget <= 0:
         draft_map_budget = 8000
+    # KC-80: 0 is a real value — one review, no rework — so only a negative
+    # count is a typo, and the typo keeps the default rather than disabling the
+    # review. `draft` never refuses a round on either number.
+    draft_review_rounds = safe_getint(parser, "contest", "draft_review_rounds", fallback=2)
+    if draft_review_rounds < 0:
+        draft_review_rounds = 2
 
     return ContestConfig(
         kilo_bin=scalar("kilo_bin", "auto"),
@@ -963,6 +975,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         draft_llm_profile=draft_profile,
         draft_settings=draft_settings,
         draft_map_budget=draft_map_budget,
+        draft_review_rounds=draft_review_rounds,
     )
 
 

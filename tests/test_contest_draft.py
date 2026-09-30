@@ -1,12 +1,15 @@
-"""tests/test_contest_draft.py — KC-79: a plain brief becomes a ticket grounded in the collect maps.
+"""tests/test_contest_draft.py — KC-79/KC-80: a brief becomes a reviewed, committed ticket.
 
 `contest draft` runs `action_collect` (Pass A only, no Pass B) over the target,
 feeds the brief plus the three maps to one LLM call, lints the reply against the
-repo and the artifact and writes `epic-tasks/<NN>-<slug>.md`. The tests use a
-fake LLM — a callable returning canned text — and a tiny repo built in
-`tmp_path` with a real `action_collect` run over it, so the artifact the lint
-reads is the collect's own, not a fixture. No test dials a provider: the roster
-ini the CLI tests load carries only stub values, and the calls are faked.
+repo and the artifact and writes `epic-tasks/<NN>-<slug>.md`. KC-80 adds the
+review — one call to the profile `[contest] gate_llm_profile` names, one round
+of problems at a time, `[contest] draft_review_rounds` of them — and the commit
+of the ticket on `contest-legs`. The tests use a fake LLM — a callable returning
+canned text — and a tiny repo built in `tmp_path` with a real `action_collect`
+run over it, so the artifact the lint reads is the collect's own, not a fixture.
+No test dials a provider: the roster ini the CLI tests load carries only stub
+values, and the calls are faked.
 """
 
 from __future__ import annotations
@@ -31,6 +34,15 @@ ACCEPTANCE = """```bash
 pytest tests -q
 ```"""
 
+#: What the reviewer says when it has nothing to object to.
+APPROVAL = '{"ok": true}'
+
+#: What the reviewer says when it disagrees, one problem per fix.
+REFUSALS = [
+    '{"ok": false, "problems": ["the ticket never mentions the tests" ]}',
+    '{"ok": false, "problems": ["the acceptance command runs nothing"]}',
+]
+
 
 @pytest.fixture(autouse=True)
 def _empty_seeds(monkeypatch):
@@ -43,6 +55,37 @@ def _empty_seeds(monkeypatch):
 
 def _git(root: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=str(root), capture_output=True, check=True, text=True)
+
+
+def _git_out(root: Path, *args: str) -> str:
+    """`git`'s stdout, for the assertions that read the branch and the commit."""
+    return subprocess.run(["git", *args], cwd=str(root), capture_output=True,
+                          check=True, text=True).stdout.strip()
+
+
+def _dirty(repo: Path) -> list:
+    return [line for line in _git_out(repo, "status", "--porcelain", "--untracked-files=no").splitlines()
+            if line]
+
+
+def _make_dirty(repo: Path, name: str = "dirty.py") -> Path:
+    """A tracked file with an uncommitted change — untracked files are not the point."""
+    path = repo / name
+    path.write_text("def dirty():\n    return 1\n")
+    _git(repo, "add", "--", name)
+    _git(repo, "commit", "-q", "-m", f"add {name}")
+    path.write_text("def dirty():\n    return 2\n")
+    return path
+
+
+def _branch(repo: Path) -> str:
+    return _git_out(repo, "rev-parse", "--abbrev-ref", "HEAD")
+
+
+def _tickets(repo: Path) -> list:
+    """The tickets in `epic-tasks/`: a `.rejected.md` is a draft, not a ticket."""
+    return [path for path in (repo / draft_mod.TASKS_DIR).glob("*.md")
+            if not path.name.endswith(draft_mod.REJECTED_SUFFIX)]
 
 
 @pytest.fixture
@@ -103,11 +146,14 @@ def lint_of(text, artifact, repo, round_no=1):
                                  tasks_dir=repo / draft_mod.TASKS_DIR, round_no=round_no)
 
 
-def _roster(tmp_path: Path, *, with_draft: bool = True, budget: int | None = None) -> Path:
-    """A contest.ini with a draft profile of stub values — nothing is ever dialed."""
+def _roster(tmp_path: Path, *, with_draft: bool = True, budget: int | None = None,
+            with_gate: bool = True) -> Path:
+    """A contest.ini with a draft and a gate profile of stub values — never dialed."""
     lines = ["[contest]"]
     if with_draft:
         lines.append("draft_llm_profile = draft_model")
+    if with_gate:
+        lines.append("gate_llm_profile = gate_model")
     if budget is not None:
         lines.append(f"draft_map_budget = {budget}")
     lines += [
@@ -116,6 +162,16 @@ def _roster(tmp_path: Path, *, with_draft: bool = True, budget: int | None = Non
         "base_url = http://127.0.0.1:1/v1",
         "api_key = unset-in-the-test",
         "model = stub/draft",
+    ]
+    if with_gate:
+        lines += [
+            "",
+            "[gate_model]",
+            "base_url = http://127.0.0.1:2/v1",
+            "api_key = unset-in-the-test",
+            "model = stub/gate",
+        ]
+    lines += [
         "",
         "[contest.agent.a]",
         "model = stub/agent-a",
@@ -125,9 +181,17 @@ def _roster(tmp_path: Path, *, with_draft: bool = True, budget: int | None = Non
     return path
 
 
-def _args(repo, *, roster, brief=BRIEF, round_no=None, out=None) -> argparse.Namespace:
-    return argparse.Namespace(target=str(repo), roster=str(roster), brief=brief,
-                              round=round_no, out=out)
+def _args(repo, *, roster, brief=BRIEF, round_no=None, out=None, no_review=False,
+          run=False, base="HEAD", models="", backend=None, legs=None,
+          no_tests=False, resume=False, no_gate=False) -> argparse.Namespace:
+    """`draft`'s namespace; the run flags are what `draft --run` would be parsed with."""
+    return argparse.Namespace(
+        cmd="draft", target=str(repo), roster=str(roster), brief=brief, round=round_no,
+        out=out, no_review=no_review, run=run, base=base, models=models, backend=backend,
+        provider=None, variant=None, register_missing=False, reprobe=False,
+        allow_unprobed=False, max_parallel=None, legs=legs, no_tests=no_tests,
+        no_gate=no_gate, resume=resume, dry_run=False, fresh=False,
+    )
 
 
 def _drafting(monkeypatch, answers) -> list:
@@ -140,6 +204,35 @@ def _drafting(monkeypatch, answers) -> list:
 
     monkeypatch.setattr(draft_mod, "llm_call_for", lambda settings: fake)
     return prompts
+
+
+def _drafting_and_review(monkeypatch, answers, review_answers, systems=None):
+    """Two callables from one patch: the drafter on the draft profile and the
+    reviewer on the profile that carries the review's own system prompt.
+    *systems* records the prompt each call was built with, when given."""
+    draft_prompts: list = []
+    review_prompts: list = []
+
+    def draft_fake(prompt: str) -> str:
+        draft_prompts.append(prompt)
+        return answers[len(draft_prompts) - 1] if len(draft_prompts) - 1 < len(answers) else answers[-1]
+
+    def review_fake(prompt: str) -> str:
+        review_prompts.append(prompt)
+        return review_answers[len(review_prompts) - 1] \
+            if len(review_prompts) - 1 < len(review_answers) else review_answers[-1]
+
+    def factory(settings, system=None):
+        if systems is not None:
+            systems.append(system)
+        return review_fake if system == draft_mod.REVIEW_SYSTEM_PROMPT else draft_fake
+
+    monkeypatch.setattr(draft_mod, "llm_call_for", factory)
+    return draft_prompts, review_prompts
+
+
+def _refusal(i: int, message: str) -> str:
+    return '{"ok": false, "problems": ["%s"]}' % message
 
 
 # ── the lint ────────────────────────────────────────────────────────────────
@@ -166,7 +259,6 @@ def test_a_file_that_names_no_path_yields_one_problem(collected):
     assert len(problems) == 1
     assert "File" in problems[0]
     assert "repo path" in problems[0]
-
 
 
 def test_a_missing_file_under_a_missing_directory_is_a_problem(collected):
@@ -249,11 +341,12 @@ def test_a_good_draft_is_written_and_lints_clean(collected):
     text = ticket_text()
     result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: text)
 
-    written = list((collected / draft_mod.TASKS_DIR).glob("*.md"))
+    written = _tickets(collected)
     assert len(written) == 1
     assert written[0].name == "01-kc-90-speed-up-a-and-b.md"
     assert written[0].read_text(encoding="utf-8") == text
-    assert result == draft_mod.DraftResult(path=written[0], rejected=False, problems=())
+    assert result == draft_mod.DraftResult(path=written[0], rejected=False, problems=(),
+                                           number=1)
     artifact = draft_mod.load_artifact(collected / draft_mod.COLLECT_DIR)
     # the same lint now reports the number as taken: the ticket just claimed it
     again = lint_of(written[0].read_text(encoding="utf-8"), artifact, collected)
@@ -384,19 +477,428 @@ def test_the_slug_comes_from_the_title(collected):
     assert draft_mod.slug_for("A plain brief becomes a ticket") == "a-plain-brief-becomes-a-ticket"
 
 
+# ── the review ──────────────────────────────────────────────────────────────
+
+
+def test_a_review_prompt_carries_the_ticket_and_the_checklist(collected):
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return APPROVAL
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(),
+                                    review_call=fake)
+    assert result.rejected is False and result.path is not None
+    prompt = prompts[0]
+    assert ticket_text() in prompt, "the whole ticket, not a summary of it"
+    assert BRIEF in prompt, "the brief the ticket must stay faithful to"
+    for bullet in draft_mod.REVIEW_CHECKLIST:
+        assert bullet in prompt, f"the checklist item {bullet!r} is missing"
+
+
+def test_a_review_that_agrees_is_untouched(collected):
+    """The ticket the drafter wrote is the ticket the reviewer saw, byte for byte."""
+    text = ticket_text()
+    prompts = []
+
+    def fake(prompt, *, system_prompt=None):
+        prompts.append((system_prompt, prompt))
+        return APPROVAL
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: text,
+                                    review_call=fake)
+    assert result.rejected is False and result.path.read_text(encoding="utf-8") == text
+    assert len(prompts) == 1, "one review, no rework"
+
+
+def test_a_review_round_sends_the_problems_back_to_the_drafter(collected):
+    """Not ok, then ok: the drafter saw the problems and the ticket was reworked."""
+    good = ticket_text()
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text(also="(none)", severity="HIGH") if len(prompts) == 1 else good
+
+    def reviewer(prompt):
+        return REFUSALS[0] if len(prompts) == 1 else APPROVAL
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=fake, review_call=reviewer,
+                                    review_rounds=1)
+
+    assert result.rejected is False
+    assert result.path is not None and result.path.read_text(encoding="utf-8") == good
+    assert len(prompts) == 2
+    assert "the ticket never mentions the tests" in prompts[1], "the problems go back verbatim"
+    assert "Your draft above is rejected" in prompts[1]
+    assert prompts[0] in prompts[1], "the rework keeps the first prompt"
+    assert ticket_text(also="(none)", severity="HIGH") in prompts[1], \
+        "the rework gets the draft back to rewrite"
+
+
+def test_three_refusals_exit_2_with_the_rejected_and_no_commit(collected):
+    """One review, then two rounds — the third refusal is the last word."""
+    refusals = [REFUSALS[0], REFUSALS[1], _refusal(2, "the size does not fit the change")]
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text(also="(none)", severity="HIGH", round_no=1)
+
+    def reviewer(prompt, *, system_prompt=None):
+        return refusals[len(prompts) - 1]
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=fake, review_call=reviewer,
+                                    review_rounds=2)
+
+    assert result.rejected is True
+    assert result.path is None
+    assert result.number == 1
+    assert result.rejected_path == collected / draft_mod.TASKS_DIR / \
+        f"01-kc-90-speed-up-a-and-b{draft_mod.REJECTED_SUFFIX}"
+    assert result.rejected_path.exists()
+    assert _tickets(collected) == [], "no ticket in epic-tasks/"
+    assert _branch(collected) != draft_mod.LEG_BRANCH, "nothing was committed"
+    assert len(prompts) == 3, "one rework after every refusal but the last"
+    for message in ("the ticket never mentions the tests",
+                    "the acceptance command runs nothing"):
+        assert any(message in prompt for prompt in prompts[1:]), f"{message} never went back"
+    assert result.problems == ("the size does not fit the change",), "the last word is kept"
+
+
+def test_review_rounds_comes_from_the_config(collected):
+    """A configured round count beats the default: one review, one rework."""
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text(severity="HIGH")
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=fake,
+                                    review_call=lambda p: REFUSALS[0],
+                                    config=ContestConfig(draft_review_rounds=1))
+    assert result.rejected is True
+    assert len(prompts) == 2, "one rework, then the last word"
+
+
+def test_a_bad_review_rounds_keeps_the_default(collected):
+    """A negative count in the config is a typo, not a switch that turns the review off."""
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text(severity="HIGH")
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=fake,
+                                    review_call=lambda p: REFUSALS[0],
+                                    config=ContestConfig(draft_review_rounds=-1))
+    assert result.rejected is True
+    assert len(prompts) == 3, f"{draft_mod.DEFAULT_REVIEW_ROUNDS} rounds, not none"
+
+
+def test_zero_review_rounds_still_reviews_once(collected):
+    """0 is a real value — one review, no rework — and a refusal is a refusal."""
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text(severity="HIGH")
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=fake,
+                                    review_call=lambda p: REFUSALS[0], review_rounds=0)
+    assert result.rejected is True
+    assert len(prompts) == 1, "no rework at all"
+    assert "the ticket never mentions the tests" in result.problems[0]
+
+
+def test_a_non_json_review_reply_is_not_ok_and_keeps_the_raw_text(collected):
+    """No JSON, no verdict: the reply is the problem, and it goes back to the drafter."""
+    raw = "This looks fine to me, but I cannot be bothered to write JSON."
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text(severity="HIGH")
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=fake,
+                                    review_call=lambda p: raw, review_rounds=1)
+    assert result.rejected is True
+    assert result.problems == (raw,), "the reply is the problem, not an invention"
+    assert len(prompts) == 2
+    assert raw in prompts[1], "the reply went back as the problem to fix"
+
+
+def test_a_review_call_that_fails_is_an_empty_reply(collected):
+    """No verdict out of a dead reviewer is a refusal, not a crash."""
+    def boom(prompt):
+        raise ConnectionError("the gate is down")
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(),
+                                    review_call=boom, review_rounds=0)
+    assert result.rejected is True
+    assert result.path is None
+    assert result.problems, "an empty reply fails the review"
+
+
+def test_review_problems_are_printable_strings(collected):
+    """A `problems` field that is not a list is still usable, one entry a string."""
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(),
+                                    review_call=lambda p: '{"ok": false, "problems": "one"}',
+                                    review_rounds=0)
+    assert result.rejected is True
+    assert all(isinstance(problem, str) for problem in result.problems)
+    assert "one" in " ".join(result.problems)
+
+
+def test_review_rounds_falls_back_to_the_default_on_a_bad_number():
+    assert draft_mod._as_rounds(None) == draft_mod.DEFAULT_REVIEW_ROUNDS
+    assert draft_mod._as_rounds(3) == 3
+    assert draft_mod._as_rounds(0) == 0
+    assert draft_mod._as_rounds(-2) == draft_mod.DEFAULT_REVIEW_ROUNDS
+    assert draft_mod._as_rounds("two") == draft_mod.DEFAULT_REVIEW_ROUNDS
+    assert draft_mod._as_rounds(True) == draft_mod.DEFAULT_REVIEW_ROUNDS
+
+
+# ── the commit ──────────────────────────────────────────────────────────────
+
+
+def _seed_scripts(repo: Path) -> None:
+    """The runner's scripts already in the target, so the commit is the ticket alone."""
+    for name in draft_mod.CONTEST_SCRIPTS:
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(draft_mod.RUNNER_SCRIPTS_DIR / Path(name).name, target)
+
+
+def test_commit_ticket_lands_the_ticket_alone_on_the_leg_branch(collected):
+    """The ticket is the only path in the commit; the branch the draft left is unmoved."""
+    _seed_scripts(collected)
+    ticket = collected / draft_mod.TASKS_DIR / "01-kc-90-speed-up-a-and-b.md"
+    ticket.write_text(ticket_text())
+    origin = _branch(collected)
+
+    result = draft_mod.commit_ticket(collected, ticket)
+
+    assert result.ok and result.sha
+    assert _branch(collected) == draft_mod.LEG_BRANCH
+    assert _git_out(collected, "diff", "--name-only", "HEAD~1", "HEAD").splitlines() == \
+        [f"{draft_mod.TASKS_DIR}/01-kc-90-speed-up-a-and-b.md"]
+    assert _git_out(collected, "log", "-1", "--format=%s") == \
+        "contest: ticket 01-kc-90-speed-up-a-and-b"
+    assert _dirty(collected) == [], "nothing left unstaged"
+    assert _git_out(collected, "rev-list", "-1", "HEAD~1") == _git_out(collected, "rev-list", "-1", origin), \
+        f"{origin} did not move"
+
+
+def test_commit_ticket_copies_the_runner_scripts_when_the_target_has_none(collected):
+    for name in draft_mod.CONTEST_SCRIPTS:
+        assert not (collected / name).exists(), "the target has neither script"
+
+    ticket = collected / draft_mod.TASKS_DIR / "01-t.md"
+    ticket.write_text(ticket_text())
+    result = draft_mod.commit_ticket(collected, ticket, message="t")
+    assert result.ok
+    for name in draft_mod.CONTEST_SCRIPTS:
+        assert (collected / name).exists(), f"{name} was copied"
+    assert sorted(_git_out(collected, "diff", "--name-only", "HEAD~1", "HEAD").splitlines()) == \
+        sorted([f"{draft_mod.TASKS_DIR}/01-t.md"] + list(draft_mod.CONTEST_SCRIPTS))
+    for name in draft_mod.CONTEST_SCRIPTS:
+        assert (collected / name).read_bytes() == \
+            (draft_mod.RUNNER_SCRIPTS_DIR / Path(name).name).read_bytes()
+
+
+def test_commit_ticket_leaves_a_script_that_is_already_there(collected):
+    next_task = collected / "scripts" / "next_task.py"
+    next_task.parent.mkdir(parents=True, exist_ok=True)
+    next_task.write_text("# mine\n")
+
+    ticket = collected / draft_mod.TASKS_DIR / "01-t.md"
+    ticket.write_text(ticket_text())
+    result = draft_mod.commit_ticket(collected, ticket, message="t")
+    assert result.ok
+    assert next_task.read_text() == "# mine\n", "an existing file is not overwritten"
+    assert sorted(_git_out(collected, "diff", "--name-only", "HEAD~1", "HEAD").splitlines()) == \
+        sorted([f"{draft_mod.TASKS_DIR}/01-t.md", "scripts/append_task.py"])
+
+
+def test_commit_ticket_cannot_be_made_to_commit_out_of_tree_work(collected):
+    """`-a` is not used: work outside the ticket rides along with the branch, not the commit."""
+    ticket = collected / draft_mod.TASKS_DIR / "01-t.md"
+    ticket.write_text(ticket_text())
+    _seed_scripts(collected)
+    _make_dirty(collected, "untouched.py")
+
+    result = draft_mod.commit_ticket(collected, ticket, message="t")
+    assert result.ok is False, "the dirty repo is refused before the commit"
+    assert _dirty(collected) == ["M untouched.py"], "the dirty file is still there"
+
+
+def test_commit_ticket_refuses_a_dirty_repo_and_commits_nothing(collected):
+    dirty = _make_dirty(collected)
+    ticket = collected / draft_mod.TASKS_DIR / "01-t.md"
+    ticket.write_text(ticket_text())
+
+    result = draft_mod.commit_ticket(collected, ticket)
+    assert result.ok is False
+    assert "uncommitted changes" in result.message
+    assert dirty.name in result.message, "the operator is told which files"
+    assert _branch(collected) != draft_mod.LEG_BRANCH
+    assert dirty.read_text() == "def dirty():\n    return 2\n", "nothing touched the dirty file"
+
+
+def test_dirty_repos_are_refused_before_the_first_llm_call(collected):
+    _make_dirty(collected)
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text()
+
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=fake, commit=True)
+    assert result.rejected is True
+    assert result.path is None
+    assert prompts == [], "no LLM call at all on a dirty repo"
+    assert "uncommitted changes" in result.problems[0]
+    assert "dirty.py" in result.problems[0]
+    assert result.commit is not None and result.commit.ok is False
+    assert _branch(collected) != draft_mod.LEG_BRANCH
+
+
+def test_a_dirty_repo_is_refused_even_without_a_commit(collected):
+    """The refusal is the commit's, so it stands even when `commit=False` never would have."""
+    dirty = _make_dirty(collected)
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(),
+                                    commit=False)
+    assert result.rejected is False
+    assert result.path is not None, "no commit asked for, no refusal"
+    assert dirty.read_text() == "def dirty():\n    return 2\n"
+
+
+def test_commit_failure_keeps_the_ticket_and_says_so(collected, monkeypatch):
+    """A failed commit still leaves the ticket on disk, and says so."""
+    def refuse(repo, path, **kwargs):
+        return draft_mod.CommitResult(ok=False, message="commit failed")
+
+    monkeypatch.setattr(draft_mod, "commit_ticket", refuse)
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(),
+                                    commit=True)
+    assert result.rejected is True
+    written = _tickets(collected)
+    assert len(written) == 1 and written[0].read_text() == ticket_text(), \
+        "the ticket is still on disk"
+    assert result.path is None, "nothing is handed to the round"
+    assert result.number == 1
+    assert result.commit is not None and result.commit.ok is False
+    assert "commit failed" in result.problems[0]
+
+
 # ── the command ─────────────────────────────────────────────────────────────
 
 
-def test_cmd_draft_writes_the_ticket_and_prints_the_path(collected, tmp_path, monkeypatch, capsys):
+def test_cmd_draft_writes_reviews_and_commits_the_ticket(collected, tmp_path, monkeypatch, capsys):
     roster = _roster(tmp_path)
-    prompts = _drafting(monkeypatch, [ticket_text()])
+    systems = []
+    prompts, review_prompts = _drafting_and_review(monkeypatch, [ticket_text()], [APPROVAL], systems)
     code = contest_cli.cmd_draft(_args(collected, roster=roster))
 
     assert code == 0
-    path = capsys.readouterr().out.strip()
+    out = capsys.readouterr().out
+    path = out.split(": ", 1)[1].split(" — ", 1)[0]
     assert path.startswith(str(collected / draft_mod.TASKS_DIR))
     assert Path(path).exists()
+    assert "ticket 1 ready" in out
+    assert "python3 -m tools.contest run --ticket 1" in out
+    assert _branch(collected) == draft_mod.LEG_BRANCH
+    assert _git_out(collected, "log", "-1", "--format=%s") == \
+        "contest: ticket 01-kc-90-speed-up-a-and-b"
+    assert _dirty(collected) == []
     assert len(prompts) == 1
+    assert len(review_prompts) == 1, "one review, no rework"
+    assert systems == [draft_mod.REVIEW_SYSTEM_PROMPT, None], \
+        "the reviewer got its own prompt, the drafter the default"
+
+
+def test_cmd_draft_passes_this_commands_run_flags_to_the_round(collected, tmp_path, monkeypatch, capsys):
+    roster = _roster(tmp_path)
+    _drafting_and_review(monkeypatch, [ticket_text()], [APPROVAL])
+    called = []
+
+    def fake_run(run_args):
+        called.append(run_args)
+        return 0
+
+    monkeypatch.setattr(contest_cli, "cmd_run", fake_run)
+    args = _args(collected, roster=roster, run=True, base="HEAD~2", backend="kilo", legs=3,
+                 no_tests=True, resume=True, models="m:a")
+    code = contest_cli.cmd_draft(args)
+
+    assert code == 0
+    assert len(called) == 1
+    run_args = called[0]
+    assert run_args is not args, "the round's namespace is a copy"
+    assert run_args.cmd == "run" and run_args.ticket == 1
+    assert run_args.target == str(collected)
+    assert run_args.roster == str(roster)
+    assert run_args.out is None, "`draft`'s --out is the ticket's file, not the round's folder"
+    assert run_args.base == "HEAD~2" and run_args.backend == "kilo"
+    assert run_args.legs == 3 and run_args.no_tests is True and run_args.resume is True
+    assert run_args.models == "m:a"
+    assert args.cmd == "draft" and args.out is None, "the original namespace is untouched"
+
+
+def test_cmd_draft_no_run_stops_after_the_commit(collected, tmp_path, monkeypatch, capsys):
+    roster = _roster(tmp_path)
+    _drafting_and_review(monkeypatch, [ticket_text()], [APPROVAL])
+    monkeypatch.setattr(contest_cli, "cmd_run",
+                        lambda run_args: pytest.fail("the round runs without --run"))
+    assert contest_cli.cmd_draft(_args(collected, roster=roster)) == 0
+    assert "ticket 1 ready" in capsys.readouterr().out
+
+
+def test_cmd_draft_without_a_review_skips_it_and_says_so(collected, tmp_path, monkeypatch, capsys):
+    """`--no-review` needs no gate profile and prints that it skipped the review."""
+    roster = _roster(tmp_path, with_gate=False)
+    calls = []
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text()
+
+    def factory(settings, system=None):
+        calls.append(system)
+        return fake
+
+    monkeypatch.setattr(draft_mod, "llm_call_for", factory)
+    code = contest_cli.cmd_draft(_args(collected, roster=roster, no_review=True))
+
+    assert code == 0
+    err = capsys.readouterr().err
+    assert "the gate model's review was skipped" in err
+    assert len(prompts) == 1, "the gate model was never asked"
+    assert calls == [None], "only the draft's default prompt, never the reviewer's"
+    assert draft_mod.REVIEW_SYSTEM_PROMPT not in calls
+    assert _branch(collected) == draft_mod.LEG_BRANCH, "the ticket is still committed"
+
+
+def test_cmd_draft_refuses_without_a_gate_profile_and_names_the_key(collected, tmp_path, monkeypatch, capsys):
+    roster = _roster(tmp_path, with_gate=False)
+    called = []
+
+    def fake(settings, system=None):
+        called.append(system)
+        return lambda prompt: ticket_text()
+
+    monkeypatch.setattr(draft_mod, "llm_call_for", fake)
+    code = contest_cli.cmd_draft(_args(collected, roster=roster))
+
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "[contest] gate_llm_profile" in err
+    assert "--no-review" in err
+    assert called == [], "no LLM call at all when the review's profile is unset"
+    assert _tickets(collected) == []
 
 
 def test_cmd_draft_with_two_bad_drafts_exits_2_and_saves_the_rejected(
@@ -411,7 +913,7 @@ def test_cmd_draft_with_two_bad_drafts_exits_2_and_saves_the_rejected(
             else ticket_text(symbol="`still_not_a_symbol`")
 
     monkeypatch.setattr(draft_mod, "llm_call_for", lambda settings: fake)
-    code = contest_cli.cmd_draft(_args(collected, roster=roster, out=str(out)))
+    code = contest_cli.cmd_draft(_args(collected, roster=roster, out=str(out), no_review=True))
 
     assert code == 2
     err = capsys.readouterr().err
@@ -420,15 +922,68 @@ def test_cmd_draft_with_two_bad_drafts_exits_2_and_saves_the_rejected(
     assert not out.exists(), "the rejected draft is not a ticket"
     rejected = out.with_name(out.stem + draft_mod.REJECTED_SUFFIX)
     assert rejected.exists()
-    assert list((collected / draft_mod.TASKS_DIR).glob("*.md")) == [], "nothing in epic-tasks/"
+    assert _tickets(collected) == [], "nothing in epic-tasks/"
     assert len(prompts) == 2, "the draft is sent back exactly once"
+    assert _branch(collected) != draft_mod.LEG_BRANCH, "nothing was committed"
+
+
+def test_cmd_draft_exits_2_when_the_review_refuses(collected, tmp_path, monkeypatch, capsys):
+    roster = _roster(tmp_path)
+    prompts = []
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text(severity="HIGH")
+
+    refusals = [REFUSALS[0], REFUSALS[1], _refusal(2, "the size does not fit the change")]
+    monkeypatch.setattr(draft_mod, "llm_call_for",
+                        lambda settings, system=None: fake if system != draft_mod.REVIEW_SYSTEM_PROMPT
+                        else (lambda p: refusals[len(prompts) - 1]))
+
+    code = contest_cli.cmd_draft(_args(collected, roster=roster))
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "the size does not fit the change" in err, "the last refusal is the one printed"
+    assert "the acceptance command runs nothing" not in err
+    rejected = collected / draft_mod.TASKS_DIR / \
+        f"01-kc-90-speed-up-a-and-b{draft_mod.REJECTED_SUFFIX}"
+    assert rejected.exists()
+    assert _tickets(collected) == []
+    assert _branch(collected) != draft_mod.LEG_BRANCH
+    assert len(prompts) == 3, "the review refused three times, the rework happened twice"
+
+
+def test_cmd_draft_refuses_a_dirty_repo_before_any_llm_call(collected, tmp_path, monkeypatch, capsys):
+    """A dirty tree is refused before the first call: no draft, not even the review."""
+    roster = _roster(tmp_path)
+    _make_dirty(collected)
+    asked = []
+
+    def fake(settings, system=None):
+        def call(prompt):
+            asked.append(system)
+            return ticket_text()
+
+        return call
+
+    monkeypatch.setattr(draft_mod, "llm_call_for", fake)
+    code = contest_cli.cmd_draft(_args(collected, roster=roster))
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "uncommitted changes" in err
+    assert "dirty.py" in err
+    assert asked == [], "no model was asked"
+    assert _tickets(collected) == []
+    assert _branch(collected) != draft_mod.LEG_BRANCH
 
 
 def test_cmd_draft_without_a_profile_refuses_naming_the_key(collected, tmp_path, monkeypatch, capsys):
     roster = _roster(tmp_path, with_draft=False)
     called = []
 
-    def fake(settings):
+    def fake(settings, system=None):
         called.append(settings)
         return lambda prompt: ticket_text()
 
@@ -439,7 +994,7 @@ def test_cmd_draft_without_a_profile_refuses_naming_the_key(collected, tmp_path,
     assert code == 1
     assert "[contest] draft_llm_profile" in err
     assert called == [], "no LLM call when the profile is unset"
-    assert list((collected / draft_mod.TASKS_DIR).glob("*.md")) == []
+    assert _tickets(collected) == []
 
 
 def test_cmd_draft_refuses_a_profile_that_does_not_resolve(collected, tmp_path, capsys):
@@ -447,7 +1002,7 @@ def test_cmd_draft_refuses_a_profile_that_does_not_resolve(collected, tmp_path, 
     path.write_text("[contest]\n"
                     "draft_llm_profile = missing_section\n\n"
                     "[contest.agent.a]\nmodel = stub/agent-a\n")
-    code = contest_cli.cmd_draft(_args(collected, roster=path))
+    code = contest_cli.cmd_draft(_args(collected, roster=path, no_review=True))
     err = capsys.readouterr().err
     assert code == 1
     assert "missing_section" in err
@@ -463,15 +1018,18 @@ def test_cmd_draft_prints_the_flag_round_in_the_file_name(collected, tmp_path, m
     (collected / draft_mod.TASKS_DIR / "05-taken.md").write_text("# KC-5 — taken\n")
     roster = _roster(tmp_path)
     _drafting(monkeypatch, [ticket_text(round_no=5)])
-    code = contest_cli.cmd_draft(_args(collected, roster=roster, round_no=5))
+    code = contest_cli.cmd_draft(_args(collected, roster=roster, round_no=5, no_review=True))
     assert code == 2, "the round is taken, so the lint refuses both attempts"
     assert "05-*.md already exists" in capsys.readouterr().err
 
 
 def test_cmd_draft_takes_the_flag_round_when_it_is_free(collected, tmp_path, monkeypatch, capsys):
     roster = _roster(tmp_path)
-    _drafting(monkeypatch, [ticket_text(round_no=7)])
+    _drafting_and_review(monkeypatch, [ticket_text(round_no=7)], [APPROVAL])
     code = contest_cli.cmd_draft(_args(collected, roster=roster, round_no=7))
     assert code == 0
-    assert Path(capsys.readouterr().out.strip()).name == "07-kc-90-speed-up-a-and-b.md"
-
+    out = capsys.readouterr().out
+    assert "ticket 7 ready" in out
+    assert "run --ticket 7" in out
+    assert _git_out(collected, "log", "-1", "--format=%s") == \
+        "contest: ticket 07-kc-90-speed-up-a-and-b"

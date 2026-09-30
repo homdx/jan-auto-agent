@@ -11,15 +11,33 @@ ticket to `epic-tasks/<NN>-<slug>.md`.
 
 The brief is never rewritten into a different task: speed, coverage, docs, tests
 and bug hunt all take this one code path; what differs is only what the model
-reads in the maps. Nothing here commits, and nothing here moves a branch — KC-80
-does that.
+reads in the maps.
+
+KC-80 adds the two steps after the lint. A second model — the one
+`[contest] gate_llm_profile` names, resolved through the same
+``resolve_llm_profile`` the gate is resolved with — reads the ticket against the
+brief and a fixed checklist and answers ``{"ok": bool, "problems": [str]}``: an
+acceptance that cannot fail, a task met by deleting or skipping tests, a task too
+big for one leg, a task that is not the brief. Not ok sends the problems back to
+the drafter, then the lint, then the review again, at most
+`[contest] draft_review_rounds` such rounds. Still not ok is a refusal like a
+lint refusal — the problems printed, the last draft saved as `.rejected.md`,
+nothing committed.
+
+A ticket that is ok is committed by :func:`commit_ticket` on the branch
+`contest-legs` in the target repo: the branch is created when missing, the two
+scripts the agents' prompt runs are copied in when absent, and the commit names
+the ticket's path and the scripts' paths explicitly — never `-a`. A repo with
+uncommitted tracked changes is refused before the first LLM call, the way
+`2legs/prepare_task.sh` refuses it.
 
 :func:`lint_ticket` is the mechanical half: pure, no LLM, one string per problem.
 It is what decides between "write it" and "ask again once, then refuse".
 
-The model is the one `[contest] draft_llm_profile` names in the contest config,
+Both models are named in the contest config — the drafter by
+`[contest] draft_llm_profile` and the reviewer by `[contest] gate_llm_profile` —
 resolved through ``tools.auto.llm_profile.resolve_llm_profile`` exactly as
-``gate_llm_profile`` is, and passed in as a callable: this module never holds a
+``gate_llm_profile`` is, and passed in as callables: this module never holds a
 model name, a URL or a key. An unset profile is a refusal that names the key.
 
 Fail-open throughout: an absent or unreadable `.collect/`, an artifact that is
@@ -32,11 +50,14 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from tools.collect.cli import action_collect
+from tools.git_run import run_git
 from tools.llm_stream import (
     build_chat_request,
     make_unverified_context,
@@ -47,20 +68,32 @@ from tools.llm_stream import (
 __all__ = [
     "ARTIFACT_FILENAME",
     "COLLECT_DIR",
+    "CONTEST_SCRIPTS",
     "DEFAULT_MAP_BUDGET",
+    "DEFAULT_REVIEW_ROUNDS",
     "HEADER_FIELDS",
+    "LEG_BRANCH",
     "MAP_FILES",
     "OPEN",
+    "REJECTED_SUFFIX",
+    "REVIEW_CHECKLIST",
+    "REVIEW_SYSTEM_PROMPT",
+    "RUNNER_SCRIPTS_DIR",
     "SECTIONS",
     "TASKS_DIR",
+    "CommitResult",
     "DraftResult",
+    "ReviewResult",
     "build_prompt",
+    "build_review_prompt",
+    "commit_ticket",
     "draft_ticket",
     "llm_call_for",
     "lint_ticket",
     "load_artifact",
     "maps_text",
     "next_round",
+    "review_ticket",
     "round_taken",
     "slug_for",
     "symbols_by_path",
@@ -93,6 +126,23 @@ OPEN = "open"
 #: A budget the operator may raise or lower; it is never a model window.
 DEFAULT_MAP_BUDGET = 8000
 
+#: The rework rounds the review may send a draft back for when
+#: `[contest] draft_review_rounds` is unset. 2 = one review, then at most two
+#: rounds of problems -> rework -> lint -> review; 0 = one review, no rework.
+DEFAULT_REVIEW_ROUNDS = 2
+
+#: The branch a drafted ticket is committed to: the same branch
+#: `2legs/prepare_task.sh` commits onto, so a drafted round and a hand-made one
+#: start from the same place.
+LEG_BRANCH = "contest-legs"
+
+#: The two scripts the agents' prompt runs in their clone; the commit copies
+#: them in when the target repo does not have them yet.
+CONTEST_SCRIPTS = ("scripts/next_task.py", "scripts/append_task.py")
+
+#: Where the two scripts above come from: this repo's own `scripts/`.
+RUNNER_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
+
 #: Seconds one draft call may take before it is a transport failure.
 DRAFT_TIMEOUT = 300.0
 
@@ -110,6 +160,28 @@ DRAFT_SYSTEM_PROMPT = (
     "Every file path and symbol name you write must come from the collect maps "
     "you were given; never invent one. The brief is the task — do not widen it, "
     "narrow it or turn it into a different one."
+)
+
+#: The system prompt of the review call. It names the job and the shape of the
+#: answer, not a model: the reviewer is the gate's, and `[contest] gate_llm_profile`
+#: is what resolves it.
+REVIEW_SYSTEM_PROMPT = (
+    "You are the reviewer of one ticket for an autonomous model contest. Decide "
+    "whether it is worth an agent's hour, against the brief it was drafted from "
+    "and every item of the checklist it is given. Answer JSON only, and nothing "
+    "else: no preamble, no commentary, no code fence, no key besides the two. "
+    '{"ok": true} when every item passes, {"ok": false} with one short sentence '
+    "per failing item in \"problems\" — each one something the drafter can act on."
+)
+
+#: The checklist the review verdict is against, one line per item. KC-79's lint
+#: can only check that the ticket is well formed; these four are what a second
+#: model can see that the lint cannot.
+REVIEW_CHECKLIST = (
+    "- the acceptance can be checked by running commands, not by opinion;\n"
+    "- the task cannot be met by deleting, skipping or weakening tests;\n"
+    "- it fits one agent in one leg — if it does not, say how to split it;\n"
+    "- it does what the brief asked, not something nearby."
 )
 
 #: `**Status:** open — round 55 …` → the label and the value, one pass each.
@@ -133,18 +205,40 @@ _FENCE_RE = re.compile(r"```[^\n]*\n([\s\S]*?)```")
 
 
 @dataclass(frozen=True)
+class ReviewResult:
+    """The reviewer's verdict on one draft: ``ok`` and one problem per line."""
+
+    ok: bool
+    problems: tuple
+
+
+@dataclass(frozen=True)
+class CommitResult:
+    """One commit's outcome: ``ok``, the line to print, and the commit when one exists."""
+
+    ok: bool
+    message: str
+    sha: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class DraftResult:
     """One draft attempt's outcome.
 
     ``path`` is the written ticket, or ``None`` when the lint refused both
     attempts; ``rejected_path`` is the last draft's ``.rejected.md`` copy, when
-    the operator asked for the work to be written.
+    the operator asked for the work to be written. ``number`` is the ticket
+    number the draft claimed — ``None`` when the draft was refused before a
+    number existed to claim — and ``commit`` is the KC-80 commit's outcome,
+    ``None`` when no commit was asked for.
     """
 
     path: Optional[Path]
     rejected: bool
     problems: tuple
     rejected_path: Optional[Path] = None
+    number: Optional[int] = None
+    commit: Optional[CommitResult] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -433,6 +527,33 @@ def _rework(draft: str, problems: list) -> str:
     return "\n".join(lines)
 
 
+def _rework_prompt(prompt: str, draft: str, problems: list) -> str:
+    """The drafter's rework prompt: its own draft back with the problems appended.
+
+    KC-79's lint problems and KC-80's review problems both go through here, so
+    the drafter always sees the original prompt, its own draft and one problem
+    list to work through.
+    """
+    return prompt + "\n\n## Your draft\n\n" + draft.strip() + _rework(draft, problems)
+
+
+def _as_rounds(value) -> int:
+    """*value* as a number of review rounds: a non-negative int, else the default.
+
+    Absent is the default, and a string that is not a number, a bool and a
+    negative are the default too — a typo must not loop the draft forever, and
+    it must not turn the review into no review either. ``0`` is a real value:
+    one review, no rework.
+    """
+    if isinstance(value, bool):
+        return DEFAULT_REVIEW_ROUNDS
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_REVIEW_ROUNDS
+    return count if count >= 0 else DEFAULT_REVIEW_ROUNDS
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # the lint
 # ─────────────────────────────────────────────────────────────────────────────
@@ -564,23 +685,167 @@ def next_round(tasks_dir, start: int = 1) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# the review: the gate model's verdict on the draft
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_review_prompt(brief: str, ticket_text: str, checklist: str = None) -> str:
+    """The one prompt the review call gets: the brief, the ticket, the checklist.
+
+    The same shape as `build_prompt`: the brief first, because the ticket has to
+    do what the brief asked and not something nearby, then the ticket as
+    drafted, then the checklist the verdict is judged against.
+    """
+    return "\n".join([
+        "Decide whether the ticket below is worth an agent's hour. Judge it "
+        "against the brief it was drafted from and every item of the checklist "
+        "at the end.",
+        "",
+        "## The brief — the task, unchanged",
+        "",
+        (brief or "").strip(),
+        "",
+        "## The ticket — as drafted",
+        "",
+        (ticket_text or "").strip(),
+        "",
+        "## The checklist — every item must pass",
+        "",
+        checklist or REVIEW_CHECKLIST,
+        "",
+        'Answer JSON only: {"ok": true|false, "problems": ["one sentence each"]}.',
+    ])
+
+
+def review_ticket(text, brief, review_call) -> ReviewResult:
+    """One ask of the reviewer — the gate model — as a verdict.
+
+    *review_call* is a callable taking the prompt text and returning the reply:
+    a fake in tests, `llm_call_for(config.gate_settings,
+    system=REVIEW_SYSTEM_PROMPT)` on the real path. This module supplies only the
+    brief, the ticket and the checklist; the model, the URL and the key are the
+    gate's own, resolved through the same call the gate's profile is.
+
+    A reply that is not the JSON answer is ``ok: False`` with the raw reply as
+    the one problem, and a call that raises or comes back empty is the same: a
+    reviewer that cannot answer refuses the ticket rather than letting it through.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ReviewResult(False, ("the draft is empty",))
+    reply = _call(review_call, build_review_prompt(brief, text))
+    return _parse_review_reply(reply)
+
+
+def _parse_review_reply(reply: str) -> ReviewResult:
+    """A reply as a verdict; anything that is not the JSON answer is not ok.
+
+    ``ok`` must be a real boolean, else the whole reply is the one problem — the
+    reviewer answered, and it was not an answer. An approval needs no ``problems``:
+    the reviewer is told to answer ``{"ok": true}`` when everything passes, and the
+    missing or non-list ``problems`` on a refusal is not what an approval owes. A
+    refusal without a list gets the reply itself as the problem, so the drafter
+    always has one thing to work with.
+    """
+    raw = (reply or "").strip()
+    payload = _json_object(raw)
+    if not isinstance(payload, dict):
+        return ReviewResult(False, (raw or "the reviewer answered nothing",))
+    ok = payload.get("ok")
+    if not isinstance(ok, bool):
+        return ReviewResult(False, (raw or "the reviewer answered nothing",))
+    if ok:
+        return ReviewResult(True, ())
+    problems = payload.get("problems")
+    if not isinstance(problems, list):
+        return ReviewResult(False, (raw or "the reviewer answered nothing",))
+    found = tuple(str(item).strip() for item in problems if str(item).strip())
+    if not found:
+        found = ("the reviewer refused it without naming a problem",)
+    return ReviewResult(False, found)
+
+
+def _json_object(text: str):
+    """The JSON object in *text*, or `None` when there is no one to read.
+
+    A bare object, one wrapped in a fence, or one sitting inside a sentence: the
+    first that parses wins. Fence stripping re-uses `_FENCE_RE`, so the reply
+    shape the draft's own maps use is accepted here too.
+    """
+    body = (text or "").strip()
+    if not body:
+        return None
+    body = _FENCE_RE.sub(lambda match: match.group(1), body).strip()
+    brace = body.find("{")
+    candidates = (body,) if brace < 0 else (body, body[brace:])
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except ValueError:
+            try:
+                value, _end = json.JSONDecoder().raw_decode(candidate)
+            except ValueError:
+                continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _review_rounds(text, brief, *, prompt, llm_call, review_call, rounds,
+                   artifact, repo, tasks_dir, number) -> tuple:
+    """`draft_ticket`'s review loop, as ``(text, problems)``.
+
+    One review, then at most *rounds* rounds of "the problems go back to the
+    drafter, the lint runs again, the review runs again". The first verdict that
+    is ok — or the lint's problems, if a rework broke the ticket — stops the
+    loop; the last refusal's problems are the ones the caller prints.
+    """
+    for attempt in range(rounds + 1):
+        verdict = review_ticket(text, brief, review_call)
+        if verdict.ok:
+            return text, ()
+        if attempt >= rounds:
+            return text, verdict.problems
+        text = _call(llm_call, _rework_prompt(prompt, text, list(verdict.problems)))
+        problems = lint_ticket(text, artifact, repo=repo, tasks_dir=tasks_dir,
+                               round_no=number)
+        if problems:
+            return text, problems
+    return text, ("the review refused the ticket on every round",)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # the draft
 # ─────────────────────────────────────────────────────────────────────────────
 
 def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
                  collect_fn: Optional[Callable] = None, write: bool = True,
-                 format_spec: str = None) -> DraftResult:
-    """One brief, one collect run, at most two LLM calls, one ticket.
+                 format_spec: str = None, review_call: Optional[Callable] = None,
+                 review_rounds=None, commit: bool = False) -> DraftResult:
+    """One brief, one collect run, one ticket — drafted, reviewed, committed.
 
     *llm_call* is a callable taking the prompt text and returning the draft — a
     fake in tests, `llm_call_for(config.draft_settings)` on the real path.
-    *config* supplies the map budget; *round_no* the ticket number, else the
-    next free one; *out* the file to write, else `epic-tasks/<NN>-<slug>.md`.
+    *config* supplies the map budget and the review's round count; *round_no* the
+    ticket number, else the next free one; *out* the file to write, else
+    `epic-tasks/<NN>-<slug>.md`.
+
+    *review_call* is the gate model's callable, KC-80's second step: with it the
+    lint's clean ticket is judged against the brief and the checklist, and a
+    refusal sends the problems back to the drafter, then the lint, then the
+    review again, at most *review_rounds* rounds (else
+    `[contest] draft_review_rounds`, else 2). Without it the ticket is exactly
+    KC-79's: lint and stop. *review_rounds* may also be given outright, which
+    wins over the config.
+
+    *commit* is KC-80's third step: `commit_ticket` on `LEG_BRANCH` in *repo*.
+    A repo with uncommitted tracked changes is refused before the first LLM call,
+    because a draft that cannot be committed should not burn the calls to be
+    refused.
 
     The order is fixed: collect, prompt, lint, one rework with the problem list
-    appended, lint again, write or refuse. A second problem list is printed and
-    the last draft saved as `.rejected.md` next to the output — never written to
-    `epic-tasks/` under a number that is supposed to be free.
+    appended, lint again, the review's rounds, write or refuse. A refusal prints
+    its problem list and saves the last draft as `.rejected.md` next to the
+    output — never written to `epic-tasks/` under a number that is supposed to be
+    free, and never committed.
     """
     if not isinstance(brief, str) or not brief.strip():
         raise ValueError("draft_ticket: the brief is empty")
@@ -590,6 +855,23 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     collect_dir = repo / COLLECT_DIR
     budget = _as_budget(getattr(config, "draft_map_budget", DEFAULT_MAP_BUDGET)
                         if config is not None else DEFAULT_MAP_BUDGET)
+    if review_rounds is None:
+        review_rounds = _as_rounds(getattr(config, "draft_review_rounds",
+                                           DEFAULT_REVIEW_ROUNDS)
+                                   if config is not None else DEFAULT_REVIEW_ROUNDS)
+    else:
+        review_rounds = _as_rounds(review_rounds)
+    number = int(round_no) if round_no is not None else None
+
+    # The commit is what refuses a dirty repo, so the refusal is here and not at
+    # the end: nothing is drafted and nothing is dialed for a repo the commit
+    # cannot touch. Untracked files do not count — the ticket about to be written
+    # is one, and so is everything the collect run left behind.
+    if commit:
+        refusal = _clean_refusal(repo)
+        if refusal is not None:
+            return DraftResult(path=None, rejected=True, problems=(refusal,),
+                               number=number, commit=CommitResult(False, refusal))
 
     try:
         (collect_fn or run_collect)(repo)
@@ -599,25 +881,40 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     maps = maps_text(collect_dir, budget)
     artifact = load_artifact(collect_dir)
 
-    number = int(round_no) if round_no is not None else next_round(tasks_dir)
+    if number is None:
+        number = next_round(tasks_dir)
     prompt = build_prompt(brief, maps, round_no=number, format_spec=format_spec)
 
     text = _call(llm_call, prompt)
     problems = lint_ticket(text, artifact, repo=repo, tasks_dir=tasks_dir, round_no=number)
 
     if problems:
-        second = prompt + "\n\n## Your draft\n\n" + text.strip() + _rework(text, problems)
-        text = _call(llm_call, second)
+        text = _call(llm_call, _rework_prompt(prompt, text, problems))
         problems = lint_ticket(text, artifact, repo=repo, tasks_dir=tasks_dir, round_no=number)
+
+    if not problems and review_call is not None:
+        text, problems = _review_rounds(
+            text, brief, prompt=prompt, llm_call=llm_call, review_call=review_call,
+            rounds=review_rounds, artifact=artifact, repo=repo, tasks_dir=tasks_dir,
+            number=number)
 
     target = Path(out) if out else tasks_dir / f"{number:02d}-{slug_for(title_of(text))}.md"
     if problems:
         rejected_path = _write(target.with_name(target.stem + REJECTED_SUFFIX), text) if write else None
         return DraftResult(path=None, rejected=True, problems=tuple(problems),
-                           rejected_path=rejected_path)
+                           rejected_path=rejected_path, number=number)
 
     path = _write(target, text) if write else target
-    return DraftResult(path=path, rejected=False, problems=(), rejected_path=None)
+    commit_result = None
+    if commit and path.is_file():
+        commit_result = commit_ticket(repo, path)
+        if not commit_result.ok:
+            return DraftResult(
+                path=None, rejected=True,
+                problems=(f"{path} is written but not committed: {commit_result.message}",),
+                number=number, commit=commit_result)
+    return DraftResult(path=path, rejected=False, problems=(), number=number,
+                       commit=commit_result)
 
 
 def _call(llm_call: Callable, prompt: str) -> str:
@@ -676,4 +973,129 @@ def llm_call_for(settings, system: str = DRAFT_SYSTEM_PROMPT,
         return strip_think(text) or ""
 
     return ask
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the commit: the ticket on contest-legs, nothing else
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _git(repo, *args) -> tuple:
+    """`git <args>` in *repo* as `(returncode, stdout, stderr)` — never raises.
+
+    Through `tools.git_run.run_git`, so a transient held index is waited out the
+    way every other git call in the tree is. A git that cannot be run at all
+    comes back as a non-zero code with the reason, so a broken environment is a
+    refusal the operator can read, not an exception in the draft.
+    """
+    try:
+        proc = run_git(("git", *args), cwd=str(repo))
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, "", "git could not be run"
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _dirty_paths(repo) -> Optional[list]:
+    """The repo's uncommitted tracked paths, or `None` when that cannot be read.
+
+    `--untracked-files=no` is the point: the ticket about to be written is
+    untracked, and so is everything the collect run left, so neither counts as
+    dirt. `None` is a git that failed, never a clean tree.
+    """
+    code, out, _err = _git(repo, "status", "--porcelain", "--untracked-files=no")
+    if code != 0:
+        return None
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def _clean_refusal(repo) -> Optional[str]:
+    """The refusal for a repo the commit must not touch, or `None` when it is clean."""
+    dirty = _dirty_paths(repo)
+    if dirty is None:
+        return f"{repo} cannot be read with git status — commit its tickets by hand"
+    if dirty:
+        shown = ", ".join(dirty[:5]) + (", …" if len(dirty) > 5 else "")
+        return (f"{repo} has uncommitted changes ({shown}) — commit or stash them "
+                "first, as 2legs/prepare_task.sh does")
+    return None
+
+
+def _repo_rel(repo, path) -> Optional[str]:
+    """*path* relative to *repo* as a posix path, or `None` when it is outside it."""
+    try:
+        relative = Path(path).resolve().relative_to(Path(repo).resolve())
+    except (ValueError, OSError):
+        return None
+    if str(relative) in (".", ""):
+        return None
+    return relative.as_posix()
+
+
+def commit_ticket(repo, ticket_path, *, message=None, branch: str = LEG_BRANCH,
+                  scripts_dir=None) -> CommitResult:
+    """Commit *ticket_path* on *branch* in *repo* and nothing else.
+
+    The order is the one `2legs/prepare_task.sh` uses: refuse a repo with
+    uncommitted tracked changes, check out the branch creating it when missing,
+    copy the two scripts the agents' prompt runs in when they are absent, and
+    commit with the paths spelled out — never `-a`, so nothing the operator left
+    in the tree rides along. The branch is left checked out, because
+    `run --target REPO --base HEAD` needs the ticket at HEAD, and the operator's
+    own branch keeps every commit it had.
+
+    Fail-open throughout: a repo that is not a git repo, a branch that cannot be
+    checked out, a script that cannot be copied and a commit that fails all come
+    back as a refusal with the reason. Nothing is deleted, stashed or reset.
+    """
+    repo = Path(repo)
+    ticket = Path(ticket_path)
+    rel = _repo_rel(repo, ticket)
+    if rel is None:
+        return CommitResult(False, f"{ticket} is not inside {repo}")
+    if not ticket.is_file():
+        return CommitResult(False, f"{ticket} does not exist — nothing to commit")
+
+    refusal = _clean_refusal(repo)
+    if refusal is not None:
+        return CommitResult(False, refusal)
+
+    paths = [rel]
+    source_dir = Path(scripts_dir) if scripts_dir is not None else RUNNER_SCRIPTS_DIR
+    for rel_script in CONTEST_SCRIPTS:
+        target = repo / rel_script
+        if target.exists():
+            continue
+        source = source_dir / Path(rel_script).name
+        if not source.is_file():
+            return CommitResult(False,
+                                f"{source} is missing — {rel_script} cannot be copied in")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+        except OSError as exc:
+            return CommitResult(False, f"cannot copy {rel_script} into {repo}: {exc}")
+        paths.append(rel_script)
+
+    code, _out, err = _git(repo, "rev-parse", "--verify", "--quiet",
+                           f"refs/heads/{branch}")
+    if code == 0:
+        code, _out, err = _git(repo, "checkout", "-q", branch)
+    else:
+        code, _out, err = _git(repo, "checkout", "-q", "-b", branch)
+    if code != 0:
+        return CommitResult(False, f"cannot check out {branch} in {repo}: {err.strip()}")
+
+    code, _out, err = _git(repo, "add", "--", *paths)
+    if code != 0:
+        return CommitResult(False,
+                            f"cannot stage {', '.join(paths)} in {repo}: {err.strip()}")
+
+    subject = message or f"contest: ticket {ticket.stem}"
+    code, _out, err = _git(repo, "commit", "-q", "-m", subject, "--", *paths)
+    if code != 0:
+        return CommitResult(False,
+                            f"cannot commit {', '.join(paths)} in {repo}: {err.strip()}")
+
+    code, out, _err = _git(repo, "rev-parse", "HEAD")
+    sha = out.strip() if code == 0 and out.strip() else None
+    return CommitResult(True, f"{branch} holds {', '.join(paths)}", sha)
 
