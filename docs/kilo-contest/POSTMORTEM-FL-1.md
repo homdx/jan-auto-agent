@@ -1772,6 +1772,42 @@ person who did not yet know how it ended.
 
 ---
 
+## 12. Afterword — the suite got slow (SLOW-1)
+
+FL-1 made the suite trustworthy; it did not make it fast, and two later fixes
+quietly made it slower. Round 119 (SLOW-1, "tests got slower — find the commit
+and fix") turned that into a ticket. Three causes, each a different shape:
+
+| # | cause | brought in by | fix |
+|---|---|---|---|
+| 1 | `make_config` in `tests/test_contest_runner.py` left `error_retry_backoff_sec` at the roster's 15 s, so the silence tests slept it for real (`_wait_backoff`) — ~65 s, all on one worker | `4b5c8ee` (KC-9) | `b6464a1` — `error_retry_backoff_sec=0` in the harness; the roster default stays 15 |
+| 2 | a file-wide `pytestmark = xdist_group("port_bound_http_servers")` on the runner tests; under `--dist=loadgroup` ~250 tests queued on one worker behind the port suites — that queue *was* the wall clock | `e8c6ad3` (KC-6) | `3144826` — the mark removed; the bench binds OS-assigned ports only |
+| 3 | `test_collect_already_safe_query.py` rebuilt the real repo index (~38 s) in seven tests, `test_collect_gates.py` the gates map in ten; spread over workers, each paid again | standing cost | `6abdca4` — one session fixture and one `xdist_group` per file |
+
+Measured on one machine, `tests -n 8`, three runs each, alternating: the two
+collect files 103/96 s → 65/62 s; the whole suite 233/187/183 s → 212/166/165 s
+for cause 3 alone (−20 s, ~10 %). Causes 1 and 2 are the regression proper.
+
+**The link back to FL-1.** Cause 2 is an FL-1 remedy overapplied: putting a
+suite on the port group is the right fix for a port race (§8, shape 4), but a
+*file-wide* mark serialises everything in the file, including tests that bind
+nothing. Rule: mark the tests that bind a fixed port, never the file; tests that
+bind port 0 need no group at all.
+
+**One more, of shape 3 (§8).** `test_scan_of_the_tree_is_deterministic_and_fast`
+read 10.3 and 10.8 s of wall clock under `-n 8` beside a live round, on a scan
+that costs 4.5 s idle. The scan is one thread with no subprocess, so
+`process_time` is its own cost: `574fdc8` times CPU, not the wall. 16 copies at
+once on 8 cores: the wall-clock version failed 15 of 16, the CPU one passed 16
+of 16. A speed bound on single-threaded work measures the work; a speed bound
+on the wall measures the box.
+
+Judging kit for the round: `contest-bench/slow1/` (`REFERENCE.md` for the
+judge, `check_slow1.py` for the mechanical half, pinned by
+`tests/test_slow1_check.py`). Round 119's entries each removed one cause of two.
+
+---
+
 ## Appendix A — minimal reproductions
 
 ```bash
