@@ -139,11 +139,21 @@ class Harvest:
 
 
 def _progress_rows(progress_csv: Path) -> list[dict]:
-    """The rows of *progress_csv*, or [] when the file does not exist yet."""
+    """The rows of *progress_csv*, or [] when the file does not exist yet.
+
+    A queue file the reader cannot answer is "no rows", not a raise: a NUL
+    byte (a binary tool wrote into it) or an invalid UTF-8 byte (an editor
+    saved it in another encoding) degrades the claim to absent, the way an
+    unreadable index degrades `_status_lines` — the harvest settles on
+    `no_progress_row` instead of dying on the runner's own file.
+    """
     if not progress_csv.is_file():
         return []
-    with open(progress_csv, newline="", encoding="utf-8") as fh:
-        return list(csv.DictReader(fh))
+    try:
+        with open(progress_csv, newline="", encoding="utf-8") as fh:
+            return list(csv.DictReader(fh))
+    except (OSError, UnicodeDecodeError, csv.Error):
+        return []
 
 
 def _is_ancestor(path: Path, commit: str) -> bool:
@@ -413,8 +423,12 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     for row in _progress_rows(ws.progress_csv):
         if (row.get("ticket") or "").strip() == ticket:
             claim = row
-    claimed_commit = (claim or {}).get("commit", "").strip()
-    outcome = (claim or {}).get("outcome", "").strip().upper()
+    # `csv.DictReader` fills the fields a short row did not carry with `None`
+    # (its `restval`), and a writer that died mid-row or a hand echo leaves
+    # exactly that: `or ""` degrades the missing claim to empty — the row
+    # scores `no_commit` — instead of a `None.strip()` into the run.
+    claimed_commit = ((claim or {}).get("commit") or "").strip()
+    outcome = ((claim or {}).get("outcome") or "").strip().upper()
 
     progress = f"runs/{ws.agent}/PROGRESS.csv"  # ws.progress_csv, for a short reason
     reasons: list[Reason] = []

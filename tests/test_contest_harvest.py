@@ -973,6 +973,68 @@ def test_harvest_flags_a_done_row_without_a_commit(round_, tmp_path):
     assert h.facts["sha"] == sha[:7]  # the branch head is still in the facts
 
 
+def test_harvest_degrades_a_truncated_row_to_an_empty_claim(round_, tmp_path):
+    """A PROGRESS row shorter than its header — a writer that died mid-row, an
+    agent's `echo ticket,,outcome` — leaves the missing fields as `None`
+    (`csv.DictReader`'s `restval`). The claim degrades to the empty one: the
+    row scores `no_commit`, the outcome-None row scores `EMPTY`, and the run
+    is not killed by the queue file."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    wt.progress_csv.parent.mkdir(parents=True, exist_ok=True)
+    wt.progress_csv.write_text(
+        "ticket,finding,outcome,commit,note\n"
+        + ticket.name + ",,DONE\n", encoding="utf-8")
+
+    h = harvest(wt, ticket)
+    assert h.verdict == "REWORK"
+    assert _codes(h) == ["no_commit"]
+    assert h.commit is None
+
+    # a row of one field: every claim field after the ticket is None, and the
+    # sentence degrades the same way — `progress_not_done` names EMPTY
+    wt.progress_csv.write_text(
+        "ticket,finding,outcome,commit,note\n" + ticket.name + "\n",
+        encoding="utf-8")
+    h = harvest(wt, ticket)
+    assert "progress_not_done" in _codes(h) and "no_commit" in _codes(h)
+    assert "EMPTY" in _reason(h, "progress_not_done").text
+
+
+@pytest.mark.parametrize("raw,tag", [
+    (b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,abc1234,\x00\n", "nul"),
+    (b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,\xff\n", "utf8"),
+])
+def test_harvest_reads_no_rows_from_a_broken_queue_file(round_, tmp_path, raw, tag):
+    """A queue file the reader cannot answer — a NUL byte, an invalid UTF-8
+    byte — keeps no rows: the harvest settles on `no_progress_row` and still
+    names the branch's one commit (KC-30). A broken queue file degrades, it
+    never raises into the round."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path, agent=tag)
+    head = _accepting(wt)
+    wt.progress_csv.parent.mkdir(parents=True, exist_ok=True)
+    wt.progress_csv.write_bytes(raw)
+
+    h = harvest(wt, ticket)
+    assert h.verdict == "REWORK"
+    assert "no_progress_row" in _codes(h)
+    assert h.commit == head
+
+
+def test_progress_rows_are_empty_when_the_file_cannot_be_read(tmp_path):
+    """`_progress_rows` itself: a NUL byte or a bad byte is "no rows" — the
+    same shape as a missing file, never a `csv.Error` / `UnicodeDecodeError`."""
+    p = tmp_path / "PROGRESS.csv"
+    p.write_bytes(b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,x,\x00\n")
+    assert harvest_mod._progress_rows(p) == []
+    p.write_bytes(b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,\xff\n")
+    assert harvest_mod._progress_rows(p) == []
+    p.write_bytes(b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,abc1234,n\n")
+    assert harvest_mod._progress_rows(p)[0]["ticket"] == "01-r1.md"
+
+
 def test_harvest_flags_a_commit_off_the_branch(round_, tmp_path):
     repo, base, ticket = round_
     wt = _worktree(repo, base, tmp_path)
