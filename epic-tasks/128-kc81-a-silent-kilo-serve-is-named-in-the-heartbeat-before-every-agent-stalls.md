@@ -1,6 +1,6 @@
 # KC-81 — A silent Kilo server is named in the heartbeat before every agent stalls
 
-**Status:** open
+**Status:** landed `6c11c34`+`ca35ecc` on 2026-09-30 — round 128, winner 25/25 on contest-bench/kc81 taken as-is; follow-up: no warning while every live agent harvests, the real silence in the line, off on OpenRouter, `contest status` names the spell
 **Severity:** MEDIUM
 **File:** `tools/contest/runner.py`
 **Symbol:** `_Heartbeat`
