@@ -438,9 +438,16 @@ def title_of(text: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-def slug_for(title: str, fallback: str = "ticket") -> str:
-    """The file name from a ticket title: lower-cased, dashes, no spaces."""
+def slug_for(title: str, fallback: str = "ticket", round_no=None) -> str:
+    """The file name from a ticket title: lower-cased, dashes, no spaces.
+
+    With *round_no*, a title that already opens with that number
+    (`# 129-delta-validator — …`) loses it, so the file is
+    `129-delta-validator-….md` and not `129-129-delta-validator-….md`.
+    """
     words = re.sub(r"[^A-Za-z0-9]+", "-", (title or "").lower()).strip("-")
+    if round_no is not None:
+        words = re.sub(rf"^0*{int(round_no)}(?:-|$)", "", words)
     return words[:60] or fallback
 
 
@@ -898,7 +905,7 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
             rounds=review_rounds, artifact=artifact, repo=repo, tasks_dir=tasks_dir,
             number=number)
 
-    target = Path(out) if out else tasks_dir / f"{number:02d}-{slug_for(title_of(text))}.md"
+    target = Path(out) if out else tasks_dir / f"{number:02d}-{slug_for(title_of(text), round_no=number)}.md"
     if problems:
         rejected_path = _write(target.with_name(target.stem + REJECTED_SUFFIX), text) if write else None
         return DraftResult(path=None, rejected=True, problems=tuple(problems),

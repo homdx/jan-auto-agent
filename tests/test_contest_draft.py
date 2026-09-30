@@ -477,6 +477,15 @@ def test_the_slug_comes_from_the_title(collected):
     assert draft_mod.slug_for("A plain brief becomes a ticket") == "a-plain-brief-becomes-a-ticket"
 
 
+def test_slug_for_drops_the_round_number_the_title_already_carries():
+    """Round 129's title `129-delta-validator — …` must not file as `129-129-…`."""
+    title = "129-delta-validator — add tests"
+    assert draft_mod.slug_for(title, round_no=129) == "delta-validator-add-tests"
+    assert draft_mod.slug_for("0129 add tests", round_no=129) == "add-tests"
+    assert draft_mod.slug_for("1290 things", round_no=129) == "1290-things"
+    assert draft_mod.slug_for("129", round_no=129) == "ticket"
+
+
 # ── the review ──────────────────────────────────────────────────────────────
 
 
