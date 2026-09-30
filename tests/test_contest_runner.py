@@ -4158,10 +4158,26 @@ def test_max_parallel_one_runs_two_agents_sequentially(tmp_path):
 
 def test_max_parallel_two_overlaps_two_agents(tmp_path):
     sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
-    # a 3 s turn: the overlap is proven from the request order, but the box is
-    # shared, and a loaded box must not push the second session's creation
-    # past the first turn's finish
-    with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy"], "delay": 3.0}]}) as fake:
+    # The first turn is held until the second session exists, not for a fixed
+    # time. A 3 s delay used to stand in for that, and three suites sharing 8
+    # cores pushed the second `POST /session` past it — the overlap looked
+    # missing though max_parallel=2 was honoured. With the hold, load only makes
+    # the test slower: a runner that serialises the agents never opens the
+    # second session while the first is held, the hold runs out, the first turn
+    # finishes first and the assertion below fails as it should. The fake's
+    # hook heartbeat keeps the held turn busy, so no silence window fires.
+    fake = None
+
+    def work_once_both_open(directory, text):
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if len([r for r in list(fake.requests)
+                    if r["method"] == "POST" and r["path"] == "/session"]) >= 2:
+                break
+            time.sleep(0.05)
+        work_ready(directory, text)
+
+    with _BenchFake({"turns": [{"on_prompt": work_once_both_open, "events": ["busy"]}]}) as fake:
         state = _round(sb, fake, make_config(["agent-a", "agent-b"], max_parallel=2))
         between, finished_first = _creates_and_reads(fake)
     for name in ("agent-a", "agent-b"):
