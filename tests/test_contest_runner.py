@@ -6261,13 +6261,14 @@ class _SuiteSleeper:
 
 
 def _suite_scenario(command: str, *, delay: float = 0.0, idle: bool = True,
-                     on_prompt=None) -> dict:
+                     on_prompt=None, hold=None) -> dict:
     """One turn that asks for a whole pytest root, as Kilo sends it.
 
-    `delay` keeps the turn alive after the reply, so the asker still holds its
-    slot while a test arranges the next one. `on_prompt` is the prompt hook —
-    the git work that makes the harvest accept the turn instead of reworking
-    it, which is what a READY assertion needs.
+    `hold` (a `threading.Event`) keeps the turn alive after the reply until the
+    test sets it, so the asker still holds its slot while the test arranges the
+    next one; `delay` does the same for a fixed time. `on_prompt` is the prompt
+    hook — the git work that makes the harvest accept the turn instead of
+    reworking it, which is what a READY assertion needs.
     """
     turn = {"events": ["busy"],
             "permission": {"permission": "bash", "metadata": {"command": command}},
@@ -6276,6 +6277,8 @@ def _suite_scenario(command: str, *, delay: float = 0.0, idle: bool = True,
         turn["on_prompt"] = on_prompt
     if delay:
         turn["delay"] = delay
+    if hold is not None:
+        turn["hold"] = hold
     return {"turns": [turn]}
 
 
@@ -6337,10 +6340,13 @@ def test_two_agents_share_one_suite_slot(tmp_path, monkeypatch):
                         holding.get(_runner_module._path_of(worktree), set()))
     monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
     slots = _runner_module._SUITE_SLOTS
+    # both turns stay alive past the checks below — until the second reply is
+    # seen — where a fixed 20 s delay made the test sit out all 20 s of it
+    release = threading.Event()
 
-    with _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, delay=20.0,
+    with _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, hold=release,
                                      on_prompt=work_ready)) as fa, \
-         _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, delay=20.0,
+         _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, hold=release,
                                      on_prompt=work_ready)) as fb:
         ha = Harness(sb, fa, cfg, agent=names[0])
         hb = Harness(sb, fb, cfg, agent=names[1])
@@ -6370,6 +6376,7 @@ def test_two_agents_share_one_suite_slot(tmp_path, monkeypatch):
         assert _wait_for(lambda: fb.calls(method="POST", prefix="/permission/")), \
             "the second reply never went out"
         replied_b = time.monotonic()
+        release.set()                    # both turns may go idle now
         for thread in (ta, tb):          # the fakes are still up: the streams end
             thread.join(60)              # with them, and a stream gone is ERROR
         assert not ta.is_alive() and not tb.is_alive()
