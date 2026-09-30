@@ -1,6 +1,6 @@
 # KC-79 — A plain brief becomes a ticket grounded in the collect maps
 
-**Status:** open
+**Status:** landed `551ac20` + `e6628da` (indented Acceptance) + `cfb712b` (contest.ini drafter) on 2026-09-30 — round 126, winner 25/26 on contest-bench/kc79 taken as-is, 26/26 with the fix
 **Severity:** HIGH
 **File:** `tools/contest/draft.py`
 **Symbol:** `draft_ticket`, `lint_ticket`
