@@ -1,6 +1,6 @@
 # 129-DELTA-VALIDATOR-TESTS — add tests/test_auto_delta_validator.py covering DeltaValidator
 
-**Status:** open
+**Status:** landed `79223f2`+`969dd97`+`57a3aca` on 2026-09-30 — round 129, winner sn68v2 32/33 on contest-bench/129 taken as-is, coverage 39→100 %
 **Severity:** LOW
 **File:** tests/test_auto_delta_validator.py
 **Symbol:** DeltaValidator, DeltaVerdict, check, _read_at_head, make_delta_validator, feedback
