@@ -7740,10 +7740,17 @@ def test_a_dead_agent_is_not_harvested_and_never_holds_the_round(tmp_path, monke
 
         `self.fake.scenario` is one global, and a two-agent round interleaves
         its sessions — so a global is whichever agent posted last. `POST
-        /session` names the worktree in its query and `prompt_async` names the
-        session, and the sandbox puts each agent in `wt/<agent>`: both are
-        enough to keep the assignment for the whole run, including the second
-        session an agent opens for itself mid-round.
+        /session` names the worktree in its query and every other session call
+        names the session, and the sandbox puts each agent in `wt/<agent>`:
+        both are enough to keep the assignment for the whole run, including the
+        second session an agent opens for itself mid-round.
+
+        The script is set for the request's own thread (see `_ByAgent`), not on
+        the fake: the two agents' requests run on concurrent server threads,
+        and a shared assignment let agent-b's `POST` land between agent-a's
+        assignment and its read — agent-a then ran agent-b's `work_ready` turn
+        and came back READY instead of DEAD. The abort is looked up the same
+        way, so `abort_idles` is agent-a's own and not whoever posted last.
         """
         def _script_for(self, sid=None, directory=None):
             name = None
@@ -7757,18 +7764,38 @@ def test_a_dead_agent_is_not_harvested_and_never_holds_the_round(tmp_path, monke
             return self.fake.scenario
 
         def do_POST(self):
-            if self.path.split("?", 1)[0] == "/session":
+            path = self.path.split("?", 1)[0]
+            if path == "/session":
                 from urllib.parse import parse_qs, urlparse
                 query = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
                 self._script_for(directory=query.get("directory") or self.fake.directory)
                 return super().do_POST()
-            m = _kilo_fake._RE_PROMPT.fullmatch(self.path.split("?", 1)[0])
+            m = re.match(r"^/session/([^/]+)/", path)
             if m:
                 self._script_for(sid=m.group(1))
             return super().do_POST()
 
     class _ByAgent(_BenchFake):
-        """The one fake that hands each agent its own script (see the handler)."""
+        """The one fake that hands each agent its own script (see the handler).
+
+        `scenario` is per thread: a server thread reads the script its own
+        request was assigned; any other thread (the fake's turn threads, the
+        test) reads the one the fake was built with, as `_BenchFake` would.
+        """
+
+        def __init__(self, scenario=None, **kw):
+            self._by_thread = threading.local()
+            super().__init__(scenario, **kw)
+
+        @property
+        def scenario(self):
+            return getattr(self._by_thread, "scenario", self._built_with)
+
+        @scenario.setter
+        def scenario(self, value):
+            if not hasattr(self, "_built_with"):
+                self._built_with = value
+            self._by_thread.scenario = value
 
         def start(self):
             if self._httpd is not None:
