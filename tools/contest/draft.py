@@ -84,6 +84,7 @@ __all__ = [
     "CommitResult",
     "DraftResult",
     "ReviewResult",
+    "brief_sources",
     "build_prompt",
     "build_review_prompt",
     "commit_ticket",
@@ -159,7 +160,11 @@ DRAFT_SYSTEM_PROMPT = (
     "nothing else: no preamble, no commentary, no fences around the ticket. "
     "Every file path and symbol name you write must come from the collect maps "
     "you were given; never invent one. The brief is the task — do not widen it, "
-    "narrow it or turn it into a different one."
+    "narrow it or turn it into a different one. When the source of a file is "
+    "given, `## What to build` lists the concrete cases it shows — each branch, "
+    "return value, config key and fallback by name — and says outright when a "
+    "parameter the brief names is never read; a line that only restates the "
+    "brief is not a case."
 )
 
 #: The system prompt of the review call. It names the job and the shape of the
@@ -181,7 +186,9 @@ REVIEW_CHECKLIST = (
     "- the acceptance can be checked by running commands, not by opinion;\n"
     "- the task cannot be met by deleting, skipping or weakening tests;\n"
     "- it fits one agent in one leg — if it does not, say how to split it;\n"
-    "- it does what the brief asked, not something nearby."
+    "- it does what the brief asked, not something nearby;\n"
+    "- `## What to build` names concrete cases (branches, values, keys) an agent "
+    "can check off, not the brief restated in other words."
 )
 
 #: `**Status:** open — round 55 …` → the label and the value, one pass each.
@@ -481,7 +488,35 @@ def ticket_format_spec() -> str:
     return "\n".join(lines)
 
 
-def build_prompt(brief: str, maps: list, *, round_no: int, format_spec: str = None) -> str:
+#: `tools/auto/delta_validator.py` in a brief → a candidate repo path.
+_BRIEF_PATH_RE = re.compile(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+")
+
+
+def brief_sources(repo, brief: str, budget) -> list:
+    """The files the brief names, as ``(path, text)`` pairs, each cut to *budget*.
+
+    Only existing files inside *repo* count, each once, in the brief's order: a
+    test file the brief asks for does not exist yet and is skipped. The maps say
+    where things are; this is what the drafter needs to name the cases.
+    """
+    budget = _as_budget(budget)
+    repo = Path(repo)
+    pairs, seen = [], set()
+    for rel in _BRIEF_PATH_RE.findall(brief or ""):
+        rel = (rel[2:] if rel.startswith("./") else rel).rstrip(".")
+        if rel in seen or not _safe_rel(rel) or not (repo / rel).is_file():
+            continue
+        seen.add(rel)
+        try:
+            body = (repo / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        pairs.append((rel, _cut(body, budget)))
+    return pairs
+
+
+def build_prompt(brief: str, maps: list, *, round_no: int, format_spec: str = None,
+                 sources: list = None) -> str:
     """The one prompt the draft call gets: the brief, the maps, the format.
 
     *maps* is `maps_text`, already cut. The brief is copied verbatim and the
@@ -498,6 +533,9 @@ def build_prompt(brief: str, maps: list, *, round_no: int, format_spec: str = No
         f"It lands in `epic-tasks/{int(round_no):02d}-<slug>.md`; write "
         f"`**Round:** {int(round_no)}`.",
     ]
+    for rel, body in sources or ():
+        parts += ["", f"## Source of `{rel}` — name the cases from it", "",
+                  "```", body.rstrip(), "```"]
     for name, body in maps:
         parts += ["", f"## {name}", "", body.strip()]
     if not maps:
@@ -890,7 +928,8 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
 
     if number is None:
         number = next_round(tasks_dir)
-    prompt = build_prompt(brief, maps, round_no=number, format_spec=format_spec)
+    prompt = build_prompt(brief, maps, round_no=number, format_spec=format_spec,
+                          sources=brief_sources(repo, brief, budget))
 
     text = _call(llm_call, prompt)
     problems = lint_ticket(text, artifact, repo=repo, tasks_dir=tasks_dir, round_no=number)

@@ -1072,3 +1072,30 @@ def test_cmd_draft_no_review_allows_one_model(collected, tmp_path, monkeypatch, 
                         lambda settings, system=None: (lambda p: ticket_text()))
     code = contest_cli.cmd_draft(_args(collected, roster=roster, no_review=True))
     assert code == 0
+
+
+def test_brief_sources_reads_the_existing_files_the_brief_names(tmp_path):
+    """The named module is read, the test file still to write is not, each once."""
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "mod.py").write_text("def f(mode):\n    return 1\n")
+    brief = ("tools/mod.py has no tests: add tests/test_mod.py for tools/mod.py. "
+             "Also ../etc/passwd.")
+    assert draft_mod.brief_sources(tmp_path, brief, 8000) == [
+        ("tools/mod.py", "def f(mode):\n    return 1\n")]
+
+
+def test_the_prompt_carries_the_source_and_asks_for_cases(collected):
+    """Round 129: the drafter saw only maps and restated the brief; now it gets the code."""
+    prompts = []
+    target = next(p for p in collected.rglob("*.py") if ".collect" not in p.parts)
+    rel = target.relative_to(collected).as_posix()
+
+    def fake(prompt):
+        prompts.append(prompt)
+        return ticket_text()
+
+    draft_mod.draft_ticket(f"add tests for {rel}", repo=collected, llm_call=fake)
+    assert f"## Source of `{rel}`" in prompts[0]
+    assert target.read_text().strip().splitlines()[0] in prompts[0]
+    assert "concrete cases" in draft_mod.DRAFT_SYSTEM_PROMPT
+    assert "not the brief restated" in draft_mod.REVIEW_CHECKLIST
