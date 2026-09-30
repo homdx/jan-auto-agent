@@ -89,6 +89,46 @@ def _cached_scan_repo(root, *, config=None):
 _scanner.scan_repo = _cached_scan_repo
 
 
+# ── 1c. Cache gates._repo_defined_names(modules, ROOT) across the session ──────
+#
+# tests/test_collect_gates.py builds GATES against this repo's own real
+# scan several times over (the session-scoped `gates_entries` fixture,
+# plus test_bad_module_citation_raises / test_bad_parser_citation_raises,
+# each with their own one-entry seed). Every one of those calls, after
+# the gates.py fix that turned build_gates_map's per-seed-entry re-parse
+# into a single per-call `_repo_defined_names` pass, still does that one
+# full-repo ast.parse pass again from scratch -- ~3-4s each, on the same
+# modules list (scan_repo(ROOT) above already returns the same cached
+# list object every time) and the same root. Same safe-to-cache
+# reasoning as 1b: this checked-out repo doesn't change mid-run, and
+# `_repo_defined_names` returns a fresh, unshared set with no side
+# effects. Scoped the same way -- only root == this repo's own ROOT is
+# cached; a tmp_path repo (e.g. test_foreign_repo_skips_seed_instead_of_raising)
+# always goes to the real, uncached function.
+from tools.collect import gates as _gates
+
+_real_repo_defined_names = _gates._repo_defined_names
+_gates_defined_names_cache: dict = {}
+
+
+def _cached_repo_defined_names(modules, root):
+    resolved = Path(root).resolve()
+    if resolved != ROOT:
+        return _real_repo_defined_names(modules, root)
+    # Keyed on `resolved` alone (not the `modules` object's identity):
+    # `build_gates_map` passes its own `list(modules)` copy on every
+    # call, a fresh object each time even for the same underlying scan,
+    # so an id()-based key never hit. Safe the same way 1b's scan_repo
+    # cache is: this repo's own tree doesn't change mid-run, so every
+    # call for `resolved == ROOT` answers the same question.
+    if resolved not in _gates_defined_names_cache:
+        _gates_defined_names_cache[resolved] = _real_repo_defined_names(modules, root)
+    return _gates_defined_names_cache[resolved]
+
+
+_gates._repo_defined_names = _cached_repo_defined_names
+
+
 # ── 2a. Custom collector ───────────────────────────────────────────────────────
 
 def _is_script_test(p: Path) -> bool:
