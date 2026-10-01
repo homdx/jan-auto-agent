@@ -279,10 +279,11 @@ _test_map.build_test_map = _cached_build_test_map
 _registries.build_fail_open_registry = _cached_build_fail_open_registry
 
 
-def pytest_collection_modifyitems(session, config, items):
+def _share_main_call_sites() -> None:
     """1b-3's third table. `main.py` is this repo's entry point, not a package
     module, so its call-site scan is wrapped once the tests that import it
-    are collected; a run that never imports it has nothing to wrap."""
+    are collected (from `pytest_collection_modifyitems`, section 5); a run
+    that never imports it has nothing to wrap."""
     main = sys.modules.get("main")
     real = getattr(main, "_scan_typed_config_call_sites", None)
     if real is None or getattr(real, "_shared_on_root", False):
@@ -506,3 +507,30 @@ def pytest_xdist_auto_num_workers(config):
     if forced.isdigit() and int(forced) > 0:
         return int(forced)
     return max(4, os.cpu_count() or 1)
+
+
+# ── 5. Under xdist the heavy tier is queued first ──────────────────────────────
+#
+# xdist hands a worker its next test once it has two or fewer left, in the
+# collection order (after the xdist groups, which its --loadscope-reorder
+# queues first). A long test met near the end of that queue lands on a worker
+# the others no longer wait with: at -n 8, three 6-7 s runner tests queued on
+# one worker at the end finished it 7 s after the rest. The files
+# tests/SLOW_TESTS.txt names -- the heavy tier sync_test_tiers.py keeps -- are
+# queued first, so their long tests start early and the fast files fill in at
+# the end. Only the queue's order changes, and only on xdist workers: a plain
+# `pytest` keeps pytest's own order.
+def _heavy_tier_files() -> frozenset:
+    try:
+        lines = (ROOT / "tests" / "SLOW_TESTS.txt").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return frozenset()
+    return frozenset(line for line in (raw.strip() for raw in lines)
+                     if line and not line.startswith("#"))
+
+
+def pytest_collection_modifyitems(session, config, items):
+    _share_main_call_sites()
+    if hasattr(config, "workerinput"):              # an xdist worker
+        heavy = _heavy_tier_files()
+        items.sort(key=lambda item: item.path.name not in heavy)   # stable
