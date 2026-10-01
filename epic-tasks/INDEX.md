@@ -1,4 +1,4 @@
-# Epic round — 122 tickets, in order
+# Epic round — 130 tickets, in order
 
 One ticket per round. Every agent does the same ticket against the same
 tree; you merge the winner; the next round starts from the merged tree.
@@ -130,6 +130,7 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 122 | `KC-75` | landed `af3b02f` — by hand, 2026-09-28; round 120: a first-touch nudge queued by Kilo into a busy session shifted every idle by one turn and 11 agents GAVE_UP in 5 min. One extra idle is waited per nudge (5 s quiet); an empty turn after a provider 4xx/5xx retry gets `max_silent_retries = 8`, 15..120 s backoff, no continue spent | HIGH | S | [122-kc75-a-queued-nudges-turn-is-waited-out-and-an-empty-reply-after-a-provider-error-is-retried.md](122-kc75-a-queued-nudges-turn-is-waited-out-and-an-empty-reply-after-a-provider-error-is-retried.md) | `tools/contest/runner.py` |
 | 123 | `KC-76` | landed `dd830b9` — by hand, 2026-09-29 (was KC-68 on kc-2legs-runbook): `run --target REPO_PATH` runs the round on an external repo instead of the CWD; a relative `--roster` resolves against the CWD; intake refuses a target whose base lacks the two scripts or `epic-tasks/`; harvest skips the `_shrink` gate when the base has no bridge | HIGH | M | [123-kc76-the-contest-runs-on-a-target-repo-not-only-on-its-own-tree.md](123-kc76-the-contest-runs-on-a-target-repo-not-only-on-its-own-tree.md) | `tools/contest/cli.py` |
 | 124 | `KC-77` | landed — by hand, 2026-09-29 (was KC-69): the two-leg runbook `2legs/` runs as a test (`run_2legs.sh` + `check_2legs.py`, 11 checks), 11/11 on both machines; `--legs 2` on the external repo not yet run live | MEDIUM | S | [124-kc77-a-two-leg-relay-is-validated-on-an-external-repo-and-the-runbook-covers-it.md](124-kc77-a-two-leg-relay-is-validated-on-an-external-repo-and-the-runbook-covers-it.md) | `2legs/HOW-WE-RUN-2LEGS.md` |
+| 125 | `KC-78` | landed `bf48739` — by hand, 2026-09-29: before refusing a leg, `_carry_workspaces` reattaches an agent that committed on its own branch built on the round branch | HIGH | S | [125-kc78-a-leg-carries-an-agent-that-committed-on-its-own-branch.md](125-kc78-a-leg-carries-an-agent-that-committed-on-its-own-branch.md) | `tools/contest/workspace.py` |
 | 126 | `KC-79` | landed `551ac20`+`e6628da`+`cfb712b` — `tools.contest draft --target REPO "brief"`: collect maps + one LLM call → ticket, mechanical lint against artifact.json | HIGH | M | [126-kc79-a-plain-brief-becomes-a-ticket-grounded-in-the-collect-maps.md](126-kc79-a-plain-brief-becomes-a-ticket-grounded-in-the-collect-maps.md) | `tools/contest/draft.py` |
 | 127 | `KC-80` | landed `57bd1a8` — the gate model reviews the draft (≤2 rounds), commit on `contest-legs`, `--run` starts the round | MEDIUM | S | [127-kc80-a-drafted-ticket-is-reviewed-by-the-gate-model-committed-and-can-start-the-round.md](127-kc80-a-drafted-ticket-is-reviewed-by-the-gate-model-committed-and-can-start-the-round.md) | `tools/contest/draft.py` |
 | 128 | `KC-81` | landed `6c11c34`+`ca35ecc` — the heartbeat names a hung `kilo serve` (no event for any agent + `kilo-serve.log` idle ≥ `kilo_silent_sec`, default 600) with pid/cpu and a kill hint; never kills | MEDIUM | S | [128-kc81-a-silent-kilo-serve-is-named-in-the-heartbeat-before-every-agent-stalls.md](128-kc81-a-silent-kilo-serve-is-named-in-the-heartbeat-before-every-agent-stalls.md) | `tools/contest/runner.py` |
@@ -145,9 +146,9 @@ sequence; a step is not started until the previous one is merged.
 
 | step | ticket | why here | measure after |
 |---|---|---|---|
-| 1 | `RUN-6` | the pack is off in every resumed session; nothing collect-side can be measured live until it is on | `collect blocks > 0` on the next session's snapshot |
-| 2 | `RUN-3` | 7 of 29 BLOCKED tasks ended on an exec error the coder never saw; XS | exec-rejected attempts per BLOCKED task |
-| 3 | `RUN-4` | the most frequent coder failure in both trees; 6 BLOCKED tasks | `cut off` count, done/blocked ratio |
+| 1 | `RUN-6` | *landed* `7135844` (+`5788423`, `d4ffb12`) — the pack is off in every resumed session; nothing collect-side can be measured live until it is on | `collect blocks > 0` on the next session's snapshot |
+| 2 | `RUN-3` | *landed* — 7 of 29 BLOCKED tasks ended on an exec error the coder never saw; XS | exec-rejected attempts per BLOCKED task |
+| 3 | `RUN-4` | *landed* `ade28e6` — the most frequent coder failure in both trees; 6 BLOCKED tasks | `cut off` count, done/blocked ratio |
 | 4 | `RUN-5` | *landed* — 25–35 % of candidates dropped by provider silence; plan size is a coin flip until fixed | `unparsed` → `unknown` column, plan size |
 | 5 | `RUN-7` | *landed* — live `../testtext2` (`baa9da87a2ab`): a validator outage (ollama.com 429) was recorded as 5 rejections, the task went BLOCKED unreviewed | `validator_status = unavailable` rows, tasks left `todo` instead of BLOCKED |
 | 6 | `RUN-8` | *landed* — same run: one 80-min hung coder stream = one burned attempt + the whole task budget → BLOCKED after one round | `cod transport` column, deadline credited |
@@ -156,10 +157,10 @@ sequence; a step is not started until the previous one is merged.
 | 10 | `RUN-11` | *landed* `e84240b` — Pass B checkpoints every landed summary; Ctrl-C costs one module | `collect_summarize_state.json` after an interrupted refresh |
 | 7 | `L1` | *landed* `ff22c04` — deterministic: 82 / 30 gate-1 calls on non-`.py` locations | non-`.py` gate-1 rows → 0 |
 | 8 | `M3` | measurement only; decides whether V12/V13 exist | ceiling number in `EPIC-M-metrics.md` |
-| 9 | `V4`, `V10` | supply rows — worth it only once step 1 puts the pack in front of the coder | M2 static numbers, block sizes |
+| 9 | `V4`, `V10` | V10 *landed* `74cd58f`; V4 open — supply rows — worth it only once step 1 puts the pack in front of the coder | M2 static numbers, block sizes |
 | 10 | `V12`/`V13` | only if step 8 says ceiling > 0 | gate-1 stage split |
 | 11 | `M6` | outcome metric against `validate1/truth.csv`; needs a plan whose membership is not decided by step 4's bug | precision/recall |
-| 12 | `V8`, `V14`, `V15`, `L3` | low value now; V14 only if docs mode is used at all | — |
+| 12 | `V8`, `V14`, `V15`, `L3` | V8 *landed* `da1e9b3`; the rest low value now; V14 only if docs mode is used at all | — |
 
 After steps 1–4 land: reset one tree to its `pre_run_sha`, `--collect
 --refresh`, one full `--auto` execution run, snapshot with `--run-id`, then

@@ -1,6 +1,6 @@
 # V15 — Docs sync and the consumer column
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12), re-verified against `149eb88` (2026-10-01); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** LOW  
 **File:** `README.md`  
 **Symbol:** `—`  
@@ -9,6 +9,15 @@
 **Source:** `docs/collect-epics/PLAN-v2.md` § V15  
 **Depends on:** everything  
 **Also touches:** `docs/`  
+
+
+**Re-verified against `149eb88` (2026-10-01).** Not done. Paths: the metrics
+file is `docs/collect-epics/archive/EPIC-M-metrics.md`, not
+`docs/collect-epics/EPIC-M-metrics.md`. `sibling_gaps` is still produced
+(`tools/collect/cli.py:_sibling_gaps`). The stale "no-op today" sentence about
+`use_in_*` was corrected in every `agents*.ini` on 2026-10-01 (`use_in_auto`
+is wired and on in `agents_128k.ini`); the acceptance grep now passes, the
+rest of this ticket is still open.
 
 ---
 
@@ -28,7 +37,7 @@
 3. `README.md` `[collect]`: `pack_enabled`, `--rebuild`, `--drop-summaries`, the
    corrected `--refresh` description, and what `use_in_bughunt` / `use_in_doc`
    now do.
-4. `docs/collect-epics/EPIC-M-metrics.md` (**Measured** table — there is no `METRICS.md`) gets the filled before/after table.
+4. `docs/collect-epics/archive/EPIC-M-metrics.md` (**Measured** table — there is no `METRICS.md`) gets the filled before/after table.
 
 **Acceptance**
 

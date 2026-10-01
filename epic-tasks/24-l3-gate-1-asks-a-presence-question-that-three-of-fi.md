@@ -1,12 +1,20 @@
 # L3 — Gate 1 asks a presence question that three of five goals cannot answer
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12), re-verified against `149eb88` (2026-10-01); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** MEDIUM  
 **File:** `—`  
 **Symbol:** `—`  
 **Round:** 24 of 27  
 **Size:** S (measurement only)  
 **Source:** `docs/collect-epics/EPIC-L-live-findings.md` § L3  
+
+
+**Re-verified against `149eb88` (2026-10-01).** Not doable as written: the
+`../testtext`, `../testtext3`, `../testtext5`, `../testtext6` and `../testtext7`
+trees and their `.agent/trace_*.jsonl` no longer exist on this machine, so the
+table below cannot be reproduced. Either re-run `--auto` on those goals to get
+fresh traces, or close this ticket with the 2026-09 table as its record.
+`docs/TASK-jan-selfaudit.md` still exists.
 
 ---
 

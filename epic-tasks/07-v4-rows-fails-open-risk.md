@@ -1,6 +1,6 @@
 # V4 — Rows: `fails_open`, `risk`
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12), re-verified against `149eb88` (2026-10-01); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  
@@ -9,6 +9,24 @@
 **Source:** `docs/collect-epics/PLAN-v2.md` § V4  
 **Depends on:** V1, V2  
 
+
+**Re-verified against `149eb88` (2026-10-01).** Still not built: `_PACK_ROWS`
+has no `fails_open` or `risk` row. The numbers below were taken at `2f9005d`
+and have moved — measured on the current tree (`scan_repo` +
+`build_fail_open_registry` + `compute_risk_index`):
+
+| fact | ticket said | now |
+|---|---|---|
+| fail-open sites | 117 over 64 modules | **298 over 105 modules** |
+| sites with a rationale | 22 of 117 | **78 of 298** |
+| `coder.py` fail-open sites | 7 | 7 (all 7 undocumented) |
+| `coder.py` risk components | loc 2507 · imported by 25 · unguarded 45 | **loc 2792 · imported by 31 · unguarded 47** · covered yes |
+| `coder.py` composite score | 3138 | 3473 |
+| GUARDED / UNGUARDED accesses | 23 / 2620 | **68 / 7112** |
+
+The decision stands: GUARDED is still under 1 % of accesses, so no `guarded`
+row. The acceptance item "`coder.py` renders 7 fail-open sites" is still true.
+
 ---
 
 **Priority:** High · **Size:** S · **Files:** `tools/auto/context_assembler.py`
@@ -16,14 +34,14 @@
 
 **Do**
 
-1. `fails_open` from `fail_open_registry` (117 sites over 64 modules): the count,
+1. `fails_open` from `fail_open_registry` (298 sites over 105 modules at `149eb88`): the count,
    then up to 4 `:line type` pairs, then the sentence that is the point of the
    row — `— these swallow exceptions on purpose, do not add error handling here`.
-   A site *with* a rationale renders it; only 22 of 117 have one, so the row
+   A site *with* a rationale renders it; only 78 of 298 have one, so the row
    must read correctly without.
 2. `risk` from `risk_index`, rendering the **components**, never the raw score
-   (3138 for `coder.py` — unbounded and meaningless in a prompt):
-   `loc 2507 · imported by 25 · unguarded accesses 45 · covered yes`.
+   (3473 for `coder.py` — unbounded and meaningless in a prompt):
+   `loc 2792 · imported by 31 · unguarded accesses 47 · covered yes`.
    Suppress the row when nothing in it is notable.
 3. **No `guarded` row.** Measured: 23 GUARDED locations across 469 modules, on
    15 modules. A row that fires on 3% of files and says "0" on the rest is

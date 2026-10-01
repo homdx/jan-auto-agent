@@ -1,6 +1,6 @@
 # V12 — Gate-1 Stage A2, minimal — **only if M3 says the ceiling is > 0**
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12), re-verified against `149eb88` (2026-10-01); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** MEDIUM  
 **File:** `tools/auto/gate1_filter.py`  
 **Symbol:** `—`  
@@ -8,6 +8,15 @@
 **Size:** S  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V12  
 **Depends on:** M3  
+
+
+**Re-verified against `149eb88` (2026-10-01).** Not built; blocked on M3.
+**Name clash:** `gate1_filter.py` already calls its grounding-notes assembly
+"Stage A2" (AUTO-H2-1/-2/-3/-6 — evidence for Stage B, never a rejection). The
+new rejecting stage must not reuse that name: call it `already_safe` (the
+`FilterResult.stage` value this ticket already uses) in code, logs and tests.
+`use_in_bughunt = false` in every `agents*.ini`; `bughunt_filter.suppress()`
+has no caller outside `tests/test_collect_bughunt_suppression.py`.
 
 ---
 

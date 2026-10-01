@@ -1,6 +1,6 @@
 # M3 — Suppressor ceiling: the go/no-go for EPIC B
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12), re-verified against `149eb88` (2026-10-01); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** CRITICAL  
 **File:** `scripts/collect_metrics.py`  
 **Symbol:** `—`  
@@ -8,6 +8,17 @@
 **Size:** M  
 **Source:** `docs/collect-epics/EPIC-M-metrics.md` § M3  
 **Depends on:** M1. **Blocks:** every ticket in EPIC B except the Pass C fix.  
+
+
+**Re-verified against `149eb88` (2026-10-01).** Not done: no ceiling in
+`docs/collect-epics/baseline.json`. Its inputs are not in this repository:
+`validate1/` holds only `ANALYTICS-RUNBOOK.md`; `truth.csv` exists in the
+sibling checkouts `../code4/validate1/`, `../code6/validate1/` and
+`../code7/validate1/`. Copy one in (or name the path) before this can run.
+`GROUND-competition.md` is at the repo root. The counts in the table below are
+from `2f9005d`; today: fail-open 298 (78 with a rationale), GUARDED 68,
+UNGUARDED 7112, contracts 4 — re-count them as step 0. `bughunt_filter.py` still
+has no caller outside its test.
 
 ---
 
