@@ -208,6 +208,27 @@ class ProbeOp:
         return f"{self.op} {self.arg}".strip()
 
 
+@dataclass(frozen=True)
+class ProbeOpTally:
+    """One op's hit/miss tally from the last :meth:`ArchProbe.execute` call.
+
+    AUTO-P5-v2: ``last_by_op`` used to hand out ``dict(self._last_by_op)`` —
+    a shallow copy whose values were the exact ``[hits, misses]`` lists the
+    tally itself mutates via ``setdefault``. Copying the *dict* left every
+    *value* aliased, so ``probe.last_by_op["facts"][0] += 1`` silently
+    corrupted the probe's own bookkeeping (the same shape of bug fixed for
+    ``StateStore`` in commit ``4796e0a``). A frozen row cannot be written to
+    at all, so there is nothing left to alias.
+    """
+
+    op: str
+    hits: int
+    misses: int
+
+    def __str__(self) -> str:  # mirrors ProbeOp; used by last_by_op_str
+        return f"{self.op}={self.hits}/{self.misses}"
+
+
 def extract_probe_request(
     text: str,
     *,
@@ -579,17 +600,29 @@ class ArchProbe:
         return self._last_misses
 
     @property
-    def last_by_op(self) -> dict:
-        """AUTO-P5: ``{op_name: [hits, misses]}`` for the last execute()."""
-        return {k: list(v) for k, v in self._last_by_op.items()}
+    def last_by_op(self) -> tuple["ProbeOpTally", ...]:
+        """AUTO-P5-v2: one immutable :class:`ProbeOpTally` row per op from
+        the last :meth:`execute` call, ordered by op name.
+
+        Used to return ``dict(self._last_by_op)`` — a *block* of shared
+        mutable state: the dict copy was shallow, so its ``[hits, misses]``
+        values were the same list objects ``_resolve_op`` still tallies
+        into, and a caller mutating one corrupted the probe itself (see
+        :class:`ProbeOpTally`). Replacing that block with an ordered tuple
+        of frozen rows removes the aliasing outright rather than copying
+        around it, and sorting here — what :meth:`last_by_op_str` already
+        did — means both accessors now agree on one order instead of one
+        being insertion-order and the other sorted.
+        """
+        return tuple(
+            ProbeOpTally(op, h, m) for op, (h, m) in sorted(self._last_by_op.items())
+        )
 
     def last_by_op_str(self) -> str:
         """`last_by_op` as a trace-friendly string: ``facts=3/1 module=1/0``
         (hits/misses). Flat text because agent_trace stringifies params
         anyway, and a parseable one-liner beats a repr of a dict."""
-        return " ".join(
-            f"{op}={h}/{m}" for op, (h, m) in sorted(self._last_by_op.items())
-        )
+        return " ".join(str(row) for row in self.last_by_op)
 
     @property
     def run_chars_used(self) -> int:

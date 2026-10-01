@@ -39,7 +39,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.llm_stream import request_completion
 
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 BOM = "\ufeff"
 

@@ -1,0 +1,2327 @@
+{
+  "agnes-2-5-flash": {
+    "attach_clone_dirty_then_force": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised_without_force",
+          "ok": true
+        },
+        {
+          "detail": "c90ee56f98231723c343d069b9826c71efaf6648",
+          "name": "force_resets_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_force",
+          "ok": true
+        }
+      ]
+    },
+    "attach_clone_missing_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "foreign_folder_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    },
+    "fresh_round": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "got 2",
+          "name": "returned_n",
+          "ok": true
+        },
+        {
+          "detail": "c90ee56f98231723c343d069b9826c71efaf6648",
+          "name": "alice.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.clean",
+          "ok": true
+        },
+        {
+          "detail": "c90ee56f98231723c343d069b9826c71efaf6648",
+          "name": "bob.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.clean",
+          "ok": true
+        }
+      ]
+    },
+    "idempotent_reset_worktree": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "same_sha_twice",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_second",
+          "ok": true
+        }
+      ]
+    },
+    "remove_round_cleans_up": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "worktree /tmp/kc4-sbx-fhzhc5n6/repo\nHEAD 34ac21d9ed021880651be8fb8e7f5db25ca4605a\nbranch refs/heads/main\n\n",
+          "name": "no_worktrees_left",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "no_branches_left",
+          "ok": true
+        }
+      ]
+    },
+    "repo_checkout_never_touched": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "34ac21d9ed021880651be8fb8e7f5db25ca4605a->34ac21d9ed021880651be8fb8e7f5db25ca4605a",
+          "name": "head_unchanged",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_unchanged",
+          "ok": true
+        }
+      ]
+    },
+    "rerun_after_dirty_crash": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "c90ee56f98231723c343d069b9826c71efaf6648",
+          "name": "reset_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "runs_cleared",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_clean",
+          "ok": true
+        }
+      ]
+    },
+    "stale_branch_recreated": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "branch_survives_removal",
+          "ok": true
+        },
+        {
+          "detail": " \"-b\", branch, base_sha)\n  File \"/tmp/cb-kc4-wt/agnes-2-5-flash/tools/contest/workspace.py\", line 95, in _git\n    return subprocess.run(\n  File \"/usr/lib/python3.10/subprocess.py\", line 526, in run\n    raise CalledProcessError(retcode, process.args,\nsubprocess.CalledProcessError: Command '['git', '-",
+          "name": "crash",
+          "ok": false
+        }
+      ]
+    },
+    "unresolvable_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "untracked_epic_tasks_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "epic-tasks/ at the base does not match the working folder \u2014 the runbook warns that an untracked folder is invisible inside a worktree and a rerun after a crash means removing everything by hand first;",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "mentions_epic_tasks",
+          "ok": true
+        }
+      ]
+    },
+    "worktree_of_other_repo": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    }
+  },
+  "deepseek-v4-1-flash": {
+    "attach_clone_dirty_then_force": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised_without_force",
+          "ok": true
+        },
+        {
+          "detail": "916c8e353f5e69869460a22efefab418e5d206c8",
+          "name": "force_resets_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_force",
+          "ok": true
+        }
+      ]
+    },
+    "attach_clone_missing_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "foreign_folder_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    },
+    "fresh_round": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "got 2",
+          "name": "returned_n",
+          "ok": true
+        },
+        {
+          "detail": "34ac21d9ed021880651be8fb8e7f5db25ca4605a",
+          "name": "alice.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.clean",
+          "ok": true
+        },
+        {
+          "detail": "34ac21d9ed021880651be8fb8e7f5db25ca4605a",
+          "name": "bob.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.clean",
+          "ok": true
+        }
+      ]
+    },
+    "idempotent_reset_worktree": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "same_sha_twice",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_second",
+          "ok": true
+        }
+      ]
+    },
+    "remove_round_cleans_up": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "worktree /tmp/kc4-sbx-uq9p3cqc/repo\nHEAD 916c8e353f5e69869460a22efefab418e5d206c8\nbranch refs/heads/main\n\n",
+          "name": "no_worktrees_left",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "no_branches_left",
+          "ok": true
+        }
+      ]
+    },
+    "repo_checkout_never_touched": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "916c8e353f5e69869460a22efefab418e5d206c8->916c8e353f5e69869460a22efefab418e5d206c8",
+          "name": "head_unchanged",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_unchanged",
+          "ok": true
+        }
+      ]
+    },
+    "rerun_after_dirty_crash": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "34ac21d9ed021880651be8fb8e7f5db25ca4605a",
+          "name": "reset_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "runs_cleared",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_clean",
+          "ok": true
+        }
+      ]
+    },
+    "stale_branch_recreated": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "branch_survives_removal",
+          "ok": true
+        },
+        {
+          "detail": "916c8e353f5e69869460a22efefab418e5d206c8",
+          "name": "recreated_at_base",
+          "ok": true
+        },
+        {
+          "detail": "contest/30/alice",
+          "name": "on_same_branch",
+          "ok": true
+        }
+      ]
+    },
+    "unresolvable_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "untracked_epic_tasks_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "`epic-tasks/` has uncommitted or untracked file(s): epic-tasks/UNTRACKED.md \u2014 `epic-tasks/` must be committed before the round: `git worktree add` checks out the branch, so an untracked folder does no",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "mentions_epic_tasks",
+          "ok": true
+        }
+      ]
+    },
+    "worktree_of_other_repo": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    }
+  },
+  "glm4-7": {
+    "attach_clone_dirty_then_force": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised_without_force",
+          "ok": true
+        },
+        {
+          "detail": "029ca20dedf392166d1bc46adc05280908beabd8",
+          "name": "force_resets_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_force",
+          "ok": true
+        }
+      ]
+    },
+    "attach_clone_missing_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "foreign_folder_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    },
+    "fresh_round": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "got 2",
+          "name": "returned_n",
+          "ok": true
+        },
+        {
+          "detail": "916c8e353f5e69869460a22efefab418e5d206c8",
+          "name": "alice.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.clean",
+          "ok": true
+        },
+        {
+          "detail": "916c8e353f5e69869460a22efefab418e5d206c8",
+          "name": "bob.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.clean",
+          "ok": true
+        }
+      ]
+    },
+    "idempotent_reset_worktree": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "same_sha_twice",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_second",
+          "ok": true
+        }
+      ]
+    },
+    "remove_round_cleans_up": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "worktree /tmp/kc4-sbx-rp4b2j2m/repo\nHEAD 029ca20dedf392166d1bc46adc05280908beabd8\nbranch refs/heads/main\n\n",
+          "name": "no_worktrees_left",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "no_branches_left",
+          "ok": true
+        }
+      ]
+    },
+    "repo_checkout_never_touched": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "36de9a23de01f84c431a0687243f9295c556d349->36de9a23de01f84c431a0687243f9295c556d349",
+          "name": "head_unchanged",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_unchanged",
+          "ok": true
+        }
+      ]
+    },
+    "rerun_after_dirty_crash": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "916c8e353f5e69869460a22efefab418e5d206c8",
+          "name": "reset_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "runs_cleared",
+          "ok": false
+        },
+        {
+          "detail": "",
+          "name": "status_clean",
+          "ok": false
+        }
+      ]
+    },
+    "stale_branch_recreated": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "branch_survives_removal",
+          "ok": true
+        },
+        {
+          "detail": "_one_kc4.py\", line 252, in run\n    ws2 = mod.reset_worktree(repo, str(rounds_dir), 30, \"alice\", base_sha)\n  File \"/tmp/cb-kc4-wt/glm4-7/tools/contest/workspace.py\", line 224, in reset_worktree\n    raise WorkspaceError(f\"failed to {verb} worktree at {worktree_path}: {e}\")\nkc4_workspace.WorkspaceError",
+          "name": "crash",
+          "ok": false
+        }
+      ]
+    },
+    "unresolvable_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "untracked_epic_tasks_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "no exception",
+          "name": "raised",
+          "ok": false
+        }
+      ]
+    },
+    "worktree_of_other_repo": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    }
+  },
+  "hy3": {
+    "attach_clone_dirty_then_force": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised_without_force",
+          "ok": true
+        },
+        {
+          "detail": "36de9a23de01f84c431a0687243f9295c556d349",
+          "name": "force_resets_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_force",
+          "ok": true
+        }
+      ]
+    },
+    "attach_clone_missing_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "foreign_folder_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    },
+    "fresh_round": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "got 2",
+          "name": "returned_n",
+          "ok": true
+        },
+        {
+          "detail": "36de9a23de01f84c431a0687243f9295c556d349",
+          "name": "alice.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.clean",
+          "ok": true
+        },
+        {
+          "detail": "36de9a23de01f84c431a0687243f9295c556d349",
+          "name": "bob.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.clean",
+          "ok": true
+        }
+      ]
+    },
+    "idempotent_reset_worktree": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "same_sha_twice",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_second",
+          "ok": true
+        }
+      ]
+    },
+    "remove_round_cleans_up": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "worktree /tmp/kc4-sbx-iag2yia_/repo\nHEAD 36de9a23de01f84c431a0687243f9295c556d349\nbranch refs/heads/main\n\n",
+          "name": "no_worktrees_left",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "no_branches_left",
+          "ok": true
+        }
+      ]
+    },
+    "repo_checkout_never_touched": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "de048e66e2292c8e71ef3b70bf31abf6b4bb01fb->de048e66e2292c8e71ef3b70bf31abf6b4bb01fb",
+          "name": "head_unchanged",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_unchanged",
+          "ok": true
+        }
+      ]
+    },
+    "rerun_after_dirty_crash": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "36de9a23de01f84c431a0687243f9295c556d349",
+          "name": "reset_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "runs_cleared",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_clean",
+          "ok": true
+        }
+      ]
+    },
+    "stale_branch_recreated": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "branch_survives_removal",
+          "ok": true
+        },
+        {
+          "detail": "de048e66e2292c8e71ef3b70bf31abf6b4bb01fb",
+          "name": "recreated_at_base",
+          "ok": true
+        },
+        {
+          "detail": "contest/30/alice",
+          "name": "on_same_branch",
+          "ok": true
+        }
+      ]
+    },
+    "unresolvable_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "untracked_epic_tasks_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "epic-tasks/ has uncommitted or untracked changes at the base commit \u2014 an untracked epic-tasks/ is invisible inside a worktree, so the runbook forbids it; commit epic-tasks/ at the base before running ",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "mentions_epic_tasks",
+          "ok": true
+        }
+      ]
+    },
+    "worktree_of_other_repo": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    }
+  },
+  "laguna-s-2-1": {
+    "attach_clone_dirty_then_force": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised_without_force",
+          "ok": true
+        },
+        {
+          "detail": "de048e66e2292c8e71ef3b70bf31abf6b4bb01fb",
+          "name": "force_resets_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_force",
+          "ok": true
+        }
+      ]
+    },
+    "attach_clone_missing_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "foreign_folder_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    },
+    "fresh_round": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "got 2",
+          "name": "returned_n",
+          "ok": true
+        },
+        {
+          "detail": "de048e66e2292c8e71ef3b70bf31abf6b4bb01fb",
+          "name": "alice.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.clean",
+          "ok": true
+        },
+        {
+          "detail": "de048e66e2292c8e71ef3b70bf31abf6b4bb01fb",
+          "name": "bob.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.clean",
+          "ok": true
+        }
+      ]
+    },
+    "idempotent_reset_worktree": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "same_sha_twice",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_second",
+          "ok": true
+        }
+      ]
+    },
+    "remove_round_cleans_up": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "worktree /tmp/kc4-sbx-tqs5xv_5/repo\nHEAD abd6fadd7f70961d879e75784fd0c4e64256a4aa\nbranch refs/heads/main\n\n",
+          "name": "no_worktrees_left",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "no_branches_left",
+          "ok": true
+        }
+      ]
+    },
+    "repo_checkout_never_touched": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "abd6fadd7f70961d879e75784fd0c4e64256a4aa->abd6fadd7f70961d879e75784fd0c4e64256a4aa",
+          "name": "head_unchanged",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_unchanged",
+          "ok": true
+        }
+      ]
+    },
+    "rerun_after_dirty_crash": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "de048e66e2292c8e71ef3b70bf31abf6b4bb01fb",
+          "name": "reset_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "runs_cleared",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_clean",
+          "ok": true
+        }
+      ]
+    },
+    "stale_branch_recreated": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "branch_survives_removal",
+          "ok": true
+        },
+        {
+          "detail": "abd6fadd7f70961d879e75784fd0c4e64256a4aa",
+          "name": "recreated_at_base",
+          "ok": true
+        },
+        {
+          "detail": "contest/30/alice",
+          "name": "on_same_branch",
+          "ok": true
+        }
+      ]
+    },
+    "unresolvable_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "untracked_epic_tasks_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "epic-tasks/ is not clean at base de048e66e2292c8e71ef3b70bf31abf6b4bb01fb \u2014 commit epic-tasks/ before preparing a round: an untracked folder does not exist inside a worktree, so next_task.py finds not",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "mentions_epic_tasks",
+          "ok": true
+        }
+      ]
+    },
+    "worktree_of_other_repo": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    }
+  },
+  "sn67-var1": {
+    "attach_clone_dirty_then_force": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised_without_force",
+          "ok": true
+        },
+        {
+          "detail": "9b1b7355cb3d8213d60c3531926d1f86079c7fc5",
+          "name": "force_resets_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_force",
+          "ok": true
+        }
+      ]
+    },
+    "attach_clone_missing_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "foreign_folder_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    },
+    "fresh_round": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "got 2",
+          "name": "returned_n",
+          "ok": true
+        },
+        {
+          "detail": "abd6fadd7f70961d879e75784fd0c4e64256a4aa",
+          "name": "alice.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.clean",
+          "ok": true
+        },
+        {
+          "detail": "abd6fadd7f70961d879e75784fd0c4e64256a4aa",
+          "name": "bob.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.clean",
+          "ok": true
+        }
+      ]
+    },
+    "idempotent_reset_worktree": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "same_sha_twice",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_second",
+          "ok": true
+        }
+      ]
+    },
+    "remove_round_cleans_up": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "worktree /tmp/kc4-sbx-x9qcy424/repo\nHEAD 9b1b7355cb3d8213d60c3531926d1f86079c7fc5\nbranch refs/heads/main\n\n",
+          "name": "no_worktrees_left",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "no_branches_left",
+          "ok": true
+        }
+      ]
+    },
+    "repo_checkout_never_touched": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "9b1b7355cb3d8213d60c3531926d1f86079c7fc5->9b1b7355cb3d8213d60c3531926d1f86079c7fc5",
+          "name": "head_unchanged",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_unchanged",
+          "ok": true
+        }
+      ]
+    },
+    "rerun_after_dirty_crash": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "abd6fadd7f70961d879e75784fd0c4e64256a4aa",
+          "name": "reset_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "runs_cleared",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_clean",
+          "ok": true
+        }
+      ]
+    },
+    "stale_branch_recreated": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "branch_survives_removal",
+          "ok": true
+        },
+        {
+          "detail": "9b1b7355cb3d8213d60c3531926d1f86079c7fc5",
+          "name": "recreated_at_base",
+          "ok": true
+        },
+        {
+          "detail": "contest/30/alice",
+          "name": "on_same_branch",
+          "ok": true
+        }
+      ]
+    },
+    "unresolvable_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "untracked_epic_tasks_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "epic-tasks/ has uncommitted changes (epic-tasks/UNTRACKED.md): `git worktree add` checks out the base commit, so a file that is not committed there does not exist inside the agents' worktrees and next",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "mentions_epic_tasks",
+          "ok": true
+        }
+      ]
+    },
+    "worktree_of_other_repo": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    }
+  },
+  "sn68-var1": {
+    "attach_clone_dirty_then_force": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised_without_force",
+          "ok": true
+        },
+        {
+          "detail": "fd7742cdcdf2c705c4a6ab23ea31d04f3b31bd7d",
+          "name": "force_resets_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_force",
+          "ok": true
+        }
+      ]
+    },
+    "attach_clone_missing_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "foreign_folder_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    },
+    "fresh_round": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "got 2",
+          "name": "returned_n",
+          "ok": true
+        },
+        {
+          "detail": "9b1b7355cb3d8213d60c3531926d1f86079c7fc5",
+          "name": "alice.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.clean",
+          "ok": true
+        },
+        {
+          "detail": "9b1b7355cb3d8213d60c3531926d1f86079c7fc5",
+          "name": "bob.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.clean",
+          "ok": true
+        }
+      ]
+    },
+    "idempotent_reset_worktree": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "same_sha_twice",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_second",
+          "ok": true
+        }
+      ]
+    },
+    "remove_round_cleans_up": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "worktree /tmp/kc4-sbx-htg1id0u/repo\nHEAD fd7742cdcdf2c705c4a6ab23ea31d04f3b31bd7d\nbranch refs/heads/main\n\n",
+          "name": "no_worktrees_left",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "no_branches_left",
+          "ok": true
+        }
+      ]
+    },
+    "repo_checkout_never_touched": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "4fea84ccb9e3cc72636e493cc5943a6fadf44fb9->4fea84ccb9e3cc72636e493cc5943a6fadf44fb9",
+          "name": "head_unchanged",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_unchanged",
+          "ok": true
+        }
+      ]
+    },
+    "rerun_after_dirty_crash": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "9b1b7355cb3d8213d60c3531926d1f86079c7fc5",
+          "name": "reset_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "runs_cleared",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_clean",
+          "ok": true
+        }
+      ]
+    },
+    "stale_branch_recreated": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "branch_survives_removal",
+          "ok": true
+        },
+        {
+          "detail": "fd7742cdcdf2c705c4a6ab23ea31d04f3b31bd7d",
+          "name": "recreated_at_base",
+          "ok": true
+        },
+        {
+          "detail": "contest/30/alice",
+          "name": "on_same_branch",
+          "ok": true
+        }
+      ]
+    },
+    "unresolvable_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "untracked_epic_tasks_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "epic-tasks/ differs from the base fd7742cdcdf2 \u2014 not committed at the base: UNTRACKED.md. `git worktree add` checks out the base commit, so tickets that are not committed there do not exist inside the",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "mentions_epic_tasks",
+          "ok": true
+        }
+      ]
+    },
+    "worktree_of_other_repo": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    }
+  },
+  "sn68-var2": {
+    "attach_clone_dirty_then_force": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised_without_force",
+          "ok": true
+        },
+        {
+          "detail": "4fea84ccb9e3cc72636e493cc5943a6fadf44fb9",
+          "name": "force_resets_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_force",
+          "ok": true
+        }
+      ]
+    },
+    "attach_clone_missing_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "foreign_folder_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    },
+    "fresh_round": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "got 2",
+          "name": "returned_n",
+          "ok": true
+        },
+        {
+          "detail": "4fea84ccb9e3cc72636e493cc5943a6fadf44fb9",
+          "name": "alice.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.clean",
+          "ok": true
+        },
+        {
+          "detail": "4fea84ccb9e3cc72636e493cc5943a6fadf44fb9",
+          "name": "bob.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.clean",
+          "ok": true
+        }
+      ]
+    },
+    "idempotent_reset_worktree": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "same_sha_twice",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_second",
+          "ok": true
+        }
+      ]
+    },
+    "remove_round_cleans_up": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "worktree /tmp/kc4-sbx-zb976z0y/repo\nHEAD 4fbad53f55456873e5b24f762b1463a51d5dc2be\nbranch refs/heads/main\n\n",
+          "name": "no_worktrees_left",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "no_branches_left",
+          "ok": true
+        }
+      ]
+    },
+    "repo_checkout_never_touched": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "4fbad53f55456873e5b24f762b1463a51d5dc2be->4fbad53f55456873e5b24f762b1463a51d5dc2be",
+          "name": "head_unchanged",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_unchanged",
+          "ok": true
+        }
+      ]
+    },
+    "rerun_after_dirty_crash": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "4fea84ccb9e3cc72636e493cc5943a6fadf44fb9",
+          "name": "reset_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "runs_cleared",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_clean",
+          "ok": true
+        }
+      ]
+    },
+    "stale_branch_recreated": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "branch_survives_removal",
+          "ok": true
+        },
+        {
+          "detail": "4fbad53f55456873e5b24f762b1463a51d5dc2be",
+          "name": "recreated_at_base",
+          "ok": true
+        },
+        {
+          "detail": "contest/30/alice",
+          "name": "on_same_branch",
+          "ok": true
+        }
+      ]
+    },
+    "unresolvable_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "untracked_epic_tasks_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "epic-tasks/ has 1 uncommitted change(s) not in HEAD: epic-tasks/UNTRACKED.md. `git worktree add` checks out the base commit, so these are not present inside any agent's worktree and next_task.py finds",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "mentions_epic_tasks",
+          "ok": true
+        }
+      ]
+    },
+    "worktree_of_other_repo": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    }
+  },
+  "sn68-var3": {
+    "attach_clone_dirty_then_force": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised_without_force",
+          "ok": true
+        },
+        {
+          "detail": "b3a263de78c31dcdb33962c57f70c92811f87643",
+          "name": "force_resets_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_force",
+          "ok": true
+        }
+      ]
+    },
+    "attach_clone_missing_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "foreign_folder_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    },
+    "fresh_round": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "got 2",
+          "name": "returned_n",
+          "ok": true
+        },
+        {
+          "detail": "4fbad53f55456873e5b24f762b1463a51d5dc2be",
+          "name": "alice.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "alice.clean",
+          "ok": true
+        },
+        {
+          "detail": "4fbad53f55456873e5b24f762b1463a51d5dc2be",
+          "name": "bob.at_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.runs_empty",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "bob.clean",
+          "ok": true
+        }
+      ]
+    },
+    "idempotent_reset_worktree": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "same_sha_twice",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "clean_after_second",
+          "ok": true
+        }
+      ]
+    },
+    "remove_round_cleans_up": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "worktree /tmp/kc4-sbx-jpfrs9hb/repo\nHEAD b3a263de78c31dcdb33962c57f70c92811f87643\nbranch refs/heads/main\n\n",
+          "name": "no_worktrees_left",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "no_branches_left",
+          "ok": true
+        }
+      ]
+    },
+    "repo_checkout_never_touched": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "b3a263de78c31dcdb33962c57f70c92811f87643->b3a263de78c31dcdb33962c57f70c92811f87643",
+          "name": "head_unchanged",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_unchanged",
+          "ok": true
+        }
+      ]
+    },
+    "rerun_after_dirty_crash": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "4fbad53f55456873e5b24f762b1463a51d5dc2be",
+          "name": "reset_to_base",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "runs_cleared",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "status_clean",
+          "ok": true
+        }
+      ]
+    },
+    "stale_branch_recreated": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "branch_survives_removal",
+          "ok": true
+        },
+        {
+          "detail": "b3a263de78c31dcdb33962c57f70c92811f87643",
+          "name": "recreated_at_base",
+          "ok": true
+        },
+        {
+          "detail": "contest/30/alice",
+          "name": "on_same_branch",
+          "ok": true
+        }
+      ]
+    },
+    "unresolvable_base": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        }
+      ]
+    },
+    "untracked_epic_tasks_refused": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "the round cannot start at 4fbad53f5545: epic-tasks/UNTRACKED.md is on disk but not committed at the base. `git worktree add` checks out the branch, so an untracked folder does not exist inside the age",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "mentions_epic_tasks",
+          "ok": true
+        }
+      ]
+    },
+    "worktree_of_other_repo": {
+      "checks": [
+        {
+          "detail": "",
+          "name": "import",
+          "ok": true
+        },
+        {
+          "detail": "WorkspaceError",
+          "name": "raised",
+          "ok": true
+        },
+        {
+          "detail": "",
+          "name": "left_untouched",
+          "ok": true
+        }
+      ]
+    }
+  }
+}

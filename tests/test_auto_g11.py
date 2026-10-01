@@ -175,7 +175,7 @@ git_user = agent
 git_email = agent@test
 max_rounds_per_task = {max_rounds}
 max_attempts_per_task = {max_attempts}
-exec_timeout_sec = 30
+exec_timeout_sec = 300
 max_tasks_per_run = {max_tasks}
 max_runtime_min = 0
 

@@ -6,7 +6,9 @@ an OpenCode-based headless server), provider `kenary`, models
 `laguna-s-2-1:free`, `mistral-medium-3-5:free`, `hy3:free`. Session directory
 `/tmp/kilo-hello`. Raw event log of every run: `/tmp/kilo-hello/events.jsonl`
 (not committed). The script is standard-library only and imports nothing from
-this repository.
+this repository. The contest built on these primitives and its operator's
+reset/run/score page are [`EPIC-KC.md`](EPIC-KC.md) and
+[`RUN-THE-KILO-CONTEST.md`](RUN-THE-KILO-CONTEST.md).
 
 ```bash
 python3 scripts/kilo_hello.py --model kenary/hy3:free --dir /tmp/kilo-hello --file hello-hy3.txt --append-model
@@ -104,6 +106,71 @@ With `"reply": "once"`: `status=completed output="removed '/tmp/testfile'\n"`.
    call and its result live in the `tool` parts of
    `GET /session/{id}/message`, and the fact of an edit shows up as
    `file.edited` + `session.diff`.
+
+## KC-1 module re-verified live (2026-09-18)
+
+`tools/contest/kilo_client.py` (the module built from this probe) was run
+live against a real `kilo` server and all three models, independently of
+`kilo_hello.py`: same two-turn same-session flow (write `hello.txt`, then
+append a line) plus the `rm -v` outside-directory boundary check, using
+`KiloClient`/`EventTap`/`wait_idle` as shipped. All three passed —
+`session.idle` observed on both turns, file content correct,
+`permission.asked` fired and `reject` was honored on the boundary turn.
+
+Timings (turn 1 / turn 2, seconds to idle): laguna 13.8 / 23.2, mistral
+15.8 / 15.6, hy3 16.8 / 19.2 — consistent with the original probe numbers
+above. `tool_parts()` per model: laguna and hy3 both did
+`write → read → edit`, mistral did `write → edit` only. Boundary permission
+count: laguna 2, mistral 2, hy3 1 (mistral's retry-with-`workdir` behaviour
+noted in fact 3 above still holds).
+
+## KC-2 roster re-verified live (2026-09-18)
+
+`tools/contest/roster.py`'s `load_roster("contest.ini")` was used, unmodified,
+to drive real sessions: for each of the three `AgentSpec`s it returned
+(`laguna`, `mistral`, `hy3` — provider/model split at the first `/`),
+`KiloClient.create_session` was called with that spec's `provider_id`/
+`model_id` and `ContestConfig.session_rules()` as the permission list, then
+prompted with `"Reply with exactly: OK"`. All three reached `session.idle`
+and replied `OK` (laguna 9.2 s, mistral 9.2 s, hy3 7.6 s). No fix needed —
+the roster's parsing and rule list work as shipped against a real server.
+
+## KC-3 policy re-verified live (2026-09-18)
+
+`tools/contest/policy.py` (winner `SenSenova6-7-var`, landed `1499cd8`, plus
+the `_pathlike` bare-command fix, `5214138`) was checked against a real
+`permission.asked` event instead of a synthetic one. For each of the three
+roster models a live session was prompted to "run exactly `whoami` (bare
+command, no arguments, no path)" with `bash: ask`; the raw event was fed
+into `Policy.decide()` built from the real, committed `contest.ini` via
+`load_roster`.
+
+All three models produced the same event shape — a bare, path-free command:
+
+```
+{"permission": "bash", "patterns": ["whoami"], "always": ["whoami *"],
+ "metadata": {"command": "whoami", ...}}
+```
+
+Before the `_pathlike` fix this shape was the exact bug: `Path("whoami").resolve()`
+resolves against cwd and reads as "inside the worktree", so the mechanical
+layer auto-approved it, skipping `deny_commands` and the gate entirely.
+With the fix, `_pathlike()` requires a leading `/`, `~`, `./` or `../`, so
+`"whoami"` no longer qualifies as a path and the event falls through to the
+gate check. Confirmed live: `policy.decide()` returned
+`Decision(reply='reject', layer='budget', reason='gate budget exhausted (0)')`
+for all three models — i.e. the mechanical layer did **not** auto-approve,
+it correctly deferred to the gate. (`gate_budget_left=0` was used because no
+real `contest_gate_llm`/`gate1_llm` credential exists in this repo yet —
+both are unfilled `${ENV}`/placeholder values — so the gate call itself
+could not be exercised live; only the mechanical-layer routing was
+verified against genuine events.)
+
+No fix needed as a result of this check — `_pathlike()` holds against real
+model-generated events, not just the synthetic `reboot` repro. `kilo_hello.py`
+was not touched (per KC-1's acceptance rule); no minimal-example update was
+warranted since the throwaway probe script, not the shipped hello-world
+template, was what exercised the real Kilo protocol here.
 
 ## Side observations
 

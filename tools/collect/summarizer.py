@@ -542,10 +542,16 @@ def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
     except ValueError as exc:
         logger.warning("config [collect] temperature is malformed (%s) — using default 0.1", exc)
         temperature = 0.1
+    # [collect] timeout_seconds first: a Pass B reply is a short JSON, while
+    # [loop] timeout_seconds is the agent's budget (4800 s in the big
+    # profiles) — borrowed here, a dropped connection held collect for over
+    # an hour before error_retries ever saw it. Unset → [loop], as before.
+    timeout_section = "collect" if config.has_option("collect", "timeout_seconds") else "loop"
     try:
-        timeout = config.getint("loop", "timeout_seconds", fallback=300)
+        timeout = config.getint(timeout_section, "timeout_seconds", fallback=300)
     except ValueError as exc:
-        logger.warning("config [loop] timeout_seconds is malformed (%s) — using default 300", exc)
+        logger.warning("config [%s] timeout_seconds is malformed (%s) — using default 300",
+                       timeout_section, exc)
         timeout = 300
     # Thinking models (qwen3) prepend a <think> block; Pass B is a short,
     # structured-JSON reply, so default this off the same way gate1/coder do

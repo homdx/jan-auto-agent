@@ -1,0 +1,1 @@
+../tests/test_contest_policy_file_asks.py

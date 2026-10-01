@@ -174,7 +174,7 @@ sequence, one candidate at a time, never two in parallel:
    `9406601`; case 1 must fail, the rest may pass.
 5. **Suites**, sequentially, in the candidate's worktree:
    ```bash
-   python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+   python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
    ```
 6. **Proxy, twice.** `v16proxy.py` on the candidate tree → must print
    `empty 0 … dropped 0`. Then the V11 proxy (`V11/` report, test-file
@@ -216,7 +216,7 @@ check has misread the ticket).
    and run nothing extra; combining roots in one `pytest` call produces ~362
    false errors from a conftest collision:
    ```bash
-   python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+   python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
    ```
    `python` is not on PATH — use `python3`. One suite at a time — the machine
    is shared with the other round entrants.

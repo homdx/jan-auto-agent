@@ -834,11 +834,22 @@ class TestRewriteGateContextSatisfied:
         state.upsert_task(dict(TASK))
 
         mock_inner = MagicMock()
+        # FL-1 (round 84): state explicitly that this fixture wants no
+        # wall-clock task budget, rather than relying on the
+        # _task_budget_seconds guard to turn an unset MagicMock attribute
+        # into 0. Un-set, a bare MagicMock() coerces via float() to 1.0 (it
+        # implements __float__), which used to install a real 1-second
+        # budget across all rounds nobody asked for and made this test race
+        # its own wall clock to reach the round the rewriter is eligible for.
+        mock_inner.max_task_seconds = 0
 
         outer = OuterLoop(
             inner_loop=mock_inner,
             state=state,
-            max_rounds=5,
+            # A test asserting a rewriter is called must not be spending
+            # its wall clock to get there — give the eligible round
+            # (rewrite_every_n_rounds=2) comfortable headroom.
+            max_rounds=8,
             task_rewriter=rewriter,
             rewrite_every_n_rounds=2,
             max_rewrites=5,

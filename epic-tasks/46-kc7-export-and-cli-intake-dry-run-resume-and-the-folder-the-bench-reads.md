@@ -1,95 +1,133 @@
-# KC-7 — `tools/contest/export.py` + `cli.py`: `python3 -m tools.contest run` — intake, the round, and the folder `contest-bench` reads
+# KC-7 — `run --dry-run`, `status`, `entrants.json` and `SUMMARY.md`: the round's folder is the one `contest-bench` reads
 
-**Status:** queued — after KC-6 (round 45). Written against `67e834d`.  
-**Severity:** HIGH  
-**File:** `tools/contest/cli.py` (new), `tools/contest/export.py` (new), `tools/contest/__main__.py` (new)  
-**Symbol:** `main`, `cmd_run`, `cmd_status`, `intake`, `export_round`, `write_summary`, `write_entrants`  
-**Round:** 46  
-**Size:** M  
-**Source:** `contest-bench/harness/setup_worktrees.py`'s docstring is the `entrants.json` contract (`base`, `entrants.<name>.source`, optional `duplicate_of`); `scripts/judge_epic_round.py --worktree name=path` is the scorer's input; `scripts/next_task.py` refuses tickets whose `**Status:**` is `landed`/`queued`. The run must stop where those start.  
-**Depends on:** KC-6 (and through it all earlier rounds).  
-**Also touches:** `tests/test_contest_cli.py` (new), `.gitignore` (`contest-out/` — from KC-2), `AGENTS.md` (one line under Build/Run)
+**Status:** landed `3e9f5d5` — applied from patch 1-kc7-round46-winner + KC-72 62719ee
+**Severity:** HIGH
+**File:** `tools/contest/export.py` (new), `tools/contest/cli.py`
+**Symbol:** `write_entrants`, `write_summary`, `cmd_status`, `cmd_run`, `intake`, `_parser`
+**Round:** 46
+**Size:** M
+**Source:** `contest-bench/harness/setup_worktrees.py`'s docstring is the `entrants.json` contract (`base`, `entrants.<name>.source`, optional `duplicate_of`); `scripts/judge_epic_round.py --worktree name=path` is the scorer's input; `scripts/next_task.py` reads `**File:**` and `**Symbol:**` from every ticket. The run must stop where those start.
+**Depends on:** KC-16 (landed), KC-31 (landed), KC-41 (landed).
+**Also touches:** `tests/test_contest_cli_export.py` (new), `AGENTS.md` (the `--dry-run` and `status` lines under Build)
 
 ---
 
 ## What happens today
 
-`run_round` exists but nothing invokes it, checks the inputs, or turns
-the terminal states into files the existing tooling reads. The operator
-would still hand-write `entrants.json` and `format-patch` each branch.
+`python3 -m tools.contest run --ticket NN` runs the round and leaves
+`contest-out/NN/` with one `.patch` or `.diff` per agent, `state.json`, the
+per-agent folders and one JSON line per agent on stdout. After that the operator
+still has to:
+
+- hand-write `entrants.json` for `contest-bench` — round 87's folder has six
+  patches and diffs and no `entrants.json`;
+- read `state.json` or scroll the terminal to see who ended how, and grep
+  every `decisions.jsonl` for the gate's refusals;
+- start the whole round, kilo server included, to see the prompt the agents
+  would get. No command prints the plan and stops.
+
+`cli.py`'s own docstring says so: *"No summary, no `entrants.json`, no
+scoring"*, and *"KC-7 (round 46) adds `status` and `--dry-run`"*.
 
 ## What must change
 
-1. **`intake(repo, config, round_no, base_ref) -> Intake`** — before any
-   server starts: the ticket file for `round_no` exists (`gates.ticket_for_round`);
-   its `**Status:**` first word is `open` (not `landed`, not `queued`);
-   it has `**File:**` and `**Symbol:**` lines (the `next_task.py` contract);
-   `base_ref` resolves; `epic-tasks/` is committed at the base
-   (KC-4's check, called early so the message comes before worktrees);
-   `kilo_bin` resolves (`find_kilo_binary`) or `server` is a URL that
-   answers `/global/health`; the gate profile has a non-empty `api_key`
-   after env expansion. Any failure → exit 1 with one line per problem.
-   Everything passes → prints the plan: ticket title, base sha, N agents
-   with models, gate model, out dir.
+1. **`run --dry-run`.** Run `intake`, then `prepare_round`, then print the plan
+   (`_print_plan`) and the exact prompt `runner.round_prompt` would send the
+   first agent. Then exit 0.
+   - It starts no `kilo serve`, not even intake's throwaway offer server, and
+     opens no session and no gate call.
+   - The checks that need a server (the offer, the variant probe, the gate
+     probe) are skipped. Each prints one `dry-run: skipped …` line so the plan
+     does not look fully checked.
+   - The worktrees it creates are the round's own. A later `run` without
+     `--fresh` meets them as KC-23 does today, and says so. `--dry-run
+     --fresh` is allowed.
 
-2. **`cmd_run`** — `python3 -m tools.contest run --ticket NN [--roster contest.ini] [--base REF] [--attach URL] [--clone name=path …] [--dry-run] [--resume] [--run-tests]`:
-   - `--dry-run`: intake + `prepare_round` + print the plan and the
-     exact prompt that would be sent; **no server, no session**;
-   - otherwise: `KiloServer.spawn` (or `attach`), `run_round`,
-     `export_round`, server closed in `finally`; `--resume` loads
-     `out_dir/<NN>/state.json` and passes it through; `--run-tests`
-     makes harvest run the four pytest roots (slow; off by default);
-   - exit 0 if ≥ 1 agent `READY`, 2 if none, 1 on intake/server error.
-   - `cmd_status`: `python3 -m tools.contest status --ticket NN` prints
-     the table from `state.json` without touching anything.
+2. **`intake` refuses a ticket without `**File:**` or `**Symbol:**`.**
+   `scripts/next_task.py` needs both, so the sessions would be handed a
+   different ticket, or none. One `intake:` line per missing field, read from
+   the base tree like the status check.
 
-3. **`export_round(state: RoundState, workspaces, out_dir, base_sha)`**:
-   - for every agent with a commit (`READY`, and `GAVE_UP` with a commit):
-     `git -C ws format-patch --stdout <base_sha>..<branch>` → `out_dir/<agent>.patch`;
-     `GAVE_UP` patches are named `<agent>.GAVE_UP.patch`;
-   - `write_entrants(out_dir, base_sha, agents)` → `entrants.json` in the
-     bench's shape, `source` relative to `out_dir`, byte-identical patches
-     marked `duplicate_of` (compare after stripping the `From <sha>` and
-     `Date:` lines);
-   - `write_summary(out_dir, state)` → `SUMMARY.md`: the header (ticket,
-     base, gate model, started/finished, wall time), then one table row
-     per agent — name, model, state, attempts, turns, asked/allowed/
-     rejected/gated/gate-failed, questions, cost, tokens in/out, commit,
-     last reason — then a "Decisions worth a look" list: every `gate` and
-     `gate-failed` decision across agents with its command and reason
-     (the operator reads this to see whether the gate blocked something
-     the ticket needed), then the three commands to run next
-     (`judge_epic_round.py --worktree …` with the real paths,
-     `contest-bench/harness/setup_worktrees.py <out>/entrants.json --wt …`,
-     `contest_reset.sh` for cleanup).
+3. **`export.write_entrants(out_dir, base_sha, state, paths) -> Path`** writes
+   `entrants.json` in the shape `setup_worktrees.py` reads.
+   - `base` is the round's base sha.
+   - There is one entry per exported `.patch` or `.diff`, keyed by agent name.
+     `source` is relative to the repo root when the file is under it, and
+     absolute otherwise. `setup_worktrees.py` and `validate_inputs.py` both
+     resolve it against `--repo`, not against the JSON file's folder.
+   - A patch that is byte-identical to an earlier one gets
+     `duplicate_of: <first name>` instead of being a second entry. The
+     comparison drops the `From <sha>` and `Date:` lines first.
+   - A `GAVE_UP`, `STALLED` or `ERROR` entry is included. Its state is in its
+     file name, and the bench scores it like any other; it gets `"state"`
+     alongside `source`.
+   - With no patch at all, no file is written.
 
-4. **`tools/contest/__main__.py`** → `cli.main()`. `AGENTS.md` gains the
-   `run` line and the dry-run line.
+4. **`export.write_summary(out_dir, state, base_sha, paths) -> Path`** writes
+   `SUMMARY.md` in three parts.
+   - **Header:** ticket, base, gate model, the round's start and end, and wall
+     time.
+   - **Table:** one row per agent from `state.table_rows()`: name, model,
+     state, attempts, turns, asked/allowed/rejected/gated/gate-failed,
+     questions, cost, tokens in/out, commit, last reason, and the file
+     exported.
+   - **"Decisions worth a look":** every `gate` and `gate-failed` decision
+     from each agent's `decisions.jsonl`, with the command and the reason.
+     The operator reads it to see whether the gate blocked something the
+     ticket needed.
+   - It ends with the two commands to run next, using the real paths:
+     `python3 contest-bench/harness/setup_worktrees.py <out>/entrants.json --wt …`
+     and `python3 scripts/judge_epic_round.py --round NN --base <sha>
+     --worktree <agent>=<its worktree> …`. It does not name
+     `scripts/contest_reset.sh`: that script prepares a round's worktrees and
+     cleans nothing up.
+
+   `cmd_run` calls both after `export_patches`, and prints their paths with the
+   `patch:` lines. A failure to write either one is a `warn:` line, never a
+   different exit code.
+
+5. **`status --ticket NN [--out DIR]`** prints the SUMMARY table from
+   `<out>/state.json` and touches nothing. It works mid-round too: `state.json`
+   is saved at every transition. With no `state.json`, it prints one line and
+   exits 1.
+
+6. **`cli.py`'s module docstring** stops saying "no summary, no
+   `entrants.json`". `AGENTS.md` gains the `--dry-run` and `status` lines.
 
 ## Acceptance
 
-- [ ] `tests/test_contest_cli.py`: `--dry-run` on a temp repo with a
-      committed open ticket prints the plan and the prompt, creates the
-      worktrees, starts **no** server (assert `KiloServer.spawn` is not
-      called — monkeypatch); a `queued` ticket, a missing `**File:**`
-      line, an unresolved base, uncommitted `epic-tasks/`, and an empty
-      gate `api_key` each fail intake with the named reason and exit 1;
-      a full `run` against `tests/_kilo_fake.py` (monkeypatch
-      `KiloServer.spawn` to attach to the fake) with two agents — one
-      READY, one GAVE_UP with a commit — writes `laguna.patch`,
-      `mistral.GAVE_UP.patch`, `entrants.json` that
-      `contest-bench/harness/setup_worktrees.py` accepts (call its loader
-      on it), and a `SUMMARY.md` with both rows and the gate section;
-      exit 0; the same with both GAVE_UP → exit 2; two byte-identical
-      patches → the second is `duplicate_of` the first.
-- [ ] `git am` of `laguna.patch` onto the base in a fresh temp worktree
-      applies cleanly and reproduces the branch's tree.
-- [ ] `status` after the run prints the same table as `SUMMARY.md`'s.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+All tests are offline: no `kilo`, no provider, no network. The fake is
+`tests/_kilo_fake.py`, attached through a monkeypatched `KiloServer.spawn`, as
+in the existing `test_contest_cli*` files.
+
+- [ ] `--dry-run` on a temp repo with a committed open ticket:
+  - prints the plan, the prompt and the `dry-run: skipped` lines;
+  - creates the worktrees;
+  - `KiloServer.spawn`, `KiloServer.attach` and the gate client are never
+    called (monkeypatched to raise);
+  - exits 0.
+- [ ] A ticket without `**File:**`, and one without `**Symbol:**`, each fail
+      intake with that line and exit 1.
+- [ ] A full `run` with two agents, one READY and one GAVE_UP with a commit,
+      writes `<a>.patch`, `<b>.GAVE_UP.patch` and `entrants.json`, which
+      `setup_worktrees.py`'s own parsing accepts: load it and resolve every
+      `source` against the repo root, as that script does. It also writes a `SUMMARY.md` with
+      both rows and a gate section, and exits 0.
+- [ ] A STALLED agent with only a KC-31 `.diff` is in `entrants.json` as a
+      `.diff` source.
+- [ ] Two patches that differ only in `From <sha>` and `Date:`: the second
+      is `duplicate_of` the first.
+- [ ] `git am` of the READY agent's patch onto the base, in a fresh temp
+      worktree, applies cleanly and reproduces the branch's tree.
+- [ ] `status` after the run prints the same table as `SUMMARY.md`.
+      Without `state.json` it exits 1.
+- [ ] Every new test fails against `5d4d834`.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` is green.
 
 ## Out of scope
 
-- Merging, cherry-picking, scoring — the operator's stages 3–5.
+- Merging, cherry-picking, scoring: the operator's stages 3–5.
+- An `--attach URL` flag. The roster's `server = <url>` already does it.
 - Uploading anything anywhere.
 
 ## Ground rules (same as every round)
@@ -97,4 +135,4 @@ would still hand-write `entrants.json` and `format-patch` each branch.
 - Do not touch `CollectBridge._shrink`.
 - No test starts a real `kilo` or calls a live provider.
 - Do not edit `epic-tasks/`.
-- One commit, no push; a test ships with the change and fails without it.
+- One commit, no push. A test ships with the change and fails without it.

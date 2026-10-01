@@ -882,7 +882,7 @@ def test_a_collected_repo_gains_the_row_when_summaries_are_present(collected_rep
 
 
 @pytest.fixture(scope="module")
-def live_model() -> CollectModel:
+def live_model(live_collect_model) -> CollectModel:
     """This repo's graph and test map, built straight from the source tree.
 
     `.collect/` is gitignored and rebuilt per machine, so loading the artifact
@@ -895,7 +895,7 @@ def live_model() -> CollectModel:
     edges = build_edges(modules)
     reverse = reverse_index(edges)
     tmap = build_test_map(REPO_ROOT, modules)
-    return CollectModel(
+    return live_collect_model(
         status=STATUS_FRESH,
         modules=tuple(modules),
         import_edges={key: tuple(sorted(value)) for key, value in edges.items()},
@@ -951,6 +951,14 @@ def test_the_live_artifact_renders_coder_neighbours_with_real_llm_prose():
     cannot supply."""
     model = loader_mod.load(REPO_ROOT)
     target = "tools/auto/coder.py"
+    # A collect run with Pass B off (no LLM configured, or --no-llm) writes a
+    # valid artifact with no summaries at all; this test is about the prose,
+    # so such an artifact is the same "not on this checkout" as no artifact.
+    candidates = tuple(model.callers_of(target)) + tuple(model.calls_into(target))
+    if not any(getattr(getattr(model.module(p), "summary", None), "purpose", "")
+               for p in candidates):
+        pytest.skip(".collect/ artifact was built without Pass B summaries for "
+                    f"{target}'s neighbours; the empty-row path is pinned above")
     row = _row_neighbours(model, target, None)
 
     assert row, "this repo's artifact carries summaries, so the row must render"

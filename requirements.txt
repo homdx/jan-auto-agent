@@ -4,3 +4,8 @@
 # (tools/collect/java_parser.py:is_available()).
 tree-sitter>=0.23
 tree-sitter-java>=0.23
+
+# Contest gates (tools/contest/gates.py::_pytest) append --timeout=180 to
+# every pytest root only when this plugin is installed; without it the flag
+# is omitted rather than making pytest exit 4 (KC-5/KC-57/KC-76).
+# pytest-timeout

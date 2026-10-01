@@ -1,0 +1,6 @@
+[
+  {"info": {"role": "user", "sessionID": "ses_fake", "time": 1700000000.0}, "parts": [{"type": "text", "text": "go"}]},
+  {"info": {"role": "assistant", "sessionID": "ses_fake", "time": 1700000001.0,
+            "error": {"name": "MessageOutputLengthError", "message": "reply stopped"}},
+   "parts": []}
+]

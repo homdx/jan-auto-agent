@@ -1,8 +1,15 @@
 # Ground file — multi-model bug-hunt competition
 
-State as of 2026-09-09, branch `competition`. Written so a new session can pick
-this up without re-deriving anything. Read this first, then only the files it
-points at.
+State as of 2026-09-29, branch `kc`. Written so a new session can pick this up
+without re-deriving anything. Read this first, then only the files it points at.
+
+The competition has moved on since this file was first written (2026-09-09,
+branch `competition`). The five-stage validate/adjudicate/fix harness below is
+still the method; the work since then runs as **epic rounds** — one ticket at a
+time, every model on the same tree, the winner merged — and the round itself is
+now driven by the **Kilo contest** runner. The current state of both is in
+[The Kilo contest — where it stands](#the-kilo-contest--where-it-stands) at the
+end of this file. Start there if you are picking up rounds.
 
 ## What this is
 
@@ -47,10 +54,11 @@ Both real finds came from `sensenova-6-8-flash-lite` as solo `NEW-*` rows:
 
 - `tools/search_agent.py` — `SearchAgent` binds the module-level
   `_DEFAULT_SKIP_DIRS` by reference; one `append` poisons every later instance.
-  **Verified, still unfixed.**
+  **Fixed** — checked 2026-09-29: `SearchAgent().skip_dirs is _DEFAULT_SKIP_DIRS`
+  is `False`.
 - `tools/auto/arch_probe.py::ArchProbe.last_by_op` — `dict()` is shallow and the
   values are `[hits, misses]` lists, so the tally is mutable from outside.
-  **Verified, still unfixed.**
+  **Fixed** — AUTO-P5-v2: it now returns immutable `ProbeOpTally` rows.
 
 Fixed during this work: `StateStore.get_task` / `all_tasks` / `resume_info` all
 returned live task dicts, so a caller could mutate one and the next validated
@@ -64,10 +72,10 @@ a row each time a finding is settled by hand.
 
 | finding | truth | how it was checked |
 |---|---|---|
-| `tools/search_agent.py::_DEFAULT_SKIP_DIRS` | **REAL** | identity check: `SearchAgent().skip_dirs is _DEFAULT_SKIP_DIRS` → True; one `append` poisons every later instance |
+| `tools/search_agent.py::_DEFAULT_SKIP_DIRS` | **REAL** (fixed since) | identity check: `SearchAgent().skip_dirs is _DEFAULT_SKIP_DIRS` → True; one `append` poisons every later instance |
 | `tools/search_agent.py::SearchAgent.__init__` | **REAL** | same defect, reported at the constructor |
 | `tools/search_agent.py::SearchAgent.skip_dirs` | **REAL** | same defect, reported at the attribute |
-| `tools/auto/arch_probe.py::ArchProbe.last_by_op` | **REAL** | `dict()` is shallow and values are `[hits,misses]` lists from `setdefault(op,[0,0])` — nested mutables shared |
+| `tools/auto/arch_probe.py::ArchProbe.last_by_op` | **REAL** (fixed since) | `dict()` is shallow and values are `[hits,misses]` lists from `setdefault(op,[0,0])` — nested mutables shared |
 | `tools/metrics_collector.py::MetricsCollector._load_all_cached` | **FALSE** | sole caller `record()` does `records = list(records)  # don't mutate the cached list in place` |
 | `tools/auto/state.py::StateStore.get_progress` | **FALSE** | `_progress` only ever holds str/int — `dict()` is a complete copy |
 | `tools/auto/controller.py::AutoController.config` | **REAL** (LOW) | форма подтверждена (обычный атрибут, не `@property`); заявленный импакт опровергнут — `task_mode`/`RunLimits` снимаются один раз в `__init__`; но `[gates]` order и `[collect] use_in_auto` читаются живьём, latent |
@@ -263,10 +271,10 @@ blind?
 
 ## Open items
 
-- **`tasks/` holds 2 generated tickets** for the verified defects; neither is
-  fixed yet.
-- **Two verified bugs are unfixed**: `SearchAgent._DEFAULT_SKIP_DIRS` aliasing
-  and `ArchProbe.last_by_op` sharing nested lists. Both `LOW`, both real.
+- **The two verified bugs are fixed** (`SearchAgent._DEFAULT_SKIP_DIRS`
+  aliasing, `ArchProbe.last_by_op` sharing nested lists). The `truth.csv` rows
+  stay `REAL` — that is what they were when judged, and it is what scores a
+  reviewer; they are marked "fixed since".
 - **Variants 2–6 have never been run.** Only variant 1 (mutable state) has data.
 - **`harvest_report.py` promotes a solo NEW to ACT on one vote.** Deliberate,
   but a `--min-votes` flag would let you separate consensus from solo.
@@ -275,10 +283,172 @@ blind?
 
 ## Conventions in this repo
 
-- Four pytest roots, run separately — combining them yields ~362 false errors
-  from a conftest collision:
-  `for d in tests tests_bugfix .smoke_tests .regression_tests; do python3 -m pytest "$d" -q --timeout=180; done`
+- **Two real test roots, run one after the other, never in parallel and never
+  combined:** `python3 -m pytest tests -n 8 -q`, then
+  `python3 -m pytest tests_bugfix -n 8 -q`. `.smoke_tests/` and
+  `.regression_tests/` are symlink tiers into `tests/` (regenerate with
+  `scripts/sync_test_tiers.py`, never by hand) — running them as well runs the
+  same files twice. Combining roots in one command still collides conftests.
+  As of 2026-09-29 on `kc`: `tests` 6098 passed, `tests_bugfix` 2878 passed,
+  about two and a half minutes together.
 - `python` is not on PATH; use `python3`.
-- Every fix ships a regression test in `tests_bugfix/`, one commit per bug.
+- Every fix ships a test that fails without it, one commit per concern, commit
+  with explicit paths (`git commit -- <paths>`): an operator's `commit -a`
+  once swept a round's code into an unrelated commit.
 - Verify a reported defect against live code before fixing — this branch's whole
   history says the reports go stale faster than anyone updates them.
+- Round data stays out of git: `contest-out/`, `ground/`, `kcNN/`, `fl2/`,
+  `*.patch`. Only `contest-bench/<ticket>/` (the judge's suite) is committed.
+
+## The Kilo contest — where it stands
+
+### What it is
+
+`python3 -m tools.contest run --ticket NN` runs one epic ticket as a round:
+every model in `contest.ini`'s roster gets its own git worktree
+(`../rounds/NN-<agent>`) from the same base commit and works the ticket through
+a local `kilo serve` session. A second model is the safety gate for
+permissions. At the end of each turn the runner's **harvest** scores the
+worktree mechanically — the `PROGRESS.csv` claim, one commit, a test file,
+`_shrink` untouched, then the pytest roots on the claimed commit — and says
+`READY` or `REWORK`. Everything lands in `contest-out/NN/` (`state.json`,
+`SUMMARY.md`, a `<agent>.patch` per entry, `kilo-serve.log`).
+
+The runbook is `docs/kilo-contest/RUN-THE-KILO-CONTEST.md`; the epic is
+`docs/kilo-contest/EPIC-KC.md`; the ticket list with what landed where is
+`epic-tasks/INDEX.md`.
+
+```bash
+python3 -m tools.contest run --ticket NN            # the round (the operator starts it)
+python3 -m tools.contest run --ticket NN --dry-run  # plan + first prompt, no server
+python3 -m tools.contest status --ticket NN         # the table off state.json, mid-round too
+python3 scripts/revive_round.py NN                  # ended agents back in play, then run --resume
+```
+
+`revive_round.py` only works on a round that already has `contest-out/NN/`;
+a round that was never started is started with `run`, not revived.
+
+### How a round is judged
+
+The harvest's verdict is not the score. A round is scored by a
+**judge's acceptance suite** written from the ticket alone —
+`contest-bench/<ticket>/acceptance_<ticket>.py` — that drives only the public
+contract (the CLI end to end against the fake Kilo in `tests/_kilo_fake.py`,
+the documented functions, the files the ticket names). It must be red on the
+base. Copy it into every worktree and run it there:
+
+```bash
+for d in ../rounds/NN-*; do mkdir -p $d/contest-bench/kcNN
+  cp contest-bench/kcNN/acceptance_kcNN.py $d/contest-bench/kcNN/
+  (cd $d && python3 -m pytest contest-bench/kcNN/acceptance_kcNN.py -n 8 -q); done
+```
+
+Score **every** entry, `STALLED`, `GAVE_UP` and `ERROR` included — their
+worktrees hold real work, and the round-83 winner's four equals were all
+entries the runner had stopped. Before believing a red, check it is the
+entry's fault and not the suite's: in round 83 two entries had taught the
+bench's roster the same key the suite wrote, and a strict reading of the
+refusal text failed entries the ticket did not. Ties are broken by the
+entry's own `tests`/`tests_bugfix`, then by reading the code. The winner lands
+on `kc` as-is when it can (author `renat <renat@hp.local2>`), and the
+ticket's row in `INDEX.md` and its `**Status:**` line say what landed.
+
+`contest-out/` lives in the checkout that orchestrated the round — `qwen25`
+or `qwen26`. Look in both before saying a round never ran.
+
+### Where it stands (2026-09-29)
+
+**The KC epic is done.** KC-44 (round 83) was its last ticket: the ticket's
+own `**Size:**` picks the leg count through `[contest] legs_by_size`
+(`XS=1, S=1, M=1, L=3`), `--legs` always wins, and an `L` ticket that would
+run one leg is refused unless `--legs 1` says so. Winner agnes-3-0-flash,
+30/30, landed as-is as `f9bd680`.
+
+Round 83 in numbers: eleven free models, 90 min each. Two `READY` (mimo,
+agnes-3), seven `STALLED` (six on the agent's time, glm on 70 min with
+no idle), one `GAVE_UP` (step), one `ERROR`
+(bynara: the provider dropped the connection). On the suite: five at 30/30,
+two at 29, agnes-2 28, mimo and step 27, glm 15 (its `cmd_run` raises).
+
+Fixed on `kc` from what round 83 showed (all unpushed as of this writing):
+
+| commit | what |
+|---|---|
+| `a325336` | the heartbeat prints one agent per line, name and state padded, so ages and bars line up |
+| `5b11111` | the harvest pauses the agent's `agent_max_sec`, as its own suite queue already did (KC-58). Round 83's harvest queue ran 21 and 27 min for two agents, the limit fired inside it, and a `REWORK` ended as `time up` with no rework sent |
+| `2cba4a6` | a `PROGRESS.csv` row that claims the round's base is refused. The base is an ancestor of `HEAD`, so it passed as "on the branch": the roots ran on the base, not the change, and `GAVE_UP` named the base as the agent's commit |
+| `5d979be` | Kilo's own `session.compacted` in the middle of a turn counts in `compactions` (one per turn). Round 83 had fourteen of them and the table read 0 for all eleven |
+
+**Open, outside KC:** `V4`, `M3`, `V12`, `V13`, `V14`, `V15`, `M6`, `L3` in
+`epic-tasks/INDEX.md`.
+
+### What the rounds taught — do not re-derive
+
+- **`state.json` lags.** `status` can show the same numbers for ten minutes
+  while every agent is working. The live picture is the runner's own console
+  line and `contest-out/NN/kilo-serve.log` (`step=N` per session); a worktree's
+  `git status` says whether files move.
+- **The heartbeat's `(suite 68s)`** is that agent running a whole pytest root
+  in one of the round's suite slots; `(suite queued 3m, 2 ahead)` is it
+  waiting for one; `over the ceiling` is past `agent_suite_max_sec`.
+- **Two kinds of compaction.** Kilo compacts a session on its own
+  (`agent=compaction` in `kilo-serve.log`, `session.compacted` in
+  `events.jsonl`); the runner compacts or asks for a summary itself at
+  `compact_at_percent`. `compactions` in the table counts both since
+  `5d979be`; before that only the runner's and Kilo's overflow path.
+- **The harvest queue is the round's, not the agent's.** With many agents and
+  few suite slots the judge's own roots can wait half an hour. Since `5b11111`
+  that time does not come off the agent's 90 min.
+- **A claim can name the wrong commit and still look valid.** Check what the
+  roots actually ran on before trusting a `tests_failed`.
+- **Free models drop out for provider reasons** (`UnknownError: The model
+  service connection was interrupted`, 429s, quota). That is not a verdict on
+  the model; the runner keeps the work as a deadline commit.
+- **Kilo's `bash` tool defaults to 120 s**; a suite longer than that needs its
+  own timeout on the call.
+
+### Where it stands (2026-10-01)
+
+Rounds since KC-44 are numbered by ticket (`epic-tasks/NNN-*.md`), judged on
+`contest-bench/NNN`, and landed on `kc` (never `main` without an explicit go).
+
+| round | landed on `kc` |
+|---|---|
+| 126–130 | see `epic-tasks/INDEX.md`; pushed |
+| 131, 132 | `9bd4871`, `dafbd20`, `8c58a1d`, ticket+bench `9f99300` (both winners sn68v2) |
+| 134 | `f36dbc7`, ticket+bench `73d15eb` |
+| 133 | `ec2bc8c` (winner mimo, ran on the second machine), load 3×6347 passed |
+| 135 | landed on kc, winner laguna-s-2-1 as-is — see Round 135 below |
+
+Nothing past `ec2bc8c` is pushed. The `kc` → `main` merge message waits for
+the operator's go.
+
+**Closing a round (since 135):** one ideal commit (the winner's code keeps the
+model as author/trailer `<model> <model@round-NNN.contest>`); every ticket of
+the round set to landed/closed **inside that same commit**, with no separate status
+commit; then a load test: 3× `tests -n 8` in parallel, then `tests_bugfix -n 8`.
+
+**How a running round is watched — always all three:**
+1. the runner's own console tab (one line per agent every minute: state,
+   age, bar, files touched);
+2. `contest-out/NNN/kilo-serve.log`: `step=N` lines growing means models
+   answer. Silent for minutes while every agent is `WAITING 0%` means
+   `kilo serve` hung (round 135's first start hung this way and was restarted);
+3. `python3 -m tools.contest status --ticket NNN` lags; use it only for the
+   end table.
+Notes on a round go **here**, in this file, as the round goes, not only in
+the session's memory.
+
+#### Round 135 (KC 135, 2026-10-01)
+
+- Ran 14:58–19:09 UTC (15090 s). kilo serve was slow to start (log quiet
+  for minutes, every agent WAITING 0 %), not hung — 271 `step=` lines by the
+  end. Every `last reason` reads "POST /session timed out": a start-up trace,
+  harmless.
+- All 11 READY with a commit; glm-4-7-flash finished a round for the first time.
+- contest-bench/135: 9 tests, base 3/9, every entry 9/9. Run the bench from
+  inside the entry's checkout (copy it in) — run from this checkout it imports
+  this checkout's `tools/` and scores the base.
+- Code is the same `returncode != 0` raise in all 11. Winner laguna-s-2-1,
+  as-is: the only entry whose tests cover all three cases of the ticket
+  (failed status, prepare_round leaves no worktree, dirty + clean unchanged).

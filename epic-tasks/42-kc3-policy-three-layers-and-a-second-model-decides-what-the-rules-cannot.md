@@ -1,6 +1,6 @@
 # KC-3 — `tools/contest/policy.py`: every permission is decided — by the rules, by geometry, or by a second model; never by silence
 
-**Status:** queued — after KC-2 (round 41). Written against `67e834d`.  
+**Status:** landed `1499cd8` (+ `5214138`: a bare single-word bash command is judged as a command, not a path); re-verified live `c6438bf`. Follow-up: KC-13 (round 52) — paths inside `metadata.command` are judged too. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** CRITICAL (this is the thing that lets N agents run unattended)  
 **File:** `tools/contest/policy.py` (new)  
 **Symbol:** `Policy`, `Decision`, `PolicyContext`, `decide`, `_mechanical`, `_ask_gate`, `GATE_SYSTEM_PROMPT`  
@@ -119,7 +119,7 @@ events by geometry alone; the rest need a reader.
 - [ ] `grep -c '"always"' tools/contest/policy.py` counts only the
       docstring mention (assert in a test).
 - [ ] `record()` writes one line per decision with the listed keys.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

@@ -1,6 +1,6 @@
 # KC-10 — Context fill is measured after every turn; at 80 % the session is compacted, not abandoned
 
-**Status:** queued — after KC-9 (round 48). Written against `f069f07`.  
+**Status:** landed `5f439e3` — round 49 winner sensenova-6-7-flash-lite-var2 (15/15 on `contest-bench/kc10`, `527cab7`), with `context_limit_fallback` off by default (0: today's models without a limit are ~250k windows, KC-67's memory sizes them). Item 6 not taken as written: KC-54/KC-69 already recover from an overflow, two of them end READY. Round-49 fixes landed with it: `1087584` (KC-69's own abort ended two agents ERROR), `be56cd0` (KC-67's `last_ok` read Kilo's summary as 0).  
 **Severity:** HIGH  
 **File:** `tools/contest/runner.py`, `tools/contest/kilo_client.py`  
 **Symbol:** `KiloClient.model_limit`, `KiloClient.session_tokens`, `KiloClient.compact`, `runner.context_fill`, `runner.maybe_compact`  
@@ -70,7 +70,7 @@ only.
       same prompt again → `READY`; the same error twice → `ERROR`.
 - [ ] `turns.jsonl` lines carry `fill` and `compacted`; `SUMMARY.md` (KC-7)
       shows `fill%` at the last turn and the number of compactions.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

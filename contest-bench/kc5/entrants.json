@@ -1,0 +1,65 @@
+{
+ "base": "4ff7d14",
+ "python": "3.10.12",
+ "disqualified": {
+  "kc5-sensenova-6-7.patch": "0 bytes"
+ },
+ "entrants": {
+  "sensenova68": {
+   "source": "kc5/kc5-Sensenova-6-8.patch",
+   "applied": "commit 1 of 2 (commit 2 'tests: fix two suite-wide failures' is off-ticket, not applied)"
+  },
+  "sonet5-var2": {
+   "source": "kc5/kc5-only-sonet5-var2-.patch",
+   "applied": "single commit faf7141; byte-identical to kc5/kc5-sonet5-var2.patch 13/13"
+  },
+  "deepseek": {
+   "source": "kc5/kc5-deepseek-v1.patch",
+   "applied": "single commit"
+  },
+  "hy3-c2": {
+   "source": "kc5/kc5-hy3.patch",
+   "applied": "both commits (commit 2 mixes KC-12 with the KC-5 smoke links + golden test)"
+  },
+  "hy3": {
+   "source": "kc5/kc5-hy3.patch",
+   "applied": "commit 1 only"
+  },
+  "sensenova67v2-c3": {
+   "source": "kc5/kc5-sensenova-6-7-var2.patch",
+   "applied": "commits 1 + 3 (commit 2 is KC-12, skipped)"
+  },
+  "sensenova67v2": {
+   "source": "kc5/kc5-sensenova-6-7-var2.patch",
+   "applied": "commit 1 only"
+  },
+  "sonet5": {
+   "source": "kc5/sonet-5-kc5.patch",
+   "applied": "13/13 only (90bb69d); 1-12 are already in the base"
+  },
+  "sonet5-var2b": {
+   "source": "kc5/sonet5-var2.patch",
+   "applied": "13/13 only (19d964a); 1-12 are already in the base"
+  },
+  "sonet": {
+   "source": "kc5/kc5_sonet.patch",
+   "applied": "single commit == 910a19c, the commit sitting at HEAD of branch kc when the round was scored"
+  },
+  "glm47": {
+   "source": "kc5/kc5-glm47.patch",
+   "applied": "3 commits"
+  },
+  "northmini": {
+   "source": "kc5/NorthMini.patch",
+   "applied": "raw diff (no commit, no tests); its epic-tasks/ hunk dropped, committed by the bench"
+  },
+  "sonet4-var2": {
+   "source": "kc5/sonet4-var2-kc5.patch",
+   "applied": "single commit"
+  },
+  "ideal": {
+   "source": "this branch",
+   "applied": "skeleton sensenova68 + simplifications; see RESULTS.md"
+  }
+ }
+}

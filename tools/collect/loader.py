@@ -368,6 +368,7 @@ def _absent(collect_dir: Optional[Path], reason: str) -> CollectModel:
     return CollectModel(status=STATUS_ABSENT, collect_dir=collect_dir, reason=reason)
 
 
+# Gate 1 corpus AUTO-T12 grades `_load_from_dir` live: tests/test_gate1_corpus_precision.py
 def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> CollectModel:
     """Read `artifact.json` out of `collect_dir` into a `CollectModel`.
     Any missing file, unreadable JSON, or missing/malformed key is treated

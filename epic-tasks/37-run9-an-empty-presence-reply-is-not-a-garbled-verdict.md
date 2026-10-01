@@ -156,7 +156,7 @@ Two smaller defects in the same loop:
 - [ ] Stub answers `""` (transport) on every call → after `presence_empty_retries` retries the ladder runs as today and the candidate ends `UNKNOWN`; the WARNING says `empty (transport)`; with `presence_unknown = keep` it is KEPT, with `drop` it is dropped — unchanged policy.
 - [ ] `presence_empty_retries = 0` → behaviour and log lines identical to today (except the classification line and the fixed cap log).
 - [ ] The `capped at unparseable_max_tokens_cap` line is never followed by a `skipping … already tried` line quoting a different `max_tokens`.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

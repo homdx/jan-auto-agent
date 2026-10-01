@@ -13,8 +13,8 @@ Design contract
   so that even if the paths were somehow shared the interactive
   ``json_parse_failure_rate`` computation would not be affected (it already
   skips ``None`` records — see MetricsCollector.summarize_failures).
-* Thread-safe: a ``threading.Lock`` serialises every read-modify-write cycle
-  through ``MetricsCollector.record()``, which is not thread-safe on its own.
+* Thread-safe: ``MetricsCollector.record()`` serialises itself internally
+  (FL-1, round 84) — AutoMetricsStream holds no lock of its own around it.
 * Atomic writes: ``record_gate2()`` writes via a temp file + atomic rename so a
   crash mid-write never leaves a corrupt ``metrics.json``.
 * All methods are fail-closed: errors are logged and swallowed so a metrics
@@ -37,7 +37,6 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -109,7 +108,9 @@ class AutoMetricsStream:
                 "interactive-path collision check: %s", metrics_path, exc,
             )
 
-        self._lock = threading.Lock()
+        # FL-1 (round 84): no lock needed — MetricsCollector.record() now
+        # serialises its own writes; _warn_if_contaminated/.collector stay
+        # freely callable from another thread.
         self._collector = MetricsCollector(metrics_path=metrics_path)
         self._warn_if_contaminated()
 
@@ -145,9 +146,8 @@ class AutoMetricsStream:
         """
         Record a Gate-2 validation outcome to the auto metrics stream.
 
-        Thread-safe: acquires ``self._lock`` for the full read-modify-write
-        cycle so concurrent calls from separate worker threads produce a
-        consistent record count.
+        Thread-safe: delegates to ``MetricsCollector.record()``, which
+        serialises the read-modify-write cycle internally (FL-1, round 84).
 
         ``improvement_json_ok`` is always ``None`` so these records are
         excluded from the interactive optimizer's json_parse_failure_rate
@@ -176,16 +176,17 @@ class AutoMetricsStream:
         # the legacy ``attempts`` parameter.
         effective_attempts = attempts_used if attempts_used is not None else attempts
         try:
-            with self._lock:
-                _record_gate2_locked(
-                    self._collector,
-                    task_id,
-                    approved=approved,
-                    feedback=feedback,
-                    attempts_used=effective_attempts,
-                    prompt_store=prompt_store,
-                    unavailable=unavailable,
-                )
+            # No lock here (FL-1, round 84): MetricsCollector.record() now
+            # serialises itself; nothing above this call is shared state.
+            _record_gate2_locked(
+                self._collector,
+                task_id,
+                approved=approved,
+                feedback=feedback,
+                attempts_used=effective_attempts,
+                prompt_store=prompt_store,
+                unavailable=unavailable,
+            )
         except Exception as exc:
             logger.error("AutoMetricsStream.record_gate2: failed to record metric — %s", exc)
 
@@ -193,15 +194,14 @@ class AutoMetricsStream:
         """
         Explicit sync / clean-shutdown hook.
 
-        MetricsCollector writes on every ``record()`` call, so this is a
-        no-op in normal operation.  It exists as a named hook so callers can
-        signal intent at shutdown without coupling to the underlying
-        implementation.
+        MetricsCollector's fsync is bounded-cadence, not per-call (FL-1,
+        round 84), so this is no longer always a no-op: it forces the
+        current on-disk metrics file durable right now, regardless of when
+        the last cadence-triggered fsync happened.
+
+        Never raises.
         """
-        # No buffering in MetricsCollector — nothing to flush.
-        # Acquire the lock briefly so any in-progress write completes first.
-        with self._lock:
-            pass
+        self._collector.flush()
 
     # ------------------------------------------------------------------ #
     # Factory                                                              #

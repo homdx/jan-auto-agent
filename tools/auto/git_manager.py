@@ -35,8 +35,16 @@ from __future__ import annotations
 import configparser
 import logging
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
+
+from tools.git_run import (
+    LOCK_BACKOFF_S,
+    LOCK_CONTENTION_RE,
+    LOCK_RETRIES,
+    run_git,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -414,45 +422,104 @@ class GitManager:
 
     # ── Private ──────────────────────────────────────────────────────────────
 
+    # FL-2 (round 85): the ladder is no longer this class's. It is
+    # `tools.git_run.run_git`, shared with every other git caller in the tree —
+    # `workspace._git`, `gates.git`, `runner._dirty_tree`, `manifest._run_git`,
+    # `cli.export_patches`, `delta_validator` — so a held `.git/index.lock` costs
+    # the same two seconds for every command instead of being waited out by one
+    # module and fatal to the rest. FL-1 (round 84) put it here first, as the
+    # caller the 32-worker stress run happened to hit; it now lives once, and
+    # these aliases keep the names the class has always had. See `tools/git_run`
+    # for the rationale — why the lock is a transient, and why the ladder is
+    # bounded by the same error that already names stale locks as the likely cause.
+    _LOCK_CONTENTION_RE = LOCK_CONTENTION_RE
+    _LOCK_RETRIES = LOCK_RETRIES
+    _LOCK_BACKOFF_S = LOCK_BACKOFF_S
+
     def _run(self, cmd: list[str], error_msg: str) -> str:
-        """Run *cmd* inside *repo_dir*, capture output, raise on failure."""
+        """Run *cmd* inside *repo_dir*, capture output, raise on failure.
+
+        The held-index retry is `tools.git_run.run_git` — see
+        `_LOCK_CONTENTION_RE` above; this method only adds the `GitError` text.
+        The class's own count and backoff are passed through rather than
+        relying on `run_git`'s defaults, so overriding them here still works.
+        """
         try:
-            result = subprocess.run(
+            proc = run_git(
                 cmd,
                 cwd=self.repo_dir,
-                capture_output=True,
-                text=True,
+                timeout=60,
                 encoding="utf-8",
                 errors="replace",
-                timeout=60,
+                retries=self._LOCK_RETRIES,
+                backoff_s=self._LOCK_BACKOFF_S,
+                sleep=self._backoff,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise GitError(
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise self._raise(cmd, error_msg, exc) from exc
+        return self._decode(cmd, error_msg, proc)
+
+    def _backoff(self, seconds: float) -> None:
+        """Wait between two lock retries.
+
+        A named seam rather than a bare ``time.sleep`` so a test can stand in
+        for the wait without patching the ``time`` module for its whole
+        process — which is both too broad to be safe and, under ``pytest -n``,
+        a way to change behaviour a long way from the test doing it.
+        `run_git` calls it through its *sleep* argument (FL-2).
+        """
+        time.sleep(seconds)
+
+    def _run_once(self, cmd: list[str], error_msg: str) -> str:
+        """One attempt at *cmd*, no waiting; `_run` is what decides to repeat."""
+        try:
+            proc = run_git(
+                cmd,
+                cwd=self.repo_dir,
+                timeout=60,
+                encoding="utf-8",
+                errors="replace",
+                retries=1,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise self._raise(cmd, error_msg, exc) from exc
+        return self._decode(cmd, error_msg, proc)
+
+    def _raise(self, cmd: list[str], error_msg: str, exc: Exception) -> GitError:
+        """The `GitError` for an attempt that could not be made or did not finish.
+
+        Timeout first: its message already names a stale `.git/index.lock` and a
+        hung hook as the likely cause, which is how the operator finds it. A
+        missing git binary or a vanished *repo_dir* must never escape as a bare
+        OSError past callers that catch `GitError` only.
+        """
+        if isinstance(exc, subprocess.TimeoutExpired):
+            return GitError(
                 f"{error_msg} (timed out after 60s)\n"
                 f"  cmd : {' '.join(cmd)}\n"
                 "  Possible causes: stale .git/index.lock, a hung git hook, "
                 "or an unresponsive remote."
-            ) from exc
-        except OSError as exc:
-            # Only TimeoutExpired was caught, unlike the sibling call sites in
-            # this module: a missing git binary or a vanished repo_dir escaped
-            # as a bare OSError past callers that catch GitError.
-            raise GitError(
-                f"{error_msg} ({exc})\n"
-                f"  cmd : {' '.join(cmd)}\n"
-                "  Possible causes: git is not installed / not on PATH, or "
-                f"repo_dir ({self.repo_dir!r}) does not exist or is not "
-                "accessible."
-            ) from exc
-        if result.returncode != 0:
+            )
+        return GitError(
+            f"{error_msg} ({exc})\n"
+            f"  cmd : {' '.join(cmd)}\n"
+            "  Possible causes: git is not installed / not on PATH, or "
+            f"repo_dir ({self.repo_dir!r}) does not exist or is not "
+            "accessible."
+        )
+
+    def _decode(self, cmd: list[str], error_msg: str,
+                proc: subprocess.CompletedProcess) -> str:
+        """The stdout of a successful git, or the `GitError` for a failed one."""
+        if proc.returncode != 0:
             raise GitError(
                 f"{error_msg}\n"
                 f"  cmd : {' '.join(cmd)}\n"
-                f"  code: {result.returncode}\n"
-                f"  out : {result.stdout.strip()}\n"
-                f"  err : {result.stderr.strip()}"
+                f"  code: {proc.returncode}\n"
+                f"  out : {proc.stdout.strip()}\n"
+                f"  err : {proc.stderr.strip()}"
             )
-        return result.stdout
+        return proc.stdout
 
 
 # ─────────────────────────────────────────────────────────────────────────────

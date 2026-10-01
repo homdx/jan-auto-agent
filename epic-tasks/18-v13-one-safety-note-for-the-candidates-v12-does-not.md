@@ -1,6 +1,6 @@
 # V13 — One safety note for the candidates V12 does *not* suppress
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12), re-verified against `149eb88` (2026-10-01); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** LOW  
 **File:** `tools/auto/gate1_grounding.py`  
 **Symbol:** `—`  
@@ -8,6 +8,12 @@
 **Size:** S  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V13  
 **Depends on:** V12  
+
+
+**Re-verified against `149eb88` (2026-10-01).** Not built; blocked on V12.
+`collect_contract_note` and `existing_test_coverage_note` are still in
+`gate1_grounding.py`. The "22 of 117 sites have a rationale" figure is now
+**78 of 298**.
 
 ---
 
@@ -60,7 +66,7 @@ def already_handled_note(collect_bridge, cited) -> Optional[str]:
    and run nothing extra; combining roots in one `pytest` call produces ~362
    false errors from a conftest collision:
    ```bash
-   python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+   python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
    ```
    `python` is not on PATH — use `python3`. One suite at a time — the machine
    is shared with the other round entrants.

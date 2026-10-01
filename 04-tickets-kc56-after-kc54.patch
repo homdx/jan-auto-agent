@@ -1,0 +1,157 @@
+From 74c1f6670e93d6bb07a389995e6304d464e8231d Mon Sep 17 00:00:00 2001
+From: renat <renat@hp.local2>
+Date: Thu, 24 Sep 2026 16:55:38 +0300
+Subject: [PATCH] =?UTF-8?q?epic-tasks:=20KC-56=20(102)=20squares=20with=20?=
+ =?UTF-8?q?landed=20KC-54=20=E2=80=94=20a=20context=20cut-off=20on=20a=20c?=
+ =?UTF-8?q?lean=20tree=20is=20a=20stated=20exception=20to=20its=20clean-ov?=
+ =?UTF-8?q?erflow=20stall,=20shares=20its=20session=20swap=20and=20continu?=
+ =?UTF-8?q?e=20budget,=20no=20KC-39=20dependency;=20one=2090=20%=20thresho?=
+ =?UTF-8?q?ld=20with=20KC-39=20=C2=A77?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ...nish-length-is-not-a-model-that-stopped.md | 65 +++++++++++++------
+ ...resh-session-not-a-same-session-harvest.md |  3 +
+ epic-tasks/INDEX.md                           |  2 +-
+ 3 files changed, 49 insertions(+), 21 deletions(-)
+
+diff --git a/epic-tasks/102-kc56-a-turn-cut-off-at-finish-length-is-not-a-model-that-stopped.md b/epic-tasks/102-kc56-a-turn-cut-off-at-finish-length-is-not-a-model-that-stopped.md
+index 7ccfeeb..f59170f 100644
+--- a/epic-tasks/102-kc56-a-turn-cut-off-at-finish-length-is-not-a-model-that-stopped.md
++++ b/epic-tasks/102-kc56-a-turn-cut-off-at-finish-length-is-not-a-model-that-stopped.md
+@@ -1,13 +1,13 @@
+ # KC-56 — A turn that ends on `finish: length` was cut off, not finished; it is continued or re-sessioned, not harvested as "did nothing"
+ 
+-**Status:** queued — found live 2026-09-24 in round 74 (base `3017885`). Two `sensenova` agents ended their first turn idle on an assistant message with `finish: "length"` and no text. That means the reply was cut off by a token limit; the model did not decide it was done. Both worktrees were clean, so KC-22 granted no continue. The runner sent both to `HARVESTING`, which ran the four pytest roots on an untouched base (905 s and 1593 s under `_TEST_RUNS_LOCK`) to reach the `REWORK` everyone could see coming. One of the two then went into its rework in the same full session, was cut off again, and ended `ERROR` on the next prompt.
++**Status:** queued — found live 2026-09-24 in round 74 (base `3017885`, before KC-54 landed). Two `sensenova` agents ended their first turn idle on an assistant message with `finish: "length"` and no text. That means the reply was cut off by a token limit; the model did not decide it was done. Both worktrees were clean, so KC-22 granted no continue. The runner sent both to `HARVESTING`, which ran the four pytest roots on an untouched base (905 s and 1593 s under `_TEST_RUNS_LOCK`) to reach the `REWORK` everyone could see coming. One of the two then went into its rework in the same full session, was cut off again, and ended `ERROR` on the next prompt (on today's tree, with KC-54, that overflow is a clean one and ends `STALLED` — still no work).
+ **Severity:** HIGH (two of ten slots lost their first hour to a limit the runner can see in the message it already fetches. The empty harvests also held the global test lock for 42 min combined, and every other agent's harvest queued behind them)
+ **File:** `tools/contest/runner.py`
+-**Symbol:** `run_agent` (the `idle.status == "idle"` branch, ~line 740), `_cut_off` (new)
++**Symbol:** `run_agent` (the `idle.status == "idle"` branch, ~line 840 after KC-54), `_cut_off` (new), the KC-54 session swap in the `idle.status == "error"` branch (~line 755, factored out, not copied)
+ **Round:** 102
+ **Size:** S
+ **Source:** `contest-out/74/sensenova-6-7-flash-lite-var1/events.jsonl`, `contest-out/74/sensenova-6-8-flash-lite-var2/events.jsonl` (`message.updated`, `info.finish`, `info.tokens`), `contest-out/74/state.json` (`turns`).
+-**Depends on:** KC-22 (continue budget, `continue_message`), KC-54 (the fresh-session path for an overflow, queued), KC-39 (`max_sessions_per_attempt`, queued). `KiloClient.messages()` is already in the tree.
++**Depends on:** KC-22 (continue budget, `continue_message`), KC-54 (landed `f383335`: the fresh-session swap for an overflow, counted in `max_continues_per_attempt`). **Not** KC-39: it is still queued, and nothing here needs its `max_sessions_per_attempt`; if KC-39 lands first, the fresh session of §3 moves under that key with KC-39's own. `KiloClient.messages()` is already in the tree.
+ **Also touches:** `tests/test_contest_runner.py`, `tests/_kilo_fake.py` (only if the fake needs a `finish` on its assistant message)
+ 
+ ---
+@@ -41,24 +41,39 @@ cut it off.
+    `idle`, read the session's last assistant message
+    (`KiloClient.messages`, fail-open: any error → `None`). It returns
+    `"context"` when `info.finish == "length"` and `input + cache.read +
+-   reasoning + output` is at or above 95 % of the model's `limit.context`
+-   (from `GET /provider`, already read at intake; unknown limit → treat as
+-   `"output"`). It returns `"output"` for any other `finish == "length"`, and
+-   `None` otherwise.
++   reasoning + output` is at or above 90 % of the model's `limit.context`.
++   The limit comes from `GET /provider`, already read at intake; an unknown
++   limit counts as `"output"`. 90 % is the threshold of KC-39 §7 too: one
++   module constant, not two numbers. It returns `"output"` for any other
++   `finish == "length"`, and `None` otherwise.
+ 2. **`"output"` → a continue, clean tree or not.** Same session, counted in
+    `max_continues_per_attempt`, with a short message instead of
+    `continue_message`: your last reply hit the output limit before any text or
+    tool call; think less, and make the next step a tool call. `turns.jsonl`
+    records `cut_off: "output"`.
+-3. **`"context"` → a fresh session** on the KC-54 path (abort, new session,
+-   `round_prompt(..., dirty=_dirty_tree(ws))`, `run.attempt` unchanged),
+-   capped by KC-39's `max_sessions_per_attempt`. A same-session continue into a
+-   full context is exactly the 4-second `ContextOverflowError` of the third
+-   row. `turns.jsonl` records `cut_off: "context"` and `new_session`.
+-4. **No harvest for a cut-off turn** while either budget lasts. Once both are
+-   spent it falls through to today's path, which KC-50 makes cheap.
+-5. **Rework into a full session** (the third row's second half) is the same
+-   check made before sending a rework: see KC-39 §7.
++3. **`"context"` → a fresh session, clean tree or not.** This is a deliberate
++   exception to KC-54, which ends a *clean* `ContextOverflowError` as
++   `STALLED` ("a model that spent its whole context reading and produced
++   nothing"). That rule stays as it is for the error. A `finish: "length"`
++   idle is different evidence: the provider cut the reply off mid-thought, it
++   did not reject a prompt, and the next session starts with the ticket in
++   hand. The swap is KC-54's own block (record the old turn with its
++   `session_id`, `backend.create_session(...)` with the spec's provider,
++   model, rules, agent and variant, `run.session_id = session.id`,
++   `continue_text = round_prompt(spec.name, ticket_path, ws.base_sha,
++   dirty=dirty)`). Factor it into one helper that both branches call; do not
++   paste a second copy. `dirty` is `_dirty_tree(ws)` when the branch has no
++   commit, otherwise `""`, and an empty `dirty` is fine: `round_prompt`
++   without the paragraph. `run.attempt` stays unchanged, and the swap counts
++   in `max_continues_per_attempt` (`continue_used`), exactly like KC-54's.
++   `turns.jsonl` records `cut_off: "context"` and `new_session`. A
++   same-session continue into a full context is the 4-second
++   `ContextOverflowError` of the third row.
++4. **No harvest for a cut-off turn** while the continue budget lasts. Once it
++   is spent, the turn falls through to today's path, which KC-50 makes cheap.
++5. **Rework into a full session** (the third row's second half) is not this
++   ticket. It is the same check made before sending a rework: KC-39 §7, with
++   the same 90 % constant.
+ 
+ ## Acceptance
+ 
+@@ -66,18 +81,28 @@ cut it off.
+   `reasoning == output limit`, on a clean tree → a continue in the same session
+   with the cut-off message, no `HARVESTING`, `cut_off: "output"` in
+   `turns.jsonl`.
+-- [ ] The same with `input` at 96 % of `limit.context` → a new session with
+-  `round_prompt(dirty=…)`, `run.attempt` unchanged, `cut_off: "context"`.
++- [ ] The same with `input` at 91 % of `limit.context`, clean tree → a new
++  session whose first prompt is `round_prompt` without the dirty paragraph,
++  `run.attempt` unchanged, `cut_off: "context"`, `continue_used` + 1.
++- [ ] The same with a dirty tree → the new session's `round_prompt` carries
++  the dirty paragraph.
++- [ ] At 85 % of `limit.context` → `"output"`, same session.
+ - [ ] `finish: "stop"` on a clean tree → exactly today's path (HARVESTING).
+ - [ ] `messages()` raising → exactly today's path (fail-open).
+-- [ ] Budgets spent → today's path. Every existing runner test unmodified and green.
++- [ ] Budget spent → today's path.
++- [ ] KC-54 unchanged: a clean `ContextOverflowError` still ends `STALLED`,
++  and a dirty one still gets its fresh session. Every existing runner test,
++  KC-54's included, unmodified and green.
+ 
+ ## Out of scope
+ 
+ - The variant. `high` asking for 32 000 output tokens is KC-49's resolution,
+   and a model that thinks for all of them is still allowed to.
+ - Kilo's own compaction (row four). When it works, the turn never idles.
+-- KC-54's `ContextOverflowError` path. This ticket reuses it and does not change it.
++- KC-54's `ContextOverflowError` path. This ticket shares its session swap
++  (§3) and does not change what it decides.
++- KC-39's `max_sessions_per_attempt`. If KC-39 lands first, both swaps move
++  under that key there, not here.
+ 
+ ## Self-check before `append_task.py`
+ 
+diff --git a/epic-tasks/78-kc39-a-continue-that-changes-nothing-starts-a-fresh-session-not-a-same-session-harvest.md b/epic-tasks/78-kc39-a-continue-that-changes-nothing-starts-a-fresh-session-not-a-same-session-harvest.md
+index 4b7a6a5..0a12a8e 100644
+--- a/epic-tasks/78-kc39-a-continue-that-changes-nothing-starts-a-fresh-session-not-a-same-session-harvest.md
++++ b/epic-tasks/78-kc39-a-continue-that-changes-nothing-starts-a-fresh-session-not-a-same-session-harvest.md
+@@ -94,6 +94,9 @@ shown it cannot act on, spending one of `max_rework`'s attempts on it.
+    `max_sessions_per_attempt`, and `turns.jsonl` records `new_session` with
+    `reason: "context"`. Below 90 %, or with the limit unknown, today's
+    same-session rework stands.
++   The 90 % is one module constant shared with KC-56's `_cut_off`, and the
++   session swap is KC-54's (landed `f383335`), factored into one helper
++   rather than copied a third time.
+ 
+ ## Acceptance
+ 
+diff --git a/epic-tasks/INDEX.md b/epic-tasks/INDEX.md
+index 38956a0..45c9159 100644
+--- a/epic-tasks/INDEX.md
++++ b/epic-tasks/INDEX.md
+@@ -107,7 +107,7 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
+ | 99 | `KC-55` | landed `54de4bf` (round 99, winner `sensenova-6-8-flash-lite-var2`) — found live 2026-09-24 in round 66, again in round 91 (19 of 22 gate calls `gate-failed`): the gate fails fast on a 429 from the key it shares with 8 agents. Transport retries via `request_completion`, one re-ask of an empty reply, a `gate_deadline_sec` wall-clock bound checked at intake, a shared-endpoint warning and a key/model probe at intake | HIGH | M | [99-kc55-the-gate-rides-out-a-rate-limit-a-429-or-a-dropped-call-is-retried-inside-a-bounded-wait.md](99-kc55-the-gate-rides-out-a-rate-limit-a-429-or-a-dropped-call-is-retried-inside-a-bounded-wait.md) | `tools/contest/policy.py`, `tools/contest/roster.py`, `tools/contest/cli.py`, `contest.ini` |
+ | 100 | `FL-6` | landed (2026-09-24, by hand) — a red `test_events_of_the_session_keep_a_turn_alive` in a full `-n 6` under heavy load: `_BenchFake.pulse(then_idle=True)` idled on its count (5 s; 2 s for `test_a_silent_agent_stalls_next_to_a_chatty_one`'s neighbour) before the hook's git work and PROGRESS.csv row, so a READY turn came back `GAVE_UP — no_progress_row`. Deterministic repro (delay `_claim`); 22 stress runs up to `-n 8 & -n 8` never hit it. `pulse(idle_after=)` idles only after the work | MEDIUM | XS | [100-fl-6-a-counted-keep-alive-pulse-idles-before-the-work-it-covers-and-a-ready-turn-comes-back-gave-up.md](100-fl-6-a-counted-keep-alive-pulse-idles-before-the-work-it-covers-and-a-ready-turn-comes-back-gave-up.md) | `tests/test_contest_runner.py` |
+ | 101 | `FL-7` | landed `ec9d78d` (2026-09-24, by hand) — found live in round 74: `pytest.ini`'s `addopts -q` plus the `-q` every agent types is `-qq`, which prints no `N passed` line; `sensenova-6-8-flash-lite-var1`/`-var2` re-ran the full suite 3-4 times looking for it and both ran out of their hour, uncommitted. `-q` is gone from `addopts`; a test pins `pytest -q` printing `1 passed` | HIGH | XS | [101-fl-7-an-ini-q-on-top-of-the-q-everyone-types-hides-pytests-passed-line.md](101-fl-7-an-ini-q-on-top-of-the-q-everyone-types-hides-pytests-passed-line.md) | `pytest.ini` |
+-| 102 | `KC-56` | queued — found live 2026-09-24 in round 74: two `sensenova` agents' first turns ended idle on `finish: length` (output budget: reasoning = 32 000; context: 244 410 + 17 734 = 262 144) with a clean tree, and were harvested as "did nothing" (905 s and 1593 s of pytest under the lock). Output cut → a same-session continue; context cut → a fresh session (KC-54 path) | HIGH | S | [102-kc56-a-turn-cut-off-at-finish-length-is-not-a-model-that-stopped.md](102-kc56-a-turn-cut-off-at-finish-length-is-not-a-model-that-stopped.md) | `tools/contest/runner.py` |
++| 102 | `KC-56` | queued — found live 2026-09-24 in round 74: two `sensenova` agents' first turns ended idle on `finish: length` (output budget: reasoning = 32 000; context: 244 410 + 17 734 = 262 144) with a clean tree, and were harvested as "did nothing" (905 s and 1593 s of pytest under the lock). Output cut → a same-session continue; context cut (≥ 90 % of `limit.context`) → a fresh session even on a clean tree, a stated exception to KC-54's clean-overflow stall, through KC-54's swap (factored out) and its `max_continues_per_attempt` budget; no dependency on KC-39 | HIGH | S | [102-kc56-a-turn-cut-off-at-finish-length-is-not-a-model-that-stopped.md](102-kc56-a-turn-cut-off-at-finish-length-is-not-a-model-that-stopped.md) | `tools/contest/runner.py` |
+ 
+ ## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed — `7135844` (+`5788423`, `d4ffb12`); step 2 landed — RUN-3; step 3 landed — `ade28e6`; step 4 landed — RUN-5)
+ 
+-- 
+2.43.0
+

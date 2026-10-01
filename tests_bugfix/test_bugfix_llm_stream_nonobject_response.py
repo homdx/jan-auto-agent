@@ -54,7 +54,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.llm_stream import _extract_content, request_completion
 
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 _HEADERS = {"Content-Type": "application/json"}
 _PAYLOAD = {"model": "x", "messages": []}

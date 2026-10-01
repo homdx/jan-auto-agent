@@ -76,14 +76,18 @@ contest-out/<NN>/                    one folder per round (git-ignored)
 Created with `directory = <worktree>`, the roster's model, and these rules:
 
 ```
-* allow · external_directory ask · doom_loop ask · bash deny for each `deny_commands` pattern
+* allow · external_directory ask · doom_loop ask · bash ask for each `ask_commands` pattern · bash deny for each `deny_commands` pattern
 ```
 
 `bash` stays `allow` (the probe showed `bash: ask` turns every `pytest` and
 `git` into a round trip). The `deny_commands` patterns (`git push*`,
 `sudo *`, `rm -rf /*`, …) are refused by Kilo itself, no round trip, no
-LLM. Everything else that leaves the worktree arrives as
-`external_directory` and goes through the policy.
+LLM. The `ask_commands` patterns catch shell writes that do not name a path
+argument — redirects, `tee`, `cp`/`mv`/`ln`/`rsync`/`dd` destinations and
+installer commands — and raise `bash` instead of falling through to an
+invisible `external_directory` that cannot parse redirect targets.
+Everything else that leaves the worktree arrives as `external_directory` and
+goes through the policy.
 
 ## 4. The approver — three layers, the third is a second model
 
@@ -94,8 +98,8 @@ the reason go back to Kilo and the model reads the reason.
 | layer | decides when | verdict | LLM call |
 |---|---|---|---|
 | 0 server rules | command matches `deny_commands` | Kilo denies | none |
-| 1 mechanical | every path in `patterns` / `metadata.directories` is inside the worktree or inside a `tmp_roots` glob → allow; any path under a hard denylist (`/`, `$HOME` itself, `~/.ssh`, `~/.config`, the repo's `.git/hooks`, any other worktree of the round) → reject; `permission == doom_loop` → reject | final | none |
-| 2 LLM safety gate | everything layer 1 could not settle (a path outside both lists, a command it cannot classify) | `allow` or `reject` with a one-line reason | **one call to the gate model** |
+| 1 mechanical | every path in `patterns` / `metadata.directories` is inside the worktree or inside a `tmp_roots` glob → allow; any path under a hard denylist (`/`, `$HOME` itself, `~/.ssh`, `~/.config`, the repo's `.git/hooks`, any other worktree of the round) → reject; `permission == doom_loop` → reject; `permission == bash` with no path outside the worktree/tmp_roots (a redirect, `2>&1`, a relative write, or a bare command like `pytest -q`) → allow | final | none |
+| 2 LLM safety gate | everything layer 1 could not settle (a path outside both lists, a `bash` ask with an outside path) | `allow` or `reject` with a one-line reason | **one call to the gate model** |
 
 The gate model is **not** the agent's model. It is a named profile
 (`[contest] gate_llm_profile = contest_gate_llm`) resolved with
@@ -200,3 +204,35 @@ model.
 | 50 | KC-11 | each roster model probed once at the highest thinking `variant` that answers `say: hello`; cached in `contest-probe.json`; models without reasoning skip it | M |
 
 Order of implementation as requested: KC-9, then KC-10, then KC-11.
+
+## 10. Added 2026-09-20 — operator comfort, last in the queue
+
+| round | id | what lands | size |
+|---|---|---|---|
+| 66 | KC-27 | the heartbeat shows each agent's phase, a files-count progress bar against the pack's median (60 % working, 70 % committed, 80 % tests, 100 % READY) and how long the judge's tests took; `turn["harvest"]["elapsed"]` persisted | S |
+| 67 | KC-28 | `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/tty` are dropped by `_extract_paths`, so a `> /dev/null` is a no-path bash ask (KC-15's `once`/`mechanical`) and not a gate call out of the session's twenty | S |
+| 68 | KC-29 | a stall the runner asked for (the questions cap) keeps its `STALLED` and exports its patch — only a session that died on its own is promoted to `READY` | S |
+| 69 | KC-30 | `harvest` names the branch's one commit when no `PROGRESS.csv` row does, so `export_patches` has a sha and no caller re-derives one | S |
+| 70 | KC-31 | a `STALLED`/`ERROR` worktree with edits and no commit is exported as `<agent>.STALLED.diff` | S |
+| 71 | KC-32 | the contest tests stop failing on the operator's own box: `contest.local.ini` is not the committed roster, and no test bounds wall-clock under a round's load | S |
+
+## 11. Added 2026-09-23 — FL-1 and its postmortem
+
+Round 84 (FL-1, `epic-tasks/84-…`) is the hardest ticket the epic has
+produced: the full test suite is not reproducibly green under load, and the
+causes are **layered**, so a candidate with real progress still sees an
+identical red suite. Five agents ran it and none finished; Opus 5 needed two
+sittings and twelve further stress runs after the first fix already looked
+done.
+
+| file | what it is |
+|---|---|
+| `POSTMORTEM-FL-1.md` (repo root; identical copy `docs/kilo-contest/POSTMORTEM-FL-1.md`) | the full account — ten causes, six rounds, the four-shape taxonomy of time-dependent test failure (§8), verification by regression injection (§9) and the diagnostic toolkit (Appendix B) |
+| `contest-bench/fl1/RUNBOOK.md` | how to rerun FL-1 as a benchmark: the base, the stress command, what the round is scoring, and the acceptance bar |
+
+Four of the ten causes are production bugs (a lock held across `fsync`;
+`float(MagicMock()) == 1.0`; `EventTap` flushing per event on the reader
+thread and starving the silence clock it feeds; `.git/index.lock` treated as
+a hard failure). Two of those were in code nobody suspected, inside tests
+that had already been written off as flaky — which is the reason the
+postmortem exists as a document rather than a commit message.

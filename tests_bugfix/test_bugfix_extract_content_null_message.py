@@ -35,7 +35,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.llm_stream import _extract_content, request_completion
 
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 _NULL_MESSAGE_OPENAI = {"choices": [{"message": None}]}
 _NULL_MESSAGE_OLLAMA = {"message": None, "done": False}

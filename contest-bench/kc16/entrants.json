@@ -1,0 +1,12 @@
+{
+  "base": "ae124ea",
+  "ticket": "epic-tasks/55-kc16-run-a-ticket-on-the-real-repo-patches-out-tests-in-the-harvest.md",
+  "entries": {
+    "sn67-var3":   {"model": "Sensenova 6-7 var3", "file": "kc12/kc12-Sensenova-6-7-var3.patch", "note": "filed in the KC-12 folder; subject 'KC16'"},
+    "sn68":        {"model": "Sensenova 6-8",      "file": "kc16/kc-16-Sensenova6-8.patch"},
+    "sn67-var":    {"model": "Sensenova 6-7 var",  "file": "kc16/Sensenova6-7-var.patch"},
+    "ling30-var1": {"model": "Ling 30 var1",       "file": "kc16/kc16-Ling-30-var1.patch", "note": "cli.py only — runner.py untouched, run_round has no run_tests"},
+    "ling30":      {"model": "Ling 30",            "file": "kc16/kc16-Ling-30.patch", "note": "raw git diff of the whole branch (epic-tasks/ included), runner.py + runner tests only — no cli.py"},
+    "sn67":        {"model": "Sensenova 6-7",      "file": "kc16/Sensenova6-7.patch", "note": "raw git diff of the whole branch (epic-tasks/, contest-bench/ included), runner.py + runner tests only — no cli.py"}
+  }
+}

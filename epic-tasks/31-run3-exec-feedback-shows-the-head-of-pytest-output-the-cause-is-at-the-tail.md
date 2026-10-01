@@ -89,7 +89,7 @@ the interesting ones. For pytest the interesting lines are the last ones.
 - [ ] `bringing up nodes...` never appears in feedback.
 - [ ] If item 4 is taken: the workspace pytest command contains `-p no:xdist`
       by default and does not when `pytest_serial = false`.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

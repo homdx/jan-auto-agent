@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import pytest
 
-from tools.auto.arch_probe import ArchProbe, ProbeOp
+from tools.auto.arch_probe import ArchProbe, ProbeOp, ProbeOpTally
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -130,7 +130,7 @@ class TestMissMemo:
 
         assert probe.last_hits == 1
         assert probe.last_misses == 1
-        assert probe.last_by_op == {"facts": [1, 1]}
+        assert probe.last_by_op == (ProbeOpTally("facts", 1, 1),)
         assert probe.last_memo_hits == 1
 
     def test_a_hit_is_never_memoised(self) -> None:

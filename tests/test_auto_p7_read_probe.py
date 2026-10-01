@@ -48,6 +48,7 @@ from tools.auto import arch_probe
 from tools.auto.arch_probe import (
     ArchProbe,
     ProbeOp,
+    ProbeOpTally,
     _READ_MAX_LINES,
     extract_probe_request,
 )
@@ -306,7 +307,11 @@ class TestWiring:
         )
         assert len(ops) == 3
         p.execute(ops)
-        assert p.last_by_op == {"facts": [1, 0], "module": [0, 1], "read": [1, 0]}
+        assert p.last_by_op == (
+            ProbeOpTally("facts", 1, 0),
+            ProbeOpTally("module", 0, 1),
+            ProbeOpTally("read", 1, 0),
+        )
         assert p.last_by_op_str() == "facts=1/0 module=0/1 read=1/0"
 
     def test_read_respects_the_per_op_cap(self, repo) -> None:
@@ -320,7 +325,7 @@ class TestWiring:
         """AC-P7-12: AUTO-P4b behaviour, unchanged by the new op."""
         p = _probe(repo)
         assert p.execute([ProbeOp("read", "tools/nope.py")]) == ""
-        assert p.last_by_op == {"read": [0, 1]}
+        assert p.last_by_op == (ProbeOpTally("read", 0, 1),)
 
     def test_instructions_teach_the_op_and_demand_a_range(self) -> None:
         """The op is useless if the model is never told it exists, and

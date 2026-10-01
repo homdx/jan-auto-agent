@@ -208,7 +208,7 @@ and fixes → `tests_bugfix/`, and run the two real roots one after the other
 (`.smoke_tests/` and `.regression_tests/` are symlink views onto `tests/`):
 
 ```bash
-python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
 ```
 
 Every new consumer is fail-open: an absent, malformed or stale artifact degrades

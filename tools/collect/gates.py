@@ -37,7 +37,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 from tools.collect.model import ModuleRecord, Provenance
 
@@ -118,6 +118,7 @@ class GateEntry:
     config_default: str
     provenance: str = Provenance.STATIC
 
+    # Gate 1 corpus AUTO-T13 grades `__post_init__` live: tests/test_gate1_corpus_precision.py
     def __post_init__(self) -> None:
         if self.fail_mode not in FAIL_MODES:
             raise ValueError(
@@ -255,22 +256,28 @@ def _bare_name(qualified: str) -> str:
     return qualified.rsplit(".", 1)[-1]
 
 
-def _repo_defines_function(
-    modules: Iterable[ModuleRecord], root: Path, bare_name: str
-) -> bool:
-    """Whether some module in `modules` defines a function or method
-    named `bare_name`, searched via a full `ast.walk` of each module's
-    source (not just COLLECT-4's top-level `public_symbols` index, which
-    intentionally excludes methods) — so a parser cited as
-    `ClassName.method_name` resolves correctly, and so does a bare
-    function name reused across modules via `import` (e.g.
-    `_parse_verdict_soft`, defined once in `inner_loop.py` and imported
-    by three other gates' modules).
+def _repo_defined_names(modules: Iterable[ModuleRecord], root: Path) -> Set[str]:
+    """Every function/method name defined anywhere in `modules`, via a
+    full `ast.walk` of each module's source (not just COLLECT-4's
+    top-level `public_symbols` index, which intentionally excludes
+    methods) — so a parser cited as `ClassName.method_name` resolves
+    correctly, and so does a bare function name reused across modules via
+    `import` (e.g. `_parse_verdict_soft`, defined once in `inner_loop.py`
+    and imported by three other gates' modules).
 
-    A module that fails to read or parse is skipped, not fatal — the
+    A module that fails to read or parse is skipped, not fatal — a
     citation only needs *one* module in the whole repo to confirm the
     symbol; one unreadable file among many shouldn't sink the check.
+
+    PERF: this reads and `ast.parse`s every module in the repo exactly
+    once, however many gate entries end up checked against the result.
+    `build_gates_map` used to call the equivalent per-entry search once
+    per seed entry (~7 full-repo re-parses on the real `_GATE_SEED`,
+    ~6-9s each on this tree) — same repo, same source, parsed from
+    scratch every time. Parsing once into a name set and doing an O(1)
+    membership check per entry cuts that to a single pass.
     """
+    names: Set[str] = set()
     for m in modules:
         if m.parse_error:
             continue
@@ -280,9 +287,20 @@ def _repo_defines_function(
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == bare_name:
-                return True
-    return False
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(node.name)
+    return names
+
+
+def _repo_defines_function(
+    modules: Iterable[ModuleRecord], root: Path, bare_name: str
+) -> bool:
+    """Whether some module in `modules` defines a function or method
+    named `bare_name`. Kept for any external/test caller that wants a
+    single-name check; `build_gates_map` itself calls
+    `_repo_defined_names` once and checks membership instead, to avoid
+    re-parsing the whole repo once per seed entry."""
+    return bare_name in _repo_defined_names(modules, root)
 
 
 def build_gates_map(
@@ -344,6 +362,10 @@ def build_gates_map(
             return []
 
     verify = modules is not None and root is not None
+    # PERF: one full-repo parse for the whole call, not one per seed
+    # entry — see `_repo_defined_names`. `seed` is typically ~7 entries,
+    # so this turns ~7 repo-wide re-parses into 1.
+    defined_names = _repo_defined_names(modules_list, root) if verify else set()  # type: ignore[arg-type]
 
     entries: List[GateEntry] = []
     for name, spec in seed.items():
@@ -358,7 +380,7 @@ def build_gates_map(
                     "stale and must be fixed or dropped)"
                 )
             bare = _bare_name(parser)
-            if not _repo_defines_function(modules_list, root, bare):  # type: ignore[arg-type]
+            if bare not in defined_names:
                 raise GateCitationError(
                     f"gate {name!r} cites parser {parser!r}, which does not "
                     "resolve to a real function/method definition anywhere "

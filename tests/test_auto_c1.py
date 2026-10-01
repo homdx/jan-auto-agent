@@ -104,7 +104,17 @@ def _task(
     }
 
 
-def _executor(tmp_path: Path, timeout: float = 30) -> Executor:
+# FL-1 (round 84, round 7): a hang guard, not an assertion. The tests that
+# are *about* the timeout build their own Executor with `timeout_sec=0.5`;
+# this shared helper only needs the command to finish. At 30 s it was a
+# wall-clock bound over whatever the acceptance check happens to be — and
+# `test_pytest_acceptance_check` spawns a nested `python -m pytest`, which
+# imports the whole plugin stack and this repo's conftest before it runs a
+# line. The operator's stress run timed it out at 30 s.
+_EXEC_TIMEOUT_S = 300
+
+
+def _executor(tmp_path: Path, timeout: float = _EXEC_TIMEOUT_S) -> Executor:
     return Executor(
         base_dir       = tmp_path / "repo",
         workspace_root = tmp_path / "ws",

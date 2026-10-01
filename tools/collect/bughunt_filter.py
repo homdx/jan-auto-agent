@@ -94,6 +94,7 @@ def _log_verdict(verdict: SuppressionVerdict) -> None:
         )
 
 
+# Gate 1 corpus AUTO-T11 grades `suppress` live: tests/test_gate1_corpus_precision.py
 def suppress(
     candidates: Sequence[BughuntCandidate],
     model: CollectModel,

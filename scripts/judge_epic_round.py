@@ -23,150 +23,24 @@ Everything else is a column, not a verdict. The scorecard is in
 mechanical half and prints the questions it cannot answer.
 
 Exit codes: 0 scored · 1 usage / nothing to score.
+
+KC-5: the scoring itself lives in `tools/contest/gates.py` (`judge_worktree`)
+so the contest runner can import it; this file is the operator CLI over it and
+keeps its CLI and its stdout/CSV bytes.
 """
 import argparse
 import csv
 import os
-import re
-import subprocess
 import sys
 
-BRIDGE = "tools/auto/collect_bridge.py"
-TEST_ROOTS = ["tests", "tests_bugfix", ".smoke_tests", ".regression_tests"]
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-
-def git(cwd, *args, check=False):
-    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
-    if check and r.returncode:
-        raise RuntimeError(f"git {' '.join(args)} in {cwd}: {r.stderr.strip()}")
-    return r.stdout.strip()
-
-
-def extract_shrink(cwd, rev):
-    """The text of `def _shrink` at `rev`, or None if the file/def is absent."""
-    src = subprocess.run(["git", "show", f"{rev}:{BRIDGE}"], cwd=cwd,
-                         capture_output=True, text=True)
-    if src.returncode:
-        return None
-    lines = src.stdout.splitlines()
-    start = None
-    for i, l in enumerate(lines):
-        if re.match(r"^\s*def _shrink\b", l):
-            start = i
-            break
-    if start is None:
-        return None
-    indent = len(lines[start]) - len(lines[start].lstrip())
-    body = [lines[start]]
-    for l in lines[start + 1:]:
-        if l.strip() and (len(l) - len(l.lstrip())) <= indent:
-            break
-        body.append(l)
-    return "\n".join(body).rstrip()
-
-
-def ticket_for_round(tasks_dir, n):
-    for name in sorted(os.listdir(tasks_dir)):
-        m = re.match(r"^0*(\d+)-.*\.md$", name)
-        if m and int(m.group(1)) == n:
-            body = open(os.path.join(tasks_dir, name), encoding="utf-8").read()
-            f = re.search(r"^\*\*File:\*\*\s*`?([^`\n]+?)`?\s*$", body, re.M)
-            also = re.search(r"^\*\*Also touches:\*\*\s*(.+?)\s*$", body, re.M)
-            declared = [f.group(1)] if f else []
-            if also:
-                declared += re.findall(r"`([^`]+)`", also.group(1))
-            title = body.splitlines()[0].lstrip("# ").strip()
-            return name, title, [d for d in declared if d != "—"]
-    return None, None, []
-
-
-def run_tests(cwd):
-    """Four separate invocations — combining the roots collides in conftest."""
-    out = []
-    for d in TEST_ROOTS:
-        if not os.path.isdir(os.path.join(cwd, d)):
-            out.append(f"{d}:absent")
-            continue
-        r = subprocess.run([sys.executable, "-m", "pytest", d, "-q", "--timeout=180"],
-                           cwd=cwd, capture_output=True, text=True)
-        tail = (r.stdout or "").strip().splitlines()
-        summary = tail[-1] if tail else ""
-        nfail = re.search(r"(\d+) failed", summary)
-        nerr = re.search(r"(\d+) error", summary)
-        bad = int(nfail.group(1) if nfail else 0) + int(nerr.group(1) if nerr else 0)
-        out.append(f"{d}:{'PASS' if r.returncode == 0 else f'{bad}✗'}")
-    return " ".join(out)
-
-
-def judge(name, path, base, declared, want_tests):
-    row = {"agent": name, "path": path}
-    if not os.path.isdir(os.path.join(path, ".git")) and not os.path.exists(os.path.join(path, ".git")):
-        row["gate"] = "FAIL"
-        row["notes"] = "not a git worktree"
-        return row
-
-    merge_base = git(path, "merge-base", base, "HEAD") or base
-    commits = [l for l in git(path, "log", "--oneline", f"{merge_base}..HEAD").splitlines() if l]
-    row["commits"] = len(commits)
-    row["sha"] = commits[0].split()[0] if commits else "—"
-
-    # ── hard gate 1: _shrink byte-identical ──────────────────────────────
-    before, after = extract_shrink(path, merge_base), extract_shrink(path, "HEAD")
-    if before is None or after is None:
-        row["shrink"] = "?" if before is None else "GONE"
-    else:
-        row["shrink"] = "same" if before == after else "CHANGED"
-
-    # ── hard gate 2: nothing pushed ──────────────────────────────────────
-    remotes = git(path, "branch", "-r", "--contains", "HEAD")
-    row["pushed"] = "yes" if remotes.strip() else "no"
-
-    # ── diff shape ───────────────────────────────────────────────────────
-    stat = git(path, "diff", "--numstat", f"{merge_base}..HEAD")
-    files, add, dele = [], 0, 0
-    for l in stat.splitlines():
-        parts = l.split("\t")
-        if len(parts) != 3:
-            continue
-        a, d, f = parts
-        files.append(f)
-        add += int(a) if a.isdigit() else 0
-        dele += int(d) if d.isdigit() else 0
-    row["files"] = len(files)
-    row["+/-"] = f"+{add}/-{dele}"
-
-    tests = [f for f in files if re.search(r"(^|/)tests?[_/]|/test_|^\.smoke_tests/|^\.regression_tests/", f)]
-    row["test_files"] = len(tests)
-    new_tests = 0
-    for f in tests:
-        blob = subprocess.run(["git", "show", f"HEAD:{f}"], cwd=path,
-                              capture_output=True, text=True)
-        if blob.returncode == 0:
-            new_tests += len(re.findall(r"^\s*def test_", blob.stdout, re.M))
-    row["test_funcs"] = new_tests
-
-    if declared:
-        outside = [f for f in files if f not in declared and not tests.count(f)]
-        row["off_ticket"] = len(outside)
-        row["off_ticket_files"] = ";".join(outside[:4])
-    else:
-        row["off_ticket"] = 0
-        row["off_ticket_files"] = ""
-
-    row["tests_run"] = run_tests(path) if want_tests else "—"
-
-    gates = []
-    if row["shrink"] == "CHANGED":
-        gates.append("_shrink modified")
-    if row["commits"] != 1:
-        gates.append(f"{row['commits']} commits, expected 1")
-    if row["pushed"] == "yes":
-        gates.append("reached a remote")
-    if row["test_files"] == 0:
-        gates.append("no test shipped")
-    row["gate"] = "FAIL" if gates else "ok"
-    row["notes"] = "; ".join(gates)
-    return row
+from tools.contest.gates import (  # noqa: E402
+    judge_worktree,
+    ticket_for_round,
+)
 
 
 def main():
@@ -203,7 +77,7 @@ def main():
     print(f"declared files: {', '.join(f'`{d}`' for d in declared) or '—'}")
     print(f"base: {a.base}\n")
 
-    rows = [judge(n, p, a.base, declared, a.tests) for n, p in trees]
+    rows = [judge_worktree(n, p, a.base, declared, a.tests) for n, p in trees]
 
     cols = ["agent", "gate", "shrink", "commits", "files", "+/-", "test_files",
             "test_funcs", "off_ticket", "pushed", "sha"]

@@ -13,6 +13,32 @@ raising``, ``test_undecodable_test_file_is_skipped_without_crashing``): the
 specific incident becomes a permanent fixture so it can never silently
 regress.
 
+What is permanent is the CLAIMS, not the evidence (FL-5). The corpus is
+graded against the LIVE TREE: every tier passes ``REPO_ROOT`` — this
+checkout — to the filter, so each verdict is recomputed from the current
+text of the twelve cited symbols and their files' module docstrings. That is
+on purpose: it is what proves Gate 1 still behaves on today's source. The
+price is that an edit to a graded source can move a verdict — one word such
+as "deliberately" in a cited symbol's docstring fires
+``intentional_design_note`` (FL-1's ``MetricsCollector.record`` is one
+word away from turning AUTO-T7 red), and a rename fails the existence check.
+So the coupling is kept loud instead of hidden:
+
+  * every cited symbol carries a one-line marker right above its ``def``
+    naming its entry and this file (``_marker``), so whoever edits it sees
+    it is graded — ``TestLiveCoupling`` fails if an entry's symbol lacks it;
+  * every tier's failure names the entry, the file and the symbol and says
+    the graded source changed (``_coupling``), rather than reading like a
+    precision regression;
+  * every entry must still resolve in the live tree
+    (``test_every_entry_resolves_in_the_live_tree``) — including AUTO-T11,
+    which no other tier would notice renamed: the pipeline tier counts a
+    false positive rejected at Stage A as caught.
+
+When one of these goes red after an edit to a graded source, re-read the
+entry's claim against the new source. Do not reword the source to make the
+test green.
+
 Two tiers
 ---------
 1. ``TestGroundingNotesUnit`` — deterministic, no LLM at all. Directly
@@ -44,6 +70,7 @@ import configparser
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -52,7 +79,9 @@ import pytest
 from tools.auto.architect import CandidateTask, CitedLocation
 from tools.auto.gate1_filter import Gate1Filter
 
+#: The live tree — the corpus's evidence (see "What is permanent" above).
 REPO_ROOT = Path(__file__).resolve().parent.parent
+_THIS_TEST = "tests/test_gate1_corpus_precision.py"
 _FIXTURE_SIGNAL_WORDS = ("toy module", "deliberately", "negative case", "control case")
 
 
@@ -132,6 +161,11 @@ _CORPUS: list[dict] = [
         # solved. TestCorpusPrecisionRecall's mock therefore treats this
         # one as "confirmed" (Gate 1 does NOT catch it today) and recall is
         # computed accordingly — see that class's docstring.
+        # FL-5: on the live tree it IS rejected today, and not because the
+        # gap closed — intentional_design_note (AUTO-H3-1, landed a day after
+        # this corpus) fires on suppress's own "deliberately failing closed".
+        # A word in the graded source moved this verdict; see
+        # TestCorpusPrecisionRecall.
     ),
     # ── Confirmed legitimate (must NOT be suppressed by grounding notes) ───
     dict(
@@ -195,6 +229,24 @@ _CORPUS: list[dict] = [
 ]
 
 
+def _marker(entry: dict) -> str:
+    """The line that sits right above *entry*'s ``def`` (above its decorators)
+    in the graded file. ``extract_block`` starts at the decorator, so the
+    marker is never part of the evidence it announces."""
+    return f"# Gate 1 corpus {entry['id']} grades `{entry['symbol']}` live: {_THIS_TEST}"
+
+
+def _coupling(entry: dict, what: str) -> str:
+    """The failure message every tier uses for one entry: which source it
+    grades, and that the source — not necessarily Gate 1 — is what moved."""
+    return (
+        f"{entry['id']} grades the live source of {entry['file']}::{entry['symbol']} "
+        f"— {what}. If that source changed, re-read the entry's claim against it; "
+        f"this is a Gate 1 regression only if tools/auto/gate1_*.py changed too. "
+        f"Do not reword the source to turn this green."
+    )
+
+
 def _candidate(entry: dict) -> CandidateTask:
     return CandidateTask(
         title=entry["title"],
@@ -233,27 +285,60 @@ def filt(minimal_config: configparser.ConfigParser) -> Gate1Filter:
 # Tier 1 — deterministic, no LLM: does grounding fire on the RIGHT reason?
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _resolve(filt: Gate1Filter, entry: dict, root: Path) -> str:
+    """Stage A for one entry against *root*: its code block, or a failure
+    naming the source the entry grades."""
+    ok, reason, block = filt._check_existence(_candidate(entry), root, cluster_files=None)
+    assert ok, _coupling(entry, f"the symbol no longer resolves there ({reason})")
+    return block
+
+
+def _notes(filt: Gate1Filter, entry: dict, root: Path) -> str:
+    """Stage A + A2 for one entry against *root*: the grounding notes."""
+    candidate = _candidate(entry)
+    block = _resolve(filt, entry, root)
+    module_docstring = filt._module_docstring_for(candidate, root)
+    return filt._build_grounding_notes(candidate, block, module_docstring, root)
+
+
+def _check_expected_note(filt: Gate1Filter, entry: dict, root: Path) -> None:
+    notes = _notes(filt, entry, root)
+    assert notes, _coupling(entry, f"expected a {entry['note_kind']} grounding note, got none")
+    if entry["note_kind"] == "config_fallback":
+        assert "fallback=" in notes and "NoSectionError" in notes, _coupling(
+            entry, f"the config_fallback note did not fire: {notes!r}")
+    elif entry["note_kind"] == "module_docstring":
+        assert "Module docstring" in notes, _coupling(
+            entry, f"the module docstring note did not fire: {notes!r}")
+
+
+def _check_legit_is_neutral(filt: Gate1Filter, entry: dict, root: Path) -> None:
+    notes = _notes(filt, entry, root)
+    assert "NOTE (automated" not in notes, _coupling(
+        entry, f"an automated counter-note fired on a legitimate candidate: {notes!r}")
+    assert not any(w in notes.lower() for w in _FIXTURE_SIGNAL_WORDS), _coupling(
+        entry, "fixture-signal language leaked into a legitimate candidate's grounding "
+               f"notes (docstring context should be neutral here): {notes!r}")
+
+
 class TestGroundingNotesUnit:
-    """Runs Stage A for real (against this actual repo checkout) then checks
+    """Runs Stage A for real (against this actual repo checkout — the live
+    tree, see the module docstring) then checks
     Gate1Filter._build_grounding_notes directly — no LLM involved."""
+
+    @pytest.mark.parametrize("entry", _CORPUS, ids=lambda e: e["id"])
+    def test_every_entry_resolves_in_the_live_tree(self, filt: Gate1Filter, entry: dict) -> None:
+        """All twelve: a renamed or moved symbol fails here, by name. The
+        pipeline tier alone would not notice it for a false-positive entry
+        without a note (AUTO-T11) — rejected at Stage A still counts as caught."""
+        assert _resolve(filt, entry, REPO_ROOT)
 
     @pytest.mark.parametrize(
         "entry", [e for e in _CORPUS if e["note_kind"] is not None],
         ids=lambda e: e["id"],
     )
     def test_expected_grounding_note_fires(self, filt: Gate1Filter, entry: dict) -> None:
-        candidate = _candidate(entry)
-        ok, reason, block = filt._check_existence(candidate, REPO_ROOT, cluster_files=None)
-        assert ok, f"existence check failed for {entry['id']}: {reason}"
-
-        module_docstring = filt._module_docstring_for(candidate, REPO_ROOT)
-        notes = filt._build_grounding_notes(candidate, block, module_docstring, REPO_ROOT)
-
-        assert notes, f"{entry['id']}: expected a grounding note, got none"
-        if entry["note_kind"] == "config_fallback":
-            assert "fallback=" in notes and "NoSectionError" in notes
-        elif entry["note_kind"] == "module_docstring":
-            assert "Module docstring" in notes
+        _check_expected_note(filt, entry, REPO_ROOT)
 
     @pytest.mark.parametrize("entry", [e for e in _CORPUS if e["label"] == "legit"], ids=lambda e: e["id"])
     def test_legit_candidates_carry_no_disqualifying_signal(self, filt: Gate1Filter, entry: dict) -> None:
@@ -264,20 +349,7 @@ class TestGroundingNotesUnit:
         fallback= to justify it, or (b) fixture-signal language appearing
         in a docstring that was never written to say "this is a toy/
         deliberately-bad example"."""
-        candidate = _candidate(entry)
-        ok, reason, block = filt._check_existence(candidate, REPO_ROOT, cluster_files=None)
-        assert ok, f"existence check failed for {entry['id']}: {reason}"
-
-        module_docstring = filt._module_docstring_for(candidate, REPO_ROOT)
-        notes = filt._build_grounding_notes(candidate, block, module_docstring, REPO_ROOT)
-
-        assert "NOTE (automated" not in notes, (
-            f"{entry['id']}: config_fallback_note fired on a legitimate candidate: {notes!r}"
-        )
-        assert not any(w in notes.lower() for w in _FIXTURE_SIGNAL_WORDS), (
-            f"{entry['id']}: fixture-signal language leaked into a legitimate candidate's "
-            f"grounding notes (docstring context should be neutral here): {notes!r}"
-        )
+        _check_legit_is_neutral(filt, entry, REPO_ROOT)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -337,46 +409,162 @@ class TestCorpusPrecisionRecall:
 
     If this test's numbers change, either the corpus grew (good — update
     the baseline below) or a real regression happened (bad — investigate
-    before touching the baseline).
+    before touching the baseline) — or, since the corpus grades the live
+    tree, a graded source changed: the failure names which entries moved
+    and the sources they grade.
+
+    Measured on the live tree today (FL-5): 6 of 6 caught, precision and
+    recall 100%. AUTO-T11 is rejected by intentional_design_note on
+    suppress's own "deliberately failing closed", not by closing the
+    one-hop gap — a verdict moved by a word in a graded source, which the
+    bounds below let through silently. The bounds are left as they were.
     """
 
     def test_corpus_precision_recall_meets_baseline(
         self, filt: Gate1Filter,
     ) -> None:
-        candidates = [_candidate(e) for e in _CORPUS]
-        by_title = {e["title"]: e for e in _CORPUS}
+        _check_precision_recall(filt, REPO_ROOT)
 
-        with patch("tools.llm_stream.request_completion", side_effect=_prompt_aware_llm):
-            accepted, rejected = filt.filter(candidates, REPO_ROOT, cluster_files=None)
 
-        accepted_ids = {by_title[c.title]["id"] for c in accepted}
-        rejected_ids = {by_title[r.candidate.title]["id"] for r in rejected}
-        assert accepted_ids | rejected_ids == {e["id"] for e in _CORPUS}
+def _check_precision_recall(filt: Gate1Filter, root: Path) -> None:
+    """The pipeline tier against *root*. Every failure names the entries
+    that moved and the sources they grade (``_coupling``)."""
+    candidates = [_candidate(e) for e in _CORPUS]
+    by_title = {e["title"]: e for e in _CORPUS}
+    by_id = {e["id"]: e for e in _CORPUS}
 
-        false_ids = {e["id"] for e in _CORPUS if e["label"] == "false"}
-        legit_ids = {e["id"] for e in _CORPUS if e["label"] == "legit"}
+    def named(ids: set, what: str) -> str:
+        return "\n".join(_coupling(by_id[i], what) for i in sorted(ids))
 
-        tp = rejected_ids & false_ids          # correctly caught false positives
-        fn = accepted_ids & false_ids          # false positives that slipped through
-        fp = rejected_ids & legit_ids          # legit tasks wrongly rejected
-        tn = accepted_ids & legit_ids          # legit tasks correctly kept
+    with patch("tools.llm_stream.request_completion", side_effect=_prompt_aware_llm):
+        accepted, rejected = filt.filter(candidates, root, cluster_files=None)
 
-        precision = len(tp) / (len(tp) + len(fp)) if (tp or fp) else float("nan")
-        recall    = len(tp) / (len(tp) + len(fn)) if (tp or fn) else float("nan")
+    accepted_ids = {by_title[c.title]["id"] for c in accepted}
+    rejected_ids = {by_title[r.candidate.title]["id"] for r in rejected}
+    assert accepted_ids | rejected_ids == {e["id"] for e in _CORPUS}
 
-        assert fp == set(), f"Gate 1 wrongly rejected legitimate task(s): {fp}"
-        assert precision == 1.0, f"precision dropped: {precision:.0%} (fp={fp})"
-        assert tn == legit_ids, f"expected all legit tasks kept, kept={tn}"
+    false_ids = {e["id"] for e in _CORPUS if e["label"] == "false"}
+    legit_ids = {e["id"] for e in _CORPUS if e["label"] == "legit"}
 
-        # Baseline: 5/6 false positives caught. If this regresses below 5,
-        # something broke. If it improves to 6 (AUTO-T11's gap gets closed
-        # some day), update this assertion to match — a stricter bound is
-        # a welcome failure here, not a bug.
-        assert len(tp) >= 5, f"recall regressed: only caught {sorted(tp)} (recall={recall:.0%})"
-        assert "AUTO-T11" not in tp or len(tp) == 6, (
-            "AUTO-T11 is now caught — great, update this test's baseline "
-            "docstring and drop this guard, the one-hop gap has been closed."
+    tp = rejected_ids & false_ids          # correctly caught false positives
+    fn = accepted_ids & false_ids          # false positives that slipped through
+    fp = rejected_ids & legit_ids          # legit tasks wrongly rejected
+    tn = accepted_ids & legit_ids          # legit tasks correctly kept
+
+    precision = len(tp) / (len(tp) + len(fp)) if (tp or fp) else float("nan")
+    recall    = len(tp) / (len(tp) + len(fn)) if (tp or fn) else float("nan")
+
+    assert fp == set(), (
+        f"Gate 1 wrongly rejected legitimate task(s) {sorted(fp)} "
+        f"(precision {precision:.0%}):\n" + named(fp, "a legit entry was rejected")
+    )
+    assert precision == 1.0, f"precision dropped: {precision:.0%} (fp={fp})"
+    assert tn == legit_ids, f"expected all legit tasks kept, kept={tn}"
+
+    # Baseline: 5/6 false positives caught. If this regresses below 5,
+    # something broke. If it improves to 6 (AUTO-T11's gap gets closed
+    # some day), update this assertion to match — a stricter bound is
+    # a welcome failure here, not a bug.
+    assert len(tp) >= 5, (
+        f"recall regressed: only caught {sorted(tp)} (recall={recall:.0%}):\n"
+        + named(fn, "a false positive was no longer rejected")
+    )
+    assert "AUTO-T11" not in tp or len(tp) == 6, (
+        "AUTO-T11 is now caught — great, update this test's baseline "
+        "docstring and drop this guard, the one-hop gap has been closed."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FL-5 — the live-tree coupling is visible, for all twelve entries
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _graded_copy(tmp_path: Path) -> Path:
+    """A scratch root holding a copy of every graded file at its own path.
+    The real checkout is never edited."""
+    for f in {e["file"] for e in _CORPUS}:
+        dst = tmp_path / f
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPO_ROOT / f, dst)
+    return tmp_path
+
+
+def _def_line(lines: list[str], entry: dict) -> int:
+    for i, ln in enumerate(lines):
+        if re.match(rf"\s*(?:async\s+)?def {re.escape(entry['symbol'])}\b", ln):
+            return i
+    raise AssertionError(_coupling(entry, "no def of the symbol is left in the file"))
+
+
+class TestLiveCoupling:
+    """The corpus grades the live tree; these prove that an edit to a graded
+    source says so — in the file being edited and in the failure."""
+
+    @pytest.mark.parametrize("entry", _CORPUS, ids=lambda e: e["id"])
+    def test_graded_symbol_carries_the_marker(self, entry: dict) -> None:
+        lines = (REPO_ROOT / entry["file"]).read_text(encoding="utf-8").splitlines()
+        i = _def_line(lines, entry)
+        while i > 0 and lines[i - 1].lstrip().startswith("@"):
+            i -= 1
+        above = lines[i - 1].strip() if i else ""
+        assert above == _marker(entry), (
+            f"{entry['file']}::{entry['symbol']} is graded live by corpus entry "
+            f"{entry['id']} but the line above its def is not the marker — add:\n"
+            f"    {_marker(entry)}\ngot: {above!r}"
         )
+
+    def test_the_scratch_copy_grades_like_the_live_tree(
+        self, filt: Gate1Filter, tmp_path: Path,
+    ) -> None:
+        """Control for the two tests below: the unedited copy passes every
+        check, so a failure there is the edit and nothing else."""
+        root = _graded_copy(tmp_path)
+        for entry in _CORPUS:
+            _resolve(filt, entry, root)
+            if entry["note_kind"] is not None:
+                _check_expected_note(filt, entry, root)
+            if entry["label"] == "legit":
+                _check_legit_is_neutral(filt, entry, root)
+        _check_precision_recall(filt, root)
+
+    def test_a_trigger_word_in_record_fails_naming_the_entry_file_and_symbol(
+        self, filt: Gate1Filter, tmp_path: Path,
+    ) -> None:
+        """FL-1's hazard, replayed on a scratch copy: "deliberately" in
+        MetricsCollector.record's own docstring. Both tiers go red, and each
+        failure names AUTO-T7, the file and the symbol."""
+        entry = next(e for e in _CORPUS if e["id"] == "AUTO-T7")
+        root = _graded_copy(tmp_path)
+        path = root / entry["file"]
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        doc = _def_line(lines, entry) + 1
+        assert '"""' in lines[doc], f"{entry['symbol']} has no docstring to aim at"
+        lines[doc] = lines[doc].replace('"""', '"""Deliberately bounded. ', 1)
+        path.write_text("".join(lines), encoding="utf-8")
+
+        needles = (entry["id"], f"{entry['file']}::{entry['symbol']}", "live source")
+        for check in (lambda: _check_legit_is_neutral(filt, entry, root),
+                      lambda: _check_precision_recall(filt, root)):
+            with pytest.raises(AssertionError) as err:
+                check()
+            for needle in needles:
+                assert needle in str(err.value), f"failure omits {needle!r}: {err.value}"
+
+    @pytest.mark.parametrize("entry", _CORPUS, ids=lambda e: e["id"])
+    def test_a_renamed_symbol_fails_naming_the_entry_file_and_symbol(
+        self, filt: Gate1Filter, tmp_path: Path, entry: dict,
+    ) -> None:
+        root = _graded_copy(tmp_path)
+        path = root / entry["file"]
+        path.write_text(
+            re.sub(rf"\bdef {re.escape(entry['symbol'])}\b", f"def {entry['symbol']}_moved",
+                   path.read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
+        with pytest.raises(AssertionError) as err:
+            _resolve(filt, entry, root)
+        for needle in (entry["id"], f"{entry['file']}::{entry['symbol']}"):
+            assert needle in str(err.value), f"failure omits {needle!r}: {err.value}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

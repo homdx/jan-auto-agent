@@ -34,7 +34,7 @@ a release; they are simply not part of the day-to-day loop.
 ## Running these tests
 
 ```bash
-python3 -m pytest tests_bugfix -q
+python3 -m pytest tests_bugfix -n 4 -q
 ```
 
 They are ordinary pytest files — same `conftest.py` bootstrap (project root

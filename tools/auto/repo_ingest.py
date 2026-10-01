@@ -342,6 +342,7 @@ class RepoIngestor:
         "node_modules", "venv", ".venv", "dist", "build", ".tox",
     })
 
+    # Gate 1 corpus AUTO-T3 grades `_read_skip_dirs` live: tests/test_gate1_corpus_precision.py
     def _read_skip_dirs(self) -> set[str]:
         """Read skip_dirs, preferring [architect] then [search]; always union
         in the built-in noise-directory defaults."""

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tools.collect.model import ContractRecord, FunctionRecord, GuardedAccess, ModuleRecord, Provenance
 from tools.collect.registries import (
     SafetyAnswer,
@@ -24,6 +26,8 @@ from tools.collect.scanner import scan_repo
 
 REPO_ROOT = Path(__file__).parent.parent
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "collect_mini_repo"
+
+pytestmark = pytest.mark.xdist_group(name="collect_already_safe")
 
 
 def _line_of(rel_path: str, needle: str) -> int:
@@ -47,7 +51,16 @@ _MIXED_LINE = 'data[agent_name]["current_version"] = stack[-1]["version"] if sta
 _SAVE_BODY_LINE = "os.replace(tmp_path, self.store_path)"
 
 
-def _real_repo_index():
+@pytest.fixture(scope="session")
+def real_repo_index():
+    """Session-scoped cache of the full already-safe index for this repo.
+
+    build_already_safe_index (plus build_fail_open_registry and
+    build_seed_contracts) costs ~38 s per call on this tree.  Eight tests
+    below call ``_real_repo_index()`` independently — on a single worker
+    the session scope collapses them to one build; the xdist_group ensures
+    they share a worker.
+    """
     modules = scan_repo(REPO_ROOT)
     fail_open = build_fail_open_registry(modules, root=REPO_ROOT)
     contracts = build_seed_contracts(modules)
@@ -57,9 +70,8 @@ def _real_repo_index():
 # ── guarded access: prompt_store.get_current's stack[-1] ───────────────────
 
 
-def test_guarded_prompt_store_access_is_safe():
-    index = _real_repo_index()
-    answer = index.query("tools/prompt_store.py:91")
+def test_guarded_prompt_store_access_is_safe(real_repo_index):
+    answer = real_repo_index.query("tools/prompt_store.py:91")
 
     assert isinstance(answer, SafetyAnswer)
     assert answer.safe is True
@@ -156,9 +168,8 @@ def test_contract_covered_location_is_safe():
 # ── truly unknown location ───────────────────────────────────────────────────
 
 
-def test_unknown_location_is_not_safe_and_not_guessed():
-    index = _real_repo_index()
-    answer = index.query("tools/does_not_exist.py:1")
+def test_unknown_location_is_not_safe_and_not_guessed(real_repo_index):
+    answer = real_repo_index.query("tools/does_not_exist.py:1")
 
     assert answer.safe is False
     assert answer.reason == "unknown"
@@ -177,33 +188,30 @@ def test_unknown_location_is_not_safe_and_not_guessed():
 # (located by _MIXED_LINE, not pinned by number — it drifts).
 
 
-def test_real_mixed_line_without_access_is_ambiguous_not_optimistically_guarded():
-    index = _real_repo_index()
+def test_real_mixed_line_without_access_is_ambiguous_not_optimistically_guarded(real_repo_index):
     line = _line_of("tools/prompt_store.py", _MIXED_LINE)
-    answer = index.query(f"tools/prompt_store.py:{line}")
+    answer = real_repo_index.query(f"tools/prompt_store.py:{line}")
     assert answer.safe is False
     assert answer.reason == "ambiguous_location"
     assert "data[agent_name]" in answer.detail
     assert "stack[-1]" in answer.detail
 
 
-def test_real_mixed_line_disambiguated_via_access_resolves_the_guarded_one():
-    index = _real_repo_index()
+def test_real_mixed_line_disambiguated_via_access_resolves_the_guarded_one(real_repo_index):
     line = _line_of("tools/prompt_store.py", _MIXED_LINE)
-    answer = index.query(f"tools/prompt_store.py:{line}", access="stack[-1]")
+    answer = real_repo_index.query(f"tools/prompt_store.py:{line}", access="stack[-1]")
     assert answer.safe is True
     assert answer.reason == "guarded"
 
 
-def test_real_mixed_line_disambiguated_via_access_does_not_falsely_clear_the_unguarded_one():
+def test_real_mixed_line_disambiguated_via_access_does_not_falsely_clear_the_unguarded_one(real_repo_index):
     # data[agent_name] itself isn't in guarded_accesses as UNGUARDED at
     # this exact citation in isolation from contract coverage — the
     # precise point is just that asking specifically about it must never
     # come back "guarded" (borrowing stack[-1]'s status), whatever else it
     # resolves to.
-    index = _real_repo_index()
     line = _line_of("tools/prompt_store.py", _MIXED_LINE)
-    answer = index.query(f"tools/prompt_store.py:{line}", access="data[agent_name]")
+    answer = real_repo_index.query(f"tools/prompt_store.py:{line}", access="data[agent_name]")
     assert answer.reason != "guarded"
 
 
@@ -261,22 +269,20 @@ def test_access_that_does_not_exist_at_a_real_location_is_unknown_not_unguarded(
 # code that has nothing to do with atomic saving at all.
 
 
-def test_real_prompt_store_unrelated_methods_no_longer_falsely_match_save_contract():
-    index = _real_repo_index()
+def test_real_prompt_store_unrelated_methods_no_longer_falsely_match_save_contract(real_repo_index):
     # Lines inside get_store_summary/get_version_label/push/rollback —
     # none of them call _save or touch its atomic-write behavior.
     for line in (90, 100, 130, 150):
-        answer = index.query(f"tools/prompt_store.py:{line}")
+        answer = real_repo_index.query(f"tools/prompt_store.py:{line}")
         assert answer.reason != "contract", (
             f"line {line} (not inside _save) falsely matched a contract "
             f"that only guarantees _save's behavior: {answer!r}"
         )
 
 
-def test_real_prompt_store_save_body_still_matches_its_own_contract():
-    index = _real_repo_index()
+def test_real_prompt_store_save_body_still_matches_its_own_contract(real_repo_index):
     line = _line_of("tools/prompt_store.py", _SAVE_BODY_LINE)
-    answer = index.query(f"tools/prompt_store.py:{line}")
+    answer = real_repo_index.query(f"tools/prompt_store.py:{line}")
     assert answer.safe is True
     assert answer.reason == "contract"
     assert "prompt_store_atomic_save" in answer.detail
@@ -326,3 +332,36 @@ def test_class_level_contract_with_no_method_reference_still_matches_class_wide(
     answer = index.query("pkg/widget.py:50")
     assert answer.safe is True
     assert answer.reason == "contract"
+
+
+# ── session-fixture sanity ─────────────────────────────────────────────────
+
+
+def test_shared_index_fixture_exists():
+    """real_repo_index must be a session-scoped fixture so the eight tests
+    that need the full repo index build it once instead of ~38 s each.
+
+    Without the fixture, every test calls build_already_safe_index from
+    scratch — verified by checking the module carries the fixture and that
+    the xdist_group keeps all eight tests on one worker.
+    """
+    import tests.test_collect_already_safe_query as mod
+
+    assert hasattr(mod, "real_repo_index"), (
+        "real_repo_index fixture missing — tests will rebuild the index "
+        "~38 s each instead of once per session"
+    )
+
+    mark = getattr(mod, "pytestmark", None)
+    assert mark is not None, (
+        "pytestmark missing — no xdist_group on this module"
+    )
+    mark_list = mark if isinstance(mark, list) else [mark]
+    groups = [m for m in mark_list
+              if getattr(m, "name", None) == "xdist_group"
+              and m.kwargs.get("name") == "collect_already_safe"]
+    assert groups, (
+        "module-level xdist_group('collect_already_safe') missing — the "
+        "eight tests that share real_repo_index will scatter across workers "
+        "and each rebuild the index independently"
+    )

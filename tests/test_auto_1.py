@@ -20,7 +20,17 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _run(*args, input_text: str | None = None, timeout: int = 15) -> subprocess.CompletedProcess:
+# FL-1 (round 84): a hang guard, not an assertion. One of these runs takes
+# ~1.5 s on an idle box, and the old 15 s looked like a 10x margin — but the
+# operator's stress run (four `pytest -n 8` invocations at once on 8 cores)
+# blew straight through it, and `subprocess.TimeoutExpired` is a far worse
+# diagnostic than the `--timeout` stack dump that would have followed. Let
+# pytest-timeout be the one that calls a hang a hang.
+_MAIN_PY_TIMEOUT_S = 120
+
+
+def _run(*args, input_text: str | None = None,
+         timeout: int = _MAIN_PY_TIMEOUT_S) -> subprocess.CompletedProcess:
     """Run main.py with the given extra args and return the CompletedProcess."""
     cmd = [sys.executable, str(PROJECT_ROOT / "main.py"), *args]
     return subprocess.run(

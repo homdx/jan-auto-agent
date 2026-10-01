@@ -1,6 +1,6 @@
 # M6 — Outcome metric: precision against the adjudicated corpus
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12), re-verified against `149eb88` (2026-10-01); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** MEDIUM  
 **File:** `scripts/`  
 **Symbol:** `—`  
@@ -10,13 +10,20 @@
 **Depends on:** M3, and whatever EPIC B ends up shipping  
 **Also touches:** `validate1/`  
 
+
+**Re-verified against `149eb88` (2026-10-01).** Not done; blocked on M3.
+Paths: `validate1/truth.csv` is not in this repository (see M3);
+`ANALYTICS-RUNBOOK.md` is `validate1/ANALYTICS-RUNBOOK.md`; the metrics file
+is `docs/collect-epics/archive/EPIC-M-metrics.md`. The scorers
+`scripts/truth_consensus.py` and `scripts/merge_validations.py` exist.
+
 ---
 
 **Priority:** Medium · **Size:** M · **Files:** `scripts/` + `validate1/`
 **Depends on:** M3, and whatever EPIC B ends up shipping
 
 Tier 3. The project already has the hard part: `validate1/truth.csv` is 54
-findings adjudicated to FALSE / REAL / FIXED, and `ANALYTICS-RUNBOOK.md`
+findings adjudicated to FALSE / REAL / FIXED, and `validate1/ANALYTICS-RUNBOOK.md`
 describes how it was built.
 
 ### Do
@@ -42,7 +49,7 @@ findings produced               ___          ___
 
 - [ ] Noise floor recorded before and after, produced by the existing scorers.
 - [ ] Zero REAL findings lost.
-- [ ] Numbers land in `docs/collect-epics/EPIC-M-metrics.md` (**Measured** table — there is no `METRICS.md`) under **Measured**.
+- [ ] Numbers land in `docs/collect-epics/archive/EPIC-M-metrics.md` (**Measured** table — there is no `METRICS.md`) under **Measured**.
 
 ---
 
@@ -97,7 +104,7 @@ M1 ─┬─ M2 ──────────────► EPIC A can start
    and run nothing extra; combining roots in one `pytest` call produces ~362
    false errors from a conftest collision:
    ```bash
-   python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+   python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
    ```
    `python` is not on PATH — use `python3`. One suite at a time — the machine
    is shared with the other round entrants.

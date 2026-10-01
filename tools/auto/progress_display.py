@@ -292,6 +292,7 @@ class ProgressDisplay:
 # Factory
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Gate 1 corpus AUTO-T1 grades `make_progress_display` live: tests/test_gate1_corpus_precision.py
 def make_progress_display(
     state,
     config: configparser.ConfigParser,

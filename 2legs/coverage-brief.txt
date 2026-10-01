@@ -1,0 +1,16 @@
+Raise test coverage where it is lowest.
+
+1. Measure: run `python3 -m pytest --cov=. --cov-report=term-missing -q`
+   (install pytest-cov into a venv under /tmp/kilo/ if it is missing; never
+   commit the venv). Save the table to `docs/COVERAGE.md`: per module the
+   statements, missed and percent, sorted from least covered, plus the total.
+2. Pick the least covered modules that hold real logic (not `__init__`, not
+   generated code, not CLI glue) and write tests for their uncovered branches.
+   Each test asserts behaviour, not just that a line ran.
+3. If a new test exposes a bug, keep the test, fix the bug, and say so in the
+   commit body.
+4. Re-measure and add the "after" column to `docs/COVERAGE.md`.
+5. One commit: subject `tests: coverage <before>% -> <after>%`.
+
+On a later leg: read docs/COVERAGE.md first and continue with the next least
+covered module.

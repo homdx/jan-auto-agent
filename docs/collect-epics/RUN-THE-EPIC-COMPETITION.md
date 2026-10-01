@@ -66,6 +66,21 @@ per-agent progress files never appear in the diffs you are comparing.
 
 ## Stage 1 — hand out one round
 
+**The Kilo contest replaces this stage and stage 2 with one command:**
+`docs/kilo-contest/RUN-THE-KILO-CONTEST.md` is the operator's page for it —
+its stage R (`scripts/contest_reset.sh`) is the worktree-per-agent below, and
+its RUN stage (`python3 -m tools.contest run`) carries the prompt, the loop
+and the ground rules in the runner's own prompt. Stages 3–5 are unchanged
+either way; the contest's hand-over section points back to this page.
+
+**KC-44 — the ticket's own size decides its legs.** The contest's `run` reads
+the ticket's `**Size:**` line and runs `[contest] legs_by_size`'s count for
+it (`XS=1, S=1, M=1, L=3` in the committed `contest.ini`) unless `--legs`
+was passed; an L ticket that comes out one leg is refused at intake unless
+`--legs 1` says it out loud. The chosen count and its source — `flag`,
+`size` or `config` — land in the relay's `state.json` and the plan's `legs`
+line; a round of one leg is the round it always was.
+
 **One worktree per agent, all from the same commit.** Agents committing into one
 checkout collide; that is not a tool problem, it is what worktrees are for.
 
@@ -146,6 +161,9 @@ wrong (see `INDEX.md` §"Numbers in this file … are hand-measured").
 > Never point any command at a live provider config. If a step needs one, copy
 > `agents_128k.ini` to a scratch path and stub every `base_url` first.
 >
+> Running the test suite on this machine can take up to 20 minutes under load:
+> give that `bash` call a `timeout` of at least 1200000 ms.
+>
 > When you are done, report: the commit sha, each Acceptance checkbox and
 > whether you met it, and anything in the ticket you found to be wrong about the
 > live code — each ticket names the commit it was written against in its
@@ -225,7 +243,7 @@ agent is actually better, accumulated over 24 rounds instead of guessed.
 ```bash
 git checkout competition
 git cherry-pick <winning sha>
-python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
 git worktree remove ../round-opus   # …and the rest
 ```
 

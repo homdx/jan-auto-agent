@@ -1,0 +1,303 @@
+# KC-6 as a benchmark ticket — how the round was judged, and how to run it again
+
+KC-6 (`epic-tasks/45-kc6-runner-prompt-wait-harvest-rework-in-the-same-session-for-n-agents.md`)
+is the hardest ticket of EPIC KC: it joins four landed modules into a threaded
+state machine, depends on a primitive that did not exist yet (KC-12), and has
+nine Acceptance scenarios. That makes it the right ticket to hand to a live
+multi-agent run once the KC epic is complete: the bench below scores any set
+of worktrees black-box, in minutes, with no LLM and no `kilo` binary.
+
+Everything here lives in `contest-bench/kc6/`:
+
+| file | what |
+|---|---|
+| `setup_kc6.sh` | `*.patch` folder → one worktree per entry + `base`, outside the repo tree |
+| `run_one_kc6.py` | one scenario, `cwd` = an entry worktree; builds its own sandbox + stub server |
+| `run_all_kc6.py` | every scenario × every entry → `results.json` + the matrix |
+| `entrants.json`, `results.json`, `RESULTS.md` | the 2026-09-19 round as it was scored |
+
+## 1. The round as it was handed out
+
+The tree every agent started from is commit **`f48a92c`**: KC-1…KC-5 landed,
+KC-6 `open` in `epic-tasks/`, no `tools/contest/runner.py`. That commit is the
+`base_ref` for any rerun — the ticket is unimplemented there, `next_task.py`
+offers it, and the harvest (`tools/contest/harvest.py`) scores the worktree
+against it. The bench itself lives in later commits; copy
+`contest-bench/kc6/` to scratch (or check it out from `9dbb525`) when the
+base tree is what the agents see.
+
+The prompt each agent got is the runbook's Stage 1 block
+(`docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`), which is also what
+`tools.contest.runner.round_prompt` sends in a live round.
+
+## 2. Collect the patches
+
+One `git format-patch <base>..HEAD` file per agent in one folder
+(`kc6/` in this repo, never committed). Name them after the agent. Check
+before anything else:
+
+```bash
+# same diff twice? (two KC-6 pairs were)
+for a in kc6/*.patch; do for b in kc6/*.patch; do [ "$a" \< "$b" ] && cmp -s <(sed 1,3d "$a") <(sed 1,3d "$b") && echo "same: $a $b"; done; done
+# how many commits, which files
+grep -c '^From [0-9a-f]\{40\}' kc6/*.patch
+grep -E '^ [^ ]+ *\| ' kc6/*.patch
+```
+
+## 3. Worktrees
+
+```bash
+S=/tmp/kc6-bench                      # anywhere outside the repo tree
+contest-bench/kc6/setup_kc6.sh kc6/ $S/wt            # base f48a92c
+contest-bench/kc6/setup_kc6.sh kc6/ $S/wt <other-sha>  # a different base
+```
+
+Prints one line per patch: the commit count (the ticket wants exactly one) or
+`DOES NOT APPLY`. `$S/wt/base` is the unpatched base — the bench reads the
+base tree's `tests/_kilo_fake.py` and `scripts/append_task.py` from it.
+
+## 4. Static checks, per worktree
+
+These are the ticket's self-check list, run by hand; every one of them cost a
+KC-5 or KC-6 entry points:
+
+```bash
+for d in $S/wt/*/; do [ "$(basename $d)" = base ] && continue; ( cd $d
+  echo "== $(basename $d): $(git rev-list --count f48a92c..HEAD) commit(s)"
+  git diff --stat f48a92c..HEAD | tail -n +1                 # only File:/Also touches: + .smoke_tests
+  python3 -c "import tools.contest.runner" && echo import-ok  # Python 3.10.12 on the judge
+  python3 scripts/sync_test_tiers.py --check | tail -1
+  git diff f48a92c HEAD -- tools/auto/collect_bridge.py | wc -l  # must be 0
+  grep -c 'def test_' tests/test_contest_runner.py
+  grep -n 'kilo serve\|localhost:[0-9]\{4\}' tests/test_contest_runner.py  # must find nothing
+); done
+```
+
+## 5. Each entry's own tests (not the score — a sanity column)
+
+```bash
+for d in $S/wt/*/; do [ "$(basename $d)" = base ] && continue
+  (cd $d && echo "== $(basename $d)" && timeout 600 python3 -m pytest tests/test_contest_runner.py -q --timeout=180 -p no:cacheprovider 2>&1 | tail -2)
+done
+```
+
+An entry's own tests prove what its author thought of; in KC-6 all seven had
+tests and none of them caught any of the defects the bench found.
+
+## 6. The bench
+
+```bash
+python3 contest-bench/kc6/run_all_kc6.py --wt $S/wt --out $S/results.json          # everything
+python3 contest-bench/kc6/run_all_kc6.py --wt $S/wt --out $S/results.json sn68v1   # one entry
+python3 contest-bench/kc6/run_all_kc6.py --wt $S/wt --out $S/results.json s30_stall_with_a_chatty_neighbour  # one scenario, all entries
+```
+
+About 40 s per entry when nothing else runs; **do not run two bench
+processes at once** — s14/s22/s26/s30 assert wall-clock bounds. The last
+line of every run is `PASS`, `FAIL <why>` or `ERROR <traceback tail>`, and
+`results.json` keeps them. To see one failure in full:
+
+```bash
+cd $S/wt/<entry> && python3 /path/to/contest-bench/kc6/run_one_kc6.py s30_stall_with_a_chatty_neighbour $S/wt/base
+```
+
+Run the bench on `base` too: every scenario must `ERROR` there (no module) —
+that is the "red without the change" check for the bench itself.
+
+### The stub server
+
+`run_one_kc6.py::bench_fake` subclasses `tests/_kilo_fake.py::FakeKiloServer`
+(the scripted `kilo serve` from KC-1). A scenario is one dict shared by every
+session; `on_prompt(directory, text)` runs in the fake before the turn's
+events and is where the "agent's work" happens — the bench commits into the
+worktree and writes `runs/<agent>/PROGRESS.csv` through the real
+`scripts/append_task.py`. Knobs, per turn:
+
+| key | what the session does |
+|---|---|
+| `events: ["busy", "file.edited", "idle"]` | the recorded event sequence; `idle` is held until permission/question are answered |
+| `permission: {...}` | one `permission.asked`; the turn blocks until the runner replies |
+| `questions: N` | *(bench)* N `question.asked` in a row, each waits for `reject` |
+| `delay: 1.0` | seconds before `session.idle` |
+| `idle: false` | never goes idle (a stall; the turn timeout or the silence clock must end it) |
+| `error: {...}` | `session.error` instead of idle |
+| `tool_parts`, `assistant`, `info`, `diff` | what `GET /session/{id}/message`, `/session/{id}`, `/diff` return |
+| top-level `bad_models: {"m:free"}` | *(bench)* `POST /session` answers 400 for that model |
+| top-level `session: {"cost": …, "tokens": {…}}` | what `session_info` reports |
+
+The fake **broadcasts every event to every open `/event` stream**, whatever
+`directory` the tap asked for. That is the property behind s30: a runner
+whose silence clock counts any tap event never stalls a silent agent while a
+neighbour is chatty. A real server with several directories on one stream
+behaves the same way; count the session's own events.
+
+Ad-hoc shapes are done by patching the instance (see s30: `fake._run_turn`,
+`fake._permission_event`, `fake._record_request` are swapped per test); the
+same subclass exists as `_BenchFake` in `tests/test_contest_runner.py` with
+a `pulse()` helper for "busy every N ms".
+
+### Adding a scenario
+
+Add a `@scenario` function to `run_one_kc6.py` (they are discovered by name,
+`sNN_` prefix keeps the order), build a `Sandbox(tmp, agents)`, script the
+fake, call `AgentHarness(...).go()` for `run_agent` or `_round(...)` for
+`run_round`, and `check(...)` the contract: the returned `AgentRun`/
+`RoundState`, `out_dir/state.json`, `out_dir/<agent>/turns.jsonl`,
+`decisions.jsonl`, `<agent>.session.json`, and the fake's request/event log
+(`fake.calls(...)`, `fake.events_of(...)`, `prompts(fake)`). Only the
+ticket's public names — the bench must not know how an entry is built.
+Re-run the base (must `ERROR`) and the ideal (must `PASS`), then everyone.
+
+## 7. One test file on every entry
+
+The ideal's `tests/test_contest_runner.py` is the bench in pytest form with
+exact shapes. To run it inside each entry (a second, stricter column):
+
+```bash
+for d in $S/wt/*/; do e=$(basename $d); [ $e = base ] && continue
+  cp tests/test_contest_runner.py $d/tests/test_kc6_final.py
+  (cd $d && timeout 900 python3 -m pytest tests/test_kc6_final.py -q --timeout=120 -p no:cacheprovider 2>&1 | tail -1 | sed "s/^/$e: /")
+  rm $d/tests/test_kc6_final.py
+done
+```
+
+(Copy under a new name: the file's `REPO_ROOT` is its own parent's parent,
+so it imports the entry's runner, not the ideal's.)
+
+## 8. From the matrix to the ideal
+
+1. Rank by the bench, not by the entries' tests or line counts.
+2. Read the code of the top group only, and only after the matrix — what
+   they did differently on the scenarios that split them.
+3. Write the ideal from the ticket with the bench as the spec (in KC-6 the
+   result was a fresh write closest to the winner's structure, 622 lines
+   against 837–1197), run it through the bench (must be 28/28) and through
+   the ticket's own self-check list.
+4. Branch `kc<N>-ideal` off the round base; commits in this order:
+   the ideal (one commit, `File:` + `Also touches:` + `.smoke_tests/` link
+   only), the bench record (`contest-bench/kc<N>/`), the round flip
+   (`epic-tasks/`: this ticket `landed <sha>` with the one-paragraph verdict,
+   the next ticket's `Status:` updated with what it must now know).
+5. `python3 scripts/next_task.py --tasks epic-tasks --status` must offer only
+   the next round. `kc` fast-forwards to the ideal branch; the operator pushes.
+
+## 9. Using KC-6 to test a live multi-agent run
+
+Once KC-7 (`python3 -m tools.contest run`) and KC-9 exist:
+
+```bash
+python3 -m tools.contest run --ticket 45 --base f48a92c --config contest.ini --out contest-out/kc6-live
+```
+
+hands the very same ticket to the roster in one session each, harvests,
+reworks and exports one patch per agent. Score them with this folder:
+
+```bash
+contest-bench/kc6/setup_kc6.sh contest-out/kc6-live/patches $S/wt f48a92c
+python3 contest-bench/kc6/run_all_kc6.py --wt $S/wt --out $S/live-results.json
+```
+
+Compare against `results.json` here: the same models, the same ticket, the
+same 28 scenarios — the difference between the hand-run round of 2026-09-19
+and the runner's round is the runner's own score. What to look at first:
+`s30` (the concurrency edge nobody's own tests caught), `s26` (Ctrl-C), and
+the static checks in §4 — a live agent that stacks commits or edits
+`kilo_client.py` fails the harvest before the bench sees it.
+
+## 10. Live runs, 2026-09-19 — the runner against `kilo serve` and the three free models
+
+`live_smoke.py` (this folder) builds a sandbox repo under `/tmp/contest/live-kc6`
+with the real `scripts/next_task.py` / `append_task.py`, a stub
+`CollectBridge`, `pkg/thing.py` and two tickets, then runs the ideal runner
+with the roster of `contest.ini` (`kenary/laguna-s-2-1:free`,
+`mistral-medium-3-5:free`, `hy3:free`), `max_parallel = 3`,
+`turn_timeout 600`, `idle_event_timeout 120`, the gate left at contest.ini's
+placeholder URL (so every gated permission fails closed).
+
+```bash
+python3 contest-bench/kc6/live_smoke.py --round 1            # one turn each
+python3 contest-bench/kc6/live_smoke.py --round 2            # two commits + two outside writes: rework + permissions
+python3 contest-bench/kc6/live_smoke.py --round 2 --resume   # after a Ctrl-C
+```
+
+| run | result | what it exercised |
+|---|---|---|
+| round 1 (×2) | 3/3 READY in 118 s and 127 s, one turn each, 5/5 tests green in every worktree, one commit, `PROGRESS.csv` row with the sha | create → prompt → idle → harvest; free-tier rate limits (`session.status {"type": "retry"}`) retried by Kilo itself |
+| round 2 (×2) | 3/3 READY in 295 s both times; laguna REWORK `commits_ne_1` → amended in the same session → READY at attempt 1 (first run), hy3 and mistral the same in the other runs | the rework loop live: the model remembered the ticket and squashed |
+| round 2, permissions | laguna `cat …/rounds/01-laguna/runs/laguna/PROGRESS.csv` → **reject (mechanical, forbidden: the rounds folder)**; `/tmp/contest/notes/*` → `once` (tmp_roots); `/tmp/kc6-outside-*` → gate → `gate-failed` reject; laguna retried the rejected write 5× (the counters: asked 7, rejected 5) | the sibling-worktree rule against the exact DeepSeek pattern; the budget counters |
+| Ctrl-C at 45 s, then `--resume` | `KeyboardInterrupt` propagated (rc 130), `state.json` = three agents WAITING, server closed; resume restarted all three from CREATED in the same worktrees → 3/3 READY in 295 s | s26 live |
+
+What the live stream taught (none of it visible on the fake):
+
+- **`server.heartbeat` every 10 s, no `sessionID`**, plus `sync`,
+  `plugin.added`, `file.watcher.updated`, `indexing.status` … without a
+  session. A silence clock that counts *any* event never fires on the live
+  server — the five KC-6 entries that lost s30 would never detect a stall
+  at all. `file.edited` also carries no `sessionID` live
+  (`{"file": "..."}` only), so a per-session clock does not see edits; the
+  session's own `message.part.*` / `session.status` events are the liveness
+  signal, and a long silent tool call is exactly what `idle_event_timeout_sec`
+  = 300 is for. Recorded in the KC-12 ticket.
+- **`external_directory` names one path per bash command.** For
+  `mkdir -p /tmp/contest/notes && … > /tmp/contest/notes/x && … > /tmp/kc6-outside-x`
+  Kilo asked with `patterns: ["/tmp/contest/notes/*"]` only; the redirect
+  target outside was not in the event, the policy judged only `patterns` /
+  `metadata.directories`, answered `once`, and the outside file was written.
+  KC-13 (new ticket) makes the policy read every absolute path in
+  `metadata.command` too.
+- **Models retry a rejected command** (laguna: five times in one turn)
+  although the prompt says a rejection is final; `gate_max_calls_per_session`
+  is what bounds it — with the gate placeholder every retry is a fast
+  `gate-failed`, with a real gate each is a paid call.
+- Token counts come back as `{"input", "output", "reasoning", "cache": {"read", "write"}}`
+  with `cost` 0 on the free tier; `Harvest.commit` is whatever sha the model
+  wrote into `PROGRESS.csv` (mistral: a 7-char short sha) — the harvest
+  resolves it, the summary shows it as written.
+
+## 11. Live run, 2026-09-19 — twelve more free models through `--models`
+
+`live_smoke.py --models a:free,b:free,…` runs a roster built from the list
+instead of `contest.ini`'s (provider `kenary` unless the id carries one; the
+agent name is the model id without its `:tag`), `--max-parallel N` sets the
+pool. The list is not scored anywhere — the point was more models against
+the same runner, not a table.
+
+```bash
+python3 contest-bench/kc6/live_smoke.py --round 1 --max-parallel 4 \
+  --models agnes-2-0-flash:free,agnes-2-5-flash:free,agnes-3-0-flash:free,glm-4-7-flash:free,laguna-xs-2-1:free,mimo-v2-5:free,muse-spark-1-3-contributor:free,nemotron-3-super-120b-a12b:free,nemotron-3-ultra-550b-a55b:free,nex-n2-5-pro:free,north-mini-code:free,step-3-7-flash:free
+python3 contest-bench/kc6/live_smoke.py --round 2 --max-parallel 3 \
+  --models agnes-2-0-flash:free,agnes-2-5-flash:free,glm-4-7-flash:free,mimo-v2-5:free,step-3-7-flash:free,nemotron-3-super-120b-a12b:free
+```
+
+| run | result | what it exercised |
+|---|---|---|
+| round 1, 12 models, 4 at a time | 285 s. **5 READY** (agnes-2-0-flash, agnes-2-5-flash, glm-4-7-flash, mimo-v2-5, step-3-7-flash: one turn, one commit, 5/5 tests, a `PROGRESS.csv` row). **5 ERROR in ~1 s** — `session.error … Model not found: kenary/<id>. Did you mean: …` for agnes-3-0-flash, laguna-xs-2-1, muse-spark-1-3-contributor, nex-n2-5-pro, north-mini-code (not on this Kilo 7.6.2's kenary list; `kilo models` agrees). **2 ERROR from the provider** — nemotron-3-super-120b-a12b after 48 s, nemotron-3-ultra-550b-a55b after 198 s and four free-tier retries: `"the model's provider rejected the request. check the model id, request fields, and context length"` | s13 live (the error body is readable in `last_error` and the table); a wave of four with 12 agents; heartbeats-only silence on the 550B model for 35 s was *not* a stall (own-session clock, 120 s) |
+| round 2, 6 models, 3 at a time | 591 s. **5/5 READY** of the models that exist: agnes-2-0, agnes-2-5, mimo → `commits_ne_1` → amended → READY at attempt 1; glm-4-7-flash → `commits_ne_1`, then `commit_not_on_branch` (it recorded a sha, then reset and re-committed) → READY at attempt 2 — the last allowed one, 1.2 M input tokens; step-3-7-flash squashed before recording → READY at attempt 0. nemotron-super made its two commits and asked one permission, then the provider rejected the next request at 127 k input tokens → ERROR | the rework loop across five different model families; `attempt == max_rework` → READY, not GAVE_UP, when the last rework lands |
+
+No runner change came out of it. Two findings became tickets:
+
+- **KC-14 — `harvest` accepts `--commit HEAD`.** agnes-2-0-flash recorded
+  `…,FIXED,HEAD,"…"`; `git merge-base --is-ancestor HEAD HEAD` is true, the
+  verdict was READY and `Harvest.commit == "HEAD"` went into `state.json`
+  and the round table. The claim must be a 7–40 hex sha that resolves;
+  `tools/contest/harvest.py`.
+- **KC-15 — a bash redirect outside the worktree raises no permission at
+  all.** In round 2 four of five models wrote `/tmp/kc6-outside-<name>.txt`
+  with a bare `echo "…" > /tmp/kc6-outside-….txt`; `decisions.jsonl` has
+  one line per agent (the `mkdir -p /tmp/contest/notes && …` call, which
+  asked `external_directory` for the `mkdir` argument and was `once` under
+  tmp_roots), step-3-7-flash asked nothing at all because the notes folder
+  already existed. Kilo's `external_directory` reads command *arguments* of
+  the commands it knows; a redirect target is not one. §10's hy3 case was
+  caught only because the redirect shared a line with a `mkdir`. The fix is
+  a `bash` ask for write-shaped commands (`ask_commands`) plus a layer-1
+  rule that keeps path-less bash commands free — after KC-13.
+
+Also seen: the free tier's rate limit is per account, not per model — four
+sessions at once spend most of the first minute in
+`session.status {"type": "retry"}`; three at a time was smoother. One
+model (step-3-7-flash) took "your name" as `$USER` for the note files
+(`/tmp/contest/notes/renat.txt`) but used the prompt's
+`runs/step-3-7-flash/PROGRESS.csv` for the claim — harvest reads
+`ws.progress_csv`, so a model that also invented its own `runs/<name>` folder
+would be `no_progress_row` and told the path in the rework message.

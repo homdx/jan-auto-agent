@@ -490,7 +490,7 @@ def test_the_legacy_order_is_not_reused():
 
 
 @pytest.fixture(scope="module")
-def live_model() -> CollectModel:
+def live_model(live_collect_model) -> CollectModel:
     """This repo's symbols and config reads, built from the source tree the way
     the producer builds them — never from `.collect/`, which is gitignored and
     would make AC #1 skip on a fresh checkout. Contracts come from the
@@ -500,7 +500,7 @@ def live_model() -> CollectModel:
     edges = graph_mod.import_edges(modules)
     reverse = graph_mod.imported_by(edges)
     tmap = test_map_mod.build_test_map(REPO_ROOT, modules)
-    return CollectModel(
+    return live_collect_model(
         status=STATUS_FRESH,
         modules=tuple(modules),
         import_edges={k: tuple(sorted(v)) for k, v in edges.items()},

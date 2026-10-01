@@ -177,7 +177,7 @@ in a scratch checkout, then:
 ```bash
 git apply --check <patch> && git apply <patch>
 grep -n "_shrink" — the diff must not touch a line inside CollectBridge._shrink
-python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
 ```
 
 The two roots run **one after the other, never combined** (conftest collision

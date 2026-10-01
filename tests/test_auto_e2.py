@@ -35,6 +35,10 @@ Thread safety  [from draft: TestThreadSafety / AC-7]
   * Concurrent record_gate2() calls produce a consistent total — no lost writes,
     no file corruption.
 
+record() encoding  [FL-1 follow-up]
+  * The file is byte-identical to json.dump(records, indent=2).
+  * A file changed underneath the cache is re-read, not appended to.
+
 Isolation — the core E2 guarantee
   * Interactive metrics.json untouched after recording to auto stream.
   * Auto stream path never equals Path("metrics.json") resolved.
@@ -58,6 +62,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import os
 import sys
 import threading
 from pathlib import Path
@@ -347,6 +352,43 @@ class TestThreadSafety:
         for r in stream.collector.load_recent(1000):
             assert r.improvement_json_ok is None
 
+
+
+# ── record() encodes each record once  [FL-1 follow-up] ──────────────────────
+
+class TestIncrementalEncoding:
+    """record() writes the file from per-record encoded text it caches. The
+    file must stay exactly what ``json.dump(records, f, indent=2)`` writes, and
+    a file changed underneath the cache must be re-encoded, not appended to."""
+
+    def _layout_is_json_dump(self, path):
+        text = path.read_text(encoding="utf-8")
+        assert text == json.dumps(json.loads(text), indent=2)
+
+    def test_the_file_is_byte_identical_to_json_dump(self, tmp_path):
+        stream = AutoMetricsStream(_agent_dir(tmp_path))
+        for i in range(5):
+            stream.record_gate2(f"T{i}", approved=bool(i % 2),
+                                feedback='line one\nline "two" \\ é', attempts=i)
+        self._layout_is_json_dump(stream.metrics_path)
+        assert len(stream.collector.load_recent(10)) == 5
+
+    def test_an_outside_write_is_re_read_before_the_next_record(self, tmp_path):
+        stream = AutoMetricsStream(_agent_dir(tmp_path))
+        stream.record_gate2("T0", approved=True, feedback="", attempts=1)
+        stream.record_gate2("T1", approved=True, feedback="", attempts=1)
+        path = stream.metrics_path
+        outside = json.loads(path.read_text(encoding="utf-8"))[:1]
+        outside[0]["validator_feedback"] = "written by another process"
+        path.write_text(json.dumps(outside, indent=2), encoding="utf-8")
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+
+        stream.record_gate2("T2", approved=False, feedback="", attempts=1)
+
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert [r["validator_feedback"] for r in on_disk] == ["written by another process", ""]
+        self._layout_is_json_dump(path)
 
 # ── Isolation — the core E2 guarantee ────────────────────────────────────────
 

@@ -1,6 +1,6 @@
 # KC-6 — `tools/contest/runner.py`: prompt → wait → harvest → rework, in the same session, for N agents at once, resumable
 
-**Status:** queued — after KC-5 (round 44); needs KC-1, KC-2, KC-3, KC-4, KC-5. Written against `67e834d`.  
+**Status:** landed `e8c6ad3` — ideal patch from a 7-entry contest, `kc6/*.patch`, scored black-box via `contest-bench/kc6/` (28 scenarios: the Acceptance list plus three agents reworking at once, a silent agent next to a chatty one, Ctrl-C then resume). Winner Sensenova-6-8-var1 (27/28); DeepSeek 27/28 but disqualified (read other agents' folders). What sank the rest: silence clocked on any tap event instead of the session's own (5 of 7), `with ThreadPoolExecutor` joining every worker before Ctrl-C's abort, four `turns.jsonl` lines per turn, a windowed `wait_idle` that aborts a live session at every window edge, `time.time()` subtracted from `time.monotonic()`, `AgentState` as a `typing.Literal`. `tests` + `tests_bugfix` green. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** CRITICAL  
 **File:** `tools/contest/runner.py` (new)  
 **Symbol:** `AgentRun`, `AgentState`, `run_agent`, `run_round`, `round_prompt`, `RoundState`  
@@ -116,7 +116,7 @@ The operator still pastes the prompt into N UIs and watches.
         agent is skipped, the other restarts and reaches `READY`.
 - [ ] `round_prompt` contains the runbook's `next_task.py` and
       `append_task.py` command lines and the agent name.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 
@@ -124,6 +124,46 @@ The operator still pastes the prompt into N UIs and watches.
 - Retrying a session that hit `ERROR` on the provider side (HTTP 429 at
   the provider) — it is recorded; the operator reruns with `--resume`.
 - Any LLM judgement of the *result* — the harvest is mechanical.
+
+## Self-check before `append_task.py` (required — every item, in the worktree you submit)
+
+Every line below is a way a KC-5 entry lost points on the round bench;
+the scorer checks all of them mechanically, so check them yourself first.
+
+- [ ] `python3 --version` on the judge is **3.10.12**. Every new/changed
+      module imports there: `python3 -c "import tools.contest.runner"` from the
+      repo root **and** from `/tmp` (with `PYTHONPATH` unset — the sys.path
+      bootstrap is yours to ship). No backslash and no nested same-quote
+      inside an f-string expression (a 3.12-only `f"{x.split("\t")}"`
+      is a `SyntaxError` here and scores 0).
+- [ ] Exactly **one** commit on top of the base: `git log --oneline <base>..HEAD`
+      prints one line. Only this ticket's work is in it — no other KC
+      ticket, no "while I was here" fixes; amend, do not stack.
+- [ ] `git diff --stat <base>..HEAD` names only the files under **File:**
+      and **Also touches:** (plus `.smoke_tests/` links). Never `epic-tasks/`.
+- [ ] Names and signatures are the ticket's, verbatim — **Symbol:** is the
+      contract the bench calls: `AgentRun`, `AgentState`, `run_agent`, `run_round`, `round_prompt`, `RoundState`. Read the modules this ticket
+      builds on before calling them (`tools/contest/harvest.py` — `harvest(ws, ticket_path, *, run_tests=False)` and `rework_message(h, attempt, max_rework)`; `tools/contest/workspace.py` — `Workspace.base_sha`, `.branch`, `.progress_csv`; `tools/contest/kilo_client.py` — `wait_idle(..., idle_event_timeout=)` from KC-12); a keyword you invented
+      (`run_tests_flag=`, `base="HEAD"`) is a `TypeError` on every scenario.
+- [ ] `python3 scripts/sync_test_tiers.py --check` is clean (the new test
+      file has its `.smoke_tests/` symlink; the pre-commit hook runs this).
+- [ ] The new test is red without the change: check the test file alone
+      out onto the base (`git stash` / `git checkout <base> -- <src>`),
+      run it, see it fail; restore.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, **sequentially**,
+      both green.
+- [ ] `CollectBridge._shrink` byte-identical:
+      `git diff <base> HEAD -- tools/auto/collect_bridge.py` is empty.
+- [ ] Then, and only then, `scripts/append_task.py` from the worktree;
+      open `runs/<you>/PROGRESS.csv` and see your row with the sha of the
+      one commit (the script stores `--outcome DONE` as `FIXED`; that is fine).
+- [ ] What you hand in is `git format-patch <base>..HEAD` of that one
+      commit — not a raw `git diff`, not the whole branch, not an empty file.
+- [ ] `tests/test_contest_runner.py` runs against `tests/_kilo_fake.py` only:
+      `grep -n 'kilo serve\|localhost:.*[0-9]\{4\}' tests/test_contest_runner.py` finds nothing
+      that reaches a real server; every scenario in **Acceptance** has a
+      test whose name says which one it is.
 
 ## Ground rules (same as every round)
 

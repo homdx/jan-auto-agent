@@ -1,6 +1,6 @@
 # V14 — Turn on docs mode
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12), re-verified against `149eb88` (2026-10-01); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** MEDIUM  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  
@@ -8,6 +8,13 @@
 **Size:** S  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V14  
 **Depends on:** V2–V5  
+
+
+**Re-verified against `149eb88` (2026-10-01).** Not built: no
+`_PACK_ROWS_DOC`, and `use_in_doc = false` in `agents_128k.ini`. The flag is
+selected by `task_mode` in `collect_bridge.make_collect_bridge` and in
+`controller.py`, as the ticket says. `entry_points` now has **552** entries
+(was 382). Worth a round only if docs mode is actually run.
 
 ---
 
@@ -61,7 +68,7 @@ the one consumer that is disabled.
    and run nothing extra; combining roots in one `pytest` call produces ~362
    false errors from a conftest collision:
    ```bash
-   python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+   python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
    ```
    `python` is not on PATH — use `python3`. One suite at a time — the machine
    is shared with the other round entrants.

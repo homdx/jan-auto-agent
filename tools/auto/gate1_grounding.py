@@ -46,9 +46,11 @@ JIRA epic AUTO-H2) motivated this module:
 from __future__ import annotations
 
 import ast
+import os
 import re
+import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 # ── AUTO-H2-6: cited-location / target-file mismatch ───────────────────────────
 #
@@ -516,39 +518,354 @@ def _referenced_call_names(code_block: str) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def _find_def_in_repo(name: str, base_dir: Path, max_files: int = 4000) -> Optional[tuple[Path, str]]:
+# ── FL-9: the repo walk must not be a filesystem-order lottery ───────────
+#
+# _find_def_in_repo's job is to point Stage B at a definition, and every
+# wrong answer it can give is worse than no answer at all: a definition from
+# a nested work tree is somebody else's revision, a copied fixture is a
+# different program, and "not found" on a definition that is sitting in the
+# repo costs the claim its only chance at a counter-fact. The old walk had
+# three sources of error:
+#
+#   * it read whatever ``Path.rglob`` handed it first, and rglob's order is
+#     directory-entry order, so a checkout that also holds nested work trees
+#     (``rounds/``), vendored output or copied fixtures could hand back a
+#     foreign definition — the machine that happened to list those first;
+#   * it ignored whether a file was tracked, so an untracked copy of a module
+#     was a first-class candidate;
+#   * max_files could be spent entirely on files the search should never have
+#     read, leaving "not found" for a definition that was in the repo (FIX-2
+#     #11 cut this for .agent/ and node_modules/; FL-9 closes it for
+#     everything git already told us to ignore).
+#
+# The result is now an ordered preference list — the cited file, then its
+# package outward, then the tracked repo in sorted order — so two runs and
+# two machines agree. Every shortcut here is optional and fail-open: no git,
+# git failing, or a malformed answer just drops that stage and the plain
+# walk below still runs.
+
+def _resolve_cited(base_dir: Path, cited_file: Optional[str]) -> Optional[Path]:
+    """*cited_file* as an absolute path inside *base_dir*, else ``None``.
+
+    ``None`` covers an empty citation, a missing file's directory, a
+    traversal out of *base_dir* and a non-path *base_dir* alike. Every
+    caller treats ``None`` as "no citation to anchor on" and falls back to
+    the unanchored walk rather than raising.
+    """
+    if not cited_file:
+        return None
+    try:
+        root_abs = Path(base_dir).resolve()
+        cited_abs = (Path(base_dir) / cited_file).resolve()
+        cited_abs.relative_to(root_abs)
+    except (ValueError, OSError, RuntimeError, TypeError):
+        return None
+    return cited_abs
+
+
+def _same_file_as_citation(found_path: Path, cited_file: str, base_dir: Path) -> bool:
+    """True when *found_path* IS the cited file.
+
+    Comparing identities, not basenames. The old ``found_path.name ==
+    Path(cited_file).name`` test also swallowed a genuinely different module
+    that merely shares a filename (``tools/x.py`` vs
+    ``tests/fixtures/copy/tools/x.py``), which is the copy confusion this
+    search exists to steer around.
+    """
+    cited_abs = _resolve_cited(base_dir, cited_file)
+    if cited_abs is None:
+        return False
+    try:
+        return found_path.resolve() == cited_abs
+    except (OSError, RuntimeError):
+        return False
+
+
+def _display_path(found_path: Path, base_dir: Path) -> Path:
+    """*found_path* relative to *base_dir* for the prompt.
+
+    ``_find_def_in_repo`` only returns paths under *base_dir*, so this is
+    normally a plain relative_to. The resolve covers *base_dir* reached
+    through a symlink, and the last resort keeps a stray absolute path out
+    of Stage B's prompt rather than printing one.
+    """
+    try:
+        return found_path.relative_to(base_dir)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return found_path.resolve().relative_to(Path(base_dir).resolve())
+    except (ValueError, OSError, RuntimeError, TypeError):
+        return found_path.name
+
+
+#: Tracked-file lookups are not cached across calls: an --auto run makes
+#: several Gate 1 passes against a tree its Coder keeps committing to, and a
+#: process-wide cache would hand a later pass the index of an earlier one.
+#: ``callee_context`` reads the list once per call and passes it to every
+#: name it tries, which is the one place the repeat cost was.
+_TRACKED_FILES_TIMEOUT_SECONDS = 10
+
+
+#: FIX-2 #11's original exclusions: the run's own state and the vendored
+#: pile. Applied to every walk, tracked or not — a definition inside them
+#: is not a result even when it matches. FL-9 deliberately keeps this list
+#: unchanged: the tracked walk already drops build/ output, site-packages
+#: and virtualenvs by virtue of not being tracked, and widening the list
+#: here would hide a real definition in a checkout that has no git at all.
+_EXCLUDED_SEGMENTS: tuple[str, ...] = (".agent", "node_modules")
+
+
+def _path_parts(p: object) -> list[str]:
+    """*p*'s path components, for a ``Path`` or a bare string stand-in.
+
+    ``tests_bugfix/test_bugfix_fix2_11_find_def_budget.py`` drives the
+    search with a stub whose ``rglob`` yields relative ``Path`` objects, so
+    a ``"/.agent/"``-style substring test would silently stop matching a
+    path that merely *starts* with an excluded name. Comparing whole
+    segments handles absolute, relative and plain-string inputs alike.
+    """
+    try:
+        return list(p.parts)  # type: ignore[union-attr]
+    except AttributeError:
+        return str(p).replace(os.sep, "/").split("/")
+
+
+def _has_segment(p: object, segments: tuple[str, ...]) -> bool:
+    """True when any component of *p* is one of *segments*."""
+    return any(part in segments for part in _path_parts(p))
+
+
+def _is_excluded_path(p: Path) -> bool:
+    """True when *p* is inside one of ``_EXCLUDED_SEGMENTS``."""
+    return _has_segment(p, _EXCLUDED_SEGMENTS)
+
+
+def _tracked_python_files(base_dir: Path) -> Optional[list[Path]]:
+    """Paths of the ``*.py`` files git tracks under *base_dir*, or ``None``.
+
+    ``None`` means "git could not tell us" — not inside a work tree, no
+    ``git`` on PATH, an unreadable index, a hang, anything at all. Every
+    failure mode degrades to the plain walk, which is the pre-FL-9
+    behaviour; nothing here may raise. An empty list is a real answer and
+    is returned as such — see the note before the sort. The list comes back
+    sorted, so the caller's order is the same on every run and every
+    machine.
+    """
+    if not isinstance(base_dir, (Path, str, os.PathLike)):
+        return None
+
+    def _git(args: list[str], *, timeout: int = 5) -> Optional[bytes]:
+        try:
+            proc = subprocess.run(
+                ["git", *args], cwd=str(base_dir),
+                capture_output=True, timeout=timeout,
+            )
+        except Exception:  # noqa: BLE001 — no git, no cwd, timeout: all "no git"
+            return None
+        if proc.returncode != 0:
+            return None
+        return proc.stdout
+
+    top = _git(["rev-parse", "--show-toplevel"])
+    if top is None or not top.strip():
+        return None
+    # --full-name: without it ls-files answers relative to cwd, and joining
+    # that to the root below loses every file when base_dir is a
+    # subdirectory of the work tree.
+    raw = _git(
+        ["ls-files", "-z", "--full-name", "*.py"],
+        timeout=_TRACKED_FILES_TIMEOUT_SECONDS,
+    )
+    if raw is None:
+        return None
+
+    try:
+        base_abs = Path(base_dir).resolve()
+        root_abs = Path(top.strip().decode("utf-8", "replace")).resolve()
+    except (OSError, ValueError):
+        return None
+
+    # ls-files answers relative to the work tree root, so both ends have to
+    # be resolved before the containment test — the root may be a symlink,
+    # and a base_dir outside the tree must not be read as a relative path.
+    out: list[Path] = []
+    for rel in raw.split(b"\x00"):
+        rel_s = rel.decode("utf-8", "replace").strip()
+        if not rel_s:
+            continue
+        candidate = root_abs / rel_s
+        # Both ends are resolved already, so a plain relative_to usually
+        # settles it without a second resolve per file. The resolve exists
+        # for the one case it matters — base_dir reached through a symlink,
+        # where the tracked path still names the link and not its target.
+        try:
+            candidate.relative_to(base_abs)
+        except ValueError:
+            try:
+                candidate.resolve().relative_to(base_abs)
+            except (ValueError, OSError, RuntimeError):
+                continue
+        if candidate.suffix == ".py" and candidate.exists():
+            out.append(candidate)
+
+    # An empty list is a real answer, not "no git": the index loaded and
+    # simply holds no tracked python under *base_dir*, so the search should
+    # find nothing rather than fall back to a walk that would happily cite
+    # somebody's untracked scratch files. Only rc != 0 / a missing binary /
+    # a timeout above mean "git could not tell us".
+    #
+    # That holds only when base_dir IS the work tree. A base_dir below the
+    # root with nothing tracked under it is a tree git does not own at all —
+    # a target cloned or copied into an ignored directory of some other
+    # checkout — and git's "nothing" says nothing about it: walk it.
+    if not out and base_abs != root_abs:
+        return None
+    out.sort(key=lambda p: str(p).replace(os.sep, "/"))
+    return out
+
+
+def _ordered_python_files(base_dir: Path, tracked: Optional[list[Path]]) -> list[Path]:
+    """Every candidate file, preferred first.
+
+    1. git-tracked files under *base_dir*, sorted — the real repo, nothing
+       else. Nested work trees, ignored build output and untracked copies
+       fall out, and max_files then counts only files that are really
+       part of the tree being judged.
+    2. the old ``rglob`` walk, sorted, with the FIX-2 #11 exclusions. Used
+       when there is no git at all, and never raises.
+    """
+    if tracked is not None:
+        return tracked
+    try:
+        found = [
+            p for p in base_dir.rglob("*.py")
+            if p.suffix == ".py" and not _has_segment(p, _EXCLUDED_SEGMENTS)
+        ]
+    except OSError:
+        return []
+    return sorted(found, key=lambda p: str(p).replace(os.sep, "/"))
+
+
+def _scan_for_def(
+    paths: "Iterable[Path]",
+    pattern: "re.Pattern[str]",
+    budget: list[int],
+    seen: Optional[set[Path]] = None,
+) -> Optional[tuple[Path, str]]:
+    """Read *paths* in order and return the first containing *pattern*.
+
+    ``budget`` is a one-element list of remaining max_files, shared across
+    the cited file, its package and the repo walk, so the cap still bounds
+    the total work instead of applying per stage. ``seen`` holds the paths
+    already read earlier in the same search — the cited file's own package
+    is scanned shallowly and then appears again in the repo walk, and
+    re-reading it would spend budget on work already done.
+
+    Excluded trees, vanished files and already-read files are skipped
+    BEFORE the decrement. FIX-2 #11 pinned this ordering: with the
+    exclusion below the increment every file the walk was about to throw
+    away still consumed max_files budget — and .agent/ holds the run's own
+    state while node_modules/ holds thousands of vendored files, so
+    whenever either came first the search hit the cap having read nothing
+    but files it was discarding anyway and reported "not found" for a
+    definition sitting right there. Never read, never counted.
+    """
+    for p in paths:
+        if seen is not None and p in seen:
+            continue
+        if _is_excluded_path(p) or not p.is_file():
+            continue
+        budget[0] -= 1
+        if budget[0] < 0:
+            return None
+        if seen is not None:
+            seen.add(p)
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if pattern.search(text):
+            return p, text
+    return None
+
+
+#: `_find_def_in_repo`'s default for *tracked*: read the index itself. A
+#: caller that looks up several names in one tree reads it once and passes
+#: the list (or ``None``, "no git") to each lookup.
+_READ_TRACKED = object()
+
+
+def _find_def_in_repo(
+    name: str,
+    base_dir: Path,
+    max_files: int = 4000,
+    cited_file: Optional[str] = None,
+    *,
+    tracked: "Optional[list[Path]] | object" = _READ_TRACKED,
+) -> Optional[tuple[Path, str]]:
     """Best-effort repo-wide search for a top-level ``def name(`` and return
     (file, source). Deliberately shallow — this is context for an LLM
     prompt, not a resolver that needs to be exact; a wrong-but-plausible
     match is caught by the LLM having full instruction context, an
-    exception here must never break Stage B."""
+    exception here must never break Stage B.
+
+    FL-9: the search is ordered, not first-come. When *cited_file* names a
+    real Python file under *base_dir* that start is authoritative — the
+    citation resolved there in Stage A, so a same-named copy anywhere else
+    cannot displace it. Next comes that file's own package: its directory,
+    then each parent directory up to *base_dir*, shallowest first. Only
+    then is the rest of the tree walked. Each directory is scanned for the
+    ``def`` without descending into its subpackages, so this stays a
+    constant-cost local search no matter how deep the citation sits.
+    """
     pattern = re.compile(rf"^\s*def {re.escape(name)}\s*\(", re.MULTILINE)
-    count = 0
+
+    # Depth 0 = one named file, depth 1 = one directory scanned shallowly.
+    queue: list[tuple[Path, int]] = []
+    cited_abs = _resolve_cited(base_dir, cited_file)
+    if cited_abs is not None and cited_abs.suffix == ".py":
+        # _resolve_cited already resolved base_dir successfully, so it cannot
+        # fail a second time here.
+        root_abs = Path(base_dir).resolve()
+        queue.append((cited_abs, 0))
+        current = cited_abs.parent
+        while current != root_abs and current != current.parent:
+            queue.append((current, 1))
+            current = current.parent
+        if current == root_abs:
+            queue.append((root_abs, 1))
+
+    budget = [max_files]
+    seen: set[Path] = set()
     try:
-        for p in base_dir.rglob("*.py"):
-            # FIX-2 #11: this exclusion must stay AHEAD of the increment.
-            # With it below, every file the walk was about to throw away
-            # still consumed max_files budget — and .agent/ holds the run's
-            # own state while node_modules/ holds thousands of vendored
-            # files, so whenever either sorted ahead of the file defining
-            # the symbol, the walk hit the cap having read nothing but
-            # files it was discarding anyway and reported "not found" for a
-            # definition that was sitting right there. The counter bounds
-            # the work actually done: never read, never counted.
-            if "/.agent/" in str(p) or "/node_modules/" in str(p):
-                continue
-            count += 1
-            if count > max_files:
-                break
-            try:
-                text = p.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            if pattern.search(text):
-                return p, text
-    except OSError:
+        if tracked is _READ_TRACKED:
+            tracked = _tracked_python_files(base_dir)
+        for path, depth in queue:
+            if depth == 0:
+                candidates = [path] if path.is_file() else []
+            elif tracked is not None:
+                # The package tiers draw from the index too: an untracked
+                # scratch copy next to the cited file (`x_old.py`, a pasted
+                # backup) must not outrank the tracked module it copies.
+                candidates = [c for c in tracked if c.parent == path]
+            else:
+                candidates = sorted(
+                    (c for c in path.iterdir() if c.is_file() and c.suffix == ".py"),
+                    key=lambda p: p.name,
+                )
+            hit = _scan_for_def(candidates, pattern, budget, seen)
+            if hit is not None:
+                return hit
+        return _scan_for_def(_ordered_python_files(base_dir, tracked), pattern, budget, seen)
+    # OSError is the original contract (a vanished file mid-walk). The wider
+    # net is the same fail-open stance: *base_dir* may be a stand-in object
+    # that only supports rglob, a path whose type surprises Path, or a
+    # filesystem that refuses a read — Stage B loses one optional note, it
+    # does not lose a run. gate1_filter also catches this call site, but
+    # that safety net must not be the only one.
+    except (OSError, TypeError, AttributeError, ValueError, RuntimeError):
         return None
-    return None
 
 
 def callee_context(
@@ -570,24 +887,23 @@ def callee_context(
     if not _CRASH_CLAIM_CUES.search(instruction):
         return None
 
+    tracked = _READ_TRACKED  # read on the first name that needs it, then shared
     for name in _referenced_call_names(code_block):
         if len(name) < 3 or name.startswith("__"):
             continue
-        found = _find_def_in_repo(name, base_dir)
+        if tracked is _READ_TRACKED:
+            tracked = _tracked_python_files(base_dir)
+        found = _find_def_in_repo(name, base_dir, cited_file=cited_file, tracked=tracked)
         if found is None:
             continue
         found_path, found_source = found
-        if str(found_path.name) == Path(cited_file).name:
+        if _same_file_as_citation(found_path, cited_file, base_dir):
             continue  # same file as the citation — Stage B already sees this
         from tools.block_extractor import extract_block
         body = extract_block(found_source, name, ".py")
         if not body:
             continue
-        rel = found_path
-        try:
-            rel = found_path.relative_to(base_dir)
-        except ValueError:
-            pass
+        rel = _display_path(found_path, base_dir)
         snippet = body if len(body) <= max_chars else body[:max_chars] + " …(truncated)"
         return (
             f"Downstream context (automated, one call-hop from the code above): "

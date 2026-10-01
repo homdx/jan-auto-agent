@@ -1,0 +1,16 @@
+{
+  "base": "ae124ea",
+  "ticket": "epic-tasks/51-kc12-stall-detection-wait-idle-aborts-when-no-event-arrives.md",
+  "entries": {
+    "sn68":         {"model": "Sensenova 6-8",         "file": "kc12/kc12-Sensenova-6-8.patch"},
+    "sonet46-var2": {"model": "Claude Sonnet 4.6 var2", "file": "kc12/sonet46-var2-kc12/0001-KC-12-wait_idle-aborts-on-idle_event_timeout-silence(1).patch"},
+    "sonet5":       {"model": "Claude Sonnet 5",       "file": "kc12/fin-sonet-5-0001-KC-12-tools-contest-kilo_client.py-wait_idle-gets-idle.patch", "same_as": "kc12/sonet5-0001-...(1).patch"},
+    "sn67-var":     {"model": "Sensenova 6-7 var",     "file": "kc12/kc12-sensenova-6-7-var.patch"},
+    "sn68-var2":    {"model": "Sensenova 6-8 var2",    "file": "kc12/kc12-Sensenova-6-8-var2.patch"},
+    "sn67-var2":    {"model": "Sensenova 6-7 var2",    "file": "kc12/kc12-Sensenova-6-7-var2.patch"}
+  },
+  "not_entries": {
+    "kc12/kc12-Sensenova-6-7-var3.patch": "a KC-16 submission (subject 'KC16', cli.py/__main__.py) filed in the KC-12 folder",
+    "kc12/kc5-deepseek-v1.patch": "the KC-6 DeepSeek patch (DQ'd in round 45)"
+  }
+}

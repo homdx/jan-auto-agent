@@ -1,6 +1,6 @@
 # KC-5 — `tools/contest/gates.py` + `harvest.py`: the checks the round is scored on become the checks the runner sends back
 
-**Status:** queued — after KC-4 (round 43). Written against `67e834d`.  
+**Status:** landed `0d91dd6` — ideal patch from a 13-entry contest, `kc5/*.patch`, scored black-box via `contest-bench/kc5/` (43 sandbox scenarios; the claim written by the real `scripts/append_task.py`, the pre-move `judge_epic_round.py` as the byte-for-byte oracle): winner kc5-Sensenova-6-8 (43/43) taken as the skeleton, three trims borrowed from sonet5-var2 (42/43) — `Harvest.commit` is the claimed sha or `None`, `rework_message` without the `Blocking:`/`(none)` scaffolding, the literal `runs/<agent>/PROGRESS.csv` in reason texts. What sank the rest: `append_task.py` rewrites `--outcome DONE` → `FIXED` before the CSV exists, so entries accepting one spelling only (sonet5-var2b: DONE; sonet, sonet5: FIXED) reject every real row; `kc5_sonet` (was `910a19c` on `kc`) called `harvest(..., base="HEAD")` and never read `ws.base_sha` — every worktree is "0 commits", never READY; glm4-7 and sonet4-var2 do not import on the judge's Python 3.10 (backslashes inside f-string expressions); NorthMini decorated `__post_init__` with `@property`; hy3 and sensenova-6-7-var2 bundled KC-12 into the same submission; one file was 0 bytes. `tests` + `tests_bugfix` green. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/gates.py` (new), `tools/contest/harvest.py` (new), `scripts/judge_epic_round.py` (becomes a thin wrapper)  
 **Symbol:** `judge_worktree` (moved from `judge_epic_round.judge`), `extract_shrink`, `ticket_for_round`, `harvest`, `Harvest`, `Reason`  
@@ -70,11 +70,11 @@ done; nothing today combines the claim with the facts.
 ## Acceptance
 
 - [ ] Golden test: `scripts/judge_epic_round.py --round 1 --worktree a=… --worktree b=… --csv out.csv`
-      on a temp round produces the same stdout and CSV bytes as at
-      `67e834d` (capture with `git stash`-free method: the test builds the
-      expected strings from the *moved* function and the *old* function
-      imported from `git show 67e834d:scripts/judge_epic_round.py` into a
-      temp module).
+      on a temp round produces the same stdout and CSV bytes as it did
+      before this change (capture with a `git stash`-free method: the test
+      builds the expected strings from the *moved* function and the *old*
+      function imported from a pre-change copy of `scripts/judge_epic_round.py`
+      into a temp module).
 - [ ] `tests/test_contest_harvest.py` on temp worktrees: no
       `PROGRESS.csv` → REWORK `no_progress_row`; a DONE row with a commit
       that is on the branch, one commit, a `tests/test_x.py` in the diff,
@@ -85,7 +85,7 @@ done; nothing today combines the claim with the facts.
       with a failing test → `tests_failed` and the tail in the text.
 - [ ] `rework_message` on a two-reason harvest contains both sentences,
       the attempt counter, and the word `append_task.py`.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

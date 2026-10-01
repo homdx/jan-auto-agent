@@ -70,7 +70,7 @@ has no ladder.
 - [x] Next task on the same `Coder` starts at the learned 6 000.
 - [x] `max_tokens_cap` malformed → warning + default, same style as every
       other key in `Coder.__init__`.
-- [x] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [x] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

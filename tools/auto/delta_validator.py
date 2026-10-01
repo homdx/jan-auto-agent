@@ -52,6 +52,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from tools.git_run import run_git
+
 logger = logging.getLogger(__name__)
 
 
@@ -87,7 +89,13 @@ class DeltaValidator:
         """Return *rel_path*'s content at HEAD, or ``None`` when there is no
         baseline to compare against (new file, no commits yet, not a git
         repo, or any other reason git can't answer) — every one of those
-        means "not a no-op", never "identical"."""
+        means "not a no-op", never "identical".
+
+        FL-2: the call goes through ``tools.git_run.run_git``, so the "git
+        can't answer" case is reached only after a transient held
+        ``.git/index.lock`` has been waited out — the one way this read fails
+        while the tree is perfectly fine.
+        """
         try:
             # AUTO-FIX: "HEAD:{rel_path}" resolves *rel_path* relative to
             # the repo's top-level directory, not to base_dir — identical
@@ -101,9 +109,9 @@ class DeltaValidator:
             # make a ":path" pathspec cwd-relative instead of
             # top-level-relative — identical result in the common case,
             # correct result in the uncommon one.
-            result = subprocess.run(
+            result = run_git(
                 ["git", "-C", str(base_dir), "show", f"HEAD:./{rel_path}"],
-                capture_output=True, text=True, timeout=10,
+                timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
             logger.warning(

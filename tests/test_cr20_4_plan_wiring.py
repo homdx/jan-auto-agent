@@ -55,7 +55,7 @@ api_format = openai
 
 [auto]
 task_mode        = {task_mode}
-exec_timeout_sec = 10
+exec_timeout_sec = 300
 
 [architect]
 validate_plan_creative = {validate}
