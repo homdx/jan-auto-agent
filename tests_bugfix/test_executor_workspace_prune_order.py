@@ -34,6 +34,24 @@ def _run_task(executor, task_id: str) -> None:
     executor.run({"id": task_id, "acceptance_check": "true", "target_files": []})
 
 
+def _past_the_stamp_of(path, scratch) -> None:
+    """Wait until this filesystem's clock has moved past `path`'s mtime, so
+    the next workspace's fresh stamp is strictly later. A millisecond or so
+    where timestamps are fine-grained, up to a second where they are whole
+    seconds -- a fixed `sleep(1.05)` paid that worst case on every box. The
+    probe lives in `scratch`, on the same filesystem but never a sibling the
+    prune would count. A clock that has not moved in 5 s is left to the
+    test's own assertion rather than waited on for ever."""
+    stamp = path.stat().st_mtime_ns
+    probe = scratch / ".mtime-probe"
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        probe.touch()
+        if probe.stat().st_mtime_ns > stamp:
+            return
+        time.sleep(0.005)
+
+
 def test_prune_evicts_oldest_workspace_first(tmp_path):
     base_dir = tmp_path / "repo"
     base_dir.mkdir()
@@ -45,10 +63,10 @@ def test_prune_evicts_oldest_workspace_first(tmp_path):
     task_ids = [f"AUTO-T{i}" for i in range(5)]
     for task_id in task_ids:
         _run_task(executor, task_id)
-        # Force distinct wall-clock times; the bug this guards against
-        # manifested even with a real time gap between runs, since the
-        # broken mtime came from copytree metadata, not from timing.
-        time.sleep(1.05)
+        # Force distinct stamps; the bug this guards against manifested even
+        # with a real time gap between runs, since the broken mtime came from
+        # copytree metadata, not from timing.
+        _past_the_stamp_of(workspace_root / task_id, tmp_path)
 
     remaining = sorted(p.name for p in workspace_root.iterdir())
 
@@ -69,7 +87,7 @@ def test_workspace_mtime_is_not_clobbered_by_copytree(tmp_path):
     _run_task(executor, "AUTO-T0")
     ws0_mtime = (workspace_root / "AUTO-T0").stat().st_mtime
 
-    time.sleep(1.05)
+    _past_the_stamp_of(workspace_root / "AUTO-T0", tmp_path)
 
     _run_task(executor, "AUTO-T1")
     ws1_mtime = (workspace_root / "AUTO-T1").stat().st_mtime
