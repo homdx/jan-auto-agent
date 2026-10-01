@@ -1087,7 +1087,10 @@ def test_brief_sources_reads_the_existing_files_the_brief_names(tmp_path):
 def test_the_prompt_carries_the_source_and_asks_for_cases(collected):
     """Round 129: the drafter saw only maps and restated the brief; now it gets the code."""
     prompts = []
-    target = next(p for p in collected.rglob("*.py") if ".collect" not in p.parts)
+    # rglob order is the filesystem's: on another disk the first .py can be
+    # an empty __init__.py, which has no first line to look for.
+    target = next(p for p in sorted(collected.rglob("*.py"))
+                  if ".collect" not in p.parts and p.read_text().strip())
     rel = target.relative_to(collected).as_posix()
 
     def fake(prompt):
