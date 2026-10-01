@@ -19,6 +19,7 @@ All paths are from the repo root. `python` is not on PATH — use `python3`.
 | R | **reset** | you, per round | `scripts/contest_reset.sh NN [base_ref]` | one checkout per agent at the base |
 | RUN | **run** | the runner, N models | `python3 -m tools.contest run --ticket NN` | `contest-out/NN/`: one patch per agent, `entrants.json`, `SUMMARY.md` |
 | — | *watch* | you, mid-round | `python3 -m tools.contest status --ticket NN` | the same table, off `state.json` — touches nothing |
+| — | *revive* | you, after the round | `scripts/revive_round.py NN`, then `run --ticket NN --resume` | the ended agents back at work in their own trees |
 | 3 | **score** | you | the `judge_epic_round.py` line `SUMMARY.md` prints | the mechanical table |
 | 4 | **judge** | you | read the diffs; the bench table per `contest-bench/README.md` | the winner |
 | 5 | **merge** | you | `git cherry-pick <winning sha>` | the base for the next round |
@@ -50,6 +51,54 @@ there, is refused with the id to use — before any worktree is built. A model
 the provider serves but Kilo's list lacks is not a failure: `--register-missing`
 adds it for the round alone through `KILO_CONFIG_CONTENT` (KC-35) and says so
 in the plan.
+
+No model is built into the code. The roster in `contest.ini` is an example (the
+three PROBE.md models), and `--models` replaces it for one round. The one
+default is the provider a bare `--models` id gets: `kenary` (`DEFAULT_PROVIDER`
+in `tools/contest/cli.py`; `--provider ID` changes it). Name the provider in
+every id (`sensenova123/…`, `bynara/…`) and that default never applies.
+
+### Pick the models
+
+Before a round, check which models answer at all and can write code.
+`scripts/py_model_test.py` sends one Python task through `kilo run`, with
+Kilo's own config and no keys of its own, and scores the answer on 15 checks:
+
+```bash
+python3 scripts/py_model_test.py --find-free kenary openrouter      # list the free models with tools; calls none
+python3 scripts/py_model_test.py -j 4 sensenova123/sensenova-6.8-flash-lite kenary/mimo-v2-5:free
+```
+
+A model with no answer prints the reason: a timeout, Kilo's exit code, or the
+tail of its stderr (401, 404, `Database is busy`, …). The exit code is 0 only
+when every model got a score. Each `kilo run` writes the user's Kilo store, so
+next to a live round `-j` is capped at 4 (`--force` keeps the number). The
+models that score go into `--models`.
+
+### The settings you touch
+
+Everything sits in `[contest]` of `contest.ini`, one comment per key. An
+unknown key fails at load time with its name. Put local values in
+`contest.local.ini`: it is read after `contest.ini` and overrides it.
+
+| key | default | what it decides |
+|---|---|---|
+| `max_parallel` | 3 | sessions at once; `--max-parallel N` for one round |
+| `legs`, `legs_by_size` | 1; `L=3` | legs per round, by the ticket's `**Size:**`; `--legs N` overrides both |
+| `max_rework`, `max_continues_per_attempt` | 2, 2 | reworks after the first turn; nudges for an idle turn with edits and no commit |
+| `turn_timeout_sec`, `turn_extend_sec`, `turn_max_sec` | 3600, 600, 7200 | the turn clock: a floor, extended while the tree changes, up to a ceiling |
+| `idle_event_timeout_sec` | 900 | no event this long → the session is aborted |
+| `first_touch_sec` | 420 | no file touched this long → a nudge, then a fresh session, then `DEAD` |
+| `agent_max_sec` | 5400 | one agent's hard limit; at it the agent ends `STALLED`, its tree scored as it stands |
+| `max_error_retries`, `error_retry_max_backoff_sec` | 30, 60 | retryable provider errors in a row before `ERROR` |
+| `provider_retry_max_wait_sec`, `quota_patterns` | 300 | a reset further out than this, or a quota message, ends the agent `ERROR provider_quota` |
+| `harvest_budget_sec`, `deadline_commit` | 900, true | the harvest's clock; uncommitted work at the deadline is committed for the agent |
+| `agent_suite_slots`, `pytest_workers_*` | 1, auto | how many agents run pytest at once, and with how many workers |
+| `tmp_roots`, `deny_commands`, `ask_commands` | | the policy: paths allowed outside the worktree, commands always refused, commands sent to the gate |
+| `gate_llm_profile`, `draft_llm_profile` | | the profile sections for the gate and the drafter (keys in `contest.local.ini`) |
+| `variant` | highest | the reasoning variant of an agent that names none; `--variant` or `model@variant` |
+| `compact_at_percent`, `summary_at_percent` | 80, 90 | when a long session is compacted, and when a summary is asked for |
+| `out_dir`, `rounds_dir`, `workspace_kind` | contest-out, ../rounds, clone | where the output and the agents' checkouts go |
 
 ---
 
@@ -103,6 +152,24 @@ An L ticket that comes out to one leg is refused unless `--legs 1` says so.
 
 `--run` starts the round right after the commit with the run flags given to
 `draft` (`--max-parallel`, `--legs`, `--fresh`, …). Without it, go to Stage R.
+
+### A ticket written by hand
+
+Most rounds of this epic ran on hand-written tickets, and intake treats them the
+same way. A ticket is `epic-tasks/NN-<slug>.md`, committed before the round
+(intake reads it from the base tree). Intake requires:
+
+- `**Status:** open`. Any other first word is refused.
+- `**File:**` and `**Symbol:**` lines. Without them the sessions get no code to
+  fix, so intake refuses the ticket.
+- Every lower-numbered ticket parked: `landed` or `queued`. A lower ticket still
+  on offer is refused, and the refusal prints the `sed` + `git commit` that
+  parks it.
+
+`**Size:** XS|S|M|L` is optional; it picks the legs. Copy the header of a
+recent ticket (e.g. `epic-tasks/126-*.md`) and keep the Why / What / Acceptance
+sections. Read the ticket back with `cat epic-tasks/NN-*.md`. The exact prompt
+the agents get is printed by `run --dry-run`.
 
 For a task on another repository, or a task split into several tickets that
 run one after another (ticket 01 → winner lands → ticket 02 on top), see
@@ -161,6 +228,31 @@ skipped …` line each), builds the round's worktrees, and prints the plan and
 the exact prompt the first agent would get — no `kilo serve`, no session,
 no gate call. A later `run` without `--fresh` meets those worktrees as a
 round left behind; `--dry-run --fresh` discards them.
+
+**A ready ticket, the usual round.** The models come from the command line, not
+the roster. Round 126 ran like this:
+
+```bash
+time python3 -m tools.contest run --ticket 126 --max-parallel 12 --models \
+sensenova123/sensenova-6.8-flash-lite,sensenova123/sensenova-6.7-flash-lite,\
+sensenova123/sensenova-6.8-flash-lite,sensenova123/sensenova-6.7-flash-lite,\
+agnes-2-5-flash:free,mimo-v2-5:free,step-3-7-flash:free,\
+bynara/space-bunny-alpha-bynara,laguna-s-2-1:free,agnes-3-0-flash:free,glm-4-7-flash:free
+```
+
+How `--models` reads that list:
+- An id split at its first `/` is `provider/model`. An id with no `/` goes to
+  the default provider (`kenary`, or `--provider ID`).
+- The agent's name is the model id without its `:tag`, made branch-safe.
+- A name given twice is run twice, as `-var1`, `-var2`, … in list order:
+  `sensenova-6-8-flash-lite-var1`, `…-var2`. Each gets its own checkout and
+  branch.
+- `model@high` sets that agent's reasoning variant.
+- `--resume` must get the same `--models` string; the names come from it.
+- `--max-parallel` at or above the number of agents starts them all at once.
+
+Add `--dry-run` to the same line first: it shows the agents' names and the
+plan without calling any model.
 
 **What the console shows.** The plan, one line per fact — the round 47 plan
 of the recorded run below, verbatim:
@@ -226,6 +318,41 @@ in the same session within the round's own budgets (KC-19, KC-64), and a
 quota — a reset time further out than `provider_retry_max_wait_sec` — ends
 the agent `ERROR provider_quota` at once, with the reset time printed once
 per provider at the round's end.
+
+**Putting ended agents back to work: `scripts/revive_round.py`.** `--resume`
+restarts only the agents that were mid-flight. An agent that already ended
+`STALLED`, `GAVE_UP` or `ERROR` (a quota that has since reset, a deadline hit
+on a loaded box) stays ended. The script sets each of them back to `WAITING`
+in `state.json`, and the next `--resume` takes them up again:
+
+```bash
+scripts/revive_round.py 126 --dry-run       # what it would change, writes nothing
+scripts/revive_round.py 126                 # revive; the old file is kept as state.before-revive.json
+python3 -m tools.contest run --ticket 126 --resume --models <the same list>
+```
+
+The rules:
+- `READY` and `DEAD` agents are kept as they are.
+- A revived agent's tree is harvested first: a finished commit is taken as
+  `READY`, and anything else restarts in the same tree with a fresh attempt
+  budget.
+- The old state, attempt and error are kept on the agent under
+  `revived_from`.
+- Run it only when the round is stopped. A live runner rewrites `state.json`
+  and would undo it.
+
+For a round of legs, the round's number or folder resolves to the **last** leg
+(`contest-out/65.3`), the only one whose `state.json` is the whole round. The
+script prints the resume line for that leg:
+
+```bash
+scripts/revive_round.py 65                  # → contest-out/65.3
+python3 -m tools.contest run --ticket 65 --out contest-out/65.3 --legs 1 --resume
+```
+
+An earlier leg is refused unless you pass `--any-leg`. Even then, the legs
+share one worktree per agent, so that leg restarts on the tree the later legs
+left.
 
 **`--legs N` for a ticket too large for one turn (KC-43).** A round is one shot:
 one turn, the continues and reworks inside its session, then the harvest. When
@@ -319,6 +446,7 @@ checks and runs end to end on the fake Kilo, which emits
 | flag | what it does |
 |---|---|
 | `--ticket NN` | the ticket, NN from `epic-tasks/NN-*.md` (required) |
+| `--target REPO_PATH` | the git repo the round runs on (default: the current one); see `2legs/MULTI-LEG-RUNBOOK.md` (KC-76) |
 | `--roster PATH` | the roster ini (default `contest.ini`; `contest.local.ini` beside it overrides it) |
 | `--base REF` | the ref the worktrees start from (default `HEAD`) |
 | `--models a:free,b:free` | these models run instead of the roster's agents; `model@variant` names a variant |

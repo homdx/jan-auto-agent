@@ -80,6 +80,18 @@ python3 -m tools.contest status --ticket 1 --out /path/to/repo/contest-out/01.2
 Output lands in `/path/to/repo/contest-out/01.1/`, `01.2/` — the last leg holds
 the patches, `entrants.json` and `SUMMARY.md`.
 
+Agents that ended `STALLED`, `GAVE_UP` or `ERROR` can go back to work after the
+round. `scripts/revive_round.py` (run from jan-auto-agent) resolves the round to
+its last leg and prints the resume line:
+
+```bash
+python3 scripts/revive_round.py /path/to/repo/contest-out/01
+python3 -m tools.contest run --ticket 1 --target /path/to/repo \
+    --out /path/to/repo/contest-out/01.2 --legs 1 --resume --models <the same list>
+```
+
+See *Putting ended agents back to work* in `docs/kilo-contest/RUN-THE-KILO-CONTEST.md`.
+
 ## 4. Pick the results (by hand — there is no shared bench for a free task)
 
 For a hunt every entry found **its own** bug; for coverage or docs each chose
