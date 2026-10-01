@@ -656,9 +656,15 @@ def _new_under_existing(repo: Path, rel: str) -> bool:
     """Whether *rel* is a file the repo does not have yet, under a directory it does.
 
     A new test file is normal, so `tests/test_new.py` passes while
-    `no/such/dir/x.py` does not.
+    `no/such/dir/x.py` does not. A ticket that starts a new package names
+    files in a directory the repo does not have yet — `tools/arena/cli.py` —
+    so one new directory level under an existing one passes too; two invented
+    levels (`no/such/dir/x.py`) are still a made-up path.
     """
-    return _safe_rel(rel) and (repo / rel).parent.is_dir()
+    if not _safe_rel(rel):
+        return False
+    parent = (repo / rel).parent
+    return parent.is_dir() or (parent != repo and parent.parent.is_dir())
 
 
 def lint_ticket(text, artifact, *, repo=None, tasks_dir=None, round_no=None) -> list:

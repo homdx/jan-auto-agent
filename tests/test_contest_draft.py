@@ -1191,3 +1191,66 @@ def test_no_rules_file_no_rules_section(tmp_path):
     assert draft_mod.repo_rules(tmp_path, 8000) is None
     (tmp_path / "CLAUDE.md").write_text("c")
     assert draft_mod.repo_rules(tmp_path, 8000) == ("CLAUDE.md", "c")
+
+
+def test_a_new_package_one_directory_deep_is_not_a_problem(collected):
+    """A ticket that starts a package names files in a directory still to create."""
+    artifact = draft_mod.load_artifact(collected / draft_mod.COLLECT_DIR)
+    problems = lint_of(ticket_text(also="`tests/newpkg/cli.py`"), artifact, collected)
+    assert problems == []
+
+
+def _with_review_profile(roster: Path, model: str = "stub/review") -> Path:
+    """Add `[contest] draft_review_llm_profile` and its section to *roster*."""
+    text = roster.read_text().replace(
+        "[contest]\n", "[contest]\ndraft_review_llm_profile = review_model\n", 1)
+    text += ("\n[review_model]\nbase_url = http://127.0.0.1:3/v1\n"
+             f"api_key = unset-in-the-test\nmodel = {model}\n")
+    roster.write_text(text)
+    return roster
+
+
+def test_draft_review_profile_is_read_from_the_roster(tmp_path):
+    """The ticket reviewer resolves on its own; unset, it stays None."""
+    from tools.contest.roster import load_roster
+    plain = load_roster(_roster(tmp_path))
+    assert plain.draft_review_llm_profile == "" and plain.draft_review_settings is None
+    config = load_roster(_with_review_profile(_roster(tmp_path)))
+    assert config.draft_review_llm_profile == "review_model"
+    assert config.draft_review_settings.model == "stub/review"
+    assert config.gate_settings.model == "stub/gate"
+
+
+def test_cmd_draft_reviews_with_the_draft_review_profile(collected, tmp_path, monkeypatch, capsys):
+    """With its own reviewer set, the review goes to it, not to the gate's model."""
+    roster = _with_review_profile(_roster(tmp_path))
+    used = []
+
+    def call_for(settings, system=None):
+        used.append((settings.model, system is not None))
+        return lambda p: ticket_text() if system is None else '{"ok": true, "problems": []}'
+
+    monkeypatch.setattr(draft_mod, "llm_call_for", call_for)
+    contest_cli.cmd_draft(_args(collected, roster=roster))
+    reviewers = [model for model, is_review in used if is_review]
+    assert reviewers == ["stub/review"]
+
+
+def test_cmd_draft_refuses_a_review_profile_that_is_the_drafter(collected, tmp_path, monkeypatch, capsys):
+    """The same-model check applies to the ticket reviewer and names its key."""
+    roster = _with_review_profile(_roster(tmp_path), model="stub/draft")
+    monkeypatch.setattr(draft_mod, "llm_call_for",
+                        lambda settings, system=None: (lambda p: ticket_text()))
+    code = contest_cli.cmd_draft(_args(collected, roster=roster))
+    assert code == contest_cli.EXIT_FAILED
+    assert "draft_review_llm_profile" in capsys.readouterr().err
+
+
+def test_cmd_draft_refuses_a_review_profile_that_does_not_resolve(collected, tmp_path, capsys):
+    """A review key naming a missing section refuses and names the key."""
+    roster = _roster(tmp_path)
+    roster.write_text(roster.read_text().replace(
+        "[contest]\n", "[contest]\ndraft_review_llm_profile = no_such_section\n", 1))
+    code = contest_cli.cmd_draft(_args(collected, roster=roster))
+    assert code == contest_cli.EXIT_FAILED
+    assert "draft_review_llm_profile = no_such_section" in capsys.readouterr().err

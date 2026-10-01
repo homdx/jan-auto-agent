@@ -152,6 +152,7 @@ CONTEST_KEYS = (
     "summary_at_percent",
     "context_limit_fallback",
     "draft_llm_profile",
+    "draft_review_llm_profile",
     "draft_map_budget",
     "draft_review_rounds",
 )
@@ -506,6 +507,13 @@ class ContestConfig:
     #: be resolved: ``run`` never fails on it, only ``draft`` refuses.
     draft_llm_profile: str = ""
     draft_settings: LlmSettings | None = None
+    #: The profile behind ``[contest] draft_review_llm_profile`` — the model that
+    #: reviews a drafted ticket. Unset, the review stays on the gate's model; set,
+    #: tickets get their own writer/reviewer pair and the round's gate is not
+    #: touched. ``draft_review_settings`` is ``None`` when the key is unset or the
+    #: section cannot be resolved (fail-open, like the draft's own profile).
+    draft_review_llm_profile: str = ""
+    draft_review_settings: LlmSettings | None = None
     #: KC-79: the character budget each collect map gets in the draft's prompt.
     #: A budget the operator sets, never a model window hard-coded in the code.
     draft_map_budget: int = 8000
@@ -910,6 +918,19 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         except (ValueError, RosterError) as exc:
             _log.warning("[contest] draft_llm_profile: %s — `contest draft` will refuse to run",
                          exc)
+    # The ticket reviewer's own profile, resolved the same fail-open way: a typo
+    # here stops `contest draft` only, never a round.
+    draft_review_profile = scalar("draft_review_llm_profile", "")
+    draft_review_settings = None
+    if draft_review_profile:
+        try:
+            _expand(parser, (draft_review_profile,))
+            draft_review_settings, _ = resolve_llm_profile(
+                parser, "contest", "draft_review_llm_profile", defaults=DEFAULTS_DRAFT
+            )
+        except (ValueError, RosterError) as exc:
+            _log.warning("[contest] draft_review_llm_profile: %s — `contest draft` "
+                         "will refuse to review", exc)
     draft_map_budget = safe_getint(parser, "contest", "draft_map_budget", fallback=8000)
     if draft_map_budget <= 0:
         draft_map_budget = 8000
@@ -993,6 +1014,8 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         openrouter_llm_profile=openrouter_profile,
         draft_llm_profile=draft_profile,
         draft_settings=draft_settings,
+        draft_review_llm_profile=draft_review_profile,
+        draft_review_settings=draft_review_settings,
         draft_map_budget=draft_map_budget,
         draft_review_rounds=draft_review_rounds,
     )

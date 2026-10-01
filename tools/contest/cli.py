@@ -2636,9 +2636,21 @@ def cmd_draft(args: argparse.Namespace) -> int:
 
     review_call = None
     if not getattr(args, "no_review", False):
-        # the reviewer is the gate's model: the same resolution and transport the
-        # gate uses, and no model, URL or key in this module
-        if not config.gate_llm_profile:
+        # The reviewer is `[contest] draft_review_llm_profile` when it is set —
+        # tickets then have their own writer/reviewer pair and the round's gate
+        # keeps its model — and the gate's model otherwise: the same resolution
+        # and transport the gate uses, and no model, URL or key in this module.
+        review_settings = config.gate_settings
+        review_key = "gate_llm_profile"
+        if config.draft_review_llm_profile:
+            if config.draft_review_settings is None:
+                print("draft: [contest] draft_review_llm_profile = "
+                      + config.draft_review_llm_profile + " does not resolve — that "
+                      "section needs base_url, api_key and model", file=sys.stderr)
+                return EXIT_FAILED
+            review_settings = config.draft_review_settings
+            review_key = "draft_review_llm_profile"
+        elif not config.gate_llm_profile:
             print("draft: [contest] gate_llm_profile is not set — the review runs on "
                   "the gate's model, so name it in " + LOCAL_FILENAME +
                   " as run does, or pass --no-review", file=sys.stderr)
@@ -2646,14 +2658,14 @@ def cmd_draft(args: argparse.Namespace) -> int:
         # A model reviewing its own ticket approves its own blind spots: the
         # reviewer must be a different model from the drafter, not just a
         # different section naming the same one.
-        if _same_model(config.gate_settings, config.draft_settings):
+        if _same_model(review_settings, config.draft_settings):
             print("draft: the review model is the draft model ("
                   + str(getattr(config.draft_settings, "model", "")) + ") — set a "
-                  "different model under [contest] gate_llm_profile or "
+                  "different model under [contest] " + review_key + " or "
                   "draft_llm_profile in " + LOCAL_FILENAME + ", or pass --no-review",
                   file=sys.stderr)
             return EXIT_FAILED
-        review_call = draft.llm_call_for(config.gate_settings,
+        review_call = draft.llm_call_for(review_settings,
                                          system=draft.REVIEW_SYSTEM_PROMPT)
 
     try:

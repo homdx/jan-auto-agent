@@ -883,7 +883,7 @@ model = kenary/laguna-s-2-1:free
 
 def test_exported_key_sets_match_the_dataclass():
     assert set(CONTEST_KEYS) == set(ContestConfig.__dataclass_fields__) - {
-        "agents", "gate_settings", "openrouter_settings", "draft_settings",
+        "agents", "gate_settings", "openrouter_settings", "draft_settings", "draft_review_settings",
     }
     assert set(AGENT_KEYS) == {"model", "kilo_agent", "variant"}
     assert AGENT_SECTION_PREFIX == "contest.agent."
