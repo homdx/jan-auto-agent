@@ -34,8 +34,14 @@ def task(tid):
             "target_files": ["a.py"], "acceptance_check": "pytest -q"}
 
 def one_run(seed):
+    """One simulated run in a directory of its own, removed afterwards: the
+    150 seeds below, and the thousands of a `__main__` search, each used to
+    leave a `tmpXXXXXXXX/.agent` behind in the system temp dir."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        return _one_run(seed, Path(tmp))
+
+def _one_run(seed, d):
     rnd = random.Random(seed)
-    d = Path(tempfile.mkdtemp())
     st = StateStore(d/".agent"); st.initialise("g", d)
     tk = make_ticket_store(d/".agent")
     calls = {"n": 0}

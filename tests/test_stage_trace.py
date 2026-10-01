@@ -19,7 +19,6 @@ Covers:
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,6 +46,15 @@ def traced(tmp_path):
         yield trace_path
     finally:
         tracer.configure(enabled=False)
+
+
+@pytest.fixture()
+def base_dir(tmp_path):
+    """The task's own directory: under `tmp_path`, which pytest cleans up,
+    and beside the trace file rather than holding it."""
+    path = tmp_path / "base"
+    path.mkdir()
+    return path
 
 
 def _read_events(trace_path: Path) -> list[dict]:
@@ -110,13 +118,13 @@ TASK_CREATIVE = {"id": "AUTO-T2", "target_files": ["chapter_01.md"], "goal": "g"
 
 # ── Coder / executor / gate2 (apply to every task mode) ──────────────────────
 
-def test_coder_rejected_is_traced(traced):
+def test_coder_rejected_is_traced(traced, base_dir):
     coder = _WritingCoder(results=[
         SimpleNamespace(succeeded=False, files_written=[], missing_context=[],
                         context_satisfied=True, error="bad json"),
     ])
     loop = InnerLoop(coder, _OkExecutor(), _OkValidator(), max_attempts=2)
-    result = loop.run_task(TASK_CODE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CODE, base_dir)
     assert result.passed is True
     events = _read_events(traced)
     coder_events = _decisions(events, "coder")
@@ -125,9 +133,9 @@ def test_coder_rejected_is_traced(traced):
     assert coder_events[0]["params"]["task"] == "AUTO-T1"
 
 
-def test_executor_rejected_is_traced(traced):
+def test_executor_rejected_is_traced(traced, base_dir):
     loop = InnerLoop(_WritingCoder(), _FailingExecutor(), _OkValidator(), max_attempts=1)
-    result = loop.run_task(TASK_CODE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CODE, base_dir)
     assert result.passed is False
     events = _read_events(traced)
     ex_events = _decisions(events, "executor")
@@ -149,10 +157,10 @@ class _SkippedExtraCoder:
         )
 
 
-def test_coder_skipped_extra_files_is_traced_and_executor_runs(traced):
+def test_coder_skipped_extra_files_is_traced_and_executor_runs(traced, base_dir):
     """RUN-1: a target_files skip is a warning, not a coder-stage rejection."""
     loop = InnerLoop(_SkippedExtraCoder(), _FailingExecutor(), _OkValidator(), max_attempts=1)
-    result = loop.run_task(TASK_CODE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CODE, base_dir)
     assert result.passed is False
     events = _read_events(traced)
     coder_events = _decisions(events, "coder")
@@ -166,12 +174,12 @@ def test_coder_skipped_extra_files_is_traced_and_executor_runs(traced):
     assert exec_events[0]["params"]["attempt"] == "1"
 
 
-def test_gate2_rejected_then_overall_approved_is_traced(traced):
+def test_gate2_rejected_then_overall_approved_is_traced(traced, base_dir):
     coder = _WritingCoder()
     loop = InnerLoop(coder, _OkExecutor(),
                      SimpleNamespace_validator := _SequencedValidator([(False, "no"), (True, "")]),
                      max_attempts=3)
-    result = loop.run_task(TASK_CODE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CODE, base_dir)
     assert result.passed is True and result.attempts_used == 2
     events = _read_events(traced)
     gate2_events = _decisions(events, "gate2")
@@ -191,9 +199,9 @@ class _SequencedValidator:
         return self._v.pop(0) if self._v else (True, "")
 
 
-def test_overall_exhausted_is_traced(traced):
+def test_overall_exhausted_is_traced(traced, base_dir):
     loop = InnerLoop(_WritingCoder(), _OkExecutor(), _RejectingValidator(), max_attempts=2)
-    result = loop.run_task(TASK_CODE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CODE, base_dir)
     assert result.passed is False
     events = _read_events(traced)
     overall_events = _decisions(events, "overall")
@@ -214,12 +222,12 @@ class _AlwaysConflictCanon:
         return r
 
 
-def test_canon_reject_then_accept_at_cap_is_traced(traced):
+def test_canon_reject_then_accept_at_cap_is_traced(traced, base_dir):
     loop = InnerLoop(
         _WritingCoder(), _OkExecutor(), _OkValidator(),
         max_attempts=3, canon_validator=_AlwaysConflictCanon(), task_mode="creative",
     )
-    result = loop.run_task(TASK_CREATIVE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CREATIVE, base_dir)
     assert result.passed is True
     events = _read_events(traced)
     canon_events = _decisions(events, "canon")
@@ -240,12 +248,12 @@ class _RevisingFact:
         return FactVerdict(approved=True, reason="", unparseable=False)
 
 
-def test_fact_reject_then_approve_is_traced(traced):
+def test_fact_reject_then_approve_is_traced(traced, base_dir):
     loop = InnerLoop(
         _WritingCoder(), _OkExecutor(), _OkValidator(),
         max_attempts=3, fact_validator=_RevisingFact(), task_mode="creative",
     )
-    result = loop.run_task(TASK_CREATIVE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CREATIVE, base_dir)
     assert result.passed is True
     events = _read_events(traced)
     fact_events = _decisions(events, "fact")
@@ -261,12 +269,12 @@ class _AlwaysRevisingProsody:
         return ProsodyVerdict(approved=False, reason="meter")
 
 
-def test_prosody_reject_then_accept_at_cap_is_traced(traced):
+def test_prosody_reject_then_accept_at_cap_is_traced(traced, base_dir):
     loop = InnerLoop(
         _WritingCoder(), _OkExecutor(), _OkValidator(),
         max_attempts=3, prosody_validator=_AlwaysRevisingProsody(), task_mode="creative",
     )
-    result = loop.run_task(TASK_CREATIVE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CREATIVE, base_dir)
     assert result.passed is True
     events = _read_events(traced)
     prosody_events = _decisions(events, "prosody")
@@ -280,7 +288,7 @@ class _AlwaysRevisingContinuity:
         return ContinuityVerdict(approved=False, reason="contradiction")
 
 
-def test_continuity_reject_then_accept_at_cap_is_traced(traced, monkeypatch):
+def test_continuity_reject_then_accept_at_cap_is_traced(traced, monkeypatch, base_dir):
     import tools.auto.continuity_validator as cvmod
     monkeypatch.setattr(cvmod, "read_story_bible", lambda base_dir: "")
     monkeypatch.setattr(cvmod, "find_previous_chapter_text", lambda f, base_dir: "")
@@ -289,21 +297,21 @@ def test_continuity_reject_then_accept_at_cap_is_traced(traced, monkeypatch):
         _WritingCoder(), _OkExecutor(), _OkValidator(),
         max_attempts=3, continuity_validator=_AlwaysRevisingContinuity(), task_mode="creative",
     )
-    result = loop.run_task(TASK_CREATIVE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CREATIVE, base_dir)
     assert result.passed is True
     events = _read_events(traced)
     continuity_events = _decisions(events, "continuity")
     assert [e["content"] for e in continuity_events] == ["REJECTED", "ACCEPTED_AT_CAP"]
 
 
-def test_code_mode_emits_no_creative_stage_events(traced):
+def test_code_mode_emits_no_creative_stage_events(traced, base_dir):
     """Regression: code-mode tasks must never emit canon/fact/prosody/continuity
     stage events, even if a validator instance is (incorrectly) attached."""
     loop = InnerLoop(
         _WritingCoder(), _OkExecutor(), _OkValidator(),
         max_attempts=1, canon_validator=_AlwaysConflictCanon(), task_mode="code",
     )
-    result = loop.run_task(TASK_CODE, Path(tempfile.mkdtemp()))
+    result = loop.run_task(TASK_CODE, base_dir)
     assert result.passed is True
     events = _read_events(traced)
     assert _decisions(events, "canon") == []
