@@ -732,6 +732,58 @@ def test_commit_ticket_leaves_a_script_that_is_already_there(collected):
         sorted([f"{draft_mod.TASKS_DIR}/01-t.md", "scripts/append_task.py"])
 
 
+def test_commit_ticket_checks_out_the_leg_branch_before_copying_the_scripts(collected):
+    """KC-80: a second `contest draft` on a target whose own branch lacks the
+    scripts must re-check out `contest-legs` first, so the `exists()` test sees the
+    leg branch and commits only the ticket — it must not fail with "cannot check
+    out" and leave stray script copies in the operator's tree."""
+    ticket1 = collected / draft_mod.TASKS_DIR / "01-t.md"
+    ticket1.write_text(ticket_text())
+    origin = _branch(collected)
+    first = draft_mod.commit_ticket(collected, ticket1, message="t1")
+    assert first.ok, "the first draft commits the scripts on the leg branch"
+    assert sorted(_git_out(collected, "diff", "--name-only", "HEAD~1", "HEAD").splitlines()) == \
+        sorted([f"{draft_mod.TASKS_DIR}/01-t.md"] + list(draft_mod.CONTEST_SCRIPTS))
+
+    _git(collected, "checkout", "-q", origin)
+    for name in draft_mod.CONTEST_SCRIPTS:
+        assert not (collected / name).exists(), "the scripts are gone on the origin branch"
+
+        ticket2 = collected / draft_mod.TASKS_DIR / "02-t.md"
+        ticket2.parent.mkdir(parents=True, exist_ok=True)
+        ticket2.write_text(ticket_text())
+    result = draft_mod.commit_ticket(collected, ticket2, message="t2")
+
+    assert result.ok, result.message
+    assert _branch(collected) == draft_mod.LEG_BRANCH
+    assert _git_out(collected, "diff", "--name-only", "HEAD~1", "HEAD").splitlines() == \
+        [f"{draft_mod.TASKS_DIR}/02-t.md"], "no scripts re-committed on the second draft"
+
+
+def test_commit_ticket_leaves_no_script_behind_when_checkout_fails(collected, monkeypatch):
+    """A checkout that fails for any reason leaves no copied script in the
+    operator's tree, because the copy now runs after the checkout."""
+    origin = _branch(collected)
+    ticket = collected / draft_mod.TASKS_DIR / "01-t.md"
+    ticket.write_text(ticket_text())
+
+    real_git = draft_mod._git
+
+    def _failing_checkout(root, *args):
+        if args[:1] == ("checkout",) or (len(args) >= 2 and args[0] == "checkout"):
+            return 1, "", "checkout refused by the test"
+        return real_git(root, *args)
+
+    monkeypatch.setattr(draft_mod, "_git", _failing_checkout)
+
+    result = draft_mod.commit_ticket(collected, ticket, message="t")
+    assert result.ok is False
+    assert "cannot check out" in result.message
+    for name in draft_mod.CONTEST_SCRIPTS:
+        assert not (collected / name).exists(), f"{name} was copied despite the failed checkout"
+    assert _branch(collected) == origin, "the operator's branch is unmoved"
+
+
 def test_commit_ticket_cannot_be_made_to_commit_out_of_tree_work(collected):
     """`-a` is not used: work outside the ticket rides along with the branch, not the commit."""
     ticket = collected / draft_mod.TASKS_DIR / "01-t.md"

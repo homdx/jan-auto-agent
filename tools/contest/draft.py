@@ -1144,6 +1144,22 @@ def commit_ticket(repo, ticket_path, *, message=None, branch: str = LEG_BRANCH,
     if refusal is not None:
         return CommitResult(False, refusal)
 
+    # Check out the leg branch first: the `target.exists()` test inside the copy
+    # loop below must see the leg branch's tree, not the operator's current branch.
+    # When it ran after the copy, a target whose own branch lacked the scripts
+    # copied them in as untracked files, and the later `checkout` then failed with
+    # "untracked working tree files would be overwritten", leaving the scripts in
+    # the operator's tree and the ticket uncommitted. A failed checkout now leaves
+    # nothing copied behind, because nothing has been copied yet.
+    code, _out, err = _git(repo, "rev-parse", "--verify", "--quiet",
+                           f"refs/heads/{branch}")
+    if code == 0:
+        code, _out, err = _git(repo, "checkout", "-q", branch)
+    else:
+        code, _out, err = _git(repo, "checkout", "-q", "-b", branch)
+    if code != 0:
+        return CommitResult(False, f"cannot check out {branch} in {repo}: {err.strip()}")
+
     paths = [rel]
     source_dir = Path(scripts_dir) if scripts_dir is not None else RUNNER_SCRIPTS_DIR
     for rel_script in CONTEST_SCRIPTS:
@@ -1160,15 +1176,6 @@ def commit_ticket(repo, ticket_path, *, message=None, branch: str = LEG_BRANCH,
         except OSError as exc:
             return CommitResult(False, f"cannot copy {rel_script} into {repo}: {exc}")
         paths.append(rel_script)
-
-    code, _out, err = _git(repo, "rev-parse", "--verify", "--quiet",
-                           f"refs/heads/{branch}")
-    if code == 0:
-        code, _out, err = _git(repo, "checkout", "-q", branch)
-    else:
-        code, _out, err = _git(repo, "checkout", "-q", "-b", branch)
-    if code != 0:
-        return CommitResult(False, f"cannot check out {branch} in {repo}: {err.strip()}")
 
     code, _out, err = _git(repo, "add", "--", *paths)
     if code != 0:
