@@ -1,6 +1,6 @@
 # 130 — find and fix real bugs in tools/contest/harvest.py
 
-**Status:** open
+**Status:** landed `36dd4c4`+`abe73fd` on 2026-10-01 — round 130, winner agnes-3-0-flash 6/6 on contest-bench/130 taken as-is; 4 of 9 entries 6/6, laguna-s-2-1 DEAD
 **Severity:** MEDIUM
 **File:** tools/contest/harvest.py
 **Symbol:** Reason, Harvest, _progress_rows, _is_ancestor, _at_or_under_base, _resolve_claim, _status_lines, _commit_worktree, _drop_worktree, _branch_commit, _last_tail_section, _tests_slow_reason, _uncommitted_reason, harvest, rework_message
