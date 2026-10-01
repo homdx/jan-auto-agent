@@ -272,10 +272,23 @@ def _commits_above(worktree: Path, base_sha: str) -> int:
     clean tree on an old base is not carrying work. On a base with no history in
     common it would count the branch's whole length instead, a non-zero number,
     which is the safe way to be wrong here: refusing loses nothing.
+
+    Raises :class:`WorkspaceError` when git cannot answer (FL-2): a failed
+    ``rev-list`` is a read error, not "zero commits". The non-zero branch used to
+    return 0, so a worktree whose ``rev-list`` lost the index lock read as an
+    empty branch and ``reset_worktree`` went straight to ``checkout -B`` and
+    ``clean -fdx`` over the commits KC-23's guard exists to keep. ``--fresh`` is
+    the way out the message names, because it skips this read altogether — a
+    forced reset discards everything it would have reported.
     """
     proc = _git(worktree, ["rev-list", "--count", f"{base_sha}..HEAD"], check=False)
     if proc.returncode != 0:
-        return 0
+        raise WorkspaceError(
+            f"git rev-list --count {base_sha}..HEAD in {worktree} failed "
+            f"({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()} — "
+            "cannot tell whether the worktree holds commits above the base; "
+            "pass --fresh to discard"
+        )
     text = proc.stdout.strip()
     return int(text) if text.isdigit() else 0
 
@@ -298,8 +311,21 @@ def _dirty_outside_runs(worktree: Path) -> list[str]:
     ``runs/<agent>/PROGRESS.csv`` is the round's queue file — KC-4 empties it and
     the ``clean`` below excludes it — so a worktree holding nothing but that is
     clean: the idempotent rerun must not refuse over a file the round writes.
+
+    Raises :class:`WorkspaceError` when git cannot answer (FL-2): this branch never
+    read ``proc.returncode``, and a failed ``status`` prints nothing, so its empty
+    stdout became an empty list and read as a clean tree. The guard that follows
+    then saw no commits and no dirty files and reset a worktree whose edits were
+    simply unreported. A failed status is a read error, not a clean tree.
     """
     proc = _git(worktree, ["status", "--porcelain", "--untracked-files=all"], check=False)
+    if proc.returncode != 0:
+        raise WorkspaceError(
+            f"git status --porcelain --untracked-files=all in {worktree} failed "
+            f"({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()} — "
+            "cannot tell whether the worktree holds uncommitted edits; "
+            "pass --fresh to discard"
+        )
     return [line for line in proc.stdout.splitlines() if not _is_runs_scratch(line)]
 
 
@@ -344,6 +370,12 @@ def reset_worktree(
     ``--fresh``); when present but not ours, raises rather than delete it.
     ``runs/<agent>/`` is always emptied. A clean worktree at the base, and a clean
     one left behind by a moved base, reset as before.
+
+    Under ``force`` the guard's two reads are skipped: a forced reset discards
+    everything they would report, and a ``rev-list`` or ``status`` that cannot be
+    answered would raise rather than be read as an empty count or a clean tree
+    (FL-2). Without it, a :class:`WorkspaceError` from either propagates out of
+    :func:`prepare_round` untouched — an unreadable worktree is never "clean".
     """
     root = _resolve_rounds_dir(repo, str(rounds_dir))
     path = _workspace_path(root, round_no, agent)
@@ -372,8 +404,15 @@ def reset_worktree(
                 f"{path} exists but is not a worktree of {repo} — refusing to "
                 f"delete a folder this module did not create"
             )
-        commits = _commits_above(path, base_sha)
-        dirty = _dirty_outside_runs(path)
+        # KC-23's guard, and the two reads it needs. Under ``--fresh`` neither
+        # runs: the reset is already agreed to discard everything they would
+        # report, and a ``rev-list`` or ``status`` that cannot be answered would
+        # raise instead of being read as an empty count or a clean tree (FL-2).
+        commits = 0
+        dirty: list[str] = []
+        if not force:
+            commits = _commits_above(path, base_sha)
+            dirty = _dirty_outside_runs(path)
         if (commits or dirty) and not force:
             raise _refuse_to_reset(path.resolve(), branch, round_no, commits, dirty)
         # ``--fresh`` has already agreed to drop the edits; without
@@ -467,6 +506,13 @@ def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
     moved base, reset as before. ``runs/<agent>/`` is always emptied. A folder at
     the path that is not a git clone, or a clone of a different repo, raises
     rather than being deleted; an empty folder is removed and the clone rebuilt.
+
+    Under ``force`` the guard's two reads are skipped too, exactly as for a
+    worktree: a forced reset discards everything they would report, and a
+    ``rev-list`` or ``status`` that cannot be answered would raise rather than be
+    read as an empty count or a clean tree (FL-2). Without it, a
+    :class:`WorkspaceError` from either propagates out of :func:`prepare_round`
+    untouched — an unreadable checkout is never "clean".
     """
     repo_path = Path(repo).resolve()
     root = _resolve_rounds_dir(repo_path, str(rounds_dir))
@@ -505,8 +551,15 @@ def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
                     f"after fetching origin — the base is not on any branch of "
                     f"{repo_path}"
                 )
-            commits = _commits_above(path, base_sha)
-            dirty = _dirty_outside_runs(path)
+            # KC-23's guard, and the two reads it needs. Same as
+            # :func:`reset_worktree`: under ``--fresh`` neither runs, so a
+            # ``rev-list`` or ``status`` that cannot be answered raises rather
+            # than being read as an empty count or a clean tree (FL-2).
+            commits = 0
+            dirty: list[str] = []
+            if not force:
+                commits = _commits_above(path, base_sha)
+                dirty = _dirty_outside_runs(path)
             if (commits or dirty) and not force:
                 raise _refuse_to_reset(path.resolve(), branch, round_no, commits, dirty)
             # ``--fresh`` has already agreed to drop the edits; without ``-f`` a
@@ -803,7 +856,11 @@ def prepare_round(
     ``refs/stash``, its push URL cut), a worktree when it is ``worktree``. Each
     checkout that holds commits above the base or edits outside ``runs/`` is
     refused unless *force* (KC-23's ``--fresh``); *force_clone* still governs the
-    attached clones alone. Every agent's scratch dir is created first. The repo's
+    attached clones alone. A checkout whose ``rev-list`` or ``status`` cannot be
+    read is refused the same way, without *force*: the guard's reads raise
+    :class:`WorkspaceError` straight out of here (FL-2), and *force* skips the
+    reads altogether because a forced reset discards whatever they would have
+    said. Every agent's scratch dir is created first. The repo's
     own checkout is never touched (no ``checkout``/``reset`` in *repo* itself).
 
     KC-43: *leg* is the leg being prepared (1 is the round's first, and every

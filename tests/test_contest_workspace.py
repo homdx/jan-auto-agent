@@ -16,6 +16,13 @@ adds the refusal: a worktree holding commits above the base or edits outside
 ``runs/`` is not reset unless ``force=True``, and the message names ``--fresh`` and
 ``--resume``.
 
+FL-2 / KC-23: the guard's two reads are read errors when git cannot answer — a
+``rev-list --count`` that exits 128 is not "zero commits", and a ``status
+--porcelain`` that exits 128 prints nothing, which used to read as a clean tree.
+Both now raise ``WorkspaceError`` instead of letting the reset run, and
+``force=True`` skips both reads because a forced reset discards what they would
+report.
+
 Knowledge label: KC-4 regression test.
 
 KC-59: the KC-4/KC-23 coverage below pins ``workspace_kind = worktree`` — the
@@ -39,6 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(REPO_ROOT))
 
+import tools.contest.workspace as workspace_mod
 from tools.contest.harvest import harvest
 from tools.contest.roster import ContestConfig
 from tools.contest.workspace import (
@@ -130,6 +138,34 @@ def clone_config(tmp_path):
 
 def _base_sha(repo: Path) -> str:
     return _git(repo, "rev-parse", "HEAD~1").strip()
+
+
+def _fail_git_read(monkeypatch, args, cwd: Path, *, stderr: str = "") -> list[list[str]]:
+    """Make one git read fail; every other call still runs on the real git.
+
+    KC-23's guard asks git two questions and decides the reset from the answers
+    alone, so a single read that exits 128 with nothing on stdout is the whole
+    FL-2 defect. This stands in for exactly that call — ``_git(*args)`` in *cwd*
+    — and delegates the rest, so the round is still prepared for real. The
+    returned list is every argv asked of *cwd*, so a test can prove the failing
+    read was never asked of it at all.
+    """
+    real_git = workspace_mod._git
+    asked: list[list[str]] = []
+    failed_cwd = Path(cwd).resolve()
+
+    def failing(cwd_arg, args_arg, *, check=True):
+        if Path(cwd_arg).resolve() != failed_cwd:
+            return real_git(cwd_arg, args_arg, check=check)
+        asked.append(list(args_arg))
+        if list(args_arg) == args:
+            return subprocess.CompletedProcess(
+                list(args_arg), 128, stdout="", stderr=stderr
+            )
+        return real_git(cwd_arg, args_arg, check=check)
+
+    monkeypatch.setattr(workspace_mod, "_git", failing)
+    return asked
 
 
 def test_prepare_round_creates_worktrees_at_base_with_empty_runs(repo, config):
@@ -272,6 +308,113 @@ def test_prepare_round_without_force_still_refuses_that_edit(repo, config):
     with pytest.raises(WorkspaceError, match="--fresh"):
         prepare_round(repo, config, 40, new_base)
     assert (laguna.path / "readme.txt").read_text() == "the agent's edit\n"
+
+
+def test_prepare_round_refuses_a_worktree_when_rev_list_fails(repo, config, monkeypatch):
+    """FL-2: a ``rev-list --count`` that exits 128 is a read error, not "zero
+    commits". The guard used to read the failure as an empty branch and reset a
+    worktree that holds a commit, so the commit and its file are left in place."""
+    base = _base_sha(repo)
+    laguna = next(ws for ws in prepare_round(repo, config, 40, base)
+                  if ws.agent == "laguna")
+
+    (laguna.path / "thing.py").write_text("42\n")
+    _git(laguna.path, "add", "thing.py")
+    _git(laguna.path, "commit", "-q", "-m", "KC-23: thing")
+    assert _git(laguna.path, "rev-list", "--count", f"{base}..HEAD").strip() == "1"
+
+    asked = _fail_git_read(monkeypatch, ["rev-list", "--count", f"{base}..HEAD"],
+                           laguna.path,
+                           stderr="fatal: Unable to create 'index.lock': File exists")
+
+    with pytest.raises(WorkspaceError) as excinfo:
+        prepare_round(repo, config, 40, base)
+
+    message = str(excinfo.value)
+    assert str(laguna.path) in message
+    assert "rev-list --count" in message
+    assert "index.lock" in message
+    assert "--fresh" in message
+    assert asked == [["rev-list", "--count", f"{base}..HEAD"]]
+    # the refusal must not have touched the worktree
+    assert _git(laguna.path, "rev-parse", "HEAD").strip() != base
+    assert (laguna.path / "thing.py").exists()
+
+
+def test_prepare_round_refuses_a_worktree_when_status_fails(repo, config, monkeypatch):
+    """FL-2: a failed ``status --porcelain`` prints nothing, and the old code
+    never read its exit code, so nothing printed read as a clean tree. The
+    failure now raises, and the edit stays on disk."""
+    base = _base_sha(repo)
+    laguna = next(ws for ws in prepare_round(repo, config, 40, base)
+                  if ws.agent == "laguna")
+
+    (laguna.path / "thing.py").write_text("42\n")
+
+    asked = _fail_git_read(monkeypatch, ["status", "--porcelain", "--untracked-files=all"],
+                           laguna.path,
+                           stderr="fatal: Unable to create 'index.lock': File exists")
+
+    with pytest.raises(WorkspaceError) as excinfo:
+        prepare_round(repo, config, 40, base)
+
+    message = str(excinfo.value)
+    assert str(laguna.path) in message
+    assert "status --porcelain --untracked-files=all" in message
+    assert "index.lock" in message
+    assert "--fresh" in message
+    # the count read ran for real, the status read is the one that failed
+    assert asked == [
+        ["rev-list", "--count", f"{base}..HEAD"],
+        ["status", "--porcelain", "--untracked-files=all"],
+    ]
+    assert _git(laguna.path, "rev-parse", "HEAD").strip() == base
+    assert (laguna.path / "thing.py").exists()
+
+
+def test_prepare_round_force_skips_the_failing_rev_list(repo, config, monkeypatch):
+    """``--fresh`` already agreed to discard everything, so the count read is
+    skipped instead of refusing the reset it would discard."""
+    base = _base_sha(repo)
+    laguna = next(ws for ws in prepare_round(repo, config, 40, base)
+                  if ws.agent == "laguna")
+
+    (laguna.path / "thing.py").write_text("42\n")
+    _git(laguna.path, "add", "thing.py")
+    _git(laguna.path, "commit", "-q", "-m", "KC-23: thing")
+
+    asked = _fail_git_read(monkeypatch, ["rev-list", "--count", f"{base}..HEAD"],
+                           laguna.path)
+
+    wss = prepare_round(repo, config, 40, base, force=True)
+    laguna2 = next(ws for ws in wss if ws.agent == "laguna")
+
+    assert not any(a[:2] == ["rev-list", "--count"] for a in asked)
+    assert _git(laguna2.path, "rev-parse", "HEAD").strip() == base
+    assert not (laguna2.path / "thing.py").exists()
+    assert _git(laguna2.path, "status", "--porcelain").strip() == ""
+
+
+def test_prepare_round_force_skips_the_failing_status(repo, config, monkeypatch):
+    """The edit read is skipped under ``--fresh`` too: the forced reset lands
+    back on the base and the edit goes with it."""
+    base = _base_sha(repo)
+    laguna = next(ws for ws in prepare_round(repo, config, 40, base)
+                  if ws.agent == "laguna")
+
+    (laguna.path / "thing.py").write_text("42\n")
+
+    asked = _fail_git_read(monkeypatch, ["status", "--porcelain", "--untracked-files=all"],
+                           laguna.path)
+
+    wss = prepare_round(repo, config, 40, base, force=True)
+    laguna2 = next(ws for ws in wss if ws.agent == "laguna")
+
+    assert not any(a[:3] == ["status", "--porcelain", "--untracked-files=all"]
+                   for a in asked)
+    assert _git(laguna2.path, "rev-parse", "HEAD").strip() == base
+    assert not (laguna2.path / "thing.py").exists()
+    assert _git(laguna2.path, "status", "--porcelain").strip() == ""
 
 
 def test_attach_clone_force_resets_an_edit_the_base_also_changes(repo, tmp_path):
