@@ -249,6 +249,40 @@ def test_judge_worktree_reports_a_non_worktree(round_, tmp_path):
     assert "commits" not in row
 
 
+def test_judge_worktree_counts_a_file_under_a_declared_dir_prefix(round_, tmp_path):
+    """KC-5/KC-34: a declared entry ending in `/` is a directory — every path
+    under it is on-ticket, not `off_ticket`."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _edit(wt, "contest-bench/kc76/x.py", "X = 1\n")
+    _edit(wt, "tests/test_x.py", "def test_x():\n    assert True\n")
+    _commit(wt, "bench under a declared dir")
+    row = judge_worktree(wt.agent, str(wt.path), base,
+                         ["contest-bench/kc76/"], False)
+    assert row["off_ticket"] == 0, row
+
+
+def test_judge_worktree_counts_a_rename_under_its_new_path(tmp_path):
+    """KC-5: numstat with `--no-renames` names the rename's new path, which
+    matches `declared`; the deleted side (the old path) is not off-ticket."""
+    repo, base = _make_repo(tmp_path)
+    (repo / "tools" / "auto" / "probe.py").write_text("PROBE = 1\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add probe")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    wt = _worktree(repo, base, tmp_path)
+    (wt.path / "tools" / "contest").mkdir(parents=True)
+    _git(wt.path, "mv", "tools/auto/probe.py", "tools/contest/runner.py")
+    _edit(wt, "tests/test_runner.py", "def test_runner():\n    assert True\n")
+    _commit(wt, "rename probe to runner")
+
+    row = judge_worktree(wt.agent, str(wt.path), base,
+                         ["tools/contest/runner.py"], False)
+    assert row["off_ticket"] == 0, row
+    assert row["off_ticket_files"] == ""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. `declared_files` and the moved helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,6 +346,32 @@ def test_declared_files_drops_config_keys_on_also_touches(tmp_path):
                 "`contest.ini` (`compact_at_percent = 80`), `tests/_kilo_fake.py`")
     assert declared_files(p) == ("tools/contest/runner.py", "contest.ini",
                                  "tests/_kilo_fake.py")
+
+
+def test_declared_files_reads_a_wrapped_also_touches_block(tmp_path):
+    """KC-34: a wrapped `**Also touches:**` field carries every path on every
+    line; the field ends at the next `**Label:**` line, whose own backticked
+    paths are not part of it."""
+    p = tmp_path / "123-kc76.md"
+    p.write_text(
+        "# 123 — kc76 bench\n"
+        "\n"
+        "**File:** `tools/contest/runner.py`\n"
+        "\n"
+        "**Also touches:** `tests/test_contest_cli.py`\n"
+        "`contest-bench/kc76/`\n"
+        "`contest-bench/kc76/README.md`\n"
+        "`contest-bench/kc76/run.sh`\n"
+        "**Also touches:** `should/not/count.py`\n"
+        "**Severity:** `not/a/path.py`\n",
+        encoding="utf-8")
+    assert declared_files(p) == (
+        "tools/contest/runner.py",
+        "tests/test_contest_cli.py",
+        "contest-bench/kc76/",
+        "contest-bench/kc76/README.md",
+        "contest-bench/kc76/run.sh",
+    )
 
 
 def test_harvest_does_not_call_the_file_line_path_off_ticket(round_, tmp_path):
@@ -460,6 +520,60 @@ def test_run_tests_reports_a_non_zero_exit_without_a_failed_test(round_, tmp_pat
     _commit(wt, "collection error")
     summary, tail = run_tests_detail(str(wt.path))
     assert "✗" in summary.split()[0] and summary.split()[0] != "tests:PASS"
+    assert tail[0] == "--- tests"
+
+
+def test_pytest_appends_timeout_only_when_pytest_timeout_is_installed(
+        monkeypatch, tmp_path):
+    """KC-5/KC-57/KC-76: `--timeout=180` is a guard, not a requirement — without
+    pytest-timeout installed the flag makes every pytest root exit 4, so the
+    flag is appended only when the plugin is importable."""
+    calls: list = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(gates_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(gates_mod.importlib.util, "find_spec", lambda name: None)
+    gates_mod._pytest(str(tmp_path), "tests")
+    assert "--timeout=180" not in calls[0], calls[0]
+
+    monkeypatch.setattr(gates_mod.importlib.util, "find_spec",
+                        lambda name: object() if name == "pytest_timeout" else None)
+    gates_mod._pytest(str(tmp_path), "tests")
+    assert "--timeout=180" in calls[1], calls[1]
+
+
+def test_run_tests_detail_does_not_mark_unparseable_failures_flaky(
+        round_, tmp_path, monkeypatch):
+    """KC-26: `bad` comes from the stats line and `ids` from the short summary.
+    A node id with a space never matches `_SUMMARY_LINE`, so `len(ids) < bad`
+    and the rerun never saw the lost failure — a passing rerun must not emit
+    `PASS*2` and hide a real red as flaky."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+
+    full_out = (
+        "FAILED tests/test_probe.py::test_probe - assert False\n"
+        "FAILED tests/test_probe.py::test_x[a b] - assert False\n"
+        "2 failed in 1.00s\n"
+    )
+    calls: list = []
+
+    def fake_pytest(cwd, *args, budget=0.0):
+        calls.append(args)
+        if args and args[0] == "tests":
+            return subprocess.CompletedProcess(["pytest"], 1, full_out, "")
+        return subprocess.CompletedProcess(["pytest"], 0, "1 passed in 0.10s\n", "")
+
+    monkeypatch.setattr(gates_mod, "_pytest", fake_pytest)
+    summary, tail = run_tests_detail(str(wt.path))
+    assert summary.startswith("tests:2✗"), summary
+    assert "PASS*2" not in summary
+    assert len(calls) == 2                      # the root, then the one parseable id
+    assert calls[1][0] == "tests/test_probe.py::test_probe"
     assert tail[0] == "--- tests"
 
 

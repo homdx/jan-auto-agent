@@ -122,22 +122,30 @@ def _looks_like_path(span: str) -> bool:
 
 
 def _declared_paths(body: str) -> tuple[str, ...]:
-    """The paths a ticket declares: the `**File:**` line plus `**Also touches:**`.
+    """The paths a ticket declares: the `**File:**` field plus `**Also touches:**`.
 
-    Both lines are read the same way (KC-17): every backticked span that looks
-    like a path, in order, `**File:**` first. A `**File:**` line without any
-    backtick is one path, the whole value; a `—` placeholder declares nothing.
+    Each field runs from its `**Label:**` line up to the next blank line or the
+    next `**Label:**` line (KC-34) — a wrapped `**Also touches:**` block carries
+    every path on every line, not only the first. Within that block every
+    backticked span that looks like a path counts, in order, `**File:**` first;
+    a `**File:**` field without any backtick is one path, the whole value; a
+    `—` placeholder declares nothing.
     """
     declared: list[str] = []
     for label in ("File", "Also touches"):
-        m = re.search(rf"^\*\*{label}:\*\*\s*(.+?)\s*$", body, re.M)
+        m = re.search(rf"^\*\*{label}:\*\*", body, re.M)
         if not m:
             continue
-        value = m.group(1)
+        lines = []
+        for line in body[m.end():].splitlines():
+            if not line.strip() or re.match(r"^\*\*[^*]+:\*\*", line):
+                break
+            lines.append(line)
+        value = " ".join(l.strip() for l in lines)
         spans = re.findall(r"`([^`]+)`", value)
         if spans:
             declared += [s for s in spans if _looks_like_path(s)]
-        elif label == "File" and value != "—":
+        elif label == "File" and value and value != "—":
             declared.append(value)
     return tuple(declared)
 
@@ -227,8 +235,14 @@ def _pytest(cwd, *args, budget: float = 0.0) -> subprocess.CompletedProcess:
     A bounded run writes to files rather than pipes: `communicate(timeout=…)`
     reads the partial output into a local and throws it away when the deadline
     hits, so the `-v` line that names the test the budget hit in would be lost.
+
+    KC-5/KC-57/KC-76: `--timeout=180` is a per-test guard, not a requirement —
+    without `pytest-timeout` installed the flag makes pytest exit 4 and no root
+    can ever pass. The plugin is looked up the same way `run_tests_detail`
+    looks up xdist, and the flag is omitted when it is absent.
     """
-    cmd = [sys.executable, "-m", "pytest", *args, "--timeout=180"]
+    timeout = ["--timeout=180"] if importlib.util.find_spec("pytest_timeout") else []
+    cmd = [sys.executable, "-m", "pytest", *args, *timeout]
     if budget <= 0:
         return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
@@ -418,7 +432,10 @@ def run_tests_detail(cwd, budget_sec: float = 0.0) -> tuple[str, list[str]]:
                 tail.extend(_budget_tail(
                     f"--- {d}: the flake rerun ended after the harvest budget", rerun))
                 continue
-        if rerun is not None and rerun.returncode == 0:
+        if rerun is not None and rerun.returncode == 0 and len(ids) == bad:
+            # KC-26: only a rerun that covered every failure is a flake — when
+            # a node id did not parse (`len(ids) < bad`), the rerun never saw
+            # the lost failure, so a real red must not be marked `PASS*`.
             out.append(f"{d}:PASS*{bad}")
             tail.append(f"--- {d}: {bad} test(s) failed under the full run and passed "
                         f"alone on rerun (flaky, not counted): {' '.join(ids)}")
@@ -436,6 +453,17 @@ def run_tests_detail(cwd, budget_sec: float = 0.0) -> tuple[str, list[str]]:
             tail.append("--- tiers")
             tail.extend(((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-FAIL_TAIL_LINES:])
     return " ".join(out), tail
+
+
+def _on_ticket(f: str, declared) -> bool:
+    """True when *f* is declared exactly, or lies under a declared directory.
+
+    A declared entry ending in `/` (e.g. `contest-bench/kc76/`) is a directory
+    prefix — every path under it is on-ticket (KC-5/KC-34).
+    """
+    if f in declared:
+        return True
+    return any(d.endswith("/") and f.startswith(d) for d in declared)
 
 
 def judge_worktree(name, path, base, declared, want_tests):
@@ -475,7 +503,10 @@ def judge_worktree(name, path, base, declared, want_tests):
         row["pushed"] = "yes" if remotes.strip() else "no"
 
     # ── diff shape ───────────────────────────────────────────────────────
-    stat = git(path, "diff", "--numstat", f"{merge_base}..HEAD")
+    # KC-5: `--no-renames` so a rename is a plain deletion + plain addition
+    # under its real paths — `old => new` / `dir/{a => b}.py` never match
+    # `declared`, and `git show HEAD:<that>` fails on the composite name.
+    stat = git(path, "diff", "--numstat", "--no-renames", f"{merge_base}..HEAD")
     files, add, dele = [], 0, 0
     for l in stat.splitlines():
         parts = l.split("\t")
@@ -498,8 +529,19 @@ def judge_worktree(name, path, base, declared, want_tests):
             new_tests += len(re.findall(r"^\s*def test_", blob.stdout, re.M))
     row["test_funcs"] = new_tests
 
+    # KC-5: with rename detection on, `R<score>\told\tnew` names the deleted
+    # side of a rename — it is not a change of its own, so it is never
+    # off-ticket even when `--no-renames` listed it as a deletion.
+    renamed_away = set()
+    for l in git(path, "diff", "--name-status", f"{merge_base}..HEAD").splitlines():
+        parts = l.split("\t")
+        if len(parts) == 3 and parts[0].startswith("R"):
+            renamed_away.add(parts[1])
+
     if declared:
-        outside = [f for f in files if f not in declared and not tests.count(f)]
+        outside = [f for f in files
+                   if not _on_ticket(f, declared) and not tests.count(f)
+                   and f not in renamed_away]
         row["off_ticket"] = len(outside)
         row["off_ticket_files"] = ";".join(outside[:4])
     else:

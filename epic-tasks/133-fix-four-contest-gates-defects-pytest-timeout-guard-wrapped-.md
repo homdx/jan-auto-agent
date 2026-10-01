@@ -1,6 +1,6 @@
 # 133 — fix four contest gates defects: pytest timeout guard, wrapped declared paths, rename prefix, flaky id parse
 
-**Status:** queued — runs as round 133 on the second machine; parked here so round 134 can start
+**Status:** landed — round 133, winner mimo-v2-5 (15/15 on contest-bench/133, base 7/15), as-is
 **Severity:** MEDIUM
 **File:** `tools/contest/gates.py`
 **Symbol:** `_pytest, _declared_paths, judge_worktree, run_tests_detail`
