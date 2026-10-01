@@ -39,8 +39,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.llm_stream import _extract_content, request_completion
 
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
-
 
 class _NonStreamHandler(http.server.BaseHTTPRequestHandler):
     body: dict = {}

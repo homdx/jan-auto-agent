@@ -49,8 +49,6 @@ from tools.contest import context_memory as cm  # noqa: E402
 from tools.contest import runner as runner_mod  # noqa: E402
 from tools.contest.roster import ContestConfig, load_roster  # noqa: E402
 
-# every runner test below binds an ephemeral-port HTTP server
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 DAY = 86400.0
 

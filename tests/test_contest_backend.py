@@ -59,8 +59,6 @@ from tools.contest.kilo_client import IdleResult, KiloHttpError, KiloServer  # n
 from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext  # noqa: E402
 from tools.contest.roster import ContestConfig  # noqa: E402
 
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # fakes for the two backends' transports

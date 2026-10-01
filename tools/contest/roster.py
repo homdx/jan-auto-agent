@@ -69,6 +69,7 @@ __all__ = [
     "DEFAULTS",
     "DEFAULTS_GATE",
     "DEFAULTS_OPENROUTER",
+    "DEFAULTS_DRAFT",
     "LOCAL_FILENAME",
     "AgentSpec",
     "ContestConfig",
@@ -114,6 +115,7 @@ CONTEST_KEYS = (
     "provider_retry_max_wait_sec",
     "quota_patterns",
     "progress_every_sec",
+    "kilo_silent_sec",
     "harvest_budget_sec",
     "deadline_commit",
     "agent_suite_slots",
@@ -149,6 +151,9 @@ CONTEST_KEYS = (
     "compact_at_percent",
     "summary_at_percent",
     "context_limit_fallback",
+    "draft_llm_profile",
+    "draft_map_budget",
+    "draft_review_rounds",
 )
 
 #: Every key an agent section may carry.
@@ -193,6 +198,22 @@ DEFAULTS_OPENROUTER = LlmSettings(
     model="",
     api_format="openai",
     temperature=0.2,
+    max_tokens=4096,
+    response_format=False,
+)
+
+#: KC-79: the draft model's own profile defaults. A ticket writer wants room
+#: for prose — the whole brief, the three collect maps and the ticket's own
+#: format in one reply — so ``max_tokens`` is wide and ``response_format`` is
+#: off: the answer is Markdown, not JSON. ``model`` is empty on purpose, so a
+#: profile section that omits its model fails at load time rather than
+#: silently inheriting the gate's or an agent's id.
+DEFAULTS_DRAFT = LlmSettings(
+    base_url="",
+    api_key="",
+    model="",
+    api_format="openai",
+    temperature=0.3,
     max_tokens=4096,
     response_format=False,
 )
@@ -346,6 +367,9 @@ class ContestConfig:
     #: not live here — they belong to KC-19's retry path.
     quota_patterns: str = ""
     progress_every_sec: int = 60
+    #: KC-81: seconds of *both* no live agent event and a still kilo-serve.log
+    #: before the heartbeat names the server as hung. 0 turns the check off.
+    kilo_silent_sec: float = 600.0
     #: KC-57: the wall-clock budget for one harvest's pytest roots.
     #: 0 turns it off, which keeps today's unbounded behaviour.
     harvest_budget_sec: int = 900
@@ -476,6 +500,20 @@ class ContestConfig:
     openrouter_settings: LlmSettings | None = None
     #: The profile name that ``openrouter_settings`` was resolved from.
     openrouter_llm_profile: str = ""
+    #: KC-79: the profile name behind ``[contest] draft_llm_profile`` — the
+    #: model ``contest draft`` writes tickets with. ``draft_settings`` is its
+    #: resolved form and ``None`` when the key is unset or the section cannot
+    #: be resolved: ``run`` never fails on it, only ``draft`` refuses.
+    draft_llm_profile: str = ""
+    draft_settings: LlmSettings | None = None
+    #: KC-79: the character budget each collect map gets in the draft's prompt.
+    #: A budget the operator sets, never a model window hard-coded in the code.
+    draft_map_budget: int = 8000
+    #: KC-80: the rework rounds the gate model's review may send the draft back
+    #: for. 3 = one review, then at most three rounds of problems -> rework ->
+    #: lint -> review; 0 = one review with no rework at all. Read fail-open the
+    #: way the map budget is: a typo keeps the default, it does not stop a draft.
+    draft_review_rounds: int = 3
 
     def session_rules(self) -> list[dict]:
         """The rule list ``KiloClient.create_session`` sends, per session.
@@ -673,6 +711,18 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     def list_(key: str) -> tuple[str, ...]:
         return _split_list(parser.get("contest", key, fallback=""))
 
+    def _kilo_silent_sec(parser) -> float:
+        """KC-81: ``[contest] kilo_silent_sec``, fail-open.
+
+        Absent is the 600 s default; a negative or non-finite value is 0 (off);
+        a malformed key falls back to the default rather than raising into a
+        round — same spirit as ``num``'s memory reads.
+        """
+        value = safe_getfloat(parser, "contest", "kilo_silent_sec", fallback=600.0)
+        if not math.isfinite(value) or value < 0:
+            return 0.0
+        return value
+
     def flag(key: str, default: bool) -> bool:
         """KC-41: an on/off key, fail-open in both directions.
 
@@ -843,6 +893,33 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         except ValueError as exc:
             raise RosterError(f"[contest] openrouter_llm_profile: {exc}") from exc
 
+    # KC-79: the draft's own profile. Unlike the gate's and OpenRouter's, a
+    # typo here must not refuse a round that never drafts — the resolution is
+    # fail-open and `contest draft` is the one command that reports it,
+    # naming the key. The section's own ${ENV} references are expanded only
+    # when the key is set, so a ${CONTEST_DRAFT_API_KEY} nobody exported
+    # costs nothing to a kilo round.
+    draft_profile = scalar("draft_llm_profile", "")
+    draft_settings = None
+    if draft_profile:
+        try:
+            _expand(parser, (draft_profile,))
+            draft_settings, _ = resolve_llm_profile(
+                parser, "contest", "draft_llm_profile", defaults=DEFAULTS_DRAFT
+            )
+        except (ValueError, RosterError) as exc:
+            _log.warning("[contest] draft_llm_profile: %s — `contest draft` will refuse to run",
+                         exc)
+    draft_map_budget = safe_getint(parser, "contest", "draft_map_budget", fallback=8000)
+    if draft_map_budget <= 0:
+        draft_map_budget = 8000
+    # KC-80: 0 is a real value — one review, no rework — so only a negative
+    # count is a typo, and the typo keeps the default rather than disabling the
+    # review. `draft` never refuses a round on either number.
+    draft_review_rounds = safe_getint(parser, "contest", "draft_review_rounds", fallback=3)
+    if draft_review_rounds < 0:
+        draft_review_rounds = 3
+
     return ContestConfig(
         kilo_bin=scalar("kilo_bin", "auto"),
         server=scalar("server", "spawn"),
@@ -872,6 +949,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         provider_retry_max_wait_sec=seconds("provider_retry_max_wait_sec", 300.0),
         quota_patterns=scalar("quota_patterns", ""),
         progress_every_sec=limit("progress_every_sec", 60),
+        # KC-81: fail-open — absent is the 600 s default, a negative or a
+        # non-finite value is 0 (off), and a malformed key never raises.
+        kilo_silent_sec=_kilo_silent_sec(parser),
         harvest_budget_sec=max(0, limit("harvest_budget_sec", 900)),
         deadline_commit=flag("deadline_commit", True),
         agent_suite_slots=agent_suite_slots,
@@ -911,6 +991,10 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         backend=backend,
         openrouter_settings=openrouter_settings,
         openrouter_llm_profile=openrouter_profile,
+        draft_llm_profile=draft_profile,
+        draft_settings=draft_settings,
+        draft_map_budget=draft_map_budget,
+        draft_review_rounds=draft_review_rounds,
     )
 
 

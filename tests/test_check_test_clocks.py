@@ -431,16 +431,29 @@ def test_the_check_starts_nothing(tmp_path):
     assert ctc.scan([_write(tmp_path, "test_c1.py", C1_BOUND)])
 
 
-def test_scan_of_the_tree_is_deterministic_and_fast():
-    """The whole tree, read-only, in a couple of seconds."""
-    first = ctc.scan(ctc.DEFAULT_ROOTS)
-    started = time.monotonic()
+@pytest.fixture(scope="module")
+def tree_findings():
+    """`tests/` and `tests_bugfix/` as they stand, scanned once for the two
+    tests below that read the real tree — several CPU-seconds a scan under
+    `-n 8`. Their xdist_group keeps both on the one worker that holds it."""
+    return ctc.scan(ctc.DEFAULT_ROOTS)
+
+
+@pytest.mark.xdist_group(name="check_test_clocks_tree")
+def test_scan_of_the_tree_is_deterministic_and_fast(tree_findings):
+    """The whole tree, read-only, in a couple of seconds of CPU.
+
+    CPU, not wall: the scan is one thread with no subprocess, so its
+    process_time is its own cost. The wall clock under `tests -n 8` next to a
+    live round read 10.3 and 10.8 s — the box's load, not the scan's."""
+    started = time.process_time()
     second = ctc.scan(ctc.DEFAULT_ROOTS)
-    assert second == first
-    assert time.monotonic() - started < 10.0
+    assert second == tree_findings
+    assert time.process_time() - started < 10.0
 
 
-def test_the_check_is_silent_on_the_tree_as_it_stands():
+@pytest.mark.xdist_group(name="check_test_clocks_tree")
+def test_the_check_is_silent_on_the_tree_as_it_stands(tree_findings):
     """FL-4's promise on the base tree: zero unexplained findings."""
-    unexplained = [finding for finding in ctc.scan(ctc.DEFAULT_ROOTS) if finding.unexplained]
+    unexplained = [finding for finding in tree_findings if finding.unexplained]
     assert unexplained == [], [str(finding) for finding in unexplained]

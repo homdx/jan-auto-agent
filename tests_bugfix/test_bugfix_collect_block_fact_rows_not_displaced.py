@@ -394,7 +394,7 @@ def test_a_larger_budget_never_renders_fewer_rows_or_names():
 
 
 @pytest.fixture(scope="module")
-def live_model() -> CollectModel:
+def live_model(live_collect_model) -> CollectModel:
     """This repo's graph and test map, built from the source tree the way the
     producer builds them — never from `.collect/`, which is gitignored and
     would make the acceptance tests skip on a fresh checkout."""
@@ -402,7 +402,7 @@ def live_model() -> CollectModel:
     edges = graph_mod.import_edges(modules)
     reverse = graph_mod.imported_by(edges)
     tmap = test_map_mod.build_test_map(REPO_ROOT, modules)
-    return CollectModel(
+    return live_collect_model(
         status=STATUS_FRESH,
         modules=tuple(modules),
         import_edges={k: tuple(sorted(v)) for k, v in edges.items()},

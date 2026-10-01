@@ -29,6 +29,9 @@ Everything here is scripted by one scenario dict, per session:
                 "diff": [...],       # replaces the session diff after this turn
                 "info": {...},       # merged into GET /session/{id} after this turn
                 "delay": 2.5,        # seconds to hold before going idle
+                "hold": threading.Event(),  # then hold until the test sets it
+                                     # (capped at HOLD_CAP_S) — for a turn that
+                                     # must outlive the test's own checks
                 "pause_before_idle_sec": 2,  # session.status busy, then that many
                                      # seconds of silence: no idle, no error,
                                      # nothing — a stalled turn (KC-12)
@@ -420,6 +423,20 @@ class FakeKiloServer:
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         return True
 
+    #: a `hold` nobody releases ends here, like a `delay` of that length
+    HOLD_CAP_S = 60.0
+
+    def _hold(self, release: threading.Event) -> bool:
+        """`_sleep` until the test sets `release` rather than for a fixed time,
+        so a turn that must outlive the test's checks lasts as long as they do
+        and not a guessed margin longer. False if stopped."""
+        deadline = time.monotonic() + self.HOLD_CAP_S
+        while not release.is_set() and time.monotonic() < deadline:
+            if self._stop.is_set():
+                return False
+            release.wait(0.05)
+        return not self._stop.is_set()
+
     def _create_session(self, body: dict, directory: str) -> dict:
         sid = self._next_id("ses")
         model = dict((body or {}).get("model") or {})
@@ -676,6 +693,9 @@ class FakeKiloServer:
         if turn.get("idle", True):
             delay = turn.get("delay")
             if delay and not self._sleep(delay):
+                return
+            hold = turn.get("hold")
+            if hold is not None and not self._hold(hold):
                 return
             self._emit({"type": "session.idle",
                         "properties": {"sessionID": session.id}})

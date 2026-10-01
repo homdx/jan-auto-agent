@@ -703,6 +703,22 @@ def _workspace_kind(config: ContestConfig) -> Literal["clone", "worktree"]:
     return _KIND_WORKTREE if kind == _KIND_WORKTREE else _KIND_CLONE
 
 
+def _reattach(path: Path, branch: str) -> bool:
+    """KC-78: put *path* back on *branch* when its HEAD only built on top of it.
+
+    True when *branch*'s tip is an ancestor of HEAD (an agent's own branch or a
+    detached HEAD that kept the round's commits): *branch* is moved to HEAD and
+    checked out, files untouched. A HEAD that dropped or rewrote the round's
+    commits is left alone — False, and the carry is refused as before.
+    """
+    tip = _git(path, ["rev-parse", "--verify", "-q", branch], check=False).stdout.strip()
+    if not tip or _git(path, ["merge-base", "--is-ancestor", tip, "HEAD"],
+                       check=False).returncode != 0:
+        return False
+    return _git(path, ["checkout", "-q", "-B", branch, "HEAD"],
+                check=False).returncode == 0
+
+
 def _carry_workspaces(config: ContestConfig, round_no: int, leg: int,
                       carry: LegCarry | None) -> list[Workspace]:
     """KC-43: the checkouts leg *leg* continues in, or a :class:`WorkspaceError`.
@@ -750,6 +766,13 @@ def _carry_workspaces(config: ContestConfig, round_no: int, leg: int,
                                  f"{agent.name} cannot be carried into leg {leg}")
         head = _git(Path(ws.path), ["rev-parse", "--abbrev-ref", "HEAD"],
                     check=False).stdout.strip()
+        if head != branch and _reattach(Path(ws.path), branch):
+            # KC-78: round 119 — the agent made its own branch on top of the
+            # round's and committed there; its work is a descendant of the
+            # round's branch, so the branch is moved to it, not the leg dropped
+            _log.warning("%s: %s was on %s — %s moved to its HEAD for leg %d",
+                           agent.name, ws.path, head or "no branch", branch, leg)
+            head = branch
         if head != branch:
             raise WorkspaceError(
                 f"{ws.path} is on {head or 'no branch'}, not {branch} — refusing to "

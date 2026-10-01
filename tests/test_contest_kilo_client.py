@@ -71,10 +71,10 @@ from tools.contest.kilo_client import (  # noqa: E402
     find_kilo_binary,
 )
 
-# This module binds real http.server instances on OS-assigned ephemeral ports
-# (the fake, plus the spawned stub binary), so it shares the xdist_group with
-# the other port-binding suites: pytest.ini's --dist=loadgroup pins them to one
-# worker, so none of them can race another for a port.
+# The spawn tests start the stub binary on the port kilo_client._free_port
+# picked and let go of, so the module shares the xdist_group with the other
+# files that do (test_contest_cli.py): pytest.ini's --dist=loadgroup pins them
+# to one worker, so no two such spawns race for one port.
 pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 

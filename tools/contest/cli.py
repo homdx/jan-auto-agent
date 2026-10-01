@@ -74,7 +74,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from tools.contest import context_memory, export, gates, probe_memory
+from tools.contest import context_memory, draft, export, gates, probe_memory
 from tools.contest.backend import KiloBackend, OpenRouterBackend
 from tools.contest.kilo_client import (
     KiloClient,
@@ -99,6 +99,7 @@ from tools.contest.roster import (
 )
 from tools.contest.runner import (
     WORKERS_FILE,
+    _age,
     RELAY_STATES,
     AgentState,
     RoundState,
@@ -141,6 +142,7 @@ __all__ = [
     "Intake",
     "agents_from_models",
     "cmd_run",
+    "cmd_draft",
     "cmd_status",
     "export_patches",
     "gate_model_refusals",
@@ -782,9 +784,51 @@ def _missing_hint_lines(missing) -> list:
 
 
 def _roster_path(repo, roster: str) -> Path:
-    """`--roster` as a path: absolute as given, else relative to the repo."""
+    """`--roster` as a path: absolute as given, else relative to the CWD.
+
+    KC-76: the CWD is where the operator stands and the repo is the `--target`,
+    so a relative roster is "my contest.ini", not "the target's". Without
+    `--target` the repo is the CWD and nothing changes. *repo* stays in the
+    signature for the callers; it no longer takes part in the resolution.
+    """
     path = Path(roster)
-    return path if path.is_absolute() else repo / path
+    return path if path.is_absolute() else Path.cwd() / path
+
+
+#: KC-76: what the agents' prompt runs inside their clone of the target — the
+#: prompt names both scripts, so a base without them fails on the first turn.
+_TARGET_FILES = ("scripts/next_task.py", "scripts/append_task.py")
+
+
+def _target_repo(target) -> Path:
+    """The repo the round runs on: `--target` resolved, else the CWD (KC-76)."""
+    return Path(target).expanduser().resolve() if target else Path.cwd().resolve()
+
+
+def _target_failures(repo, base_ref: str) -> list:
+    """Intake lines for a `--target` whose base tree cannot host a round.
+
+    The repo must be a git repo whose *base_ref* holds the two scripts the
+    prompt runs and an `epic-tasks/` (KC-76 §8). An unresolvable base is
+    skipped: `intake` reports it in its own words.
+    """
+    repo = Path(repo)
+    if not repo.is_dir():
+        return [f"--target {repo} is not a directory"]
+    if not gates.git(str(repo), "rev-parse", "--is-inside-work-tree"):
+        return [f"--target {repo} is not a git repository"]
+    if not gates.git(str(repo), "rev-parse", "--verify", f"{base_ref}^{{commit}}"):
+        return []
+    missing = []
+    for rel in (*_TARGET_FILES, "epic-tasks"):
+        listed = gates.git(str(repo), "ls-tree", "--name-only", base_ref, "--", rel)
+        if not listed:
+            missing.append(rel)
+    if not missing:
+        return []
+    return [f"--target {repo}: {base_ref} lacks {', '.join(missing)} — the agents run "
+            "scripts/next_task.py and scripts/append_task.py in their clone and read "
+            "epic-tasks/ there; copy the scripts from jan-auto-agent and commit them"]
 
 
 def _round_out_dir(repo, config: ContestConfig, round_no: int) -> Path:
@@ -2241,8 +2285,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     # decisions.jsonl. This command adds no key check; KC-7's intake does.
     os.environ.setdefault("CONTEST_GATE_API_KEY", "unset-for-the-round")
 
-    repo = Path.cwd().resolve()
+    repo = _target_repo(args.target)
     tasks_dir = repo / TASKS_DIR
+
+    if args.target:
+        failures = _target_failures(repo, args.base)
+        if failures:
+            for line in failures:
+                print(f"intake: {line}", file=sys.stderr)
+            return EXIT_FAILED
 
     try:
         # `--backend` goes into `load_roster`, not into `_apply_flags`: the
@@ -2426,19 +2477,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         # the agents this leg runs: every one on leg 1, then only those that ran out
         expected = (None if prior is None else
                     {run.agent.name for run in prior.agents if run.state in RELAY_STATES})
+        # KC-81: the log the round started its server with, so the heartbeat can
+        # name a hung one. An attached server (or openrouter's none) has no log
+        # of this round — `None` is "log ?", events side only.
+        server_log = getattr(server, "log_path", None) if server is not None else None
         try:
             if relay:
                 state = run_leg(config, args.ticket, result.ticket_path, workspaces,
                                 make_backend=make_backend, out_dir=leg_out, leg=leg,
                                 carry=prior, records=leg_records, run_tests=run_tests,
                                 server_pid=server.pid if server else None,
-                                legs=legs, legs_from=legs_from)
+                                legs=legs, legs_from=legs_from,
+                                log_path=server_log)
             else:
                 # KC-44: a round of one leg is the round `run_round` has always
                 # been — no legs keys in its `state.json`
                 state = run_round(config, args.ticket, result.ticket_path, workspaces,
                                   make_backend=make_backend, out_dir=leg_out, resume=resume,
-                                  run_tests=run_tests, server_pid=server.pid if server else None)
+                                  run_tests=run_tests, server_pid=server.pid if server else None,
+                                  log_path=server_log)
         finally:
             if server is not None:
                 server.close()
@@ -2519,6 +2576,133 @@ def cmd_run(args: argparse.Namespace) -> int:
     return EXIT_OK if ready else EXIT_NO_READY
 
 
+def _same_model(a, b) -> bool:
+    """Whether two LlmSettings name one model id — whatever the provider.
+
+    The same weights behind two URLs are still the same reviewer, so the base
+    URL does not make them different.
+    """
+    if a is None or b is None:
+        return False
+    model_a = str(getattr(a, "model", "") or "").strip().lower()
+    model_b = str(getattr(b, "model", "") or "").strip().lower()
+    return bool(model_a) and model_a == model_b
+
+
+def cmd_draft(args: argparse.Namespace) -> int:
+    """`draft --target REPO "brief" [--round NN] [--out FILE] [--run] [--no-review]`.
+
+    KC-79: `draft.draft_ticket` over the target — `action_collect` there (Pass A
+    only, no Pass B, no LLM), the three maps cut to `[contest] draft_map_budget`,
+    one call to the profile `[contest] draft_llm_profile` names, the lint, one
+    rework with the problem list appended.
+
+    KC-80 adds two steps after it. The review is one call to the profile
+    `[contest] gate_llm_profile` names — the round's own second model, resolved
+    and transported exactly as the gate is, so this module holds no model name,
+    URL or key — and the commit lands the ticket on `contest-legs`, so a drafted
+    ticket is one `run --ticket NN --target REPO` away from a round. `--no-review`
+    skips the review and says so; without a gate profile and without that flag the
+    command refuses, naming the key. `--run` starts the round right after the
+    commit instead of the message, carrying this command's `run` flags.
+
+    Exit 0 with the path written and committed, 2 with the lint's or the
+    review's problems one per line and the last draft saved as `.rejected.md`
+    next to the output, 1 on a target or a roster problem — including a profile
+    that is unset or does not resolve, which names the key and makes no LLM call.
+    """
+    repo = _target_repo(args.target)
+    if not repo.is_dir():
+        print(f"draft: --target {repo} is not a directory", file=sys.stderr)
+        return EXIT_FAILED
+    try:
+        config = load_roster(_roster_path(repo, args.roster))
+    except RosterError as exc:
+        print(f"draft: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    if config.draft_settings is None:
+        # `run` needs no draft profile: the refusal is here, not at load time, so
+        # a round never fails because someone typed the profile's section wrong.
+        if not config.draft_llm_profile:
+            reason = ("[contest] draft_llm_profile is not set — name an LlmSettings "
+                      "section (base_url, api_key, model) in " + LOCAL_FILENAME +
+                      " and set it under [contest]")
+        else:
+            reason = ("[contest] draft_llm_profile = " + config.draft_llm_profile +
+                      " does not resolve — that section needs base_url, api_key "
+                      "and model")
+        print("draft: " + reason + " — `run` needs no draft profile", file=sys.stderr)
+        return EXIT_FAILED
+
+    review_call = None
+    if not getattr(args, "no_review", False):
+        # the reviewer is the gate's model: the same resolution and transport the
+        # gate uses, and no model, URL or key in this module
+        if not config.gate_llm_profile:
+            print("draft: [contest] gate_llm_profile is not set — the review runs on "
+                  "the gate's model, so name it in " + LOCAL_FILENAME +
+                  " as run does, or pass --no-review", file=sys.stderr)
+            return EXIT_FAILED
+        # A model reviewing its own ticket approves its own blind spots: the
+        # reviewer must be a different model from the drafter, not just a
+        # different section naming the same one.
+        if _same_model(config.gate_settings, config.draft_settings):
+            print("draft: the review model is the draft model ("
+                  + str(getattr(config.draft_settings, "model", "")) + ") — set a "
+                  "different model under [contest] gate_llm_profile or "
+                  "draft_llm_profile in " + LOCAL_FILENAME + ", or pass --no-review",
+                  file=sys.stderr)
+            return EXIT_FAILED
+        review_call = draft.llm_call_for(config.gate_settings,
+                                         system=draft.REVIEW_SYSTEM_PROMPT)
+
+    try:
+        result = draft.draft_ticket(
+            args.brief,
+            repo=repo,
+            config=config,
+            round_no=args.round,
+            out=args.out,
+            llm_call=draft.llm_call_for(config.draft_settings),
+            review_call=review_call,
+            commit=True,
+        )
+    except ValueError as exc:
+        print(f"draft: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    if result.rejected:
+        for problem in result.problems:
+            print(f"draft: {problem}", file=sys.stderr)
+        if result.rejected_path:
+            print(f"draft: rejected draft saved to {result.rejected_path}", file=sys.stderr)
+        # EXIT_NO_READY is 2: the lint or the review refused, the problems are
+        # printed, the operator fixes the draft or the repo and re-runs the brief.
+        return EXIT_NO_READY
+    if getattr(args, "no_review", False):
+        print("draft: --no-review: the gate model's review was skipped", file=sys.stderr)
+    print(f"ticket {result.number} ready: {result.path} — check it, then: "
+          f"python3 -m tools.contest run --ticket {result.number} --target {repo}")
+    if getattr(args, "run", False):
+        return _run_after_draft(args, repo, result.number)
+    return EXIT_OK
+
+
+def _run_after_draft(args: argparse.Namespace, repo: Path, number: int) -> int:
+    """`--run`: the round right after the commit, this command's run flags carried.
+
+    The ticket number is the one the draft just wrote and `--target` the repo it
+    committed to; everything else is the namespace as parsed, so a flag `run`
+    knows about is never dropped by the pass-through. `--out` is dropped: on
+    `draft` it is the ticket's file, on `run` it is the round's output folder.
+    """
+    run_args = copy.copy(args)
+    run_args.cmd = "run"
+    run_args.ticket = number
+    run_args.target = str(repo) if getattr(args, "target", None) else None
+    run_args.out = None
+    return cmd_run(run_args)
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     """`status --ticket NN [--out DIR]` — the SUMMARY table off `<out>/state.json`.
 
@@ -2527,6 +2711,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     where `state.json` is one transition behind the truth, and after the round,
     where it is the whole round — the same table `SUMMARY.md` carries, so the two
     cannot disagree about who ended how.
+
+    KC-81 adds one line, not a table row, when `state.json` carries
+    `server_silent` — the spell the heartbeat named and its pid — so a hung
+    server is visible without the round's log. `SUMMARY.md` has no such line, so
+    the two still agree on the table.
 
     `--out` names the round's folder outright; without it the default
     `<out_dir>/<NN>` is derived from the roster exactly as `run` does. Exit 1 with
@@ -2554,7 +2743,75 @@ def cmd_status(args: argparse.Namespace) -> int:
         return EXIT_FAILED
     for line in export.render_table(state, export.round_patches(out_dir, state)):
         print(line)
+    # KC-81: the heartbeat's silent-spell record, so a hung server shows up here
+    # without opening the round's log. One line, not a table row — SUMMARY.md has
+    # no line for it either, and `state.json` is the only source.
+    silent = state.server_silent
+    if isinstance(silent, dict):
+        try:
+            age = _age(float(silent.get("seconds")))
+        except (TypeError, ValueError):
+            age = "?"
+        print(f"kilo serve silent {age}: pid {silent.get('pid') or '?'} — the heartbeat "
+              f"saw no event and a log that had not grown; the server may be hung")
     return EXIT_OK
+
+
+def _run_options(parser: argparse.ArgumentParser) -> None:
+    """The round's options, shared by `run` and `draft`'s `--run` pass-through.
+
+    `cmd_run` reads every one of these off the namespace — as attributes or with
+    `getattr`'s default — so a `draft --run` that dropped a flag would fail deep
+    inside the round rather than at the parser. `--ticket`, `--out` and
+    `--roster` stay in the parser that needs them: `draft` fills `--ticket` and
+    clears `--out`, and `draft --roster` is the file its profile is read from.
+    """
+    parser.add_argument("--base", default="HEAD",
+                        help="the base ref the worktrees start from (default HEAD)")
+    parser.add_argument("--models", default="",
+                        help="comma-separated model ids run INSTEAD of the roster's agents "
+                             "(a:free,b:free → --provider unless the id names its own)")
+    parser.add_argument("--backend", default=None, choices=["kilo", "openrouter"],
+                        help="override the roster's backend (kilo | openrouter)")
+    parser.add_argument("--provider", default=None, metavar="ID",
+                        help="the provider id behind a --models id that names no provider of "
+                             "its own (default kenary for backend = kilo, openrouter for "
+                             "backend = openrouter; the roster spells a model provider/model, "
+                             "and --roster's agents are unaffected)")
+    parser.add_argument("--variant", default=None, metavar="NAME",
+                        help="the reasoning variant of every agent that names none: "
+                             "high, max, … as GET /provider lists it; 'highest' (the default, "
+                             "[contest] variant) — the top one that answers 'say: hello', "
+                             "probed at intake; 'default' — send none. A --models item names "
+                             "its own as model@variant")
+    parser.add_argument("--register-missing", action="store_true",
+                        help="register a roster model that is not in Kilo's own model list "
+                             "for this round, through KILO_CONFIG_CONTENT (kilo.jsonc is not "
+                             "edited; needs server = spawn)")
+    parser.add_argument("--reprobe", action="store_true",
+                        help="re-run the variant probe even when contest-probe.json holds a "
+                             "fresh entry for the same model and Kilo version (KC-11)")
+    parser.add_argument("--allow-unprobed", action="store_true",
+                        help="start the round even when a model's variant probe failed or "
+                             "the cache has no entry for it (KC-11)")
+    parser.add_argument("--max-parallel", type=int, default=None, metavar="N",
+                        help="override the roster's max_parallel")
+    parser.add_argument("--legs", type=int, default=None, metavar="N",
+                        help="run the round as N numbered legs (KC-43): each a whole turn on a "
+                             "new session in the same worktree, handed a record of the legs "
+                             "before it; overrides [contest] legs (default 1)")
+    parser.add_argument("--no-tests", action="store_true",
+                        help="do not run the pytest roots in the harvest (the default is on)")
+    parser.add_argument("--no-gate", action="store_true",
+                        help="no gate model: the mechanical layer decides, the rest is gate-failed")
+    parser.add_argument("--resume", action="store_true",
+                        help="resume from <out>/state.json — only the mid-flight agents restart")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="intake, prepare the worktrees, print the plan and the first "
+                             "agent's prompt, and stop: no kilo serve, no session, no gate call")
+    parser.add_argument("--fresh", action="store_true",
+                        help="reset the round's worktrees even when they hold uncommitted "
+                             "work or commits")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2571,55 +2828,17 @@ def _parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--ticket", type=int, required=True, metavar="NN",
                      help="the ticket number, NN from epic-tasks/NN-*.md")
+    run.add_argument("--target", default=None, metavar="REPO_PATH",
+                     help="the git repo the round runs on (default: the current "
+                          "directory). Its epic-tasks/ holds the ticket and its base "
+                          "must carry scripts/next_task.py and scripts/append_task.py; "
+                          "worktrees, out_dir and rounds_dir resolve against it")
     run.add_argument("--roster", default=DEFAULT_ROSTER,
-                     help="the roster ini (default contest.ini at the repo root; "
-                          "contest.local.ini next to it overrides it)")
-    run.add_argument("--base", default="HEAD",
-                     help="the base ref the worktrees start from (default HEAD)")
-    run.add_argument("--models", default="",
-                     help="comma-separated model ids run INSTEAD of the roster's agents "
-                          "(a:free,b:free → --provider unless the id names its own)")
-    run.add_argument("--backend", default=None, choices=["kilo", "openrouter"],
-                     help="override the roster's backend (kilo | openrouter)")
-    run.add_argument("--provider", default=None, metavar="ID",
-                     help="the provider id behind a --models id that names no provider of "
-                          "its own (default kenary for backend = kilo, openrouter for "
-                          "backend = openrouter; the roster spells a model provider/model, "
-                          "and --roster's agents are unaffected)")
-    run.add_argument("--variant", default=None, metavar="NAME",
-                     help="the reasoning variant of every agent that names none: "
-                          "high, max, … as GET /provider lists it; 'highest' (the default, "
-                          "[contest] variant) — the top one that answers 'say: hello', "
-                          "probed at intake; 'default' — send none. A --models item names "
-                          "its own as model@variant")
-    run.add_argument("--register-missing", action="store_true",
-                     help="register a roster model that is not in Kilo's own model list "
-                          "for this round, through KILO_CONFIG_CONTENT (kilo.jsonc is not "
-                          "edited; needs server = spawn)")
-    run.add_argument("--reprobe", action="store_true",
-                     help="re-run the variant probe even when contest-probe.json holds a "
-                          "fresh entry for the same model and Kilo version (KC-11)")
-    run.add_argument("--allow-unprobed", action="store_true",
-                     help="start the round even when a model's variant probe failed or "
-                          "the cache has no entry for it (KC-11)")
-    run.add_argument("--max-parallel", type=int, default=None, metavar="N",
-                     help="override the roster's max_parallel")
-    run.add_argument("--legs", type=int, default=None, metavar="N",
-                     help="run the round as N numbered legs (KC-43): each a whole turn on a "
-                          "new session in the same worktree, handed a record of the legs "
-                          "before it; overrides [contest] legs (default 1)")
-    run.add_argument("--no-tests", action="store_true",
-                     help="do not run the pytest roots in the harvest (the default is on)")
-    run.add_argument("--no-gate", action="store_true",
-                     help="no gate model: the mechanical layer decides, the rest is gate-failed")
-    run.add_argument("--resume", action="store_true",
-                     help="resume from <out>/state.json — only the mid-flight agents restart")
-    run.add_argument("--dry-run", action="store_true",
-                     help="intake, prepare the worktrees, print the plan and the first "
-                          "agent's prompt, and stop: no kilo serve, no session, no gate call")
-    run.add_argument("--fresh", action="store_true",
-                     help="reset the round's worktrees even when they hold uncommitted "
-                          "work or commits")
+                     help="the roster ini (default contest.ini in the current "
+                          "directory; a relative path is taken from the current "
+                          "directory, not from --target; contest.local.ini next to "
+                          "it overrides it)")
+    _run_options(run)
     run.add_argument("--out", default=None, metavar="DIR",
                      help="the round's output directory (default <out_dir>/<NN>)")
     run.set_defaults(func=cmd_run)
@@ -2638,6 +2857,43 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--out", default=None, metavar="DIR",
                         help="the round's output directory (default <out_dir>/<NN>)")
     status.set_defaults(func=cmd_status)
+
+    drafting = sub.add_parser(
+        "draft",
+        help="write one ticket from a plain brief, reviewed and committed",
+        description="`--collect` over the target (Pass A only, no Pass B), the three "
+                    "maps cut to [contest] draft_map_budget, one call to the profile "
+                    "[contest] draft_llm_profile names, the lint, one rework, then a review "
+                    "by the profile [contest] gate_llm_profile names — one round of "
+                    "problems at a time, [contest] draft_review_rounds of them — and the "
+                    "ticket committed on contest-legs. `--run` starts the round with the "
+                    "flags this command knows about.",
+    )
+    drafting.add_argument("--target", default=None, metavar="REPO_PATH",
+                          help="the git repo the brief is about (default: the current "
+                               "directory); `--collect` runs there, epic-tasks/ is "
+                               "written there, and the commit lands there")
+    drafting.add_argument("brief", metavar="BRIEF",
+                          help="the task in one line, verbatim — the brief is never "
+                               "rewritten into a different task")
+    drafting.add_argument("--round", dest="round", type=int, default=None, metavar="NN",
+                          help="the ticket number (default: the next free one in "
+                               "epic-tasks/)")
+    drafting.add_argument("--out", default=None, metavar="FILE",
+                          help="where the ticket goes (default "
+                               "epic-tasks/<NN>-<slug>.md, from the ticket's own title)")
+    drafting.add_argument("--roster", default=DEFAULT_ROSTER,
+                          help="the roster ini [contest] draft_llm_profile and "
+                               "[contest] gate_llm_profile are read from (default "
+                               "contest.ini in the current directory)")
+    drafting.add_argument("--no-review", action="store_true",
+                          help="skip the gate model's review of the draft (it still needs "
+                               "the draft profile; the skip is printed to stderr)")
+    drafting.add_argument("--run", action="store_true",
+                          help="run the round right after the commit: `run --ticket NN "
+                               "--target REPO` with every run flag this command was given")
+    _run_options(drafting)
+    drafting.set_defaults(func=cmd_draft)
     return parser
 
 

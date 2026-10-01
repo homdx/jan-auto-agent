@@ -332,6 +332,17 @@ def test_harvest_does_not_call_the_file_line_path_off_ticket(round_, tmp_path):
     assert _reason(h, "off_ticket_files").text.endswith("declared list: tools/auto/other.py")
 
 
+def test_harvest_skips_the_shrink_gate_when_the_base_has_no_bridge(round_, tmp_path):
+    """KC-76 --target: an external repo has no collect_bridge.py — not `shrink_changed`."""
+    repo, base, ticket = round_
+    _git(repo, "rm", "-q", "tools/auto/collect_bridge.py")
+    _git(repo, "commit", "-q", "-m", "no bridge")
+    base = _git(repo, "rev-parse", "HEAD")
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, commit=_accepting(wt))
+    assert "shrink_changed" not in _codes(harvest(wt, ticket))
+
+
 def test_ticket_for_round_still_finds_and_titles(round_):
     repo, base, ticket = round_
     name, title, declared = ticket_for_round(str(ticket.parent), 1)
@@ -861,6 +872,8 @@ def test_harvest_names_the_branch_commit_when_no_row_claims_it(round_, tmp_path)
     _record(one, ticket.name, outcome="DONE", commit=sha)
     h = harvest(one, ticket)
     assert h.verdict == "READY" and h.commit == sha
+    # the agent's own commit is not the runner's deadline commit (KC-41)
+    assert h.facts["deadline_commit"] is False
 
     two = _worktree(repo, base, tmp_path, agent="two")
     _accepting(two)
@@ -958,6 +971,68 @@ def test_harvest_flags_a_done_row_without_a_commit(round_, tmp_path):
     assert "no_commit" in _codes(h)
     assert h.commit is None  # only the agent's own claim is ever reported
     assert h.facts["sha"] == sha[:7]  # the branch head is still in the facts
+
+
+def test_harvest_degrades_a_truncated_row_to_an_empty_claim(round_, tmp_path):
+    """A PROGRESS row shorter than its header — a writer that died mid-row, an
+    agent's `echo ticket,,outcome` — leaves the missing fields as `None`
+    (`csv.DictReader`'s `restval`). The claim degrades to the empty one: the
+    row scores `no_commit`, the outcome-None row scores `EMPTY`, and the run
+    is not killed by the queue file."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    wt.progress_csv.parent.mkdir(parents=True, exist_ok=True)
+    wt.progress_csv.write_text(
+        "ticket,finding,outcome,commit,note\n"
+        + ticket.name + ",,DONE\n", encoding="utf-8")
+
+    h = harvest(wt, ticket)
+    assert h.verdict == "REWORK"
+    assert _codes(h) == ["no_commit"]
+    assert h.commit is None
+
+    # a row of one field: every claim field after the ticket is None, and the
+    # sentence degrades the same way — `progress_not_done` names EMPTY
+    wt.progress_csv.write_text(
+        "ticket,finding,outcome,commit,note\n" + ticket.name + "\n",
+        encoding="utf-8")
+    h = harvest(wt, ticket)
+    assert "progress_not_done" in _codes(h) and "no_commit" in _codes(h)
+    assert "EMPTY" in _reason(h, "progress_not_done").text
+
+
+@pytest.mark.parametrize("raw,tag", [
+    (b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,abc1234,\x00\n", "nul"),
+    (b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,\xff\n", "utf8"),
+])
+def test_harvest_reads_no_rows_from_a_broken_queue_file(round_, tmp_path, raw, tag):
+    """A queue file the reader cannot answer — a NUL byte, an invalid UTF-8
+    byte — keeps no rows: the harvest settles on `no_progress_row` and still
+    names the branch's one commit (KC-30). A broken queue file degrades, it
+    never raises into the round."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path, agent=tag)
+    head = _accepting(wt)
+    wt.progress_csv.parent.mkdir(parents=True, exist_ok=True)
+    wt.progress_csv.write_bytes(raw)
+
+    h = harvest(wt, ticket)
+    assert h.verdict == "REWORK"
+    assert "no_progress_row" in _codes(h)
+    assert h.commit == head
+
+
+def test_progress_rows_are_empty_when_the_file_cannot_be_read(tmp_path):
+    """`_progress_rows` itself: a NUL byte or a bad byte is "no rows" — the
+    same shape as a missing file, never a `csv.Error` / `UnicodeDecodeError`."""
+    p = tmp_path / "PROGRESS.csv"
+    p.write_bytes(b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,x,\x00\n")
+    assert harvest_mod._progress_rows(p) == []
+    p.write_bytes(b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,\xff\n")
+    assert harvest_mod._progress_rows(p) == []
+    p.write_bytes(b"ticket,finding,outcome,commit,note\n01-r1.md,,FIXED,abc1234,n\n")
+    assert harvest_mod._progress_rows(p)[0]["ticket"] == "01-r1.md"
 
 
 def test_harvest_flags_a_commit_off_the_branch(round_, tmp_path):
@@ -1087,8 +1162,47 @@ def test_harvest_off_branch_sha_is_rejected_with_no_commit(round_, tmp_path):
         h = harvest(wt, ticket)
         assert _codes(h) == ["commit_not_on_branch"]
         text = _reason(h, "commit_not_on_branch").text
-        assert side[:7] in text and "not an ancestor of HEAD" in text and "rebase" in text
+        assert side[:7] in text and "not an ancestor of HEAD" in text
+        # HEAD is the agent's change here, so the row is named first (round 119)
+        head = _git(wt.path, "rev-parse", "--short", "HEAD")
+        assert f"append_task.py --commit {head}" in text and "cherry-pick" in text
         assert h.commit is None
+
+
+def test_harvest_a_row_left_behind_by_an_amend_names_head(round_, tmp_path):
+    """Round 119: the agent recorded its commit, then amended it. The row names
+    the dropped sha; the hint must name HEAD for the row, not send the agent to
+    rebase the orphan (it did, for two legs). Rewriting the row makes it READY."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    first = _accepting(wt)
+    _record(wt, ticket.name, outcome="DONE", commit=first)
+    _git(wt.path, "commit", "-q", "--amend", "-m", "amended")
+    head = _git(wt.path, "rev-parse", "--short", "HEAD")
+    assert _git(wt.path, "rev-parse", "HEAD") != first
+
+    h = harvest(wt, ticket)
+    assert _codes(h) == ["commit_not_on_branch"]
+    text = _reason(h, "commit_not_on_branch").text
+    assert first[:12] in text and f"append_task.py --commit {head}" in text
+    assert "rebase it" not in text and len(text) <= TEXT_LIMIT
+
+    _record(wt, ticket.name, outcome="DONE", commit=head)
+    assert harvest(wt, ticket).verdict == "READY"
+
+
+def test_harvest_off_branch_sha_with_nothing_on_the_branch_says_rebase(round_, tmp_path):
+    """No change on the branch yet: HEAD is the base, so there is no row to point
+    at HEAD — the claimed commit itself has to come onto the branch."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _git(wt.path, "checkout", "-q", "-b", "side", base)
+    _edit(wt, "side.txt", "side\n")
+    side = _commit(wt, "side")
+    _git(wt.path, "checkout", "-q", wt.branch)
+    _record(wt, ticket.name, outcome="DONE", commit=side)
+    text = _reason(harvest(wt, ticket), "commit_not_on_branch").text
+    assert "rebase it onto the branch" in text and "append_task" not in text
 
 
 def test_harvest_not_a_sha_sentence_stays_within_the_budget(round_, tmp_path):

@@ -23,7 +23,6 @@ fix applied to ``_clear_stale_fix_rounds``.
 from __future__ import annotations
 
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -49,11 +48,11 @@ def _write_rounds(tdir: Path, names: list[str], contents: list[str]) -> None:
         (tdir / name).write_text(content)
 
 
-def test_same_second_archive_calls_do_not_overwrite_each_other(monkeypatch):
+def test_same_second_archive_calls_do_not_overwrite_each_other(monkeypatch, tmp_path):
     """Two archive calls landing on the same `stamp` must each keep their
     own feedback_round_1.md instead of the second silently clobbering the
     first's."""
-    base = Path(tempfile.mkdtemp())
+    base = tmp_path
     loop, st = _make_loop(base)
     fix_id = "BUG-FIX-1"
     tdir = st.task_dir(fix_id)
@@ -96,9 +95,9 @@ def test_same_second_archive_calls_do_not_overwrite_each_other(monkeypatch):
     )
 
 
-def test_normal_different_second_archiving_still_works(monkeypatch):
+def test_normal_different_second_archiving_still_works(monkeypatch, tmp_path):
     """Non-colliding calls (the common case) are unaffected by the fix."""
-    base = Path(tempfile.mkdtemp())
+    base = tmp_path
     loop, st = _make_loop(base)
     fix_id = "BUG-FIX-2"
     tdir = st.task_dir(fix_id)

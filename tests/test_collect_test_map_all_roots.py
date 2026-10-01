@@ -249,12 +249,12 @@ def test_the_map_is_deterministic(tmp_path):
 
 
 @pytest.fixture(scope="module")
-def live():
+def live(live_collect_model):
     modules = scan_repo(REPO_ROOT)
     edges = import_edges(modules)
     reverse = imported_by(edges)
     tmap = build_test_map(REPO_ROOT, modules)
-    model = CollectModel(
+    model = live_collect_model(
         status=STATUS_FRESH,
         modules=tuple(modules),
         import_edges={k: tuple(sorted(v)) for k, v in edges.items()},

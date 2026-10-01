@@ -217,7 +217,7 @@ from typing import Callable
 from tools.backoff import save_state
 from tools.contest import context_memory
 from tools.contest.backend import ContestBackend, ContestBackendError
-from tools.contest.gates import declared_files, git
+from tools.contest.gates import DEADLINE_COMMIT_EMAIL, declared_files, git
 from tools.contest.harvest import harvest, rework_message
 from tools.contest.kilo_client import (
     AGENT_TEST_TIMEOUT_MS,
@@ -1741,6 +1741,11 @@ class RoundState:
     #: writes no legs keys, and so does a state.json written before KC-44.
     legs: int | None = None
     legs_from: str | None = None
+    #: KC-81: the last silent-server warning, as `{"seconds": window, "pid": n}`
+    #: — written by the heartbeat when it names the server as hung, so
+    #: `contest status` can show it. `None` for a round that never warned
+    #: (and for a state.json written before the key).
+    server_silent: dict | None = None
 
     @property
     def label(self) -> str:
@@ -1759,18 +1764,24 @@ class RoundState:
             data["legs"] = self.legs
         if self.legs_from:
             data["legs_from"] = self.legs_from
+        # KC-81: only a round that actually warned carries the key — every
+        # earlier state.json is byte for byte what it was.
+        if self.server_silent is not None:
+            data["server_silent"] = self.server_silent
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "RoundState":
         leg = data.get("leg")
         legs = data.get("legs")
+        silent = data.get("server_silent")
         return cls(round_no=int(data["round_no"]), ticket=str(data["ticket"]),
                    base_sha=str(data["base_sha"]), started_at=float(data["started_at"]),
                    agents=[AgentRun.from_dict(a) for a in data.get("agents", [])],
                    leg=int(leg) if leg is not None else None,
                    legs=int(legs) if legs is not None else None,
-                   legs_from=data.get("legs_from"))
+                   legs_from=data.get("legs_from"),
+                   server_silent=silent if isinstance(silent, dict) else None)
 
     def table_rows(self) -> list:
         """One dict per agent — the SUMMARY's inputs; KC-7 renders them."""
@@ -2296,7 +2307,7 @@ def _deadline_commit(ws: Workspace, *, reason: str, ticket=None) -> str | None:
         # for the same reason in the other direction — a hook the agent's own
         # work trips must not cost the round the commit that keeps that work.
         commit = run_git(["git", "-c", "user.name=contest runner",
-                          "-c", "user.email=contest@localhost",
+                          "-c", f"user.email={DEADLINE_COMMIT_EMAIL}",
                           "-c", "commit.gpgsign=false",
                           "commit", "-q", "--no-verify",
                           "-m", subject, "-m", body],
@@ -6221,7 +6232,8 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
               run_tests: bool = False,
               server_pid: int | None = None,
               legs: int | None = None,
-              legs_from: str | None = None) -> RoundState:
+              legs_from: str | None = None,
+              log_path: str | None = None) -> RoundState:
     """One round — or, with *leg*, one leg of it: a `run_agent` per workspace in a
     pool of `config.max_parallel`.
 
@@ -6259,6 +6271,11 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
     came from — `flag`, `size` or `config` — which a relay's `state.json`
     records, alongside the leg number every leg's `state.json` already carries.
     `None` both is `run_round`, the tree KC-43 kept byte for byte.
+
+    *log_path* (KC-81) is the `kilo-serve.log` the round started its server
+    with, so the heartbeat can name a hung server. `None` — a server the round
+    did not start, or every earlier caller — is "no log": the silent-server
+    check uses the events side alone and the line says `log ?`.
     """
     out_dir, ticket_path = Path(out_dir), Path(ticket_path)
     workspaces = list(workspaces)
@@ -6298,7 +6315,16 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
 
     heartbeat = _Heartbeat(state, since, float(config.progress_every_sec or 0),
                            server_pid=server_pid,
-                           neighbour_warn=int(getattr(config, "neighbour_kilo_warn", 4) or 0))
+                           neighbour_warn=int(getattr(config, "neighbour_kilo_warn", 4) or 0),
+                           # KC-81: `getattr` so a config written before the key
+                           # degrades to "check off", never a raise into a round.
+                           # An OpenRouter round has no `kilo serve` to hang.
+                           kilo_silent_sec=(float(getattr(config, "kilo_silent_sec", 0) or 0)
+                                            if getattr(config, "backend", "kilo") == "kilo"
+                                            else 0.0),
+                           log_path=log_path,
+                           events_root=str(out_dir),
+                           save=save)
 
     policy = Policy(config)
     live: list = []                     # (run, backend) of every agent in the pool
@@ -6368,17 +6394,19 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
               make_backend: Callable[[Workspace], ContestBackend], out_dir: Path,
               resume: RoundState | None = None,
               run_tests: bool = False,
-              server_pid: int | None = None) -> RoundState:
+              server_pid: int | None = None,
+              log_path: str | None = None) -> RoundState:
     """One round of one leg — `run_leg` with no leg number, as before KC-43.
 
     Nothing about the state, the folder or the log lines says "leg": `legs = 1`
     is this function, byte for byte, and KC-44's `legs` / `legs_from` ride on
     a relay's `state.json` through `run_leg`'s own keywords, not on this one.
-    See `run_leg` for the pool, `state.json`, *resume*, *run_tests* and
-    *server_pid*.
+    See `run_leg` for the pool, `state.json`, *resume*, *run_tests*,
+    *server_pid* and *log_path*.
     """
     return run_leg(config, round_no, ticket_path, workspaces, make_backend=make_backend,
-                   out_dir=out_dir, resume=resume, run_tests=run_tests, server_pid=server_pid)
+                   out_dir=out_dir, resume=resume, run_tests=run_tests,
+                   server_pid=server_pid, log_path=log_path)
 
 
 def _lock_status(run: AgentRun) -> tuple | None:
@@ -6394,19 +6422,63 @@ def _lock_status(run: AgentRun) -> tuple | None:
         return None
 
 
+def _proc_cpu_ticks(pid: int, proc_root: str = "/proc") -> int | None:
+    """KC-81: `utime + stime` of *pid* from ``/proc/<pid>/stat``, or None.
+
+    Fail-open like every other `/proc` read here: no pid, not Linux, a
+    vanished process or a field that is not a number all answer None, which
+    the caller prints as `cpu ?` rather than raising into a round.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        with open(f"{proc_root}/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+        # `comm` may itself contain spaces and parens: everything after the
+        # last `)` is the stable tail — state ppid pgrp session tty tpgid
+        # flags minflt cminflt majflt cmajflt utime stime …
+        fields = text.rsplit(")", 1)[-1].split()
+        return int(fields[11]) + int(fields[12])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+#: KC-81: the states of an agent with a turn in flight — the ones waiting on
+#: `kilo serve` for their next event. HARVESTING is not among them: the session
+#: is over and the work is pytest in the worktree, so a quiet server then is
+#: idle by design. (From round 128's sensenova-6-7-flash-lite-var1.)
+_EVENT_WANTED = (AgentState.PROMPTED, AgentState.WAITING, AgentState.REWORK)
+
+
 class _Heartbeat:
     """The once-a-minute line: the round's age and every agent's state, its
     files-based progress bar, and how long its last tests took —
     `round 66 14m: mimo WAITING 14m [######....] 60% 5f · ... — 3 live`.
+
+    KC-81 adds one more check on the same tick: a `kilo serve` that has gone
+    silent — no live agent event and a `kilo-serve.log` that has not grown,
+    both for `kilo_silent_sec` — gets one WARNING line naming the pid, the CPU
+    and the log's last-change time, and `server_silent` in `state.json`. It
+    never kills and never aborts: the decision is the operator's.
 
     A daemon thread waiting on an `Event`, so `stop()` returns at once and the
     thread never outlives `run_round`. `every <= 0` starts nothing.
     """
 
     def __init__(self, state: RoundState, since: dict, every: float,
-                 server_pid: int | None = None, neighbour_warn: int | None = None):
+                 server_pid: int | None = None, neighbour_warn: int | None = None,
+                 kilo_silent_sec: float = 0, log_path: str | None = None,
+                 events_root: str | None = None, save: Callable[[], None] | None = None):
         self.state, self.since, self.every = state, since, every
         self.server_pid, self.neighbour_warn = server_pid, neighbour_warn
+        # KC-81: 0 (the default, and every earlier caller) is the check off.
+        self.kilo_silent_sec = kilo_silent_sec
+        self.log_path = log_path
+        self.events_root = events_root
+        self.save = save
+        self._silent_warned = False
+        self._log_size: int | None = None
+        self._cpu_prev: tuple[float, float] | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="contest-progress", daemon=True)
 
@@ -6549,8 +6621,149 @@ class _Heartbeat:
                 return h["elapsed"]
         return None
 
+    def _sample_cpu(self) -> str:
+        """KC-81: `"100%"` from `/proc/<pid>/stat` across the last tick, else `"?"`.
+
+        Sampled once per heartbeat interval, so the number the WARNING prints is
+        the server's CPU over roughly that window — what `top` showed in round
+        127. Unreadable `/proc`, no pid, or the first sample of the thread all
+        answer `?` and never raise.
+        """
+        pid = self.server_pid
+        ticks = _proc_cpu_ticks(pid) if pid else None
+        if ticks is None:
+            self._cpu_prev = None
+            return "?"
+        now = time.monotonic()
+        if self._cpu_prev is None:
+            self._cpu_prev = (ticks, now)
+            return "?"
+        prev_ticks, prev_at = self._cpu_prev
+        self._cpu_prev = (ticks, now)
+        elapsed = now - prev_at
+        if elapsed <= 0:
+            return "?"
+        try:
+            hz = float(os.sysconf("SC_CLK_TCK"))
+        except (ValueError, OSError, AttributeError):
+            hz = 100.0
+        if hz <= 0:
+            return "?"
+        pct = max(0.0, (ticks - prev_ticks) / hz / elapsed * 100.0)
+        return f"{round(pct)}%"
+
+    def _event_idle(self, run: AgentRun, wall: float) -> float | None:
+        """KC-81: seconds since *run* last received an event, or None when the
+        side cannot be read (no `events_root`) — None means "do not warn".
+
+        An absent `events.jsonl` counts as idle since the round started: a
+        session that was prompted and never spoke has been quiet the whole
+        time, which is exactly round 127's shape.
+        """
+        if not self.events_root:
+            return None
+        path = Path(self.events_root) / run.agent.name / "events.jsonl"
+        try:
+            return wall - path.stat().st_mtime
+        except OSError:
+            return wall - float(self.state.started_at)
+
+    def _server_silent_note(self, cpu: str) -> str | None:
+        """KC-81: the one WARNING line of a silent spell, or None.
+
+        Silent means *both* hold for `kilo_silent_sec`: no agent waiting on the
+        server has had an event, and `kilo-serve.log` (when the round started a
+        server) has not grown. Either side moving ends the spell and re-arms the
+        warning; the next spell warns again and replaces `server_silent`. `kilo_silent_sec <= 0` or no event data is the check off — never
+        a raise into a round, never a kill, never an abort of a session: the
+        agents' own stall edge is untouched.
+
+        Only an agent with a turn in flight is waiting on the server
+        (`_EVENT_WANTED`). A round whose live agents are all HARVESTING runs
+        pytest in the worktrees with no session speaking, so a quiet server
+        there is idle by design, not hung, and the check says nothing.
+
+        The line and `server_silent` carry how long the server has actually
+        been silent — the newer of the last event and the log's last change —
+        not the window, so a spell that has run for an hour reads `1h`-ish,
+        not `10m` forever.
+        """
+        try:
+            window = float(self.kilo_silent_sec or 0)
+        except (TypeError, ValueError):
+            return None
+        if window <= 0 or not self.events_root:
+            return None
+        waiting = [run for run in self.state.agents
+                   if not run.terminal and run.state in _EVENT_WANTED]
+        if not waiting:
+            return self._end_spell()
+        wall = time.time()
+        # The log is checked only when the events have gone quiet; one quiet
+        # agent among busy ones is the stall logic's business, not this one.
+        silent_for = None
+        for run in waiting:
+            idle = self._event_idle(run, wall)
+            if idle is None or idle < window:
+                return self._end_spell()
+            silent_for = idle if silent_for is None else min(silent_for, idle)
+        log_note = "log ?"
+        if self.log_path:
+            try:
+                st = os.stat(self.log_path)
+            except OSError:
+                st = None
+            if st is not None:
+                if self._log_size is None:
+                    self._log_size = st.st_size
+                elif st.st_size != self._log_size:
+                    self._log_size = st.st_size
+                    return self._end_spell()
+                when = time.strftime("%H:%M:%S", time.localtime(st.st_mtime))
+                log_note = f"log idle since {when}"
+                if wall - st.st_mtime < window:
+                    return self._end_spell()
+                silent_for = min(silent_for, wall - st.st_mtime)
+        if self._silent_warned:
+            return None
+        self._silent_warned = True
+        pid = self.server_pid
+        pid_note = f"pid {pid}" if pid else "pid ?"
+        kill_pid = str(pid) if pid else "<pid>"
+        count = len(waiting)
+        plural = "agent" if count == 1 else "agents"
+        note = (
+            f"kilo serve silent {_age(silent_for)}: {pid_note}, cpu {cpu}, {log_note}, "
+            f"{count} live {plural} without an event — the server looks hung; "
+            f"stop it (kill {kill_pid}, kill -9 if it stays) and restart the round "
+            f"with --fresh"
+        )
+        self.state.server_silent = {"seconds": int(silent_for), "pid": pid}
+        self._save_state()
+        return note
+
+    def _end_spell(self) -> None:
+        """KC-81: something moved (or nobody is waiting): re-arm the warning.
+
+        `server_silent` stays on the state as the record of the last spell, so
+        `contest status` still shows it after the round; the next spell's
+        warning replaces it."""
+        self._silent_warned = False
+        return None
+
+    def _save_state(self) -> None:
+        if self.save is not None:
+            try:
+                self.save()
+            except Exception:  # noqa: BLE001 — a failed save is not a round failure
+                _log.debug("server_silent: state save failed", exc_info=True)
+
     def _loop(self) -> None:
         while not self._stop.wait(self.every):
+            cpu = self._sample_cpu()
+            note = self._server_silent_note(cpu)
+            if note:
+                _log.warning("%s", note)
             _log.info("%s", self.line())
 
 

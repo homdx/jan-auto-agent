@@ -43,8 +43,6 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = Path(__file__).resolve().parent
 for _p in (str(REPO_ROOT), str(TESTS_DIR)):
@@ -81,11 +79,6 @@ from tools.contest.runner import (  # noqa: E402
 )
 from tools.contest.workspace import Workspace  # noqa: E402
 
-# This module replays a turn through the fake's real HTTP server and SSE stream,
-# so it shares the xdist_group with the other port-binding suites: pytest.ini's
-# --dist=loadgroup pins them to one worker, so none of them can race another
-# for an OS-assigned port.
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 COMMITTED = REPO_ROOT / "contest.ini"
 

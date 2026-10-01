@@ -903,11 +903,40 @@ def test_carry_from_refuses_another_agents_checkout(repo, config):
 
 
 def test_carry_from_refuses_a_checkout_that_moved_off_its_branch(repo, config):
+    """A HEAD that dropped leg 1's commit is not the round's work: refused."""
     base, one = _leg_one(repo, config)
-    _git(one[0].path, "checkout", "-q", "--detach")
+    _git(one[0].path, "checkout", "-q", "-b", "elsewhere", base)
     with pytest.raises(WorkspaceError, match="refusing to carry it into leg 2"):
         prepare_round(repo, config, 40, base, leg=2,
                       carry_from=LegCarry(40, 1, tuple(one)))
+
+
+def test_carry_moves_the_round_branch_onto_an_agents_own_branch(repo, config):
+    """KC-78, round 119: the agent branched off contest/NN/<agent> and committed
+    there — leg 2 carries it on the round's branch instead of dropping the leg."""
+    base, one = _leg_one(repo, config)
+    ws = one[0]
+    _git(ws.path, "checkout", "-q", "-b", "fix-slowdown")
+    (ws.path / "fix.txt").write_text("fix\n")
+    _git(ws.path, "add", "fix.txt")
+    _git(ws.path, "commit", "-q", "-m", "fix on its own branch")
+    head = _git(ws.path, "rev-parse", "HEAD").strip()
+
+    two = prepare_round(repo, config, 40, base, leg=2,
+                        carry_from=LegCarry(40, 1, tuple(one)))
+
+    assert two[0].path == ws.path
+    assert _git(ws.path, "rev-parse", "--abbrev-ref", "HEAD").strip() == ws.branch
+    assert _git(ws.path, "rev-parse", "HEAD").strip() == head
+    assert (ws.path / "wip.txt").read_text() == "uncommitted\n"
+
+
+def test_carry_reattaches_a_detached_head_that_kept_the_branch(repo, config):
+    base, one = _leg_one(repo, config)
+    _git(one[0].path, "checkout", "-q", "--detach")
+    prepare_round(repo, config, 40, base, leg=2,
+                  carry_from=LegCarry(40, 1, tuple(one)))
+    assert _git(one[0].path, "rev-parse", "--abbrev-ref", "HEAD").strip() == one[0].branch
 
 
 def test_leg_one_is_prepare_round_as_it_was(repo, config):

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import io
 import os
 import re
 import shutil
@@ -43,6 +44,7 @@ from typing import Literal
 
 from tools.contest.gates import (
     BRIDGE,
+    DEADLINE_COMMIT_EMAIL,
     declared_files,
     git,
     judge_worktree,
@@ -138,11 +140,29 @@ class Harvest:
 
 
 def _progress_rows(progress_csv: Path) -> list[dict]:
-    """The rows of *progress_csv*, or [] when the file does not exist yet."""
+    """The rows of *progress_csv*, or [] when the file does not exist yet.
+
+    A queue file the reader cannot answer is "no rows", not a raise: a NUL
+    byte (a binary tool wrote into it) or an invalid UTF-8 byte (an editor
+    saved it in another encoding) degrades the claim to absent, the way an
+    unreadable index degrades `_status_lines` — the harvest settles on
+    `no_progress_row` instead of dying on the runner's own file.
+    """
     if not progress_csv.is_file():
         return []
-    with open(progress_csv, newline="", encoding="utf-8") as fh:
-        return list(csv.DictReader(fh))
+    try:
+        with open(progress_csv, newline="", encoding="utf-8") as fh:
+            text = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return []
+    # Python 3.10's `csv` raises on a NUL, 3.11+ reads it as a character:
+    # checked here so the verdict does not depend on the interpreter.
+    if "\0" in text:
+        return []
+    try:
+        return list(csv.DictReader(io.StringIO(text, newline="")))
+    except csv.Error:
+        return []
 
 
 def _is_ancestor(path: Path, commit: str) -> bool:
@@ -412,8 +432,12 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     for row in _progress_rows(ws.progress_csv):
         if (row.get("ticket") or "").strip() == ticket:
             claim = row
-    claimed_commit = (claim or {}).get("commit", "").strip()
-    outcome = (claim or {}).get("outcome", "").strip().upper()
+    # `csv.DictReader` fills the fields a short row did not carry with `None`
+    # (its `restval`), and a writer that died mid-row or a hand echo leaves
+    # exactly that: `or ""` degrades the missing claim to empty — the row
+    # scores `no_commit` — instead of a `None.strip()` into the run.
+    claimed_commit = ((claim or {}).get("commit") or "").strip()
+    outcome = ((claim or {}).get("outcome") or "").strip().upper()
 
     progress = f"runs/{ws.agent}/PROGRESS.csv"  # ws.progress_csv, for a short reason
     reasons: list[Reason] = []
@@ -465,16 +489,33 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
             elif sha is not None and _is_ancestor(ws.path, sha):
                 resolved = sha
             else:
+                # Round 119: the agent amended after writing its row, so the row
+                # named a commit the amend had dropped. "rebase it" sent it to
+                # check out the orphan and rebase for two legs; the row was the
+                # stale part. HEAD above the base is most likely the same work,
+                # so the first step named is the row, the cherry-pick second.
                 head = git(str(ws.path), "rev-parse", "--short", "HEAD")
+                head_is_change = bool(head) and not _at_or_under_base(ws, head)
+                if head_is_change:
+                    fix = (f"if HEAD holds your change (amended?), append_task.py "
+                           f"--commit {head}; else cherry-pick it")
+                else:
+                    fix = "rebase it onto the branch"
                 reasons.append(Reason(
                     "commit_not_on_branch",
                     f"commit {(sha or claimed_commit)[:12]} is not an ancestor of HEAD "
-                    f"({head or 'unresolved'}) on {ws.branch} — rebase it onto the branch",
+                    f"({head or 'unresolved'}) on {ws.branch} — {fix}",
                 ))
 
     # ── the facts: the mechanical scorecard row ───────────────────────────
     facts = judge_worktree(ws.agent, str(ws.path), ws.base_sha, list(declared),
                            want_tests=False)
+    # KC-41: a fact, not a reason — whether the one commit is the runner's
+    # deadline commit rather than the agent's. A READY reached that way is a
+    # different signal for SUMMARY and the judge than one the model claimed.
+    facts["deadline_commit"] = (
+        facts.get("commits") == 1
+        and git(str(ws.path), "log", "-1", "--format=%ce", "HEAD") == DEADLINE_COMMIT_EMAIL)
 
     if "commits" not in facts:
         # A path that is not a git worktree has nothing to score; there is no
@@ -502,7 +543,10 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
                 f"{ticket} shipped no test file — add one under tests/ that fails "
                 "without the change",
             ))
-        if facts["shrink"] != "same":
+        # `?` = the base has no bridge at all — an external `--target` repo
+        # (KC-76). There is nothing to keep byte-identical, so only a bridge
+        # the base had and the commit changed or dropped is a reason.
+        if facts["shrink"] in ("CHANGED", "GONE"):
             reasons.append(Reason(
                 "shrink_changed",
                 f"CollectBridge._shrink in {BRIDGE} is {facts['shrink']} against the "
