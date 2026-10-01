@@ -862,17 +862,21 @@ def _extract_paths(props: dict, base: "Path | None" = None) -> list:
         # and ``rm -rf /*`` was judged "inside worktree", auto-approved
         # before ``deny_commands`` was ever consulted.
         target = original.removesuffix("/*") or "/"
+        # KC-13: the shell expands these before it runs the command, so
+        # ``cat $HOME/.ssh/id_rsa`` is the same ask as ``cat ~/.ssh/id_rsa``
+        # and ``cat $PWD/x`` the same as ``cat ./x``. Each is rewritten to
+        # that spelling rather than run through ``os.path.expandvars``: the
+        # runner's own ``$PWD`` is its checkout, not the agent's worktree, so
+        # ``$PWD/x`` must resolve against *base* the way ``./x`` does (KC-51).
+        for var in ("${HOME}/", "$HOME/"):
+            if target.startswith(var):
+                target = "~/" + target[len(var):]
+        for var in ("${PWD}/", "$PWD/"):
+            if target.startswith(var):
+                target = "./" + target[len(var):]
         if target.startswith("~"):
             # ``~/.ssh/x`` must land on the home denylist, not under the cwd
             target = os.path.expanduser(target)
-        elif target.startswith(("$HOME", "${HOME}", "$PWD", "${PWD}")):
-            # KC-13: the shell expands these before it runs the command, so
-            # ``cat $HOME/.ssh/id_rsa`` is the same ask as ``cat ~/.ssh/id_rsa``.
-            # ``expandvars`` resolves both the ``$HOME`` and ``${HOME}`` spellings
-            # to the caller's home, and ``$PWD``/``${PWD}`` to the command's own
-            # cwd — the same place a ``./…`` token would resolve against when
-            # *base* is missing.
-            target = os.path.expandvars(target)
         if base is not None and not Path(target).is_absolute():
             # KC-51: a relative command token resolves against the worktree,
             # the directory the command starts in — never the runner's cwd.
@@ -947,18 +951,19 @@ def _deny_match(command: str, deny_commands) -> "str | None":
     """The first ``deny_commands`` pattern matching *command*, or ``None``.
 
     Matched twice with ``fnmatch.fnmatch``: once against *pattern* as
-    written, and once against *pattern* with a ``*`` appended, so a pattern
-    that names a pipe — ``curl * | sh`` — catches a command with a tail after
-    the pipe too (``sh ./a``), not only one that ends right at the pipe.
-    A pattern that already ends in ``*`` is unchanged: ``git push*`` catches
-    ``git push ./ HEAD`` and ``rm -v /tmp/*`` catches ``rm -v /tmp/testfile``
-    on the first match, so the append is only there for the pipe tail.
+    written, and once against *pattern* followed by a space and ``*``, so a
+    pattern that names a pipe — ``curl * | sh`` — catches a command with
+    arguments after the pipe too (``sh ./a``, ``sh -s -- -y``), not only one
+    that ends right at the pipe. The space keeps the pattern's last word a
+    whole word: a bare ``*`` would let ``curl * | sh`` reject
+    ``curl … | sha256sum`` and ``curl … | shellcheck -``. A pattern that
+    already ends in ``*`` gains nothing from the second match.
     """
     if not command:
         return None
     for pattern in _as_list(deny_commands):
         if isinstance(pattern, str) and pattern:
-            if fnmatch.fnmatch(command, pattern) or fnmatch.fnmatch(command, pattern + '*'):
+            if fnmatch.fnmatch(command, pattern) or fnmatch.fnmatch(command, pattern + " *"):
                 return pattern
     return None
 
