@@ -1,6 +1,6 @@
 # KC-26 — `gates.run_tests_detail`: the failure count is read from a stats line `-qq` never prints, the tail is the last root's only, and a timing test that flakes under round load fails every harvest
 
-**Status:** landed `6d10def` — by hand, no contest (the judge itself was wrong; a round cannot be scored by it until it is fixed). Round 65 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found on 2026-09-20 in round 53 (KC-14 on hp-uz: five kenary free models, `python3 -m tools.contest run --ticket 53`).
+**Status:** landed `6d10def` — by hand, no contest (the judge itself was wrong; a round cannot be scored by it until it is fixed). Round 65 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found on 2026-09-20 in round 53 (KC-14 on the second machine: five kenary free models, `python3 -m tools.contest run --ticket 53`).
 **Severity:** HIGH
 **File:** `tools/contest/gates.py` (`run_tests_detail`, `run_tests`)
 **Symbol:** `run_tests_detail`, `_failures`, `_pytest`, `_SUMMARY_LINE`

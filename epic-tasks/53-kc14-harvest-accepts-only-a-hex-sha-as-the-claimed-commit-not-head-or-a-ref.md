@@ -1,6 +1,6 @@
 # KC-14 — `harvest`: the claimed commit must be a hex sha that resolves — `HEAD`, a branch or a tag is `commit_not_on_branch`
 
-**Status:** landed `720e4d9` — 3-entry contest (hand-run Sensenova 6-8 / 6-8 var2 / 6-7), winner Sensenova 6-8, scored black-box in `contest-bench/kc14/`; the manager round on hp-uz (five kenary free models) produced no entry because the judge was wrong (KC-17, KC-26 — both landed by hand the same day). Round 53 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §11).
+**Status:** landed `720e4d9` — 3-entry contest (hand-run Sensenova 6-8 / 6-8 var2 / 6-7), winner Sensenova 6-8, scored black-box in `contest-bench/kc14/`; the manager round on the second machine (five kenary free models) produced no entry because the judge was wrong (KC-17, KC-26 — both landed by hand the same day). Round 53 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §11).
 **Severity:** MEDIUM
 **File:** `tools/contest/harvest.py` (`_is_ancestor`, `harvest`)
 **Symbol:** `_is_ancestor`, `harvest`, `Harvest.commit`

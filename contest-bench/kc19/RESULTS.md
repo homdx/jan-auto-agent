@@ -1,7 +1,7 @@
 # KC-19 — round 58 scored black-box
 
 Ticket: `epic-tasks/58-kc19-a-retryable-session-error-is-re-prompted-into-the-same-session-not-error.md`.
-Base: `c27bc32` (= `d0d8a45` + KC-15 parked `queued` so the round could start beside round 54 on hp-uz — see KC-24).
+Base: `c27bc32` (= `d0d8a45` + KC-15 parked `queued` so the round could start beside round 54 on the second machine — see KC-24).
 Bench: `scenarios_kc19.py` — 49 scenarios on `run_agent` against the base's `tests/_kilo_fake.py`
 (no entry changed the fake) through the base's sandbox/harness; `ingest_kc19.sh <name> <file>` runs the
 mechanical checks, the entry's own tests and the bench in `../cb-kc19/<name>`.

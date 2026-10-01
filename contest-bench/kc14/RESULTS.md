@@ -5,7 +5,7 @@ Ticket: `epic-tasks/53-kc14-harvest-accepts-only-a-hex-sha-as-the-claimed-commit
 (`kc14/*.patch`); every one applied cleanly with `git am`, one commit, the
 two declared files only, `_shrink` untouched, tiers clean, Python 3.10.
 
-The manager round on hp-uz (`python3 -m tools.contest run --ticket 53`,
+The manager round on the second machine (`python3 -m tools.contest run --ticket 53`,
 five kenary free models, `kc14/contest-out/53/`) produced **no entry** — and
 not because of the models. Two of five reached a harvest with a commit on
 the branch (agnes-2-0-flash `fb71b69`, step-3-7-flash `e1f67da`) and both
@@ -30,7 +30,7 @@ were sent back twice with `tests_failed` + `off_ticket_files`:
 
 The other three: agnes-2-5-flash and mimo-v2-5 hit the 1800 s turn timeout
 with no commit (mimo after one rejected `external_directory` ask), hy3
-went silent for 300 s at minute 12. The two commits on hp-uz were never
+went silent for 300 s at minute 12. The two commits on the second machine were never
 exported (KC-21) — `git -C rounds/53-<name> format-patch 0f4eb02..HEAD`
 would still produce them.
 
