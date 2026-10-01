@@ -243,7 +243,17 @@ def _empty_runs_dir(worktree: Path, agent: str) -> None:
 
 
 def _check_base_and_epic_tasks(repo: Path, base_ref: str) -> str:
-    """Resolve *base_ref* and refuse a dirty ``epic-tasks/``; return the base sha."""
+    """Resolve *base_ref* and refuse a dirty or unreadable ``epic-tasks/``; return the
+    base sha.
+
+    FL-2: a ``git status`` against ``epic-tasks/`` that exits non-zero (an index
+    lock, a corrupt repo — returncode 128) prints nothing on stdout, and the old
+    code read only stdout, so a failed status became an empty string and read as a
+    clean tree. The round then started against possibly stale tickets. This must
+    match :func:`_commits_above` and :func:`_dirty_outside_runs`, which already raise
+    on a non-zero returncode: a status that cannot be answered is refused, not read
+    as clean, before any worktree or clone is created.
+    """
     base_sha = _rev_parse(repo, base_ref)
     if base_sha is None:
         raise WorkspaceError(
@@ -254,6 +264,13 @@ def _check_base_and_epic_tasks(repo: Path, base_ref: str) -> str:
         ["status", "--porcelain", "--untracked-files=all", "--", "epic-tasks"],
         check=False,
     )
+    if proc.returncode != 0:
+        raise WorkspaceError(
+            f"git status --porcelain --untracked-files=all -- epic-tasks in {repo} "
+            f"failed ({proc.returncode}): "
+            f"{proc.stderr.strip() or proc.stdout.strip()} — "
+            "cannot tell whether epic-tasks/ is clean at the base commit"
+        )
     if proc.stdout.strip():
         raise WorkspaceError(_EPIC_TASKS_DIRTY_REASON)
     return base_sha

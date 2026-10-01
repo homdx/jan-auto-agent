@@ -1,6 +1,6 @@
 # 135 — _check_base_and_epic_tasks refuses a failed git status instead of reading it as clean
 
-**Status:** open
+**Status:** landed — round 135, winner laguna-s-2-1 (9/9 on contest-bench/135, all 11 entries 9/9, base 3/9), as-is
 **Severity:** MEDIUM
 **File:** tools/contest/workspace.py
 **Symbol:** _check_base_and_epic_tasks

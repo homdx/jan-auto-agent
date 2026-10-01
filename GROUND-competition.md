@@ -406,3 +406,49 @@ Fixed on `kc` from what round 83 showed (all unpushed as of this writing):
   the model; the runner keeps the work as a deadline commit.
 - **Kilo's `bash` tool defaults to 120 s**; a suite longer than that needs its
   own timeout on the call.
+
+### Where it stands (2026-10-01)
+
+Rounds since KC-44 are numbered by ticket (`epic-tasks/NNN-*.md`), judged on
+`contest-bench/NNN`, and landed on `kc` (never `main` without an explicit go).
+
+| round | landed on `kc` |
+|---|---|
+| 126–130 | see `epic-tasks/INDEX.md`; pushed |
+| 131, 132 | `9bd4871`, `dafbd20`, `8c58a1d`, ticket+bench `9f99300` (both winners sn68v2) |
+| 134 | `f36dbc7`, ticket+bench `73d15eb` |
+| 133 | `ec2bc8c` (winner mimo, ran on the second machine), load 3×6347 passed |
+| 135 | landed on kc, winner laguna-s-2-1 as-is — see Round 135 below |
+
+Nothing past `ec2bc8c` is pushed. The `kc` → `main` merge message waits for
+the operator's go.
+
+**Closing a round (since 135):** one ideal commit (the winner's code keeps the
+model as author/trailer `<model> <model@round-NNN.contest>`); every ticket of
+the round set to landed/closed **inside that same commit**, with no separate status
+commit; then a load test: 3× `tests -n 8` in parallel, then `tests_bugfix -n 8`.
+
+**How a running round is watched — always all three:**
+1. the runner's own console tab (one line per agent every minute: state,
+   age, bar, files touched);
+2. `contest-out/NNN/kilo-serve.log`: `step=N` lines growing means models
+   answer. Silent for minutes while every agent is `WAITING 0%` means
+   `kilo serve` hung (round 135's first start hung this way and was restarted);
+3. `python3 -m tools.contest status --ticket NNN` lags; use it only for the
+   end table.
+Notes on a round go **here**, in this file, as the round goes, not only in
+the session's memory.
+
+#### Round 135 (KC 135, 2026-10-01)
+
+- Ran 14:58–19:09 UTC (15090 s). kilo serve was slow to start (log quiet
+  for minutes, every agent WAITING 0 %), not hung — 271 `step=` lines by the
+  end. Every `last reason` reads "POST /session timed out": a start-up trace,
+  harmless.
+- All 11 READY with a commit; glm-4-7-flash finished a round for the first time.
+- contest-bench/135: 9 tests, base 3/9, every entry 9/9. Run the bench from
+  inside the entry's checkout (copy it in) — run from this checkout it imports
+  this checkout's `tools/` and scores the base.
+- Code is the same `returncode != 0` raise in all 11. Winner laguna-s-2-1,
+  as-is: the only entry whose tests cover all three cases of the ticket
+  (failed status, prepare_round leaves no worktree, dirty + clean unchanged).

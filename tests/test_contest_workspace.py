@@ -542,6 +542,58 @@ def test_prepare_round_rejects_unresolvable_base(repo, config):
         prepare_round(repo, config, 40, "no-such-ref-xyz")
 
 
+def test_check_base_and_epic_tasks_raises_on_failed_status(repo, monkeypatch):
+    """FL-2: a failed `git status` on `epic-tasks/` is a read error, not a clean
+    tree — the exit code is now read and raised with context."""
+    base = _base_sha(repo)
+    args = ["status", "--porcelain", "--untracked-files=all", "--", "epic-tasks"]
+    _fail_git_read(monkeypatch, args, repo, stderr="fatal: index.lock")
+
+    with pytest.raises(WorkspaceError) as excinfo:
+        workspace_mod._check_base_and_epic_tasks(repo, "HEAD~1")
+
+    message = str(excinfo.value)
+    assert "epic-tasks" in message
+    assert "128" in message
+    assert "index.lock" in message
+    assert base == _base_sha(repo)
+
+
+def test_prepare_round_refuses_when_base_status_fails(repo, config, monkeypatch):
+    """FL-2 through prepare_round: a failed base status refuses the round before any
+    worktree or clone is created — nothing lands under the rounds dir."""
+    args = ["status", "--porcelain", "--untracked-files=all", "--", "epic-tasks"]
+    _fail_git_read(monkeypatch, args, repo, stderr="fatal: index.lock")
+
+    rounds_dir = Path(config.rounds_dir)
+    with pytest.raises(WorkspaceError) as excinfo:
+        prepare_round(repo, config, 40, "HEAD~1")
+
+    message = str(excinfo.value)
+    assert "epic-tasks" in message
+    assert "128" in message
+    assert "index.lock" in message
+    assert not (rounds_dir / "40-laguna").exists()
+    assert not (rounds_dir / "40-hy3").exists()
+
+
+def test_check_base_and_epic_tasks_refuses_dirty_epic_tasks(repo):
+    """A dirty epic-tasks/ still raises _EPIC_TASKS_DIRTY_REASON — the new failed-
+    status case must not shadow it."""
+    base = _base_sha(repo)
+    (repo / "epic-tasks" / "x.md").write_text("oops\n")
+    with pytest.raises(WorkspaceError) as excinfo:
+        workspace_mod._check_base_and_epic_tasks(repo, "HEAD~1")
+    assert workspace_mod._EPIC_TASKS_DIRTY_REASON in str(excinfo.value)
+    (repo / "epic-tasks" / "x.md").unlink()
+
+
+def test_check_base_and_epic_tasks_returns_base_sha_when_clean(repo):
+    """A clean repo returns the base sha — the happy path is unchanged."""
+    base = _base_sha(repo)
+    assert workspace_mod._check_base_and_epic_tasks(repo, "HEAD~1") == base
+
+
 def test_attach_clone_attaches_and_resets_dirty(repo, config, tmp_path):
     base = _base_sha(repo)
     clone = tmp_path / "clone-hy3"
