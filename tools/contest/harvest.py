@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import io
 import os
 import re
 import shutil
@@ -151,8 +152,16 @@ def _progress_rows(progress_csv: Path) -> list[dict]:
         return []
     try:
         with open(progress_csv, newline="", encoding="utf-8") as fh:
-            return list(csv.DictReader(fh))
-    except (OSError, UnicodeDecodeError, csv.Error):
+            text = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return []
+    # Python 3.10's `csv` raises on a NUL, 3.11+ reads it as a character:
+    # checked here so the verdict does not depend on the interpreter.
+    if "\0" in text:
+        return []
+    try:
+        return list(csv.DictReader(io.StringIO(text, newline="")))
+    except csv.Error:
         return []
 
 
