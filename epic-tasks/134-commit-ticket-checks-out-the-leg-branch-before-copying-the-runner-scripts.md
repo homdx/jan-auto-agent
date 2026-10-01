@@ -1,6 +1,6 @@
 # 134 — commit_ticket checks out the leg branch before it copies the runner scripts
 
-**Status:** open
+**Status:** landed — round 134, winner hy3 (7/7 on contest-bench/134, all 11 entries 7/7, base 2/7), f36dbc7 as-is
 **Severity:** MEDIUM
 **File:** tools/contest/draft.py
 **Symbol:** commit_ticket
