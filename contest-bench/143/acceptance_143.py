@@ -434,5 +434,5 @@ def test_script_write_unchanged(tmp_path, capsys):
 
 
 def test_other_verbs_unchanged(repo, capsys):
-    rc, _, err = run(capsys, "issue", "list")
+    rc, _, err = run(capsys, "issue", "create")
     assert rc != 0 and "not implemented" in err

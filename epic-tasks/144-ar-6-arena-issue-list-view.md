@@ -1,6 +1,6 @@
 # AR-6 — `arena issue list [--state S]` / `arena issue view NN`: computed ticket state
 
-**Status:** open
+**Status:** landed
 **Severity:** LOW
 **File:** tools/arena/tickets.py
 **Symbol:** scan, Ticket, issue_list, issue_view

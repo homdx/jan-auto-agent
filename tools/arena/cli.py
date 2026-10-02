@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import models, output, profile, rounds
+from . import models, output, profile, rounds, tickets
 
 # ── exit codes ───────────────────────────────────────────────────────────────
 #: The one exit-code table every `arena` command returns from.
@@ -266,6 +266,40 @@ def _run_rerun(args: argparse.Namespace) -> int:
     return rounds.run_rerun(REPO_ROOT, args, profiles.get(active, {}))
 
 
+# ── AR-6: issue list / view ──────────────────────────────────────────────────
+def _issue_list_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--state", metavar="S", help="keep only this state")
+    p.add_argument("--branch", help="integration branch (default: profile's branch, then HEAD)")
+    _late_globals(p, "p", "o")
+
+
+def _issue_view_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("number", metavar="NN", help="the ticket's round number")
+    p.add_argument("--branch", help="integration branch (default: profile's branch, then HEAD)")
+    _late_globals(p, "p", "o")
+
+
+def _issue_profile(args: argparse.Namespace):
+    profiles, active = _load(args)
+    return profiles.get(active, {})
+
+
+def _issue_list(args: argparse.Namespace) -> int:
+    try:
+        prof = _issue_profile(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    return tickets.issue_list(REPO_ROOT, args, prof)
+
+
+def _issue_view(args: argparse.Namespace) -> int:
+    try:
+        prof = _issue_profile(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    return tickets.issue_view(REPO_ROOT, args, prof)
+
+
 # ── AR-59: model available / use / drop ──────────────────────────────────────
 def _late_globals(p: argparse.ArgumentParser, *names: str) -> None:
     """Accept `-p`, `-y`, `-o` after the verb too: `arena model use a -p p1 -y`.
@@ -377,8 +411,10 @@ OBJECTS: dict[str, Object] = {
         "tickets: draft, list, view, land",
         {
             "create": Verb("draft a ticket from a brief", "AR-7"),
-            "list": Verb("list tickets and their state", "AR-6"),
-            "view": Verb("show one ticket", "AR-6"),
+            "list": Verb("list tickets and their state", "AR-6",
+                         add_arguments=_issue_list_arguments, handler=_issue_list),
+            "view": Verb("show one ticket", "AR-6",
+                         add_arguments=_issue_view_arguments, handler=_issue_view),
             "land": Verb("land a ticket's winning entry", "AR-8"),
         },
     ),
