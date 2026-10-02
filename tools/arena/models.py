@@ -482,49 +482,64 @@ def check_not_judge(repo: Path, entries: list[str]) -> None:
 
 
 # ── the profile's `models =` line, in contest.local.ini only ─────────────────
-def _with_models(text: str, name: str, value: str) -> str:
-    """*text* (a `contest.local.ini`) with `[arena.profile.NAME]`'s `models =` set.
+def _with_key(text: str, name: str, key: str, value: Optional[str]) -> str:
+    """*text* (a `contest.local.ini`) with `[arena.profile.NAME]`'s *key* set.
 
     An edit of the text, not a parse and re-print: every other line, comment and
     key (an `api_key` among them) stays exactly as it was. A missing section is
-    appended; a missing `models` key is added at the end of its section.
+    appended; a missing key is added at the end of its section. *value* `None`
+    removes the key's line (and its continuation lines); nothing to remove is
+    no change.
     """
     nl = "\r\n" if "\r\n" in text else "\n"
     lines = text.splitlines(keepends=True)
     header = re.compile(r"^\[" + re.escape(profile.SECTION_PREFIX + name) + r"\]\s*(?:[;#].*)?$")
     start = next((i for i, ln in enumerate(lines) if header.match(ln.rstrip("\r\n"))), None)
-    new_line = f"models = {value}{nl}"
+    new_lines = [] if value is None else [f"{key} = {value}{nl}"]
     if start is None:
+        if value is None:
+            return text
         if text and not text.endswith("\n"):
             text += nl
-        return text + (nl if text else "") + f"[{profile.SECTION_PREFIX}{name}]{nl}" + new_line
+        return text + (nl if text else "") + f"[{profile.SECTION_PREFIX}{name}]{nl}" + new_lines[0]
     end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("[")), len(lines))
-    key = re.compile(r"^models\s*[=:]", re.IGNORECASE)
-    at = next((i for i in range(start + 1, end) if key.match(lines[i])), None)
+    pattern = re.compile(r"^" + re.escape(key) + r"\s*[=:]", re.IGNORECASE)
+    at = next((i for i in range(start + 1, end) if pattern.match(lines[i])), None)
     if at is not None:
         stop = at + 1
         # an indented line under the key is the rest of its value
         while stop < end and lines[stop].strip() and lines[stop][0] in " \t" \
                 and not lines[stop].lstrip().startswith(("#", ";")):
             stop += 1
-        lines[at:stop] = [new_line]
-    else:
+        lines[at:stop] = new_lines
+    elif value is not None:
         last = start
         for i in range(start + 1, end):
             if lines[i].strip():
                 last = i
         if not lines[last].endswith("\n"):
             lines[last] += nl
-        lines.insert(last + 1, new_line)
+        lines.insert(last + 1, new_lines[0])
     return "".join(lines)
 
 
-def write_models(repo: Path, name: str, value: str) -> None:
-    """Set the profile's `models =` in `contest.local.ini`, atomically, mode kept."""
+def _with_models(text: str, name: str, value: str) -> str:
+    """*text* with the profile's `models =` set — `_with_key` for `models`."""
+    return _with_key(text, name, "models", value)
+
+
+def write_profile_keys(repo: Path, name: str, values: dict[str, Optional[str]]) -> None:
+    """Set (or, for `None`, remove) profile keys in `contest.local.ini`.
+
+    The one ini writer: atomic (`mkstemp` + `os.replace`), the file mode kept,
+    every key applied to the text before the one write.
+    """
     path = repo / roster.LOCAL_FILENAME
     try:
         text = path.read_bytes().decode("utf-8") if path.exists() else ""
-        data = _with_models(text, name, value).encode("utf-8")
+        for key, value in values.items():
+            text = _with_key(text, name, key, value)
+        data = text.encode("utf-8")
         fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(repo))
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -538,6 +553,11 @@ def write_models(repo: Path, name: str, value: str) -> None:
             raise
     except (OSError, UnicodeDecodeError) as err:
         raise ModelError(f"cannot write {roster.LOCAL_FILENAME}: {err}") from err
+
+
+def write_models(repo: Path, name: str, value: str) -> None:
+    """Set the profile's `models =` in `contest.local.ini`, atomically, mode kept."""
+    write_profile_keys(repo, name, {"models": value})
 
 
 def _confirm(name: str, before: str, after: str, yes: bool) -> bool:

@@ -157,6 +157,65 @@ def _profile_view(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ── AR-61: profile set ───────────────────────────────────────────────────────
+def _profile_set_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", help="profile name ([arena.profile.NAME])")
+    p.add_argument("pairs", nargs="+", metavar="KEY=VALUE",
+                   help="keys to set; KEY= removes the key")
+    _late_globals(p, "y")
+
+
+def _set_values(pairs: list[str]) -> dict[str, Optional[str]]:
+    """`KEY=VALUE` words → `{key: value}`, `None` for `KEY=`. `ProfileError` to refuse."""
+    values: dict[str, Optional[str]] = {}
+    for pair in pairs:
+        key, eq, value = pair.partition("=")
+        key, value = key.strip(), value.strip()
+        if not eq:
+            raise profile.ProfileError(f"{pair!r}: expected KEY=VALUE")
+        if key == "models":
+            raise profile.ProfileError("models is set by `arena model use`, not `profile set`")
+        if key in ("base", "ticket"):
+            raise profile.ProfileError(f"{key} is set by arena per round, not by a profile")
+        if key not in profile.KNOWN_KEYS:
+            known = ", ".join(k for k in profile.KNOWN_KEYS if k != "models")
+            raise profile.ProfileError(f"unknown key {key!r} (known: {known})")
+        if key == "max_parallel" and value and not (value.isdigit() and int(value) > 0):
+            raise profile.ProfileError(f"max_parallel must be a positive integer, not {value!r}")
+        if key == "fresh":
+            profile.fresh_on(value)
+        values[key] = value or None
+    return values
+
+
+def _profile_set(args: argparse.Namespace) -> int:
+    """Without `-y`: before → after flags, nothing written. With `-y`: write, print."""
+    try:
+        if not models._PROFILE_NAME_RE.fullmatch(args.name):
+            raise profile.ProfileError(f"bad profile name {args.name!r}")
+        values = _set_values(args.pairs)
+        profiles, _ = profile.load_profiles(REPO_ROOT)
+        current = profiles.get(args.name, {})
+        updated = {k: v for k, v in current.items() if k not in values}
+        updated.update({k: v for k, v in values.items() if v is not None})
+        before = shlex.join(profile.profile_flags(current))
+        after = shlex.join(profile.profile_flags(updated))
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    if not getattr(args, "yes", False):
+        print(f"profile {args.name!r} — flags")
+        print(f"  before: {before or '(none)'}")
+        print(f"  after:  {after or '(none)'}")
+        print("not written — add -y to apply")
+        return EXIT_OK
+    try:
+        models.write_profile_keys(REPO_ROOT, args.name, values)
+    except models.ModelError as err:
+        return output.refuse(str(err))
+    print(f"profile {args.name!r} flags: {after or '(none)'}")
+    return EXIT_OK
+
+
 # ── AR-3: run start / run list ───────────────────────────────────────────────
 def _run_start_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("ticket", type=int, help="the ticket's round number NN")
@@ -256,6 +315,12 @@ OBJECTS: dict[str, Object] = {
                 "AR-2",
                 add_arguments=_profile_view_arguments,
                 handler=_profile_view,
+            ),
+            "set": Verb(
+                "set a profile's keys (KEY=VALUE, KEY= removes)",
+                "AR-61",
+                add_arguments=_profile_set_arguments,
+                handler=_profile_set,
             ),
         },
     ),

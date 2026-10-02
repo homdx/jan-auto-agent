@@ -41,6 +41,7 @@ KNOWN_KEYS: dict[str, Optional[str]] = {
     "backend": "--backend",
     "provider": "--provider",
     "variant": "--variant",
+    "fresh": "--fresh",
     "extra": None,
     "branch": None,
     "trailer": None,
@@ -48,6 +49,16 @@ KNOWN_KEYS: dict[str, Optional[str]] = {
 
 # Flags `arena` sets per round; a profile may never carry them.
 _FORBIDDEN_FLAGS = ("--base", "--ticket")
+
+#: AR-62: the runner flags that take a value. Given twice (profile key, `extra`,
+#: passthrough after `--`), only the last one reaches the runner.
+VALUE_FLAGS = ("--max-parallel", "--variant", "--legs", "--backend", "--provider", "--models")
+#: Switches (no value) the runner takes at most once.
+SWITCH_FLAGS = ("--fresh",)
+
+# `fresh = …`: a switch spelt as a key. Empty is "no" too.
+_TRUE_WORDS = ("yes", "true", "1")
+_FALSE_WORDS = ("no", "false", "0", "")
 
 
 class ProfileError(Exception):
@@ -78,6 +89,11 @@ def load_profiles(repo: Path) -> tuple[dict[str, dict[str, str]], str]:
         for key in values:
             if key not in KNOWN_KEYS:
                 raise ProfileError(f"[{section}] unknown key {key!r}")
+        if "fresh" in values:
+            try:
+                fresh_on(values["fresh"])
+            except ProfileError as err:
+                raise ProfileError(f"[{section}] {err}") from err
         profiles[section[len(SECTION_PREFIX) :]] = values
 
     active = DEFAULT_PROFILE
@@ -92,13 +108,18 @@ def profile_flags(
     """Turn *profile* (with *overrides* winning key by key) into run flags.
 
     Fixed order: the mapped keys in `KNOWN_KEYS` order, then the `extra` words
-    in their own order. An empty value produces nothing.
+    in their own order. An empty value produces nothing; `fresh` is a switch.
+    A flag both a key and `extra` give comes out once, the `extra` one (AR-62).
     """
     merged = {**profile, **(overrides or {})}
     flags: list[str] = []
     for key, flag in KNOWN_KEYS.items():
         value = (merged.get(key) or "").strip()
         if flag is None or not value:
+            continue
+        if flag in SWITCH_FLAGS:
+            if fresh_on(value):
+                flags.append(flag)
             continue
         flags += [flag, value]
 
@@ -111,7 +132,47 @@ def profile_flags(
         # argparse accepts, but a profile has no reason to spell one.
         if word.split("=", 1)[0] in _FORBIDDEN_FLAGS:
             raise ProfileError("--base/--ticket are set by arena, not by a profile")
-    return flags + extra
+    return dedupe_flags(flags + extra)
+
+
+def fresh_on(value: str) -> bool:
+    """`yes|true|1` → True, `no|false|0|` → False; anything else is a refusal."""
+    word = value.strip().lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    raise ProfileError(f"fresh must be yes or no, not {value.strip()!r}")
+
+
+def dedupe_flags(words: list[str]) -> list[str]:
+    """AR-62: each known runner flag once — the last one given wins.
+
+    *words* is split into items: `--flag V` and `--flag=V` (a `VALUE_FLAGS`
+    flag) are one item, a `SWITCH_FLAGS` word is one item, every other word is
+    an item of its own and passes untouched. A known flag's item survives only
+    at its last occurrence, so the order of the rest is kept and the
+    passthrough (which comes last) beats the profile. A value flag with no word
+    after it is left as it is — the runner says what is wrong with it.
+    """
+    items: list[tuple[Optional[str], list[str]]] = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        name = word.split("=", 1)[0]
+        if name in VALUE_FLAGS and "=" not in word and i + 1 < len(words):
+            items.append((name, [word, words[i + 1]]))
+            i += 2
+            continue
+        known = name in VALUE_FLAGS or (word in SWITCH_FLAGS)
+        items.append((name if known else None, [word]))
+        i += 1
+    last = {name: n for n, (name, _) in enumerate(items) if name}
+    out: list[str] = []
+    for n, (name, item) in enumerate(items):
+        if name is None or last[name] == n:
+            out += item
+    return out
 
 
 def _one_line(err: Exception) -> str:

@@ -1,6 +1,6 @@
 # AR-61 + AR-62 — `arena profile set NAME KEY=VALUE`; one runner flag reaches the runner once
 
-**Status:** open
+**Status:** landed
 **Severity:** LOW
 **File:** tools/arena/profile.py
 **Symbol:** set_keys, profile_flags, build_run_line

@@ -270,8 +270,11 @@ def build_run_line(nn: int, prof: dict[str, str], passthrough: list[str]) -> lis
         flag = _owned(word)
         if flag:
             raise RoundError(f"{flag} is set by arena, not after --")
+    # AR-62: a flag both the profile and the passthrough give reaches the
+    # runner once — the passthrough's, since it comes last.
+    flags = profile.dedupe_flags([*profile.profile_flags(prof), *passthrough])
     return [sys.executable, "-m", "tools.contest", "run", "--ticket", str(nn),
-            "--base", f"{REF_PREFIX}{nn}", *profile.profile_flags(prof), *passthrough]
+            "--base", f"{REF_PREFIX}{nn}", *flags]
 
 
 def _map_exit(code: int, state: Path, started: float) -> int:
