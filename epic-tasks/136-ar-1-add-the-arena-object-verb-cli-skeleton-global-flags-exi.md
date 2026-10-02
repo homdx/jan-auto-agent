@@ -1,6 +1,6 @@
 # AR-1 — Add the `arena <object> <verb>` CLI skeleton, global flags, exit codes, and secret masking
 
-**Status:** open
+**Status:** landed — round 136: code of the external opus5 entry (39/39 on contest-bench/136) + tests of round winner sensenova-6-7-flash-lite-var1 (38/39)
 **Severity:** MEDIUM
 **File:** tools/arena/cli.py
 **Symbol:** main, OBJECTS

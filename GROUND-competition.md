@@ -452,3 +452,23 @@ the session's memory.
 - Code is the same `returncode != 0` raise in all 11. Winner laguna-s-2-1,
   as-is: the only entry whose tests cover all three cases of the ticket
   (failed status, prepare_round leaves no worktree, dirty + clean unchanged).
+
+## Round 136 (AR-1) — run 1, 2026-10-01 23:19
+
+- 11 agents (4× sensenova123, 6× kenary, bynara), base aadbe49. Provider id is `sensenova123`, not `sensenova` (intake refused the latter: no credentials).
+- kilo serve (pid 2146779) hung 40 s after the prompts: 100 % CPU, no HTTP answer, log stopped at `snapshot.materialize` 23:20:02. An orphan kilo serve from round 135 (since 14:53, parent systemd, 172 % CPU, ignored SIGTERM) was running beside it; killed with -9, did not revive the server.
+- KC-81 detector fired on time (23:30:43, 600 s) with the right advice: kill + restart with --fresh. After kill -9 the runner ended every agent ERROR "event stream closed" by itself; no work lost (0 turns).
+- Restarted with --fresh.
+
+### Round 136 (AR-1) — run 2
+- 23:32:18 `--fresh`, 11 agents, no orphan this time. All event streams stopped at 23:32:41 right after "project copy refresh done".
+- kilo serve pid 2173746: one thread at 100 % CPU, main thread in futex; `~/.local/share/kilo/kilo.db` is 10.5 GB — prime suspect.
+- Server gone by 23:41:52; runner ended all 11 agents ERROR "event stream closed", 1 turn, 0 work. Total 9m49s.
+- Next: move kilo.db aside (backup), rerun with `--fresh`.
+
+### Round 136 (AR-1) — run 3
+- kilo.db (10.5 GB) moved to ~/kilo-db-backup/, fresh db created. Rerun `--fresh` ~23:42: events flow at once — agents edit files, gate permissions pass. Cause of the run 1–2 hangs confirmed: the bloated kilo.db.
+- Result (01:11, glm-4-7-flash still running, not waited for): 9 entries scored, mimo-v2-5 ERROR (kenary upstream unavailable / quota).
+- Bench: `contest-bench/136/acceptance_136.py` — the second machine's 42-case suite, re-cut to 39: it only knew 3 of the entries' 9 fake-handler seams (now each entry's own test-3 seam), demanded `(AR-\d+)` where the ticket spells `(AR-N)`, and guessed verb names the ticket never gives (only `run start 5` kept).
+- Scores: external opus5 39/39 · **sensenova-6-7-var1 38** (echoes `--api_key=` in a usage error) · laguna, sn68-var2, hy3, sn67-var2 37 · sn68-var1, bynara 36 · ext sonet4 35 · agnes 35 (live fake handler: `run start` exits 0) · step 34 (argparse usage block) · ext sonet5 30 · glm 18 (unfinished). Nearly all fail "multiline refuse stays one line".
+- Round winner (of ours): sensenova-6-7-flash-lite-var1. Landed code: external opus5 (206 code lines vs 296, 39/39) + sensenova's tests (globals and defaults at the handler, second `--` verbatim, no secret in a usage error, multiline refuse one line). AR-1 landed in the same commit.
