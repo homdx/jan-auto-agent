@@ -472,3 +472,15 @@ the session's memory.
 - Bench: `contest-bench/136/acceptance_136.py` — the second machine's 42-case suite, re-cut to 39: it only knew 3 of the entries' 9 fake-handler seams (now each entry's own test-3 seam), demanded `(AR-\d+)` where the ticket spells `(AR-N)`, and guessed verb names the ticket never gives (only `run start 5` kept).
 - Scores: external opus5 39/39 · **sensenova-6-7-var1 38** (echoes `--api_key=` in a usage error) · laguna, sn68-var2, hy3, sn67-var2 37 · sn68-var1, bynara 36 · ext sonet4 35 · agnes 35 (live fake handler: `run start` exits 0) · step 34 (argparse usage block) · ext sonet5 30 · glm 18 (unfinished). Nearly all fail "multiline refuse stays one line".
 - Round winner (of ours): sensenova-6-7-flash-lite-var1. Landed code: external opus5 (206 code lines vs 296, 39/39) + sensenova's tests (globals and defaults at the handler, second `--` verbatim, no secret in a usage error, multiline refuse one line). AR-1 landed in the same commit.
+
+## Round 137 (AR-2) — 2026-10-02
+
+- 11 agents (4× sensenova123, 6× kenary, bynara), base 5c67796, `--fresh --variant high --max-parallel 11`. Started cleanly (kilo.db fresh since 136); every checkout had a diff by 06:13.
+- First READY: agnes-2-5-flash, hy3, step-3-7-flash, mimo-v2-5. sensenova ×4 show WAITING with 0 turns in `status` while their checkouts already hold code.
+- Bench: `contest-bench/137/acceptance_137.py`, 52 cases from the ticket. The repo seam is patched by name (`REPO_ROOT`) or by value, and a separate case checks that it really is the checkout root. View rows are read by position: `emit` masks a column named `key`, so a literal `KEY` header masks every key (Sonet4 shows `***` in the whole first column).
+- External patches applied on 5c67796 in ../rounds/137x-{Opus5,Sonet4,Sonet5}.
+- Bench grew to 55 with three broken-input cases (an unbalanced quote in `extra`, a broken section header, a key before any section): AR-1's rule is one line, never a traceback. Opus5 tracebacked on all three.
+- Scores (glm unfinished, not waited for): **space-bunny-alpha-bynara 55/55** · sn68-var2 53 · ext Opus5 52 · hy3, sn68-var1 50 · mimo 49 · sn67-var1, sn67-var2, ext Sonet4, ext Sonet5 47 · laguna, step 46 · agnes 44.
+- Real bugs seen: agnes and step set `REPO_ROOT` one directory off (their tests patch it, so they never noticed); hy3 lets `-p nosuch` pass on `list` and lets a `--base` in `extra` traceback in `view`; Sonet4 names the view column `KEY`, so `emit` masks every key.
+- Round winner (of ours): space-bunny-alpha-bynara. Landed code: external opus5 (105 lines of profile.py vs bynara's 206) + the two refusals bynara had (configparser.Error, shlex ValueError) + bynara's tests (base is not a key, broken input, view default/name/-p, refusal inside view, agents_128k never read, REPO_ROOT is this checkout, missing repo). 55/55, AR-1 bench 39/39.
+- Ticket 138 = AR-3 (`run start` + `run list`), written on the landed AR-2 API (`cli._load`, `cli.REPO_ROOT`) with this round's lessons in the rules.

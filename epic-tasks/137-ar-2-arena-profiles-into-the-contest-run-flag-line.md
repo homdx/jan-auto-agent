@@ -1,6 +1,6 @@
 # AR-2 — Turn named arena profiles into the contest run flag line
 
-**Status:** open
+**Status:** landed — round 137: code of the external opus5 entry + one-line refusals for a broken ini and an unbalanced quote in `extra` + tests of round winner space-bunny-alpha-bynara (55/55 on contest-bench/137)
 **Severity:** LOW
 **File:** tools/arena/profile.py
 **Symbol:** load_profiles, profile_flags, KNOWN_KEYS

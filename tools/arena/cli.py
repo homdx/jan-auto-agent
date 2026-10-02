@@ -24,11 +24,13 @@ replaces argparse's usage block (principle 9).
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Optional
 
-from . import output
+from . import output, profile
 
 # ── exit codes ───────────────────────────────────────────────────────────────
 #: The one exit-code table every `arena` command returns from.
@@ -72,12 +74,100 @@ class Object:
     verbs: dict[str, Verb]
 
 
+# ── AR-2: profile list / view ────────────────────────────────────────────────
+#: The checkout `arena` runs from: the directory that holds `tools/`, the same
+#: root the launcher puts on `sys.path` — never the caller's cwd. Tests patch it.
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _load(args: argparse.Namespace) -> tuple[dict[str, dict[str, str]], str]:
+    """Profiles and the selected name (`-p` wins over `[arena] profile`).
+
+    Raises `ProfileError` for a bad file or a `-p` naming no profile.
+    """
+    profiles, active = profile.load_profiles(REPO_ROOT)
+    if args.profile is not None:
+        if args.profile not in profiles:
+            known = ", ".join(sorted(profiles)) or "none"
+            raise profile.ProfileError(
+                f"unknown profile {args.profile!r} (known: {known})"
+            )
+        active = args.profile
+    return profiles, active
+
+
+def _models_summary(models: str) -> str:
+    """`a,a,b` → `3 agents (2 models)`: the count, not the list."""
+    entries = [m.strip() for m in models.split(",") if m.strip()]
+    if not entries:
+        return ""
+    return f"{len(entries)} agents ({len(set(entries))} models)"
+
+
+def _profile_list(args: argparse.Namespace) -> int:
+    try:
+        profiles, active = _load(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    if not profiles:
+        # Nothing to list is exit 3, not a refusal — so not through `refuse`.
+        print(
+            "arena: no [arena.profile.*] section in contest.ini or contest.local.ini",
+            file=sys.stderr,
+        )
+        return EXIT_NOTHING
+    rows = [
+        {
+            "NAME": name,
+            "ACTIVE": "*" if name == active else "",
+            "MODELS": _models_summary(p.get("models", "")),
+            "LEGS": p.get("legs", ""),
+            "BRANCH": p.get("branch", ""),
+        }
+        for name, p in sorted(profiles.items())
+    ]
+    output.emit(rows, ["NAME", "ACTIVE", "MODELS", "LEGS", "BRANCH"], args.output)
+    return EXIT_OK
+
+
+def _profile_view_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("name", nargs="?", help="profile name (default: -p, then the active one)")
+
+
+def _profile_view(args: argparse.Namespace) -> int:
+    try:
+        profiles, active = _load(args)
+        name = args.name or active
+        if name not in profiles:
+            known = ", ".join(sorted(profiles)) or "none"
+            raise profile.ProfileError(f"unknown profile {name!r} (known: {known})")
+        chosen = profiles[name]
+        flags = shlex.join(profile.profile_flags(chosen))
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    # The rows are SETTING/VALUE pairs, so `emit`'s mask-by-key sees `SETTING`,
+    # not the profile key: mask each value by its own key here, `emit` still
+    # scrubs. The column is not called `KEY`: `key` is a secret word, and `emit`
+    # would mask the whole column.
+    rows = [
+        {"SETTING": k, "VALUE": output.mask({k: v})[k]} for k, v in chosen.items()
+    ]
+    rows.append({"SETTING": "flags", "VALUE": flags})
+    output.emit(rows, ["SETTING", "VALUE"], args.output)
+    return EXIT_OK
+
+
 OBJECTS: dict[str, Object] = {
     "profile": Object(
         "named run settings ([arena.profile.NAME])",
         {
-            "list": Verb("list the profiles", "AR-2"),
-            "view": Verb("show one profile and its run flag line", "AR-2"),
+            "list": Verb("list the profiles", "AR-2", handler=_profile_list),
+            "view": Verb(
+                "show one profile and its run flag line",
+                "AR-2",
+                add_arguments=_profile_view_arguments,
+                handler=_profile_view,
+            ),
         },
     ),
     "issue": Object(
