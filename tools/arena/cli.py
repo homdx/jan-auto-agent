@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import output, profile, rounds
+from . import models, output, profile, rounds
 
 # ── exit codes ───────────────────────────────────────────────────────────────
 #: The one exit-code table every `arena` command returns from.
@@ -178,6 +178,19 @@ def _run_list(args: argparse.Namespace) -> int:
     return rounds.run_list(REPO_ROOT, args)
 
 
+# ── AR-59: model available / use / drop ──────────────────────────────────────
+def _model_available(args: argparse.Namespace) -> int:
+    return models.available(REPO_ROOT, args)
+
+
+def _model_use(args: argparse.Namespace) -> int:
+    return models.use(REPO_ROOT, args)
+
+
+def _model_drop(args: argparse.Namespace) -> int:
+    return models.drop(REPO_ROOT, args)
+
+
 OBJECTS: dict[str, Object] = {
     "profile": Object(
         "named run settings ([arena.profile.NAME])",
@@ -189,6 +202,18 @@ OBJECTS: dict[str, Object] = {
                 add_arguments=_profile_view_arguments,
                 handler=_profile_view,
             ),
+        },
+    ),
+    "model": Object(
+        "the round's models, listed by Kilo",
+        {
+            "available": Verb("list Kilo's models", "AR-59",
+                              add_arguments=models.available_arguments,
+                              handler=_model_available),
+            "use": Verb("set a profile's models", "AR-59",
+                        add_arguments=models.names_arguments, handler=_model_use),
+            "drop": Verb("remove models from a profile", "AR-59",
+                         add_arguments=models.names_arguments, handler=_model_drop),
         },
     ),
     "issue": Object(
