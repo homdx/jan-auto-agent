@@ -493,3 +493,19 @@ the session's memory.
 - Scores: ext cloud Opus 5 (branch ar-3-arena-run-start-list) 44/44 · ext Opus5 patch 44 · **space-bunny-alpha-bynara 43** · ext Sonet5 43 · mimo, sn67-var2 41 · sn68-var2 40 · hy3 38 · laguna 37 · sn68-var1 26 · sn67-var1 24 · step 15 · agnes, glm 5 (unfinished).
 - Common miss: `ticket_file` drops the ticket's trailing newline (`git show` output stripped) — bynara, Sonet5, mimo, sn67-var2.
 - Landed: cloud Opus 5 as-is (588 code lines vs the patch Opus5's 675, 27 own tests vs 17). It edits one line of test_arena_cli.py (the "not implemented" example moves from `run start` to `run view`): unavoidable, `run start` is now implemented.
+
+## Round 140 — AR-59 `arena model available|use|drop` (2026-10-02)
+
+- Bench `contest-bench/140/acceptance_140.py`: 19 cases, fake `kilo` on PATH, no ini; flags accepted after the verb or as arena globals.
+- 19/19: Sonet5-4, sn68-var1, sn67-var2, sn68-var2 (fails on the real `kilo_bin = auto`). Cloud Opus 18/19 (two stderr lines on a kilo failure), mimo 18, Sonet4 18, Grok4-7 17, step 16, GPT6-Luna 15, agnes-2-5 11, bynara 8. laguna, hy3, longcat DEAD (kenary free rate limit, bynara socket drops).
+- Winner Sonet5-4: smallest full pass (608+68), 44 tests, works on real kilo 7.6.2. Ideal b63ea2f on top of the cloud 02d6328 (the branches had diverged; local AR-4 commit rebased → d77cc32). Ticket 141 open 385d2d6.
+- Tests 6484/2878; stress 3× clean.
+
+## Round 141 — AR-60 direct providers, `arena model test`, scores (2026-10-02)
+
+- 11 agents, base 385d2d6, `--fresh --variant high --max-parallel 11`; READY sn68-var1, sn67-var2; STALLED with a deadline commit agnes, mimo, step, bynara, sn68-var2, sn67-var1 (all judged); DEAD laguna, hy3, longcat (no edit in two first-touch rounds).
+- Gate: 167 permission asks, 2 to the LLM (agnes `> /tmp/x` rejected, correct; bynara heredoc allowed), 1 mechanical reject (sn67-var1 `cat ~/.local/share/kilo/tool-output/…` — Kilo's own truncation file of the agent's own output, a near false positive).
+- Bench `contest-bench/141/acceptance_141.py`: 17 cases one layer under the entries' seams — a fake `kilo` answers `models` and `run`, the direct provider is a real HTTP server on port 0, py_model_test's 15 checks run for real. AR-59 bench 140 run alongside.
+- Scores 141 + 140: cloud Opus 5.5 17+16 (built on the old cloud AR-59, breaks it) · mimo 16+17 · **cloud Sonnet 5 15+19** · sn67-var2 15+19 · bynara 10 · sn68-var1 9 · agnes, sn67-var1, sn68-var2, cloud Sonnet 4 8 · step 5. Common miss: `kilo models NAME` failing for a provider not in Kilo became a refusal instead of the no-key / no-URL hint.
+- Landed e885ba1: cloud Sonnet 5 + judge fix (unknown provider = hint, also after a failed direct list; Kilo broken = refusal) + hints name the provider as typed. Tests 6503/2878, stress 3× clean.
+- 12th entry (external patch comit-ticket.patch, also Sonnet 5): 15/17 + 19/19, the same miss; its 39 tests run against the ideal found one more hole — a failed direct list fell back to Kilo and refused in two lines for a provider Kilo lacks; fixed in the landed commit.
