@@ -7,6 +7,8 @@
     scripts/revive_round.py 112 --dry-run           print only, write nothing
     scripts/revive_round.py 65                      a round of legs: its last leg,
                                                     contest-out/65.3/state.json
+    scripts/revive_round.py 112 --dead              DEAD agents come back too
+    scripts/revive_round.py 112 --agent NAME        that one agent only
 
 A round of legs writes one folder per leg, `NN.1 … NN.K`, and only the last
 leg's state.json is the whole round: an agent a leg handed on is stale in the
@@ -39,6 +41,8 @@ from pathlib import Path
 
 #: The terminal states this script brings back; READY stays terminal.
 REVIVE = ("STALLED", "GAVE_UP", "ERROR")
+#: `--dead` adds this one: no edit in the first-touch window, a terminal state.
+DEAD_STATE = "DEAD"
 #: Not terminal, so `_plan` harvests the tree and restarts the agent.
 REVIVED_STATE = "WAITING"
 BACKUP_NAME = "state.before-revive.json"
@@ -81,12 +85,36 @@ def state_path(target: str, any_leg: bool = False) -> Path:
     return folder / "state.json"
 
 
+def revive_agents(agents: list[dict], only: str | None = None, dead: bool = False) -> list[str]:
+    """Set the revivable agents in *agents* back to WAITING, in place; the revived names.
+
+    STALLED, GAVE_UP and ERROR are revivable, and DEAD only with *dead*. *only*
+    narrows it to the agent of that name. The old state, attempt and error stay
+    on the agent under `revived_from`.
+    """
+    states = (*REVIVE, DEAD_STATE) if dead else REVIVE
+    revived: list[str] = []
+    for agent in agents:
+        name = agent.get("agent", {}).get("name", "?")
+        before = agent.get("state")
+        if before not in states or (only is not None and name != only):
+            continue
+        agent["revived_from"] = {"state": before, "attempt": agent.get("attempt"),
+                                 "last_error": agent.get("last_error")}
+        agent["state"] = REVIVED_STATE
+        agent["last_error"] = None
+        revived.append(name)
+    return revived
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("round", help="round number, a round's output folder, or its state.json")
     parser.add_argument("--dry-run", action="store_true", help="print only, write nothing")
     parser.add_argument("--any-leg", action="store_true",
                         help="revive a leg folder that is not the round's last leg")
+    parser.add_argument("--dead", action="store_true", help="bring DEAD agents back too")
+    parser.add_argument("--agent", metavar="NAME", help="revive this one agent only")
     args = parser.parse_args(argv)
 
     path = state_path(args.round, args.any_leg)
@@ -100,19 +128,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"revive_round: {path} is unreadable: {exc}", file=sys.stderr)
         return 1
 
-    revived = 0
+    names = revive_agents(agents, only=args.agent, dead=args.dead)
+    revived = len(names)
     for agent in agents:
         name = agent.get("agent", {}).get("name", "?")
-        before = agent.get("state")
-        if before in REVIVE:
-            agent["revived_from"] = {"state": before, "attempt": agent.get("attempt"),
-                                     "last_error": agent.get("last_error")}
-            agent["state"] = REVIVED_STATE
-            agent["last_error"] = None
-            revived += 1
-            print(f"{name}: {before} -> {REVIVED_STATE}")
+        if name in names:
+            print(f"{name}: {agent['revived_from']['state']} -> {REVIVED_STATE}")
         else:
-            print(f"{name}: {before} (kept)")
+            print(f"{name}: {agent.get('state')} (kept)")
 
     if args.dry_run or not revived:
         print(f"{revived} to revive" + (" (dry run, nothing written)" if args.dry_run else ""))

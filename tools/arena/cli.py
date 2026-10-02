@@ -246,6 +246,26 @@ def _run_view(args: argparse.Namespace) -> int:
     return rounds.run_view(REPO_ROOT, args)
 
 
+# ── AR-5: run rerun ──────────────────────────────────────────────────────────
+def _run_rerun_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("run", help="the round NN, or one leg NN.K")
+    p.add_argument("--failed", action="store_true",
+                   help="bring back every STALLED, GAVE_UP and ERROR agent")
+    p.add_argument("--agent", metavar="NAME", help="bring back this one agent")
+    p.add_argument("--dead", action="store_true", help="DEAD agents come back too")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print what would come back, write nothing, start nothing")
+    _late_globals(p, "p", "y")
+
+
+def _run_rerun(args: argparse.Namespace) -> int:
+    try:
+        profiles, active = _load(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    return rounds.run_rerun(REPO_ROOT, args, profiles.get(active, {}))
+
+
 # ── AR-59: model available / use / drop ──────────────────────────────────────
 def _late_globals(p: argparse.ArgumentParser, *names: str) -> None:
     """Accept `-p`, `-y`, `-o` after the verb too: `arena model use a -p p1 -y`.
@@ -375,7 +395,8 @@ OBJECTS: dict[str, Object] = {
                          handler=_run_list),
             "view": Verb("show a round or one leg", "AR-4",
                          add_arguments=_run_view_arguments, handler=_run_view),
-            "rerun": Verb("rerun failed or named agents", "AR-5"),
+            "rerun": Verb("rerun failed or named agents", "AR-5",
+                          add_arguments=_run_rerun_arguments, handler=_run_rerun),
         },
     ),
     "entry": Object(

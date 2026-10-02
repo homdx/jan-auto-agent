@@ -1,6 +1,6 @@
 # AR-5 — `arena run rerun NN[.K] --failed | --agent NAME [--dead] [--dry-run]`
 
-**Status:** open
+**Status:** landed
 **Severity:** LOW
 **File:** tools/arena/rounds.py
 **Symbol:** run_rerun, revive_agents

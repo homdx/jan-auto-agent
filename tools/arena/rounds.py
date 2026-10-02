@@ -1,4 +1,5 @@
-"""tools/arena/rounds.py — AR-3: `arena run start NN` and `arena run list`.
+"""tools/arena/rounds.py — AR-3: `arena run start NN` and `arena run list`
+(AR-4 `run view`, AR-5 `run rerun`).
 
 `run start NN` is the long `python3 -m tools.contest run --ticket NN …` line in
 one command. It finds the ticket (`.arena/drafts/`, then the checkout's
@@ -25,8 +26,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -34,7 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from scripts.revive_round import leg_folders
+from scripts.revive_round import (BACKUP_NAME, DEAD_STATE, REVIVE, REVIVED_STATE, leg_folders,
+                                  revive_agents)
 from tools.contest import cli as contest_cli
 from tools.contest import roster
 
@@ -289,6 +293,39 @@ def _map_exit(code: int, state: Path, started: float) -> int:
     return EXIT_FAILED
 
 
+def _run_child(repo: Path, nn: int, line: list[str], state: Path,
+               started: Optional[float] = None) -> int:
+    """Print *line*, run it as the foreground child under the lock file, map its exit.
+
+    *state* is the round's `state.json`: a runner exit of 2 is "no agent ready"
+    when it rewrote that file after the start, a plain failure when it did not.
+    *started* is that "after"; `run rerun` writes the file itself just before
+    the start, so it passes the instant just past its own write.
+    """
+    print(output.scrub(" ".join(line)), flush=True)
+    lock = repo / ".arena" / "locks" / f"{nn}.pid"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    if started is None:
+        # one second of slack: some filesystems keep mtimes in whole seconds
+        started = time.time() - 1
+    try:
+        child = SPAWN(line, cwd=str(repo))
+    except OSError as err:
+        return output.refuse(f"cannot start the runner: {err}")
+    try:
+        lock.write_text(f"{child.pid}\n", encoding="utf-8")
+        while True:
+            try:
+                code = child.wait()
+                break
+            except KeyboardInterrupt:
+                # Ctrl-C reached the child too (same process group): wait it out
+                continue
+    finally:
+        lock.unlink(missing_ok=True)
+    return _map_exit(code, state, started)
+
+
 def run_start(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int:
     """`arena run start NN`: refusals first, then the ref, the record and the child."""
     repo = Path(repo)
@@ -322,27 +359,7 @@ def run_start(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
     (rounds_dir / f"{nn}.json").write_text(json.dumps(record, indent=2) + "\n",
                                            encoding="utf-8")
 
-    print(output.scrub(" ".join(line)), flush=True)
-    lock = repo / ".arena" / "locks" / f"{nn}.pid"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    # one second of slack: some filesystems keep mtimes in whole seconds
-    started = time.time() - 1
-    try:
-        child = SPAWN(line, cwd=str(repo))
-    except OSError as err:
-        return output.refuse(f"cannot start the runner: {err}")
-    try:
-        lock.write_text(f"{child.pid}\n", encoding="utf-8")
-        while True:
-            try:
-                code = child.wait()
-                break
-            except KeyboardInterrupt:
-                # Ctrl-C reached the child too (same process group): wait it out
-                continue
-    finally:
-        lock.unlink(missing_ok=True)
-    return _map_exit(code, round_folder(repo, config, nn) / "state.json", started)
+    return _run_child(repo, nn, line, round_folder(repo, config, nn) / "state.json")
 
 
 # ── run list ─────────────────────────────────────────────────────────────────
@@ -519,3 +536,131 @@ def run_view(repo: Path, args: argparse.Namespace) -> int:
     sys.stdout.flush()
     return contest_cli.cmd_status(argparse.Namespace(
         ticket=nn, out=str(folder), roster=contest_cli.DEFAULT_ROSTER))
+
+
+# ── run rerun ────────────────────────────────────────────────────────────────
+def _drop_flag(words: list[str], flag: str, takes_value: bool) -> list[str]:
+    """*words* without *flag* in its `--flag V`, `--flag=V` and bare spellings."""
+    out: list[str] = []
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+            continue
+        if word == flag:
+            skip = takes_value
+            continue
+        if word.startswith(flag + "="):
+            continue
+        out.append(word)
+    return out
+
+
+def build_rerun_line(nn: int, base: str, prof: dict[str, str], passthrough: list[str],
+                     leg_folder: Optional[Path]) -> list[str]:
+    """The child's argv for a rerun: `run start`'s line, `--resume` on the end.
+
+    `--fresh` is dropped wherever it comes from — it would wipe the trees being
+    resumed. A round of legs (*leg_folder* is its `NN.K` folder) resumes that
+    leg alone, `--out <folder> --legs 1`, whatever the profile's `legs` says;
+    a round without legs gets neither flag. `RoundError` for an owned flag in
+    *passthrough*.
+    """
+    for word in passthrough:
+        flag = _owned(word)
+        if flag:
+            raise RoundError(f"{flag} is set by arena, not after --")
+    words = [*profile.profile_flags({k: v for k, v in prof.items() if k != "fresh"}),
+             *passthrough]
+    words = _drop_flag(words, "--fresh", False)
+    words = _drop_flag(words, "--resume", False)
+    words = _drop_flag(words, "--legs", True)
+    if leg_folder is not None:
+        words += ["--out", str(leg_folder), "--legs", "1"]
+    flags = profile.dedupe_flags(words)
+    return [sys.executable, "-m", "tools.contest", "run", "--ticket", str(nn),
+            "--base", base, *flags, "--resume"]
+
+
+def _rerun_refusal(data: dict, args: argparse.Namespace) -> Optional[str]:
+    """Why `--agent NAME` cannot be brought back, or None."""
+    names = [_agent_name(a.get("agent")) for a in data["agents"] if isinstance(a, dict)]
+    if args.agent not in names:
+        return f"no agent {args.agent!r} in the round (agents: {', '.join(names) or 'none'})"
+    state = next(str(a.get("state")) for a in data["agents"]
+                 if isinstance(a, dict) and _agent_name(a.get("agent")) == args.agent)
+    if state == DEAD_STATE and not args.dead:
+        return f"{args.agent} is {DEAD_STATE} — add --dead to bring it back"
+    if state not in (*REVIVE, DEAD_STATE):
+        return f"{args.agent} is {state} — only {', '.join(REVIVE)} or {DEAD_STATE} come back"
+    return None
+
+
+def run_rerun(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int:
+    """`arena run rerun NN[.K] (--failed | --agent NAME) [--dead]`: revive, then resume.
+
+    Every refusal comes before anything is written. Exit 1 for a round with no
+    `state.json`, 3 when `--failed` finds nothing to bring back.
+    """
+    repo = Path(repo)
+    match = _VIEW_ARG.match(str(args.run))
+    try:
+        if not match:
+            raise RoundError(f"run rerun: {args.run!r} is not NN or NN.K")
+        if bool(args.failed) == bool(args.agent):
+            raise RoundError("run rerun: give --failed or --agent NAME, one of them")
+        nn = int(match.group(1))
+        leg = int(match.group(2)) if match.group(2) is not None else None
+        config = load_config(repo)
+        folder = round_folder(repo, config, nn, leg=leg)
+        state = folder / "state.json"
+        if not state.is_file():
+            print(output.scrub(f"arena: no round {args.run} (looked in {folder})"),
+                  file=sys.stderr)
+            return EXIT_FAILED
+        if round_alive(repo, nn, PROC_ROOT):
+            raise RoundError(f"round {nn} is running in {repo}")
+        legs = leg_folders(folder.with_name(f"{nn:02d}"))
+        in_legs = bool(_ROUND_DIR.match(folder.name) and "." in folder.name)
+        if in_legs and legs and legs[-1] != folder and not args.yes:
+            raise RoundError(f"{folder.name} is not the last leg ({legs[-1].name}): later legs "
+                             "already changed the trees — add -y to rerun it anyway")
+        try:
+            data = json.loads(state.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not isinstance(data.get("agents"), list):
+                raise ValueError("not a round state: no agents list")
+        except (OSError, ValueError) as err:
+            print(output.scrub(f"arena: {state} is unreadable: {err}"), file=sys.stderr)
+            return EXIT_FAILED
+        if args.agent:
+            why = _rerun_refusal(data, args)
+            if why:
+                raise RoundError(why)
+        base = _rev(repo, f"{REF_PREFIX}{nn}") and f"{REF_PREFIX}{nn}" or data.get("base_sha")
+        if not base:
+            raise RoundError(f"no {REF_PREFIX}{nn} and no base_sha in {state}")
+        line = build_rerun_line(nn, str(base), prof, args.passthrough,
+                                folder if in_legs else None)
+    except (RoundError, GitRefError, profile.ProfileError, OSError) as err:
+        return output.refuse(str(err))
+
+    before = {_agent_name(a.get("agent")): a.get("state")
+              for a in data["agents"] if isinstance(a, dict)}
+    revived = revive_agents([a for a in data["agents"] if isinstance(a, dict)],
+                            only=args.agent or None, dead=args.dead)
+    if not revived:
+        print(f"arena: nothing to revive in round {args.run}", file=sys.stderr)
+        return EXIT_NOTHING
+    for name, was in before.items():
+        print(output.scrub(f"{name}: {was} -> {REVIVED_STATE}" if name in revived
+                           else f"{name}: {was} (kept)"))
+    if args.dry_run:
+        print(f"{len(revived)} to revive (dry run, nothing written)")
+        return EXIT_OK
+    try:
+        shutil.copy2(state, state.with_name(BACKUP_NAME))
+        state.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        wrote = state.stat().st_mtime
+    except OSError as err:
+        return output.refuse(f"cannot write {state}: {err}")
+    return _run_child(repo, nn, line, state, started=math.nextafter(wrote, math.inf))
