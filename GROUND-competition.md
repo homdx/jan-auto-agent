@@ -509,3 +509,12 @@ the session's memory.
 - Scores 141 + 140: cloud Opus 5.5 17+16 (built on the old cloud AR-59, breaks it) · mimo 16+17 · **cloud Sonnet 5 15+19** · sn67-var2 15+19 · bynara 10 · sn68-var1 9 · agnes, sn67-var1, sn68-var2, cloud Sonnet 4 8 · step 5. Common miss: `kilo models NAME` failing for a provider not in Kilo became a refusal instead of the no-key / no-URL hint.
 - Landed e885ba1: cloud Sonnet 5 + judge fix (unknown provider = hint, also after a failed direct list; Kilo broken = refusal) + hints name the provider as typed. Tests 6503/2878, stress 3× clean.
 - 12th entry (external patch comit-ticket.patch, also Sonnet 5): 15/17 + 19/19, the same miss; its 39 tests run against the ideal found one more hole — a failed direct list fell back to Kilo and refused in two lines for a provider Kilo lacks; fixed in the landed commit.
+
+## Round 139 — AR-4 `arena run view NN[.K]` (2026-10-02)
+
+- First round started through arena: `./arena -p p139 run start 139 -- --max-parallel 8`, base b3119fe, 8 agents; the runner got `--max-parallel 8` twice (profile `extra` + passthrough) → AR-62. Parallelism had to go into `contest.local.ini` by hand → AR-61. Both are ticket 142.
+- READY agnes, mimo, sn67-var1/2, sn68-var2, step; ERROR bynara (model connection dropped, deadline commit), sn68-var1 (stopped by the operator, committed). Plus 3 cloud entries: Sonnet 5, Opus 5.5, Sonet.
+- Bench `contest-bench/139/acceptance_139.py`: 25 cases, fake `/proc` through `rounds.PROC_ROOT`, `state.json` in a real round's shape. One case was too strict: without `base_sha`, `cmd_status` itself exits 1, and the ticket passes its code through, so only the `base ?` header is checked.
+- Scores: 25/25 cloud Sonnet 5, cloud Opus, agnes, mimo, sn67-var1, sn67-var2, sn68-var1, sn68-var2; 23/25 step, bynara, cloud Sonet (JSON `agent` = the spec dict, not the name). AR-3 bench 138 44/44 for all.
+- Rival tests against each other: sn68-var2's tests found `leg 2/1` (N counted folders, not the last leg number) in every other entry.
+- Landed faf9dd5: cloud Sonnet 5 (smallest code of the eight) + leg N fix + test. Tests 6524/2878, stress 3× clean.
