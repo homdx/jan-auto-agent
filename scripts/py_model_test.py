@@ -444,6 +444,17 @@ def free_from_openrouter() -> list:
     return rows
 
 
+# Models that are definitively free but not returned by the provider's /models endpoint.
+# Keyed by a substring of the provider's base_url.
+KNOWN_FREE_MODELS: dict[str, list[tuple[str, str, int, str]]] = {
+    "api.z.ai": [
+        ("glm-4.7-flash",  FREE, 131072, "known free (docs)"),
+        ("glm-4.5-flash",  FREE, 131072, "known free (docs)"),
+        ("glm-4.6v-flash", FREE, 131072, "known free (docs), vision"),
+    ],
+}
+
+
 def free_from_direct_api(base_url: str, api_key: str) -> list:
     """(id, status, context, note) from an OpenAI-compatible /models endpoint.
 
@@ -473,11 +484,21 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
         if not mid:
             continue
         caps = m.get("capabilities") or []
-        # If capabilities are present and neither tool-use nor tools is listed, skip
-        if caps and "tool-use" not in caps and "tools" not in caps:
-            continue
+        # Accept any recognised tool-capability token; skip only when capabilities
+        # are present but none of these tokens appears.
+        TOOL_CAPS = {"tool-use", "tools", "tool_calling", "function_calling",
+                     "function-calling", "toolcall"}
+        if caps and not (TOOL_CAPS & set(caps)):
+            # Also accept when the model has an explicit tools:true flag
+            if not m.get("tools"):
+                continue
         pricing = m.get("pricing") or {}
-        if paid_fields(pricing):
+        # Some providers price in non-USD "pollen" or similar currencies; treat
+        # those as free-tier (no real cost to the user via the API key).
+        pricing_currency = pricing.get("currency", "").lower()
+        if pricing_currency and pricing_currency not in ("usd", ""):
+            pass  # non-USD currency — treat as free-tier, skip paid_fields check
+        elif paid_fields(pricing):
             continue
         ctx = m.get("context_window") or m.get("context_length") or 0
         plan = (m.get("min_plan") or "").upper()
@@ -489,6 +510,17 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
             status, note = FREE, ""
         rows.append((mid, status, ctx, note))
     print(f"  direct api: checked {len(models)} models")
+    # Inject known-free models not returned by the /models endpoint
+    existing_ids = {r[0] for r in rows}
+    for url_frag, known in KNOWN_FREE_MODELS.items():
+        if url_frag in base_url:
+            added = 0
+            for entry in known:
+                if entry[0] not in existing_ids:
+                    rows.append(entry)
+                    added += 1
+            if added:
+                print(f"  + {added} known-free model(s) injected from docs ({url_frag})")
     return rows
 
 
@@ -510,7 +542,8 @@ def free_from_kilo(meta: dict) -> list:
     return rows
 
 
-def find_free(kilo: str, provider_specs: list) -> int:
+def find_free(kilo: str, provider_specs: list, use_curl: bool = False,
+              use_proxychains: bool = False) -> int:
     """provider_specs: list of (name, url_or_None, key_or_None).
     url/key are set for direct-API providers; None for vercel/openrouter/kilo."""
     for provider, purl, pkey in provider_specs:
@@ -546,8 +579,14 @@ def find_free(kilo: str, provider_specs: list) -> int:
                 print(mid.ljust(w), status.ljust(12), f"{ctx // 1000:>7}k", f"  {note}")
             free_ids = [r[0] for r in rows if r[1] == FREE]
             if free_ids:
+                extra_flags = ""
+                if use_proxychains:
+                    extra_flags += " --proxychains"
+                elif use_curl:
+                    extra_flags += " --curl"
                 cmd = (f"python3 scripts/py_model_test.py"
                        f" --base-url {purl} --api-key {pkey}"
+                       f"{extra_flags}"
                        f" " + " ".join(free_ids))
                 print(f"\n  second pass (free only):\n  {cmd}")
         else:
@@ -587,23 +626,68 @@ def _score_raw(raw: str, checker: str, mdir: str) -> tuple[str, str]:
     return "crash", f"code crashed: {tail(check, 4)}"
 
 
-def ask_direct(base_url: str, api_key: str, model: str, prompt: str, timeout: int) -> str:
+def ask_direct(base_url: str, api_key: str, model: str, prompt: str, timeout: int,
+               use_curl: bool = False, use_proxychains: bool = False) -> str:
     """Send one chat completion request directly to an OpenAI-compatible API.
-    Returns the assistant's text content, or raises on HTTP error."""
+    Returns the assistant's text content, or raises on HTTP error.
+
+    use_curl=True routes through a curl subprocess, which uses the system's TLS
+    stack — useful when urllib is blocked by a WAF or TLS-fingerprint check
+    (e.g. Cloudflare).  Default is urllib (no subprocess).
+    use_proxychains=True prefixes the curl command with proxychains (implies use_curl).
+    """
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2048,
-    }).encode()
+        "max_tokens": 8192,
+    })
+    url = f"{base_url.rstrip('/')}/chat/completions"
+
+    if use_curl or use_proxychains:
+        # Write body and HTTP status to separate streams so we can parse both.
+        cmd = []
+        if use_proxychains:
+            cmd += ["proxychains"]
+        cmd += [
+            "curl", "-s", "--max-time", str(timeout),
+            "-X", "POST", url,
+            "-H", f"Authorization: Bearer {api_key}",
+            "-H", "Content-Type: application/json",
+            "-d", payload,
+            "-w", "\n__STATUS__:%{http_code}",  # append status on its own line
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+        if result.returncode != 0:
+            raise RuntimeError(f"curl exit {result.returncode}: {result.stderr[:200]}")
+        # split off the appended status line
+        raw_out, _, status_tag = result.stdout.rpartition("\n__STATUS__:")
+        http_code = int(status_tag.strip()) if status_tag.strip().isdigit() else 0
+        body = raw_out if status_tag else result.stdout
+        try:
+            data = json.loads(body)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid JSON (HTTP {http_code}): {body[:200]}") from exc
+        if "choices" not in data:
+            error = data.get("error") or {}
+            msg = (data.get("message") or error.get("message") or str(data)[:200])
+            raise urllib.error.HTTPError(
+                url=url, code=http_code, msg=msg,
+                hdrs=None,  # type: ignore[arg-type]
+                fp=None,
+            )
+        msg = data["choices"][0]["message"]
+        return msg.get("content") or msg.get("reasoning_content") or ""
+
     req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/chat/completions",
-        data=payload,
+        url,
+        data=payload.encode(),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read())
-    return data["choices"][0]["message"]["content"] or ""
+    msg = data["choices"][0]["message"]
+    return msg.get("content") or msg.get("reasoning_content") or ""
 
 
 def main() -> int:
@@ -620,6 +704,11 @@ def main() -> int:
                     help="direct mode: OpenAI-compatible base URL (e.g. https://api.zyloai.net/v1)")
     ap.add_argument("--api-key", metavar="KEY",
                     help="direct mode: API key for --base-url")
+    ap.add_argument("--curl", action="store_true",
+                    help="direct mode: use curl subprocess instead of urllib "
+                         "(bypasses TLS-fingerprint / WAF blocks such as Cloudflare)")
+    ap.add_argument("--proxychains", action="store_true",
+                    help="direct mode: route curl through proxychains (implies --curl)")
     ap.add_argument("--provider", nargs=3, action="append",
                     metavar=("NAME", "URL", "KEY"),
                     help="add a direct-API provider for --find-free (repeatable)")
@@ -652,7 +741,9 @@ def main() -> int:
         note = store_note(_PROC_ROOT)
         if note:
             print(note, file=sys.stderr)
-        return find_free(kilo, provider_specs)
+        return find_free(kilo, provider_specs,
+                         use_curl=args.curl,
+                         use_proxychains=args.proxychains)
 
     if not args.models:
         ap.error("at least one model is required")
@@ -687,10 +778,13 @@ def main() -> int:
 
         if direct:
             try:
-                raw = ask_direct(args.base_url, args.api_key, model, PROMPT, args.timeout)
+                raw = ask_direct(args.base_url, args.api_key, model, PROMPT, args.timeout,
+                                 use_curl=args.curl,
+                                 use_proxychains=args.proxychains)
                 err_msg = ""
             except urllib.error.HTTPError as e:
-                body = e.read()[:300].decode(errors="replace")
+                raw_body = e.read()[:300] if e.fp else b""
+                body = raw_body.decode(errors="replace") or e.msg or ""
                 raw, err_msg = "", f"HTTP {e.code}: {body}"
             except Exception as e:  # noqa: BLE001
                 raw, err_msg = "", str(e)[:200]
