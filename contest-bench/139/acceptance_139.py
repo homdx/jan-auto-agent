@@ -261,5 +261,6 @@ def test_bad_ini_is_refusal(repo, capsys):
 
 
 def test_other_verbs_unchanged(repo, capsys):
-    rc, _, err = run(capsys, "run", "rerun", "7")
+    # `run rerun` landed in round 143 (AR-5); another unimplemented verb
+    rc, _, err = run(capsys, "issue", "list")
     assert rc != 0 and "not implemented" in err
