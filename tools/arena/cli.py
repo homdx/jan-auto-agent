@@ -179,6 +179,37 @@ def _run_list(args: argparse.Namespace) -> int:
 
 
 # ── AR-59: model available / use / drop ──────────────────────────────────────
+def _late_globals(p: argparse.ArgumentParser, *names: str) -> None:
+    """Accept `-p`, `-y`, `-o` after the verb too: `arena model use a -p p1 -y`.
+
+    `SUPPRESS` keeps the global's value when the flag is not repeated here, so
+    `arena -p p1 model use a` and `arena model use a -p p1` mean the same.
+    """
+    if "p" in names:
+        p.add_argument("-p", "--profile", metavar="NAME", default=argparse.SUPPRESS,
+                       help="profile to act on (as the global -p)")
+    if "y" in names:
+        p.add_argument("-y", "--yes", action="store_true", default=argparse.SUPPRESS,
+                       help="apply without asking")
+    if "o" in names:
+        p.add_argument("-o", "--output", choices=("table", "json"), default=argparse.SUPPRESS,
+                       help="output format (as the global -o)")
+
+
+def _model_available_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("providers", nargs="*", metavar="PROVIDER",
+                   help="providers to list (default: every provider Kilo knows)")
+    p.add_argument("--free", action="store_true", help="free and maybe-free models only")
+    p.add_argument("--search", metavar="TEXT", help="case-insensitive substring of provider/name")
+    _late_globals(p, "p", "o")
+
+
+def _model_names_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("names", metavar="NAME[,NAME...]",
+                   help="model names, comma-separated like --models")
+    _late_globals(p, "p", "y")
+
+
 def _model_available(args: argparse.Namespace) -> int:
     return models.available(REPO_ROOT, args)
 
@@ -205,15 +236,26 @@ OBJECTS: dict[str, Object] = {
         },
     ),
     "model": Object(
-        "the round's models, listed by Kilo",
+        "the model list from Kilo, by name",
         {
-            "available": Verb("list Kilo's models", "AR-59",
-                              add_arguments=models.available_arguments,
-                              handler=_model_available),
-            "use": Verb("set a profile's models", "AR-59",
-                        add_arguments=models.names_arguments, handler=_model_use),
-            "drop": Verb("remove models from a profile", "AR-59",
-                         add_arguments=models.names_arguments, handler=_model_drop),
+            "available": Verb(
+                "list Kilo's models, free ones marked",
+                "AR-59",
+                add_arguments=_model_available_arguments,
+                handler=_model_available,
+            ),
+            "use": Verb(
+                "set a profile's models by name",
+                "AR-59",
+                add_arguments=_model_names_arguments,
+                handler=_model_use,
+            ),
+            "drop": Verb(
+                "remove names from a profile's models",
+                "AR-59",
+                add_arguments=_model_names_arguments,
+                handler=_model_drop,
+            ),
         },
     ),
     "issue": Object(

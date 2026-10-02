@@ -1,6 +1,6 @@
 # AR-59 — `arena model available|use|drop`: the model list from Kilo, by name
 
-**Status:** open
+**Status:** landed
 **Severity:** LOW
 **File:** tools/arena/models.py
 **Symbol:** list_models, resolve_names, model_cache
