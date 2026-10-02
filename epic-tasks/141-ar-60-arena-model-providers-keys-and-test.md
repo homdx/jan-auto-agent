@@ -1,6 +1,6 @@
 # AR-60 — direct providers with a key, `arena model test`, results on record
 
-**Status:** open
+**Status:** landed
 **Severity:** LOW
 **File:** tools/arena/models.py
 **Symbol:** provider_key, test_models, model_scores

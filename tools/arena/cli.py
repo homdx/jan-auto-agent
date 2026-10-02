@@ -201,7 +201,18 @@ def _model_available_arguments(p: argparse.ArgumentParser) -> None:
                    help="providers to list (default: every provider Kilo knows)")
     p.add_argument("--free", action="store_true", help="free and maybe-free models only")
     p.add_argument("--search", metavar="TEXT", help="case-insensitive substring of provider/name")
+    p.add_argument("--url", metavar="URL",
+                   help="base URL of the one provider named (else env ARENA_URL_<NAME>)")
+    p.add_argument("--test", action="store_true", help="test every listed model")
     _late_globals(p, "p", "o")
+
+
+def _model_test_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("names", metavar="NAME[,NAME...]",
+                   help="model names (provider/model), comma-separated")
+    p.add_argument("--url", metavar="URL",
+                   help="base URL of the one provider named (else env ARENA_URL_<NAME>)")
+    _late_globals(p, "o")
 
 
 def _model_names_arguments(p: argparse.ArgumentParser) -> None:
@@ -212,6 +223,10 @@ def _model_names_arguments(p: argparse.ArgumentParser) -> None:
 
 def _model_available(args: argparse.Namespace) -> int:
     return models.available(REPO_ROOT, args)
+
+
+def _model_test(args: argparse.Namespace) -> int:
+    return models.test(REPO_ROOT, args)
 
 
 def _model_use(args: argparse.Namespace) -> int:
@@ -243,6 +258,12 @@ OBJECTS: dict[str, Object] = {
                 "AR-59",
                 add_arguments=_model_available_arguments,
                 handler=_model_available,
+            ),
+            "test": Verb(
+                "run the 15-check code task on models, keep the score",
+                "AR-60",
+                add_arguments=_model_test_arguments,
+                handler=_model_test,
             ),
             "use": Verb(
                 "set a profile's models by name",

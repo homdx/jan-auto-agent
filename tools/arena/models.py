@@ -37,6 +37,21 @@ The cache — the same pattern as `tools/contest/context_memory.py` (KC-67)
   error. `available` refreshes the providers it listed; `use` / `drop` call Kilo
   only when the cache has no record for a name.
 
+AR-60 — direct providers with a key, `arena model test`, results on record
+  A provider with a key *and* a base URL is listed and tested directly
+  (`free_from_direct_api` / `ask_direct` of `py_model_test.py`, imported); any
+  other goes through Kilo as above. The key is `[arena.provider.NAME] api_key =
+  ${ENV}` (a literal key is a refusal) or env `ARENA_KEY_<NAME>`; the URL is
+  `--url` (one provider only), env `ARENA_URL_<NAME>`, or the section's
+  `base_url`. No ini file is needed and none is made. A key never reaches
+  stdout, stderr, `-o json` or a record: errors are scrubbed and the key
+  replaced before they are printed or written.
+  `arena model test NAME[,NAME…]` runs the 15-check code task per model (at
+  most 4 at once) through the `RUN_TEST` seam and writes
+  `.arena/model-scores.json` — `{provider, model, via, score, max, error, at}`,
+  kept by the cache's rules, the newest record per model winning — which
+  `available` shows in LAST-TEST.
+
 `use` and `drop` write `contest.local.ini` only — never `contest.ini`, never
 `agents_128k.ini` — by editing the file's text in place, so a `[contest_gate_llm]`
 `api_key` and every comment in it come back byte for byte.
@@ -46,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import concurrent.futures
 import contextlib
 import difflib
 import glob
@@ -57,7 +73,9 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -87,8 +105,22 @@ JUDGE_KEYS = (
     ("draft_review_llm_profile", "the ticket reviewer"),
 )
 
-#: The columns of `arena model available`. LAST-TEST stays empty until AR-60.
+#: The columns of `arena model available`.
 AVAILABLE_COLUMNS = ["NAME", "PROVIDER", "FREE", "CTX", "IN-PROFILE", "LAST-TEST"]
+
+#: The scores file, next to the model cache.
+SCORES_RELPATH = Path(".arena") / "model-scores.json"
+#: `arena model test` runs at most this many models at once: every `kilo run`
+#: writes the one shared Kilo store (`py_model_test.py -j` is capped the same).
+TEST_JOBS = 4
+#: Seconds a model has to answer, and attempts on a rate limit (429 / 403).
+TEST_TIMEOUT = 240
+TEST_ATTEMPTS = 3
+#: The columns of `arena model test`.
+TEST_COLUMNS = ["NAME", "PROVIDER", "VIA", "SCORE", "ERROR"]
+
+_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_STATUS_RE = re.compile(r"\b([45]\d\d)\b")
 
 _PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 _VARIANT_RE = re.compile(r"[A-Za-z0-9_.-]+")
@@ -176,22 +208,26 @@ class ModelCache:
             return list(fresh)
         replaced = set(providers) | {r["provider"] for r in fresh}
         merged = [r for r in self.load(now) if r["provider"] not in replaced] + list(fresh)
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".tmp",
-                                       dir=str(self.path.parent))
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                    json.dump(merged, fh, ensure_ascii=False, indent=2)
-                    fh.write("\n")
-                os.replace(tmp, str(self.path))
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp)
-                raise
-        except OSError:
-            pass
+        _write_json_atomic(self.path, merged)
         return merged
+
+
+def _write_json_atomic(path: Path, data: list) -> None:
+    """*data* as JSON at *path*: `mkstemp` next to it + `os.replace`; an OSError is swallowed."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            os.replace(tmp, str(path))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
+    except OSError:
+        pass
 
 
 def _clean_record(entry: object) -> Optional[dict]:
@@ -395,6 +431,12 @@ def resolve_names(repo: Path, entries: list[str],
     with the one-line refusal and a hint (`did you mean`, or the `--search`
     line). No name is ever substituted: the operator retypes it.
     """
+    _resolve_records(repo, entries, now)
+    return entries
+
+
+def _resolve_records(repo: Path, entries: list[str], now: Optional[float]) -> list[dict]:
+    """`resolve_names`'s work; answers the records the names were checked against."""
     for entry in entries:
         variant = entry.partition("@")[2]
         if "@" in entry and not _VARIANT_RE.fullmatch(variant):
@@ -410,7 +452,7 @@ def resolve_names(repo: Path, entries: list[str],
     refusal = _check_known(entries, records)
     if refusal:
         raise ModelError(refusal)
-    return entries
+    return records
 
 
 def judge_models(repo: Path) -> dict[str, str]:
@@ -518,10 +560,427 @@ def _selected_profile(repo: Path, args: argparse.Namespace) -> tuple[dict, str]:
     return profiles, args.profile or active
 
 
-def available(repo: Path, args: argparse.Namespace) -> int:
-    """`arena model available [PROVIDER…] [--free] [--search TEXT]`."""
+# ── AR-60: direct providers, the key, the scores ─────────────────────────────
+def _env_name(provider: str) -> str:
+    """`my-prov` → `MY_PROV`: upper-cased, every non-alphanumeric character a `_`."""
+    return re.sub(r"[^A-Za-z0-9]", "_", provider).upper()
+
+
+def _hint(message: str) -> None:
+    """One stderr hint line; the command goes on."""
+    print(f"arena: {' '.join(output.scrub(message).splitlines())}", file=sys.stderr)
+
+
+def provider_config(repo: Path, provider: str,
+                    url_flag: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    """`(base_url, api_key)` of *provider*; either is `None` when nothing gives it.
+
+    Key: `[arena.provider.NAME] api_key` — which must be a `${ENV}` reference,
+    a literal key is a refusal naming the section — else env `ARENA_KEY_<NAME>`.
+    URL: `--url`, else env `ARENA_URL_<NAME>`, else the section's `base_url`.
+    """
+    parser = _read_ini(repo)
+    wanted = f"arena.provider.{provider}".lower()
+    section = next((sec for sec in parser.sections() if sec.lower() == wanted), None)
+    ini_key = ini_url = ""
+    if section:
+        ini_key = parser.get(section, "api_key", fallback="").strip()
+        ini_url = parser.get(section, "base_url", fallback="").strip()
+    key = ""
+    if ini_key:
+        ref = _ENV_REF_RE.fullmatch(ini_key)
+        if not ref:
+            raise ModelError(
+                f"[{section}] api_key must be a ${{ENV}} reference, not the key itself"
+            )
+        key = os.environ.get(ref.group(1), "").strip()
+    else:
+        key = os.environ.get(f"ARENA_KEY_{_env_name(provider)}", "").strip()
+    url = (url_flag or os.environ.get(f"ARENA_URL_{_env_name(provider)}", "")
+           or os.path.expandvars(ini_url)).strip()
+    return (url or None), (key or None)
+
+
+def _hide(text: str, key: Optional[str]) -> str:
+    """*text* with the key (and URL credentials) taken out, on one line."""
+    if key:
+        text = text.replace(key, output.MASK)
+    return " ".join(output.scrub(text).split())
+
+
+def _direct_records(url: str, key: str, now: float) -> list[dict]:
+    """What the provider's own `/models` lists, as records (`via` = direct).
+
+    `free_from_direct_api` prints a progress line; it is swallowed. It raises on
+    a network or HTTP error (the caller turns that into a hint).
+    """
+    check = _model_check()
+    with contextlib.redirect_stdout(io.StringIO()):
+        rows = check.free_from_direct_api(url, key)
+    return [{
+        "provider": "", "model": mid,
+        "free": FREE_YES if status == check.FREE else FREE_MAYBE,
+        "ctx": ctx if isinstance(ctx, int) and not isinstance(ctx, bool) and ctx > 0 else 0,
+        "at": now, "via": "direct",
+    } for mid, status, ctx, _note in rows]
+
+
+def _direct_for(provider: str, url: str, key: str, now: float) -> list[dict]:
+    """`_direct_records` for *provider*, the failure raised as a one-line `ModelError`."""
     try:
-        records = list_models(repo, args.providers)
+        recs = _direct_records(url, key, now)
+    except urllib.error.HTTPError as err:
+        raise ModelError(f"{provider}: direct list failed: HTTP {err.code}") from err
+    except (OSError, ValueError) as err:
+        raise ModelError(f"{provider}: direct list failed: {_hide(str(err), key)}") from err
+    for r in recs:
+        r["provider"] = provider
+    return recs
+
+
+def _note_missing_from_kilo(repo: Path, provider: str, found: Iterable[str]) -> None:
+    """A model found directly but not in `kilo.jsonc`: a round cannot run it."""
+    try:
+        known = set(_ask_kilo(repo, [provider]).get(provider, {}))
+    except KiloError:
+        return  # Kilo not reachable: nothing to compare against, no hint
+    for model in found:
+        if model not in known:
+            _hint(f"{provider}/{model} is not in kilo.jsonc — a round cannot run it "
+                  "until it is added there")
+
+
+def _refresh_known(repo: Path, providers: list[str], now: float) -> list[dict]:
+    """`_refresh` of *providers*, skipping the ones Kilo does not know.
+
+    `kilo models NAME` fails for a provider missing from `kilo.jsonc`; that is
+    the no-key / no-URL hint's case, and the command goes on with the others.
+    Only when Kilo itself fails (its full list fails too, or every provider is
+    known) is it the refusal it was in AR-59.
+    """
+    try:
+        return _refresh(repo, providers, now)[0]
+    except KiloError as err:
+        if not providers:
+            raise
+        try:
+            known = set(_ask_kilo(repo, []))
+        except KiloError:
+            raise err from None
+        rest = [p for p in providers if p in known]
+        if len(rest) == len(providers):
+            raise
+        return _refresh(repo, rest, now)[0] if rest else []
+
+
+def collect_models(repo: Path, providers: list[str], url_flag: Optional[str],
+                   now: float) -> tuple[list[dict], dict[str, tuple[str, str]]]:
+    """`(records, {direct provider: (url, key)})` for *providers* (none: all of Kilo).
+
+    A provider with a key and a URL is listed directly; any other goes through
+    Kilo. Records carry `via`. Hints go to stderr one line each. Raises `ModelError`.
+    """
+    if url_flag and len(set(providers)) != 1:
+        raise ModelError("--url needs exactly one provider")
+    direct: dict[str, tuple[str, str]] = {}
+    via_kilo: list[str] = []
+    keyless: list[str] = []
+    for provider in dict.fromkeys(providers):
+        url, key = provider_config(repo, provider, url_flag)
+        if url and key:
+            direct[provider] = (url, key)
+            continue
+        via_kilo.append(provider)
+        if key and not url:
+            name = _env_name(provider)
+            _hint(f"no URL for '{provider}' — export ARENA_URL_{name}=… or pass --url")
+        elif not key:
+            keyless.append(provider)
+    records: list[dict] = []
+    if via_kilo or not providers:
+        fresh = _refresh_known(repo, via_kilo, now)
+        records += [dict(r, via="kilo") for r in fresh]
+        listed = {r["provider"] for r in fresh}
+        for provider in keyless:
+            if provider not in listed:
+                name = _env_name(provider)
+                _hint(f"no key for '{provider}' — export ARENA_KEY_{name}=… or add "
+                      f"[arena.provider.{provider}] api_key = ${{ARENA_KEY_{name}}} to "
+                      f"{roster.LOCAL_FILENAME}")
+    for provider, (url, key) in list(direct.items()):
+        try:
+            recs = _direct_for(provider, url, key, now)
+        except ModelError as err:
+            _hint(f"{err} — trying Kilo")
+            fresh = _refresh_known(repo, [provider], now)
+            records += [dict(r, via="kilo") for r in fresh]
+            del direct[provider]
+            continue
+        records += recs
+        _note_missing_from_kilo(repo, provider, [r["model"] for r in recs])
+    return sorted(records, key=lambda r: (r["provider"], r["model"])), direct
+
+
+class ScoreStore:
+    """`.arena/model-scores.json`: the newest test of each model, for `model_cache_days`."""
+
+    def __init__(self, path: Path, days: float) -> None:
+        self.path = Path(path)
+        self.days = days
+        self._lock = threading.Lock()
+
+    def load(self, now: Optional[float] = None) -> list[dict]:
+        """Records inside the age cut, the newest per provider+model; `[]` if unreadable."""
+        if self.days <= 0:
+            return []
+        stamp = time.time() if now is None else now
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        newest: dict[tuple[str, str], dict] = {}
+        for entry in data:
+            rec = _clean_score(entry)
+            if rec is None or stamp - rec["at"] > self.days * _DAY:
+                continue
+            key = (rec["provider"], rec["model"])
+            if key not in newest or rec["at"] >= newest[key]["at"]:
+                newest[key] = rec
+        return list(newest.values())
+
+    def add(self, record: dict, now: Optional[float] = None) -> None:
+        """Add one record: age the file, keep the newest per model, write atomically."""
+        if self.days <= 0:
+            return
+        with self._lock:
+            kept = [r for r in self.load(now)
+                    if (r["provider"], r["model"]) != (record["provider"], record["model"])]
+            _write_json_atomic(self.path, kept + [record])
+
+
+def _clean_score(entry: object) -> Optional[dict]:
+    if not isinstance(entry, dict):
+        return None
+    provider, model, at = entry.get("provider"), entry.get("model"), entry.get("at")
+    if not (isinstance(provider, str) and provider and isinstance(model, str) and model):
+        return None
+    if isinstance(at, bool) or not isinstance(at, (int, float)) or not math.isfinite(at):
+        return None
+
+    def count(value: object) -> Optional[int]:
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    error = entry.get("error")
+    return {
+        "provider": provider, "model": model,
+        "via": "direct" if entry.get("via") == "direct" else "kilo",
+        "score": count(entry.get("score")), "max": count(entry.get("max")),
+        "error": error if isinstance(error, str) else "", "at": at,
+    }
+
+
+def score_store(repo: Path) -> ScoreStore:
+    return ScoreStore(repo / SCORES_RELPATH, cache_days(repo))
+
+
+def _age(at: float, now: float) -> str:
+    """`2d`, `5h`, `7m`: how long ago, in the biggest whole unit."""
+    secs = max(0.0, now - at)
+    for unit, size in (("d", _DAY), ("h", 3600.0), ("m", 60.0)):
+        if secs >= size:
+            return f"{int(secs // size)}{unit}"
+    return "0m"
+
+
+def _short_error(error: str) -> str:
+    """`HTTP 401: …` → `401`; a timeout → `timeout`; the rest, its first words."""
+    status = _STATUS_RE.search(error)
+    if status:
+        return status.group(1)
+    if error.startswith("timeout"):
+        return "timeout"
+    if error.startswith(("no ```", "empty")):
+        return "no code"
+    return " ".join(error.split()[:2])[:14] or "failed"
+
+
+def last_test_cell(record: Optional[dict], now: float) -> str:
+    """The LAST-TEST cell: `14/15 2d`, `401 2d`, or empty with no record."""
+    if record is None:
+        return ""
+    if record["score"] is not None and record["max"]:
+        what = f"{record['score']}/{record['max']}"
+    else:
+        what = _short_error(record["error"])
+    return f"{what} {_age(record['at'], now)}"
+
+
+def _run_test(repo: Path, spec: dict) -> dict:
+    """The default `RUN_TEST`: one 15-check code task, `{score, max, error}`.
+
+    `spec` is `{provider, model, via, url, key}`. Direct: `ask_direct` against
+    the provider; Kilo: `kilo run -m provider/model`. Both use `py_model_test.py`'s
+    prompt, answer extraction and checker, imported.
+    """
+    check = _model_check()
+    provider, model, key = spec["provider"], spec["model"], spec.get("key")
+    with tempfile.TemporaryDirectory(prefix="arena-mtest-") as work:
+        raw, error = "", ""
+        if spec["via"] == "direct":
+            try:
+                raw = check.ask_direct(spec["url"], key, model, check.PROMPT, TEST_TIMEOUT)
+            except urllib.error.HTTPError as err:
+                error = f"HTTP {err.code}"
+            except Exception as err:  # noqa: BLE001 — any failure is the model's reason
+                error = str(err) or type(err).__name__
+        else:
+            kilo = find_kilo_bin(repo)
+            for attempt in range(1, TEST_ATTEMPTS + 1):
+                out, err_text, rc = check.run(
+                    [kilo, "run", "--pure", "--format", "json", "-m", f"{provider}/{model}",
+                     check.PROMPT], work, TEST_TIMEOUT, dict(os.environ))
+                raw, _got, ev_err = check.parse_events(check.ANSI_RE.sub("", out))
+                err_text = (ev_err + "\n" + err_text) if ev_err else err_text
+                if check.pick_code(raw) or rc is None or attempt == TEST_ATTEMPTS \
+                        or not check.RETRY_RE.search(err_text):
+                    break
+                time.sleep(min(30 * attempt, 300))
+            if not check.pick_code(raw):
+                if rc is None:
+                    error = f"timeout {TEST_TIMEOUT}s"
+                elif rc != 0:
+                    error = f"kilo exit {rc}: {check.tail(err_text, 1)[:100]}"
+        if error:
+            return {"score": None, "max": None, "error": _hide(error, key)}
+        checker = os.path.join(work, "checker.py")
+        with open(checker, "w", encoding="utf-8") as fh:
+            fh.write(check.CHECKER)
+        score, detail = check._score_raw(raw, checker, work)
+        match = re.fullmatch(r"(\d+)/(\d+)", score)
+        if match:
+            return {"score": int(match.group(1)), "max": int(match.group(2)), "error": ""}
+        return {"score": None, "max": None, "error": _hide(detail or score, key)}
+
+
+#: The seam. Called `RUN_TEST(repo, spec)`; a test replaces it.
+RUN_TEST: Callable[[Path, dict], dict] = _run_test
+
+
+def run_tests(repo: Path, specs: list[dict], now: Optional[float] = None) -> list[dict]:
+    """Test every spec (at most `TEST_JOBS` at once); write each record as it lands.
+
+    Returns the records in the order of *specs*. A test that raises is a record
+    with an `error`, never a traceback.
+    """
+    store = score_store(repo)
+
+    def one(spec: dict) -> dict:
+        try:
+            got = RUN_TEST(repo, spec)
+            score, top, error = got.get("score"), got.get("max"), str(got.get("error") or "")
+        except Exception as err:  # noqa: BLE001 — a crashed test is a reason, not a crash
+            score, top, error = None, None, str(err) or type(err).__name__
+        if score is None:
+            error = error or "no score"
+        record = {
+            "provider": spec["provider"], "model": spec["model"], "via": spec["via"],
+            "score": score, "max": top if score is not None else None,
+            "error": _hide(error, spec.get("key")),
+            "at": time.time() if now is None else now,
+        }
+        store.add(record, record["at"])
+        return record
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=TEST_JOBS) as pool:
+        return list(pool.map(one, specs))
+
+
+def resolve_test_targets(repo: Path, entries: list[str], url_flag: Optional[str],
+                         now: float) -> list[dict]:
+    """The specs `model test` runs; every name checked first. Raises `ModelError`."""
+    for entry in entries:
+        if "@" in entry:
+            raise ModelError(f"{entry!r}: a variant is not tested — name the model")
+    names = list(dict.fromkeys(entries))
+    providers = {n.partition("/")[0] for n in names if "/" in n}
+    if url_flag and len(providers) != 1:
+        raise ModelError("--url needs exactly one provider")
+    configs: dict[str, tuple[str, str]] = {}
+    for provider in sorted(providers):
+        url, key = provider_config(repo, provider, url_flag)
+        if url and key:
+            configs[provider] = (url, key)
+        elif key and not url:
+            name = _env_name(provider)
+            _hint(f"no URL for '{provider}' — export ARENA_URL_{name}=… or pass --url")
+    # direct names are checked against the provider's own list, the rest against Kilo's
+    direct_pool: dict[str, list[dict]] = {}
+    for provider, (url, key) in configs.items():
+        direct_pool[provider] = _direct_for(provider, url, key, now)
+    direct_names = [n for n in names if "/" in n and n.partition("/")[0] in configs]
+    kilo_names = [n for n in names if n not in direct_names]
+    for provider, recs in direct_pool.items():
+        mine = [n for n in direct_names if n.partition("/")[0] == provider]
+        refusal = _check_known(mine, recs)
+        if refusal:
+            raise ModelError(refusal)
+    kilo_records = _resolve_records(repo, kilo_names, now) if kilo_names else []
+    specs: list[dict] = []
+    for name in names:
+        if name in direct_names:
+            provider, _, model = name.partition("/")
+            url, key = configs[provider]
+            specs.append({"provider": provider, "model": model, "via": "direct",
+                          "url": url, "key": key})
+            continue
+        if "/" in name and any(f"{r['provider']}/{r['model']}" == name for r in kilo_records):
+            provider, _, model = name.partition("/")
+        else:
+            owners = [r for r in kilo_records if r["model"] == name]
+            if len(owners) > 1:
+                where = ", ".join(sorted(f"{r['provider']}/{r['model']}" for r in owners))
+                raise ModelError(f"{name!r} is on several providers ({where}) — name one")
+            if not owners:
+                raise ModelError(f"{name!r} is not a model (arena model available --search {name})")
+            provider, model = owners[0]["provider"], owners[0]["model"]
+        specs.append({"provider": provider, "model": model, "via": "kilo",
+                      "url": None, "key": None})
+    for provider in direct_pool:
+        _note_missing_from_kilo(repo, provider,
+                                [s["model"] for s in specs
+                                 if s["provider"] == provider and s["via"] == "direct"])
+    return specs
+
+
+def _test_rows(records: list[dict]) -> list[dict]:
+    return [{
+        "NAME": r["model"], "PROVIDER": r["provider"], "VIA": r["via"],
+        "SCORE": f"{r['score']}/{r['max']}" if r["score"] is not None else "-",
+        "ERROR": r["error"],
+    } for r in records]
+
+
+def test(repo: Path, args: argparse.Namespace) -> int:
+    """`arena model test NAME[,NAME…] [--url URL]`: run the code task per model."""
+    try:
+        entries = split_names(args.names)
+        if not entries:
+            raise ModelError("no model named (arena model available)")
+        specs = resolve_test_targets(repo, entries, getattr(args, "url", None), time.time())
+        records = run_tests(repo, specs)
+    except (ModelError, profile.ProfileError) as err:
+        return output.refuse(str(err))
+    output.emit(_test_rows(records), TEST_COLUMNS, args.output)
+    return EXIT_OK if all(r["score"] is not None for r in records) else EXIT_FAILED
+
+
+def available(repo: Path, args: argparse.Namespace) -> int:
+    """`arena model available [PROVIDER…] [--free] [--search TEXT] [--test] [--url URL]`."""
+    stamp = time.time()
+    try:
+        records, direct = collect_models(repo, args.providers, getattr(args, "url", None), stamp)
     except ModelError as err:
         return output.refuse(str(err))
     try:  # IN-PROFILE is a courtesy: a missing or broken ini only leaves it empty
@@ -531,24 +990,36 @@ def available(repo: Path, args: argparse.Namespace) -> int:
         chosen = {}
     in_profile = {base_of(e) for e in split_names(chosen.get("models", ""))}
     needle = (args.search or "").lower()
-    rows = []
+    shown = []
     for r in records:
         full = f"{r['provider']}/{r['model']}"
         if args.free and r["free"] == FREE_NO:
             continue
         if needle and needle not in full.lower():
             continue
+        shown.append(r)
+    if not shown:
+        print("arena: no model matches", file=sys.stderr)
+        return EXIT_NOTHING
+    store = score_store(repo)
+    if getattr(args, "test", False):
+        specs = [{"provider": r["provider"], "model": r["model"], "via": r["via"],
+                  "url": direct.get(r["provider"], (None, None))[0],
+                  "key": direct.get(r["provider"], (None, None))[1]} for r in shown]
+        run_tests(repo, specs)
+    scores = {(r["provider"], r["model"]): r for r in store.load()}
+    now = time.time()
+    rows = []
+    for r in shown:
+        full = f"{r['provider']}/{r['model']}"
         rows.append({
             "NAME": r["model"],
             "PROVIDER": r["provider"],
             "FREE": r["free"],
             "CTX": r["ctx"] or None,
             "IN-PROFILE": "yes" if {r["model"], full} & in_profile else "",
-            "LAST-TEST": "",
+            "LAST-TEST": last_test_cell(scores.get((r["provider"], r["model"])), now),
         })
-    if not rows:
-        print("arena: no model matches", file=sys.stderr)
-        return EXIT_NOTHING
     output.emit(rows, AVAILABLE_COLUMNS, args.output)
     return EXIT_OK
 
