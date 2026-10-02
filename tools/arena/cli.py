@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import output, profile
+from . import output, profile, rounds
 
 # ── exit codes ───────────────────────────────────────────────────────────────
 #: The one exit-code table every `arena` command returns from.
@@ -157,6 +157,27 @@ def _profile_view(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ── AR-3: run start / run list ───────────────────────────────────────────────
+def _run_start_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("ticket", type=int, help="the ticket's round number NN")
+    p.add_argument("--branch", help="integration branch (default: profile's branch, then HEAD)")
+    p.add_argument("--fresh-ticket", action="store_true",
+                   help="rebuild arena-round/NN when it holds another ticket text or tip")
+
+
+def _run_start(args: argparse.Namespace) -> int:
+    try:
+        profiles, active = _load(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    # no profile file, or no profile by the active name: no profile flags
+    return rounds.run_start(REPO_ROOT, args, profiles.get(active, {}))
+
+
+def _run_list(args: argparse.Namespace) -> int:
+    return rounds.run_list(REPO_ROOT, args)
+
+
 OBJECTS: dict[str, Object] = {
     "profile": Object(
         "named run settings ([arena.profile.NAME])",
@@ -182,8 +203,14 @@ OBJECTS: dict[str, Object] = {
     "run": Object(
         "contest rounds",
         {
-            "start": Verb("start the round for a ticket", "AR-3"),
-            "list": Verb("list rounds", "AR-3"),
+            "start": Verb(
+                "start the round for a ticket",
+                "AR-3",
+                add_arguments=_run_start_arguments,
+                handler=_run_start,
+            ),
+            "list": Verb("list rounds", "AR-3", add_arguments=lambda p: None,
+                         handler=_run_list),
             "view": Verb("show a round or one leg", "AR-4"),
             "rerun": Verb("rerun failed or named agents", "AR-5"),
         },

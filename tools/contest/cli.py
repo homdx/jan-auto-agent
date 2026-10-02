@@ -299,6 +299,51 @@ def _tickets(tasks_dir, at=None) -> list:
     return sorted(found, key=lambda item: item[0])
 
 
+#: AR-3: the temp folders `ticket_file` wrote a base-only ticket into; `cmd_run`
+#: removes them when it returns, a failure included.
+_TEMP_TICKET_DIRS: list = []
+
+
+def ticket_file(repo, tasks_dir, round_no, at) -> tuple:
+    """AR-3: `(name, path)` of the ticket numbered *round_no* — `("", None)` for none.
+
+    The checkout's own file first: `(name, tasks_dir / name)`, today's path.
+    Else, when the base *at* holds the ticket (`git ls-tree --name-only <at>
+    <rel>/`, the same `^0*(\\d+)-.*\\.md$` match as `gates.ticket_for_round`),
+    its text is written to a file of the same name in a fresh temp folder, so
+    `declared_files` and `ticket_size` read a real file. `arena run start`
+    builds such a base (`arena-round/NN`) without touching the checkout.
+    """
+    repo, tasks_dir = Path(repo), Path(tasks_dir)
+    try:
+        name = gates.ticket_for_round(tasks_dir, round_no)[0]
+    except OSError:
+        name = None
+    if name:
+        return name, tasks_dir / name
+    if not at:
+        return "", None
+    try:
+        rel = tasks_dir.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return "", None
+    listed = gates.git(str(repo), "ls-tree", "--name-only", str(at), rel + "/")
+    for line in listed.splitlines():
+        base_name = line.rsplit("/", 1)[-1]
+        match = re.match(r"^0*(\d+)-.*\.md$", base_name)
+        if not match or int(match.group(1)) != round_no:
+            continue
+        r = run_git(["git", "show", f"{at}:{rel}/{base_name}"], cwd=str(repo))
+        if r.returncode:
+            return "", None
+        folder = Path(tempfile.mkdtemp(prefix="contest-ticket-"))
+        _TEMP_TICKET_DIRS.append(folder)
+        path = folder / base_name
+        path.write_text(r.stdout, encoding="utf-8")
+        return base_name, path
+    return "", None
+
+
 def _title_id(body: str, name: str) -> str:
     """`KC-7` — the id the ticket announces in its H1, or its file name."""
     match = _TITLE_RE.search(body)
@@ -1541,6 +1586,12 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
     found = gates.ticket_for_round(tasks_dir, round_no)
     name = found[0]
     ticket_path = tasks_dir / name if name else None
+    if not name and at:
+        # AR-3: a ticket only at the base — `ticket_file`'s temp copy stands in
+        name, ticket_path = ticket_file(repo, tasks_dir, round_no, at)
+        if ticket_path is not None:
+            body = ticket_path.read_text(encoding="utf-8")
+            found = (name, body.splitlines()[0].lstrip("# ").strip() if body else "", [])
     title = ""
     if ticket_path is None or not ticket_path.is_file():
         failures.append(f"no ticket numbered {round_no} in {tasks_dir}")
@@ -2239,6 +2290,15 @@ def _dry_run(repo, result: Intake, config: ContestConfig, out_dir: Path, args, *
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    """`_cmd_run`, with AR-3's base-only ticket copies removed when it returns."""
+    try:
+        return _cmd_run(args)
+    finally:
+        while _TEMP_TICKET_DIRS:
+            shutil.rmtree(_TEMP_TICKET_DIRS.pop(), ignore_errors=True)
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
     """`run --ticket NN …` — the round on the real repo, the patches in `<out>/`.
 
     `intake` first (exit 1 with one line per failure); then `prepare_round` at
@@ -2320,7 +2380,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         ticket_name = gates.ticket_for_round(tasks_dir, args.ticket)[0]
     except OSError:
         ticket_name = None    # no tasks dir to read is no size, as an unreadable file is
-    size = ticket_size(tasks_dir / ticket_name) if ticket_name else None
+    if ticket_name:
+        size = ticket_size(tasks_dir / ticket_name)
+    else:
+        # AR-3: a ticket only at the base is sized from its temp copy
+        ticket_name, base_ticket = ticket_file(repo, tasks_dir, args.ticket, args.base)
+        size = ticket_size(base_ticket) if base_ticket else None
     legs, legs_from = _legs_choice(config, args, size)
     # KC-43: a relay's legs are not resumable — a round of one leg is
     if args.resume and legs > 1:

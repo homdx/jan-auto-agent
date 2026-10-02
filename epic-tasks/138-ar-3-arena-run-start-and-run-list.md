@@ -1,6 +1,6 @@
 # AR-3 — `arena run start NN` builds the round's base ref and starts the old runner; `arena run list`
 
-**Status:** open
+**Status:** landed — round 138: code of the external cloud Opus 5 entry (branch ar-3-arena-run-start-list, 9cce55a) as-is, 44/44 on contest-bench/138; best round agent space-bunny-alpha-bynara 43/44
 **Severity:** LOW
 **File:** tools/arena/rounds.py
 **Symbol:** round_folder, round_alive, commit_file_on, ticket_file

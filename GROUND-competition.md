@@ -484,3 +484,12 @@ the session's memory.
 - Real bugs seen: agnes and step set `REPO_ROOT` one directory off (their tests patch it, so they never noticed); hy3 lets `-p nosuch` pass on `list` and lets a `--base` in `extra` traceback in `view`; Sonet4 names the view column `KEY`, so `emit` masks every key.
 - Round winner (of ours): space-bunny-alpha-bynara. Landed code: external opus5 (105 lines of profile.py vs bynara's 206) + the two refusals bynara had (configparser.Error, shlex ValueError) + bynara's tests (base is not a key, broken input, view default/name/-p, refusal inside view, agents_128k never read, REPO_ROOT is this checkout, missing repo). 55/55, AR-1 bench 39/39.
 - Ticket 138 = AR-3 (`run start` + `run list`), written on the landed AR-2 API (`cli._load`, `cli.REPO_ROOT`) with this round's lessons in the rules.
+
+## Round 138 (AR-3) — 2026-10-02
+
+- 11 agents, base 9b633e6, `--fresh --variant high --max-parallel 11`, started 08:25; agent_max_sec 5400 stopped 9 of them STALLED with a deadline commit at ~09:55; READY only mimo-v2-5 and step-3-7-flash.
+- New hazard: sensenova-6-8-var2 and sensenova-6-7-var1 tried their own `arena run start 5` for real — it built `arena-round/5` in their checkouts and started a detached `tools.contest run --ticket 5` with its own `kilo serve`. Killed by hand. Next tickets: verify only with `--dry-run`; a real `tools.contest run` / `arena run start` should go to the gate (ask_commands).
+- Bench: `contest-bench/138/acceptance_138.py`, 44 cases from the ticket; the spawn seam is patched by name (`SPAWN`) or by value (`subprocess.Popen` alias); step 0 proven with a real `run --dry-run` on the KC-16 sandbox, ticket only on `arena-round/2`.
+- Scores: ext cloud Opus 5 (branch ar-3-arena-run-start-list) 44/44 · ext Opus5 patch 44 · **space-bunny-alpha-bynara 43** · ext Sonet5 43 · mimo, sn67-var2 41 · sn68-var2 40 · hy3 38 · laguna 37 · sn68-var1 26 · sn67-var1 24 · step 15 · agnes, glm 5 (unfinished).
+- Common miss: `ticket_file` drops the ticket's trailing newline (`git show` output stripped) — bynara, Sonet5, mimo, sn67-var2.
+- Landed: cloud Opus 5 as-is (588 code lines vs the patch Opus5's 675, 27 own tests vs 17). It edits one line of test_arena_cli.py (the "not implemented" example moves from `run start` to `run view`): unavoidable, `run start` is now implemented.
