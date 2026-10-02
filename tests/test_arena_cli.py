@@ -46,9 +46,9 @@ def test_missing_or_malformed_arguments_are_one_line_usage_errors(argv, capsys):
 
 
 def test_unimplemented_verb_names_its_ticket(capsys):
-    assert cli.main(["run", "view", "5"]) == 2
+    assert cli.main(["run", "rerun", "5"]) == 2
     assert capsys.readouterr().err.strip() == (
-        "arena: run view is not implemented yet (AR-4)"
+        "arena: run rerun is not implemented yet (AR-5)"
     )
 
 

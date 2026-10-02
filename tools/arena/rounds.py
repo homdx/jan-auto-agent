@@ -415,3 +415,104 @@ def run_list(repo: Path, args: argparse.Namespace) -> int:
         return EXIT_NOTHING
     output.emit(rows, LIST_COLUMNS, args.output)
     return EXIT_OK
+
+
+# ── run view ─────────────────────────────────────────────────────────────────
+#: `NN` or `NN.K`, digits only; `07.2` is round 7 leg 2.
+_VIEW_ARG = re.compile(r"^(\d+)(?:\.(\d+))?$")
+
+#: The `-o json` columns, one row per agent in `state.json` order.
+VIEW_COLUMNS = ["agent", "state", "attempt", "tokens", "commit"]
+
+
+def _total_tokens(tokens) -> int:
+    """`input + output + reasoning` as an integer; 0 for a missing or odd value."""
+    if isinstance(tokens, bool):
+        return 0
+    if isinstance(tokens, (int, float)):
+        return int(tokens)
+    if not isinstance(tokens, dict):
+        return 0
+    total = 0
+    for key in ("input", "output", "reasoning"):
+        value = tokens.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total += int(value)
+    return total
+
+
+def _agent_name(agent) -> str:
+    """The agent's name: `state.json` holds its spec as a dict, older files a bare string."""
+    if isinstance(agent, dict):
+        return str(agent.get("name") or "")
+    return "" if agent is None else str(agent)
+
+
+def view_rows(data: dict) -> list[dict]:
+    """One row per agent in *data* (a parsed `state.json`), in file order."""
+    rows = []
+    for item in data["agents"]:
+        if not isinstance(item, dict):
+            continue
+        attempt = item.get("attempt")
+        rows.append({
+            "agent": _agent_name(item.get("agent")),
+            "state": str(item.get("state") or ""),
+            "attempt": attempt if isinstance(attempt, int) and not isinstance(attempt, bool) else 0,
+            "tokens": _total_tokens(item.get("tokens")),
+            "commit": str(item.get("commit") or "")[:12],
+        })
+    return rows
+
+
+def _view_header(repo: Path, nn: int, folder: Path, data: dict) -> str:
+    """`round NN · leg K/N · <running|done> · base <sha7>`; no `leg` part without legs."""
+    parts = [f"round {nn}"]
+    match = _ROUND_DIR.match(folder.name)
+    legs = leg_folders(folder.with_name(f"{nn:02d}"))
+    if match and match.group(2) and legs:
+        # N is the last leg's number, not the folder count: a round whose
+        # `NN.1` was cleaned away still reads `leg 2/2`, never `leg 2/1`
+        last = int(legs[-1].name.rpartition(".")[2])
+        parts.append(f"leg {int(match.group(2))}/{last}")
+    parts.append("running" if round_alive(repo, nn, PROC_ROOT) else "done")
+    base = data.get("base_sha")
+    parts.append(f"base {str(base)[:7] if base else '?'}")
+    return " · ".join(parts)
+
+
+def run_view(repo: Path, args: argparse.Namespace) -> int:
+    """`arena run view NN[.K]`: one round or one leg, found the way `run list` finds it.
+
+    Exit 1 with one line for no `state.json` or an unreadable one; a bad argument
+    is a refusal. The table is `tools.contest status`'s, called in process.
+    """
+    match = _VIEW_ARG.match(str(args.run))
+    if not match:
+        return output.refuse(f"run view: {args.run!r} is not NN or NN.K")
+    nn = int(match.group(1))
+    leg = int(match.group(2)) if match.group(2) is not None else None
+    try:
+        config = load_config(repo)
+    except RoundError as err:
+        return output.refuse(str(err))
+    folder = round_folder(repo, config, nn, leg=leg)
+    state = folder / "state.json"
+    if not state.is_file():
+        print(output.scrub(f"arena: no round {args.run} (looked in {folder})"),
+              file=sys.stderr)
+        return EXIT_FAILED
+    try:
+        data = json.loads(state.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("agents"), list):
+            raise ValueError("not a round state: no agents list")
+    except (OSError, ValueError) as err:
+        print(output.scrub(f"arena: {state} is unreadable: {err}"), file=sys.stderr)
+        return EXIT_FAILED
+    if args.output == "json":
+        output.emit(view_rows(data), VIEW_COLUMNS, "json")
+        return EXIT_OK
+    print(output.scrub(_view_header(repo, nn, folder, data)))
+    sys.stdout.flush()
+    return contest_cli.cmd_status(argparse.Namespace(
+        ticket=nn, out=str(folder), roster=contest_cli.DEFAULT_ROSTER))

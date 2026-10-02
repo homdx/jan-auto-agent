@@ -1,6 +1,6 @@
 # AR-4 — `arena run view NN[.K]`: one round or one leg, without `--out`
 
-**Status:** open
+**Status:** landed
 **Severity:** LOW
 **File:** tools/arena/rounds.py
 **Symbol:** run_view, view_rows

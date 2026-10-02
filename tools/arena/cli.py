@@ -178,6 +178,15 @@ def _run_list(args: argparse.Namespace) -> int:
     return rounds.run_list(REPO_ROOT, args)
 
 
+# ── AR-4: run view ───────────────────────────────────────────────────────────
+def _run_view_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("run", help="the round NN, or one leg NN.K")
+
+
+def _run_view(args: argparse.Namespace) -> int:
+    return rounds.run_view(REPO_ROOT, args)
+
+
 # ── AR-59: model available / use / drop ──────────────────────────────────────
 def _late_globals(p: argparse.ArgumentParser, *names: str) -> None:
     """Accept `-p`, `-y`, `-o` after the verb too: `arena model use a -p p1 -y`.
@@ -299,7 +308,8 @@ OBJECTS: dict[str, Object] = {
             ),
             "list": Verb("list rounds", "AR-3", add_arguments=lambda p: None,
                          handler=_run_list),
-            "view": Verb("show a round or one leg", "AR-4"),
+            "view": Verb("show a round or one leg", "AR-4",
+                         add_arguments=_run_view_arguments, handler=_run_view),
             "rerun": Verb("rerun failed or named agents", "AR-5"),
         },
     ),
