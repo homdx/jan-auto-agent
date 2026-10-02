@@ -518,3 +518,11 @@ the session's memory.
 - Scores: 25/25 cloud Sonnet 5, cloud Opus, agnes, mimo, sn67-var1, sn67-var2, sn68-var1, sn68-var2; 23/25 step, bynara, cloud Sonet (JSON `agent` = the spec dict, not the name). AR-3 bench 138 44/44 for all.
 - Rival tests against each other: sn68-var2's tests found `leg 2/1` (N counted folders, not the last leg number) in every other entry.
 - Landed faf9dd5: cloud Sonnet 5 (smallest code of the eight) + leg N fix + test. Tests 6524/2878, stress 3× clean.
+
+## Round 142 — AR-61 `arena profile set` + AR-62 a flag once (2026-10-02)
+
+- Started `./arena -p p139 run start 142`, base c6619d2, 8 agents: READY sn68-var1/2, sn67-var1/2, agnes, mimo, step; bynara STALLED (90-minute deadline commit, worked to the end — `WAITING` with 0 tokens in the table only means the runner records counters at the end of a turn). Plus 2 cloud entries: opus5-142, sonnet5-142-arena-profile-set.
+- Bench `contest-bench/142/acceptance_142.py`: 43 cases through `cli.main` and `rounds.build_run_line`. 43/43 for 8 of 10 — too soft, so edge probes on top (a flag twice in the passthrough, `profile set` without NAME, a second writer).
+- Out: agnes and step 42/43 (`fresh = maybe` in the ini not refused on read); step also turns `--variant a --variant b` into `a --variant b`; agnes takes `profile set max_parallel=2` as profile `max_parallel=2`; bynara has its own ini writer in profile.py beside models.py (the ticket said one writer).
+- Clean: mimo, sn67-var1/2, sn68-var1/2, cloud Opus 5, cloud Sonnet 5 (Sonnet also flipped the ticket status itself).
+- Landed 25d3cfa: cloud Opus 5 as-is — smallest diff (169 code lines), `_with_models` → `_with_key` + `write_profile_keys`, `dedupe_flags` in profile.py used by `build_run_line`. Tests 6547/2878, benches 138/140/141 green, stress 3× clean.
