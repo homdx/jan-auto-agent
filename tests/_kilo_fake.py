@@ -62,6 +62,7 @@ Everything here is scripted by one scenario dict, per session:
                     "question": {...},    # likewise
                     "work_sec": 3,   # the child beats `busy` this long; the
                                      # parent says nothing meanwhile
+                    "beat_sec": 0.1, # between two beats (default 0.5)
                 },
             },
         ],
@@ -797,11 +798,12 @@ class FakeKiloServer:
                                    "info": {"id": sid, "parentID": parent.id,
                                             "title": "subagent"}}})
         work = float(spec.get("work_sec") or 0)
+        beat = float(spec.get("beat_sec") or self.HOOK_BEAT_S * 5)
         until = time.monotonic() + work
         while time.monotonic() < until and not self._stop.is_set():
             self._emit({"type": "session.status",
                         "properties": {"sessionID": sid, "status": {"type": "busy"}}})
-            self._sleep(min(self.HOOK_BEAT_S * 5, max(0.0, until - time.monotonic())))
+            self._sleep(min(beat, max(0.0, until - time.monotonic())))
         if spec.get("permission") is not None:
             pid, event = self._permission_event(child, spec["permission"])
             self._emit(event)

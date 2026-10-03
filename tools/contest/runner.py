@@ -4162,6 +4162,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     # Kilo's shutdown, so the turn ends as a plain idle and the next prompt
     # compacts
     context_aborted = [False]
+    # set while the summary is being asked before a compact: a tool the model
+    # tries in that reply is still refused for a full context, but the stop is
+    # not armed — it would abort the very reply that carries the summary when
+    # that reply takes longer than CONTEXT_ABORT_DELAY_SEC
+    summary_asking = [False]
     # KC-42: what the first-touch watch has decided for the turn in flight —
     # "" while the turn is ordinary, `"reset"` when the watch wants a fresh
     # session, `"dead"` when the turn is over. Set on the watch's thread, read
@@ -4291,7 +4296,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         fill_now = _context_now()
         if _context_is_full(fill_now):
             decision = Decision(reply="reject", layer="context", reason=CONTEXT_FULL_REJECT)
-            if not context_full[0]:
+            if not context_full[0] and not summary_asking[0]:
                 # the model reads the refusal and still goes on with the tools
                 # that need no ask (live, glm: four refusals at 60 %, the fill
                 # still growing), so the turn is stopped — once, after the reply
@@ -4966,15 +4971,21 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         if (size and fill is not None
                 and isinstance(summary_percent, (int, float)) and summary_percent > 0
                 and fill >= summary_percent):
-            text, outcome, note = maybe_summarize_before_compact(
-                backend, session, run, ws, config, out_dir, turn,
-                session_id=getattr(session, "id", "") or "", fill=fill,
-                on_permission=on_permission, on_question=on_question)
+            summary_asking[0] = True
+            try:
+                text, outcome, note = maybe_summarize_before_compact(
+                    backend, session, run, ws, config, out_dir, turn,
+                    session_id=getattr(session, "id", "") or "", fill=fill,
+                    on_permission=on_permission, on_question=on_question)
+            finally:
+                summary_asking[0] = False
             # the ask is a turn of its own at a full context: a tool it tried was
-            # refused (KC-69) and armed the stop meant for a working turn. That
-            # stop must not land on the compact or the prompt that follow, and
-            # the refusal is not the next turn's — so both are undone here, the
-            # way the turn loop undoes them after its own wait.
+            # refused (KC-69), but `summary_asking` kept that refusal from arming
+            # the stop meant for a working turn — it would have aborted this very
+            # reply. A stop armed before the ask must not land on the compact or
+            # the prompt that follow either, and the refusal is not the next
+            # turn's — so both are undone here, the way the turn loop undoes them
+            # after its own wait.
             while context_stopper:
                 context_stopper.pop().cancel()
             context_full[0] = False
