@@ -100,6 +100,7 @@ from tools.contest.roster import (
 from tools.contest.runner import (
     WORKERS_FILE,
     _age,
+    _context_limit_fallback,
     RELAY_STATES,
     AgentState,
     RoundState,
@@ -2109,9 +2110,12 @@ def _context_memory_lines(config: ContestConfig, out_dir: Path) -> list[str]:
                                       days=context_memory.days_of(config))
     except Exception:  # noqa: BLE001 — no memory is no line, never a failed plan
         return []
-    return context_memory.plan_lines(records, config.agents,
-                                     percent=context_memory.compact_at_percent(config),
-                                     min_window=context_memory.min_window(config))
+    return context_memory.plan_lines(
+        records, config.agents,
+        percent=context_memory.compact_at_percent(config),
+        min_window=context_memory.min_window(config),
+        fallback=_context_limit_fallback(getattr(config, "context_limit_fallback", None)),
+        share_pct=context_memory.full_refusal_percent(config))
 
 
 def _with_remembered_limits(config: ContestConfig, out_dir: Path,
@@ -2128,17 +2132,23 @@ def _with_remembered_limits(config: ContestConfig, out_dir: Path,
     inside a turn — the KC-67 gate between prompts only ever saw the turn's edges
     (round 70: 263 159 input tokens in the first turn).
 
-    A model intake knows the size of keeps intake's number unless the memory
+    A model whose size intake knows keeps intake's number unless the memory
     holds a smaller one — a provider that refused below the window it declares
-    (round 145) — and then the smaller one is handed over. An attached server reads its own config and never sees the
-    overlay, so it gets nothing. ``compact_at_percent = 0`` sends the window
-    with ``input`` at the full budget: Kilo keeps its own compact there.
-    Fail-open like the rest of the memory: a memory or an operator value that
-    cannot be read is the config and *content* unchanged.
+    (round 145) — and then the smaller one is handed over. Round 149: a loose
+    memory record only wins when it is close enough to the declared window to
+    be evidence of it (`context_memory.remembered` measures that against
+    *agent*'s own ``context_limit``, the fallback and
+    ``context_full_refusal_percent``). An attached server reads its own config
+    and never sees the overlay, so it gets nothing. ``compact_at_percent = 0``
+    sends the window with ``input`` at the full budget: Kilo keeps its own
+    compact there. Fail-open like the rest of the memory: a memory or an
+    operator value that cannot be read is the config and *content* unchanged.
     """
     if config.server != "spawn":
         return config, content
     percent = context_memory.compact_at_percent(config)
+    share_pct = context_memory.full_refusal_percent(config)
+    fallback = _context_limit_fallback(getattr(config, "context_limit_fallback", None))
     try:
         records = context_memory.load(context_memory.memory_path(config, out_dir),
                                       days=context_memory.days_of(config))
@@ -2146,13 +2156,16 @@ def _with_remembered_limits(config: ContestConfig, out_dir: Path,
         return config, content
     agents, providers = [], {}
     for agent in config.agents:
-        size, output = context_memory.remembered(records, agent.provider_id, agent.model_id,
-                                                 context_memory.min_window(config))
+        size, output = context_memory.remembered(
+            records, agent.provider_id, agent.model_id,
+            context_memory.min_window(config),
+            declared=agent.context_limit, fallback=fallback, share_pct=share_pct)
         if agent.context_limit and (size is None or size >= agent.context_limit):
             # Kilo's declared window stands unless the provider has refused
             # below it (round 145: zai's glm-4.5-flash, 131 072 declared,
             # refused at 98 777) — then the smaller one is the window
             size = None
+            output = None
         limit = context_memory.kilo_limit(size, output, percent)
         if limit is None:
             agents.append(agent)

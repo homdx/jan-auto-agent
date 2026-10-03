@@ -720,7 +720,8 @@ _SIZE_VERB_RE = re.compile(
 #: A provider refusal with no size words at all is still read as an overflow
 #: when the session it refused already holds at least this share of the
 #: model's known window: the session worked, it grew, and the request it grew
-#: into was turned away. The round's own number is ``[contest]
+#: into was turned away. The same percent also gates a loose memory record
+#: (round 149: `context_memory.size_of`). The round's own number is ``[contest]
 #: context_full_refusal_percent`` (`context_memory.full_refusal_percent`); this
 #: is its default, for a caller with no config.
 FULL_REFUSAL_SHARE = context_memory.DEFAULT_FULL_REFUSAL_PERCENT / 100.0
@@ -1212,11 +1213,19 @@ def _context_budget(spec, records, config=None) -> tuple:
     fallback — which is today's prompt and today's overflow.
 
     Round 145: a remembered size *smaller* than Kilo's wins over it — the
-    provider refused below what it declares.
+    provider refused below what it declares. Round 149: a *loose* remembered
+    size (``grew`` far past ``last_ok``) only wins when it is close enough to
+    the declared window to be evidence of it — `context_memory.smallest_size`
+    measures that against *spec*'s own ``context_limit``, the fallback and
+    ``context_full_refusal_percent``.
     """
     limit = getattr(spec, "context_limit", None)
-    size = context_memory.smallest_size(records, spec.provider_id, spec.model_id,
-                                        context_memory.min_window(config))
+    share_pct = context_memory.full_refusal_percent(config)
+    fallback = _context_limit_fallback(getattr(config, "context_limit_fallback", None))
+    size = context_memory.smallest_size(
+        records, spec.provider_id, spec.model_id,
+        context_memory.min_window(config),
+        declared=limit, fallback=fallback, share_pct=share_pct)
     if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
         # Round 145: Kilo's number is what the provider *declares*; an overflow
         # the memory holds is what it *did*. zai declares 131 072 for
@@ -1227,7 +1236,6 @@ def _context_budget(spec, records, config=None) -> tuple:
         return int(limit), "kilo"
     if size is not None:
         return int(size), "remembered"
-    fallback = _context_limit_fallback(getattr(config, "context_limit_fallback", None))
     if fallback:
         return fallback, "fallback"
     return None, "none"
@@ -4673,12 +4681,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         setter = getattr(backend, "set_model_limit", None)
         if not callable(setter):
             return
+        declared = getattr(spec, "context_limit", None)
         try:
             size, output = context_memory.remembered(
-                _memory(), spec.provider_id, spec.model_id, context_memory.min_window(config))
+                _memory(), spec.provider_id, spec.model_id,
+                context_memory.min_window(config),
+                declared=declared,
+                fallback=_context_limit_fallback(
+                    getattr(config, "context_limit_fallback", None)),
+                share_pct=context_memory.full_refusal_percent(config))
         except Exception:  # noqa: BLE001 — no memory, nothing to hand over
             return
-        declared = getattr(spec, "context_limit", None)
         if not size or pushed_limit[0] == size or push_refused[0] == size:
             return
         if isinstance(declared, int) and not isinstance(declared, bool) and 0 < declared <= size:

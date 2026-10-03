@@ -469,8 +469,12 @@ class ContestConfig:
     #: by, in tokens; a provider refusal of a session smaller than this is never
     #: read as an overflow by size words alone. 0 = the floor off.
     context_min_window: int = 32000
-    #: Round 145: a refusal with no words about a size is an overflow when the
-    #: session holds at least this percent of its window. 0 = that reading off.
+    #: Round 145/149: "close enough to the wall to be evidence", as a percent.
+    #: (1) a refusal with no words about a size is an overflow when the session
+    #: holds at least this percent of its window. (2) a loose memory record
+    #: sizes the model only when its last_ok is at least this percent of the
+    #: window Kilo declares (or of context_limit_fallback when Kilo declares
+    #: nothing). 0 = both readings off.
     context_full_refusal_percent: float = 60.0
     #: Round 145: seconds between two reads of a running turn's fill, for a
     #: model sized by the memory or the fallback rather than by Kilo; at

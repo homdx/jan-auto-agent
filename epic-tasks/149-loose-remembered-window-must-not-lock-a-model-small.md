@@ -1,6 +1,6 @@
 # 149 — a loose remembered window must not override Kilo's declared one (KC-73 regression)
 
-**Status:** open
+**Status:** landed (branch ctx-overflow-fix — round 149 winner mimo-v2-5)
 **Severity:** HIGH
 **File:** tools/contest/context_memory.py
 **Symbol:** size_of, _pick, smallest_size, remembered

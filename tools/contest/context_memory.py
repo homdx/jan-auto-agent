@@ -94,10 +94,14 @@ DEFAULT_COMPACT_AT_PERCENT = 80.0
 #: or a broken reply, not the model's window: remembered, it would compact
 #: every turn for ever. 0 turns the floor off.
 DEFAULT_MIN_WINDOW = 32000
-#: Round 145: ``[contest] context_full_refusal_percent`` — a provider's refusal
-#: with no words about a size is read as an overflow when the session it
-#: refused holds at least this percent of the window it is sized by. 0 turns
-#: that reading off.
+#: Round 145/149: ``[contest] context_full_refusal_percent`` — "close enough to
+#: the wall to be evidence". (1) a provider's refusal with no words about a size
+#: is read as an overflow when the session it refused holds at least this
+#: percent of the window it is sized by (round 145). (2) a loose memory record
+#: (``grew`` far past ``last_ok``) sizes the model only when ``last_ok`` is at
+#: least this percent of the window Kilo declares, or of
+#: ``context_limit_fallback`` when Kilo declares nothing (round 149). 0 turns
+#: both readings off.
 DEFAULT_FULL_REFUSAL_PERCENT = 60.0
 #: KC-40: the default fill, as a percent of a known size, at which the runner
 #: asks a session that holds an uncommitted diff for its own account of it,
@@ -273,7 +277,9 @@ class OverflowRecord:
 LOOSE_FLOOR_SHARE = 0.25
 
 
-def size_of(record: OverflowRecord, min_window: int = DEFAULT_MIN_WINDOW) -> int | None:
+def size_of(record: OverflowRecord, min_window: int = DEFAULT_MIN_WINDOW,
+            declared: int | None = None, fallback: int | None = None,
+            share_pct: float = DEFAULT_FULL_REFUSAL_PERCENT) -> int | None:
     """The size one record remembers: the limit the provider named, else its
     ``last_ok`` — the last reply that still went through, which is the only
     number a provider that names no limit ever gave.
@@ -283,40 +289,62 @@ def size_of(record: OverflowRecord, min_window: int = DEFAULT_MIN_WINDOW) -> int
     budget of 230 144, and a prompt past that overflows. A record without the
     output, or with one that would leave nothing, keeps the limit as before.
 
-    KC-73: a ``last_ok`` the overflow jumped far past is no size. The window
-    lies between ``last_ok`` and ``last_ok + grew``; when ``grew`` is more than
+    KC-73 + round 149: a ``last_ok`` the overflow jumped far past is no size —
+    unless it is close enough to the wall to be evidence of it. The window lies
+    between ``last_ok`` and ``last_ok + grew``; when ``grew`` is more than
     `LOOSE_FLOOR_SHARE` of ``last_ok`` that range says nothing a session can
-    compact by. Live, agnes-2-0-flash: 17 382 OK, then one step of reads added
-    ~269 000 and overflowed a ~250 000 window; glm-4-7-flash: 14 179 OK plus
-    ~134 000 past a ~120 000 one. Sized at 80 % of those floors the runner
-    compacted every turn and the agents gave up. Such a record sizes nothing;
-    the next overflow that grows into the window step by step will.
+    compact by, so a *loose* record sizes the model only when ``last_ok`` is at
+    least *share_pct* percent of the wall: *declared* (the window Kilo declares
+    for the model) when it is set, else *fallback*
+    (``context_limit_fallback``). With neither, a loose record sizes nothing —
+    KC-73 as it was. A *tight* record (``grew`` small or ``None``) sizes the
+    model as before, at or above the floor; when *declared* is known the floor
+    drops to ``min(min_window, share_pct % × declared)`` so a genuine
+    small-window model Kilo declares can remember its own size. Named limits
+    are walls and are never touched by any of this. *share_pct* 0 turns both
+    share checks off: a loose record sizes nothing, the floor stays
+    *min_window*. Everything here is fail-open: a non-number *declared*,
+    *fallback* or *share_pct* degrades to the defaults, never an exception.
 
-    Round 145: *min_window* (``[contest] context_min_window``) is where that
-    line is drawn. A ``last_ok`` under it sizes nothing, tight or loose — a
-    window that small is a plan's cap or a broken reply, and remembered it
-    would compact every turn for ever. A loose ``last_ok`` at or above it
-    *does* size the model: it is a reply the provider took, so compacting at
-    80 % of it is early but never late (live, glm-4.5-flash: 81 311 went
-    through, one batch of reads added ~42 000 and hit a ~99 000 wall, and with
-    nothing remembered every fresh session read the same batch into the same
-    wall). Named limits are walls and are not touched by it.
+    Round 145: *min_window* (``[contest] context_min_window``) is the floor
+    when no window is declared. A ``last_ok`` under it sizes nothing, tight or
+    loose — a window that small is a plan's cap or a broken reply, and
+    remembered it would compact every turn for ever.
     """
     if record.limit and record.output and record.limit > record.output:
         return record.limit - record.output
     if record.limit:
         return record.limit
+    if not record.last_ok:
+        return None
     floor = _number(min_window) or 0
-    if not record.last_ok or record.last_ok < floor:
-        return None
-    if (floor <= 0 and record.grew is not None
-            and record.grew > record.last_ok * LOOSE_FLOOR_SHARE):
-        # KC-73 as it was, for a round that turned the window floor off
-        return None
-    return record.last_ok
+    declared_n = _number(declared)
+    try:
+        share = float(share_pct)
+    except (TypeError, ValueError):
+        share = DEFAULT_FULL_REFUSAL_PERCENT
+    if not math.isfinite(share) or share < 0 or share > 100:
+        share = DEFAULT_FULL_REFUSAL_PERCENT
+    share = share / 100.0
+    loose = (record.grew is not None
+             and record.grew > record.last_ok * LOOSE_FLOOR_SHARE)
+    if loose:
+        # KC-73 + round 149: a loose last_ok is evidence of the wall only when
+        # it is close enough to the wall to be one
+        wall = declared_n if declared_n is not None else _number(fallback)
+        if wall is None or share <= 0:
+            return None
+        return record.last_ok if record.last_ok >= share * wall else None
+    if declared_n is not None and share > 0:
+        # round 149: a model Kilo declares at 32 768 can remember a tight
+        # 28 000 — the floor drops to share × D when D is known
+        floor = min(floor, share * declared_n)
+    return record.last_ok if record.last_ok >= floor else None
 
 
-def _pick(records, provider: str, model: str, min_window: int = DEFAULT_MIN_WINDOW):
+def _pick(records, provider: str, model: str, min_window: int = DEFAULT_MIN_WINDOW,
+          declared: int | None = None, fallback: int | None = None,
+          share_pct: float = DEFAULT_FULL_REFUSAL_PERCENT):
     """``(size, output)`` for ``provider`` / ``model`` out of *records*, else ``None``.
 
     A record that names a limit is a wall: the smallest of those wins, as it
@@ -328,6 +356,10 @@ def _pick(records, provider: str, model: str, min_window: int = DEFAULT_MIN_WIND
     model that another session proved at 254 613 — at 80 % of 17 382 the runner
     compacted every turn and the agent gave up. The two are then combined as
     before, the smaller wins: hy3's 104 065 over a named 262 144 still stands.
+
+    Round 149: *declared*, *fallback* and *share_pct* are `size_of`'s — a loose
+    record that is not close enough to the declared wall sizes nothing and is
+    skipped here like any other record that sizes nothing.
     """
     if not isinstance(records, (list, tuple)):
         return None
@@ -336,7 +368,8 @@ def _pick(records, provider: str, model: str, min_window: int = DEFAULT_MIN_WIND
         record = entry if isinstance(entry, OverflowRecord) else OverflowRecord.from_dict(entry)
         if record is None or record.provider != provider or record.model != model:
             continue
-        size = size_of(record, min_window)
+        size = size_of(record, min_window, declared=declared, fallback=fallback,
+                       share_pct=share_pct)
         if size is None:
             continue
         if record.limit:
@@ -350,12 +383,15 @@ def _pick(records, provider: str, model: str, min_window: int = DEFAULT_MIN_WIND
 
 
 def remembered(records, provider: str, model: str,
-               min_window: int = DEFAULT_MIN_WINDOW) -> tuple[int | None, int | None]:
+               min_window: int = DEFAULT_MIN_WINDOW,
+               declared: int | None = None, fallback: int | None = None,
+               share_pct: float = DEFAULT_FULL_REFUSAL_PERCENT) -> tuple[int | None, int | None]:
     """KC-69: ``(size, output)`` of the record that sizes ``provider`` /
     ``model`` — :func:`smallest_size` plus the output that record reserved,
     ``None`` when it named none. ``(None, None)`` for nothing remembered.
     """
-    best = _pick(records, provider, model, min_window)
+    best = _pick(records, provider, model, min_window, declared=declared,
+                 fallback=fallback, share_pct=share_pct)
     return best if best is not None else (None, None)
 
 
@@ -394,7 +430,9 @@ def kilo_limit(size, output, percent: float = DEFAULT_COMPACT_AT_PERCENT) -> dic
 
 
 def smallest_size(records, provider: str, model: str,
-                  min_window: int = DEFAULT_MIN_WINDOW) -> int | None:
+                  min_window: int = DEFAULT_MIN_WINDOW,
+                  declared: int | None = None, fallback: int | None = None,
+                  share_pct: float = DEFAULT_FULL_REFUSAL_PERCENT) -> int | None:
     """The size remembered for ``provider`` / ``model``, else ``None``.
 
     The smallest named limit, or the largest ``last_ok`` of the records that
@@ -402,9 +440,12 @@ def smallest_size(records, provider: str, model: str,
     provider and model count — one model's overflow says nothing about its
     neighbour's — and a record without either a limit or a ``last_ok`` counts
     for nothing at all. Anything that is not a list of records is ``None``: no
-    size, the way today's session is treated.
+    size, the way today's session is treated. *declared*, *fallback* and
+    *share_pct* are `size_of`'s (round 149): a loose record that is not close
+    enough to the declared wall sizes nothing.
     """
-    best = _pick(records, provider, model, min_window)
+    best = _pick(records, provider, model, min_window, declared=declared,
+                 fallback=fallback, share_pct=share_pct)
     return best[0] if best is not None else None
 
 
@@ -580,9 +621,13 @@ def min_window(config) -> int:
 
 
 def full_refusal_percent(config) -> float:
-    """Round 145: ``[contest] context_full_refusal_percent`` — the default for
-    a missing key, a non-number or one outside 0–100; ``0`` turns the reading
-    off. Never an exception."""
+    """Round 145/149: ``[contest] context_full_refusal_percent`` — "close enough
+    to the wall to be evidence", as a percent. It governs both readings: a
+    wordless refusal of a session at or past this fill of its window (round
+    145) and a loose memory record whose ``last_ok`` is at least this percent
+    of the declared window (round 149). The default for a missing key, a
+    non-number or one outside 0–100; ``0`` turns both readings off. Never an
+    exception."""
     if config is None:
         return DEFAULT_FULL_REFUSAL_PERCENT
     try:
@@ -634,13 +679,17 @@ def summary_file_name(agent) -> str:
 
 
 def plan_lines(records, agents, *, percent: float = DEFAULT_COMPACT_AT_PERCENT,
-               min_window: int = DEFAULT_MIN_WINDOW) -> list[str]:
+               min_window: int = DEFAULT_MIN_WINDOW, fallback: int | None = None,
+               share_pct: float = DEFAULT_FULL_REFUSAL_PERCENT) -> list[str]:
     """One line per model that has a remembered size, for the round's plan.
 
     *agents* is the round's roster, in its own order; a model with nothing
     remembered gets no line, because a line for it would say nothing. ``[]`` for
     an empty memory and for anything that is not a roster — the plan prints
-    what it already prints, and no more.
+    what it already prints, and no more. Each spec's ``context_limit`` is the
+    declared window `size_of` measures loose records against (round 149);
+    *fallback* and *share_pct* are its other two knobs, read from the config by
+    the caller.
     """
     if not isinstance(agents, (list, tuple)):
         return []
@@ -650,7 +699,10 @@ def plan_lines(records, agents, *, percent: float = DEFAULT_COMPACT_AT_PERCENT,
         model = getattr(spec, "model_id", "")
         if not isinstance(provider, str) or not isinstance(model, str):
             continue
-        size = smallest_size(records, provider, model, min_window)
+        declared = getattr(spec, "context_limit", None)
+        size = smallest_size(records, provider, model, min_window,
+                             declared=declared, fallback=fallback,
+                             share_pct=share_pct)
         if size is None:
             continue
         lines.append(f"context memory: {provider}/{model} = {size} "

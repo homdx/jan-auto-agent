@@ -657,17 +657,20 @@ def test_the_full_refusal_percent_comes_from_the_config(tmp_path):
     assert run.state is tr.AgentState.ERROR and not memory.exists()
 
 
-@pytest.mark.parametrize("last_ok,grew,floor,want", [
-    (81_311, 42_588, 32_000, 81_311),   # live glm: loose, but a reply the provider took
-    (17_382, 269_086, 32_000, None),    # KC-73's agnes: under the floor
-    (14_179, 134_000, 32_000, None),    # KC-73's glm-4-7
-    (25_000, 100, 32_000, None),        # tight, but under the floor: a plan's cap
-    (17_382, 269_086, 0, None),         # floor off: KC-73 exactly as it was
-    (247_828, 3_000, 0, 247_828),
+@pytest.mark.parametrize("last_ok,grew,floor,declared,want", [
+    (81_311, 42_588, 32_000, 131_072, 81_311),  # live glm: loose, but near the wall
+    (17_382, 269_086, 32_000, 131_072, None),   # KC-73's agnes: far from the wall
+    (14_179, 134_000, 32_000, 131_072, None),   # KC-73's glm-4-7
+    (25_000, 100, 32_000, 131_072, None),       # tight, but under the floor
+    (17_382, 269_086, 0, None, None),           # no window at all: KC-73 as it was
+    (247_828, 3_000, 0, None, 247_828),         # floor off, tight: sized as before
+    (33_000, 200_000, 32_000, 262_144, None),   # 149's bug: loose, far below the wall
+    (81_311, 42_588, 32_000, None, None),       # loose with no window: nothing
 ])
-def test_the_window_floor_decides_which_last_ok_sizes_a_model(last_ok, grew, floor, want):
+def test_the_window_floor_decides_which_last_ok_sizes_a_model(
+        last_ok, grew, floor, declared, want):
     record = ctm._record(limit=None, last_ok=last_ok, grew=grew, prompt=None)
-    assert cm.size_of(record, floor) == want
+    assert cm.size_of(record, floor, declared=declared) == want
 
 
 def test_the_three_keys_are_read_from_the_ini(tmp_path):

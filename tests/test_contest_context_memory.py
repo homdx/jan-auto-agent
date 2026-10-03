@@ -1149,3 +1149,116 @@ def test_the_fill_after_a_compact_is_the_summary_not_the_reply_before_it():
     after = {"info": {"role": "assistant", "tokens": {"input": 11_000, "output": 50}}, "parts": []}
     backend = type("B", (), {"messages": lambda self, s: [before, summary, after]})()
     assert runner_mod._context_tokens(backend, None) == 11_050
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# round 149: a loose remembered window must not lock a model small
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _loose_record(**over) -> cm.OverflowRecord:
+    """A loose record — KC-73's pattern: last_ok far below what grew past it."""
+    base = dict(at=time.time(), round="149", agent="agent-a",
+                provider="kenary", model="agent-a:free",
+                limit=None, last_ok=33_000, grew=200_000, prompt=None)
+    base.update(over)
+    return cm.OverflowRecord(**base)
+
+
+def test_a_loose_record_far_below_the_declared_window_sizes_nothing():
+    """Ticket 149 test 1: 33 000 / 200 000 under Kilo's 262 144 is 13 % of the
+    wall — not evidence of it — so ``size_of`` returns None and
+    ``_context_budget`` keeps Kilo's window."""
+    record = _loose_record()
+    assert cm.size_of(record, 32_000, declared=262_144) is None
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=262_144)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (262_144, "kilo")
+
+
+def test_a_loose_record_with_no_window_and_a_fallback_sizes_nothing():
+    """Ticket 149 test 2: no Kilo window, fallback 128 000 — 33 000 is 26 % of
+    it, under the 60 % share, so KC-73 holds: the fallback is what sizes."""
+    record = _loose_record()
+    assert cm.size_of(record, 32_000, fallback=128_000) is None
+    config = replace(tr.make_config(["agent-a"]), context_limit_fallback=128_000)
+    assert runner_mod._context_budget(config.agents[0], [record.to_dict()],
+                                      config) == (128_000, "fallback")
+
+
+def test_glm_s_loose_record_near_the_declared_wall_still_sizes_the_model():
+    """Ticket 149 test 3: glm-4.5-flash — 81 311 went through and ~42 000 more
+    overflowed a 131 072 window: 62 % of the wall, so it counts."""
+    record = _loose_record(last_ok=81_311, grew=42_000)
+    assert cm.size_of(record, 32_000, declared=131_072) == 81_311
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=131_072)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (81_311, "remembered")
+
+
+def test_a_tight_record_under_a_declared_window_still_sizes_the_model():
+    """Ticket 149 test 4: a tight 40 000 under Kilo's 131 072 sizes as before."""
+    record = _loose_record(last_ok=40_000, grew=1_000)
+    assert cm.size_of(record, 32_000, declared=131_072) == 40_000
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=131_072)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (40_000, "remembered")
+
+
+def test_a_small_declared_window_lowers_the_floor_for_a_tight_record():
+    """Ticket 149 test 5: Kilo declares 32 768; a tight 28 000 is under
+    context_min_window but at 85 % of the declared window — the floor drops
+    to share × D and the model is remembered at 28 000."""
+    record = _loose_record(last_ok=28_000, grew=500)
+    assert cm.size_of(record, 32_000, declared=32_768) == 28_000
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=32_768)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (28_000, "remembered")
+
+
+def test_a_remembered_size_equal_to_kilo_s_window_is_kilo_s():
+    """Ticket 149 test 7: a remembered size equal to Kilo's window exactly is
+    not smaller, so the source is ``"kilo"``."""
+    record = _loose_record(last_ok=262_144, grew=1_000)
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=262_144)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (262_144, "kilo")
+
+
+def test_the_next_round_s_overlay_carries_nothing_for_a_loose_small_record(
+        tmp_path, monkeypatch):
+    """Ticket 149 test 1 (overlay half): a loose 33 000 under Kilo's 262 144
+    hands Kilo nothing — intake's window stands, no ``limit`` in the overlay."""
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+    memory = tmp_path / "context-memory.json"
+    assert cm.add(memory, _loose_record()) is True
+    base = _config(tmp_path, memory=memory)
+    config = replace(base, agents=(replace(base.agents[0], context_limit=262_144),))
+    out, content = contest_cli._with_remembered_limits(config, tmp_path / "out" / "149", None)
+    assert out.agents[0].context_limit == 262_144
+    assert content is None
+
+
+def test_a_kc73_loop_guard_a_loose_record_does_not_compact_every_turn(tmp_path):
+    """Ticket 149 test 6: the memory holds a loose 45 000 / 200 000 record and
+    Kilo declares 262 144. Without the fix the record sizes the model at
+    45 000, the runner compacts at 36 000, and every turn (the round prompt
+    alone is 15–20k) earns a compact — KC-73's hy3/agnes failure. With the
+    fix Kilo's window stays in charge: six turns under 80 % of 262 144 compact
+    no more often than every 3 turns, and the run ends READY."""
+    memory = tmp_path / "context-memory.json"
+    assert cm.add(memory, _loose_record(last_ok=45_000, grew=200_000)) is True
+    base = _config(tmp_path, memory=memory, max_rework=5)
+    config = replace(base, agents=(replace(base.agents[0], context_limit=262_144),))
+    fills = [50_000, 55_000, 60_000, 65_000, 70_000, 75_000]
+    turns = []
+    for i, fill in enumerate(fills):
+        on_prompt = tr.work_ready if i == len(fills) - 1 else tr.work_no_test
+        tokens = {"input": fill - 6_000, "cache": {"read": 6_000},
+                  "reasoning": 0, "output": 0}
+        turns.append({"on_prompt": on_prompt, "events": ["busy", "idle"],
+                      "message_info": {"tokens": tokens}})
+    sb, fake, _h, run, _ = tr._run_one(tmp_path, {"turns": turns}, config)
+    tr._assert_ready(run, sb.ws("agent-a"))
+    compacts = sum(1 for turn in run.turns if turn.get("compacted"))
+    assert compacts <= len(run.turns) // 3, (
+        f"{compacts} compacts in {len(run.turns)} turns — the loose record "
+        "locked the model small again")
+    for turn in run.turns:
+        assert turn["context_source"] == "kilo"
+        assert turn["context_size"] == 262_144
+    assert not any(p.endswith("/summarize") for p, _ in _posts(fake))
