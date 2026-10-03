@@ -8,7 +8,7 @@
 **Size:** M
 **Also touches:** tools/contest/runner.py (`_context_budget`), tools/contest/cli.py (`_with_remembered_limits`), tests/test_contest_context_memory.py, tests/test_contest_overflow_wording.py
 
-**Depends on:** ticket 148 (branch `ctx-overflow-fix`). A separate round, started over the commit that lands 148.
+**Depends on:** ticket 148, landed on branch `ctx-overflow-fix` as eb5867d. This round starts over that commit.
 
 Found by all three reviews of 147. Confirmed at c0c9c74: a record `last_ok` 33 000 / `grew` 200 000 under a Kilo window of 262 144 gives `_context_budget` → `(33000, 'remembered')`.
 
