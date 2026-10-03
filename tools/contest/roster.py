@@ -475,7 +475,10 @@ class ContestConfig:
     #: Round 145: seconds between two reads of a running turn's fill, for a
     #: model sized by the memory or the fallback rather than by Kilo; at
     #: ``compact_at_percent`` the turn is stopped and the next prompt compacts.
-    #: 0 = off (the dataclass default, so a config built in code is today's).
+    #: 0 = off. Both defaults stay: this dataclass default is 0, so a config
+    #: built in code is the watch off and the round is unchanged; the ini read
+    #: below and the shipped ``contest.ini`` both default to 10, so a loaded
+    #: round arms it.
     context_watch_sec: float = 0.0
     #: KC-59: how ``prepare_round`` builds each agent's checkout — one of
     #: ``WORKSPACE_KINDS``. ``clone`` (the default) makes a fresh local clone

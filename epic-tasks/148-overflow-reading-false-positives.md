@@ -1,6 +1,6 @@
 # 148 — an overflow is read only from a real size refusal; the in-turn watch stands down once Kilo has the window; `.kilo/` outlives no turn
 
-**Status:** open
+**Status:** landed (branch ctx-overflow-fix, round 148 winner sensenova-6-8-flash-lite-var2)
 **Severity:** HIGH
 **File:** tools/contest/runner.py
 **Symbol:** _SIZE_REFUSAL_RE, _NOT_SIZE_RE, _is_overflow, _is_full_refusal, _context_watch_sec, run_agent._overflow_of, run_agent._remember_overflow, run_agent.context_watch, run_agent._push_remembered_limit

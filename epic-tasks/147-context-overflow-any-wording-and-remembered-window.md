@@ -1,6 +1,6 @@
 # 147 — a context overflow in any provider's words, a remembered window below Kilo's, and a watch inside the turn
 
-**Status:** landed (branch ctx-overflow-fix, 7b4e5f9 + c0c9c74)
+**Status:** fixed on branch ctx-overflow-fix (7b4e5f9 + c0c9c74), not landed on `arena`; 148 fixes its false positives
 **Severity:** HIGH
 **File:** tools/contest/runner.py
 **Symbol:** _is_overflow, _is_full_refusal, _context_budget, run_agent._overflow_of, run_agent.context_watch
@@ -73,7 +73,7 @@ What must not happen, either way: round 144's `deepseek-v4-flash-free` was refus
 - **Why only then:** live, 7.6.2 answers the patch by reloading the workspace's instance (`server.instance.disposed`). A turn, or a compact that Kilo or the runner is running in it, would be cut, and the workspace's `/event` stream ends. The first version sent it right after the overflow: the recovery compact finished in 34 s, the runner never heard it and waited 600 s, and every later wait of that agent was blind.
 - **Reconnecting:** `KiloBackend` reconnects the stream after the patch (`_reconnect_tap`). The old tap sees its end and is stopped; a new tap on the same log waits for `server.connected`. Live, after this fix: disposed → `tap.closed` → `server.connected` within a second, and the continue is heard.
 - **How:** `PATCH /config` for the agent's own workspace, carrying `context_memory.kilo_limit` — the same limit the next round's spawn overlay carries. Each size is sent once.
-- **Keeping the file out of git:** Kilo keeps the patch as `.kilo/kilo.jsonc` in that workspace, so `.kilo/` is added to the worktree's own `info/exclude` first. It is local, never in the agent's diff or commit.
+- **Keeping the file out of git:** Kilo keeps the patch as `.kilo/kilo.jsonc` in that workspace, so `.kilo/` is added to that checkout's `info/exclude` first. `git rev-parse --git-path info/exclude` resolves the repository's *common* exclude — for a linked worktree the file every worktree of that repository shares, not the worktree's own — which is harmless here: the entry is local to the checkout either way, never committed. (Round 148, part B3: the "worktree's own" wording was wrong; also not taken when the checkout already tracks `.kilo/`.)
 - **Other backends:** a backend without the method is skipped.
 - **On failure:** a warning, and the watch below still stands.
 
@@ -95,7 +95,7 @@ What must not happen, either way: round 144's `deepseek-v4-flash-free` was refus
 
 ## Tests
 
-### Offline: `tests/test_contest_overflow_wording.py` (new, 60 cases)
+### Offline: `tests/test_contest_overflow_wording.py` (new, 125 cases after round 148)
 
 1. Size refusals in nine providers' words are overflows. Free tier, wallet, rate limit, quota, key, a bare `Bad Request` and a tool-schema error are not.
 2. A wordless refusal at or past the share is an overflow. It is not one when:

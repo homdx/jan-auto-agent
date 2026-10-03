@@ -2816,6 +2816,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         except (RosterError, OSError) as exc:
             print(f"status: cannot find the round's folder: {exc}", file=sys.stderr)
             return EXIT_FAILED
+    # Round 148: a round of legs writes `<NN>.1 … <NN>.K` and no `<NN>/state.json`;
+    # only the last leg's file is the whole round (revive_round.py's rule), so a
+    # bare round folder with no state of its own reads its highest leg.
+    if not (out_dir / "state.json").is_file():
+        legs = sorted(
+            (int(leg), sibling)
+            for sibling in out_dir.parent.glob(f"{out_dir.name}.*")
+            for stem, dot, leg in [sibling.name.rpartition(".")]
+            if dot and stem == out_dir.name and leg.isdigit() and sibling.is_dir()
+        )
+        if legs:
+            out_dir = legs[-1][1]
+            print(f"status: a round of legs — {out_dir.name}", file=sys.stderr)
     state_path = out_dir / "state.json"
     if not state_path.is_file():
         print(f"status: no {state_path} — nothing to report", file=sys.stderr)

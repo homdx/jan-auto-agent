@@ -86,7 +86,11 @@ __all__ = [
     "ContestBackend",
     "ContestBackendError",
     "KiloBackend",
+    "KiloLimitRefused",
+    "KILO_PROJECT_FILE",
     "OpenRouterBackend",
+    "drop_stale_kilo_file",
+    "tracked_kilo_files",
 ]
 
 _LOG = logging.getLogger(__name__)
@@ -125,6 +129,23 @@ class ContestBackendError(Exception):
     back as ``IdleResult(status="error")`` with ``data.isRetryable`` set, so
     the runner's ``_retryable()`` decides.
     """
+
+
+class KiloLimitRefused(ContestBackendError):
+    """The workspace will not take the model's ``limit`` at all.
+
+    Raised by :meth:`KiloBackend.set_model_limit` when the checkout already
+    tracks ``.kilo/kilo.jsonc`` — the ``PATCH /config`` would rewrite a
+    tracked file and land in the agent's diff, and ``info/exclude`` does
+    nothing there.
+
+    Round 148: the only reason ``set_model_limit`` can refuse, and the only one
+    that will refuse again the same way on the next call. The runner remembers
+    it (`push_refused`) so the check is not re-run for the same size, and a
+    watch that was standing by that refusal stays armed — a window that was
+    never handed to Kilo is exactly what the watch is for. Every other failure
+    is a plain :class:`ContestBackendError`: it is retryable, and the runner
+    does not remember it."""
 
 
 @runtime_checkable
@@ -294,29 +315,108 @@ class ContestBackend(Protocol):
 # Kilo
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _exclude_kilo_dir(directory: str) -> None:
-    """``.kilo/`` in the checkout's ``info/exclude`` (its own, for a worktree),
-    once. Local to that checkout and never committed. A directory that is not
-    a git checkout, or an exclude file that cannot be written, is left alone."""
+#: Round 148: the project config a `PATCH /config` writes into the workspace.
+#: Kilo keeps the patch there, so the file outlives the turn that wrote it.
+KILO_PROJECT_FILE = ".kilo/kilo.jsonc"
+
+#: Round 148: the directories whose ``info/exclude`` already carries ``.kilo/``
+#: — the push is called once per turn and there is no reason to re-run `git` for
+#: one it already did. A directory that failed stays out of this, so a checkout
+#: that appears later is still tried.
+_KILO_EXCLUDED: dict = {}
+
+
+def _git(directory, *args) -> tuple:
+    """One `git` in *directory*: ``(ran, stdout.strip())``.
+
+    ``(False, "")`` on any failure — not a checkout, no `git`, a timeout, a
+    refused tree — so a caller can tell "git answered no" from "git never
+    answered". Never raises: this is a workspace check, not a round step.
+    """
     try:
-        out = subprocess.run(["git", "-C", str(directory), "rev-parse", "--git-path",
-                              "info/exclude"], capture_output=True, text=True, timeout=30)
+        out = subprocess.run(["git", "-C", str(directory), *args],
+                             capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
-        return
-    if out.returncode != 0 or not out.stdout.strip():
-        return
-    path = Path(out.stdout.strip())
-    if not path.is_absolute():
-        path = Path(directory) / path
+        return False, ""
+    return out.returncode == 0, out.stdout.strip()
+
+
+def tracked_kilo_files(directory) -> list:
+    """The ``.kilo`` paths the checkout of *directory* already tracks, by name.
+
+    ``[]`` for every failure: a directory that is not a git checkout, no `git`,
+    a tree that cannot be read. An empty answer here means "nothing to protect",
+    not "nothing is tracked" — the caller that protects (the push) takes the
+    empty answer as a green light, which is the point of the check: a tracked
+    ``.kilo/kilo.jsonc`` makes a `PATCH /config` rewrite a tracked file and
+    land it in the agent's diff, and `info/exclude` does nothing there.
+    """
+    ok, out = _git(directory, "ls-files", ".kilo")
+    if not ok or not out:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def drop_stale_kilo_file(directory) -> bool:
+    """Round 148: delete an *untracked* ``.kilo/kilo.jsonc`` in *directory*.
+
+    ``KILO_PROJECT_FILE`` outlives the turn that wrote it, and a respawned
+    server (`--resume`, `scripts/revive_round.py`) finds it on spawn — so the
+    round deletes its own before the run ends and before the resumed agent's
+    server reads the workspace. Kilo marks the file `configProtected`, which is
+    why the deletion checks the index first: only a file the checkout does not
+    track is this round's, and only that goes.
+
+    True when one was removed; False when there was nothing to do — no file, a
+    tracked one, a directory that is not a checkout, a removal that fails.
+    Never raises: a stale file is a nuisance, not a round.
+    """
+    ok, out = _git(directory, "ls-files", ".kilo")
+    if not ok:
+        return False
+    if KILO_PROJECT_FILE in (line.strip() for line in out.splitlines()):
+        return False
     try:
-        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-        if ".kilo/" in (line.strip() for line in lines):
+        target = Path(directory) / KILO_PROJECT_FILE
+        if not target.is_file():
+            return False
+        target.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _exclude_kilo_dir(directory: str) -> None:
+    """``.kilo/`` in the checkout's ``info/exclude``, once per directory.
+
+    ``git rev-parse --git-path info/exclude`` resolves the repository's *common*
+    exclude — for a linked worktree the file every worktree of that repository
+    shares, not the worktree's own — and that is harmless for ``.kilo/``: the
+    entry is local to the checkout either way and never committed. Local, so a
+    directory that is done is remembered and no `git` runs again for it. A
+    directory that is not a git checkout, or an exclude file that cannot be
+    written, is left alone.
+    """
+    key = str(directory)
+    if _KILO_EXCLUDED.get(key):
+        return
+    ok, rel = _git(directory, "rev-parse", "--git-path", "info/exclude")
+    if not ok or not rel:
+        return
+    path = Path(rel)
+    if not path.is_absolute():
+        path = Path(directory) / rel
+    try:
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        if ".kilo/" in (line.strip() for line in text.splitlines()):
+            _KILO_EXCLUDED[key] = True
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
-            if lines and not path.read_text(encoding="utf-8").endswith("\n"):
+            if text and not text.endswith("\n"):
                 fh.write("\n")
             fh.write(".kilo/\n")
+        _KILO_EXCLUDED[key] = True
     except OSError:
         return
 
@@ -385,9 +485,31 @@ class KiloBackend:
     def set_model_limit(self, provider_id: str, model_id: str, limit: dict) -> None:
         """Round 145: the model's ``limit`` for this workspace, at once (see
         `KiloClient.set_model_limit`). Kilo writes it to ``.kilo/kilo.jsonc`` in
-        the workspace, so ``.kilo/`` goes into the worktree's own
-        ``info/exclude`` first — never a file in the agent's tree, its diff or
-        its commit. Raises `ContestBackendError`; the caller logs and goes on."""
+        the workspace, so ``.kilo/`` goes into the checkout's ``info/exclude``
+        first — never a file in the agent's tree, its diff or
+        its commit.
+
+        Round 148: not when the checkout already **tracks** ``.kilo/``. There
+        ``info/exclude`` does nothing — the patch would rewrite a tracked file
+        and land in the agent's diff. The push is then refused with a warning
+        *and* :class:`KiloLimitRefused`: a silent return would look to the
+        caller like a window Kilo now holds, and the runner's in-turn watch —
+        the fallback for exactly a window that was not handed over — would stand
+        down for a turn Kilo still sizes by its own 131 072. The refusal is
+        structural and cannot change between calls, so the caller remembers it.
+
+        Raises `ContestBackendError`, the tracked case as
+        `KiloLimitRefused`; the caller logs and goes on, with its watch still
+        armed."""
+        tracked = tracked_kilo_files(self._directory)
+        if tracked:
+            shown = ", ".join(tracked[:3]) + (" …" if len(tracked) > 3 else "")
+            _LOG.warning("%s: the workspace tracks %s — the remembered window is "
+                         "not handed to Kilo: the patch would land in the agent's diff",
+                         self._directory, shown)
+            raise KiloLimitRefused(
+                f"the workspace tracks {shown} — the patch would rewrite it and land "
+                "in the agent's diff")
         _exclude_kilo_dir(self._directory)
         try:
             self._client.set_model_limit(provider_id, model_id, limit)
