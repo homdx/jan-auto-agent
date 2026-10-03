@@ -615,7 +615,7 @@ def min_window(config) -> int:
         return DEFAULT_MIN_WINDOW
     try:
         out = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # inf has no int
         return DEFAULT_MIN_WINDOW
     return out if out >= 0 else DEFAULT_MIN_WINDOW
 

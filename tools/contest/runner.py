@@ -583,7 +583,8 @@ _RETRYABLE_CODES = frozenset({
     "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET",
 })
 _RETRYABLE_MSG_RE = re.compile(
-    r"429|502|503|504|overloaded|rate limit|timeout"
+    # a status code standing alone: `req_429ab503`, a request id, is no 429
+    r"(?<!\w)(?:429|502|503|504)(?!\w)|overloaded|rate limit|timeout"
     r"|interrupted the response|upstream unavailable", re.IGNORECASE
 )
 
@@ -737,6 +738,22 @@ REPEAT_OVERFLOW_SHARE = 0.5
 #: key, 429 the rate, 5xx the provider itself, 422 a schema — none of them a
 #: size, and none of them may teach the memory.
 _SIZE_REFUSAL_STATUSES = (400, 413)
+
+#: A 400 that names its own cause names one that is not the session's size: a
+#: body that is not JSON, a tool call or a schema the model got wrong, a
+#: safety filter. Only the wordless reading (`_is_full_refusal`) asks — a
+#: message with size words is the wording path's, and TGI's ``Input validation
+#: error: … tokens must be <= 4096`` is a real overflow there; a message that
+#: counts tokens (`_TOKENS_RE`) is never vetoed by it.
+_REQUEST_FAULT_RE = re.compile(
+    r"\bjson\b|tool[\s_-]*call|function[\s_-]*call|\bschema\b|invalid\s+(?:argument|parameter|request\s+format)"
+    r"|content[\s_-]*(?:policy|filter|management)|moderation|\bflagged\b|\bsafety\b"
+    r"|validation\s+error|is\s+required|unexpected\s+(?:end|token|property)",
+    re.IGNORECASE,
+)
+_CONTEXT_WALL_RE = re.compile(r"\bcontext\s+(?:limit|length|window|size)\b", re.IGNORECASE)
+_OUTPUT_CAP_RE = re.compile(r"`?max_tokens`?|output\s+tokens", re.IGNORECASE)
+_TOKENS_RE = re.compile(r"\btokens?\b", re.IGNORECASE)
 
 #: KC-56: a reply cut off at ``finish: "length"`` whose tokens reach this share
 #: of the model's ``limit.context`` filled the context window rather than the
@@ -952,7 +969,13 @@ def _error_texts(error) -> str:
 
 
 def _not_a_size(text: str, quota_re=None) -> bool:
-    """Money, a plan, a key or a rate (`_NOT_SIZE_RE`, *quota_re*) — never an overflow."""
+    """Money, a plan, a key or a rate (`_NOT_SIZE_RE`, *quota_re*) — never an overflow.
+
+    An output cap named beside the context wall (`_CONTEXT_WALL_RE`) is a term of
+    the sum, not the refusal: ``input length and `max_tokens` exceed context
+    limit: 188240 + 21333 > 200000`` is an overflow."""
+    if _CONTEXT_WALL_RE.search(text) is not None:
+        text = _OUTPUT_CAP_RE.sub(" ", text)
     if _NOT_SIZE_RE.search(text):
         return True
     return quota_re is not None and quota_re.search(text) is not None
@@ -980,6 +1003,11 @@ def _is_overflow(error, quota_re=None) -> bool:
     text = _error_texts(error)
     if _OVERFLOW_RE.search(text) is not None:
         return True
+    data = error.get("data") if isinstance(error, dict) else None
+    status = data.get("statusCode") if isinstance(data, dict) else None
+    if status is not None and status not in _SIZE_REFUSAL_STATUSES:
+        # a size's words on a rate's or the provider's status: `_overflow_of` agrees
+        return False
     return _SIZE_REFUSAL_RE.search(text) is not None and not _not_a_size(text, quota_re)
 
 
@@ -1027,6 +1055,8 @@ def _is_full_refusal(error, last_ok: int, size, quota_re=None,
         return False
     text = _error_texts(error)
     if _not_a_size(text, quota_re):
+        return False
+    if _REQUEST_FAULT_RE.search(text) is not None and _TOKENS_RE.search(text) is None:
         return False
     # A size word the wording path looked for and declined is not the session's
     # size: a body, a display or an output. This reading exists for the message
@@ -5115,6 +5145,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         # cap, and nothing was remembered for it.
         requested = last_ok + (grew or 0)
         floor = context_memory.min_window(config)
+        declared = getattr(spec, "context_limit", None)
+        share = context_memory.full_refusal_percent(config) / 100.0
+        if isinstance(declared, int) and not isinstance(declared, bool) \
+                and declared > 0 and share > 0:
+            # round 149, as `context_memory.size_of`: a model Kilo declares at
+            # 32 768 and refuses at 28 000 is full, not a plan's cap
+            floor = min(floor, int(share * declared))
         if not last_ok or (floor and requested < floor):
             # nothing went through yet, whatever the floor: a refusal of the
             # session's first request cannot have filled a context
@@ -5123,7 +5160,6 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                       _brief(_error_message(error)), f"{last_ok:,}",
                       f"{floor:,}")
             return False
-        share = context_memory.full_refusal_percent(config) / 100.0
         worded = _SIZE_REFUSAL_RE.search(text) is not None
         if worded:
             how = "read as a context overflow"
