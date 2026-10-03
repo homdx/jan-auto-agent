@@ -14,6 +14,7 @@ values, and the calls are faked.
 
 from __future__ import annotations
 
+import re
 import argparse
 import shutil
 import subprocess
@@ -1254,3 +1255,51 @@ def test_cmd_draft_refuses_a_review_profile_that_does_not_resolve(collected, tmp
     code = contest_cli.cmd_draft(_args(collected, roster=roster))
     assert code == contest_cli.EXIT_FAILED
     assert "draft_review_llm_profile = no_such_section" in capsys.readouterr().err
+
+
+# ── AR-7: draft_ticket(out_dir=) and draft_callables ─────────────────────────
+
+def test_out_dir_takes_the_ticket_and_the_rejected_copy(collected, tmp_path):
+    """`out_dir=` is where `<NN>-<slug>.md` and a refused `.rejected.md` land; `epic-tasks/` is untouched."""
+    drafts = tmp_path / ".arena" / "drafts"
+    tasks = collected / draft_mod.TASKS_DIR
+    before = sorted(p.name for p in tasks.glob("*")) if tasks.exists() else None
+    ok = draft_mod.draft_ticket(BRIEF, repo=collected, round_no=1, out_dir=drafts,
+                                llm_call=lambda p: ticket_text())
+    assert not ok.rejected and ok.path.parent == drafts and ok.path.is_file()
+    bad = draft_mod.draft_ticket(BRIEF, repo=collected, round_no=2, out_dir=drafts,
+                                 llm_call=lambda p: "garbage")
+    assert bad.rejected and bad.rejected_path.parent == drafts
+    assert bad.rejected_path.name.endswith(draft_mod.REJECTED_SUFFIX)
+    assert (sorted(p.name for p in tasks.glob("*")) if tasks.exists() else None) == before
+
+
+def test_out_wins_over_out_dir_and_commit_is_refused_with_it(collected, tmp_path):
+    """`out=` beats `out_dir=`; `commit=True` with `out_dir=` is a `ValueError`."""
+    target = tmp_path / "chosen.md"
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, round_no=1, out=target,
+                                    out_dir=tmp_path / "other", llm_call=lambda p: ticket_text())
+    assert result.path == target and not (tmp_path / "other").exists()
+    with pytest.raises(ValueError):
+        draft_mod.draft_ticket(BRIEF, repo=collected, out_dir=tmp_path / "other",
+                               commit=True, llm_call=lambda p: ticket_text())
+
+
+def test_draft_callables_refusals_carry_cmd_drafts_text(tmp_path):
+    """Each refusal raises `DraftSetupError`, the text `cmd_draft` prints after `draft: `."""
+    from tools.contest import roster as roster_mod
+    ok = roster_mod.load_roster(_roster(tmp_path))
+    llm_call, review_call = contest_cli.draft_callables(ok, False)
+    assert callable(llm_call) and callable(review_call)
+    assert contest_cli.draft_callables(ok, True)[1] is None
+    cases = [
+        (dict(with_draft=False), "[contest] draft_llm_profile is not set"),
+        (dict(with_gate=False), "[contest] gate_llm_profile is not set"),
+        (dict(gate_model="stub/draft"), "the review model is the draft model (stub/draft)"),
+    ]
+    for kwargs, text in cases:
+        sub = tmp_path / str(len(text))
+        sub.mkdir()
+        config = roster_mod.load_roster(_roster(sub, **kwargs))
+        with pytest.raises(contest_cli.DraftSetupError, match=re.escape(text)):
+            contest_cli.draft_callables(config, False)

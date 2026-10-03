@@ -909,7 +909,8 @@ def _review_rounds(text, brief, *, prompt, llm_call, review_call, rounds,
 def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
                  collect_fn: Optional[Callable] = None, write: bool = True,
                  format_spec: str = None, review_call: Optional[Callable] = None,
-                 review_rounds=None, commit: bool = False) -> DraftResult:
+                 review_rounds=None, commit: bool = False,
+                 out_dir=None) -> DraftResult:
     """One brief, one collect run, one ticket — drafted, reviewed, committed.
 
     *llm_call* is a callable taking the prompt text and returning the draft — a
@@ -926,6 +927,14 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     KC-79's: lint and stop. *review_rounds* may also be given outright, which
     wins over the config.
 
+    *out_dir* (AR-7) is the folder the default `<NN>-<slug>.md`, and a refused
+    draft's `.rejected.md`, are written into instead of `epic-tasks/`; *out*
+    still wins over it. A draft outside `epic-tasks/` is never committed, so
+    `commit=True` with *out_dir* is a `ValueError`. The slug comes from the
+    ticket's own title, known only after the model answers — which is why the
+    caller cannot write the file itself. The lint's "round is taken" check keeps
+    reading `epic-tasks/`.
+
     *commit* is KC-80's third step: `commit_ticket` on `LEG_BRANCH` in *repo*.
     A repo with uncommitted tracked changes is refused before the first LLM call,
     because a draft that cannot be committed should not burn the calls to be
@@ -939,6 +948,9 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     """
     if not isinstance(brief, str) or not brief.strip():
         raise ValueError("draft_ticket: the brief is empty")
+    if out_dir is not None and commit:
+        raise ValueError("draft_ticket: out_dir and commit do not go together — "
+                         "a draft outside epic-tasks/ is never committed")
 
     repo = Path(repo)
     tasks_dir = repo / TASKS_DIR
@@ -990,7 +1002,8 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
             rounds=review_rounds, artifact=artifact, repo=repo, tasks_dir=tasks_dir,
             number=number)
 
-    target = Path(out) if out else tasks_dir / f"{number:02d}-{slug_for(title_of(text), round_no=number)}.md"
+    folder = Path(out_dir) if out_dir is not None else tasks_dir
+    target = Path(out) if out else folder / f"{number:02d}-{slug_for(title_of(text), round_no=number)}.md"
     if problems:
         rejected_path = _write(target.with_name(target.stem + REJECTED_SUFFIX), text) if write else None
         return DraftResult(path=None, rejected=True, problems=tuple(problems),
