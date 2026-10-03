@@ -315,7 +315,7 @@ def test_view_json(repo, capsys):
 
 
 # 7
-@pytest.mark.parametrize("verb", ["create", "land"])
+@pytest.mark.parametrize("verb", ["land"])
 def test_other_issue_verbs_unimplemented(repo, capsys, verb):
     args = ["issue", verb, "x"] if verb == "create" else ["issue", verb, "21"]
     rc, _, err = run(capsys, *args)

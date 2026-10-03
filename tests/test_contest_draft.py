@@ -1254,3 +1254,56 @@ def test_cmd_draft_refuses_a_review_profile_that_does_not_resolve(collected, tmp
     code = contest_cli.cmd_draft(_args(collected, roster=roster))
     assert code == contest_cli.EXIT_FAILED
     assert "draft_review_llm_profile = no_such_section" in capsys.readouterr().err
+
+
+# ── AR-7: draft_ticket(out_dir=) and draft_callables ─────────────────────────
+
+def test_draft_ticket_out_dir(collected, tmp_path):
+    """The ticket and a refused draft's `.rejected.md` land in out_dir; epic-tasks/ is untouched."""
+    shutil.rmtree(collected / "epic-tasks")
+    drafts = tmp_path / ".arena" / "drafts"
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(round_no=5),
+                                    round_no=5, out_dir=drafts, collect_fn=lambda r: None)
+    assert not result.rejected and result.path.parent == drafts
+    refused = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: "garbage",
+                                     round_no=6, out_dir=drafts, collect_fn=lambda r: None)
+    assert refused.rejected and refused.rejected_path.parent == drafts
+    assert not (collected / "epic-tasks").exists()
+    out = tmp_path / "given.md"
+    won = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(round_no=7),
+                                 round_no=7, out=out, out_dir=drafts, collect_fn=lambda r: None)
+    assert won.path == out
+    with pytest.raises(ValueError):
+        draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(),
+                               round_no=8, out_dir=drafts, commit=True)
+
+
+@pytest.mark.parametrize("edit,needle", [
+    (lambda t: t.replace("draft_llm_profile = draft_model\n", ""), "draft_llm_profile is not set"),
+    (lambda t: t.replace("draft_llm_profile = draft_model", "draft_llm_profile = nosuch"),
+     "draft_llm_profile = nosuch does not resolve"),
+    (lambda t: t.replace("gate_llm_profile = gate_model\n", ""), "gate_llm_profile is not set"),
+    (lambda t: t.replace("model = stub/gate", "model = stub/draft"),
+     "the review model is the draft model"),
+    (lambda t: t.replace("[contest]\n", "[contest]\ndraft_review_llm_profile = nosuch\n", 1),
+     "draft_review_llm_profile = nosuch does not resolve"),
+])
+def test_draft_callables_refusals(tmp_path, collected, monkeypatch, capsys, edit, needle):
+    """Each refusal is a DraftSetupError with the text `cmd_draft` prints after `draft: `."""
+    from tools.contest.roster import load_roster
+    roster = _roster(tmp_path)
+    roster.write_text(edit(roster.read_text()))
+    called = []
+    monkeypatch.setattr(draft_mod, "llm_call_for", lambda *a, **k: called.append(a))
+    with pytest.raises(contest_cli.DraftSetupError) as err:
+        contest_cli.draft_callables(load_roster(roster), False)
+    assert needle in str(err.value) and called == []
+    assert contest_cli.cmd_draft(_args(collected, roster=roster)) == contest_cli.EXIT_FAILED
+    assert capsys.readouterr().err.strip() == f"draft: {err.value}"
+
+
+def test_draft_callables_no_review(tmp_path, monkeypatch):
+    from tools.contest.roster import load_roster
+    roster = _roster(tmp_path, with_gate=False)
+    monkeypatch.setattr(draft_mod, "llm_call_for", lambda s, system=None: "writer")
+    assert contest_cli.draft_callables(load_roster(roster), True) == ("writer", None)

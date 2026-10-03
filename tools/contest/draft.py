@@ -909,7 +909,8 @@ def _review_rounds(text, brief, *, prompt, llm_call, review_call, rounds,
 def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
                  collect_fn: Optional[Callable] = None, write: bool = True,
                  format_spec: str = None, review_call: Optional[Callable] = None,
-                 review_rounds=None, commit: bool = False) -> DraftResult:
+                 review_rounds=None, commit: bool = False,
+                 out_dir=None) -> DraftResult:
     """One brief, one collect run, one ticket — drafted, reviewed, committed.
 
     *llm_call* is a callable taking the prompt text and returning the draft — a
@@ -936,9 +937,16 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     its problem list and saves the last draft as `.rejected.md` next to the
     output — never written to `epic-tasks/` under a number that is supposed to be
     free, and never committed.
+
+    *out_dir* (AR-7) is the folder the default `<NN>-<slug>.md` — and a refused
+    draft's `.rejected.md` — land in instead of `epic-tasks/`; *out* still wins.
+    A draft outside `epic-tasks/` is never committed, so `commit=True` with it is
+    a `ValueError`. The lint's "round is taken" check keeps reading `epic-tasks/`.
     """
     if not isinstance(brief, str) or not brief.strip():
         raise ValueError("draft_ticket: the brief is empty")
+    if commit and out_dir is not None:
+        raise ValueError("draft_ticket: a draft written to out_dir is never committed")
 
     repo = Path(repo)
     tasks_dir = repo / TASKS_DIR
@@ -990,7 +998,7 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
             rounds=review_rounds, artifact=artifact, repo=repo, tasks_dir=tasks_dir,
             number=number)
 
-    target = Path(out) if out else tasks_dir / f"{number:02d}-{slug_for(title_of(text), round_no=number)}.md"
+    target = Path(out) if out else Path(out_dir or tasks_dir) / f"{number:02d}-{slug_for(title_of(text), round_no=number)}.md"
     if problems:
         rejected_path = _write(target.with_name(target.stem + REJECTED_SUFFIX), text) if write else None
         return DraftResult(path=None, rejected=True, problems=tuple(problems),

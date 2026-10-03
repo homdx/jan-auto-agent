@@ -279,6 +279,17 @@ def _issue_view_arguments(p: argparse.ArgumentParser) -> None:
     _late_globals(p, "p", "o")
 
 
+def _issue_create_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("text", nargs="?", help="the brief, or the task for the --file material")
+    p.add_argument("--file", action="append", metavar="PATH",
+                   help="material for the brief (repeatable; relative to the repo)")
+    p.add_argument("--item", metavar="ID", help="only the `ID` section of the one --file")
+    p.add_argument("--number", metavar="NN", help="the ticket number (default: max + 1)")
+    p.add_argument("--no-review", action="store_true", help="skip the second model's review")
+    p.add_argument("--branch", help="integration branch (default: profile's branch, then HEAD)")
+    _late_globals(p, "p", "o")
+
+
 def _issue_profile(args: argparse.Namespace):
     profiles, active = _load(args)
     return profiles.get(active, {})
@@ -298,6 +309,14 @@ def _issue_view(args: argparse.Namespace) -> int:
     except profile.ProfileError as err:
         return output.refuse(str(err))
     return tickets.issue_view(REPO_ROOT, args, prof)
+
+
+def _issue_create(args: argparse.Namespace) -> int:
+    try:
+        prof = _issue_profile(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    return tickets.issue_create(REPO_ROOT, args, prof)
 
 
 # ── AR-59: model available / use / drop ──────────────────────────────────────
@@ -410,7 +429,8 @@ OBJECTS: dict[str, Object] = {
     "issue": Object(
         "tickets: draft, list, view, land",
         {
-            "create": Verb("draft a ticket from a brief", "AR-7"),
+            "create": Verb("draft a ticket from a brief", "AR-7",
+                           add_arguments=_issue_create_arguments, handler=_issue_create),
             "list": Verb("list tickets and their state", "AR-6",
                          add_arguments=_issue_list_arguments, handler=_issue_list),
             "view": Verb("show one ticket", "AR-6",
