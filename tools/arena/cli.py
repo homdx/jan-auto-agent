@@ -157,6 +157,19 @@ def _profile_view(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ── AR-4: run view ───────────────────────────────────────────────────────────
+def _run_view_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("round", help="round number NN or leg NN.K")
+
+
+def _run_view(args: argparse.Namespace) -> int:
+    try:
+        rounds.load_config(REPO_ROOT)
+    except rounds.RoundError as err:
+        return output.refuse(str(err))
+    return rounds.run_view(REPO_ROOT, args)
+
+
 # ── AR-3: run start / run list ───────────────────────────────────────────────
 def _run_start_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("ticket", type=int, help="the ticket's round number NN")
@@ -299,7 +312,12 @@ OBJECTS: dict[str, Object] = {
             ),
             "list": Verb("list rounds", "AR-3", add_arguments=lambda p: None,
                          handler=_run_list),
-            "view": Verb("show a round or one leg", "AR-4"),
+            "view": Verb(
+                "show a round or one leg",
+                "AR-4",
+                add_arguments=_run_view_arguments,
+                handler=_run_view,
+            ),
             "rerun": Verb("rerun failed or named agents", "AR-5"),
         },
     ),

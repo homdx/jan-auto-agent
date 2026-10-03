@@ -403,6 +403,87 @@ def list_rows(repo: Path, config, now: Optional[float] = None,
 LIST_COLUMNS = ["RUN", "LEGS", "STATE", "AGE", "READY/TOTAL"]
 
 
+# ── AR-4: run view ────────────────────────────────────────────────────────────
+_VIEW_ARG_RE = re.compile(r"^(\d+)(?:\.(\d+))?$")
+
+
+def _parse_view_arg(text: str) -> tuple[int, Optional[int]]:
+    m = _VIEW_ARG_RE.match(text)
+    if not m:
+        raise RoundError(f"bad round argument {text!r} — use NN or NN.K")
+    return int(m.group(1)), (int(m.group(2)) if m.group(2) is not None else None)
+
+
+def _token_total(tokens: object) -> int:
+    """Sum input + output + reasoning from a tokens dict; 0 when missing."""
+    if not isinstance(tokens, dict):
+        return 0
+    return sum(tokens.get(k, 0) or 0 for k in ("input", "output", "reasoning"))
+
+
+def run_view(repo: Path, args: argparse.Namespace) -> int:
+    """`arena run view NN[.K]`: print the header and the agent table."""
+    repo = Path(repo)
+    try:
+        config = load_config(repo)
+        nn, leg = _parse_view_arg(args.round)
+    except RoundError as err:
+        return output.refuse(str(err))
+
+    folder = round_folder(repo, config, nn, leg=leg)
+    state_path = folder / "state.json"
+
+    if not state_path.is_file():
+        print(output.scrub(f"arena: no round {nn} (looked in {folder})"), file=sys.stderr)
+        return EXIT_FAILED
+
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("agents"), list):
+            raise ValueError("missing agents list")
+        agents = data["agents"]
+    except (ValueError, OSError) as err:
+        print(output.scrub(f"arena: {state_path}: {err}"), file=sys.stderr)
+        return EXIT_FAILED
+
+    if args.output == "json":
+        rows = [
+            {
+                "agent": a.get("agent", ""),
+                "state": a.get("state", ""),
+                "attempt": a.get("attempt", 0),
+                "tokens": _token_total(a.get("tokens")),
+                "commit": (a.get("commit") or "")[:12],
+            }
+            for a in agents
+        ]
+        output.emit(rows, ["agent", "state", "attempt", "tokens", "commit"], args.output)
+        return EXIT_OK
+
+    base_folder = contest_cli._round_out_dir(repo, config, nn)
+    actual_legs = leg_folders(base_folder)
+    n_legs = len(actual_legs)
+
+    shown_leg = leg
+    if shown_leg is None and actual_legs and not (base_folder / "state.json").is_file():
+        m = _ROUND_DIR.match(folder.name)
+        shown_leg = int(m.group(2) or 0) if m else None
+
+    alive = round_alive(repo, nn, PROC_ROOT)
+    base_sha = (data.get("base_sha") or "?")[:7] or "?"
+    status = "running" if alive else "done"
+
+    if n_legs and shown_leg is not None:
+        header = f"round {nn} · leg {shown_leg}/{n_legs} · {status} · base {base_sha}"
+    else:
+        header = f"round {nn} · {status} · base {base_sha}"
+    print(header)
+
+    return contest_cli.cmd_status(
+        argparse.Namespace(ticket=nn, out=str(folder), roster=contest_cli.DEFAULT_ROSTER)
+    )
+
+
 def run_list(repo: Path, args: argparse.Namespace) -> int:
     """`arena run list`: the table, or exit 3 with one stderr line for no rounds."""
     try:
