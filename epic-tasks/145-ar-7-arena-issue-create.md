@@ -1,6 +1,6 @@
 # AR-7 — `arena issue create`: a ticket drafted from a brief, a file or one epic item, into `.arena/drafts/`, no branch, no commit
 
-**Status:** open
+**Status:** queued (round 145 ran on arena; judged there, not on this branch)
 **Severity:** LOW
 **File:** tools/arena/tickets.py
 **Symbol:** issue_create, next_number, build_brief

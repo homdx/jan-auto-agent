@@ -1,6 +1,6 @@
 # 147 — a context overflow in any provider's words, a remembered window below Kilo's, and a watch inside the turn
 
-**Status:** open
+**Status:** landed (branch ctx-overflow-fix, 7b4e5f9 + c0c9c74)
 **Severity:** HIGH
 **File:** tools/contest/runner.py
 **Symbol:** _is_overflow, _is_full_refusal, _context_budget, run_agent._overflow_of, run_agent.context_watch
