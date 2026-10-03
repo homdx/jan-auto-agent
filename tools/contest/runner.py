@@ -200,6 +200,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -216,7 +217,8 @@ from typing import Callable
 
 from tools.backoff import save_state
 from tools.contest import context_memory
-from tools.contest.backend import ContestBackend, ContestBackendError
+from tools.contest.backend import (ContestBackend, ContestBackendError, KiloLimitRefused,
+                                  drop_stale_kilo_file)
 from tools.contest.gates import DEADLINE_COMMIT_EMAIL, declared_files, git
 from tools.contest.harvest import harvest, rework_message
 from tools.contest.kilo_client import (
@@ -581,7 +583,8 @@ _RETRYABLE_CODES = frozenset({
     "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET",
 })
 _RETRYABLE_MSG_RE = re.compile(
-    r"429|502|503|504|overloaded|rate limit|timeout"
+    # a status code standing alone: `req_429ab503`, a request id, is no 429
+    r"(?<!\w)(?:429|502|503|504)(?!\w)|overloaded|rate limit|timeout"
     r"|interrupted the response|upstream unavailable", re.IGNORECASE
 )
 
@@ -646,6 +649,111 @@ _PROVIDER_REJECTED_RE = re.compile(
 _OVERFLOW_RE = re.compile(
     r"ContextOverflowError|maximum context length|context_length_exceeded", re.IGNORECASE
 )
+
+#: A request refused for its size, in whatever words the provider picked. The
+#: three spellings above are the ones Kilo and OpenAI-shaped gateways use; the
+#: rest of the providers each have their own (round 145's zai: ``Prompt exceeds
+#: max length``, a 400 with no name), and a list of exact strings is one more
+#: entry per new provider. So the shape is matched instead: a thing that has a
+#: size — the prompt, the context, the input, the tokens — and a word that says
+#: it is past one, in either order, within one clause.
+#:
+#: The heads stay narrow: ``request``, ``message`` and ``conversation`` are
+#: dropped because a gateway says ``Request too large`` for a rate cap,
+#: ``Request entity too large`` for a body, ``Request timed out`` for a timeout,
+#: and ``Your error message is too large to display`` for neither. ``exceed``
+#: alone is dropped the other way — it requires a size noun, so
+#: ``max_tokens exceeds the model's maximum output tokens`` (an output cap a
+#: compact cannot fix) stays out on its own. A bare ``too large`` keeps Groq's
+#: ``Request too large for model`` without a head, because the provider says
+#: the request is too large *for the model* — and it needs the same noun, so
+#: ``too large to display`` stays out.
+_SIZE_REFUSAL_RE = re.compile(
+    r"\b(?:prompt|context|input)s?\b[^.\n]{0,60}?"
+    r"(?:\btoo\s+(?:long|large|big)\b|\bexceed\w*|\bover\s+the\s+(?:max\w*|limit)\b"
+    r"|\blonger\s+than\s+(?:the\s+)?(?:max\w*|limit|context|allowed\s+length)\b)"
+    r"|\bexceed\w*\b[^.\n]{0,40}?\b(?:context|length|size|tokens?)\b"
+    r"|\btoo\s+(?:long|large|big)\b[^.\n]{0,40}?\b(?:context|length|size|tokens?|model)\b"
+    r"|\btoo\s+many\s+(?:input\s+|prompt\s+)?tokens\b",
+    re.IGNORECASE,
+)
+
+#: What a size refusal never is: money, a plan, a key or a rate — and the other
+#: refusals that carry the size words too. ``rate limit exceeded`` and
+#: ``exceeded your quota`` carry them, and orcarrouter's free tier says ``This
+#: prompt is longer than the free tier allows`` — a plan's cap the next prompt
+#: hits again however small the session is, so it stays the quota it is (round
+#: 144's deepseek-free) and is never remembered as the model's window.
+#:
+#: The same goes for the rest of the refusals a gateway answers with a status:
+#: a rate cap names tokens per minute, a gateway times out, an upload limit
+#: speaks of an entity or a body, an output cap names ``max_tokens``, an
+#: attachment cap names images and a plan's allowance names a budget. Each is
+#: matched as a phrase, not a bare word — a real overflow can say ``the file
+#: you sent pushed the prompt past 131072 tokens``, and a lone ``file``,
+#: ``body`` or ``queue`` may not veto it. ``wallet`` and ``recharge`` are not
+#: here: they are one provider's phrases and belong in ``quota_patterns``
+#: (KC-61), where the committed ``contest.ini`` already has them.
+_NOT_SIZE_RE = re.compile(
+    r"rate.?limit|too\s+many\s+requests|quota|credit|balance|payment"
+    r"|free.?tier|unauthori[sz]ed|forbidden|api.?key"
+    r"|per\s+(?:min|minute|hour|day)|\bTPM\b|\bRPM\b"
+    r"|timed?\s*out|deadline\s+exceeded|time\s+limit|overloaded|queue\s+exceeded"
+    r"|entity\s+too\s+large|body\s+(?:exceeds|too)"
+    r"|max_tokens|output\s+tokens"
+    r"|\bimages?\b|attachment"
+    r"|token\s+budget|budget\s+exceeded|allowance",
+    re.IGNORECASE,
+)
+
+#: The size verbs `_SIZE_REFUSAL_RE` hunts for, alone of their head and noun.
+#: A1 left ``Your error message is too large to display`` out of the wording
+#: path on purpose: a bare ``too large`` needs the model's own noun, and a
+#: display is not one. The inferred reading must agree — it takes a message
+#: the wording path found size words in and declined, and the size there was
+#: the response's, a body's or an output's, never the session's.
+_SIZE_VERB_RE = re.compile(
+    r"\btoo\s+(?:long|large|big)\b|\bexceed\w*\b|\bover\s+the\s+(?:max\w*|limit)\b"
+    r"|\btoo\s+many\s+(?:input\s+|prompt\s+)?tokens\b",
+    re.IGNORECASE,
+)
+
+#: A provider refusal with no size words at all is still read as an overflow
+#: when the session it refused already holds at least this share of the
+#: model's known window: the session worked, it grew, and the request it grew
+#: into was turned away. The same percent also gates a loose memory record
+#: (round 149: `context_memory.size_of`). The round's own number is ``[contest]
+#: context_full_refusal_percent`` (`context_memory.full_refusal_percent`); this
+#: is its default, for a caller with no config.
+FULL_REFUSAL_SHARE = context_memory.DEFAULT_FULL_REFUSAL_PERCENT / 100.0
+
+#: A second overflow in one run whose request was smaller than this share of the
+#: first one's is not the window again: the compact (or the fresh session)
+#: left far less than the wall, and the provider still refused — so the
+#: refusal is about something else, and another compact would only loop.
+REPEAT_OVERFLOW_SHARE = 0.5
+
+#: The statuses a provider refuses a request's *size* with: a 400 that turned
+#: the request away and a 413, which is literally a size status. 401/403 are the
+#: key, 429 the rate, 5xx the provider itself, 422 a schema — none of them a
+#: size, and none of them may teach the memory.
+_SIZE_REFUSAL_STATUSES = (400, 413)
+
+#: A 400 that names its own cause names one that is not the session's size: a
+#: body that is not JSON, a tool call or a schema the model got wrong, a
+#: safety filter. Only the wordless reading (`_is_full_refusal`) asks — a
+#: message with size words is the wording path's, and TGI's ``Input validation
+#: error: … tokens must be <= 4096`` is a real overflow there; a message that
+#: counts tokens (`_TOKENS_RE`) is never vetoed by it.
+_REQUEST_FAULT_RE = re.compile(
+    r"\bjson\b|tool[\s_-]*call|function[\s_-]*call|\bschema\b|invalid\s+(?:argument|parameter|request\s+format)"
+    r"|content[\s_-]*(?:policy|filter|management)|moderation|\bflagged\b|\bsafety\b"
+    r"|validation\s+error|is\s+required|unexpected\s+(?:end|token|property)",
+    re.IGNORECASE,
+)
+_CONTEXT_WALL_RE = re.compile(r"\bcontext\s+(?:limit|length|window|size)\b", re.IGNORECASE)
+_OUTPUT_CAP_RE = re.compile(r"`?max_tokens`?|output\s+tokens", re.IGNORECASE)
+_TOKENS_RE = re.compile(r"\btokens?\b", re.IGNORECASE)
 
 #: KC-56: a reply cut off at ``finish: "length"`` whose tokens reach this share
 #: of the model's ``limit.context`` filled the context window rather than the
@@ -842,18 +950,9 @@ def _retryable(error, finished: int = 0) -> bool:
     return False
 
 
-def _is_overflow(error) -> bool:
-    """True when *error* is a context overflow (KC-54).
-
-    An overflow has filled the session's context, so a prompt into the *same*
-    session overflows again: the runner opens a fresh session for the work
-    instead of retrying, and a clean tree is a stall rather than a crash.
-    True when ``name`` is ``"ContextOverflowError"``, or when ``data.message``
-    (or a top-level ``message``) carries ``"maximum context length"`` or
-    ``"context_length_exceeded"``. A plain string matches on any of those
-    three. A payload that is not a dict, or carries none of them, is not an
-    overflow — ``None`` and ``{}`` are False.
-    """
+def _error_texts(error) -> str:
+    """``name``, ``data.message`` and a top-level ``message`` of *error*, joined
+    by spaces; a plain string is itself; anything else is ``""``."""
     parts = []
     if isinstance(error, str):
         parts.append(error)
@@ -866,7 +965,105 @@ def _is_overflow(error) -> bool:
             parts.append(data["message"])
         if isinstance(error.get("message"), str):
             parts.append(error["message"])
-    return _OVERFLOW_RE.search(" ".join(parts)) is not None
+    return " ".join(parts)
+
+
+def _not_a_size(text: str, quota_re=None) -> bool:
+    """Money, a plan, a key or a rate (`_NOT_SIZE_RE`, *quota_re*) — never an overflow.
+
+    An output cap named beside the context wall (`_CONTEXT_WALL_RE`) is a term of
+    the sum, not the refusal: ``input length and `max_tokens` exceed context
+    limit: 188240 + 21333 > 200000`` is an overflow."""
+    if _CONTEXT_WALL_RE.search(text) is not None:
+        text = _OUTPUT_CAP_RE.sub(" ", text)
+    if _NOT_SIZE_RE.search(text):
+        return True
+    return quota_re is not None and quota_re.search(text) is not None
+
+
+def _is_overflow(error, quota_re=None) -> bool:
+    """True when *error* is a context overflow (KC-54).
+
+    An overflow has filled the session's context, so a prompt into the *same*
+    session overflows again: the runner opens a fresh session for the work
+    instead of retrying, and a clean tree is a stall rather than a crash.
+    True when ``name`` is ``"ContextOverflowError"``, or when ``data.message``
+    (or a top-level ``message``) carries ``"maximum context length"`` or
+    ``"context_length_exceeded"``. A plain string matches on any of those
+    three. A payload that is not a dict, or carries none of them, is not an
+    overflow — ``None`` and ``{}`` are False.
+
+    Round 145: also when the text is a size refusal in the provider's own
+    words (`_SIZE_REFUSAL_RE`) that is not money, a plan, a key or a rate
+    (`_NOT_SIZE_RE`, and *quota_re* — the round's ``quota_patterns`` — when
+    the caller has it). zai's ``Prompt exceeds max length`` ended glm-4.5-flash
+    ERROR at 98 777 tokens of a window Kilo called 131 072: no memory, no
+    compact, the run lost.
+    """
+    text = _error_texts(error)
+    if _OVERFLOW_RE.search(text) is not None:
+        return True
+    data = error.get("data") if isinstance(error, dict) else None
+    status = data.get("statusCode") if isinstance(data, dict) else None
+    if status is not None and status not in _SIZE_REFUSAL_STATUSES:
+        # a size's words on a rate's or the provider's status: `_overflow_of` agrees
+        return False
+    return _SIZE_REFUSAL_RE.search(text) is not None and not _not_a_size(text, quota_re)
+
+
+def _is_full_refusal(error, last_ok: int, size, quota_re=None,
+                     share: float = FULL_REFUSAL_SHARE) -> bool:
+    """Round 145: a provider refusal of a session that is already full enough to
+    be refused for its size, though the message says nothing about one.
+
+    True when *error* is the provider refusing the request itself — a dict whose
+    ``data.statusCode`` is present and one of `_SIZE_REFUSAL_STATUSES` (400 and
+    413; a status that is not there at all, or a 422, is the request or its
+    shape, not its size) — whose ``name`` is an API error, not flagged retryable
+    in any of the runner's senses (`_retryable`, which reads
+    ``data.isRetryable`` and the socket codes too), not Kilo's own abort, not an
+    auth error, and not money/plan/key/rate. A message that carries a size word
+    (`_SIZE_VERB_RE`) the wording path declined for lack of the model's own noun
+    is one too — A1 left `Your error message is too large to display` out on
+    purpose, and this reading takes the message that says nothing about a size.
+    ``last_ok`` (the last reply that
+    went through) must then be at least *share* of *size*, the window the runner
+    sizes the model by; *share* 0 is the reading off.
+
+    A refusal with no status, no size to measure against, no reply that went
+    through, or the session's first request is never one: a model that cannot
+    take the round prompt at all (round 144's deepseek-free) is not an overflow
+    to compact. An inferred reading never names a size, so it never writes one
+    to the memory.
+    """
+    if not isinstance(error, dict) or not size or not last_ok or last_ok <= 0:
+        return False
+    if not share or share <= 0:
+        return False
+    name = error.get("name")
+    if _is_provider_unavailable(error) or _is_external_abort(error) \
+            or name == "ProviderQuota":
+        return False
+    if isinstance(name, str) and "Auth" in name:
+        return False
+    if not (name == "APIError" or (isinstance(name, str) and name.endswith("APIError"))):
+        return False
+    if _retryable(error):
+        return False
+    data = error.get("data") if isinstance(error.get("data"), dict) else {}
+    if data.get("statusCode") not in _SIZE_REFUSAL_STATUSES:
+        return False
+    text = _error_texts(error)
+    if _not_a_size(text, quota_re):
+        return False
+    if _REQUEST_FAULT_RE.search(text) is not None and _TOKENS_RE.search(text) is None:
+        return False
+    # A size word the wording path looked for and declined is not the session's
+    # size: a body, a display or an output. This reading exists for the message
+    # that says nothing about one.
+    if _SIZE_VERB_RE.search(text) is not None and _SIZE_REFUSAL_RE.search(text) is None:
+        return False
+    return last_ok >= share * float(size)
 
 
 def _is_provider_unavailable(error) -> bool:
@@ -1044,14 +1241,31 @@ def _context_budget(spec, records, config=None) -> tuple:
     which send only a name and their reasoning and overflow the same way every
     round. ``("none", "none")`` when there is nothing at all — not even a
     fallback — which is today's prompt and today's overflow.
+
+    Round 145: a remembered size *smaller* than Kilo's wins over it — the
+    provider refused below what it declares. Round 149: a *loose* remembered
+    size (``grew`` far past ``last_ok``) only wins when it is close enough to
+    the declared window to be evidence of it — `context_memory.smallest_size`
+    measures that against *spec*'s own ``context_limit``, the fallback and
+    ``context_full_refusal_percent``.
     """
     limit = getattr(spec, "context_limit", None)
+    share_pct = context_memory.full_refusal_percent(config)
+    fallback = _context_limit_fallback(getattr(config, "context_limit_fallback", None))
+    size = context_memory.smallest_size(
+        records, spec.provider_id, spec.model_id,
+        context_memory.min_window(config),
+        declared=limit, fallback=fallback, share_pct=share_pct)
     if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        # Round 145: Kilo's number is what the provider *declares*; an overflow
+        # the memory holds is what it *did*. zai declares 131 072 for
+        # glm-4.5-flash and refused it at 98 777 — the runner's compact at 80 %
+        # of 131 072 came after the wall. The smaller of the two is the window.
+        if size is not None and int(size) < limit:
+            return int(size), "remembered"
         return int(limit), "kilo"
-    size = context_memory.smallest_size(records, spec.provider_id, spec.model_id)
     if size is not None:
         return int(size), "remembered"
-    fallback = _context_limit_fallback(getattr(config, "context_limit_fallback", None))
     if fallback:
         return fallback, "fallback"
     return None, "none"
@@ -2377,6 +2591,47 @@ def _brief(value) -> str:
     """A one-line, bounded rendering of a server payload for `last_error`."""
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     return " ".join(text.split())[:300]
+
+
+def _context_watch_sec(config) -> float:
+    """Round 145: ``[contest] context_watch_sec`` — seconds between two reads of
+    a turn's fill; 0, a negative, a non-number or a non-finite one turns the
+    watch off. ``inf`` is refused like the others (`math.isfinite`, as
+    `full_refusal_percent` does): a config built in code can hold it, and a
+    watch that never wakes is a thread that reads nothing but keeps one alive."""
+    try:
+        value = float(getattr(config, "context_watch_sec", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if 0.0 < value and math.isfinite(value) else 0.0
+
+
+class _ContextWatch:
+    """Round 145: one turn's in-turn fill watch — its stop signal, the thread
+    behind it, and the lock between them.
+
+    `stop()` sets the signal *under the same lock* the watch takes before it
+    acts, and waits `every` seconds for the thread to leave. Without both, a
+    read that returns after the turn ended can still set `context_full` and
+    `context_aborted`, write `context_watch_stop` into a turn already appended
+    to `turns.jsonl`, and abort a session this turn no longer holds — and the
+    runner reads that as its own stop on the next turn, and compacts for no
+    reason. Fail-open: a join that does not return in time gives up and the
+    turn goes on.
+    """
+
+    def __init__(self, stop: threading.Event, thread: threading.Thread,
+                 every: float, lock: threading.Lock) -> None:
+        self.stop_event = stop
+        self.thread = thread
+        self.every = every
+        self.lock = lock
+
+    def stop(self) -> None:
+        """End the turn: the watch may not act on the next one."""
+        with self.lock:
+            self.stop_event.set()
+        self.thread.join(timeout=self.every)
 
 
 def _abort_quietly(backend: ContestBackend, session: SessionRef) -> None:
@@ -4117,6 +4372,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             stall(f"{questions_this_turn[0]} questions in one turn")
 
     def finish(state: AgentState, error: str | None = None, *, note: str | None = None) -> AgentRun:
+        drop_stale_kilo_file(ws.path)
         transition(state, error, note=note)
         return run
 
@@ -4426,6 +4682,151 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         return (f"context {now['tokens']:,} tokens = {now['fill']:.1f}% of "
                 f"{now['size']:,} ({now['source']}), compact at {now['compact_at']:g}%")
 
+    pushed_limit: list = [None]
+    push_refused: list = [None]
+
+    def _push_remembered_limit() -> None:
+        """Round 145: a remembered window below Kilo's handed to the running
+        server (`KiloBackend.set_model_limit`, ``PATCH /config`` for this
+        workspace), so Kilo compacts inside the turn by it — the same
+        `context_memory.kilo_limit` the next round's spawn overlay carries. Only
+        when the memory is smaller than what Kilo was told (or Kilo was told
+        nothing), once per size, and only on a backend that can: anything that
+        goes wrong is a warning and the watch below still stands.
+
+        Round 148: nothing is handed over when the workspace tracks
+        ``.kilo/kilo.jsonc`` — the patch would rewrite a tracked file and land
+        in the agent's diff, and `info/exclude` does nothing there. That check
+        is the backend's (`tracked_kilo_files`), which raises: a silent return
+        would look like a window Kilo now holds. Here the refusal is remembered
+        so the check is not re-run for the same size and the warning is not
+        repeated — and `pushed_limit[0]` stays unset, so `context_watch` arms,
+        because a push that never happened is exactly why the watch is needed.
+
+        Called only between turns, right before a prompt's mark: live, 7.6.2
+        answers the patch by reloading the workspace's instance
+        (``server.instance.disposed``) — a turn or a compact running in it
+        would be cut, and the event stream ends (the backend reconnects it).
+        """
+        setter = getattr(backend, "set_model_limit", None)
+        if not callable(setter):
+            return
+        declared = getattr(spec, "context_limit", None)
+        try:
+            size, output = context_memory.remembered(
+                _memory(), spec.provider_id, spec.model_id,
+                context_memory.min_window(config),
+                declared=declared,
+                fallback=_context_limit_fallback(
+                    getattr(config, "context_limit_fallback", None)),
+                share_pct=context_memory.full_refusal_percent(config))
+        except Exception:  # noqa: BLE001 — no memory, nothing to hand over
+            return
+        if not size or pushed_limit[0] == size or push_refused[0] == size:
+            return
+        if isinstance(declared, int) and not isinstance(declared, bool) and 0 < declared <= size:
+            return
+        limit = context_memory.kilo_limit(size, output, context_memory.compact_at_percent(config))
+        if limit is None:
+            return
+        percent = context_memory.compact_at_percent(config)
+        try:
+            setter(spec.provider_id, spec.model_id, limit)
+        except Exception as exc:  # noqa: BLE001 — the watch still stands
+            if isinstance(exc, KiloLimitRefused):
+                # structural: the checkout tracks .kilo, so it will refuse the
+                # same way again — remember it, the check is not re-run
+                push_refused[0] = size
+            _log.warning("%s: the remembered window was not handed to Kilo: %s",
+                         spec.name, _brief(str(exc)))
+            return
+        pushed_limit[0] = size
+        _log.info("%s: Kilo now sizes %s/%s = %s (compact at %g %% of it, after %s "
+                  "tokens) — was %s", spec.name, spec.provider_id, spec.model_id, f"{size:,}",
+                  percent, f"{limit.get('input') or 0:,}",
+                  f"{declared:,}" if isinstance(declared, int) else "unknown")
+
+    def context_watch(turn: dict) -> "_ContextWatch | None":
+        """Round 145: the fill, watched *inside* a turn, for a model Kilo cannot
+        size — the fallback for a window that could not be handed to Kilo.
+
+        Kilo compacts a session inside a turn by the ``limit`` it was given, and
+        since round 147 that can be handed to it between turns
+        (`_push_remembered_limit`, a ``PATCH /config`` for the workspace, the
+        event stream reconnected after the reload). So the watch is armed only
+        when the window was **not** handed over — the push failed, was skipped,
+        or the backend has no `set_model_limit`: `pushed_limit[0]` is not the
+        size the session is sized by now. When it did go, Kilo compacts by the
+        pushed window at the same fill the watch would fire at
+        (`kilo_limit` sets `input = percent * size + min(20 000, output)` and
+        compacts at `input - reserve`), and the watch's abort would only throw
+        away the step in progress — whichever of the two fired first would win,
+        and the loser is a turn's work.
+
+        This thread reads the fill every ``[contest] context_watch_sec`` and, at
+        ``compact_at_percent``, stops the turn the way KC-69's refused ask does:
+        `context_full` set, the session aborted once, and the next prompt
+        compacts first. It lags one step behind what the model is doing and
+        cannot catch a single large jump — round 145's glm read about 42 000
+        tokens in one step and met the wall with no read in between.
+
+        The read is an HTTP call and can return after the turn ended, so it is
+        re-checked against the stop signal before it acts, and the actions are
+        taken under the lock the turn's `finally` takes too (`_ContextWatch`).
+        ``None`` — nothing armed — when the watch is off (0), the compact is
+        off, there is no size, the size is Kilo's own, or the window went to
+        Kilo.
+        """
+        every = _context_watch_sec(config)
+        percent = context_memory.compact_at_percent(config)
+        if every <= 0 or percent <= 0:
+            return None
+        try:
+            size, source = _context_budget(spec, _memory(), config)
+        except Exception:  # noqa: BLE001 — no size, no watch
+            return None
+        if not size or source == "kilo":
+            return None
+        if pushed_limit[0] == size:
+            # the window went to Kilo before this prompt: it compacts by it
+            _log.info("%s: Kilo compacts inside the turn by the window handed to it "
+                      "(%s tokens) — the in-turn watch stays off", spec.name, f"{size:,}")
+            return None
+        stop = threading.Event()
+        target = session
+        lock = threading.Lock()
+
+        def watch() -> None:
+            while not stop.wait(every):
+                try:
+                    tokens = _context_tokens(backend, target)
+                except Exception:  # noqa: BLE001 — an unreadable fill is no fill
+                    continue
+                if stop.is_set():
+                    # the read took long enough for the turn to end: its actions
+                    # would land on the wait that follows, not this one
+                    return
+                fill = tokens * 100.0 / float(size)
+                if fill < percent or context_full[0]:
+                    continue
+                with lock:
+                    if stop.is_set():
+                        return
+                    context_full[0] = True
+                    context_aborted[0] = True
+                    turn["context_watch_stop"] = round(fill, 1)
+                    _log.info("%s: context %s tokens = %.1f%% of %s (%s) inside the turn — "
+                              "stopping it to compact before the next prompt", spec.name,
+                              f"{tokens:,}", fill, f"{size:,}", source)
+                    # under the lock too: an abort sent after the turn's `finally`
+                    # set `stop` would land on the next turn
+                    _abort_quietly(backend, target)
+                return
+
+        thread = threading.Thread(target=watch, name=f"context-watch-{spec.name}", daemon=True)
+        thread.start()
+        return _ContextWatch(stop, thread, every, lock)
+
     def first_touch_watch(turn: dict) -> "_FirstTouch | None":
         """KC-42: the watch on this turn, or None when the ticket is off.
 
@@ -4670,7 +5071,115 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                   spec.name, kind)
         return "compacted"
 
-    def _remember_overflow(error) -> None:
+    overflows_seen: list = []
+
+    def _overflow_of(error):
+        """KC-54's overflow check, round 145's two readings on top of it.
+
+        The three fixed spellings (`_OVERFLOW_RE`) are an overflow as they
+        always were. Round 145 adds two more, and both demand a session that
+        actually grew — the last reply that went through at or above ``[contest]
+        context_min_window`` — so a model a plan cuts off at a small prompt
+        (round 144's free tier) ends the way it always ended and never writes a
+        size into the memory:
+
+          * a size refusal in the provider's own words (`_SIZE_REFUSAL_RE` with
+            the round's ``quota_patterns``, so money, a plan, a key or a rate
+            never is one);
+          * a refusal with no words about a size, of a session at or past
+            ``context_full_refusal_percent`` of its window (`_is_full_refusal`).
+
+        And neither may repeat into a loop: a second one in this run whose
+        request was under `REPEAT_OVERFLOW_SHARE` of the first one's came after
+        a compact (or a fresh session) left far less than the wall, so the
+        refusal is about something else — the error it is, not another compact.
+        Each reading is logged, so the operator sees why an error became one.
+
+        Reads the error *before* either new reading — and only *after* the fixed
+        spellings, which keep their verdict — whether it is a status the provider
+        does not use for a size, or an error any other path owns: a retry, the
+        provider being unavailable, or Kilo's own abort. A rate cap that names
+        tokens, a timeout that names a deadline and a body-size 413 would each
+        read as an overflow otherwise, and an overflow ends the agent's run
+        instead of retrying it.
+
+        Returns how it read the error, or ``False``: ``"words"`` when a size
+        refusal named a size, ``"inferred"`` when the session's fill did. An
+        inferred reading names no size, so it never writes one to the memory —
+        ``_remember_overflow`` takes the answer and skips — and it still counts
+        for the repeat guard.
+        """
+        text = _error_texts(error)
+        if _OVERFLOW_RE.search(text) is not None:
+            # The old path's verdict is unchanged; what changes is that it
+            # records the size too, so a second overflow far below it is not
+            # read as the window again.
+            try:
+                last_ok, _grew = _last_reply(backend, session)
+            except Exception:  # noqa: BLE001 — no read, no record
+                last_ok = 0
+            overflows_seen.append(last_ok)
+            _log.info("%s: %r at %s tokens — read as a context overflow", spec.name,
+                      _brief(_error_message(error)), f"{last_ok:,}")
+            return "words"
+        status = None
+        data = error.get("data") if isinstance(error, dict) else None
+        if isinstance(data, dict):
+            status = data.get("statusCode")
+        if status is not None and status not in _SIZE_REFUSAL_STATUSES:
+            return False
+        if _retryable(error) or _is_provider_unavailable(error) or _is_external_abort(error):
+            return False
+        quota_re = _quota_re(config)
+        if _not_a_size(text, quota_re):
+            return False
+        try:
+            last_ok, grew = _last_reply(backend, session)
+            size, source = _context_budget(spec, _memory(), config)
+        except Exception:  # noqa: BLE001 — no read, no guess: the error as before
+            return False
+        # The request that was refused was the last reply plus what the reply's
+        # tools added after it, so both readings compare that — the record keeps
+        # `last_ok`, the size that went through. `last_ok` alone refused a
+        # session that read a big batch in one step (round 145's glm) as a plan's
+        # cap, and nothing was remembered for it.
+        requested = last_ok + (grew or 0)
+        floor = context_memory.min_window(config)
+        declared = getattr(spec, "context_limit", None)
+        share = context_memory.full_refusal_percent(config) / 100.0
+        if isinstance(declared, int) and not isinstance(declared, bool) \
+                and declared > 0 and share > 0:
+            # round 149, as `context_memory.size_of`: a model Kilo declares at
+            # 32 768 and refuses at 28 000 is full, not a plan's cap
+            floor = min(floor, int(share * declared))
+        if not last_ok or (floor and requested < floor):
+            # nothing went through yet, whatever the floor: a refusal of the
+            # session's first request cannot have filled a context
+            _log.info("%s: %r at %s tokens — under context_min_window %s, not read "
+                      "as a context overflow", spec.name,
+                      _brief(_error_message(error)), f"{last_ok:,}",
+                      f"{floor:,}")
+            return False
+        worded = _SIZE_REFUSAL_RE.search(text) is not None
+        if worded:
+            how = "read as a context overflow"
+        elif _is_full_refusal(error, last_ok, size, quota_re, share):
+            how = f"at {last_ok * 100.0 / float(size):.1f}% of {size:,} ({source}) " \
+                  "read as a context overflow"
+        else:
+            return False
+        if overflows_seen and requested < REPEAT_OVERFLOW_SHARE * max(overflows_seen):
+            _log.info("%s: %r at %s tokens, after an overflow at %s — not the window "
+                      "again, not read as a context overflow", spec.name,
+                      _brief(_error_message(error)), f"{requested:,}",
+                      f"{max(overflows_seen):,}")
+            return False
+        overflows_seen.append(last_ok)
+        _log.info("%s: %r at %s tokens %s", spec.name, _brief(_error_message(error)),
+                  f"{last_ok:,}", how)
+        return "words" if worded else "inferred"
+
+    def _remember_overflow(error, how="words") -> None:
         """KC-67: one line in the shared memory, for the next round.
 
         The provider's own numbers — the limit it named, the prompt it named,
@@ -4681,7 +5190,15 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         fails is a warning and nothing else: the overflow still ends the turn
         the way it does today, and the line is for the next session, not this
         one.
+
+        An inferred reading (``"inferred"`` from `_overflow_of`) names no size —
+        the session's fill did, not the provider — so it writes nothing and
+        hands nothing to Kilo: the record would size the model for every agent
+        of the next rounds from a number the provider never said. The compact
+        and the continue still happen, and the guard still counts it.
         """
+        if how == "inferred":
+            return
         try:
             limit, prompt = context_memory.parse_overflow(_error_message(error))
             last_ok, grew = _last_reply(backend, session)
@@ -4700,10 +5217,18 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             if not context_memory.add(context_memory.memory_path(config, out_dir),
                                       record, days=context_memory.days_of(config)):
                 _log.warning("%s: context memory: not written", spec.name)
+            # the window goes to Kilo before the next prompt, not here: Kilo may
+            # still be compacting this session itself, and a `PATCH /config`
+            # reloads the workspace's instance under it
         except Exception as exc:  # noqa: BLE001 — the overflow still ends the turn
             _log.warning("%s: context memory: %s", spec.name, _brief(str(exc)))
 
     try:
+        # Round 148: the project file a `PATCH /config` left in the worktree
+        # does not outlive the run that wrote it — a resumed agent's server
+        # reads it on spawn, and it is not this round's window. Untracked only:
+        # a file the checkout tracks is the agent's, and `policy` asks for it.
+        drop_stale_kilo_file(ws.path)
         # ── CREATED: one session, kept for every turn ─────────────────────
         if not run.sessions:
             # KC-39 appends each session's transcript to `<agent>.session.json`,
@@ -4783,6 +5308,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             else:
                 note = f"attempt {run.attempt} ({kind})"
             transition(AgentState.PROMPTED, note=note)
+            # round 145: a remembered window below Kilo's goes to Kilo now —
+            # the session is between turns, and the backend's event stream is
+            # reconnected after the reload, before the mark below is taken
+            _push_remembered_limit()
             # KC-63: the mark goes right before the POST, so no event of this
             # turn can come before it and every event of an earlier one does
             mark_fn = getattr(backend, "mark", None)
@@ -4862,6 +5391,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # be nudged after the fact, and a nudge is never sent into a
             # session this turn is not holding.
             touch = first_touch_watch(turn)
+            watch = context_watch(turn)
             try:
                 idle = _wait_turn(backend, session, config,
                                   on_permission=on_permission, on_question=on_question,
@@ -4870,6 +5400,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 run._turn_clock = None
                 if touch is not None:
                     touch.stop()
+                if watch is not None:
+                    watch.stop()
                 while context_stopper:
                     context_stopper.pop().cancel()
             # KC-75: a nudge is posted into a busy session, and Kilo 7.6.2 queues
@@ -5044,9 +5576,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     error = _no_idle_error(config, idle.elapsed, clock)
                     state = AgentState.STALLED
             elif idle.status == "error":
-                overflow = _is_overflow(idle.error)
+                overflow = _overflow_of(idle.error)
                 if overflow:
-                    _remember_overflow(idle.error)
+                    _remember_overflow(idle.error, overflow)
                     # KC-54: the overflow has filled this session's context, so
                     # a prompt into it overflows again — never RETRY_PROMPT here,
                     # even when the provider flags the error retryable. The work

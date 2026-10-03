@@ -151,6 +151,9 @@ CONTEST_KEYS = (
     "compact_at_percent",
     "summary_at_percent",
     "context_limit_fallback",
+    "context_min_window",
+    "context_full_refusal_percent",
+    "context_watch_sec",
     "draft_llm_profile",
     "draft_review_llm_profile",
     "draft_map_budget",
@@ -462,6 +465,25 @@ class ContestConfig:
     #: point. KC-67's memory sizes those from their own overflow instead; set
     #: this only for a roster of models known to be that small.
     context_limit_fallback: int = 0
+    #: Round 145: the smallest window a remembered ``last_ok`` may size a model
+    #: by, in tokens; a provider refusal of a session smaller than this is never
+    #: read as an overflow by size words alone. 0 = the floor off.
+    context_min_window: int = 32000
+    #: Round 145/149: "close enough to the wall to be evidence", as a percent.
+    #: (1) a refusal with no words about a size is an overflow when the session
+    #: holds at least this percent of its window. (2) a loose memory record
+    #: sizes the model only when its last_ok is at least this percent of the
+    #: window Kilo declares (or of context_limit_fallback when Kilo declares
+    #: nothing). 0 = both readings off.
+    context_full_refusal_percent: float = 60.0
+    #: Round 145: seconds between two reads of a running turn's fill, for a
+    #: model sized by the memory or the fallback rather than by Kilo; at
+    #: ``compact_at_percent`` the turn is stopped and the next prompt compacts.
+    #: 0 = off. Both defaults stay: this dataclass default is 0, so a config
+    #: built in code is the watch off and the round is unchanged; the ini read
+    #: below and the shipped ``contest.ini`` both default to 10, so a loaded
+    #: round arms it.
+    context_watch_sec: float = 0.0
     #: KC-59: how ``prepare_round`` builds each agent's checkout — one of
     #: ``WORKSPACE_KINDS``. ``clone`` (the default) makes a fresh local clone
     #: per agent, ``worktree`` keeps the pre-KC-59 worktree per agent.
@@ -873,6 +895,12 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     # a typo is 0 too — the rule stands down rather than sizing every prompt
     # against a nonsense number.
     context_limit_fallback = int(num("context_limit_fallback", 0))
+    # Round 145: the two numbers that keep a plan's cap out of the memory — the
+    # same fail-open read; `context_memory.min_window` / `full_refusal_percent`
+    # apply the default rule to whatever comes through
+    context_min_window = int(num("context_min_window", 32000))
+    context_full_refusal_percent = num("context_full_refusal_percent", 60.0)
+    context_watch_sec = num("context_watch_sec", 10.0)
 
     # KC-58: 0 slots is "the queue is off", so a negative count is refused
     # rather than read as 0; a negative ceiling would unblock every holder at
@@ -998,6 +1026,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         compact_at_percent=compact_at_percent,
         summary_at_percent=summary_at_percent,
         context_limit_fallback=context_limit_fallback,
+        context_min_window=context_min_window,
+        context_full_refusal_percent=context_full_refusal_percent,
+        context_watch_sec=context_watch_sec,
         workspace_kind=workspace_kind,
         variant=scalar("variant", "highest") or "highest",
         probe_ttl_days=int(scalar("probe_ttl_days", "7") or "7"),
