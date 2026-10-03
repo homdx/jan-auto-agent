@@ -75,7 +75,10 @@ def _branch_names(repo: Path, branch: str) -> list[str]:
 
 def _commit_numbers(repo: Path, branch: str) -> set[int]:
     """The ticket numbers *branch*'s commit subjects name — one `git log` per scan."""
-    subjects = git(repo, "log", "--format=%s", branch)
+    # The trailing `--` makes *branch* a revision even when a file of the same
+    # name sits in the worktree: this repo's own `./arena` script and branch
+    # `arena` made `git log arena` ambiguous and `issue list` refused.
+    subjects = git(repo, "log", "--format=%s", branch, "--")
     found = set()
     for line in subjects.splitlines():
         match = _SUBJECT_RE.match(line)

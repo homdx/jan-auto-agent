@@ -127,6 +127,17 @@ def test_each_flag(repo, capsys):
     assert flags[13] == ["two files for 13: 13-d.md, 13-e.md"]
 
 
+def test_a_file_named_like_the_branch_does_not_make_git_log_ambiguous(repo, capsys):
+    # This repo's own `./arena` script sits next to branch `arena`: a bare
+    # `git log arena` was "ambiguous argument" and `issue list` refused.
+    _write(repo / "arena", "#!/bin/sh\n")
+    _tracked(repo, "14-x.md", "X", "open")
+    _commit(repo, "14: the work")
+    code, out, err = _run(capsys, "-o", "json", "issue", "list")
+    assert code == 0, err
+    assert json.loads(out)[0]["flags"] == ["commit 14: on arena but status open"]
+
+
 def test_state_filter(repo, capsys):
     _tracked(repo, "02-open.md", "O", "open")
     _tracked(repo, "03-queued.md", "Q", "queued")
