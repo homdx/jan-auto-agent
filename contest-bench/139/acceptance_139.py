@@ -261,6 +261,6 @@ def test_bad_ini_is_refusal(repo, capsys):
 
 
 def test_other_verbs_unchanged(repo, capsys):
-    # `issue list` landed in round 144 (AR-6); another unimplemented verb
-    rc, _, err = run(capsys, "issue", "create")
+    # `issue create` landed in round 145 (AR-7); another unimplemented verb
+    rc, _, err = run(capsys, "issue", "land")
     assert rc != 0 and "not implemented" in err

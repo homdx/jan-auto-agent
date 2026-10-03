@@ -46,9 +46,9 @@ def test_missing_or_malformed_arguments_are_one_line_usage_errors(argv, capsys):
 
 
 def test_unimplemented_verb_names_its_ticket(capsys):
-    assert cli.main(["issue", "create"]) == 2
+    assert cli.main(["issue", "land"]) == 2
     assert capsys.readouterr().err.strip() == (
-        "arena: issue create is not implemented yet (AR-7)"
+        "arena: issue land is not implemented yet (AR-8)"
     )
 
 

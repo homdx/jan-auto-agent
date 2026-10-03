@@ -315,10 +315,9 @@ def test_view_json(repo, capsys):
 
 
 # 7
-@pytest.mark.parametrize("verb", ["create", "land"])
-def test_other_issue_verbs_unimplemented(repo, capsys, verb):
-    args = ["issue", verb, "x"] if verb == "create" else ["issue", verb, "21"]
-    rc, _, err = run(capsys, *args)
+def test_other_issue_verb_unimplemented(repo, capsys):
+    # `issue create` landed in round 145 (AR-7); `land` is still AR-8
+    rc, _, err = run(capsys, "issue", "land", "21")
     assert rc != 0 and "not implemented" in err
 
 

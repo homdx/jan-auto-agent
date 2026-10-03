@@ -183,10 +183,10 @@ def test_view_refusals(repo, capsys):
     assert code == 2 and len(err.splitlines()) == 1
 
 
-def test_create_and_land_still_unimplemented(capsys):
-    for verb in ("create", "land"):
-        code, _, err = _run(capsys, "issue", verb)
-        assert code == 2 and "not implemented" in err
+def test_land_still_unimplemented(capsys):
+    # `issue create` landed in round 145 (AR-7); `issue land` is AR-8.
+    code, _, err = _run(capsys, "issue", "land")
+    assert code == 2 and "not implemented" in err
 
 
 def _snapshot(repo: Path):

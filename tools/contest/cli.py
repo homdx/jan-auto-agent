@@ -140,10 +140,12 @@ __all__ = [
     "DEFAULT_ROSTER",
     "GATE_PLACEHOLDER_MODEL",
     "TASKS_DIR",
+    "DraftSetupError",
     "Intake",
     "agents_from_models",
     "cmd_run",
     "cmd_draft",
+    "draft_callables",
     "cmd_status",
     "export_patches",
     "gate_model_refusals",
@@ -2674,6 +2676,78 @@ def _same_model(a, b) -> bool:
     return bool(model_a) and model_a == model_b
 
 
+class DraftSetupError(ValueError):
+    """The draft's writer or its reviewer cannot be prepared.
+
+    The message is the whole line `cmd_draft` prints after `draft: ` — a draft
+    profile that is unset or does not resolve, a reviewer profile that does not
+    resolve, no reviewer profile without `--no-review`, a reviewer that is the
+    writer. A `ValueError` so a caller that already refuses `ValueError` can
+    reuse this check: `arena issue create` raises no model name, URL or key here
+    either, and no model is called until the callables are asked for a draft.
+    """
+
+
+def draft_callables(config, no_review: bool) -> tuple:
+    """`(llm_call, review_call)` for one draft; `DraftSetupError` when either is unset.
+
+    The preparation `cmd_draft` used to keep inline, so the two commands that
+    draft a ticket — `contest draft` and `arena issue create` — cannot disagree
+    about who writes and who reviews. The writer is the profile `[contest]
+    draft_llm_profile` names; the reviewer is `[contest] draft_review_llm_profile`
+    when it is set, else the gate's model. Both are built by `draft.llm_call_for`,
+    so no model name, URL or key lives in this module or in the caller. Nothing
+    is called here — the callables are handed to `draft.draft_ticket`, which asks
+    them for the draft.
+    """
+    if config.draft_settings is None:
+        # `run` needs no draft profile: the refusal is here, not at load time, so
+        # a round never fails because someone typed the profile's section wrong.
+        if not config.draft_llm_profile:
+            reason = ("[contest] draft_llm_profile is not set — name an LlmSettings "
+                      "section (base_url, api_key, model) in " + LOCAL_FILENAME +
+                      " and set it under [contest]")
+        else:
+            reason = ("[contest] draft_llm_profile = " + config.draft_llm_profile +
+                      " does not resolve — that section needs base_url, api_key "
+                      "and model")
+        raise DraftSetupError(reason + " — `run` needs no draft profile")
+
+    review_call = None
+    if not no_review:
+        # The reviewer is `[contest] draft_review_llm_profile` when it is set —
+        # tickets then have their own writer/reviewer pair and the round's gate
+        # keeps its model — and the gate's model otherwise: the same resolution
+        # and transport the gate uses, and no model, URL or key in this module.
+        review_settings = config.gate_settings
+        review_key = "gate_llm_profile"
+        if config.draft_review_llm_profile:
+            if config.draft_review_settings is None:
+                raise DraftSetupError("[contest] draft_review_llm_profile = "
+                                      + config.draft_review_llm_profile + " does not "
+                                      "resolve — that section needs base_url, api_key "
+                                      "and model")
+            review_settings = config.draft_review_settings
+            review_key = "draft_review_llm_profile"
+        elif not config.gate_llm_profile:
+            raise DraftSetupError("[contest] gate_llm_profile is not set — the review "
+                                  "runs on the gate's model, so name it in "
+                                  + LOCAL_FILENAME + " as run does, or pass --no-review")
+        # A model reviewing its own ticket approves its own blind spots: the
+        # reviewer must be a different model from the drafter, not just a
+        # different section naming the same one.
+        if _same_model(review_settings, config.draft_settings):
+            raise DraftSetupError("the review model is the draft model ("
+                                  + str(getattr(config.draft_settings, "model", "")) +
+                                  ") — set a different model under [contest] " + review_key +
+                                  " or draft_llm_profile in " + LOCAL_FILENAME +
+                                  ", or pass --no-review")
+        review_call = draft.llm_call_for(review_settings,
+                                         system=draft.REVIEW_SYSTEM_PROMPT)
+
+    return draft.llm_call_for(config.draft_settings), review_call
+
+
 def cmd_draft(args: argparse.Namespace) -> int:
     """`draft --target REPO "brief" [--round NN] [--out FILE] [--run] [--no-review]`.
 
@@ -2705,53 +2779,11 @@ def cmd_draft(args: argparse.Namespace) -> int:
     except RosterError as exc:
         print(f"draft: {exc}", file=sys.stderr)
         return EXIT_FAILED
-    if config.draft_settings is None:
-        # `run` needs no draft profile: the refusal is here, not at load time, so
-        # a round never fails because someone typed the profile's section wrong.
-        if not config.draft_llm_profile:
-            reason = ("[contest] draft_llm_profile is not set — name an LlmSettings "
-                      "section (base_url, api_key, model) in " + LOCAL_FILENAME +
-                      " and set it under [contest]")
-        else:
-            reason = ("[contest] draft_llm_profile = " + config.draft_llm_profile +
-                      " does not resolve — that section needs base_url, api_key "
-                      "and model")
-        print("draft: " + reason + " — `run` needs no draft profile", file=sys.stderr)
+    try:
+        llm_call, review_call = draft_callables(config, getattr(args, "no_review", False))
+    except DraftSetupError as exc:
+        print(f"draft: {exc}", file=sys.stderr)
         return EXIT_FAILED
-
-    review_call = None
-    if not getattr(args, "no_review", False):
-        # The reviewer is `[contest] draft_review_llm_profile` when it is set —
-        # tickets then have their own writer/reviewer pair and the round's gate
-        # keeps its model — and the gate's model otherwise: the same resolution
-        # and transport the gate uses, and no model, URL or key in this module.
-        review_settings = config.gate_settings
-        review_key = "gate_llm_profile"
-        if config.draft_review_llm_profile:
-            if config.draft_review_settings is None:
-                print("draft: [contest] draft_review_llm_profile = "
-                      + config.draft_review_llm_profile + " does not resolve — that "
-                      "section needs base_url, api_key and model", file=sys.stderr)
-                return EXIT_FAILED
-            review_settings = config.draft_review_settings
-            review_key = "draft_review_llm_profile"
-        elif not config.gate_llm_profile:
-            print("draft: [contest] gate_llm_profile is not set — the review runs on "
-                  "the gate's model, so name it in " + LOCAL_FILENAME +
-                  " as run does, or pass --no-review", file=sys.stderr)
-            return EXIT_FAILED
-        # A model reviewing its own ticket approves its own blind spots: the
-        # reviewer must be a different model from the drafter, not just a
-        # different section naming the same one.
-        if _same_model(review_settings, config.draft_settings):
-            print("draft: the review model is the draft model ("
-                  + str(getattr(config.draft_settings, "model", "")) + ") — set a "
-                  "different model under [contest] " + review_key + " or "
-                  "draft_llm_profile in " + LOCAL_FILENAME + ", or pass --no-review",
-                  file=sys.stderr)
-            return EXIT_FAILED
-        review_call = draft.llm_call_for(review_settings,
-                                         system=draft.REVIEW_SYSTEM_PROMPT)
 
     try:
         result = draft.draft_ticket(
@@ -2760,7 +2792,7 @@ def cmd_draft(args: argparse.Namespace) -> int:
             config=config,
             round_no=args.round,
             out=args.out,
-            llm_call=draft.llm_call_for(config.draft_settings),
+            llm_call=llm_call,
             review_call=review_call,
             commit=True,
         )

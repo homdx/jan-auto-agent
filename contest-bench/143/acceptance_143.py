@@ -434,5 +434,6 @@ def test_script_write_unchanged(tmp_path, capsys):
 
 
 def test_other_verbs_unchanged(repo, capsys):
-    rc, _, err = run(capsys, "issue", "create")
+    # `issue create` landed in round 145 (AR-7); `land` is still AR-8
+    rc, _, err = run(capsys, "issue", "land")
     assert rc != 0 and "not implemented" in err
