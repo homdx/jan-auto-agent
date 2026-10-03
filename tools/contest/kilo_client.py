@@ -1334,6 +1334,22 @@ class KiloClient:
         self._check(status, resp, "POST", path)
         return None
 
+    def set_model_limit(self, provider_id: str, model_id: str, limit: dict) -> None:
+        """Round 145: ``PATCH /config`` — the model's ``limit`` for this client's
+        directory, taken by the running server at once.
+
+        Live, 7.6.2: sent with the session's own ``directory`` the server answers
+        200, ``GET /provider`` shows the new ``limit.context``, and the next step
+        of a session past ``limit.input`` is compacted by Kilo itself (83 657
+        tokens to a summary and a 2 885-token reply). Sent without it, the patch
+        lands in the *server's* project and no session sees it. The server keeps
+        it as ``.kilo/kilo.jsonc`` in that directory — the caller keeps the file
+        out of git (`KiloBackend.set_model_limit`).
+        """
+        body = {"provider": {provider_id: {"models": {model_id: {"limit": dict(limit)}}}}}
+        status, resp = self._request("PATCH", "/config", body)
+        self._check(status, resp, "PATCH", "/config")
+
     def delete_session(self, session: SessionRef) -> None:
         """``DELETE /session/{id}`` — 200 on 7.6.2; KC-49's variant probe
         removes each throwaway session with it."""

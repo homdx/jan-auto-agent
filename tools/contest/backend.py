@@ -66,6 +66,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
 from tools.contest.kilo_client import (
@@ -293,6 +294,33 @@ class ContestBackend(Protocol):
 # Kilo
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _exclude_kilo_dir(directory: str) -> None:
+    """``.kilo/`` in the checkout's ``info/exclude`` (its own, for a worktree),
+    once. Local to that checkout and never committed. A directory that is not
+    a git checkout, or an exclude file that cannot be written, is left alone."""
+    try:
+        out = subprocess.run(["git", "-C", str(directory), "rev-parse", "--git-path",
+                              "info/exclude"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if out.returncode != 0 or not out.stdout.strip():
+        return
+    path = Path(out.stdout.strip())
+    if not path.is_absolute():
+        path = Path(directory) / path
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+        if ".kilo/" in (line.strip() for line in lines):
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            if lines and not path.read_text(encoding="utf-8").endswith("\n"):
+                fh.write("\n")
+            fh.write(".kilo/\n")
+    except OSError:
+        return
+
+
 class KiloBackend:
     """:class:`ContestBackend` backed by a Kilo server — today's default.
 
@@ -318,6 +346,7 @@ class KiloBackend:
             tap = EventTap(base, directory, events_log).start()
         self._client = client
         self._tap = tap
+        self._directory = directory
         self._interrupted = False
 
     # ── the protocol ────────────────────────────────────────────────────────
@@ -349,6 +378,18 @@ class KiloBackend:
 
     def mark(self) -> int | None:
         return self._tap.mark()
+
+    def set_model_limit(self, provider_id: str, model_id: str, limit: dict) -> None:
+        """Round 145: the model's ``limit`` for this workspace, at once (see
+        `KiloClient.set_model_limit`). Kilo writes it to ``.kilo/kilo.jsonc`` in
+        the workspace, so ``.kilo/`` goes into the worktree's own
+        ``info/exclude`` first — never a file in the agent's tree, its diff or
+        its commit. Raises `ContestBackendError`; the caller logs and goes on."""
+        _exclude_kilo_dir(self._directory)
+        try:
+            self._client.set_model_limit(provider_id, model_id, limit)
+        except KiloHttpError as exc:
+            raise ContestBackendError(str(exc)) from exc
 
     def abort(self, session: SessionRef) -> None:
         try:

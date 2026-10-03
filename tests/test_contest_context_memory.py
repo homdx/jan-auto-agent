@@ -225,7 +225,10 @@ def test_smallest_size_is_the_smallest_the_model_has_ever_given(tmp_path):
     # record still wins over it: hy3's 104 065 in the ticket's table
     assert cm.smallest_size(records, "kenary", "agent-a:free") == 104_065
     assert cm.size_of(_record(limit=500, last_ok=900)) == 500
-    assert cm.size_of(_record(limit=None, last_ok=999)) == 999
+    # round 145: a last_ok under context_min_window sizes nothing; with the
+    # floor off (0) it is what it always was
+    assert cm.size_of(_record(limit=None, last_ok=999), 0) == 999
+    assert cm.size_of(_record(limit=None, last_ok=999)) is None
     assert cm.size_of(_record(limit=None, last_ok=None)) is None
     # a neighbour's overflow says nothing about this model
     assert cm.smallest_size(records, "kenary", "unknown:free") is None

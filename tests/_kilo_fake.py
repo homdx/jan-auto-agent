@@ -912,6 +912,16 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ── POST ───────────────────────────────────────────────────────────────
 
+    def do_PATCH(self) -> None:
+        # round 145: `PATCH /config` — a model's limit for one directory. The
+        # fake records it (`fake.calls("PATCH")`) and answers with the body,
+        # as 7.6.2 does; nothing else reads it.
+        body = self._body()
+        path, _query = self._record(body)
+        if path == "/config":
+            return self._json(200, body)
+        return self._not_found(path)
+
     def do_DELETE(self) -> None:
         # KC-49: the variant probe removes each throwaway session
         path, _query = self._record(None)

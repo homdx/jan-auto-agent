@@ -60,7 +60,9 @@ __all__ = [
     "summary_at_percent",
     "summary_file_name",
     "days_of",
+    "full_refusal_percent",
     "kilo_limit",
+    "min_window",
     "load",
     "memory_path",
     "parse_output",
@@ -86,6 +88,17 @@ KILO_COMPACT_RESERVE = 20000
 #: The default fill, as a percent of the remembered size, at which the runner
 #: compacts a session that has no limit of its own. 0 turns the compact off.
 DEFAULT_COMPACT_AT_PERCENT = 80.0
+#: Round 145: ``[contest] context_min_window`` — the smallest window a
+#: ``last_ok`` may size a model by. No coding session works below it (the round
+#: prompt and the tools alone are ~15–20k), so a floor under it is a plan's cap
+#: or a broken reply, not the model's window: remembered, it would compact
+#: every turn for ever. 0 turns the floor off.
+DEFAULT_MIN_WINDOW = 32000
+#: Round 145: ``[contest] context_full_refusal_percent`` — a provider's refusal
+#: with no words about a size is read as an overflow when the session it
+#: refused holds at least this percent of the window it is sized by. 0 turns
+#: that reading off.
+DEFAULT_FULL_REFUSAL_PERCENT = 60.0
 #: KC-40: the default fill, as a percent of a known size, at which the runner
 #: asks a session that holds an uncommitted diff for its own account of it,
 #: before a compact shrinks the history that explains the diff. Kept above
@@ -260,7 +273,7 @@ class OverflowRecord:
 LOOSE_FLOOR_SHARE = 0.25
 
 
-def size_of(record: OverflowRecord) -> int | None:
+def size_of(record: OverflowRecord, min_window: int = DEFAULT_MIN_WINDOW) -> int | None:
     """The size one record remembers: the limit the provider named, else its
     ``last_ok`` — the last reply that still went through, which is the only
     number a provider that names no limit ever gave.
@@ -278,18 +291,32 @@ def size_of(record: OverflowRecord) -> int | None:
     ~134 000 past a ~120 000 one. Sized at 80 % of those floors the runner
     compacted every turn and the agents gave up. Such a record sizes nothing;
     the next overflow that grows into the window step by step will.
+
+    Round 145: *min_window* (``[contest] context_min_window``) is where that
+    line is drawn. A ``last_ok`` under it sizes nothing, tight or loose — a
+    window that small is a plan's cap or a broken reply, and remembered it
+    would compact every turn for ever. A loose ``last_ok`` at or above it
+    *does* size the model: it is a reply the provider took, so compacting at
+    80 % of it is early but never late (live, glm-4.5-flash: 81 311 went
+    through, one batch of reads added ~42 000 and hit a ~99 000 wall, and with
+    nothing remembered every fresh session read the same batch into the same
+    wall). Named limits are walls and are not touched by it.
     """
     if record.limit and record.output and record.limit > record.output:
         return record.limit - record.output
     if record.limit:
         return record.limit
-    if (record.last_ok and record.grew is not None
+    floor = _number(min_window) or 0
+    if not record.last_ok or record.last_ok < floor:
+        return None
+    if (floor <= 0 and record.grew is not None
             and record.grew > record.last_ok * LOOSE_FLOOR_SHARE):
+        # KC-73 as it was, for a round that turned the window floor off
         return None
     return record.last_ok
 
 
-def _pick(records, provider: str, model: str):
+def _pick(records, provider: str, model: str, min_window: int = DEFAULT_MIN_WINDOW):
     """``(size, output)`` for ``provider`` / ``model`` out of *records*, else ``None``.
 
     A record that names a limit is a wall: the smallest of those wins, as it
@@ -309,7 +336,7 @@ def _pick(records, provider: str, model: str):
         record = entry if isinstance(entry, OverflowRecord) else OverflowRecord.from_dict(entry)
         if record is None or record.provider != provider or record.model != model:
             continue
-        size = size_of(record)
+        size = size_of(record, min_window)
         if size is None:
             continue
         if record.limit:
@@ -322,12 +349,13 @@ def _pick(records, provider: str, model: str):
     return wall or floor
 
 
-def remembered(records, provider: str, model: str) -> tuple[int | None, int | None]:
+def remembered(records, provider: str, model: str,
+               min_window: int = DEFAULT_MIN_WINDOW) -> tuple[int | None, int | None]:
     """KC-69: ``(size, output)`` of the record that sizes ``provider`` /
     ``model`` — :func:`smallest_size` plus the output that record reserved,
     ``None`` when it named none. ``(None, None)`` for nothing remembered.
     """
-    best = _pick(records, provider, model)
+    best = _pick(records, provider, model, min_window)
     return best if best is not None else (None, None)
 
 
@@ -365,7 +393,8 @@ def kilo_limit(size, output, percent: float = DEFAULT_COMPACT_AT_PERCENT) -> dic
     return {"context": size + reserve, "input": at, "output": reserve}
 
 
-def smallest_size(records, provider: str, model: str) -> int | None:
+def smallest_size(records, provider: str, model: str,
+                  min_window: int = DEFAULT_MIN_WINDOW) -> int | None:
     """The size remembered for ``provider`` / ``model``, else ``None``.
 
     The smallest named limit, or the largest ``last_ok`` of the records that
@@ -375,7 +404,7 @@ def smallest_size(records, provider: str, model: str) -> int | None:
     for nothing at all. Anything that is not a list of records is ``None``: no
     size, the way today's session is treated.
     """
-    best = _pick(records, provider, model)
+    best = _pick(records, provider, model, min_window)
     return best[0] if best is not None else None
 
 
@@ -534,6 +563,38 @@ def compact_at_percent(config) -> float:
     return value
 
 
+def min_window(config) -> int:
+    """Round 145: ``[contest] context_min_window`` in tokens — the default when
+    the key is absent or not a whole number of tokens, ``0`` (the floor off)
+    when it is set to 0. Never an exception."""
+    if config is None:
+        return DEFAULT_MIN_WINDOW
+    value = getattr(config, "context_min_window", DEFAULT_MIN_WINDOW)
+    if isinstance(value, bool):
+        return DEFAULT_MIN_WINDOW
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_WINDOW
+    return out if out >= 0 else DEFAULT_MIN_WINDOW
+
+
+def full_refusal_percent(config) -> float:
+    """Round 145: ``[contest] context_full_refusal_percent`` — the default for
+    a missing key, a non-number or one outside 0–100; ``0`` turns the reading
+    off. Never an exception."""
+    if config is None:
+        return DEFAULT_FULL_REFUSAL_PERCENT
+    try:
+        value = float(getattr(config, "context_full_refusal_percent",
+                              DEFAULT_FULL_REFUSAL_PERCENT))
+    except (TypeError, ValueError):
+        return DEFAULT_FULL_REFUSAL_PERCENT
+    if not math.isfinite(value) or value < 0 or value > 100:
+        return DEFAULT_FULL_REFUSAL_PERCENT
+    return value
+
+
 def summary_at_percent(config) -> float:
     """KC-40: ``[contest] summary_at_percent`` — the fill, as a percent of a
     known size, at which a session that already holds an uncommitted diff is
@@ -572,7 +633,8 @@ def summary_file_name(agent) -> str:
     return f"{safe or 'agent'}.summary.md"
 
 
-def plan_lines(records, agents, *, percent: float = DEFAULT_COMPACT_AT_PERCENT) -> list[str]:
+def plan_lines(records, agents, *, percent: float = DEFAULT_COMPACT_AT_PERCENT,
+               min_window: int = DEFAULT_MIN_WINDOW) -> list[str]:
     """One line per model that has a remembered size, for the round's plan.
 
     *agents* is the round's roster, in its own order; a model with nothing
@@ -588,7 +650,7 @@ def plan_lines(records, agents, *, percent: float = DEFAULT_COMPACT_AT_PERCENT) 
         model = getattr(spec, "model_id", "")
         if not isinstance(provider, str) or not isinstance(model, str):
             continue
-        size = smallest_size(records, provider, model)
+        size = smallest_size(records, provider, model, min_window)
         if size is None:
             continue
         lines.append(f"context memory: {provider}/{model} = {size} "

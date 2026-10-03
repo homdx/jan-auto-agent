@@ -101,6 +101,10 @@ QUOTA_PHRASES = (
     "would exceed your available credits",
     "top up",
     "billing",
+    # round 145: an empty wallet ("Your ... wallet balance is insufficient.
+    # Recharge at ...") ended a plain session.error instead of provider_quota
+    "wallet balance",
+    "recharge",
 )
 QUOTA_DEFAULT = " | ".join(QUOTA_PHRASES)
 
