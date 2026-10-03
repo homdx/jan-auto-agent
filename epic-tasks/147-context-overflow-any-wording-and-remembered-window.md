@@ -69,9 +69,9 @@ What must not happen, either way: round 144's `deepseek-v4-flash-free` was refus
 
 ### The window handed to the running Kilo (`kilo_client.set_model_limit`, `backend.KiloBackend.set_model_limit`, `runner.py: run_agent._push_remembered_limit`)
 
-- **When:** a remembered window smaller than Kilo's (or one Kilo was never told) is sent at once:
-  - right after the overflow is written to the memory;
-  - when a turn starts with such a window already remembered, e.g. a revived agent.
+- **When:** a remembered window smaller than Kilo's (or one Kilo was never told) is sent **between turns only**, right before a prompt's mark — the first prompt of a revived agent, or the continue after an overflow.
+- **Why only then:** live, 7.6.2 answers the patch by reloading the workspace's instance (`server.instance.disposed`). A turn, or a compact that Kilo or the runner is running in it, would be cut, and the workspace's `/event` stream ends. The first version sent it right after the overflow: the recovery compact finished in 34 s, the runner never heard it and waited 600 s, and every later wait of that agent was blind.
+- **Reconnecting:** `KiloBackend` reconnects the stream after the patch (`_reconnect_tap`). The old tap sees its end and is stopped; a new tap on the same log waits for `server.connected`. Live, after this fix: disposed → `tap.closed` → `server.connected` within a second, and the continue is heard.
 - **How:** `PATCH /config` for the agent's own workspace, carrying `context_memory.kilo_limit` — the same limit the next round's spawn overlay carries. Each size is sent once.
 - **Keeping the file out of git:** Kilo keeps the patch as `.kilo/kilo.jsonc` in that workspace, so `.kilo/` is added to the worktree's own `info/exclude` first. It is local, never in the agent's diff or commit.
 - **Other backends:** a backend without the method is skipped.
@@ -115,6 +115,7 @@ What must not happen, either way: round 144's `deepseek-v4-flash-free` was refus
    - a remembered size above Kilo's changes nothing.
 7. The window handed to Kilo:
    - an overflow below Kilo's window is `PATCH`ed once, for agent-a's worktree, with `kilo_limit`'s numbers, and `.kilo/` is in its `info/exclude`;
+   - the patch comes after the overflow's compact and before the continue. The fake Kilo ends every `/event` stream on it as 7.6.2 does, and the run still ends READY inside the silence window. With `_reconnect_tap` disabled the same test hangs and fails — checked by mutation;
    - a run that starts with such a memory sends it before the first wait;
    - nothing is sent when Kilo's window is the smaller, and nothing for a plan's cap.
 8. The watch:

@@ -430,22 +430,39 @@ def _patches(fake) -> list:
     return [(r["query"].get("directory"), r["body"]) for r in fake.calls("PATCH")]
 
 
-def test_an_overflow_below_kilo_s_window_is_handed_to_kilo_for_this_workspace(tmp_path):
+def test_an_overflow_below_kilo_s_window_is_handed_to_kilo_before_the_next_prompt(tmp_path):
     """Live, 7.6.2: `PATCH /config` sent with the session's directory resizes
     the model on the running server, and Kilo compacts by it inside the turn.
-    The overflow at 98 777 is sent once, for agent-a's worktree, with the same
-    limit the next round's spawn overlay would carry — and `.kilo/` is kept
-    out of that worktree's git."""
+    It also reloads the workspace's instance and ends its `/event` stream — so
+    it goes between turns, right before the next prompt, and the backend
+    reconnects the stream: the continue after it is heard and the run ends
+    READY well inside the silence window (a dead stream would sit it out).
+    Sent once, for agent-a's worktree, with `kilo_limit`'s numbers, and
+    `.kilo/` kept out of that worktree's git."""
+    import subprocess
+    import time as _time
     memory = tmp_path / "context-memory.json"
-    scenario = ctm._overflow_scenario(ZAI, REFUSED_AT)
-    sb, fake, _h, run, _ = _run(tmp_path, scenario, memory, max_continues_per_attempt=0)
-    assert run.state is tr.AgentState.STALLED
+    scenario = {"summary_tokens": 3_000, "turns": [
+        {"events": ["busy", "idle"], "message_info": {"tokens": {"input": REFUSED_AT,
+                                                                  "output": 0}}},
+        {"events": ["busy"], "error": ZAI},
+        {"on_prompt": tr.work_ready, "events": ["busy", "idle"]},
+    ]}
+    started = _time.monotonic()
+    sb, fake, _h, run, _ = _run(tmp_path, scenario, memory, max_continues_per_attempt=3)
+    tr._assert_ready(run, sb.ws("agent-a"))
+    assert _time.monotonic() - started < 40, "the stream after the reload was heard"
     ((directory, body),) = _patches(fake)
     wt = sb.ws("agent-a").path
     assert Path(directory).resolve() == Path(wt).resolve()
     limit = body["provider"]["kenary"]["models"]["agent-a:free"]["limit"]
     assert limit == cm.kilo_limit(REFUSED_AT, None, cm.DEFAULT_COMPACT_AT_PERCENT)
-    import subprocess
+    # the patch is between turns: after the overflow's compact, before the continue
+    calls = [(r["method"], r["path"]) for r in fake.calls()]
+    patch_at = calls.index(("PATCH", "/config"))
+    summarize_at = max(i for i, c in enumerate(calls) if c[1].endswith("/summarize"))
+    continue_at = max(i for i, c in enumerate(calls) if c[1].endswith("/prompt_async"))
+    assert summarize_at < patch_at < continue_at
     exclude = subprocess.run(["git", "-C", str(wt), "rev-parse", "--git-path", "info/exclude"],
                              capture_output=True, text=True, check=True).stdout.strip()
     path = Path(exclude) if Path(exclude).is_absolute() else Path(wt) / exclude

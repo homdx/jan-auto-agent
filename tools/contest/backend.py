@@ -347,6 +347,9 @@ class KiloBackend:
         self._client = client
         self._tap = tap
         self._directory = directory
+        # round 145: what a reconnect after `set_model_limit` needs — only a tap
+        # this backend built itself can be rebuilt
+        self._tap_args = (server.base_url, directory, events_log) if events_log else None
         self._interrupted = False
 
     # ── the protocol ────────────────────────────────────────────────────────
@@ -390,6 +393,35 @@ class KiloBackend:
             self._client.set_model_limit(provider_id, model_id, limit)
         except KiloHttpError as exc:
             raise ContestBackendError(str(exc)) from exc
+        self._reconnect_tap()
+
+    def _reconnect_tap(self, settle: float = 5.0) -> None:
+        """Round 145: the workspace's event stream after a config reload.
+
+        Live, 7.6.2: a `PATCH /config` disposes the directory's instance and the
+        `/event` stream for it ends (``tap.closed: stream ended``); the old tap
+        never hears another event, so every later wait sits out its silence
+        clock (live: a 34-second compact waited 600 s). The old tap is given up
+        to *settle* seconds to see its end, stopped, and a new one is started
+        on the same log and waits for ``server.connected``. Marks are per tap:
+        the caller takes its next mark after this returns. A tap this backend
+        did not build (a test's) is left alone."""
+        if self._tap_args is None:
+            return
+        old = self._tap
+        try:
+            old.wait(lambda e: e.get("type") == "tap.closed", settle)
+        except Exception:  # noqa: BLE001 — a tap that cannot wait is stopped anyway
+            pass
+        old.stop()
+        old.join(settle)
+        base, directory, log = self._tap_args
+        tap = EventTap(base, directory, log).start()
+        try:
+            tap.wait(lambda e: e.get("type") == "server.connected", settle)
+        except Exception:  # noqa: BLE001 — the stream is open; the event is a courtesy
+            pass
+        self._tap = tap
 
     def abort(self, session: SessionRef) -> None:
         try:

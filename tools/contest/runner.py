@@ -4553,12 +4553,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
 
     def _push_remembered_limit() -> None:
         """Round 145: a remembered window below Kilo's handed to the running
-        server at once (`KiloBackend.set_model_limit`, ``PATCH /config`` for this
+        server (`KiloBackend.set_model_limit`, ``PATCH /config`` for this
         workspace), so Kilo compacts inside the turn by it — the same
         `context_memory.kilo_limit` the next round's spawn overlay carries. Only
         when the memory is smaller than what Kilo was told (or Kilo was told
         nothing), once per size, and only on a backend that can: anything that
         goes wrong is a warning and the watch below still stands.
+
+        Called only between turns, right before a prompt's mark: live, 7.6.2
+        answers the patch by reloading the workspace's instance
+        (``server.instance.disposed``) — a turn or a compact running in it
+        would be cut, and the event stream ends (the backend reconnects it).
         """
         setter = getattr(backend, "set_model_limit", None)
         if not callable(setter):
@@ -4614,7 +4619,6 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             return None
         if not size or source == "kilo":
             return None
-        _push_remembered_limit()
         stop = threading.Event()
         target = session
 
@@ -4975,8 +4979,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             if not context_memory.add(context_memory.memory_path(config, out_dir),
                                       record, days=context_memory.days_of(config)):
                 _log.warning("%s: context memory: not written", spec.name)
-            else:
-                _push_remembered_limit()
+            # the window goes to Kilo before the next prompt, not here: Kilo may
+            # still be compacting this session itself, and a `PATCH /config`
+            # reloads the workspace's instance under it
         except Exception as exc:  # noqa: BLE001 — the overflow still ends the turn
             _log.warning("%s: context memory: %s", spec.name, _brief(str(exc)))
 
@@ -5060,6 +5065,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             else:
                 note = f"attempt {run.attempt} ({kind})"
             transition(AgentState.PROMPTED, note=note)
+            # round 145: a remembered window below Kilo's goes to Kilo now —
+            # the session is between turns, and the backend's event stream is
+            # reconnected after the reload, before the mark below is taken
+            _push_remembered_limit()
             # KC-63: the mark goes right before the POST, so no event of this
             # turn can come before it and every event of an earlier one does
             mark_fn = getattr(backend, "mark", None)

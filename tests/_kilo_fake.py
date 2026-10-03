@@ -285,6 +285,9 @@ class FakeKiloServer:
         self._port = port
         self.reply_timeout = float(reply_timeout)
         self._bus = _Bus()
+        #: round 145: `PATCH /config` calls so far — a stream opened after one
+        #: starts with `server.connected`, as 7.6.2's does
+        self._config_reloads = 0
         self.requests: list = []
         self._sessions: dict = {}
         self._pending: dict = {}
@@ -919,6 +922,15 @@ class _Handler(BaseHTTPRequestHandler):
         body = self._body()
         path, _query = self._record(body)
         if path == "/config":
+            # 7.6.2 reloads the directory's instance: `server.instance.disposed`
+            # and the end of every open `/event` stream; a stream opened after
+            # it starts with `server.connected`
+            self.fake._emit({"type": "server.instance.disposed", "properties": {}})
+            self.fake._config_reloads += 1
+            with self.fake._bus._lock:
+                subs = list(self.fake._bus._subs)
+            for q in subs:
+                q.put(None)
             return self._json(200, body)
         return self._not_found(path)
 
@@ -1050,6 +1062,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _stream_events(self) -> None:
         q = self.fake._bus.subscribe()
+        if self.fake._config_reloads:
+            q.put({"type": "server.connected", "properties": {}})
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
