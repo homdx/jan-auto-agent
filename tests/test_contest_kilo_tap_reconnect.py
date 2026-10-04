@@ -490,3 +490,53 @@ def test_a_push_from_a_linked_worktree_leaves_the_repository_s_exclude_alone(tmp
         "the repository's shared exclude is ours for no one"
     # and the worktree's own tree: only the ignore file, which hides itself
     assert _git(worktree, "status", "--porcelain") == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kilo's own `.kilo/.gitignore` (judge, round 151)
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: What 7.6.2 writes, byte for byte, when it opens a workspace whose `.kilo/` has
+#: no `.gitignore` — checked live: no trailing newline, and neither project file.
+KILO_OWN_GITIGNORE = ("node_modules\npackage.json\npackage-lock.json\npnpm-lock.yaml\n"
+                      "bun.lock\nyarn.lock\n.gitignore\nagent-manager.json")
+
+
+def test_kilo_s_own_ignore_file_is_extended_and_the_push_stays_hidden(tmp_path):
+    """The agent made `.kilo/rules/` and Kilo wrote its own `.kilo/.gitignore`
+    there before the push. That file hides itself and is not tracked, so the
+    project names are appended to it: Kilo's lines stay, and the file the
+    patch writes is out of `git status`."""
+    repo = _repo(tmp_path / "repo")
+    (repo / ".kilo" / "rules").mkdir(parents=True)
+    (repo / ".kilo" / "rules" / "x.md").write_text("# rule\n", encoding="utf-8")
+    ignore = repo / ".kilo" / ".gitignore"
+    ignore.write_text(KILO_OWN_GITIGNORE, encoding="utf-8")
+
+    backend_mod._exclude_kilo_dir(str(repo))
+    (repo / ".kilo" / "kilo.jsonc").write_text("{}\n", encoding="utf-8")
+
+    lines = ignore.read_text(encoding="utf-8").splitlines()
+    assert lines[:8] == KILO_OWN_GITIGNORE.splitlines()
+    assert "kilo.jsonc" in lines and "kilo.json" in lines
+    assert _ignored(repo, ".kilo/kilo.jsonc") is True
+    assert _ignored(repo, ".kilo/rules/x.md") is False
+    assert _git(repo, "status", "--porcelain", "-uall") == "?? .kilo/rules/x.md"
+
+
+def test_a_tracked_ignore_file_of_the_agent_s_is_never_edited(tmp_path, caplog):
+    """A `.kilo/.gitignore` the checkout tracks would put any edit in the diff,
+    even one that lists itself: it is left byte-identical and warned about."""
+    caplog.set_level(logging.WARNING, logger="tools.contest.backend")
+    repo = _repo(tmp_path / "repo")
+    (repo / ".kilo").mkdir()
+    (repo / ".kilo" / ".gitignore").write_text("node_modules\n.gitignore\n", encoding="utf-8")
+    _git(repo, "add", "-f", ".kilo/.gitignore")      # it lists itself: only -f tracks it
+    _git(repo, "commit", "-q", "-m", "the agent's ignore file")
+    before = (repo / ".kilo" / ".gitignore").read_bytes()
+
+    backend_mod._exclude_kilo_dir(str(repo))
+
+    assert (repo / ".kilo" / ".gitignore").read_bytes() == before
+    assert any("agent's" in record.getMessage() for record in caplog.records)
+

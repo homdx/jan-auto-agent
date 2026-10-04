@@ -591,6 +591,16 @@ def _exclude_kilo_dir(directory: str) -> None:
     land in the agent's diff. The file goes with the project file in
     `drop_stale_kilo_file`. Never raises: an unignored project file is a nuisance,
     not a round.
+
+    Except Kilo's own. Live, 7.6.2: an instance that opens a workspace with a
+    ``.kilo/`` and no ``.kilo/.gitignore`` writes one — ``node_modules``,
+    ``package.json``, the lock files, ``.gitignore``, ``agent-manager.json`` —
+    and never rewrites one that is there. It names neither project file, so a
+    ``.kilo/`` the agent made (``.kilo/rules/``) or a reload after a patch leaves
+    Kilo's file in place and ``kilo.jsonc`` in plain view. A file that ignores
+    itself and is not tracked is never in the agent's diff, whoever wrote it, so
+    the missing names are appended to it; one that is tracked, or does not hide
+    itself, is still the agent's and is still only warned about.
     """
     key = str(directory)
     if _KILO_EXCLUDED.get(key):
@@ -598,20 +608,40 @@ def _exclude_kilo_dir(directory: str) -> None:
     try:
         path = _kilo_ignore_path(directory)
         if path.exists():
-            lines = {line.strip() for line in path.read_text(encoding="utf-8").splitlines()}
+            text = path.read_text(encoding="utf-8")
+            lines = {line.strip() for line in text.splitlines()}
         else:
             path.parent.mkdir(parents=True, exist_ok=True)
-            lines = set()
+            text, lines = "", set()
         missing = [line for line in _KILO_IGNORE_LINES if line not in lines]
         if missing:
             if lines:
-                _LOG.warning("%s: .kilo/.gitignore is the agent's and ignores none of %s "
-                             "— the window may show in the diff", directory, ", ".join(missing))
-                return
-            path.write_text("".join(line + "\n" for line in _KILO_IGNORE_LINES), encoding="utf-8")
+                if not _hides_itself_untracked(directory, lines):
+                    _LOG.warning("%s: .kilo/.gitignore is the agent's and ignores none of %s "
+                                 "— the window may show in the diff",
+                                 directory, ", ".join(missing))
+                    return
+                with path.open("a", encoding="utf-8") as fh:
+                    if text and not text.endswith("\n"):
+                        fh.write("\n")
+                    fh.write("".join(line + "\n" for line in missing))
+            else:
+                path.write_text("".join(line + "\n" for line in _KILO_IGNORE_LINES),
+                                encoding="utf-8")
         _KILO_EXCLUDED[key] = True
     except OSError:
         return
+
+
+def _hides_itself_untracked(directory, lines: set) -> bool:
+    """Whether a ``.kilo/.gitignore`` with *lines* can never reach the agent's diff:
+    it ignores itself and the checkout does not track it. A `git` that does not
+    answer is a no — the file is then left as it is."""
+    if ".gitignore" not in lines:
+        return False
+    ok, out = _git(directory, "ls-files", "--", "/".join(_KILO_IGNORE_PATH),
+                   timeout=_KILO_GIT_TIMEOUT)
+    return ok and not out
 
 
 def _drop_kilo_ignore(directory) -> None:
