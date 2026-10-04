@@ -57,7 +57,6 @@ from tools.contest import context_memory as cm  # noqa: E402
 from tools.contest import policy as policy_mod  # noqa: E402
 from tools.contest import runner as runner_mod  # noqa: E402
 from tools.contest.runner import (  # noqa: E402
-    FULL_REFUSAL_SHARE,
     OVERFLOW_CONTINUE,
     _context_budget,
     _is_full_refusal,
@@ -68,6 +67,12 @@ from tools.contest.runner import (  # noqa: E402
 #: What zai declares for glm-4.5-flash, and where it refused (round 145).
 DECLARED = 131_072
 REFUSED_AT = 98_777
+
+#: The share the runner waits for, as a fraction. Read from `context_memory` —
+#: the one source (`[contest] context_full_refusal_percent`), not the runner's
+#: own constant: `runner.FULL_REFUSAL_SHARE` is only the default for a caller
+#: with no config, and a test that reads it cannot see a config that disagrees.
+SHARE = cm.full_refusal_percent(None) / 100.0
 
 #: The payloads round 144/145 got back, as `session.error` carried them.
 ZAI = {"name": "APIError", "data": {"message": "Prompt exceeds max length",
@@ -83,6 +88,18 @@ WALLET = {"name": "APIError", "data": {
 #: A refusal that says nothing about why.
 BARE_400 = {"name": "APIError", "data": {"message": "Bad Request", "statusCode": 400,
                                          "isRetryable": False}}
+#: Round 152: xAI names its own wall with both numbers, in a word order
+#: `_SIZE_REFUSAL_RE` did not know — `maximum prompt length` rather than
+#: `maximum context length`, which is why `_OVERFLOW_RE` never matched it.
+XAI = {"name": "APIError", "data": {
+    "message": ("This model's maximum prompt length is 131072 but the request "
+                "contains 150000 tokens"),
+    "statusCode": 400, "isRetryable": False}}
+#: Round 152: TGI states the same wall as an inequality over the sum of its two
+#: budgets — a 400 the `_REQUEST_FAULT_RE` comment always called an overflow.
+TGI = {"name": "APIError", "data": {
+    "message": "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 4096",
+    "statusCode": 400, "isRetryable": False}}
 
 
 def _committed_quota_text() -> str:
@@ -191,7 +208,7 @@ def test_a_size_word_the_wording_path_declined_vetoes_the_inference_too():
     size, not the session's. The inference stays for the message that says
     nothing about one at all."""
     quota = _committed_quota_re()
-    full = int(FULL_REFUSAL_SHARE * DECLARED) + 1
+    full = int(SHARE * DECLARED) + 1
     display = {"name": "APIError", "data": {"message": "Your error message is too large to display",
                                             "statusCode": 400}}
     assert not _is_overflow(display, quota)
@@ -213,7 +230,7 @@ def test_the_round_s_quota_patterns_veto_a_size_refusal():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_a_bare_refusal_of_a_full_session_is_an_overflow():
-    full = int(FULL_REFUSAL_SHARE * DECLARED) + 1
+    full = int(SHARE * DECLARED) + 1
     assert _is_full_refusal(BARE_400, REFUSED_AT, DECLARED)
     assert _is_full_refusal(BARE_400, full, DECLARED)
     # 413 is literally a size status, and an API error is the caller of it
@@ -233,7 +250,7 @@ def test_a_refusal_without_a_status_or_an_api_error_name_is_not_one(error):
     refusal — a status it answers a size with, and a name that says the
     provider refused it. A payload with no status at all, or one that is not an
     API error, is the request or its shape, not its size."""
-    assert not _is_full_refusal(error, int(FULL_REFUSAL_SHARE * DECLARED) + 1, DECLARED)
+    assert not _is_full_refusal(error, int(SHARE * DECLARED) + 1, DECLARED)
 
 
 @pytest.mark.parametrize("error,last_ok,size", [
@@ -596,8 +613,15 @@ def test_a_remembered_size_above_kilo_s_changes_nothing(tmp_path, monkeypatch):
     assert out is config and content is None
 
 
-def test_full_refusal_share_is_a_share():
-    assert 0 < runner_mod.FULL_REFUSAL_SHARE < 1
+def test_full_refusal_share_is_a_share(tmp_path):
+    """One source for the share: the config's number, read from `context_memory`
+    — the runner's own constant is only its default, so a test that read it
+    could not see a config that set another. The runner reads the share off the
+    config on every overflow, so a config that sets one wins."""
+    assert SHARE == cm.full_refusal_percent(None) / 100.0
+    assert 0 < SHARE < 1
+    config = ctm._config(tmp_path, context_full_refusal_percent=70)
+    assert cm.full_refusal_percent(config) / 100.0 == 0.7
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1055,3 +1079,150 @@ def test_the_ini_watches_every_ten_seconds_and_a_code_config_does_not(tmp_path):
     assert tr.make_config(["agent-a"]).context_watch_sec == 0.0
     assert "context_watch_sec            = 10" in (REPO_ROOT / "contest.ini").read_text(
         encoding="utf-8")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. round 152: the wording gaps, the closed status list, the guard's unit
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_xai_s_named_prompt_length_is_a_worded_overflow_that_is_remembered(
+        tmp_path, caplog):
+    """Round 152 test 1: xAI names its own wall — `maximum prompt length`, with
+    the limit and the request's size — in words the wording path did not know,
+    so on HEAD it was only ever the *inferred* reading at 60 % fill: nothing
+    written to the memory, no window handed to Kilo, and every round met the
+    same wall again at the same size. Now it is worded: the memory holds the
+    last reply, and a second refusal far below it is still the repeat guard's,
+    not the window a second time."""
+    import logging
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    memory = tmp_path / "context-memory.json"
+    quota = _committed_quota_re()
+    # a number named next to the wall is the wording, not the inference
+    assert runner_mod._SIZE_REFUSAL_RE.search(XAI["data"]["message"]) is not None
+    assert _is_overflow(XAI, quota) and _is_overflow(XAI["data"], quota)
+    scenario = {"summary_tokens": 3_000, "turns": [
+        {"events": ["busy", "idle"], "message_info": {"tokens": {"input": REFUSED_AT,
+                                                                   "output": 0}}},
+        {"events": ["busy"], "error": XAI},
+        {"events": ["busy", "idle"], "message_info": {"tokens": {"input": 40_000,
+                                                                   "output": 0}}},
+        {"events": ["busy"], "error": XAI},
+    ]}
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory, max_continues_per_attempt=5,
+                                  context_min_window=32_000)
+    assert run.state is tr.AgentState.ERROR
+    (record,) = cm.load(memory)
+    # xAI names a limit but not in the shape `parse_overflow` reads, so the
+    # record is the reply that went through — the number the provider proved
+    assert record.limit is None and record.last_ok == REFUSED_AT
+    assert cm.size_of(record) == REFUSED_AT
+    assert any("not the window again" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("message,status,want", [
+    ("Your prompt with 3 images exceeds the context window", 400, True),
+    ("Your prompt with 3 images exceeds the context window", 413, True),
+    ("image attachment too large", 400, False),
+    ("token budget exceeded, retry later", 400, False),
+    ("prompt exceeds the free tier's token budget", 400, False),
+    ("input exceeds 20 images", 400, False),
+])
+def test_a_wall_named_beside_images_or_a_budget_is_the_window(message, status, want):
+    """Round 152 test 2: the images and the budget are what the prompt carried
+    or what the plan allows — `_CONTEXT_WALL_RE` overrides those vetoes, as it
+    already overrides the output cap, so `Your prompt with 3 images exceeds the
+    context window` is the window. A message with the word and no wall keeps
+    every veto: an attachment cap counts images, a rate cap counts a token
+    budget, a plan counts an allowance."""
+    assert _is_overflow({"name": "APIError", "data": {"message": message,
+                                                      "statusCode": status}},
+                        _committed_quota_re()) is want, message
+
+
+def test_tgi_s_token_sum_is_an_overflow_on_a_400_and_not_on_a_422():
+    """Round 152 test 3, the decision: `tokens ... must be <= N` goes into
+    `_SIZE_REFUSAL_RE`, so TGI's validation error is the overflow its comment
+    always claimed it was — 400, 413. A 422 is the request's shape, not its
+    size, whatever it says, and it may never teach the memory."""
+    message = TGI["data"]["message"]
+    quota = _committed_quota_re()
+    assert runner_mod._SIZE_REFUSAL_RE.search(message) is not None
+    for status in (400, 413):
+        assert _is_overflow({"name": "APIError", "data": {"message": message,
+                                                           "statusCode": status}}, quota)
+    assert not _is_overflow({"name": "APIError", "data": {"message": message,
+                                                           "statusCode": 422}}, quota)
+
+
+@pytest.mark.parametrize("message", ["prompt too long", "Prompt exceeds max length",
+                                     "input is too long", TGI["data"]["message"]])
+@pytest.mark.parametrize("status", [422, 500])
+def test_a_worded_refusal_on_a_422_or_a_500_is_not_the_window(message, status):
+    """Round 152 test 4: `_SIZE_REFUSAL_STATUSES` is closed on 400 and 413 — the
+    two statuses a provider uses for a size — and stays closed even when the
+    message names the wall in every word. A 422 is the request's shape and a
+    5xx is the provider itself, and neither may be remembered as the model's
+    window."""
+    quota = _committed_quota_re()
+    assert _is_overflow({"name": "APIError", "data": {"message": message,
+                                                       "statusCode": 400}}, quota)
+    assert not _is_overflow({"name": "APIError", "data": {"message": message,
+                                                           "statusCode": status}}, quota)
+
+
+def test_the_repeat_guard_comares_the_same_unit_on_both_sides(tmp_path, caplog):
+    """Round 152 test 5: the first overflow went through at 98 000 and then
+    read another 60 000, so the request the provider refused was 158 000. The
+    second went through at 60 000 and refused there — 38 % of the first
+    *request*. The guard compares one unit to one unit, so this is not the
+    window again. On HEAD it compared the second request (60 000) with half
+    the first *reply* (49 000) and let it through, remembering a 60 000 window
+    below the 98 000 the provider had already refused at."""
+    import logging
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    memory = tmp_path / "context-memory.json"
+    scenario = {"summary_tokens": 3_000, "turns": [
+        _big_read_turn(98_000, 60_000),
+        {"events": ["busy"], "error": ZAI},
+        {"events": ["busy", "idle"], "message_info": {"tokens": {"input": 60_000,
+                                                                   "output": 0}}},
+        {"events": ["busy"], "error": ZAI},
+    ]}
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory, max_continues_per_attempt=5,
+                                  max_error_retries=0, context_min_window=32_000)
+    assert run.state is tr.AgentState.ERROR
+    assert "context overflow" not in run.last_error
+    (record,) = cm.load(memory)
+    assert record.last_ok == 98_000 and record.grew == 60_000
+    assert any("not the window again" in r.getMessage() for r in caplog.records)
+
+
+def test_a_small_window_with_no_declared_limit_is_remembered_by_the_fallback(tmp_path):
+    """Round 152 test 6, the floor half: Kilo declares nothing, so the wall the
+    floor drops against is the round's ``context_limit_fallback`` — the same
+    wall `context_memory.size_of` measures against, which must not disagree.
+    28 000 of 32 768 is 85 %, so the refusal is the window and it is
+    remembered, exactly as it was under a declared 32 768."""
+    memory = tmp_path / "context-memory.json"
+    config = _declared(ctm._config(tmp_path, memory=memory, context_limit_fallback=32_768,
+                                   max_continues_per_attempt=0), limit=None)
+    _sb, _fake, _h, run, _ = tr._run_one(tmp_path, ctm._overflow_scenario(ZAI, 28_000), config)
+    assert run.state is tr.AgentState.STALLED
+    assert run.last_error == "context overflow"
+    (record,) = cm.load(memory)
+    assert record.last_ok == 28_000
+    assert runner_mod._context_budget(config.agents[0], cm.load(memory), config) == (
+        28_000, "remembered")
+
+
+def test_a_small_window_with_neither_declared_nor_fallback_is_not_remembered(tmp_path):
+    """Round 152 test 6, the other half: with neither wall there is nothing to
+    call 28 000 close to, so the floor stands at `context_min_window` and the
+    model stays unremembered — the error it always was."""
+    memory = tmp_path / "context-memory.json"
+    config = _declared(ctm._config(tmp_path, memory=memory, context_limit_fallback=0,
+                                   max_continues_per_attempt=0), limit=None)
+    _sb, _fake, _h, run, _ = tr._run_one(tmp_path, ctm._overflow_scenario(ZAI, 28_000), config)
+    assert run.state is tr.AgentState.ERROR
+    assert cm.load(memory) == []

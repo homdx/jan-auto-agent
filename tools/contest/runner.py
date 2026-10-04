@@ -669,13 +669,29 @@ _OVERFLOW_RE = re.compile(
 #: ``Request too large for model`` without a head, because the provider says
 #: the request is too large *for the model* — and it needs the same noun, so
 #: ``too large to display`` stays out.
+#:
+#: The provider naming its own limit is an overflow too, in either word order
+#: (round 152, xAI: ``This model's maximum prompt length is 131072 but the
+#: request contains 150000 tokens``) — a head, a size noun and a number, and
+#: the wall is the model's, not a plan's cap. It needs the number or a size
+#: noun near it: a bare ``maximum input size`` says nothing about this
+#: request. The number may not carry a byte unit — a body cap speaks in MB,
+#: not tokens, and ``maximum input size 1 MB`` is the upload limit. TGI states
+#: the same wall as an inequality over the sum of its two budgets
+#: (```inputs` tokens + `max_new_tokens` must be <= 4096``); a token count with
+#: a ``must be <= N`` is that shape, and the output half of the sum is a term
+#: of it, not a refusal.
 _SIZE_REFUSAL_RE = re.compile(
     r"\b(?:prompt|context|input)s?\b[^.\n]{0,60}?"
     r"(?:\btoo\s+(?:long|large|big)\b|\bexceed\w*|\bover\s+the\s+(?:max\w*|limit)\b"
     r"|\blonger\s+than\s+(?:the\s+)?(?:max\w*|limit|context|allowed\s+length)\b)"
     r"|\bexceed\w*\b[^.\n]{0,40}?\b(?:context|length|size|tokens?)\b"
     r"|\btoo\s+(?:long|large|big)\b[^.\n]{0,40}?\b(?:context|length|size|tokens?|model)\b"
-    r"|\btoo\s+many\s+(?:input\s+|prompt\s+)?tokens\b",
+    r"|\btoo\s+many\s+(?:input\s+|prompt\s+)?tokens\b"
+    r"|\bmaximum\s+(?:prompt|context|input)\s+(?:length|size)\b[^.\n]{0,40}?"
+    r"(?:\b\d[\d,]*(?!\s*(?:kb|mb|gb|tb|bytes?)\b)\b|\b(?:tokens?|length|size|limit|allowed)\b)"
+    r"|\btokens?\b[^.\n]{0,50}?\bmust\s+be\s*(?:<=|<|=|at\s+most|no\s+more\s+than)\s*"
+    r"\d[\d,]*",
     re.IGNORECASE,
 )
 
@@ -695,6 +711,13 @@ _SIZE_REFUSAL_RE = re.compile(
 #: ``body`` or ``queue`` may not veto it. ``wallet`` and ``recharge`` are not
 #: here: they are one provider's phrases and belong in ``quota_patterns``
 #: (KC-61), where the committed ``contest.ini`` already has them.
+#:
+#: Four of the vetoes below give way when the message also names the window
+#: (`_CONTEXT_WALL_RE`, `_WALL_VETO_RE`): ``Your prompt with 3 images exceeds
+#: the context window`` is the window, the images are only what the prompt
+#: carried. They are the phrases the other refusals speak in — an attachment
+#: cap counts images, a rate cap counts a token budget, a plan counts an
+#: allowance — and none of them names the window.
 _NOT_SIZE_RE = re.compile(
     r"rate.?limit|too\s+many\s+requests|quota|credit|balance|payment"
     r"|free.?tier|unauthori[sz]ed|forbidden|api.?key"
@@ -706,6 +729,12 @@ _NOT_SIZE_RE = re.compile(
     r"|token\s+budget|budget\s+exceeded|allowance",
     re.IGNORECASE,
 )
+
+#: The vetoes a named context wall overrides (`_not_a_size`). `attachment`
+#: stays a veto even there: `image attachment too large` names no window, so
+#: the wall never gets to decide it.
+_WALL_VETO_RE = re.compile(
+    r"\bimages?\b|token\s+budget|budget\s+exceeded|allowance", re.IGNORECASE)
 
 #: The size verbs `_SIZE_REFUSAL_RE` hunts for, alone of their head and noun.
 #: A1 left ``Your error message is too large to display`` out of the wording
@@ -738,13 +767,23 @@ REPEAT_OVERFLOW_SHARE = 0.5
 #: the request away and a 413, which is literally a size status. 401/403 are the
 #: key, 429 the rate, 5xx the provider itself, 422 a schema — none of them a
 #: size, and none of them may teach the memory.
+#:
+#: The tuple stays closed on those two on purpose (round 152): a provider that
+#: answers `prompt too long` with a 422 or a 500 is refusing the request's
+#: shape or itself, not naming a window. The wording path and the inferred
+#: reading both gate on this one tuple, so widening it would let a 422 or a 5xx
+#: teach the memory the size of a model nobody ever said it had. The three
+#: fixed spellings (`_OVERFLOW_RE`) read before the status is looked at: the
+#: provider named the overflow itself there, and a 5xx that still says
+#: `ContextOverflowError` is the overflow it always was.
 _SIZE_REFUSAL_STATUSES = (400, 413)
 
 #: A 400 that names its own cause names one that is not the session's size: a
 #: body that is not JSON, a tool call or a schema the model got wrong, a
 #: safety filter. Only the wordless reading (`_is_full_refusal`) asks — a
 #: message with size words is the wording path's, and TGI's ``Input validation
-#: error: … tokens must be <= 4096`` is a real overflow there; a message that
+#: error: … tokens must be <= 4096`` is a real overflow there, matched by the
+#: `tokens ... must be <= N` shape of `_SIZE_REFUSAL_RE`; a message that
 #: counts tokens (`_TOKENS_RE`) is never vetoed by it.
 _REQUEST_FAULT_RE = re.compile(
     r"\bjson\b|tool[\s_-]*call|function[\s_-]*call|\bschema\b|invalid\s+(?:argument|parameter|request\s+format)"
@@ -972,11 +1011,16 @@ def _error_texts(error) -> str:
 def _not_a_size(text: str, quota_re=None) -> bool:
     """Money, a plan, a key or a rate (`_NOT_SIZE_RE`, *quota_re*) — never an overflow.
 
-    An output cap named beside the context wall (`_CONTEXT_WALL_RE`) is a term of
-    the sum, not the refusal: ``input length and `max_tokens` exceed context
-    limit: 188240 + 21333 > 200000`` is an overflow."""
+    A cap named beside the context wall (`_CONTEXT_WALL_RE`) is a term of the
+    sum, not the refusal: ``input length and `max_tokens` exceed context
+    limit: 188240 + 21333 > 200000`` is an overflow. So is a cap the wall only
+    mentions in passing — `_WALL_VETO_RE`: ``Your prompt with 3 images exceeds
+    the context window`` is the window, not the attachments. A message with no
+    wall keeps every veto: `input exceeds 20 images` and `image attachment too
+    large` stay the refusals they are."""
     if _CONTEXT_WALL_RE.search(text) is not None:
         text = _OUTPUT_CAP_RE.sub(" ", text)
+        text = _WALL_VETO_RE.sub(" ", text)
     if _NOT_SIZE_RE.search(text):
         return True
     return quota_re is not None and quota_re.search(text) is not None
@@ -1227,6 +1271,20 @@ def _context_limit_fallback(value) -> int:
     except (TypeError, ValueError):
         return 0
     return number if number > 0 else 0
+
+
+def _declared_window(spec) -> int | None:
+    """The window Kilo declares for *spec*, as a positive int, else ``None``.
+
+    ``None`` is the size the round has to supply itself — the memory, then
+    ``context_limit_fallback`` — which is what the floor is lowered against
+    (`context_memory.size_of`, `_overflow_of`). A missing key, a bool, a
+    non-int or a non-positive number all mean the same: nothing declared.
+    """
+    declared = getattr(spec, "context_limit", None)
+    if isinstance(declared, bool) or not isinstance(declared, int) or declared <= 0:
+        return None
+    return declared
 
 
 def _context_budget(spec, records, config=None) -> tuple:
@@ -5118,10 +5176,15 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
 
         The three fixed spellings (`_OVERFLOW_RE`) are an overflow as they
         always were. Round 145 adds two more, and both demand a session that
-        actually grew — the last reply that went through at or above ``[contest]
+        actually grew — the refused *request* at or above ``[contest]
         context_min_window`` — so a model a plan cuts off at a small prompt
         (round 144's free tier) ends the way it always ended and never writes a
-        size into the memory:
+        size into the memory. The floor is lowered to
+        ``context_full_refusal_percent`` of the declared window when Kilo
+        declares one, and of ``context_limit_fallback`` when it does not —
+        `context_memory.size_of`, which decides what the next round remembers,
+        measures the same two walls and must not disagree with this. With
+        neither, the floor stands: a window under it stays unremembered.
 
           * a size refusal in the provider's own words (`_SIZE_REFUSAL_RE` with
             the round's ``quota_patterns``, so money, a plan, a key or a rate
@@ -5130,9 +5193,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             ``context_full_refusal_percent`` of its window (`_is_full_refusal`).
 
         And neither may repeat into a loop: a second one in this run whose
-        request was under `REPEAT_OVERFLOW_SHARE` of the first one's came after
-        a compact (or a fresh session) left far less than the wall, so the
-        refusal is about something else — the error it is, not another compact.
+        *request* was under `REPEAT_OVERFLOW_SHARE` of the first one's *request*
+        came after a compact (or a fresh session) left far less than the wall,
+        so the refusal is about something else — the error it is, not another
+        compact. The guard compares one unit to one unit — the refused request,
+        the reply plus what its tools added; the memory record keeps `last_ok`,
+        the reply alone, but the guard never does.
         Each reading is logged, so the operator sees why an error became one.
 
         Reads the error *before* either new reading — and only *after* the fixed
@@ -5153,12 +5219,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         if _OVERFLOW_RE.search(text) is not None:
             # The old path's verdict is unchanged; what changes is that it
             # records the size too, so a second overflow far below it is not
-            # read as the window again.
+            # read as the window again. The guard's own unit is the refused
+            # request, so this path records it too, not `last_ok`.
             try:
-                last_ok, _grew = _last_reply(backend, session)
+                last_ok, grew = _last_reply(backend, session)
             except Exception:  # noqa: BLE001 — no read, no record
-                last_ok = 0
-            overflows_seen.append(last_ok)
+                last_ok, grew = 0, 0
+            overflows_seen.append(last_ok + (grew or 0))
             _log.info("%s: %r at %s tokens — read as a context overflow", spec.name,
                       _brief(_error_message(error)), f"{last_ok:,}")
             return "words"
@@ -5179,19 +5246,25 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         except Exception:  # noqa: BLE001 — no read, no guess: the error as before
             return False
         # The request that was refused was the last reply plus what the reply's
-        # tools added after it, so both readings compare that — the record keeps
-        # `last_ok`, the size that went through. `last_ok` alone refused a
-        # session that read a big batch in one step (round 145's glm) as a plan's
-        # cap, and nothing was remembered for it.
+        # tools added after it, so both readings and the repeat guard compare
+        # that — the record keeps `last_ok`, the size that went through.
+        # `last_ok` alone refused a session that read a big batch in one step
+        # (round 145's glm) as a plan's cap, and nothing was remembered for it.
         requested = last_ok + (grew or 0)
         floor = context_memory.min_window(config)
-        declared = getattr(spec, "context_limit", None)
         share = context_memory.full_refusal_percent(config) / 100.0
-        if isinstance(declared, int) and not isinstance(declared, bool) \
-                and declared > 0 and share > 0:
+        if share > 0:
             # round 149, as `context_memory.size_of`: a model Kilo declares at
-            # 32 768 and refuses at 28 000 is full, not a plan's cap
-            floor = min(floor, int(share * declared))
+            # 32 768 and refuses at 28 000 is full, not a plan's cap. Round 152:
+            # when Kilo declares nothing the round's fallback is the wall to
+            # measure against, and with neither the floor stands, so a window
+            # under it stays unremembered.
+            wall = _declared_window(spec)
+            if wall is None:
+                wall = _context_limit_fallback(
+                    getattr(config, "context_limit_fallback", 0))
+            if wall > 0:
+                floor = min(floor, int(share * wall))
         if not last_ok or (floor and requested < floor):
             # nothing went through yet, whatever the floor: a refusal of the
             # session's first request cannot have filled a context
@@ -5214,7 +5287,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                       _brief(_error_message(error)), f"{requested:,}",
                       f"{max(overflows_seen):,}")
             return False
-        overflows_seen.append(last_ok)
+        # One unit: the refused request, as the comparison just made, not
+        # `last_ok` — the reply alone was half the request a big batch made.
+        overflows_seen.append(requested)
         _log.info("%s: %r at %s tokens %s", spec.name, _brief(_error_message(error)),
                   f"{last_ok:,}", how)
         return "words" if worded else "inferred"

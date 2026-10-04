@@ -300,11 +300,17 @@ def size_of(record: OverflowRecord, min_window: int = DEFAULT_MIN_WINDOW,
     KC-73 as it was. A *tight* record (``grew`` small or ``None``) sizes the
     model as before, at or above the floor; when *declared* is known the floor
     drops to ``min(min_window, share_pct % × declared)`` so a genuine
-    small-window model Kilo declares can remember its own size. Named limits
-    are walls and are never touched by any of this. *share_pct* 0 turns both
-    share checks off: a loose record sizes nothing, the floor stays
-    *min_window*. Everything here is fail-open: a non-number *declared*,
-    *fallback* or *share_pct* degrades to the defaults, never an exception.
+    small-window model Kilo declares can remember its own size. Round 152:
+    when Kilo declares nothing the same drop uses *fallback*
+    (``context_limit_fallback``) — a model the round sizes at 32 768 and the
+    provider refuses at 28 000 is full, not a plan's cap. With neither a
+    declared window nor a fallback, a ``last_ok`` under *min_window* stays
+    unremembered: there is no wall to measure it against, so the floor stands
+    as *min_window*. Named limits are walls and are never touched by any of
+    this. *share_pct* 0 turns both share checks off: a loose record sizes
+    nothing, the floor stays *min_window*. Everything here is fail-open: a
+    non-number *declared*, *fallback* or *share_pct* degrades to the defaults,
+    never an exception.
 
     Round 145: *min_window* (``[contest] context_min_window``) is the floor
     when no window is declared. A ``last_ok`` under it sizes nothing, tight or
@@ -335,10 +341,13 @@ def size_of(record: OverflowRecord, min_window: int = DEFAULT_MIN_WINDOW,
         if wall is None or share <= 0:
             return None
         return record.last_ok if record.last_ok >= share * wall else None
-    if declared_n is not None and share > 0:
+    if share > 0:
         # round 149: a model Kilo declares at 32 768 can remember a tight
-        # 28 000 — the floor drops to share × D when D is known
-        floor = min(floor, share * declared_n)
+        # 28 000 — the floor drops to share × D when D is known. Round 152:
+        # the round's fallback is the same wall when Kilo declares nothing.
+        wall = declared_n if declared_n is not None else _number(fallback)
+        if wall is not None:
+            floor = min(floor, share * wall)
     return record.last_ok if record.last_ok >= floor else None
 
 

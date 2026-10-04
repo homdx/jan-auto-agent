@@ -1211,6 +1211,29 @@ def test_a_small_declared_window_lowers_the_floor_for_a_tight_record():
     assert runner_mod._context_budget(spec, [record.to_dict()]) == (28_000, "remembered")
 
 
+def test_a_fallback_window_lowers_the_floor_for_a_tight_record_with_no_declared():
+    """Ticket 152 test 6: Kilo declares nothing, so the wall is the round's
+    ``context_limit_fallback`` — the same number `size_of` already measures a
+    loose record against, and now the same number the floor drops against. A
+    tight 28 000 of a 32 768 fallback is 85 %, so the model is remembered.
+    With neither a declared window nor a fallback the floor stands at
+    context_min_window and the same record sizes nothing: there is no wall to
+    call 28 000 close to."""
+    record = _loose_record(last_ok=28_000, grew=500)
+    share_pct = cm.full_refusal_percent(None)
+    assert record.last_ok >= share_pct / 100.0 * 32_768, "85 % of the fallback"
+    assert cm.size_of(record, 32_000, fallback=32_768) == 28_000
+    assert cm.size_of(record, 32_000, declared=None, fallback=32_768) == 28_000
+    assert cm.size_of(record, 32_000, fallback=None) is None
+    assert cm.size_of(record, 32_000) is None
+    config = replace(tr.make_config(["agent-a"]), context_limit_fallback=32_768)
+    assert runner_mod._context_budget(config.agents[0], [record.to_dict()], config) == (
+        28_000, "remembered")
+    # a declared window above context_min_window lowers the floor not at all,
+    # so the fallback is the only wall that saves this record
+    assert cm.size_of(record, 32_000, declared=131_072) is None
+
+
 def test_a_remembered_size_equal_to_kilo_s_window_is_kilo_s():
     """Ticket 149 test 7: a remembered size equal to Kilo's window exactly is
     not smaller, so the source is ``"kilo"``."""
