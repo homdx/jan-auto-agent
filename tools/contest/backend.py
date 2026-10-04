@@ -77,6 +77,7 @@ from tools.contest.kilo_client import (
     KiloServer,
     SessionRef,
     _deadline_grant,
+    _context_limit_of,
     _permission_answer,
 )
 
@@ -86,6 +87,7 @@ __all__ = [
     "ContestBackend",
     "ContestBackendError",
     "KiloBackend",
+    "KiloLimitKept",
     "KiloLimitRefused",
     "KiloTapReconnectError",
     "KILO_PROJECT_FILE",
@@ -168,6 +170,34 @@ class KiloTapReconnectError(ContestBackendError):
     "the window was not handed to Kilo" — which un-remembers a window Kilo does
     hold and re-patches, and reloads Kilo, for every later prompt.
     """
+
+
+class KiloLimitKept(ContestBackendError):
+    """Round 153: the patch landed, and the server kept its own window anyway.
+
+    Live, 7.6.2: a model whose ``limit`` the server's own config content carries
+    (the round's spawn ``KILO_CONFIG_CONTENT`` — or the operator's) keeps it
+    field by field. A ``PATCH /config`` for a smaller one answers 200, writes
+    ``.kilo/kilo.jsonc``, disposes the instance and reopens the stream — and the
+    next ``GET /provider`` still reports the content's limit. The window never
+    went over, even though the server said 200 and this round's stream is fine,
+    which is why a caller that trusts the status code stands its in-turn watch
+    down for a turn Kilo sizes by the old, larger window: the refusal the memory
+    just recorded.
+
+    ``kept`` is the ``limit.context`` the read-back reported, ``None`` when the
+    read-back could not be read at all: the caller cannot tell which window Kilo
+    sizes by and must keep the watch armed either way. It is remembered like a
+    :class:`KiloLimitRefused` — the server's own content does not change inside
+    a round, so the same size is not re-patched, and reloaded, every prompt.
+
+    Unlike :class:`KiloLimitRefused` the file *was* written: the caller drops it
+    on the way out with the limit it pushed.
+    """
+
+    def __init__(self, message: str, *, kept: int | None = None) -> None:
+        super().__init__(message)
+        self.kept = kept
 
 
 @runtime_checkable
@@ -759,10 +789,17 @@ class KiloBackend:
         down for a turn Kilo still sizes by its own 131 072. The refusal is
         structural and cannot change between calls, so the caller remembers it.
 
+        Round 153: a 200 is not the answer, either. After the reconnect the
+        model is read back from ``GET /provider`` and compared with what was
+        sent; a limit the server keeps of its own is
+        :class:`KiloLimitKept`, the same "the window never went over" case a
+        caller has to remember with its watch still armed.
+
         Raises `ContestBackendError`, the tracked case as
-        `KiloLimitRefused`, the reconnect case as `KiloTapReconnectError`; the
-        caller logs and goes on, with its watch still armed — or remembered as
-        pushed, in the case that is this round's stream and not its window."""
+        `KiloLimitRefused`, the reconnect case as `KiloTapReconnectError`, the
+        read-back case as `KiloLimitKept`; the caller logs and goes on, with
+        its watch still armed — or remembered as pushed, in the one case that
+        is this round's stream and not its window."""
         tracked = tracked_kilo_files(self._directory)
         if tracked:
             shown = ", ".join(tracked[:3]) + (" …" if len(tracked) > 3 else "")
@@ -782,6 +819,37 @@ class KiloBackend:
         # `KiloTapReconnectError` — never as the plain error a caller would
         # read as "the window was not handed over"
         self._reconnect_tap()
+        self._readback_limit(provider_id, model_id, limit)
+
+    def _readback_limit(self, provider_id: str, model_id: str, limit: dict) -> None:
+        """Round 153: prove the push took, by reading the model back.
+
+        Live, 7.6.2: ``limit.context`` the server's own config content carries
+        outranks a ``PATCH /config``, field by field — the patch answers 200 and
+        writes the file, and the next ``GET /provider`` still reports it.
+        ``limit.context`` is compared always and ``limit.input`` when the push
+        sent one; ``output`` is Kilo's own reserve and stays out of it. Anything
+        the read-back reports that is not this limit — a different number, no
+        limit, an offer it would not read — is a window that never went over, so
+        :class:`KiloLimitKept` keeps the caller's in-turn watch armed.
+
+        A reconnect failure above never reaches here: the stream is this
+        round's problem, and the window is not.
+        """
+        seen = self._client.model_limits(provider_id, model_id)
+        want_context = _context_limit_of((limit or {}).get("context"))
+        want_input = _context_limit_of((limit or {}).get("input"))
+        if seen is None:
+            raise KiloLimitKept(
+                f"the read-back for {provider_id}/{model_id} did not come back with a "
+                "limit — the offer shows none for the model, or it would not answer")
+        got_context = _context_limit_of(seen.get("context"))
+        got_input = _context_limit_of(seen.get("input"))
+        if got_context != want_context or (want_input is not None
+                                           and got_input != want_input):
+            raise KiloLimitKept(
+                f"the read-back reports {got_context:,} for {provider_id}/{model_id} "
+                f"where the patch asked for {want_context:,}", kept=got_context)
 
     def _start_tap(self, base: str, directory: str, log: str) -> EventTap:
         """Round 151: a new `EventTap` on this backend's own log, retried once.

@@ -1252,6 +1252,38 @@ class KiloClient:
         self._model_limits[key] = answer
         return answer
 
+    def model_limits(self, provider_id: str, model_id: str) -> dict | None:
+        """Round 153: the model's whole ``limit`` from a *fresh* ``GET /provider``.
+
+        The read-back of a ``PATCH /config`` — never :attr:`_model_limits`, which
+        may hold the number the patch was meant to replace. Live, 7.6.2: the
+        patch answers 200 and writes ``.kilo/kilo.jsonc``, yet a model whose
+        ``limit`` the server's own config content (the spawn's
+        ``KILO_CONFIG_CONTENT``) sets keeps that limit field by field, and this
+        is the only read that shows it — the field this patch compared against.
+
+        ``None`` when the offer cannot be read, when the provider or the model is
+        absent, when the model carries no ``limit``, or when it is not a dict: a
+        caller that cannot see the limit it asked for must keep its fallback
+        armed, never guess a match. Nothing here raises.
+        """
+        try:
+            offer = self.providers()
+        except (KiloHttpError, ValueError, TypeError, OSError):
+            return None
+        if not isinstance(offer, dict):
+            return None
+        for entry in offer.get("all") or []:
+            if not isinstance(entry, dict) or entry.get("id") != str(provider_id):
+                continue
+            models = entry.get("models")
+            if not isinstance(models, dict):
+                continue
+            model = models.get(model_id)
+            raw = model.get("limit") if isinstance(model, dict) else None
+            return dict(raw) if isinstance(raw, dict) else None
+        return None
+
     # ── the session ────────────────────────────────────────────────────────
 
     def create_session(self, provider_id: str, model_id: str, *, rules: list,

@@ -217,8 +217,8 @@ from typing import Callable
 
 from tools.backoff import save_state
 from tools.contest import context_memory
-from tools.contest.backend import (ContestBackend, ContestBackendError, KiloLimitRefused,
-                                  KiloTapReconnectError,
+from tools.contest.backend import (ContestBackend, ContestBackendError, KiloLimitKept,
+                                  KiloLimitRefused, KiloTapReconnectError,
                                   drop_stale_kilo_file)
 from tools.contest.gates import DEADLINE_COMMIT_EMAIL, declared_files, git
 from tools.contest.harvest import harvest, rework_message
@@ -4784,6 +4784,18 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         in progress — and the failure gets its own line, not the "not handed
         to Kilo" line a caller would read as a window still unset. A refused
         or a failed patch is the other way: nothing went over, the watch arms.
+
+        Round 153: 200 is not the end of it either. A model whose ``limit`` the
+        server's own config content carries — this round's spawn overlay, or
+        the operator's — keeps it field by field, whatever the patch said, and
+        the backend's read-back off ``GET /provider`` is what shows it
+        (`KiloLimitKept`). That is the refused case, not the pushed one: Kilo
+        sizes the session by its own window, so `pushed_limit[0]` stays unset
+        and `context_watch` arms, the turn is stopped by the watch at the size
+        the memory just recorded, and the size is remembered so it is not
+        re-patched — and Kilo reloaded — every prompt. The file the patch wrote
+        is still ours, so `pushed_spec[0]` is set and it is dropped on the way
+        out like a push that took.
         """
         setter = getattr(backend, "set_model_limit", None)
         if not callable(setter):
@@ -4818,6 +4830,26 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             _log.warning("%s: the remembered window was not handed to Kilo: %s",
                          spec.name, _brief(str(exc)))
             return
+        except KiloLimitKept as exc:
+            # round 153: the patch answered 200 and the reload was followed, but
+            # the read-back still reports the limit the server's own config
+            # content carries — the spawn's `KILO_CONFIG_CONTENT`, or the
+            # operator's, which outranks a patch field by field. Kilo sizes the
+            # session by its own window, so nothing was handed over, and it will
+            # not change inside the round: remembered like a refusal, so the
+            # size is not re-patched — and Kilo reloaded — every prompt.
+            # `pushed_spec[0]` is still set: the file the patch wrote is ours and
+            # goes with `drop_stale_kilo_file` on the way out.
+            push_refused[0] = size
+            pushed_spec[0] = limit
+            detail = _brief(str(exc))
+            if exc.kept:
+                _log.warning("%s: Kilo kept %s from KILO_CONFIG_CONTENT — the watch stays "
+                             "armed (%s)", spec.name, f"{exc.kept:,}", detail)
+            else:
+                _log.warning("%s: Kilo did not take the patched window — the watch stays "
+                             "armed (%s)", spec.name, detail)
+            return
         except KiloTapReconnectError as exc:
             # the patch answered 200, so the window went over: only this
             # round's stream of it is broken. Mark it pushed — Kilo compacts by
@@ -4845,9 +4877,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         Kilo compacts a session inside a turn by the ``limit`` it was given, and
         since round 147 that can be handed to it between turns
         (`_push_remembered_limit`, a ``PATCH /config`` for the workspace, the
-        event stream reconnected after the reload). So the watch is armed only
-        when the window was **not** handed over — the push failed, was skipped,
-        or the backend has no `set_model_limit`: `pushed_limit[0]` is not the
+        event stream reconnected after the reload, the read-back checked against
+        the limit Kilo still reports). So the watch is armed only when the
+        window was **not** handed over — the push failed, was refused,
+        was kept by Kilo's own config content, was skipped, or the backend has
+        no `set_model_limit`: `pushed_limit[0]` is not the
         size the session is sized by now. When it did go, Kilo compacts by the
         pushed window at the same fill the watch would fire at
         (`kilo_limit` sets `input = percent * size + min(20 000, output)` and

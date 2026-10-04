@@ -14,6 +14,10 @@ Everything here is scripted by one scenario dict, per session:
         "diff": [...],               # default GET /session/{id}/diff
         "providers": {...},          # the GET /provider body; DEFAULT_OFFER when absent
         "providers_status": 500,     # GET /provider answers this instead of 200
+        "env_limits": {...},         # round 153: the limits the server's own config
+                                     # content carries, {model_id: limit} — a PATCH
+                                     # /config answers 200 for the same model and the
+                                     # offer still reports these, field by field
         "turns": [                   # one entry per prompt the client sends
             {
                 "events": ["busy", "file.edited", "idle"],
@@ -88,13 +92,20 @@ all sit under a ``properties`` dict next to a ``type``. ``session.created`` and
 ``session.error`` payloads were never printed by the probe, so they use the
 envelope every other recorded event uses and nothing more.
 
-The two offer keys are per round, not per session: ``providers`` replaces
+The offer keys are per round, not per session: ``providers`` replaces
 the whole ``GET /provider`` body (the ticket's ``{"all", "default",
-"connected", "failed"}`` shape, each provider carrying its ``models`` map), and
+"connected", "failed"}`` shape, each provider carrying its ``models`` map),
 ``providers_status`` answers it with something other than 200, so the client's
-``KiloHttpError`` path is reachable. Without either, the default body is one
+``KiloHttpError`` path is reachable, and ``env_limits`` is the ``limit`` the
+server's own config content carries. Without any of them, the default body is one
 provider ``kenary`` named ``kenari`` offering the model ids the contest's own
 test rosters use, so a roster built on them is on offer with no override.
+
+A ``PATCH /config`` takes the limit it sets into the offer it names, the way
+7.6.2 does — that is the read-back of a push, so a push that took is visible in
+the next ``GET /provider``. A model named in ``env_limits`` keeps its own limit
+whatever a patch says for it: the live server's ``KILO_CONFIG_CONTENT`` outranks
+a patch, field by field, and that is the case the read-back exists to catch.
 
 Every request is recorded as ``{method, path, query, body}`` in ``requests``
 (``path`` without its query string) and every emitted event in ``events``, so
@@ -104,6 +115,7 @@ actually said. Unknown routes answer 404, like the real server does.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import queue
@@ -289,6 +301,10 @@ class FakeKiloServer:
         #: round 145: `PATCH /config` calls so far — a stream opened after one
         #: starts with `server.connected`, as 7.6.2's does
         self._config_reloads = 0
+        #: round 153: the limits a `PATCH /config` set, by the directory it
+        #: named and the model it named — the offer for that directory answers
+        #: with them, which is the read-back a push is checked against
+        self._patched_limits: dict = {}
         self.requests: list = []
         self._sessions: dict = {}
         self._pending: dict = {}
@@ -395,6 +411,49 @@ class FakeKiloServer:
         ``providers`` when one is given, else :data:`DEFAULT_OFFER`."""
         return self.scenario.get("providers", DEFAULT_OFFER)
 
+    def provider_body(self, directory: str | None = None) -> dict:
+        """The ``GET /provider`` body for *directory*: the offer the live server
+        answers after its own config and every patch are in.
+
+        Round 153: the scenario's offer with the ``PATCH /config`` limits that
+        directory took, and the scenario's ``env_limits`` on top of them — a
+        model the server's own config content sizes keeps that limit whatever a
+        patch said for it, field by field, which is the case the push's
+        read-back has to catch. ``limit`` is only ever written, never read back
+        into the scenario, so a caller holding one body sees no later patch.
+        """
+        body = copy.deepcopy(self.scenario.get("providers", DEFAULT_OFFER))
+        if not isinstance(body, dict):
+            return body
+        env_limits = self.scenario.get("env_limits") or {}
+        if not isinstance(env_limits, dict):
+            env_limits = {}
+        directory = directory or self.directory
+        patched = self._patched_limits.get(directory) or {}
+        for entry in body.get("all") or []:
+            if not isinstance(entry, dict):
+                continue
+            models = entry.get("models")
+            if not isinstance(models, dict):
+                continue
+            for model_id, model in list(models.items()):
+                if not isinstance(model, dict):
+                    continue
+                if model_id in patched:
+                    model["limit"] = copy.deepcopy(patched[model_id])
+                if model_id in env_limits:
+                    model["limit"] = copy.deepcopy(env_limits[model_id])
+        return body
+
+    def patched_limit(self, directory: str | None, model_id: str) -> dict | None:
+        """The ``limit`` a ``PATCH /config`` set for *model_id* in *directory*,
+        else ``None`` — the assertion side of :meth:`provider_body`."""
+        if not isinstance(model_id, str):
+            return None
+        with self._lock:
+            limit = (self._patched_limits.get(directory or self.directory) or {}).get(model_id)
+        return copy.deepcopy(limit) if isinstance(limit, dict) else None
+
     @property
     def subscribers(self) -> int:
         """Open event streams. Zero means a tap has not connected yet, and an
@@ -409,6 +468,31 @@ class FakeKiloServer:
         with self._lock:
             self.requests.append({"method": method, "path": path,
                                   "query": dict(query or {}), "body": body})
+
+    def _take_limits(self, body, directory: str) -> None:
+        """Round 153: take the ``limit`` a ``PATCH /config`` names for *directory*.
+
+        Only the ``provider.<id>.models.<id>.limit`` shape the client sends is
+        taken into the offer: anything else is left out of it rather than
+        trusted. The scenario's ``env_limits`` outrank what is taken here, which
+        is how the live server keeps the limit its own config content carries.
+        """
+        if not isinstance(body, dict):
+            return
+        provider = body.get("provider")
+        if not isinstance(provider, dict):
+            return
+        with self._lock:
+            taken = self._patched_limits.setdefault(directory, {})
+            for _provider_id, spec in provider.items():
+                if not isinstance(spec, dict):
+                    continue
+                models = spec.get("models")
+                if not isinstance(models, dict):
+                    continue
+                for model_id, model in models.items():
+                    if isinstance(model, dict) and isinstance(model.get("limit"), dict):
+                        taken[str(model_id)] = copy.deepcopy(model["limit"])
 
     def _next_id(self, prefix: str) -> str:
         with self._lock:
@@ -893,9 +977,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         if _RE_PROVIDER.fullmatch(path):
             # the offer: `providers` replaces it wholesale, `providers_status`
-            # makes the route answer an error instead (KC-25's intake line)
+            # makes the route answer an error instead (KC-25's intake line); a
+            # `PATCH /config` for this directory has already taken its limit in
             return self._json(int(self.fake.scenario.get("providers_status", 200)),
-                              self.fake.scenario.get("providers", DEFAULT_OFFER))
+                              self.fake.provider_body(directory))
 
         if _RE_SESSION_BY_ID.fullmatch(path):
             m = _RE_SESSION_BY_ID.fullmatch(path)
@@ -920,10 +1005,14 @@ class _Handler(BaseHTTPRequestHandler):
     def do_PATCH(self) -> None:
         # round 145: `PATCH /config` — a model's limit for one directory. The
         # fake records it (`fake.calls("PATCH")`) and answers with the body,
-        # as 7.6.2 does; nothing else reads it.
+        # as 7.6.2 does. Round 153: the patch also takes its limit into the
+        # offer for that directory, which is the read-back a push is checked
+        # against — unless the model's limit is the fake's own config content,
+        # which outranks it.
         body = self._body()
-        path, _query = self._record(body)
+        path, query = self._record(body)
         if path == "/config":
+            self.fake._take_limits(body, query.get("directory") or self.fake.directory)
             # 7.6.2 reloads the directory's instance: `server.instance.disposed`
             # and the end of every open `/event` stream; a stream opened after
             # it starts with `server.connected`
