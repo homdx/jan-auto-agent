@@ -620,3 +620,89 @@ def test_the_old_tap_is_gone_before_the_new_one_writes(tmp_path, monkeypatch):
 
     lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line]
     assert sum(1 for rec in lines if rec["event"].get("type") == "bench.once") == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# round 159: a Ctrl-C never waits on a reload
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_an_interrupt_during_a_slow_reconnect_returns_at_once(tmp_path, monkeypatch):
+    """The new tap's start is held on a barrier (a slow open, a hung socket):
+    `interrupt()` returns in well under a second instead of waiting for the
+    reconnect, and once the start goes on no tap thread is left running."""
+    repo = _repo(tmp_path / "repo")
+    release, reached = threading.Event(), threading.Event()
+    created: list = []
+    real_start = EventTap.start
+
+    with FakeKiloServer() as fake:
+        backend = _backend(fake, str(repo), str(tmp_path / "out" / "events.jsonl"))
+        old = backend._tap
+
+        def slow_start(self):
+            created.append(self)
+            reached.set()
+            release.wait(10)
+            return real_start(self)
+
+        monkeypatch.setattr(EventTap, "start", slow_start)
+        worker = threading.Thread(target=backend.set_model_limit,
+                                  args=("kenary", "agent-a:free", PUSHED_LIMIT), daemon=True)
+        worker.start()
+        try:
+            assert reached.wait(10), "the reconnect reached the new tap's start"
+            started = time.monotonic()
+            backend.interrupt()
+            took = time.monotonic() - started
+            assert took < 0.5, f"interrupt() waited {took:.1f}s on the reconnect"
+        finally:
+            release.set()
+        worker.join(15)
+        assert not worker.is_alive()
+        assert backend.interrupted()
+        for tap in (old, *created):
+            assert tap.join(5.0), "a tap thread outlived the interrupt"
+        backend.close()
+
+
+def test_a_reconnect_after_an_interrupt_opens_no_stream(tmp_path, monkeypatch):
+    """Ctrl-C first, then the reconnect: no new tap is started at all, and the
+    old one is stopped."""
+    repo = _repo(tmp_path / "repo")
+    with FakeKiloServer() as fake:
+        backend = _backend(fake, str(repo), str(tmp_path / "out" / "events.jsonl"))
+        old = backend._tap
+        backend.interrupt()
+        built: list = []
+        monkeypatch.setattr(EventTap, "start", lambda self: built.append(self) or self)
+        backend._reconnect_tap(settle=0.5)
+        assert built == [], "a stream was opened for an interrupted backend"
+        assert backend._tap is old and old.join(2.0)
+        backend.close()
+
+
+def test_a_reconnect_that_publishes_into_an_interrupt_leaves_no_thread(tmp_path, monkeypatch):
+    """The interrupt lands while the new tap is starting: when the reconnect
+    returns, the new tap's reader has already exited — not just been told to."""
+    repo = _repo(tmp_path / "repo")
+    release, reached = threading.Event(), threading.Event()
+    real_start = EventTap.start
+    with FakeKiloServer() as fake:
+        backend = _backend(fake, str(repo), str(tmp_path / "out" / "events.jsonl"))
+
+        def held(self):
+            reached.set()
+            release.wait(10)
+            return real_start(self)
+
+        monkeypatch.setattr(EventTap, "start", held)
+        worker = threading.Thread(target=backend._reconnect_tap, kwargs={"settle": 0.5},
+                                  daemon=True)
+        worker.start()
+        assert reached.wait(10)
+        backend.interrupt()
+        release.set()
+        worker.join(10)
+        assert not worker.is_alive()
+        assert not backend._tap._thread.is_alive(), "the new tap still reads after the return"
+        backend.close()

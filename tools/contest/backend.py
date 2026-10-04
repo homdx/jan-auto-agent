@@ -821,7 +821,8 @@ class KiloBackend:
         not end the stream cannot hold the round for three times *settle*.
         `interrupt` holds the same lock: a Ctrl-C mid-swap stops the tap being
         replaced, and a swap that publishes into an already-interrupted backend
-        stops its own tap straight away.
+        stops its own tap straight away. Round 159: that lock is held only to
+        read and to publish `self._tap`, never across a wait or a start.
 
         Round 160: the old tap is stopped and joined **before** the new one
         starts — one writer on ``events.jsonl`` at a time. 151 started the new
@@ -835,46 +836,71 @@ class KiloBackend:
         """
         if self._tap_args is None:
             return
+        deadline = time.monotonic() + max(0.0, float(settle))
+        base, directory, log = self._tap_args
+        # round 159: the lock covers reading and publishing `self._tap` only.
+        # The waits and the start below run without it, so an `interrupt()`
+        # (Ctrl-C) never waits on a reload — 151 held it across all of them,
+        # up to *settle* seconds and the whole of a start that hangs.
         with self._tap_lock:
-            deadline = time.monotonic() + max(0.0, float(settle))
-            base, directory, log = self._tap_args
             old = self._tap
-            left = max(0.0, deadline - time.monotonic())
-            saw_end = False
-            try:
-                saw_end = old.wait(lambda e: e.get("type") == "tap.closed", left) is not None
-            except Exception:  # noqa: BLE001 — a tap that cannot wait is stopped anyway
-                pass
-            if not saw_end:
-                _LOG.warning("%s: the old event stream did not end within %.0fs of the "
-                             "config reload — stopping it", directory, settle)
-            old.stop()
-            if not old.join(max(_OLD_TAP_JOIN_SEC, deadline - time.monotonic())):
-                _LOG.warning("%s: the old event tap is still running %.0fs after its stop "
-                             "— the new tap shares %s with it", directory,
-                             _OLD_TAP_JOIN_SEC, log)
-            try:
-                new_tap = self._start_tap(base, directory, log)
-            except KiloTapReconnectError:
-                # the wait above consumed the old tap's one `tap.closed`: the
-                # next caller's wait on it must still wake at once, not sit out
-                # its silence clock. Memory only — its log is closed by now.
-                old._close_with("the event stream could not be reopened after "
-                                "the config reload")
-                raise
-            left = max(0.0, deadline - time.monotonic())
-            connected = False
-            try:
-                connected = new_tap.wait(lambda e: e.get("type") == "server.connected",
-                                         left) is not None
-            except Exception:  # noqa: BLE001 — the stream is open; the event is a courtesy
-                pass
-            if not connected:
-                _LOG.warning("%s: the reconnected event stream did not report "
-                             "server.connected within %.0fs", directory, settle)
-            self._tap = new_tap
             if self._interrupted:
+                # a Ctrl-C before the reconnect: no new stream is opened for a
+                # backend that is being given up
+                old.stop()
+                return
+        left = max(0.0, deadline - time.monotonic())
+        saw_end = False
+        try:
+            saw_end = old.wait(lambda e: e.get("type") == "tap.closed", left) is not None
+        except Exception:  # noqa: BLE001 — a tap that cannot wait is stopped anyway
+            pass
+        if not saw_end:
+            _LOG.warning("%s: the old event stream did not end within %.0fs of the "
+                         "config reload — stopping it", directory, settle)
+        old.stop()
+        if not old.join(max(_OLD_TAP_JOIN_SEC, deadline - time.monotonic())):
+            _LOG.warning("%s: the old event tap is still running %.0fs after its stop "
+                         "— the new tap shares %s with it", directory,
+                         _OLD_TAP_JOIN_SEC, log)
+        try:
+            new_tap = self._start_tap(base, directory, log)
+        except KiloTapReconnectError:
+            # the wait above consumed the old tap's one `tap.closed`: the
+            # next caller's wait on it must still wake at once, not sit out
+            # its silence clock. Memory only — its log is closed by now.
+            old._close_with("the event stream could not be reopened after "
+                            "the config reload")
+            raise
+        with self._tap_lock:
+            self._tap = new_tap
+            interrupted = self._interrupted
+            if interrupted:
+                # an interrupt that came while the new tap was being started
+                # stopped the old one; this one is stopped here, under the lock
+                # it would have taken
                 new_tap.stop()
+        if interrupted:
+            # stopped above: when this returns, no tap thread of ours runs on
+            new_tap.join(_OLD_TAP_JOIN_SEC)
+            return
+        left = max(0.0, deadline - time.monotonic())
+        connected = False
+        try:
+            seen = new_tap.wait(lambda e: e.get("type") in ("server.connected", "tap.closed"),
+                                left)
+        except Exception:  # noqa: BLE001 — the stream is open; the event is a courtesy
+            seen = None
+        if seen is not None and seen.get("type") == "tap.closed":
+            # an interrupt (or the stream's end) landed during this wait, which
+            # consumed its `tap.closed`: record it again, so the caller's next
+            # wait on this tap still wakes at once
+            new_tap._close_with((seen.get("properties") or {}).get("error") or "stopped")
+            return
+        connected = seen is not None
+        if not connected:
+            _LOG.warning("%s: the reconnected event stream did not report "
+                         "server.connected within %.0fs", directory, settle)
 
     def abort(self, session: SessionRef) -> None:
         try:
