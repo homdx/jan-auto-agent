@@ -68,14 +68,6 @@ PUSHED_LIMIT = {"context": 131_072, "input": 98_777, "output": 20_000}
 AGENT_FILE = '{"provider": {"timeout": {"request": 600}}}\n'
 
 
-@pytest.fixture(autouse=True)
-def _no_exclude_cache():
-    """`_exclude_kilo_dir` caches per directory, and a cache would outlive a test."""
-    backend_mod._KILO_EXCLUDED.clear()
-    yield
-    backend_mod._KILO_EXCLUDED.clear()
-
-
 def _git(repo: Path, *args: str) -> str:
     """One `git` in *repo*: its stdout, or an `AssertionError` carrying stderr."""
     out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
@@ -540,3 +532,33 @@ def test_a_tracked_ignore_file_of_the_agent_s_is_never_edited(tmp_path, caplog):
     assert (repo / ".kilo" / ".gitignore").read_bytes() == before
     assert any("agent's" in record.getMessage() for record in caplog.records)
 
+
+def test_the_ignore_is_written_again_after_the_drop_in_the_same_process(tmp_path):
+    """A relay's next leg runs in the same process and the same worktrees: the
+    drop at the end of one leg takes the ignore file with it, so the next push
+    writes it again instead of trusting what it did the first time."""
+    repo = _repo(tmp_path / "repo")
+    backend_mod._exclude_kilo_dir(str(repo))
+    project = repo / ".kilo" / "kilo.jsonc"
+    project.write_text(json.dumps({"provider": {"kenary": {"models": {
+        "agent-a:free": {"limit": PUSHED_LIMIT}}}}}), encoding="utf-8")
+    assert drop_stale_kilo_file(str(repo), PUSHED_LIMIT) is True
+    assert not (repo / ".kilo").exists()
+
+    backend_mod._exclude_kilo_dir(str(repo))
+    project.write_text("{}\n", encoding="utf-8")
+    assert _ignored(repo, ".kilo/kilo.jsonc") is True
+    assert _git(repo, "status", "--porcelain", "-uall") == ""
+
+
+def test_the_ignore_is_written_again_after_the_agent_removed_kilo(tmp_path):
+    """The agent's own `git clean -fdx` (or `rm -rf .kilo`) between two pushes:
+    no drop ran, and the second push still hides the file it makes."""
+    import shutil
+    repo = _repo(tmp_path / "repo")
+    backend_mod._exclude_kilo_dir(str(repo))
+    shutil.rmtree(repo / ".kilo")
+    backend_mod._exclude_kilo_dir(str(repo))
+    (repo / ".kilo" / "kilo.jsonc").write_text("{}\n", encoding="utf-8")
+    assert _ignored(repo, ".kilo/kilo.jsonc") is True
+    assert _git(repo, "status", "--porcelain", "-uall") == ""

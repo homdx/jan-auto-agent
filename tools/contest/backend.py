@@ -364,12 +364,6 @@ _KILO_IGNORE_LINES = ("kilo.jsonc", "kilo.json", ".gitignore")
 #: exactly why the caller has to refuse rather than wait longer.
 _KILO_GIT_TIMEOUT = 10.0
 
-#: Round 148/151: the directories whose ``.kilo/.gitignore`` already carries
-#: every line of `_KILO_IGNORE_LINES` — the push is called once per turn and
-#: there is no reason to re-read the file for one it already did. A directory
-#: that failed stays out of this, so a checkout that appears later is still
-#: tried.
-_KILO_EXCLUDED: dict = {}
 
 
 def _git(directory, *args, timeout: float = 30.0) -> tuple:
@@ -602,9 +596,10 @@ def _exclude_kilo_dir(directory: str) -> None:
     the missing names are appended to it; one that is tracked, or does not hide
     itself, is still the agent's and is still only warned about.
     """
-    key = str(directory)
-    if _KILO_EXCLUDED.get(key):
-        return
+    # round 155: no per-directory memory of a file already in place — the
+    # agent's `git clean -fdx` or `rm -rf .kilo`, or the drop at the end of a
+    # leg, removes it behind any cache, and Kilo's reload then writes its own
+    # without the project names. One read per push (once per size) is nothing.
     try:
         path = _kilo_ignore_path(directory)
         if path.exists():
@@ -628,7 +623,6 @@ def _exclude_kilo_dir(directory: str) -> None:
             else:
                 path.write_text("".join(line + "\n" for line in _KILO_IGNORE_LINES),
                                 encoding="utf-8")
-        _KILO_EXCLUDED[key] = True
     except OSError:
         return
 
