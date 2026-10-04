@@ -1012,17 +1012,16 @@ def test_an_untracked_project_file_is_dropped_and_a_tracked_one_is_kept(tmp_path
     assert (wt / ".kilo" / "kilo.jsonc").exists()
 
 
-def test_a_directory_that_is_not_a_checkout_needs_no_git(tmp_path):
-    """No `git` at all: nothing is deleted and nothing raises. The ignore file is
-    written anyway, because it is in the workspace, not in git — there is no index
-    here that could refuse a push over a tracked file."""
+def test_a_directory_that_is_not_a_checkout_is_left_alone(tmp_path):
+    """No `git` at all: nothing is written, nothing is deleted, nothing raises.
+    Round 156: 151's ignore file went into such a directory too — there is no
+    diff there to keep the project file out of."""
     import tools.contest.backend as backend_mod
     d = tmp_path / "not-a-repo"
     (d / ".kilo").mkdir(parents=True)
     (d / ".kilo" / "kilo.jsonc").write_text("{}\n", encoding="utf-8")
     backend_mod._exclude_kilo_dir(d)
-    assert (d / ".kilo" / ".gitignore").read_text(encoding="utf-8").splitlines() \
-        == list(backend_mod._KILO_IGNORE_LINES)
+    assert sorted(p.name for p in (d / ".kilo").iterdir()) == ["kilo.jsonc"]
     assert backend_mod.tracked_kilo_files(d) == []
     assert backend_mod.drop_stale_kilo_file(d) is False
     assert (d / ".kilo" / "kilo.jsonc").exists()

@@ -600,6 +600,12 @@ def _exclude_kilo_dir(directory: str) -> None:
     # agent's `git clean -fdx` or `rm -rf .kilo`, or the drop at the end of a
     # leg, removes it behind any cache, and Kilo's reload then writes its own
     # without the project names. One read per push (once per size) is nothing.
+    # round 148's contract: a directory that is not a git checkout has no diff
+    # to keep anything out of, and nothing is written there
+    ok, inside = _git(directory, "rev-parse", "--is-inside-work-tree",
+                      timeout=_KILO_GIT_TIMEOUT)
+    if not ok or inside != "true":
+        return
     try:
         path = _kilo_ignore_path(directory)
         if path.exists():
