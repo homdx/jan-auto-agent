@@ -1,6 +1,6 @@
 # 151 — the event-tap reconnect after `PATCH /config` never leaves a dead tap; the `.kilo` project-file guards agree, fail closed and run before the server spawns
 
-**Status:** queued
+**Status:** landed
 **Severity:** HIGH
 **File:** tools/contest/backend.py
 **Symbol:** KiloBackend.__init__, KiloBackend._reconnect_tap, KiloBackend.interrupt, KiloBackend.set_model_limit, tracked_kilo_files, drop_stale_kilo_file, _exclude_kilo_dir
@@ -48,6 +48,15 @@ Kilo 7.6.2 answers `PATCH /config` by reloading the workspace and closing its `/
 - **Check live on Kilo 7.6.2** which wins, `.kilo/kilo.jsonc` or `KILO_CONFIG_CONTENT`, and whether a workspace's project file is read on first open. Record the answer in this ticket; if the file cannot override, say so and keep the deletion anyway.
 
 ---
+
+### Live answer (Kilo 7.6.2, judge of round 151, no model call)
+
+- `KILO_CONFIG_CONTENT` wins over `.kilo/kilo.jsonc`, field by field: a model whose `limit` the env content sets keeps it after a `PATCH /config` (200, file written, `GET /provider` unchanged). A field the env does not set comes from the project file, and the project file **is** read on the first open of a workspace — so the deletion before spawn stays. The consequence for the runner's push is ticket 153.
+- Kilo writes its own `.kilo/.gitignore` (no project names in it) when it opens a workspace that has `.kilo/` and no `.gitignore`, and never rewrites an existing one. The guard extends that file when it ignores itself and is not tracked.
+
+### Landed (judge of round 151)
+
+sensenova-6-8-flash-lite-var2 as it left its worktree (808cdf8), then one ticket per bug the bench and the cross-tests reproduced on it: 154 (Kilo's own `.kilo/.gitignore`), 155 (the ignore trusted from a cache), 156 (no ignore file in a non-checkout), 160 (two taps on one log), 159 (Ctrl-C held behind the reconnect). Queued from this round: 153 (the overlay outranks the PATCH), 157 (arena run lock), 158 (cross-tests in the judge).
 
 ## Tests (offline, `tests/_kilo_fake.py`; each fails on 6e5daf8)
 
