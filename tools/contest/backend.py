@@ -665,6 +665,13 @@ def _drop_kilo_ignore(directory) -> None:
         pass
 
 
+#: Round 160: the least time `_reconnect_tap` gives the old tap to exit after
+#: its stop — the stop shuts the socket, so the reader is gone well inside it.
+#: Not cut by the reconnect's deadline: a join of zero is what left two taps
+#: on one log.
+_OLD_TAP_JOIN_SEC = 2.0
+
+
 class KiloBackend:
     """:class:`ContestBackend` backed by a Kilo server — today's default.
 
@@ -779,9 +786,7 @@ class KiloBackend:
     def _start_tap(self, base: str, directory: str, log: str) -> EventTap:
         """Round 151: a new `EventTap` on this backend's own log, retried once.
 
-        The caller's old tap is still running when this returns — it is given
-        up only once a replacement is up — so a failed start here leaves a live
-        tap in place. Both attempts failing raises :class:`KiloTapReconnectError`,
+        Both attempts failing raises :class:`KiloTapReconnectError`,
         never a bare `OSError`: the caller is otherwise about to wait on a
         stream nobody reads, and that reads to the runner as a window that never
         went over rather than as a broken stream.
@@ -810,38 +815,53 @@ class KiloBackend:
         the caller takes its next mark after this returns. A tap this backend
         did not build (a test's) is left alone.
 
-        Round 151: the new tap is started **before** the old one is given up,
-        and published only once it is running, so a start that fails leaves the
-        old, still-live tap in place — `self._tap` never points at a stopped
-        tap when this returns — and one that fails twice raises
-        :class:`KiloTapReconnectError` instead. Every wait shares the one
+        Round 151: a new tap that cannot be started is retried once and then
+        raises :class:`KiloTapReconnectError`. Every wait shares the one
         deadline of *settle* seconds and logs its timeout, so a reload that does
         not end the stream cannot hold the round for three times *settle*.
         `interrupt` holds the same lock: a Ctrl-C mid-swap stops the tap being
         replaced, and a swap that publishes into an already-interrupted backend
         stops its own tap straight away.
+
+        Round 160: the old tap is stopped and joined **before** the new one
+        starts — one writer on ``events.jsonl`` at a time. 151 started the new
+        tap first, and a stream the reload did not end (or a join cut to zero by
+        a spent deadline) left both taps appending the same events to the log
+        the legs' pytest report and the idle watch read back. Nothing is lost by
+        the order: after a reload Kilo has ended the old stream already, so the
+        old tap was never a live fallback. The join gets at least
+        `_OLD_TAP_JOIN_SEC`, since `stop` shuts the socket and the reader is gone
+        within it; one that still runs is logged.
         """
         if self._tap_args is None:
             return
         with self._tap_lock:
             deadline = time.monotonic() + max(0.0, float(settle))
             base, directory, log = self._tap_args
-            new_tap = self._start_tap(base, directory, log)
             old = self._tap
-            if old is new_tap:
-                return
             left = max(0.0, deadline - time.monotonic())
             saw_end = False
             try:
                 saw_end = old.wait(lambda e: e.get("type") == "tap.closed", left) is not None
             except Exception:  # noqa: BLE001 — a tap that cannot wait is stopped anyway
                 pass
-            old.stop()
-            joined = old.join(max(0.0, deadline - time.monotonic()))
-            if not (saw_end and joined):
+            if not saw_end:
                 _LOG.warning("%s: the old event stream did not end within %.0fs of the "
-                             "config reload — the new tap shares %s with it",
-                             directory, settle, log)
+                             "config reload — stopping it", directory, settle)
+            old.stop()
+            if not old.join(max(_OLD_TAP_JOIN_SEC, deadline - time.monotonic())):
+                _LOG.warning("%s: the old event tap is still running %.0fs after its stop "
+                             "— the new tap shares %s with it", directory,
+                             _OLD_TAP_JOIN_SEC, log)
+            try:
+                new_tap = self._start_tap(base, directory, log)
+            except KiloTapReconnectError:
+                # the wait above consumed the old tap's one `tap.closed`: the
+                # next caller's wait on it must still wake at once, not sit out
+                # its silence clock. Memory only — its log is closed by now.
+                old._close_with("the event stream could not be reopened after "
+                                "the config reload")
+                raise
             left = max(0.0, deadline - time.monotonic())
             connected = False
             try:

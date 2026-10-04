@@ -174,10 +174,15 @@ def test_a_reconnect_that_cannot_reopen_raises_and_keeps_the_live_tap(tmp_path, 
         assert isinstance(KiloTapReconnectError("x"), ContestBackendError), \
             "the runner catches one class for both"
         assert backend._tap is old_tap
-        assert not old_tap._stop.is_set(), "the live tap was not stopped by us"
+        # round 160: the old tap is stopped before the new one starts (one
+        # writer on the log); its stream had ended at the reload already
         assert old_tap.join(2.0) is True
+        closed = [e["properties"]["error"] for e in old_tap.events if e["type"] == "tap.closed"]
+        assert any("stream ended" in reason for reason in closed), closed
+        # round 160: the reconnect's own wait took that one, so the failure
+        # records a fresh `tap.closed` for the next waiter
         assert old_tap.events[-1]["type"] == "tap.closed"
-        assert "stream ended" in old_tap.events[-1]["properties"]["error"]
+        assert "could not be reopened" in closed[-1]
         assert fake.calls("PATCH"), "the patch did land: only the stream is broken"
         attempts = [record.getMessage() for record in caplog.records
                     if "event tap start attempt" in record.getMessage()]
@@ -562,3 +567,56 @@ def test_the_ignore_is_written_again_after_the_agent_removed_kilo(tmp_path):
     (repo / ".kilo" / "kilo.jsonc").write_text("{}\n", encoding="utf-8")
     assert _ignored(repo, ".kilo/kilo.jsonc") is True
     assert _git(repo, "status", "--porcelain", "-uall") == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# round 160: one writer on events.jsonl at a time
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _NoReloadClient:
+    """`set_model_limit` that answers and reloads nothing: the old stream stays
+    open, the case where two live taps would share the log."""
+
+    def __init__(self) -> None:
+        self.limits: list = []
+
+    def set_model_limit(self, provider_id, model_id, limit):
+        self.limits.append((provider_id, model_id, dict(limit)))
+
+
+def test_the_old_tap_is_gone_before_the_new_one_writes(tmp_path, monkeypatch):
+    """The reload did not end the stream: the old tap is stopped and joined
+    before the new tap starts, and an event sent after the reconnect is in
+    `events.jsonl` once, not once per live tap."""
+    repo = _repo(tmp_path / "repo")
+    log = tmp_path / "out" / "events.jsonl"
+    alive_at_start: list = []
+    real_start = EventTap.start
+
+    with FakeKiloServer() as fake:
+        backend = KiloBackend(KiloServer.attach(fake.url), str(repo), events_log=str(log),
+                              client=_NoReloadClient())
+        backend.wait_ready()
+        old = backend._tap
+
+        def start(self):
+            thread = getattr(old, "_thread", None)
+            alive_at_start.append(thread is not None and thread.is_alive())
+            return real_start(self)
+
+        monkeypatch.setattr(EventTap, "start", start)
+        backend._reconnect_tap(settle=0.5)
+        assert alive_at_start == [False], "the old tap was still reading when the new one started"
+        assert backend._tap is not old
+        # the new stream is subscribed once it hears a ping; then one event
+        for n in range(50):
+            fake._emit({"type": f"bench.ping.{n}", "properties": {}})
+            if backend._tap.wait(lambda e: e.get("type", "").startswith("bench.ping"),
+                                 0.2) is not None:
+                break
+        fake._emit({"type": "bench.once", "properties": {}})
+        assert backend._tap.wait(lambda e: e.get("type") == "bench.once", 5.0) is not None
+        backend.close()
+
+    lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line]
+    assert sum(1 for rec in lines if rec["event"].get("type") == "bench.once") == 1
