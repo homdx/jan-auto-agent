@@ -1,6 +1,6 @@
 # 152 — the overflow reading learns xAI's wording and the images / TGI cases; a small window with no declared limit can be remembered; the repeat guard compares one unit
 
-**Status:** queued
+**Status:** landed
 **Severity:** MEDIUM
 **File:** tools/contest/runner.py
 **Symbol:** _SIZE_REFUSAL_RE, _NOT_SIZE_RE, _REQUEST_FAULT_RE, _CONTEXT_WALL_RE, _SIZE_REFUSAL_STATUSES, run_agent._overflow_of
@@ -48,3 +48,7 @@ python3 -m pytest tests -n 8 -q
 ```bash
 python3 -m pytest tests_bugfix -n 8 -q
 ```
+
+## Landed
+
+Round 152 (run on the second machine, base fc517bd = 3416cbe + this ticket's status): winner sensenova-6-7-flash-lite-var2 as-is, ab8897e on arena over 151. TGI decided as an overflow at 400 (`tokens … must be <= / < / at most / no more than N`), never at 422. Bench `contest-bench/152/acceptance_152.py`, 33 cases.

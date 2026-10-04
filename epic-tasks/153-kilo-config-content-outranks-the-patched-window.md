@@ -1,6 +1,6 @@
 # 153 — a window the spawn overlay already set is not re-sized by `PATCH /config`: check it took, or keep the watch armed
 
-**Status:** queued
+**Status:** open
 **Severity:** HIGH
 **File:** tools/contest/runner.py
 **Symbol:** run_agent._push_remembered_limit, KiloBackend.set_model_limit
