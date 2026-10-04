@@ -817,7 +817,6 @@ def test_an_overflow_below_kilo_s_window_is_handed_to_kilo_before_the_next_promp
     READY well inside the silence window (a dead stream would sit it out).
     Sent once, for agent-a's worktree, with `kilo_limit`'s numbers, and
     `.kilo/` kept out of that worktree's git."""
-    import subprocess
     import time as _time
     memory = tmp_path / "context-memory.json"
     scenario = {"summary_tokens": 3_000, "turns": [
@@ -841,10 +840,14 @@ def test_an_overflow_below_kilo_s_window_is_handed_to_kilo_before_the_next_promp
     summarize_at = max(i for i, c in enumerate(calls) if c[1].endswith("/summarize"))
     continue_at = max(i for i, c in enumerate(calls) if c[1].endswith("/prompt_async"))
     assert summarize_at < patch_at < continue_at
-    exclude = subprocess.run(["git", "-C", str(wt), "rev-parse", "--git-path", "info/exclude"],
-                             capture_output=True, text=True, check=True).stdout.strip()
-    path = Path(exclude) if Path(exclude).is_absolute() else Path(wt) / exclude
-    assert ".kilo/" in path.read_text(encoding="utf-8").splitlines()
+    # round 151: the push writes nothing to git's own exclude — a linked worktree's
+    # `--git-path info/exclude` is the repository's shared file, the operator's
+    # checkout included. `.kilo/.gitignore` in the workspace carries the same
+    # rules, and it goes with the file it hides, so nothing of ours survives.
+    exclude = tmp_path / "repo" / ".git" / "info" / "exclude"
+    exclude_text = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+    assert ".kilo" not in exclude_text
+    assert not (wt / ".kilo" / "kilo.jsonc").exists()
 
 
 def test_a_remembered_window_is_handed_over_when_the_turn_starts(tmp_path):
@@ -992,8 +995,15 @@ def test_an_untracked_project_file_is_dropped_and_a_tracked_one_is_kept(tmp_path
     (wt / ".kilo").mkdir()
     (wt / ".kilo" / "kilo.jsonc").write_text("{}\n", encoding="utf-8")
     assert backend_mod.tracked_kilo_files(wt) == []
-    assert backend_mod.drop_stale_kilo_file(wt) is True
+    # Round 151: untracked is not the same as this round's, so the pre-spawn
+    # drop says so with `assume_stale`; the runner's own `finish` passes the
+    # limit it pushed and only that file goes.
+    assert backend_mod.drop_stale_kilo_file(wt) is False
+    assert backend_mod.drop_stale_kilo_file(wt, assume_stale=True) is True
     assert not (wt / ".kilo" / "kilo.jsonc").exists()
+    # the guard deleted its file and the empty `.kilo/` it came in, so the agent's
+    # directory starts over
+    (wt / ".kilo").mkdir()
     (wt / ".kilo" / "kilo.jsonc").write_text("{}\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(wt), "add", ".kilo/kilo.jsonc"], check=True)
     subprocess.run(["git", "-C", str(wt), "commit", "-q", "-m", "keep"], check=True)
@@ -1002,13 +1012,17 @@ def test_an_untracked_project_file_is_dropped_and_a_tracked_one_is_kept(tmp_path
     assert (wt / ".kilo" / "kilo.jsonc").exists()
 
 
-def test_a_directory_that_is_not_a_checkout_is_left_alone(tmp_path):
-    """No `git` at all: nothing is written, nothing is deleted, nothing raises."""
+def test_a_directory_that_is_not_a_checkout_needs_no_git(tmp_path):
+    """No `git` at all: nothing is deleted and nothing raises. The ignore file is
+    written anyway, because it is in the workspace, not in git — there is no index
+    here that could refuse a push over a tracked file."""
     import tools.contest.backend as backend_mod
     d = tmp_path / "not-a-repo"
     (d / ".kilo").mkdir(parents=True)
     (d / ".kilo" / "kilo.jsonc").write_text("{}\n", encoding="utf-8")
     backend_mod._exclude_kilo_dir(d)
+    assert (d / ".kilo" / ".gitignore").read_text(encoding="utf-8").splitlines() \
+        == list(backend_mod._KILO_IGNORE_LINES)
     assert backend_mod.tracked_kilo_files(d) == []
     assert backend_mod.drop_stale_kilo_file(d) is False
     assert (d / ".kilo" / "kilo.jsonc").exists()

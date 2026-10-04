@@ -218,6 +218,7 @@ from typing import Callable
 from tools.backoff import save_state
 from tools.contest import context_memory
 from tools.contest.backend import (ContestBackend, ContestBackendError, KiloLimitRefused,
+                                  KiloTapReconnectError,
                                   drop_stale_kilo_file)
 from tools.contest.gates import DEADLINE_COMMIT_EMAIL, declared_files, git
 from tools.contest.harvest import harvest, rework_message
@@ -4377,7 +4378,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             stall(f"{questions_this_turn[0]} questions in one turn")
 
     def finish(state: AgentState, error: str | None = None, *, note: str | None = None) -> AgentRun:
-        drop_stale_kilo_file(ws.path)
+        # Round 151: only the file this run pushed for goes — one the agent wrote
+        # on purpose carries its own limit and survives to the harvest.
+        drop_stale_kilo_file(ws.path, expected_limit=pushed_spec[0])
         transition(state, error, note=note)
         return run
 
@@ -4688,6 +4691,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 f"{now['size']:,} ({now['source']}), compact at {now['compact_at']:g}%")
 
     pushed_limit: list = [None]
+    pushed_spec: list = [None]
     push_refused: list = [None]
 
     def _push_remembered_limit() -> None:
@@ -4712,6 +4716,16 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         answers the patch by reloading the workspace's instance
         (``server.instance.disposed``) — a turn or a compact running in it
         would be cut, and the event stream ends (the backend reconnects it).
+
+        Round 151: ``pushed_limit[0]`` is set the moment the patch answers 200,
+        not after the backend has reopened the event stream for it. A reload
+        that the reconnect could not follow is this round's stream, not its
+        window: Kilo answered the patch and now sizes the session by the
+        pushed limit, so `pushed_limit[0]` is set and `context_watch` stands
+        down — aborting a turn Kilo was about to compact throws away the step
+        in progress — and the failure gets its own line, not the "not handed
+        to Kilo" line a caller would read as a window still unset. A refused
+        or a failed patch is the other way: nothing went over, the watch arms.
         """
         setter = getattr(backend, "set_model_limit", None)
         if not callable(setter):
@@ -4737,15 +4751,30 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         percent = context_memory.compact_at_percent(config)
         try:
             setter(spec.provider_id, spec.model_id, limit)
+        except KiloLimitRefused as exc:
+            # structural: the checkout tracks .kilo, so it will refuse the
+            # same way again — remember it, the check is not re-run. Nothing
+            # went over, so the watch stays armed for a turn Kilo still sizes
+            # by its own 131 072.
+            push_refused[0] = size
+            _log.warning("%s: the remembered window was not handed to Kilo: %s",
+                         spec.name, _brief(str(exc)))
+            return
+        except KiloTapReconnectError as exc:
+            # the patch answered 200, so the window went over: only this
+            # round's stream of it is broken. Mark it pushed — Kilo compacts by
+            # it now — and report the reconnect on its own line.
+            pushed_limit[0] = size
+            pushed_spec[0] = limit
+            _log.warning("%s: the window went to Kilo but its event stream was not "
+                         "reopened after the reload: %s", spec.name, _brief(str(exc)))
+            return
         except Exception as exc:  # noqa: BLE001 — the watch still stands
-            if isinstance(exc, KiloLimitRefused):
-                # structural: the checkout tracks .kilo, so it will refuse the
-                # same way again — remember it, the check is not re-run
-                push_refused[0] = size
             _log.warning("%s: the remembered window was not handed to Kilo: %s",
                          spec.name, _brief(str(exc)))
             return
         pushed_limit[0] = size
+        pushed_spec[0] = limit
         _log.info("%s: Kilo now sizes %s/%s = %s (compact at %g %% of it, after %s "
                   "tokens) — was %s", spec.name, spec.provider_id, spec.model_id, f"{size:,}",
                   percent, f"{limit.get('input') or 0:,}",
@@ -5239,7 +5268,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         # does not outlive the run that wrote it — a resumed agent's server
         # reads it on spawn, and it is not this round's window. Untracked only:
         # a file the checkout tracks is the agent's, and `policy` asks for it.
-        drop_stale_kilo_file(ws.path)
+        # Round 151: nothing has been pushed for this run yet, so `assume_stale`
+        # — a content compare here would compare against a limit this run has not
+        # chosen. `finish` drops this run's own file, by the limit it pushed.
+        drop_stale_kilo_file(ws.path, assume_stale=True)
         # ── CREATED: one session, kept for every turn ─────────────────────
         if not run.sessions:
             # KC-39 appends each session's transcript to `<agent>.session.json`,

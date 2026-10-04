@@ -75,7 +75,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from tools.contest import context_memory, draft, export, gates, probe_memory
-from tools.contest.backend import KiloBackend, OpenRouterBackend
+from tools.contest.backend import KiloBackend, OpenRouterBackend, drop_stale_kilo_file
 from tools.contest.kilo_client import (
     KiloClient,
     KiloHttpError,
@@ -1945,7 +1945,8 @@ def _start_server(config: ContestConfig, out_dir: Path, env: dict | None = None)
     return KiloServer.attach(config.server)
 
 
-def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None):
+def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None,
+                   workspaces=()):
     """``(server, make_backend)`` for ``run_round``: one ``ContestBackend`` per worktree.
 
     ``backend = kilo`` starts (or attaches to) the ``kilo serve`` process the
@@ -1958,6 +1959,13 @@ def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None
     *env* goes to both: the server for `KILO_CONFIG_CONTENT` (KC-35), and the
     OpenRouter agents' subprocess for KC-65's worker count — without it the
     sizing rule would be a Kilo-only rule.
+
+    *workspaces* get their stale ``.kilo`` project file dropped before the server
+    is started (Round 151): Kilo reads a workspace's copy of the config on
+    spawn, so a file an earlier attempt left there would size the resumed
+    agents by a window this round never chose. The drop is untracked-only — a
+    file the checkout tracks is the agent's — and keeps the cleanup
+    `runner.finish` does at the end of the run.
     """
     if config.backend == "openrouter":
         settings = config.openrouter_settings
@@ -1967,9 +1975,11 @@ def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None
                 "the agents' own base_url and api_key")
         def make_backend(workspace):
             return OpenRouterBackend(settings.api_key, settings.base_url,
-                                     str(workspace.path), extra_env=env or None)
+                                      str(workspace.path), extra_env=env or None)
         return None, make_backend
 
+    for workspace in workspaces:
+        drop_stale_kilo_file(str(workspace.path), assume_stale=True)
     server = _start_server(config, out_dir, env=env)
 
     def make_backend(workspace):
@@ -2543,7 +2553,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                       f"{leg - 1} left it", file=sys.stderr)
                 break
         try:
-            server, make_backend = _make_backends(config, leg_out, env=env or None)
+            server, make_backend = _make_backends(config, leg_out, env=env or None,
+                                                  workspaces=workspaces)
         except (KiloServerError, FileNotFoundError, OSError) as exc:
             print(f"server: {exc}", file=sys.stderr)
             if agent_tmp_created:
