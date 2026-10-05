@@ -56,6 +56,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -947,7 +948,65 @@ def _inside_worktree_or_tmp(pairs: list, worktree: "Path | None", tmp_roots) -> 
     return True
 
 
-def _deny_candidates(command: str) -> list:
+#: Shells whose ``-c`` argument is a command line of its own.
+_SHELL_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
+_MAX_NESTING = 4
+
+
+def _substitutions(command: str) -> list:
+    """The command lines a shell would run *inside* *command*: the bodies of
+    ``$(…)``, ``<(…)``, ``>(…)`` and backticks. Text in single quotes is
+    literal to the shell, so ``echo '$(git push)'`` yields nothing."""
+    out: list = []
+    n, i, quote = len(command), 0, ""
+    while i < n:
+        c = command[i]
+        if quote == "'":
+            quote = "" if c == "'" else quote
+        elif c == "\\":
+            i += 1
+        elif c == "'" and not quote:
+            quote = "'"
+        elif c == '"':
+            quote = "" if quote == '"' else '"'
+        elif c == "`":
+            end = command.find("`", i + 1)
+            end = n if end < 0 else end
+            out.append(command[i + 1:end])
+            i = end
+        elif c in "$<>" and command[i + 1:i + 2] == "(" and not (c in "<>" and quote):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                depth += (command[j] == "(") - (command[j] == ")")
+                j += 1
+            out.append(command[i + 2:j - 1 if depth == 0 else j])
+            i = j - 1
+        i += 1
+    return out
+
+
+def _inline_scripts(piece: str) -> list:
+    """The script a piece hands to a shell: ``bash -c '…'`` (also ``-lc``,
+    behind wrappers) and ``eval …``."""
+    try:
+        tokens = shlex.split(piece)
+    except ValueError:
+        return []
+    start = _past_wrappers(tokens)
+    if start is None:
+        return []
+    name = tokens[start].rsplit("/", 1)[-1]
+    rest = tokens[start + 1:]
+    if name == "eval":
+        return [" ".join(rest)] if rest else []
+    if name in _SHELL_NAMES:
+        for k, tok in enumerate(rest):
+            if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
+                return [rest[k + 1]] if k + 1 < len(rest) else []
+    return []
+
+
+def _deny_candidates(command: str, _depth: int = 0) -> list:
     """The strings a ``deny_commands`` pattern is tried against, whole line first.
 
     The whole line keeps a pattern that names a pipe (``curl * | sh``) working.
@@ -957,9 +1016,17 @@ def _deny_candidates(command: str) -> list:
     once more past its ``VAR=value`` words and ``_WRAPPERS`` — so ``cd x && git
     push``, ``(sudo ls)``, ``git  push`` and ``timeout 9 git push`` are the
     command they run, not a command that merely starts with something else.
+    What a command runs inside ``$(…)``, backticks, ``<(…)``, ``bash -c '…'``
+    and ``eval`` is a command line too and is expanded the same way (to a
+    nesting depth of ``_MAX_NESTING``), so ``echo $(git push)`` is a push.
     """
     out = [command]
+    nested: list = []
+    if _depth < _MAX_NESTING:
+        nested = _substitutions(command)
     for piece in _shell_pieces(command):
+        if _depth < _MAX_NESTING:
+            nested += _inline_scripts(piece)
         tokens = piece.split()
         if tokens:
             tokens[0] = tokens[0].lstrip("({!") or ""
@@ -971,6 +1038,9 @@ def _deny_candidates(command: str) -> list:
         start = _past_wrappers(tokens)
         if start:
             out.append(" ".join(tokens[start:]))
+    for inner in nested:
+        if inner.strip():
+            out.extend(_deny_candidates(inner, _depth + 1))
     return out
 
 
