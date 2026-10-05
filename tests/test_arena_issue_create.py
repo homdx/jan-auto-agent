@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.arena import cli, rounds, tickets
+from tools.arena import cli, models, rounds, tickets
 from tools.contest import cli as contest_cli
 from tools.contest import draft as draft_mod
 
@@ -677,3 +677,313 @@ def test_issue_create_help_shows_the_flags(capsys):
     out = capsys.readouterr().out
     for flag in ("text", "--file", "--item", "--number", "--no-review", "--branch"):
         assert flag in out, flag
+
+
+# ── AR-63: the ticket's writer and reviewer, as profile roles ─────────────────
+
+DIRECT_KEY = "sk-test-ROLESECRET"
+
+#: One direct provider: the roles' home. The key is an env reference, never literal.
+PROVIDER_SECTION = (
+    "[arena.provider.direct]\n"
+    "api_key = ${T_DIRECT_KEY}\n"
+    "base_url = http://127.0.0.1:9/v1\n"
+)
+
+#: The profile the role pairs live in.
+P1 = "[arena.profile.p1]\n"
+
+#: What the direct provider's own `/models` answers, as records.
+DIRECT_RECORDS = [
+    {"provider": "direct", "model": "model-a", "free": "yes", "ctx": 4000, "via": "direct"},
+    {"provider": "direct", "model": "model-b", "free": "yes", "ctx": 4000, "via": "direct"},
+]
+
+#: AR-7's reviewer key naming the writer's model, behind another URL.
+SAME_MODEL_OTHER_URL = INI.replace("model = model-reviewer", "model = model-a")
+
+#: Neither of AR-7's old keys: nothing left to fall back to.
+NO_OLD_KEYS = INI.replace("draft_llm_profile = draft_model\n", "") \
+                 .replace("gate_llm_profile = review_model\n", "")
+
+
+@pytest.fixture
+def direct_repo(repo, monkeypatch):
+    """The AR-7 checkout with one direct provider and a fake model list behind it."""
+    monkeypatch.setenv("T_DIRECT_KEY", DIRECT_KEY)
+    for name in ("ARENA_KEY_DIRECT", "ARENA_URL_DIRECT"):
+        monkeypatch.delenv(name, raising=False)
+    (repo / "contest.local.ini").write_text(PROVIDER_SECTION, encoding="utf-8")
+    monkeypatch.setattr(
+        models, "_direct_for",
+        lambda provider, url, key, now: [dict(r) for r in DIRECT_RECORDS])
+
+    def kilo_list(repo, providers):
+        # Kilo knows only `kiloprov`; a named provider it does not know is an error,
+        # which is what keeps the "not in kilo.jsonc" hint quiet for the roles.
+        if providers:
+            raise models.KiloError(f"kilo models {providers[0]}: unknown provider")
+        return {"kiloprov": {"model-k": {"cost": {"input": 0, "output": 0}}}}
+
+    monkeypatch.setattr(models, "KILO_LIST", kilo_list)
+    return repo
+
+
+def _role_fakes(monkeypatch, review='{"ok": true}'):
+    """`draft.llm_call_for` patched: record which model and which prompt, return a fake.
+
+    Nothing dials a provider here. The writer and the reviewer are told apart by the
+    system prompt, which is what `draft_pair` passes for the review call.
+    """
+    calls: list = []
+
+    def factory(settings, system=None):
+        is_review = system == draft_mod.REVIEW_SYSTEM_PROMPT
+        calls.append((str(getattr(settings, "model", "") or ""), is_review))
+        if is_review:
+            return lambda prompt: review
+
+        def writer_call(prompt: str) -> str:
+            match = ROUND_RE.search(prompt)
+            return TICKET.replace("{round_no}", match.group(1) if match else "1")
+
+        return writer_call
+
+    monkeypatch.setattr(draft_mod, "llm_call_for", factory)
+    monkeypatch.setattr(draft_mod, "run_collect", lambda root: None)
+    return calls
+
+
+def test_profile_roles_draft_and_review_and_the_old_keys_are_ignored(
+        direct_repo, monkeypatch, capsys):
+    """The profile's pair wins over AR-7's keys, which are still in the file."""
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-b\n",
+        encoding="utf-8")
+    assert "draft_llm_profile = draft_model" in (direct_repo / "contest.ini").read_text()
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "brief")
+    assert code == 0, err
+    assert out.splitlines() == [f"ticket 1 drafted: .arena/drafts/{_draft_name(direct_repo, 1)}",
+                                "next: arena run start 1"]
+    assert err.splitlines() == ["writer direct/model-a · reviewer direct/model-b"]
+    assert calls == [("model-a", False), ("model-b", True)]
+
+
+def test_flags_beat_the_profile_roles(direct_repo, monkeypatch, capsys):
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-b\n",
+        encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create",
+                          "--writer", "direct/model-b", "--reviewer", "direct/model-a", "brief")
+    assert code == 0, err
+    assert calls == [("model-b", False), ("model-a", True)]
+    assert err.splitlines() == ["writer direct/model-b · reviewer direct/model-a"]
+
+
+def test_each_role_is_resolved_on_its_own(direct_repo, monkeypatch, capsys):
+    """A profile writer with AR-7's reviewer key, and the reverse: both are used."""
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\n", encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "brief")
+    assert code == 0, err
+    assert calls == [("model-a", False), ("model-reviewer", True)]
+    assert err.splitlines() == ["writer direct/model-a · reviewer model-reviewer"]
+
+    (direct_repo / "contest.local.ini").write_text(PROVIDER_SECTION, encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "issue", "create", "--reviewer", "direct/model-a", "brief")
+    assert code == 0, err
+    assert calls == [("model-writer", False), ("model-a", True)]
+    assert err.splitlines() == ["writer model-writer · reviewer direct/model-a"]
+
+
+def test_the_same_model_is_refused_before_any_call_or_write(direct_repo, monkeypatch, capsys):
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-a\n",
+        encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "brief")
+    assert code == 2 and out == ""
+    assert err.splitlines() == ["arena: writer and reviewer are the same model (model-a) — pick another reviewer, or pass --same-model"]
+    assert calls == []
+    assert not (direct_repo / ".arena").exists()
+
+
+def test_the_same_model_is_refused_across_two_urls(direct_repo, monkeypatch, capsys):
+    """The model id decides: another URL is not another reviewer."""
+    _make_ini(direct_repo, SAME_MODEL_OTHER_URL)
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\n", encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "brief")
+    assert code == 2 and out == "" and calls == []
+    assert err.splitlines() == ["arena: writer and reviewer are the same model (model-a) — pick another reviewer, or pass --same-model"]
+
+
+def test_same_model_lets_the_writer_review_its_own_draft(direct_repo, monkeypatch, capsys):
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-a\n",
+        encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "--same-model", "brief")
+    assert code == 0, err
+    assert calls == [("model-a", False), ("model-a", True)]
+    lines = err.splitlines()
+    assert lines.count("review by the writer's own model (model-a) — --same-model") == 1
+    assert "writer direct/model-a · reviewer direct/model-a (same model)" in lines
+
+
+def test_same_model_makes_the_writer_the_reviewer_when_there_is_no_other(
+        direct_repo, monkeypatch, capsys):
+    _make_ini(direct_repo, NO_OLD_KEYS)
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\n", encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "--same-model", "brief")
+    assert code == 0, err
+    assert calls == [("model-a", False), ("model-a", True)]
+    assert "review by the writer's own model (model-a) — --same-model" in err
+    assert "reviewer direct/model-a (same model)" in err
+
+
+def test_same_model_with_two_models_prints_nothing_extra(direct_repo, monkeypatch, capsys):
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-b\n",
+        encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "--same-model", "brief")
+    assert code == 0, err
+    assert calls == [("model-a", False), ("model-b", True)]
+    assert err.splitlines() == ["writer direct/model-a · reviewer direct/model-b"]
+
+
+def test_the_profiles_same_model_review_key_stands_for_the_flag(direct_repo, monkeypatch, capsys):
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-a\n"
+        "same_model_review = yes\n", encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "brief")
+    assert code == 0, err
+    assert calls == [("model-a", False), ("model-a", True)]
+    assert "review by the writer's own model (model-a) — --same-model" in err
+
+
+def test_same_model_and_no_review_contradict(direct_repo, monkeypatch, capsys):
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-a\n",
+        encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create",
+                          "--same-model", "--no-review", "brief")
+    assert code == 2 and out == "" and calls == []
+    assert err.splitlines() == ["arena: --same-model and --no-review contradict: "
+                                "one reviews with the writer, the other skips the review"]
+    assert not (direct_repo / ".arena").exists()
+
+
+def test_nothing_set_at_all_names_the_set_role_way(direct_repo, monkeypatch, capsys):
+    _make_ini(direct_repo, NO_OLD_KEYS)
+    (direct_repo / "contest.local.ini").write_text(PROVIDER_SECTION, encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "issue", "create", "brief")
+    assert code == 2 and out == "" and calls == []
+    assert err.splitlines() == ["arena: no ticket writer — arena model set-role writer "
+                                "PROVIDER/MODEL -p P, or --writer, or [contest] draft_llm_profile"]
+    assert not (direct_repo / ".arena").exists()
+
+
+def test_a_stored_role_that_lost_its_key_refuses_before_any_call(direct_repo, monkeypatch, capsys):
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-b\n",
+        encoding="utf-8")
+    monkeypatch.delenv("T_DIRECT_KEY", raising=False)
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "brief")
+    assert code == 2 and out == "" and calls == []
+    assert len(err.splitlines()) == 1
+    assert "profile 'p1'" in err and "writer = direct/model-a" in err, err
+    assert "has no base_url/api_key" in err
+    assert not (direct_repo / ".arena").exists()
+
+
+def test_json_reports_the_role_pair(direct_repo, monkeypatch, capsys):
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-b\n",
+        encoding="utf-8")
+    _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-o", "json", "-p", "p1", "issue", "create", "brief")
+    assert code == 0, err
+    data = json.loads(out)
+    assert data["writer"] == "direct/model-a"
+    assert data["reviewer"] == "direct/model-b"
+    assert data["same_model"] is False
+    assert data["reviewed"] is True
+    assert data["number"] == 1 and data["rejected"] is False
+
+
+def test_json_reviewer_is_null_with_no_review(direct_repo, monkeypatch, capsys):
+    _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-o", "json", "issue", "create",
+                          "--writer", "direct/model-a", "--no-review", "brief")
+    assert code == 0, err
+    data = json.loads(out)
+    assert data["writer"] == "direct/model-a"
+    assert data["reviewer"] is None
+    assert data["same_model"] is False
+    assert data["reviewed"] is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["-p", "p1", "issue", "create", "brief"],
+    ["-p", "p1", "issue", "create", "--same-model", "brief"],
+    ["-p", "p1", "issue", "create", "--same-model", "--no-review", "brief"],
+    ["-p", "p1", "issue", "create", "--writer", "direct/model-a", "brief"],
+    ["issue", "create", "--reviewer", "direct/model-a", "brief"],
+    ["issue", "create", "brief"],
+    ["-o", "json", "-p", "p1", "issue", "create", "brief"],
+    ["-p", "p1", "issue", "create", "--writer", "kiloprov/model-k", "brief"],
+])
+def test_the_key_never_reaches_the_role_output(direct_repo, monkeypatch, capsys, argv):
+    """Every case above, with the direct provider's key in an env reference."""
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nreviewer = direct/model-b\n",
+        encoding="utf-8")
+    _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, *argv)
+    assert code in (0, 2)
+    assert DIRECT_KEY not in out, out
+    assert DIRECT_KEY not in err, err
+
+
+def test_same_model_with_the_old_keys_naming_one_model(direct_repo, monkeypatch, capsys):
+    """Step 3 found both roles, both one model: `--same-model` allows it.
+
+    AR-7's own path refuses one model outright, so with the flag the pair is
+    resolved by AR-63 even when no role and no `--writer`/`--reviewer` is set.
+    """
+    _make_ini(direct_repo, INI.replace("model = model-reviewer", "model = model-writer"))
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "issue", "create", "--same-model", "brief")
+    assert code == 0, err
+    assert calls == [("model-writer", False), ("model-writer", True)]
+    lines = err.splitlines()
+    assert lines.count("review by the writer's own model (model-writer) — --same-model") == 1
+    assert "writer model-writer · reviewer model-writer (same model)" in lines
+
+    code, out, err = _run(capsys, "issue", "create", "brief")         # no flag: AR-7's refusal
+    assert code == 2 and "the review model is the draft model" in err
+
+
+def test_no_review_on_a_profile_with_same_model_review(direct_repo, monkeypatch, capsys):
+    """Only the `--same-model` flag contradicts `--no-review`, not the profile key."""
+    (direct_repo / "contest.local.ini").write_text(
+        PROVIDER_SECTION + P1 + "writer = direct/model-a\nsame_model_review = yes\n",
+        encoding="utf-8")
+    calls = _role_fakes(monkeypatch)
+    code, out, err = _run(capsys, "-p", "p1", "issue", "create", "--no-review", "brief")
+    assert code == 0, err
+    assert calls == [("model-a", False)]
+    assert "writer direct/model-a · reviewer skipped (--no-review)" in err.splitlines()

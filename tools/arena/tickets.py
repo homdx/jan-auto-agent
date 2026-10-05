@@ -24,7 +24,7 @@ from typing import Optional
 from tools.contest import cli as contest_cli
 from tools.contest import draft as contest_draft
 
-from . import output, profile, rounds
+from . import models, output, profile, rounds
 from .gitref import GitRefError, git, printable, read_utf8
 
 #: Every state `scan` computes, in the order the first match wins.
@@ -483,8 +483,10 @@ def issue_create(repo: Path, args: argparse.Namespace, prof: dict) -> int:
     except (rounds.RoundError, GitRefError, OSError, ValueError) as err:
         return output.refuse(str(err))
     try:
-        llm_call, review_call = contest_cli.draft_callables(config, bool(args.no_review))
-    except contest_cli.DraftSetupError as err:
+        # AR-63: the role pair, resolved one role at a time — the `--writer` /
+        # `--reviewer` flag, then the profile's role, then AR-7's old keys.
+        llm_call, review_call, pair_info = models.draft_pair(repo, args, prof, config)
+    except (models.ModelError, contest_cli.DraftSetupError, profile.ProfileError) as err:
         return output.refuse(str(err))
     try:
         result = contest_draft.draft_ticket(
@@ -500,7 +502,7 @@ def issue_create(repo: Path, args: argparse.Namespace, prof: dict) -> int:
     except ValueError as err:
         return output.refuse(str(err))
 
-    reviewed = review_call is not None
+    reviewed = pair_info["reviewed"]
     if not reviewed:
         print("review skipped (--no-review)", file=sys.stderr)
     if args.output == "json":
@@ -512,6 +514,9 @@ def issue_create(repo: Path, args: argparse.Namespace, prof: dict) -> int:
             "rejected_path": (_shown(repo, result.rejected_path)
                              if result.rejected_path is not None else None),
             "reviewed": reviewed,
+            "writer": pair_info["writer"],
+            "reviewer": pair_info["reviewer"],
+            "same_model": pair_info["same_model"],
         })))
     elif result.rejected:
         for problem in result.problems:

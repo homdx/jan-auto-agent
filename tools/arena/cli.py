@@ -183,10 +183,14 @@ def _set_values(pairs: list[str]) -> dict[str, Optional[str]]:
             raise profile.ProfileError(f"{pair!r}: expected KEY=VALUE")
         if key == "models":
             raise profile.ProfileError("models is set by `arena model use`, not `profile set`")
+        if key in ("writer", "reviewer"):
+            raise profile.ProfileError(
+                f"{key} is set by `arena model set-role`, not `profile set`")
         if key in ("base", "ticket"):
             raise profile.ProfileError(f"{key} is set by arena per round, not by a profile")
         if key not in profile.KNOWN_KEYS:
-            known = ", ".join(k for k in profile.KNOWN_KEYS if k != "models")
+            known = ", ".join(k for k in profile.KNOWN_KEYS
+                              if k not in ("models", "writer", "reviewer"))
             raise profile.ProfileError(f"unknown key {key!r} (known: {known})")
         # one line, no control character: a newline would start a new key or
         # section in contest.local.ini, which `write_profile_keys` edits as text
@@ -202,6 +206,8 @@ def _set_values(pairs: list[str]) -> dict[str, Optional[str]]:
                 f"variant must be letters, digits, _ . - only, not {value!r}")
         if key == "fresh":
             profile.fresh_on(value)
+        if key == "same_model_review":
+            profile.fresh_on(value, key)
         values[key] = value or None
     return values
 
@@ -328,6 +334,12 @@ def _issue_create_arguments(p: argparse.ArgumentParser) -> None:
                    help="the ticket number (default: max + 1 over every round)")
     p.add_argument("--no-review", action="store_true",
                    help="skip the reviewer's round of problems")
+    p.add_argument("--writer", metavar="NAME",
+                   help="the ticket writer for this call only (PROVIDER/MODEL)")
+    p.add_argument("--reviewer", metavar="NAME",
+                   help="the ticket reviewer for this call only (PROVIDER/MODEL)")
+    p.add_argument("--same-model", action="store_true",
+                   help="let the writer review its own draft")
     p.add_argument("--branch", help="integration branch (default: profile's branch, then HEAD)")
     _late_globals(p, "p", "o")
 
@@ -383,6 +395,17 @@ def _model_names_arguments(p: argparse.ArgumentParser) -> None:
     _late_globals(p, "p", "y")
 
 
+def _model_set_role_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("role", help="writer or reviewer")
+    p.add_argument("name", metavar="PROVIDER/MODEL", help="the role's model")
+    _late_globals(p, "p", "y")
+
+
+def _model_unset_role_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("role", help="writer or reviewer")
+    _late_globals(p, "p", "y")
+
+
 def _model_available(args: argparse.Namespace) -> int:
     return models.available(REPO_ROOT, args)
 
@@ -397,6 +420,14 @@ def _model_use(args: argparse.Namespace) -> int:
 
 def _model_drop(args: argparse.Namespace) -> int:
     return models.drop(REPO_ROOT, args)
+
+
+def _model_set_role(args: argparse.Namespace) -> int:
+    return models.set_role(REPO_ROOT, args)
+
+
+def _model_unset_role(args: argparse.Namespace) -> int:
+    return models.unset_role(REPO_ROOT, args)
 
 
 OBJECTS: dict[str, Object] = {
@@ -444,6 +475,18 @@ OBJECTS: dict[str, Object] = {
                 "AR-59",
                 add_arguments=_model_names_arguments,
                 handler=_model_drop,
+            ),
+            "set-role": Verb(
+                "set a profile's ticket writer or reviewer",
+                "AR-63",
+                add_arguments=_model_set_role_arguments,
+                handler=_model_set_role,
+            ),
+            "unset-role": Verb(
+                "remove a profile's ticket writer or reviewer",
+                "AR-63",
+                add_arguments=_model_unset_role_arguments,
+                handler=_model_unset_role,
             ),
         },
     ),

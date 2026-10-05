@@ -55,6 +55,21 @@ AR-60 — direct providers with a key, `arena model test`, results on record
 `use` and `drop` write `contest.local.ini` only — never `contest.ini`, never
 `agents_128k.ini` — by editing the file's text in place, so a `[contest_gate_llm]`
 `api_key` and every comment in it come back byte for byte.
+
+AR-63 — the ticket's writer and reviewer as profile roles
+  `set-role` / `unset-role` store one model per role (`writer`, `reviewer`) in the
+  profile's own section, the same text edit as `use`. A role model must be on a
+  *direct* provider: the draft is one HTTP call (`draft.llm_call_for`), not a Kilo
+  session, so a provider reachable only through Kilo cannot write tickets. The
+  name is checked against that provider's own `/models` list, imported from
+  `resolve_test_targets` — never copied. `role_settings` turns one such name into
+  the `LlmSettings` a draft call wants, and `draft_pair` decides which writer and
+  reviewer `arena issue create` drafts with, role by role: the `--writer` /
+  `--reviewer` flag, then the profile's role, then AR-7's old `[contest]` keys,
+  then — with `--same-model` or `same_model_review = yes` — the writer itself.
+  AR-7's path is called through unchanged when nothing new is set, so an old
+  checkout refuses exactly as it did. A name never reaches a message that also
+  holds a key or a URL: `info` and the printed lines carry names only.
 """
 
 from __future__ import annotations
@@ -76,10 +91,13 @@ import tempfile
 import threading
 import time
 import urllib.error
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from tools.contest import roster
+from tools.auto.llm_profile import LlmSettings
+from tools.contest import cli as contest_cli
+from tools.contest import draft, roster
 from tools.contest.kilo_client import _version_key
 
 from . import output, profile
@@ -1113,3 +1131,315 @@ def drop(repo: Path, args: argparse.Namespace) -> int:
     except (ModelError, profile.ProfileError) as err:
         return output.refuse(str(err))
     return EXIT_OK
+
+
+# ── AR-63: the ticket's writer and reviewer, as profile roles ────────────────
+#: The two ticket roles a profile may hold. A role is not a round agent, so
+#: `check_not_judge` does not apply to it: the ticket writer may also be the gate.
+ROLES = ("writer", "reviewer")
+
+#: The profile key each role is stored under, both `None` in `profile.KNOWN_KEYS`
+#: so neither ever becomes a runner flag.
+ROLE_KEYS = {"writer": "writer", "reviewer": "reviewer"}
+
+
+def _check_role_name(name: str) -> None:
+    """The refusals of one role name: a list, a variant, or no provider named.
+
+    A role is one model for one HTTP call, so there is neither a `--models` list
+    nor a reasoning variant to carry: `llm_call_for` posts one call, one model.
+    """
+    if "," in name:
+        raise ModelError(f"{name!r} is a list — a role is one model")
+    if "@" in name:
+        raise ModelError(f"{name!r} has a variant — a role has no variant")
+    provider, sep, model = name.partition("/")
+    if not sep or not provider.strip() or not model.strip():
+        raise ModelError("name the provider: PROVIDER/MODEL")
+
+
+def _no_direct(role: str, provider: str) -> str:
+    """The refusal of a provider that is not reachable by one direct HTTP call.
+
+    The key value never appears here: only the env name, as `_env_name` makes it.
+    """
+    env = _env_name(provider)
+    return (f"{role} needs a direct provider: '{env}' has no base_url/api_key — "
+            f"[arena.provider.{provider}] api_key = ${{ENV}} and base_url, "
+            f"or ARENA_KEY_{env} / ARENA_URL_{env}")
+
+
+def role_settings(repo: Path, name: str, role: str = "writer") -> LlmSettings:
+    """The `LlmSettings` of one role name `PROVIDER/MODEL`; a direct provider only.
+
+    `base_url` and `api_key` come from `provider_config`, `model` is the part
+    after the slash, every other field from `roster.DEFAULTS_DRAFT` — the same
+    defaults AR-7's `[contest] draft_*_llm_profile` keys resolve against, so a
+    role and an old key agree about the call they make. The model is checked
+    against the provider's own list the way `model test` checks a direct name:
+    `resolve_test_targets` answers `via = "direct" | "kilo"`, and anything Kilo-only
+    is refused here rather than left to fail at draft time.
+    `ModelError` with the one-line refusal; nothing is dialed and nothing is written.
+    """
+    _check_role_name(name)
+    provider, _, model = name.partition("/")
+    url, key = provider_config(repo, provider)
+    if not url or not key:
+        raise ModelError(_no_direct(role, provider))
+    specs = resolve_test_targets(repo, [name], None, time.time())
+    if not specs or specs[0].get("via") != "direct":
+        raise ModelError(_no_direct(role, provider))
+    return replace(roster.DEFAULTS_DRAFT, base_url=url, api_key=key, model=model)
+
+
+def _model_part(name: str) -> str:
+    """The part of `PROVIDER/MODEL` after the slash, lower-cased, as `_same_model` compares."""
+    return (name.partition("/")[2] or "").strip().lower()
+
+
+def _same_role_model(a: str, b: str) -> bool:
+    """Whether two role names name one model — whatever the provider or the URL."""
+    if not a or not b:
+        return False
+    return _model_part(a) == _model_part(b)
+
+
+def _confirm_role(name: str, role: str, before: str, after: str, yes: bool) -> bool:
+    """Print `{role} =` before → after; ask unless *yes*. EOF is a no."""
+    print(f"profile {name!r} — {role} =")
+    print(f"  before: {before or '(none)'}")
+    print(f"  after:  {after}")
+    if yes:
+        return True
+    try:
+        return input("apply? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _role_hint(pname: str, after: str, other: str) -> None:
+    """One stderr hint when both roles of a profile name the same model.
+
+    A hint, not a refusal: `issue create` is the one that refuses, and `--same-model`
+    or `same_model_review = yes` is the operator's own way of opting in.
+    """
+    if not other or not _same_role_model(after, other):
+        return
+    print(f"arena: writer and reviewer are the same model — issue create will refuse "
+          f"without --same-model (or profile set {pname} same_model_review=yes)",
+          file=sys.stderr)
+
+
+def set_role(repo: Path, args: argparse.Namespace) -> int:
+    """`arena model set-role ROLE PROVIDER/MODEL [-p P] [-y]`: store the role."""
+    role = str(getattr(args, "role", "") or "").strip()
+    name = str(getattr(args, "name", "") or "").strip()
+    try:
+        if role not in ROLES:
+            raise ModelError(f"role must be one of {', '.join(ROLES)}, not {role!r}")
+        if not name:
+            raise ModelError("name the provider: PROVIDER/MODEL")
+        profiles, pname = _selected_profile(repo, args)
+        if not _PROFILE_NAME_RE.fullmatch(pname):
+            raise ModelError(f"{pname!r} is not a usable profile name")
+        role_settings(repo, name, role)  # the direct provider and its own model list
+        prof = profiles.get(pname) or {}
+        before = (prof.get(role) or "").strip()
+        after = name
+        if before == after:
+            print(f"profile {pname!r}: {role} = {after} (unchanged)")
+            return EXIT_OK
+        if not _confirm_role(pname, role, before, after, getattr(args, "yes", False)):
+            raise ModelError(f"not applied — {roster.LOCAL_FILENAME} unchanged")
+        write_profile_keys(repo, pname, {ROLE_KEYS[role]: after})
+        other = (prof.get(next(o for o in ROLES if o != role)) or "").strip()
+        if not profile.fresh_on(prof.get("same_model_review") or "no", "same_model_review"):
+            _role_hint(pname, after, other)
+    except (ModelError, profile.ProfileError) as err:
+        return output.refuse(str(err))
+    return EXIT_OK
+
+
+def unset_role(repo: Path, args: argparse.Namespace) -> int:
+    """`arena model unset-role ROLE [-p P] [-y]`: remove the role from the profile."""
+    role = str(getattr(args, "role", "") or "").strip()
+    try:
+        if role not in ROLES:
+            raise ModelError(f"role must be one of {', '.join(ROLES)}, not {role!r}")
+        profiles, pname = _selected_profile(repo, args)
+        # an unknown profile has no role either: one refusal for both, as the ticket words it
+        before = ((profiles.get(pname) or {}).get(role) or "").strip()
+        if not before:
+            raise ModelError(f"profile {pname!r} has no {role}")
+        if not _confirm_role(pname, role, before, "(removed)", getattr(args, "yes", False)):
+            raise ModelError(f"not applied — {roster.LOCAL_FILENAME} unchanged")
+        write_profile_keys(repo, pname, {ROLE_KEYS[role]: None})
+    except (ModelError, profile.ProfileError) as err:
+        return output.refuse(str(err))
+    return EXIT_OK
+
+
+# ── AR-63: which models `issue create` drafts with ───────────────────────────
+def _old_writer_settings(config) -> Optional[LlmSettings]:
+    """AR-7's writer: `[contest] draft_llm_profile`, `None` when unset or unresolved."""
+    if not getattr(config, "draft_llm_profile", ""):
+        return None
+    return getattr(config, "draft_settings", None)
+
+
+def _old_reviewer_settings(config) -> Optional[LlmSettings]:
+    """AR-7's reviewer: `draft_review_llm_profile` when set, else the gate's model."""
+    if getattr(config, "draft_review_llm_profile", ""):
+        return getattr(config, "draft_review_settings", None)
+    if not getattr(config, "gate_llm_profile", ""):
+        return None
+    return getattr(config, "gate_settings", None)
+
+
+def _label_of(settings) -> Optional[str]:
+    """The model id *settings* names — the only part of it a message may carry."""
+    if settings is None:
+        return None
+    return str(getattr(settings, "model", "") or "").strip() or None
+
+
+def _stored_role(repo: Path, pname: str, role: str, stored: str) -> tuple:
+    """`(settings, label)` of one stored role; `ModelError` naming the profile key.
+
+    A role stored when the provider's key was set may lose it later: the refusal
+    lands here, naming the profile key, rather than at the model call.
+    """
+    try:
+        return role_settings(repo, stored, role), stored
+    except ModelError as err:
+        raise ModelError(f"profile '{pname}': {role} = {stored} — {err}") from err
+
+
+def _print_pair(writer: Optional[str], reviewer: Optional[str], no_review: bool,
+                same: bool) -> None:
+    """The one stderr line, names only, of the pair a draft is drafted with.
+
+    Printed when AR-63 resolved the pair; AR-7's own path keeps its stderr as it
+    was, which ticket 145's tests pin byte for byte.
+    """
+    if no_review:
+        line = f"writer {writer} · reviewer skipped (--no-review)"
+    elif same:
+        line = f"writer {writer} · reviewer {reviewer} (same model)"
+    else:
+        line = f"writer {writer} · reviewer {reviewer}"
+    print(output.scrub(line), file=sys.stderr)
+
+
+def draft_pair(repo: Path, args: argparse.Namespace, prof: dict, config) -> tuple:
+    """`(llm_call, review_call, info)` for one draft: AR-63's role resolution.
+
+    Each role is resolved on its own, first match winning: the `--writer` /
+    `--reviewer` flag, then the profile's `writer` / `reviewer`, then AR-7's old
+    `[contest]` keys — and, only with same-model on, the writer again as the
+    reviewer. AR-7's own path (`draft_callables`) is called through unchanged when
+    nothing new is set, so a checkout that only ever used the old keys refuses
+    exactly as it did, in AR-7's own words.
+
+    *info* holds names only — `writer`, `reviewer` (`None` with `--no-review`),
+    `same_model` and `reviewed` — never a key or a URL, so it may go into `-o json`.
+    Every refusal is one `ModelError` line, raised before the collect and before
+    any model is asked for anything; nothing is written here.
+    """
+    repo = Path(repo)
+    try:
+        _profiles, pname = _selected_profile(repo, args)
+    except profile.ProfileError:
+        pname = getattr(args, "profile", None) or profile.DEFAULT_PROFILE
+    prof = dict(prof or {})
+    no_review = bool(getattr(args, "no_review", False))
+    raw_same = str(prof.get("same_model_review") or "").strip()
+    prof_same = bool(raw_same) and profile.fresh_on(raw_same, "same_model_review")
+    same_flag = bool(getattr(args, "same_model", False))
+    same_model = prof_same or same_flag
+    # Only the flag contradicts `--no-review`: a profile that allows one model to
+    # review does not ask for a review, so `--no-review` on it still just skips it.
+    if same_flag and no_review:
+        raise ModelError("--same-model and --no-review contradict: one reviews with "
+                         "the writer, the other skips the review")
+    w_flag = getattr(args, "writer", None)
+    r_flag = getattr(args, "reviewer", None)
+    stored = {role: str(prof.get(role) or "").strip() for role in ROLES}
+    # `--same-model` belongs here too: AR-7's path refuses one model outright, so
+    # old keys naming one model with the flag are resolved below, as step 4 says.
+    new_path = bool(w_flag or r_flag or any(stored.values()) or same_model)
+    old_key_set = bool(getattr(config, "draft_llm_profile", "")
+                       or getattr(config, "draft_review_llm_profile", "")
+                       or getattr(config, "gate_llm_profile", ""))
+
+    # Nothing AR-63 at all, and AR-7's own keys are still in play: hand the pair
+    # to `draft_callables`, so a checkout that only ever used the old keys
+    # refuses in AR-7's own words. Only when literally nothing is configured
+    # anywhere does the "no ticket writer" line below get to speak.
+    if not new_path and old_key_set:
+        llm_call, review_call = contest_cli.draft_callables(config, no_review)
+        writer_label = _label_of(_old_writer_settings(config))
+        reviewer_label = None if no_review else _label_of(_old_reviewer_settings(config))
+        info = {
+            "writer": writer_label,
+            "reviewer": reviewer_label,
+            "same_model": same_model,
+            "reviewed": review_call is not None,
+        }
+        return llm_call, review_call, info
+
+    if w_flag:
+        writer_settings = role_settings(repo, w_flag, "writer")
+        writer_label = w_flag
+    elif stored["writer"]:
+        writer_settings, writer_label = _stored_role(repo, pname, "writer", stored["writer"])
+    else:
+        writer_settings = _old_writer_settings(config)
+        writer_label = _label_of(writer_settings)
+    if writer_settings is None:
+        raise ModelError("no ticket writer — arena model set-role writer PROVIDER/MODEL -p P, "
+                         "or --writer, or [contest] draft_llm_profile")
+
+    reviewer_settings = None
+    reviewer_label = None
+    if not no_review:
+        if r_flag:
+            reviewer_settings = role_settings(repo, r_flag, "reviewer")
+            reviewer_label = r_flag
+        elif stored["reviewer"]:
+            (reviewer_settings, reviewer_label
+             ) = _stored_role(repo, pname, "reviewer", stored["reviewer"])
+        else:
+            reviewer_settings = _old_reviewer_settings(config)
+            reviewer_label = _label_of(reviewer_settings)
+        if reviewer_settings is None and same_model:
+            reviewer_settings = writer_settings  # the writer reviews its own draft
+            reviewer_label = writer_label
+        if reviewer_settings is None:
+            raise ModelError("no ticket reviewer — arena model set-role reviewer "
+                             "PROVIDER/MODEL -p P, or --reviewer, --same-model, "
+                             "or --no-review")
+        # `_same_model` compares the model id only: neither the provider nor the URL
+        # makes one model into two reviewers.
+        if contest_cli._same_model(writer_settings, reviewer_settings):
+            if not same_model:
+                raise ModelError(f"writer and reviewer are the same model "
+                                 f"({_label_of(writer_settings)}) — pick another reviewer, "
+                                 "or pass --same-model")
+            print(output.scrub(f"review by the writer's own model "
+                               f"({_label_of(writer_settings)}) — --same-model"),
+                  file=sys.stderr)
+
+    llm_call = draft.llm_call_for(writer_settings)
+    review_call = None if reviewer_settings is None else draft.llm_call_for(
+        reviewer_settings, system=draft.REVIEW_SYSTEM_PROMPT)
+    _print_pair(writer_label, reviewer_label, no_review,
+                reviewer_settings is not None
+                and contest_cli._same_model(writer_settings, reviewer_settings))
+    info = {
+        "writer": writer_label,
+        "reviewer": None if no_review else reviewer_label,
+        "same_model": same_model,
+        "reviewed": review_call is not None,
+    }
+    return llm_call, review_call, info

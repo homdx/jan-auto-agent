@@ -45,6 +45,12 @@ KNOWN_KEYS: dict[str, Optional[str]] = {
     "extra": None,
     "branch": None,
     "trailer": None,
+    # AR-63: the ticket's writer and reviewer, kept per profile like `models` —
+    # read by `arena issue create`, never handed to the runner.
+    "writer": None,
+    "reviewer": None,
+    # AR-63: one model may both write and review; a deliberate choice, visible here.
+    "same_model_review": None,
 }
 
 #: Flags `arena` sets per round; a profile may never carry them, nor may the
@@ -135,6 +141,13 @@ def load_profiles(repo: Path) -> tuple[dict[str, dict[str, str]], str]:
                 fresh_on(values["fresh"])
             except ProfileError as err:
                 raise ProfileError(f"[{section}] {err}") from err
+        # AR-63: `same_model_review` is a yes/no key too — refuse a bad value
+        # here, naming the section, as for `fresh`.
+        if "same_model_review" in values:
+            try:
+                fresh_on(values["same_model_review"], "same_model_review")
+            except ProfileError as err:
+                raise ProfileError(f"[{section}] {err}") from err
         profiles[section[len(SECTION_PREFIX) :]] = values
 
     active = DEFAULT_PROFILE
@@ -179,14 +192,18 @@ def profile_flags(
     return dedupe_flags(flags + extra)
 
 
-def fresh_on(value: str) -> bool:
-    """`yes|true|1` → True, `no|false|0|` → False; anything else is a refusal."""
+def fresh_on(value: str, key: str = "fresh") -> bool:
+    """`yes|true|1` → True, `no|false|0|` → False; anything else is a refusal.
+
+    *key* is named in the refusal: it is `fresh` in the runner, `same_model_review`
+    in AR-63's profile data.
+    """
     word = value.strip().lower()
     if word in _TRUE_WORDS:
         return True
     if word in _FALSE_WORDS:
         return False
-    raise ProfileError(f"fresh must be yes or no, not {value.strip()!r}")
+    raise ProfileError(f"{key} must be yes or no, not {value.strip()!r}")
 
 
 def dedupe_flags(words: list[str]) -> list[str]:

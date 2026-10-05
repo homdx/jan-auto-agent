@@ -1,6 +1,6 @@
 # AR-63 — the ticket writer and reviewer as profile roles: `arena model set-role / unset-role`, `issue create --writer/--reviewer/--same-model`
 
-**Status:** queued
+**Status:** landed
 **Severity:** LOW
 **File:** tools/arena/models.py
 **Symbol:** set_role, unset_role, role_settings, draft_pair
