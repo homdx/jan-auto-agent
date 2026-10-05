@@ -127,6 +127,27 @@ def test_each_flag(repo, capsys):
     assert flags[13] == ["two files for 13: 13-d.md, 13-e.md"]
 
 
+def test_subject_numbers_reads_one_ticket_or_a_list():
+    """176: `151, 152: …` names two tickets; the single forms are unchanged."""
+    from tools.arena.tickets import subject_numbers
+    assert subject_numbers("151, 152: tickets for the tap reconnect") == {151, 152}
+    assert subject_numbers("7,08,9: x") == {7, 8, 9}
+    assert subject_numbers("144: x") == {144}
+    assert subject_numbers("0144: x") == {144}
+    assert subject_numbers("144 — x") == {144}
+    assert subject_numbers("RUN-3: x") == set()
+    assert subject_numbers("151, 152 tickets") == set()
+
+
+def test_a_list_subject_clears_the_landed_without_commit_flag(repo, capsys):
+    _tracked(repo, "20-a.md", "A", "landed")
+    _tracked(repo, "21-b.md", "B", "landed")
+    _commit(repo, "20, 21: both tickets")
+    code, out, _ = _run(capsys, "-o", "json", "issue", "list")
+    assert code == 0
+    assert {row["number"]: row["flags"] for row in json.loads(out)} == {20: [], 21: []}
+
+
 def test_a_file_named_like_the_branch_does_not_make_git_log_ambiguous(repo, capsys):
     # This repo's own `./arena` script sits next to branch `arena`: a bare
     # `git log arena` was "ambiguous argument" and `issue list` refused.

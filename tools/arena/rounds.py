@@ -43,7 +43,7 @@ from tools.contest import cli as contest_cli
 from tools.contest import roster
 
 from . import output, profile
-from .gitref import GitRefError, commit_file_on, git, tree_with_file
+from .gitref import GitRefError, commit_file_on, git, read_utf8, tree_with_file
 
 #: The ref prefix (`arena-round/7`); the full ref is under `refs/heads/`.
 REF_PREFIX = "arena-round/"
@@ -151,7 +151,7 @@ def round_alive(repo: Path, nn: int, proc_root: str = "/proc") -> bool:
             return True
     lock = repo / ".arena" / "locks" / f"{nn}.pid"
     try:
-        pid = lock.read_text(encoding="utf-8").strip()
+        pid = lock.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return False
     return pid.isdigit() and _matches(_cmdline(root, pid), nn)
@@ -177,7 +177,7 @@ def find_ticket(repo: Path, nn: int, branch: str) -> tuple[str, str]:
             rel = folder.relative_to(repo).as_posix()
             raise RoundError(f"more than one ticket {nn} in {rel}/: {', '.join(found)}")
         if found:
-            return found[0], (folder / found[0]).read_text(encoding="utf-8")
+            return found[0], read_utf8(folder / found[0])
     listed = git(repo, "ls-tree", "--name-only", branch, TASKS_DIR + "/")
     found = _numbered([line.rsplit("/", 1)[-1] for line in listed.splitlines()], nn)
     if len(found) > 1:
@@ -354,7 +354,7 @@ def run_start(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
         "branch": branch,
         "base_ref": f"{REF_PREFIX}{nn}",
         "base_sha": sha,
-        "ticket_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "ticket_sha256": hashlib.sha256(content.encode("utf-8", "surrogateescape")).hexdigest(),
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     rounds_dir = repo / ".arena" / "rounds"

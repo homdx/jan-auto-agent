@@ -33,13 +33,31 @@ def git(repo: Path, *args: str, env: Optional[dict] = None,
         proc = subprocess.run(
             ["git", *args], cwd=str(repo), input=stdin, capture_output=True,
             text=True, env=env,
+            # Bug 174: not the locale's strict codec — a latin-1 commit subject
+            # or ticket blob was a UnicodeDecodeError traceback. surrogateescape
+            # keeps every byte, so a blob read here and fed back as *stdin*
+            # (`hash-object`) is the same blob; `printable` is for the screen.
+            encoding="utf-8", errors="surrogateescape",
         )
     except OSError as err:  # no git binary at all
-        raise GitRefError(f"git {' '.join(args)}: {err}") from err
+        raise GitRefError(printable(f"git {' '.join(args)}: {err}")) from err
     if proc.returncode != 0:
-        first = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[0]
-        raise GitRefError(f"git {' '.join(args)}: {first}")
+        first = (printable(proc.stderr).strip().splitlines()
+                 or [f"exit {proc.returncode}"])[0]
+        raise GitRefError(printable(f"git {' '.join(args)}: {first}"))
     return proc.stdout.strip() if strip else proc.stdout
+
+
+def printable(text: str) -> str:
+    """*text* (from `git` or `read_utf8`) with each undecodable byte as U+FFFD,
+    safe to print or to search; never feed it back to git as content."""
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def read_utf8(path: Path) -> str:
+    """A file's text the way `git` returns a blob: invalid UTF-8 bytes kept as
+    surrogates, so the text hashes and commits back to the same bytes."""
+    return Path(path).read_bytes().decode("utf-8", "surrogateescape")
 
 
 def _index_with_file(repo: Path, parent: str, path_in_repo: str, content: str,

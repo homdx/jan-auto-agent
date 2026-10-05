@@ -25,13 +25,16 @@ from tools.contest import cli as contest_cli
 from tools.contest import draft as contest_draft
 
 from . import output, profile, rounds
-from .gitref import GitRefError, git
+from .gitref import GitRefError, git, printable, read_utf8
 
 #: Every state `scan` computes, in the order the first match wins.
 STATES = ("landed", "closed", "running", "done", "queued", "draft", "open")
 
 #: A commit subject that names a ticket: `144: …`, `144 — …`, `144 …`.
 _SUBJECT_RE = re.compile(r"^0*(\d+)(?::|\s)")
+
+#: A subject that names several tickets: `151, 152: …`.
+_LIST_SUBJECT_RE = re.compile(r"^\d+(?:\s*,\s*\d+)+\s*:")
 
 #: Where a ticket was read from; the checkout's file wins over the branch's,
 #: and either `epic-tasks/` file wins over a draft.
@@ -58,8 +61,10 @@ TASK_HEADER = (
 #: `# Title` to `###### Title`: a Markdown heading line.
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
-#: A ``` fence line: what turns the heading count off and then on again.
-_FENCE_RE = re.compile(r"^\s*```")
+#: A fence line: a run of 3+ backticks or tildes, up to 3 spaces in (CommonMark).
+#: Bug 175: only ``` was a fence, so a `# comment` inside a `~~~` block was a
+#: heading, and a ``` line inside a ```` block closed it early.
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
 @dataclass
@@ -94,6 +99,15 @@ def _branch_names(repo: Path, branch: str) -> list[str]:
     return [line.rsplit("/", 1)[-1] for line in listed.splitlines()]
 
 
+def subject_numbers(subject: str) -> set:
+    """The ticket numbers one commit subject names: `144: …` is {144}, `151, 152: …` both."""
+    if _LIST_SUBJECT_RE.match(subject):
+        head = subject.split(":", 1)[0]
+        return {int(n) for n in re.findall(r"\d+", head)}
+    match = _SUBJECT_RE.match(subject)
+    return {int(match.group(1))} if match else set()
+
+
 def _commit_numbers(repo: Path, branch: str) -> set[int]:
     """The ticket numbers *branch*'s commit subjects name — one `git log` per scan."""
     # The trailing `--` makes *branch* a revision even when a file of the same
@@ -102,9 +116,7 @@ def _commit_numbers(repo: Path, branch: str) -> set[int]:
     subjects = git(repo, "log", "--format=%s", branch, "--")
     found = set()
     for line in subjects.splitlines():
-        match = _SUBJECT_RE.match(line)
-        if match:
-            found.add(int(match.group(1)))
+        found |= subject_numbers(line)
     return found
 
 
@@ -112,9 +124,10 @@ def _text(repo: Path, branch: str, where: str, name: str) -> str:
     """The md text of *name* as it is in *where*."""
     repo = Path(repo)
     if where == WHERE_BRANCH:
-        return git(repo, "show", f"{branch}:{rounds.TASKS_DIR}/{name}", strip=False)
+        return printable(git(repo, "show", f"{branch}:{rounds.TASKS_DIR}/{name}",
+                             strip=False))
     folder = repo / (".arena/drafts" if where == WHERE_DRAFT else rounds.TASKS_DIR)
-    return (folder / name).read_text(encoding="utf-8")
+    return printable(read_utf8(folder / name))
 
 
 def _path(where: str, branch: str, name: str) -> str:
@@ -299,17 +312,24 @@ def _held_by(repo: Path, config, branch: str, number: int) -> Optional[str]:
 def _headings(lines: list) -> list:
     """`(line index, level)` for every heading outside a fenced code block.
 
-    A ``` fence line turns the heading count off and then on again, so an example
-    in code is not a heading — a `#` in a fixture would otherwise start a section
-    and cut the real one short.
+    A fence (```, ~~~ or a longer run) turns the heading count off until the
+    same character, at least as long, closes it — so an example in code is not
+    a heading: a `#` in a fixture would otherwise start a section and cut the
+    real one short.
     """
     heads = []
-    in_fence = False
+    fence = None  # the opening run while inside a block, e.g. "````" or "~~~"
     for index, line in enumerate(lines):
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence:
+        match = _FENCE_RE.match(line)
+        if fence is None:
+            if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+                fence = match.group(1)
+                continue
+        else:
+            # only the same character, at least as long, with nothing after, closes
+            if (match and match.group(1)[0] == fence[0]
+                    and len(match.group(1)) >= len(fence) and not match.group(2).strip()):
+                fence = None
             continue
         match = _HEADING_RE.match(line)
         if match:
