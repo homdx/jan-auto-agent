@@ -24,6 +24,7 @@ replaces argparse's usage block (principle 9).
 from __future__ import annotations
 
 import argparse
+import re
 import shlex
 import sys
 from dataclasses import dataclass
@@ -165,6 +166,13 @@ def _profile_set_arguments(p: argparse.ArgumentParser) -> None:
     _late_globals(p, "y")
 
 
+#: What the runner's own parser takes: `--legs`/`--max-parallel` are `type=int` that
+#: intake refuses under 1, `--backend` has `choices`. ASCII digits only — `²` is
+#: `isdigit()` and not an `int`.
+_POSITIVE_INT = re.compile(r"[1-9][0-9]*")
+_BACKENDS = ("kilo", "openrouter")
+
+
 def _set_values(pairs: list[str]) -> dict[str, Optional[str]]:
     """`KEY=VALUE` words → `{key: value}`, `None` for `KEY=`. `ProfileError` to refuse."""
     values: dict[str, Optional[str]] = {}
@@ -180,8 +188,18 @@ def _set_values(pairs: list[str]) -> dict[str, Optional[str]]:
         if key not in profile.KNOWN_KEYS:
             known = ", ".join(k for k in profile.KNOWN_KEYS if k != "models")
             raise profile.ProfileError(f"unknown key {key!r} (known: {known})")
-        if key == "max_parallel" and value and not (value.isdigit() and int(value) > 0):
-            raise profile.ProfileError(f"max_parallel must be a positive integer, not {value!r}")
+        # one line, no control character: a newline would start a new key or
+        # section in contest.local.ini, which `write_profile_keys` edits as text
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise profile.ProfileError(f"{key}: the value holds a control character or a newline")
+        if key in ("max_parallel", "legs") and value and not _POSITIVE_INT.fullmatch(value):
+            raise profile.ProfileError(f"{key} must be a positive integer, not {value!r}")
+        if key == "backend" and value and value not in _BACKENDS:
+            raise profile.ProfileError(
+                f"backend must be one of {', '.join(_BACKENDS)}, not {value!r}")
+        if key == "variant" and value and not models._VARIANT_RE.fullmatch(value):
+            raise profile.ProfileError(
+                f"variant must be letters, digits, _ . - only, not {value!r}")
         if key == "fresh":
             profile.fresh_on(value)
         values[key] = value or None

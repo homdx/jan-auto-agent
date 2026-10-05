@@ -105,6 +105,30 @@ def test_refusals_write_nothing(repo, capsys, pair):
     assert local(repo) == KEEP
 
 
+@pytest.mark.parametrize("pair", [
+    "legs=abc", "legs=0", "legs=-1", "legs=\u00b2", "max_parallel=\u00b2", "max_parallel=-3",
+    "backend=zzz", "variant=a b", "variant=high!",
+    "extra=--a\n[evil]\nk=v", "provider=x\ny",
+])
+def test_set_refuses_what_the_runner_would_refuse_or_a_line_break(repo, capsys, pair):
+    """173: a value the runner's parser rejects, or one that starts a new ini line, is not stored."""
+    (repo / LOCAL).write_text(KEEP, encoding="utf-8")
+    capsys.readouterr()
+    assert cli.main(["profile", "set", "p", pair, "-y"]) == 2
+    assert len(capsys.readouterr().err.strip().splitlines()) == 1
+    assert local(repo) == KEEP
+
+
+@pytest.mark.parametrize("pair,flags", [
+    ("legs=3", "--legs 3"), ("backend=openrouter", "--backend openrouter"),
+    ("backend=kilo", "--backend kilo"), ("variant=high", "--variant high"),
+    ("provider=my prov", "--provider 'my prov'"),
+])
+def test_set_still_takes_the_values_the_runner_takes(repo, capsys, pair, flags):
+    assert cli.main(["profile", "set", "q", pair, "-y"]) == 0
+    assert view_flags(repo, capsys, "q") == flags
+
+
 def test_one_bad_pair_refuses_the_whole_set(repo):
     (repo / LOCAL).write_text(KEEP, encoding="utf-8")
     assert cli.main(["profile", "set", "p", "legs=3", "nosuch=1", "-y"]) == 2
@@ -163,3 +187,14 @@ def test_base_and_ticket_still_refused():
         rounds.build_run_line(142, {}, ["--base", "x"])
     with pytest.raises(ProfileError):
         profile_flags({"extra": "--ticket=1"})
+
+
+def test_the_backends_set_takes_are_the_runners_own_choices():
+    """173: `cli._BACKENDS` copies `--backend`'s choices of `tools.contest run`; they may not drift."""
+    import argparse
+    from tools.contest import cli as contest_cli
+
+    run = next(sub.choices["run"] for sub in contest_cli._parser()._actions
+               if isinstance(sub, argparse._SubParsersAction) and "run" in sub.choices)
+    backend = next(a for a in run._actions if "--backend" in a.option_strings)
+    assert tuple(backend.choices) == cli._BACKENDS
