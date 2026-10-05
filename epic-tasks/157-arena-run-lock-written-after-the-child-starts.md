@@ -1,6 +1,6 @@
 # 157 — `arena run start/rerun`: the round's lock file is written after the runner child has started
 
-**Status:** queued
+**Status:** open
 **Severity:** MEDIUM
 **File:** tools/arena/rounds.py
 **Symbol:** _run_child

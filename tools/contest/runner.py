@@ -7106,6 +7106,12 @@ def _lock_status(run: AgentRun) -> tuple | None:
         return None
 
 
+#: Round 153: the server's cpu share (percent of one core) from which a silent
+#: spell also carries the "delete Kilo's store" advice — a hung `kilo serve`
+#: sat at ~200 %, an idle wait on a slow provider sits near 0.
+HUNG_STORE_CPU_PERCENT = 50.0
+
+
 def _proc_cpu_ticks(pid: int, proc_root: str = "/proc") -> int | None:
     """KC-81: `utime + stime` of *pid* from ``/proc/<pid>/stat``, or None.
 
@@ -7416,11 +7422,34 @@ class _Heartbeat:
         kill_pid = str(pid) if pid else "<pid>"
         count = len(waiting)
         plural = "agent" if count == 1 else "agents"
+        # Round 153: a server that is silent *and* pinned on the CPU (a busy
+        # loop, not an idle wait) is usually Kilo's own store grown huge — every
+        # round worktree shares one project id, so `kilo.db` and `snapshot/` only
+        # get bigger (live: 1.4 GB and 2 GB, two hangs in a row at 8 and at 4
+        # parallel at ~200 % cpu; a clean store ran the same round for 2.5 h).
+        # Only a line of advice, like the rest of this warning: nothing is
+        # deleted or killed here. The path is the one this server's own
+        # environment resolves (`kilo_neighbours`), not a hard-coded one.
+        advice = ""
+        try:
+            busy = float(str(cpu).rstrip("%")) >= HUNG_STORE_CPU_PERCENT
+        except ValueError:  # "?" — no sample, no advice
+            busy = False
+        if busy:
+            store = ""
+            if pid:
+                try:
+                    _count, store = kilo_neighbours(pid)
+                except Exception:  # noqa: BLE001 — the hint names the store, never raises
+                    store = ""
+            db_path = f"{store}/kilo.db" if store else "kilo's data dir (kilo.db)"
+            advice = (f". With the cpu this high the store is the usual cause: just delete "
+                      f"{db_path} (and the snapshot/ dir next to it) and restart")
         note = (
             f"kilo serve silent {_age(silent_for)}: {pid_note}, cpu {cpu}, {log_note}, "
             f"{count} live {plural} without an event — the server looks hung; "
             f"stop it (kill {kill_pid}, kill -9 if it stays) and restart the round "
-            f"with --fresh"
+            f"with --fresh{advice}"
         )
         self.state.server_silent = {"seconds": int(silent_for), "pid": pid}
         self._save_state()

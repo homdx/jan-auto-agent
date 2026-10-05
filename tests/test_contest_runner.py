@@ -6739,6 +6739,30 @@ def test_kilo_silent_warns_once_when_events_and_log_are_still(tmp_path, caplog):
     assert hb.server_pid == os.getpid()
 
 
+def test_kilo_silent_at_a_high_cpu_advises_deleting_the_store(tmp_path, monkeypatch):
+    """Round 153: a silent server pinned on the CPU is Kilo's grown store (live:
+    kilo.db 1.4 GB, ~200 % cpu, two hangs in a row; a clean store ran 2.5 h). The
+    warning then carries one line of advice with the path *that server's own
+    environment* resolves — nothing is deleted or killed. A low or unknown cpu
+    gets the old text only."""
+    monkeypatch.setattr(_runner_module, "kilo_neighbours", lambda pid: (0, "/box/share/kilo"))
+    sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path)
+    try:
+        notes = {}
+        for cpu in ("192%", "3%", "?"):
+            hb._silent_warned = False
+            hb._log_size = None
+            time.sleep(hb.kilo_silent_sec + 0.1)
+            notes[cpu] = hb._server_silent_note(cpu)
+    finally:
+        _runner_module._worktree_files, _runner_module._commits_above = restore
+    high = notes["192%"]
+    assert high and "just delete /box/share/kilo/kilo.db" in high, notes
+    assert "snapshot/" in high and "the server looks hung" in high and "--fresh" in high, high
+    for cpu in ("3%", "?"):
+        assert notes[cpu] and "delete" not in notes[cpu], notes[cpu]
+
+
 def test_kilo_silent_stays_quiet_while_the_log_grows(tmp_path, caplog):
     """KC-81: the same still events, but kilo-serve.log keeps growing — the
     server is fine, so no warning."""

@@ -1,6 +1,6 @@
 # 153 — a window the spawn overlay already set is not re-sized by `PATCH /config`: check it took, or keep the watch armed
 
-**Status:** open
+**Status:** landed
 **Severity:** HIGH
 **File:** tools/contest/runner.py
 **Symbol:** run_agent._push_remembered_limit, KiloBackend.set_model_limit
@@ -55,3 +55,25 @@ python3 -m pytest tests -n 8 -q
 ```bash
 python3 -m pytest tests_bugfix -n 8 -q
 ```
+
+## Live check — recorded in round 153 (Kilo 7.6.2, `zai/glm-4.5-flash`)
+
+Real `kilo serve` spawned by the round's own path (`cli._spawn_overlay`), a stub ticket whose first
+turn changes nothing (so the runner sends a rework prompt), the remembered window seeded in
+`context-memory.json` (98 777 → `KILO_CONFIG_CONTENT` carries `limit {context 130777, input 98777,
+output 32000}`), and a smaller record appended right after the first prompt so the second prompt
+pushes a window the overlay already set. All twelve entries and the base were run this way, three at a
+time, on the same model.
+
+| | base (151) | landed (a2fe341) |
+|---|---|---|
+| `GET /provider?directory=` limit before the PATCH | `{context 130777, input 98777, output 32000}` | the same |
+| the PATCH | 200, `.kilo/kilo.jsonc` written, instance reloaded | the same |
+| `GET /provider?directory=` limit after the PATCH | `{context 130777, input 98777, output 32000}` — unchanged | the same — unchanged |
+| the runner's line | `Kilo now sizes zai/glm-4.5-flash = 40,000 … the in-turn watch stays off` | `Kilo kept 130,777 from KILO_CONFIG_CONTENT — the watch stays armed (the read-back reports 130,777 for zai/glm-4.5-flash where the patch asked for 72,000)` |
+| who stopped the turn | nobody — the watch stood down on the 200 | the watch: `context 32,037 tokens = 80.1% of 40,000 (remembered) inside the turn — stopping it to compact before the next prompt`, while Kilo's own window was 98 777 and the provider had not refused |
+
+A model with no limit in the overlay (empty memory at spawn, 85 000 pushed on the second prompt): the
+PATCH takes, the read-back matches, and the runner says `Kilo now sizes zai/glm-4.5-flash = 85,000
+(compact at 80 % of it, after 85,000 tokens) — was 131,072` — the same line on base and on every entry
+but `glm-4.7-flash` (its read-back method does not exist: it reported `kept` for a window that took).
