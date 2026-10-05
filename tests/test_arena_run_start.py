@@ -365,3 +365,10 @@ def test_repo_root_is_the_checkout_unpatched():
     import importlib
     fresh = importlib.reload(cli)
     assert (fresh.REPO_ROOT / "tools" / "arena" / "rounds.py").is_file()
+
+
+def test_a_profile_extra_out_is_refused_before_the_runner_line_is_built():
+    """172: `build_run_line` never lets a profile's `--out` reach the runner."""
+    from tools.arena.profile import ProfileError
+    with pytest.raises(ProfileError, match="--out is set by arena"):
+        rounds.build_run_line(3, {"extra": "--out /tmp/elsewhere"}, [])

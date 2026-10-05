@@ -72,6 +72,26 @@ def test_extra_base_or_ticket_is_refused(extra):
         profile_flags({"extra": extra})
 
 
+@pytest.mark.parametrize("extra,flag", [
+    ("--out /tmp/elsewhere", "--out"), ("--out=/tmp/x", "--out"),
+    ("--target /other", "--target"), ("--target=/other", "--target"),
+])
+def test_extra_out_or_target_is_refused(extra, flag):
+    """172: arena owns the round's folder and repository; a profile cannot move them."""
+    with pytest.raises(ProfileError, match=f"{flag} is set by arena, not by a profile"):
+        profile_flags({"extra": extra})
+
+
+def test_the_profile_and_the_passthrough_refuse_the_same_flags():
+    """172: one tuple of owned flags, so the two checks cannot drift apart again."""
+    from tools.arena import profile, rounds
+    assert rounds._OWNED_FLAGS is profile.OWNED_FLAGS
+
+
+def test_extra_max_parallel_is_still_allowed():
+    assert profile_flags({"extra": "--max-parallel 2"}) == ["--max-parallel", "2"]
+
+
 def test_unknown_key_names_section_and_key(repo):
     write(repo, "[arena.profile.default]\ncolour = red\n")
     with pytest.raises(ProfileError) as exc:

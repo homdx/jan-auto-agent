@@ -58,7 +58,7 @@ _STATUS_LINE = re.compile(r"^\*\*Status:\*\*.*$", re.MULTILINE)
 _ROUND_DIR = re.compile(r"^(\d+)(?:\.(\d+))?$")
 
 #: Flags arena sets itself; the passthrough may never carry them.
-_OWNED_FLAGS = ("--ticket", "--base", "--target", "--out")
+_OWNED_FLAGS = profile.OWNED_FLAGS
 
 #: The `/proc` `run start` and `run list` read — a seam, so tests use a fake tree.
 PROC_ROOT = "/proc"
@@ -264,8 +264,8 @@ def build_round_ref(repo: Path, nn: int, branch: str, name: str, content: str, *
 
 # ── the run line and the child ───────────────────────────────────────────────
 def _owned(word: str) -> Optional[str]:
-    flag = word.split("=", 1)[0]
-    return flag if flag in _OWNED_FLAGS else None
+    """The arena-owned flag *word* sets, abbreviations included (bug 172)."""
+    return profile.owned_flag(word, _OWNED_FLAGS)
 
 
 def build_run_line(nn: int, prof: dict[str, str], passthrough: list[str]) -> list[str]:

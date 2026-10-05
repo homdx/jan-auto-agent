@@ -47,8 +47,11 @@ KNOWN_KEYS: dict[str, Optional[str]] = {
     "trailer": None,
 }
 
-# Flags `arena` sets per round; a profile may never carry them.
-_FORBIDDEN_FLAGS = ("--base", "--ticket")
+#: Flags `arena` sets per round; a profile may never carry them, nor may the
+#: passthrough (`rounds._OWNED_FLAGS` is this same tuple). `--out` and `--target`
+#: move the round's folder and repository away from where `run list`, `run view`
+#: and `run rerun` look.
+OWNED_FLAGS = ("--ticket", "--base", "--target", "--out")
 
 #: AR-62: the runner flags that take a value. Given twice (profile key, `extra`,
 #: passthrough after `--`), only the last one reaches the runner.
@@ -59,6 +62,44 @@ SWITCH_FLAGS = ("--fresh",)
 # `fresh = …`: a switch spelt as a key. Empty is "no" too.
 _TRUE_WORDS = ("yes", "true", "1")
 _FALSE_WORDS = ("no", "false", "0", "")
+
+
+def owned_flag(word: str, owned) -> Optional[str]:
+    """The flag of *owned* that *word* reaches the runner as, or None.
+
+    Bug 172: `tools.contest run` keeps argparse's `allow_abbrev`, so `--tick 9`
+    *is* `--ticket 9`. A word counts when its flag part is an owned flag or an
+    abbreviation of one — and not, itself, an exact runner option (an exact
+    match wins in argparse, so `--backend` never stands for anything else).
+    """
+    flag = word.split("=", 1)[0]
+    if not flag.startswith("--") or len(flag) <= 2:
+        return None
+    if flag in owned:
+        return flag
+    if flag in _runner_options():
+        return None
+    return next((o for o in owned if o.startswith(flag)), None)
+
+
+_RUNNER_OPTIONS: Optional[frozenset] = None
+
+
+def _runner_options() -> frozenset:
+    """Every option string `tools.contest run` declares (read once, lazily)."""
+    global _RUNNER_OPTIONS
+    if _RUNNER_OPTIONS is None:
+        from tools.contest import cli as contest_cli  # lazy: cli is heavy
+        import argparse
+        names: set = set()
+        for action in contest_cli._parser()._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                run = action.choices.get("run")
+                if run is not None:
+                    for sub in run._actions:
+                        names.update(sub.option_strings)
+        _RUNNER_OPTIONS = frozenset(names)
+    return _RUNNER_OPTIONS
 
 
 class ProfileError(Exception):
@@ -128,10 +169,13 @@ def profile_flags(
     except ValueError as err:  # an unbalanced quote
         raise ProfileError(f"extra: {err}") from err
     for word in extra:
-        # `--base X` and `--base=X` both count; so would an abbreviation
-        # argparse accepts, but a profile has no reason to spell one.
-        if word.split("=", 1)[0] in _FORBIDDEN_FLAGS:
+        # `--base X`, `--base=X` and an abbreviation argparse accepts (`--bas`)
+        # all count, for every flag arena owns
+        flag = owned_flag(word, OWNED_FLAGS)
+        if flag in ("--base", "--ticket"):
             raise ProfileError("--base/--ticket are set by arena, not by a profile")
+        if flag:
+            raise ProfileError(f"{flag} is set by arena, not by a profile")
     return dedupe_flags(flags + extra)
 
 
