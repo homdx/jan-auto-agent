@@ -47,7 +47,7 @@ from pathlib import Path
 STATUS_RE = re.compile(r"^(\*\*Status:\*\*\s*)(\S+)(.*)$", re.MULTILINE)
 TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
 #: `| 48 | `KC-9` | queued — …` → the status word in the third cell.
-INDEX_ROW = r"^(\|\s*0*{n}\s*\|[^|\n]*\|\s*)(\S+)"
+INDEX_ROW = r"^(\|\s*0*{n}\s*\|[^|\n]*\|\s*)([^|\n]*?)(\s*\|)"
 VALID_WRITE = ("open", "queued", "landed")
 
 
@@ -205,7 +205,9 @@ def main(argv=None) -> int:
         note = f"`{args.sha}`" + (f" — {note}" if note else "")
 
     if note is None:
-        rest = match.group(3)
+        # a landed ticket sent back to open/queued must not keep the old sha
+        was_landed = match.group(2).strip("`*").lower() == "landed"
+        rest = "" if was_landed and args.status != "landed" else match.group(3)
     elif args.status == "landed":
         rest = f" {note}"  # the repo's form: landed `sha` — note
     elif note.startswith((" —", " -")):
@@ -223,7 +225,11 @@ def main(argv=None) -> int:
         rows = index.read_text()
         row_re = re.compile(INDEX_ROW.format(n=args.number), re.MULTILINE)
         if row_re.search(rows):
-            index.write_text(row_re.sub(lambda m: m.group(1) + args.status, rows, count=1))
+            # the whole status cell is rewritten: only the first word used to be,
+            # so a flip kept the old sha (`open `abc`` / a landed row with the
+            # previous winner's sha)
+            cell = f"landed `{args.sha}`" if args.status == "landed" else args.status
+            index.write_text(row_re.sub(lambda m: m.group(1) + cell + m.group(3), rows, count=1))
             paths.append(str(index.relative_to(repo)))
             print(f"{paths[-1]}: row {args.number} -> {args.status}")
 

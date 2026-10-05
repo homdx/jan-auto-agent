@@ -20,7 +20,13 @@ The round order is `ROUND_ORDER` below and it is the point of the script:
 ticket N assumes the merged result of tickets 1..N-1. Editing that list is how
 you re-plan a round.
 
-Exit codes: 0 wrote the folder · 1 a source file or a ticket id is missing.
+It never overwrites: a ticket file or `INDEX.md` that is already in the folder is
+a ticket whose `**Status:**` (landed, queued, a sha) the regenerated file does
+not carry, so the run is refused, nothing written, unless `--force` says so. The
+default `--out epic-tasks` is the folder the round's own tickets live in.
+
+Exit codes: 0 wrote the folder · 1 a source file or a ticket id is missing, or the
+folder already holds a file this would write (no `--force`).
 """
 import argparse
 import os
@@ -137,12 +143,14 @@ def meta(body):
     }
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="epic-tasks", help="folder to write NN-*.md into")
     ap.add_argument("--order", choices=("full", "short"), default="full",
                     help="full = every ticket; short = PLAN-v2 §6's short path")
-    a = ap.parse_args()
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite files already in --out (their **Status:** lines are lost)")
+    a = ap.parse_args(argv)
 
     tickets = {}
     for path, rx in SOURCES:
@@ -160,6 +168,14 @@ def main():
     extra = sorted(set(tickets) - set(order))
 
     out = os.path.join(HERE, a.out)
+    names = [f"{i:02d}-{tid.lower()}-{slug(tickets[tid]['title'])}.md"
+             for i, tid in enumerate(order, 1)] + ["INDEX.md"]
+    held = [n for n in names if os.path.exists(os.path.join(out, n))]
+    if held and not a.force:
+        print(f"refusing: {a.out}/ already holds {len(held)} of the files this would write "
+              f"({', '.join(held[:4])}{' …' if len(held) > 4 else ''}) — their **Status:** lines "
+              "would be lost. Pick another --out, or pass --force.", file=sys.stderr)
+        return 1
     os.makedirs(out, exist_ok=True)
 
     index = [f"# Epic round — {len(order)} tickets, in order", "",
