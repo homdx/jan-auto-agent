@@ -651,6 +651,22 @@ _OVERFLOW_RE = re.compile(
     r"ContextOverflowError|maximum context length|context_length_exceeded", re.IGNORECASE
 )
 
+#: Round 146: Kilo's own end of a compaction that could not bring the session
+#: under the wall Kilo holds — ``Compaction exhausted: context still exceeds
+#: model limits after 3 attempts`` — under the same ``ContextOverflowError`` name
+#: a provider's refusal gets. It is *Kilo's* wall talking: the window the
+#: provider declares, or the one the runner pushed from this very memory
+#: (`context_memory.kilo_limit`, whose docstring already records that a wall cut
+#: too low ends turns in it). It names no limit, no prompt and no output, and
+#: ``last_ok`` of such a turn is only where the session stood when Kilo gave up,
+#: so it is an overflow for the turn and never a size for the memory: stored, the
+#: next agent of the model compacted at 80 % of it, Kilo's wall came down with
+#: it, the next compaction was exhausted sooner, and the record below that one
+#: was written — for seven days, for every round (apertus-70b's declared 32 000
+#: became 22 561 in round 157; in round 146 the agent, compacted at once, answered
+#: that the ticket was missing from its conversation).
+_KILO_WALL_RE = re.compile(r"compaction\s+exhausted", re.IGNORECASE)
+
 #: A request refused for its size, in whatever words the provider picked. The
 #: three spellings above are the ones Kilo and OpenAI-shaped gateways use; the
 #: rest of the providers each have their own (round 145's zai: ``Prompt exceeds
@@ -5247,9 +5263,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         refusal named a size, ``"inferred"`` when the session's fill did. An
         inferred reading names no size, so it never writes one to the memory —
         ``_remember_overflow`` takes the answer and skips — and it still counts
-        for the repeat guard.
+        for the repeat guard. Round 146: ``"wall"`` is Kilo's own ``Compaction
+        exhausted`` (`_KILO_WALL_RE`) — an overflow for the turn, in whatever
+        words it came, and the same for the memory: no size, so nothing written.
         """
         text = _error_texts(error)
+        kilo_wall = _KILO_WALL_RE.search(text) is not None
         if _OVERFLOW_RE.search(text) is not None:
             # The old path's verdict is unchanged; what changes is that it
             # records the size too, so a second overflow far below it is not
@@ -5260,9 +5279,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             except Exception:  # noqa: BLE001 — no read, no record
                 last_ok, grew = 0, 0
             overflows_seen.append(last_ok + (grew or 0))
-            _log.info("%s: %r at %s tokens — read as a context overflow", spec.name,
-                      _brief(_error_message(error)), f"{last_ok:,}")
-            return "words"
+            _log.info("%s: %r at %s tokens — read as a context overflow%s", spec.name,
+                      _brief(_error_message(error)), f"{last_ok:,}",
+                      " (Kilo's own wall: no size, not remembered)" if kilo_wall else "")
+            return "wall" if kilo_wall else "words"
         status = None
         data = error.get("data") if isinstance(error, dict) else None
         if isinstance(data, dict):
@@ -5326,7 +5346,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         overflows_seen.append(requested)
         _log.info("%s: %r at %s tokens %s", spec.name, _brief(_error_message(error)),
                   f"{last_ok:,}", how)
-        return "words" if worded else "inferred"
+        if not worded:
+            return "inferred"
+        return "wall" if kilo_wall else "words"
 
     def _remember_overflow(error, how="words") -> None:
         """KC-67: one line in the shared memory, for the next round.
@@ -5345,8 +5367,14 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         hands nothing to Kilo: the record would size the model for every agent
         of the next rounds from a number the provider never said. The compact
         and the continue still happen, and the guard still counts it.
+
+        Round 146: the same for ``"wall"`` — Kilo's own ``Compaction exhausted``
+        (`_KILO_WALL_RE`). It is the wall Kilo holds, declared or pushed from this
+        memory, speaking; its ``last_ok`` is where the session stood when Kilo
+        gave up, not a window, and a record of it lowers the wall the next agent
+        gets and so breeds the next one.
         """
-        if how == "inferred":
+        if how in ("inferred", "wall"):
             return
         try:
             limit, prompt = context_memory.parse_overflow(_error_message(error))

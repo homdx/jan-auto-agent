@@ -127,6 +127,41 @@ def _child_session(event: dict, parents) -> str | None:
     return None
 
 
+#: Round 146: Kilo doubles the delay of a retry it repeats on its own, so any
+#: error a provider keeps answering — a 400 that is never going to pass included
+#: — crosses `max_retry_wait` without the provider ever naming a time. The
+#: crossing is at most about twice the bound (the delay doubles, with jitter and
+#: a beat skipped now and then), so a delay past this many times the bound is a
+#: time the provider stated, whichever attempt it comes on.
+_BACKOFF_CROSSING_FACTOR = 4.0
+
+
+def _retry_past_the_bound(wait: float | None, attempt, named: bool,
+                          bound: float) -> str | None:
+    """Round 146: what a Kilo `retry` status is, against `max_retry_wait`.
+
+    ``None`` — a blip, the wait goes on. ``"quota"`` — a reset the provider
+    named: the *first* retry of a streak (Kilo resets ``attempt`` after every
+    success, and a daily quota ends at ``attempt: 1``, KC-64), a retry whose text
+    is a quota phrase, or a delay no doubling could have reached from the bound.
+    ``"backoff"`` — the same error repeated until Kilo's own backoff grew past the
+    bound: the provider has named nothing, so it is not a quota.
+
+    *wait* is seconds to the retry, ``None`` when Kilo gave no (numeric) time —
+    then only a quota phrase decides, as before. An ``attempt`` that is no
+    number counts as the first retry: today's verdict, fail-open.
+    """
+    if wait is None:
+        return "quota" if named else None
+    if wait <= bound:
+        return None
+    first = (not isinstance(attempt, int) or isinstance(attempt, bool)
+             or attempt <= 1)
+    if named or first or wait > _BACKOFF_CROSSING_FACTOR * bound:
+        return "quota"
+    return "backoff"
+
+
 def _is_busy(event: dict) -> bool:
     """KC-63: a sign the session started working on a prompt.
 
@@ -1625,6 +1660,13 @@ class KiloClient:
         the provider's text in ``data.message`` and ``next`` in ``data.retryAt``,
         and the session is aborted first: that is a quota reset until midnight,
         not a blip, and the silence clock must not be the thing that names it.
+        Round 146: that is the *first* retry of a streak, a retry whose text is a
+        quota phrase, or a delay past ``_BACKOFF_CROSSING_FACTOR`` times the
+        bound. A later retry that is past the bound without any of them is
+        Kilo's own doubling of an error it keeps repeating (round 146: a 400,
+        nine attempts, 519 s): the wait ends and the session is aborted just
+        the same, but as ``ProviderUnavailable`` with ``data.attempts`` — the
+        provider named no reset (`_retry_past_the_bound`).
         A retry inside the bound is only a beat, and a ``next`` that is missing
         or is not a number is judged by ``quota_re``, a compiled pattern over the
         provider's text. Both omitted — every pre-KC-61 caller — a
@@ -1861,8 +1903,12 @@ class KiloClient:
                     wait = (float(nxt) / 1000.0 - time.time()
                             if isinstance(nxt, (int, float))
                             and not isinstance(nxt, bool) else None)
-                    if (wait is not None and wait > float(max_retry_wait)) or \
-                            (wait is None and quota_re is not None and quota_re.search(message)):
+                    attempt = status.get("attempt")
+                    far = _retry_past_the_bound(
+                        wait, attempt,
+                        quota_re is not None and quota_re.search(message) is not None,
+                        float(max_retry_wait))
+                    if far == "quota":
                         # a quota reset, not a blip: stop Kilo's own
                         # sleep-and-retry and hand the provider's text back, so
                         # the round never waits for the silence clock to name it
@@ -1871,6 +1917,19 @@ class KiloClient:
                             status="error",
                             error={"name": "ProviderQuota",
                                    "data": {"message": message, "retryAt": nxt}},
+                            elapsed=elapsed, permissions=permissions,
+                            questions=questions, stale_skipped=stale)
+                    if far == "backoff":
+                        # round 146: the same error again and again, and Kilo's
+                        # own doubling took the next try past the bound. The
+                        # wait ends here as KC-61 always ended it — but the
+                        # provider named no reset, so the agent is not a quota:
+                        # `ProviderUnavailable`, with the attempt it came to.
+                        self._abort_quietly(session)
+                        return IdleResult(
+                            status="error",
+                            error={"name": "ProviderUnavailable",
+                                   "data": {"message": message, "attempts": attempt}},
                             elapsed=elapsed, permissions=permissions,
                             questions=questions, stale_skipped=stale)
             if etype == "session.status" and retries_limit:

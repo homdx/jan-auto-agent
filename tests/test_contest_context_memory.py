@@ -418,6 +418,77 @@ def test_an_overflow_that_names_no_limit_is_remembered_with_only_the_last_ok(tmp
     assert cm.size_of(record) == 110_000
 
 
+#: Round 146: Kilo's own end of a compaction that could not get a session under
+#: the wall Kilo holds. The provider named nothing; the number it would leave in
+#: the memory is only where the session stood when Kilo gave up.
+KILO_WALL_OVERFLOW = {
+    "name": "ContextOverflowError",
+    "data": {"message": "Compaction exhausted: context still exceeds model limits "
+                        "after 3 attempts"},
+}
+
+
+def test_kilo_s_compaction_exhausted_ends_the_turn_but_is_not_remembered(tmp_path, caplog):
+    """Round 146: apertus-70b's declared 32 000 became 22 561 out of one of these,
+    the next agent compacted at 80 % of it, and Kilo's wall came down with it.
+
+    The turn ends as every overflow does — the same STALLED, the same two turns
+    — and the memory gets nothing: no file at all, so no size for the next agent.
+    """
+    caplog.set_level("INFO", logger="tools.contest.runner")
+    memory = tmp_path / "context-memory.json"
+    scenario = _overflow_scenario(KILO_WALL_OVERFLOW, 22_561)
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                   max_continues_per_attempt=0)
+    assert run.state is tr.AgentState.STALLED
+    assert run.last_error == "context overflow"
+    assert [t["kind"] for t in run.turns] == ["initial", "rework"]
+
+    assert cm.load(memory) == []
+    assert not memory.exists()
+    assert cm.smallest_size(cm.load(memory), "kenary", "agent-a:free") is None
+    assert any("Kilo's own wall" in r.getMessage() for r in caplog.records)
+
+
+def test_a_compaction_exhausted_does_not_lower_a_size_already_remembered(tmp_path):
+    """The memory holds the provider's own 200 000; Kilo's wall adds nothing to it."""
+    memory = _memory(tmp_path)
+    before = cm.load(memory)
+    scenario = _overflow_scenario(KILO_WALL_OVERFLOW, 22_561)
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                   max_continues_per_attempt=0)
+    assert run.state is tr.AgentState.STALLED
+    assert cm.load(memory) == before
+    assert cm.smallest_size(cm.load(memory), "kenary", "agent-a:free") == SIZE
+
+
+def test_a_compaction_exhausted_under_another_name_is_not_remembered_either(tmp_path):
+    """The words decide, not the error's name: a gateway that wraps Kilo's text in
+    a plain 400 reads as an overflow by its size words — and writes nothing."""
+    memory = tmp_path / "context-memory.json"
+    error = {"name": "APIError", "data": {
+        "message": KILO_WALL_OVERFLOW["data"]["message"].lower(), "statusCode": 400}}
+    scenario = _overflow_scenario(error, 110_000)
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                   max_continues_per_attempt=0)
+    assert run.state is tr.AgentState.STALLED
+    assert run.last_error == "context overflow"
+    assert cm.load(memory) == []
+
+
+def test_the_providers_own_overflow_is_still_remembered_next_to_kilo_s_wall(tmp_path):
+    """The guard against a loop must not turn the memory off: KC-67's own cases
+    (the provider names the limit, or names nothing) are written as before."""
+    memory = tmp_path / "context-memory.json"
+    for n, (error, last_ok) in enumerate(((SENSENOVA_OVERFLOW, 260_000),
+                                          (KENARY_OVERFLOW, 110_000))):
+        sandbox = tmp_path / f"run{n}"      # one sandbox per run, one memory for both
+        sandbox.mkdir()
+        _run(sandbox, _overflow_scenario(error, last_ok), memory=memory,
+             max_continues_per_attempt=0)
+    assert [r.last_ok for r in cm.load(memory)] == [260_000, 110_000]
+
+
 def test_an_overflow_one_step_jumped_into_is_remembered_but_sizes_nothing(tmp_path):
     """KC-73's live runs: the last reply went through at 14 179 and asked for a
     pile of `read`s; their results (~134 000 tokens) overflowed a ~120 000

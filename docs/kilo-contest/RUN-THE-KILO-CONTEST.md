@@ -91,7 +91,7 @@ unknown key fails at load time with its name. Put local values in
 | `first_touch_sec` | 420 | no file touched this long → a nudge, then a fresh session, then `DEAD` |
 | `agent_max_sec` | 5400 | one agent's hard limit; at it the agent ends `STALLED`, its tree scored as it stands |
 | `max_error_retries`, `error_retry_max_backoff_sec` | 30, 60 | retryable provider errors in a row before `ERROR` |
-| `provider_retry_max_wait_sec`, `quota_patterns` | 300 | a reset further out than this, or a quota message, ends the agent `ERROR provider_quota` |
+| `provider_retry_max_wait_sec`, `quota_patterns` | 300 | a reset further out than this on the first retry of a streak, a quota message, or a delay past four times this, ends the agent `ERROR provider_quota`; a later retry that only Kilo's own doubling pushed past it ends it `ERROR provider_unavailable` |
 | `harvest_budget_sec`, `deadline_commit` | 900, true | the harvest's clock; uncommitted work at the deadline is committed for the agent |
 | `agent_suite_slots`, `pytest_workers_*` | 1, auto | how many agents run pytest at once, and with how many workers |
 | `tmp_roots`, `deny_commands`, `ask_commands` | | the policy: paths allowed outside the worktree, commands always refused, commands sent to the gate |
@@ -315,9 +315,28 @@ missing or unreadable. A Ctrl-C leaves the state saved (the runner aborts
 the sessions and re-raises after saving), so the resume is the continuation.
 A provider outage does not need one: retryable session errors are re-prompted
 in the same session within the round's own budgets (KC-19, KC-64), and a
-quota — a reset time further out than `provider_retry_max_wait_sec` — ends
-the agent `ERROR provider_quota` at once, with the reset time printed once
-per provider at the round's end.
+quota — a reset time further out than `provider_retry_max_wait_sec` on the
+first retry of a streak, or whose text is a quota phrase — ends the agent
+`ERROR provider_quota` at once, with the reset time printed once per
+provider at the round's end. A provider that keeps answering the same error
+(round 146: a 400, nine retries) reaches the bound by Kilo's own doubling of
+the delay; that names no reset, so it ends `ERROR provider_unavailable after
+N retries`, not a quota.
+
+**The context memory and Kilo's `Compaction exhausted`.** The memory
+(`contest-out/context-memory.json`, `context_memory_days`) keeps what a
+provider's own overflow said about a model's window. Kilo's own
+`ContextOverflowError: Compaction exhausted: context still exceeds model
+limits after 3 attempts` is the wall Kilo holds speaking — the declared window, or
+the one the runner pushed from this memory — and names no size: it ends the
+turn as any overflow does and writes nothing (round 146: seventeen such
+records had lowered apertus-70b-instruct's declared 32 000 to 22 561 and
+apertus-v1.5-70b-thinking's to 30 241). Records written before that fix stay
+until they age out; `scripts/purge_memory_wall_records.py` finds them (a
+record with no limit, prompt or output, and a `Compaction exhausted` of the
+same agent in its `events.jsonl` a minute before it) and, with `--apply`,
+drops them and keeps the old file. Run it with no round running, once per
+checkout.
 
 **Putting ended agents back to work: `scripts/revive_round.py`.** `--resume`
 restarts only the agents that were mid-flight. An agent that already ended

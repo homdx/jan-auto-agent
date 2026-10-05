@@ -397,6 +397,121 @@ def test_the_bound_fires_on_the_wall_clock_too(monkeypatch):
     assert res.error["data"]["retryAt"] == next_ms
 
 
+# ── round 146: Kilo's own backoff is not a quota ──────────────────────────────
+
+#: Shaped after round 146's apertus-8b-instruct (`retry` events 4..12 of its
+#: `events.jsonl`): one 400 repeated, `attempt` counting up, the seconds to the next
+#: try growing as Kilo's doubling grows them, the last one 519 s — past the 300 s bound.
+REJECTED = ("litellm.APIConnectionError: APIConnectionError: OpenAIException - "
+            "The request was rejected as invalid. Please check your request parameters.")
+BACKOFF_STREAK = ((1, 11), (2, 20), (3, 25), (4, 39), (5, 71), (6, 137), (7, 182),
+                  (8, 519))
+
+
+def _retry_event(clock, attempt, seconds, message=REJECTED):
+    """A `retry` status, `seconds` out on the fake wall clock, number `attempt`."""
+    event = _quota_event(next_ms=int((clock.wall + seconds) * 1000), message=message)
+    event["properties"]["status"]["attempt"] = attempt
+    return event
+
+
+def _streak(clock, streak=BACKOFF_STREAK, last_message=REJECTED):
+    events = [_busy()]
+    for n, (attempt, seconds) in enumerate(streak):
+        last = n == len(streak) - 1
+        events.append(_retry_event(clock, attempt, seconds,
+                                   last_message if last else REJECTED))
+    return events
+
+
+def test_a_repeated_error_that_only_kilo_s_backoff_pushed_past_the_bound_is_not_a_quota(
+        monkeypatch):
+    """The reproduction: a streak of one 400, the last retry 519 s away.
+
+    Before round 146 this was `ProviderQuota` — `provider_quota: … (retry at
+    17:39 UTC)` in `state.json` and `provider_quota: publicai × 2` in the
+    round's summary — though the provider had named no reset and no phrase of
+    `quota_patterns` is in the text. It ends the wait at the same moment and
+    aborts the same session, but as `ProviderUnavailable`.
+    """
+    clock = _Clock()
+    events = _streak(clock) + [_idle()]
+    client, res = _wait(monkeypatch, events, max_retry_wait=300.0,
+                        quota_re=_quota_re(_config_with_patterns()), wall=clock.wall)
+
+    assert res.status == "error"
+    assert res.error == {"name": "ProviderUnavailable",
+                         "data": {"message": REJECTED, "attempts": 8}}
+    assert client.aborts == ["ses_quota"]
+    assert res.elapsed < 5.0          # at the crossing, not at the idle after it
+
+
+def test_the_same_streak_with_a_quota_text_on_the_last_retry_is_still_a_quota(monkeypatch):
+    """The phrases decide on any attempt: a daily limit is not a blip on the ninth."""
+    clock = _Clock()
+    events = _streak(clock, last_message=QUOTA_MESSAGE)
+    client, res = _wait(monkeypatch, events, max_retry_wait=300.0,
+                        quota_re=_quota_re(_config_with_patterns()), wall=clock.wall)
+
+    assert res.status == "error"
+    assert res.error["name"] == "ProviderQuota"
+    assert res.error["data"]["message"] == QUOTA_MESSAGE
+    assert client.aborts == ["ses_quota"]
+
+
+def test_a_delay_no_doubling_could_reach_is_a_quota_on_any_attempt(monkeypatch):
+    """A provider that states its own reset hours out, after two ordinary retries."""
+    clock = _Clock()
+    events = [_busy(), _retry_event(clock, 1, 15), _retry_event(clock, 2, 30),
+              _retry_event(clock, 3, 14 * 3600, message=NOT_QUOTA_TEXTS[3])]
+    client, res = _wait(monkeypatch, events, max_retry_wait=300.0,
+                        quota_re=_quota_re(_config_with_patterns()), wall=clock.wall)
+
+    assert res.status == "error"
+    assert res.error["name"] == "ProviderQuota"
+    assert res.error["data"]["message"] == NOT_QUOTA_TEXTS[3]
+
+
+@pytest.mark.parametrize("attempt", [None, "9", True, 1.0, -3, 0])
+def test_an_attempt_that_is_no_attempt_number_keeps_today_s_verdict(monkeypatch, attempt):
+    """Fail-open: a status without a usable `attempt` is the first retry, as before."""
+    clock = _Clock()
+    event = _retry_event(clock, attempt, 519)
+    if attempt is None:
+        del event["properties"]["status"]["attempt"]
+    client, res = _wait(monkeypatch, [_busy(), event], max_retry_wait=300.0,
+                        quota_re=_quota_re(_config_with_patterns()), wall=clock.wall)
+
+    assert res.status == "error"
+    assert res.error["name"] == "ProviderQuota"
+
+
+def test_a_streak_that_stays_inside_the_bound_goes_on(monkeypatch):
+    """The first seven retries of the streak are blips: the wait survives them."""
+    clock = _Clock()
+    events = _streak(clock, BACKOFF_STREAK[:7]) + [_idle()]
+    client, res = _wait(monkeypatch, events, max_retry_wait=300.0,
+                        quota_re=_quota_re(_config_with_patterns()), wall=clock.wall)
+
+    assert res.status == "idle", res
+    assert client.aborts == []
+
+
+@pytest.mark.parametrize("wait, attempt, named, want", [
+    (None, 1, False, None),             # no time and no phrase: a beat
+    (None, 5, True, "quota"),           # no time, a phrase: the phrase decides
+    (300.0, 9, False, None),            # on the bound is inside it
+    (301.0, 1, False, "quota"),         # the first retry: the provider named it
+    (301.0, 2, False, "backoff"),       # a later one, only Kilo's doubling
+    (301.0, 2, True, "quota"),          # … unless the text is a quota
+    (1200.0, 9, False, "backoff"),      # four times the bound is still doubling
+    (1200.5, 9, False, "quota"),        # past that, no doubling reaches it
+    (20.0, 9, True, None),              # inside the bound the bound decides first
+])
+def test_the_verdict_on_a_retry_against_the_bound(wait, attempt, named, want):
+    assert kc._retry_past_the_bound(wait, attempt, named, 300.0) == want
+
+
 # ── the phrases: these are quotas, those are not ──────────────────────────────
 
 @pytest.mark.parametrize("text", QUOTA_TEXTS)
