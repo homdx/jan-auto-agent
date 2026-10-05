@@ -1,6 +1,6 @@
 # 184 — `test_run_tests_detail_ends_the_suite_at_the_harvest_budget` needs a nested pytest to reach its slow test inside 3.0 s: it fails when the box is busy
 
-**Status:** queued
+**Status:** landed
 **Severity:** MEDIUM
 **File:** tests/test_contest_harvest.py
 **Symbol:** test_run_tests_detail_ends_the_suite_at_the_harvest_budget
