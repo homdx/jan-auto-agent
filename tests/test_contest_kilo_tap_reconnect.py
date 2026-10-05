@@ -706,3 +706,109 @@ def test_a_reconnect_that_publishes_into_an_interrupt_leaves_no_thread(tmp_path,
         assert not worker.is_alive()
         assert not backend._tap._thread.is_alive(), "the new tap still reads after the return"
         backend.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# C. round 161: any reconnect failure after a 200 is a reconnect failure
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _breaks_once(monkeypatch, name: str, message: str) -> None:
+    """`EventTap.<name>` raises *message* on its first call, then runs as before
+    — the backend's `close()` at the end of the test still stops its taps."""
+    real = getattr(EventTap, name)
+    calls = {"n": 0}
+
+    def breaks(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError(message)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(EventTap, name, breaks)
+
+
+@pytest.mark.parametrize("name", ["join", "stop"])
+def test_a_reconnect_that_breaks_outside_the_start_is_a_reconnect_failure(
+        tmp_path, monkeypatch, name):
+    """The old tap's `join()` or `stop()` raising after the PATCH answered 200:
+    `KiloTapReconnectError` with the original error chained, one PATCH, and the
+    published tap's next `tap.closed` wait wakes at once instead of sitting out
+    its silence clock — the reconnect's own wait had consumed the first one."""
+    ws = _repo(tmp_path / "ws")
+    with FakeKiloServer() as fake:
+        backend = _backend(fake, str(ws), str(tmp_path / "out" / "events.jsonl"))
+        old_tap = backend._tap
+        _breaks_once(monkeypatch, name, f"{name} broke")
+
+        with pytest.raises(KiloTapReconnectError, match=f"{name} broke") as caught:
+            backend.set_model_limit("kenary", "agent-a:free", PUSHED_LIMIT)
+
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert len(fake.calls("PATCH")) == 1, "the patch did land: only the stream is broken"
+        assert backend._tap is old_tap, "nothing new was published"
+        started = time.monotonic()
+        assert backend._tap.wait(lambda e: e.get("type") == "tap.closed", 5.0) is not None
+        assert time.monotonic() - started < 1.0, "the next wait sat out its clock"
+        backend.close()
+
+
+def test_a_published_tap_gets_no_second_end(tmp_path, monkeypatch):
+    """A failure after the new tap was swapped in (here: its join after an
+    interrupt) is still a reconnect failure, but the live tap is left without a
+    synthetic `tap.closed` of ours."""
+    ws = _repo(tmp_path / "ws")
+    with FakeKiloServer() as fake:
+        backend = _backend(fake, str(ws), str(tmp_path / "out" / "events.jsonl"))
+        old_tap = backend._tap
+        swapped = []
+
+        def publish_then_break(settle=5.0):
+            backend._tap = EventTap(*backend._tap_args).start()
+            swapped.append(backend._tap)
+            raise RuntimeError("after the swap")
+
+        monkeypatch.setattr(backend, "_reconnect_tap", publish_then_break)
+        with pytest.raises(KiloTapReconnectError, match="after the swap"):
+            backend.set_model_limit("kenary", "agent-a:free", PUSHED_LIMIT)
+        (new_tap,) = swapped
+        assert backend._tap is new_tap and new_tap is not old_tap
+        assert not [e for e in new_tap.events
+                    if e["type"] == "tap.closed" and "reopened" in
+                    str((e.get("properties") or {}).get("error"))]
+        old_tap.stop()
+        backend.close()
+
+
+def test_the_runner_reads_a_raw_reconnect_error_as_a_window_that_went_over(
+        tmp_path, monkeypatch, caplog):
+    """Through the runner: a raw error out of the reconnect is logged as "went to
+    Kilo but its event stream was not reopened", never as a window not handed
+    over, and the next prompt sends no second PATCH.
+
+    The error is raised after the real reconnect has published its new tap, so
+    the rest of the run is still heard: a failure that leaves the old tap
+    published leaves no stream at all, and the turn after it could only end on
+    the runner's silence clock — the backend tests above cover that tap."""
+    caplog.set_level(logging.WARNING, logger="tools.contest.runner")
+    real = KiloBackend._reconnect_tap
+
+    def reconnects_then_breaks(self, settle=5.0):
+        real(self, settle)
+        raise RuntimeError("join broke")
+
+    monkeypatch.setattr(KiloBackend, "_reconnect_tap", reconnects_then_breaks)
+    memory = tow._remembered(tmp_path)
+    scenario = {"turns": [
+        {"events": ["busy", "idle"]},
+        {"on_prompt": tr.work_ready, "events": ["busy", "idle"]},
+    ]}
+    config = tow._declared(ctm._config(tmp_path, memory=memory))
+    sb, fake, _harness, run, _aborted = tr._run_one(tmp_path, scenario, config)
+    tr._assert_ready(run, sb.ws("agent-a"))
+
+    assert len(run.turns) >= 2, "the run had a second prompt"
+    assert len(tow._patches(fake)) == 1, "the window is not re-sent at the next prompt"
+    lines = [record.getMessage() for record in caplog.records]
+    assert any("went to Kilo but its event stream was not reopened" in line
+               and "join broke" in line for line in lines), lines
+    assert not any("was not handed to Kilo" in line for line in lines), lines

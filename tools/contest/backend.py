@@ -796,10 +796,11 @@ class KiloBackend:
         caller has to remember with its watch still armed.
 
         Raises `ContestBackendError`, the tracked case as
-        `KiloLimitRefused`, the reconnect case as `KiloTapReconnectError`, the
-        read-back case as `KiloLimitKept`; the caller logs and goes on, with
-        its watch still armed — or remembered as pushed, in the one case that
-        is this round's stream and not its window."""
+        `KiloLimitRefused`, the reconnect case — any failure of it, round
+        161 — as `KiloTapReconnectError`, the read-back case as
+        `KiloLimitKept`; the caller logs and goes on, with its watch still
+        armed — or remembered as pushed, in the one case that is this round's
+        stream and not its window."""
         tracked = tracked_kilo_files(self._directory)
         if tracked:
             shown = ", ".join(tracked[:3]) + (" …" if len(tracked) > 3 else "")
@@ -818,8 +819,46 @@ class KiloBackend:
         # stream of it is left to fix, and it comes back as
         # `KiloTapReconnectError` — never as the plain error a caller would
         # read as "the window was not handed over"
-        self._reconnect_tap()
+        with self._tap_lock:
+            before = self._tap
+        try:
+            self._reconnect_tap()
+        except KiloTapReconnectError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — round 161: the window went over
+            self._give_up_stale_tap(before, exc)
+            raise KiloTapReconnectError(
+                f"the event stream for {self._directory} could not be reopened after "
+                f"the config reload: {exc}") from exc
         self._readback_limit(provider_id, model_id, limit)
+
+    def _give_up_stale_tap(self, before: EventTap, error: Exception) -> None:
+        """Round 161: a reconnect that broke anywhere but `_start_tap`.
+
+        `_start_tap` wraps its own failure, but the old tap's `stop()` or
+        `join()` raising (or anything else between the reload and the swap)
+        came out of `set_model_limit` raw: the runner read it as a window that
+        never went over, re-sent the PATCH — and reloaded Kilo — every turn, and
+        the next wait sat out its silence clock, because the reconnect's first
+        wait had consumed the old tap's one ``tap.closed``. When nothing new was
+        published the old tap is stopped best-effort and that end recorded
+        again, as 160 does for the double start failure; a tap already swapped
+        in is live and gets no second ``tap.closed``. Never raises.
+        """
+        with self._tap_lock:
+            if self._tap is not before:
+                return
+        try:
+            before.stop()
+        except Exception:  # noqa: BLE001 — the tap is given up either way
+            pass
+        try:
+            # memory only: the next caller's wait on it wakes at once
+            before._close_with("the event stream could not be reopened after the "
+                               f"config reload: {error}")
+        except Exception:  # noqa: BLE001
+            _LOG.warning("%s: the old event tap could not record its end — the "
+                         "next wait on it runs to its silence clock", self._directory)
 
     def _readback_limit(self, provider_id: str, model_id: str, limit: dict) -> None:
         """Round 153: prove the push took, by reading the model back.

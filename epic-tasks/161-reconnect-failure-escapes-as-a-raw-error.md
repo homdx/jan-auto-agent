@@ -1,6 +1,6 @@
 # 161 — after a 200 `PATCH /config`, a reconnect failure that is not a start escapes `set_model_limit` raw: the runner re-sends the window every turn, and the next wait sits out its silence clock
 
-**Status:** queued
+**Status:** landed
 **Severity:** MEDIUM
 **File:** tools/contest/backend.py
 **Symbol:** KiloBackend.set_model_limit, KiloBackend._reconnect_tap
@@ -59,3 +59,6 @@ python3 -m pytest tests/test_contest_kilo_tap_reconnect.py contest-bench/151/acc
 ```bash
 python3 -m pytest tests -n 8 -q
 ```
+
+**Landed:** the patch `161-reconnect-failure-escapes-raw.patch` as it came: `set_model_limit` keeps the old tap in hand, and any failure of `_reconnect_tap` that is not already a `KiloTapReconnectError` becomes one (`from exc`); `_give_up_stale_tap` stops the old tap best-effort and records `tap.closed` again when nothing new was published, and does nothing to a tap already swapped in. Its four tests (`join` and `stop` raising, a published tap getting no second end, the runner's log line and a single PATCH) fail on the base and pass here.
+Bench 151, named in the acceptance above, was red on arena before this ticket (the same nine cases on 00286a6, with or without the patch): since 153 the backend reads the window back, and the bench pushed for `m:free`, which the fake's offer does not list, and its stub client had no `model_limits`. Fixed in the bench (the model id the fake offers, a stub that answers with the last push): 28/28.
