@@ -474,12 +474,21 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
         data = json.loads(r.read())
     if isinstance(data, list):
         models = data
-    else:
+    elif isinstance(data, dict):
         models = data.get("text") or data.get("data") or data.get("models") or []
+    else:
+        models = None
+    # Bug 188: a reply of another shape (`null`, `"ok"`, `{"text": "Unauthorized"}`)
+    # is no model list — a ValueError the callers report, not an AttributeError
+    # traceback, nor a string iterated into one-letter "models".
+    if not isinstance(models, list):
+        raise ValueError(f"/models reply is not a model list: {str(data)[:80]!r}")
     rows = []
     for m in models:
         if isinstance(m, str):
             m = {"id": m}
+        if not isinstance(m, dict):
+            continue
         mid = m.get("id") or m.get("name") or ""
         if not mid:
             continue
