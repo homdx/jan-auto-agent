@@ -304,16 +304,16 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
     """
     print(output.scrub(" ".join(line)), flush=True)
     lock = repo / ".arena" / "locks" / f"{nn}.pid"
+    lock_tmp = repo / ".arena" / "locks" / f"{nn}.pid.tmp"
     lock.parent.mkdir(parents=True, exist_ok=True)
     if started is None:
         # one second of slack: some filesystems keep mtimes in whole seconds
         started = time.time() - 1
+    lock.write_text(str(os.getpid()), encoding="utf-8")
     try:
         child = SPAWN(line, cwd=str(repo))
-    except OSError as err:
-        return output.refuse(f"cannot start the runner: {err}")
-    try:
-        lock.write_text(f"{child.pid}\n", encoding="utf-8")
+        lock_tmp.write_text(f"{child.pid}\n", encoding="utf-8")
+        os.replace(lock_tmp, lock)
         while True:
             try:
                 code = child.wait()
@@ -321,6 +321,9 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
             except KeyboardInterrupt:
                 # Ctrl-C reached the child too (same process group): wait it out
                 continue
+    except OSError as err:
+        lock.unlink(missing_ok=True)
+        return output.refuse(f"cannot start the runner: {err}")
     finally:
         lock.unlink(missing_ok=True)
     return _map_exit(code, state, started)
