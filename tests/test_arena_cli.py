@@ -160,6 +160,19 @@ def test_scrub_hides_apikey_and_passwd_values_too():
     assert "monkey=banana tokens=12" in s
 
 
+def test_scrub_hides_a_url_password_that_holds_an_at_sign():
+    """171: userinfo runs to the last `@` before the path, so no tail of the password is left."""
+    assert output.scrub("postgres://user:p@ss@host/db") == "postgres://***@host/db"
+    assert output.scrub("https://u:p%40ss@h/x") == "https://***@h/x"
+    assert output.scrub("see https://u:p@ss@h:8080/v1?x=1 now") == "see https://***@h:8080/v1?x=1 now"
+
+
+def test_scrub_leaves_an_at_sign_after_the_host_alone():
+    assert output.scrub("https://x.com/a@b") == "https://x.com/a@b"
+    assert output.scrub("https://x.com?mail=a@b.c") == "https://x.com?mail=a@b.c"
+    assert output.scrub("mailto:a@b.c") == "mailto:a@b.c"
+
+
 def test_launcher_is_executable_and_runs_from_another_cwd(tmp_path):
     launcher = REPO_ROOT / "arena"
     assert launcher.stat().st_mode & stat.S_IXUSR

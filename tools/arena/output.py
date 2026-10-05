@@ -28,15 +28,31 @@ SECRET_WORDS = frozenset({"key", "apikey", "token", "secret", "password", "passw
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _SEPARATORS = re.compile(r"[_\-.]+")
 
-# `scheme://user:pass@host` — the whole userinfo part goes, user included.
-_URL_USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)[^/@\s]+@")
+# `scheme://user:pass@host` — the whole userinfo part goes, user included, up to
+# the LAST `@` before the path: a password may hold an unencoded `@` (bug 171).
+# Bug 170: the scheme starts only where a scheme-character run starts — without
+# the look-behind every position of a long word was a new start, O(n²). The
+# userinfo class stops at `/`, `?`, `#` and whitespace, so a run is bounded by
+# the next `/` and the greedy match backtracks inside it only.
+_URL_USERINFO = re.compile(
+    r"(?<![A-Za-z0-9+.\-])(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s]+@")
 # `api_key=…`, `token=…` in a query string or a form-style line. The value runs
 # to the next separator, so `&x=1` after it survives. `apikey` and `passwd` are
 # here too, so a value `mask` hides by its key cannot leak by its text.
-_KV_SECRET = re.compile(
-    r"(?P<k>\b(?:api_?key|key|token|secret|passw(?:or)?d)=)[^&\s;,]+",
-    re.IGNORECASE,
-)
+# Bug 169: the secret word may be the last `_`/`-`/`.` part of a longer name
+# (`OPENAI_API_KEY=`, `access_token=`) — `\b` alone never fires after a `_`.
+# One flat character class for the name (no nested repetition: a long line is
+# linear, never a backtracking stall); `_kv_sub` then checks the name *ends* in
+# a secret word, so `monkey=` and `tokens=` stay as they are.
+_KV_PAIR = re.compile(r"(?<![A-Za-z0-9_.\-])(?P<k>[A-Za-z0-9_.\-]+=)(?P<v>[^&\s;,]+)")
+_KV_SECRET_LAST = frozenset({"key", "apikey", "token", "secret", "password", "passwd"})
+
+
+def _kv_sub(match: "re.Match[str]") -> str:
+    parts = _words(match.group("k")[:-1])  # `_`/`-`/`.` and camelCase: `accessToken=` too
+    if parts and parts[-1] in _KV_SECRET_LAST:
+        return match.group("k") + MASK
+    return match.group(0)
 
 
 def _words(key: str) -> list[str]:
@@ -68,7 +84,7 @@ def mask(mapping: Any) -> Any:
 def scrub(text: str) -> str:
     """Return *text* with URL credentials and `secret=value` pairs replaced by `***`."""
     text = _URL_USERINFO.sub(lambda m: m.group("scheme") + MASK + "@", text)
-    return _KV_SECRET.sub(lambda m: m.group("k") + MASK, text)
+    return _KV_PAIR.sub(_kv_sub, text)
 
 
 def _scrub_all(value: Any) -> Any:
