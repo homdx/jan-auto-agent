@@ -317,11 +317,21 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
     if started is None:
         # one second of slack: some filesystems keep mtimes in whole seconds
         started = time.time() - 1
-    lock.write_text(str(os.getpid()), encoding="utf-8")
     try:
-        child = SPAWN(line, cwd=str(repo))
-        lock_tmp.write_text(f"{child.pid}\n", encoding="utf-8")
-        os.replace(lock_tmp, lock)
+        try:
+            lock.write_text(str(os.getpid()), encoding="utf-8")
+            child = SPAWN(line, cwd=str(repo))
+        except OSError as err:
+            return output.refuse(f"cannot start the runner: {err}")
+        # Bug 181: the runner is up from here on. A failed swap to its pid keeps
+        # arena's own pid in the lock and still waits the child out — never
+        # "cannot start" over a running, unlocked runner. An exception that is
+        # no OSError (from SPAWN too) leaves through the `finally`, lock gone (157).
+        try:
+            lock_tmp.write_text(f"{child.pid}\n", encoding="utf-8")
+            os.replace(lock_tmp, lock)
+        except OSError:
+            lock_tmp.unlink(missing_ok=True)
         while True:
             try:
                 code = child.wait()
@@ -329,9 +339,6 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
             except KeyboardInterrupt:
                 # Ctrl-C reached the child too (same process group): wait it out
                 continue
-    except OSError as err:
-        lock.unlink(missing_ok=True)
-        return output.refuse(f"cannot start the runner: {err}")
     finally:
         lock.unlink(missing_ok=True)
     return _map_exit(code, state, started, written)
