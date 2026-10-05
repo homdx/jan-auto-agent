@@ -1,6 +1,6 @@
 # 158 — the judge runs every entry's own tests against every other entry's code and prints the matrix
 
-**Status:** open
+**Status:** landed
 **Severity:** MEDIUM
 **File:** scripts/judge_epic_round.py
 **Symbol:** (new) cross_tests
@@ -46,3 +46,7 @@ python3 -m pytest tests/test_judge_cross_tests.py -q
 ```bash
 python3 -m pytest tests -n 8 -q
 ```
+
+**Landed:** ddc7de0 (round 158; the skeleton is `sensenova-6-7-flash-lite-var1`, an ERROR entry whose worktree held the whole diff, with the tests of the other entries, the docs of sn68-var2 and the fixes the bench and two runs of the tool on real trees found: the commit message lists them). `python3 scripts/judge_epic_round.py --round NN --base <sha> --runs <wt dir> --cross [--ideal REF] [--jobs N] [--cell-timeout SEC] [--cross-out DIR]`: the score table first, then the matrix; `cross.json` and `cross.md` in `contest-out/NN/` (zero-padded like the runner's folder); a worktree named `base` or `ideal` is that column; `setup_worktrees.py --ideal REF` makes the `ideal` worktree. `docs/kilo-contest/RUN-THE-KILO-CONTEST.md`, "Judging a finished round", is the operator's page.
+
+Divergences from the ticket text, on purpose: `api` is every `TypeError`, not only the signature ones (the ticket's list names the exception, and a call with another implementation's argument shape raises `'int' object is not iterable`); the cell's own TMPDIR and a `judgecell-` scratch name (a test of another entry that sweeps `<tmp>/xcross-*` took the scratch of the cells beside it under `--jobs`); a cell with no verdict at all runs once more; one `[k/n]` line per cell; a **Leads** block between the matrix and the failures (every `behaviour` failure, and every test the base fails that some code passes and other code fails — the class `base` alone hid who did the work). Bench `contest-bench/158/acceptance_158.py`: 16 cases through the CLI on a synthetic repo.
