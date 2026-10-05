@@ -1,6 +1,6 @@
 # 157 — `arena run start/rerun`: the round's lock file is written after the runner child has started
 
-**Status:** open
+**Status:** landed
 **Severity:** MEDIUM
 **File:** tools/arena/rounds.py
 **Symbol:** _run_child
@@ -43,3 +43,5 @@ python3 -m pytest tests/test_arena_run_start.py tests/test_arena_run_rerun.py -q
 ```bash
 python3 -m pytest tests_bugfix -n 8 -q
 ```
+
+**Landed:** 2895a4d (glm-4.7-flash as-is, round 157). The lock is created before SPAWN with the parent pid and atomically replaced by the child pid; a SPAWN that raises removes it. Bench `contest-bench/157/acceptance_157.py` 10 cases.

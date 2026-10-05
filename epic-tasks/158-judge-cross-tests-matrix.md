@@ -1,6 +1,6 @@
 # 158 — the judge runs every entry's own tests against every other entry's code and prints the matrix
 
-**Status:** queued
+**Status:** open
 **Severity:** MEDIUM
 **File:** scripts/judge_epic_round.py
 **Symbol:** (new) cross_tests
