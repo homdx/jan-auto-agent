@@ -434,8 +434,13 @@ def human_duration(seconds: float) -> str:
     """Format *seconds* as a compact human-readable duration.
 
     Examples: 0.4 -> '0.4s', 42 -> '42s', 125 -> '2m 5s', 3725 -> '1h 2m 5s',
-    90061 -> '1d 1h 1m 1s'. Negative values get a leading '-'.
+    90061 -> '1d 1h 1m 1s'. Negative values get a leading '-'. A value that
+    is not a finite number has no duration to spell out, so it is echoed as
+    'nan', 'inf' or '-inf' (``int()`` of those raises) — a log line that
+    formats a bad clock reading must not itself crash.
     """
+    if seconds != seconds or abs(seconds) == float("inf"):
+        return str(float(seconds))
     sign = "-" if seconds < 0 else ""
     s = abs(float(seconds))
     if s < 1:
