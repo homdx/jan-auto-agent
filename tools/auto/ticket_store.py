@@ -252,7 +252,14 @@ class TicketStore:
         # documented Raises: (TicketSchemaError, TicketAlreadyExists),
         # inconsistent with the _ensure_dir() conversion right above it.
         try:
-            self._write(path, ticket)
+            # exclusive: the exists() check above is only a fast path — two
+            # racing creates of one id both pass it, and a plain replace let
+            # the second silently overwrite the first.
+            self._write(path, ticket, exclusive=True)
+        except FileExistsError as exc:
+            raise TicketAlreadyExists(
+                f"Ticket '{ticket['id']}' already exists at {path}"
+            ) from exc
         except OSError as exc:
             raise TicketError(
                 f"Could not write ticket '{ticket['id']}' to {path}: {exc}"
@@ -578,10 +585,11 @@ class TicketStore:
         return json.loads(path.read_text(encoding="utf-8"))
 
     @staticmethod
-    def _write(path: Path, ticket: dict) -> None:
+    def _write(path: Path, ticket: dict, *, exclusive: bool = False) -> None:
         atomic_write_text(
             path,
             json.dumps(ticket, indent=2, ensure_ascii=False),
+            exclusive=exclusive,
         )
 
 

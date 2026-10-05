@@ -161,7 +161,7 @@ def fsync_directory(directory: "str | Path") -> None:
         )
 
 
-def atomic_write_text(path: "str | Path", content: str) -> None:
+def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = False) -> None:
     """Write *content* to *path* atomically (temp file + ``os.replace``).
 
     ``os.replace`` is a single filesystem rename, which POSIX and Windows both
@@ -173,6 +173,12 @@ def atomic_write_text(path: "str | Path", content: str) -> None:
 
     Used for state that must survive an interrupted run (plan.json,
     progress.json, tickets) so a mid-write kill can never corrupt it.
+
+    ``exclusive=True`` makes it a create-only write: the temp file is
+    hard-linked into place (``os.link`` fails if *path* exists), so of two
+    racing writers exactly one wins and the other gets ``FileExistsError``
+    instead of silently replacing the winner's file. A filesystem without
+    hard links falls back to the plain replace.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,7 +190,17 @@ def atomic_write_text(path: "str | Path", content: str) -> None:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_name, path)
+        if exclusive:
+            try:
+                os.link(tmp_name, path)
+            except FileExistsError:
+                raise
+            except OSError:
+                os.replace(tmp_name, path)
+            else:
+                os.unlink(tmp_name)
+        else:
+            os.replace(tmp_name, path)
         fsync_directory(path.parent)
     except BaseException:
         try:
