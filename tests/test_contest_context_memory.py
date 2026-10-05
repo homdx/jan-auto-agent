@@ -526,13 +526,11 @@ def test_a_memory_the_runner_cannot_write_ends_the_overflow_the_way_it_does_toda
     and the failure is a warning, not a raise into the round."""
     caplog.set_level("WARNING", logger="tools.contest.runner")
     memory = tmp_path / "read-only" / "context-memory.json"
-    memory.parent.mkdir()
-    memory.parent.chmod(0o500)
-    try:
-        _sb, _fake, _h, run, _ = _run(tmp_path, _overflow_scenario(SENSENOVA_OVERFLOW, 260_000),
-                                       memory=memory, max_continues_per_attempt=0)
-    finally:
-        memory.parent.chmod(0o755)
+    # a FILE where the folder should be: the write fails for every user — a
+    # chmod 0o500 folder is writable for root, which is who a container runs as
+    memory.parent.write_text("not a folder", encoding="utf-8")
+    _sb, _fake, _h, run, _ = _run(tmp_path, _overflow_scenario(SENSENOVA_OVERFLOW, 260_000),
+                                   memory=memory, max_continues_per_attempt=0)
     assert run.state is tr.AgentState.STALLED
     assert run.last_error == "context overflow"
     assert any("context memory" in record.message for record in caplog.records)

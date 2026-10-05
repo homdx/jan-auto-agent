@@ -952,6 +952,8 @@ def test_the_find_free_line_goes_out_at_intake(monkeypatch, tmp_path, capsys):
     root = _store_proc(tmp_path / "proc")
     monkeypatch.setattr(model_check, "_PROC_ROOT", str(root))
     monkeypatch.setattr(model_check, "find_free", lambda *a, **kw: 0)
+    # no Kilo is run here, but `main` looks for the binary first: stand one in
+    monkeypatch.setattr(model_check, "find_kilo", lambda explicit: "/bin/kilo")
     monkeypatch.setattr(sys, "argv", ["py_model_test.py", "--find-free", "openrouter"])
 
     assert model_check.main() == 0
