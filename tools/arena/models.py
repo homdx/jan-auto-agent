@@ -435,14 +435,19 @@ def resolve_names(repo: Path, entries: list[str],
     return entries
 
 
-def _resolve_records(repo: Path, entries: list[str], now: Optional[float]) -> list[dict]:
-    """`resolve_names`'s work; answers the records the names were checked against."""
+def _check_shape(entries: list[str]) -> None:
+    """The refusals that need no Kilo: a bad `@variant`, an empty or spaced name."""
     for entry in entries:
         variant = entry.partition("@")[2]
         if "@" in entry and not _VARIANT_RE.fullmatch(variant):
             raise ModelError(f"{entry!r} has a bad variant (letters, digits, _ . - only)")
         if not base_of(entry) or re.search(r"\s", entry):
             raise ModelError(f"{entry!r} is not a model (arena model available --search ...)")
+
+
+def _resolve_records(repo: Path, entries: list[str], now: Optional[float]) -> list[dict]:
+    """`resolve_names`'s work; answers the records the names were checked against."""
+    _check_shape(entries)
     cache = model_cache(repo)
     records = cache.load(now)
     known = {r["model"] for r in records} | {f"{r['provider']}/{r['model']}" for r in records}
@@ -506,11 +511,18 @@ def _with_key(text: str, name: str, key: str, value: Optional[str]) -> str:
     pattern = re.compile(r"^" + re.escape(key) + r"\s*[=:]", re.IGNORECASE)
     at = next((i for i in range(start + 1, end) if pattern.match(lines[i])), None)
     if at is not None:
+        # an indented line under the key is the rest of its value — as configparser
+        # reads it: a blank or comment line between two indented lines does not end
+        # the value (`empty_lines_in_values`), so the scan looks past them and stops
+        # only at an unindented line; trailing blanks and comments stay (bug 167)
         stop = at + 1
-        # an indented line under the key is the rest of its value
-        while stop < end and lines[stop].strip() and lines[stop][0] in " \t" \
-                and not lines[stop].lstrip().startswith(("#", ";")):
-            stop += 1
+        for i in range(at + 1, end):
+            line = lines[i]
+            if not line.strip() or line.lstrip().startswith(("#", ";")):
+                continue
+            if line[0] not in " \t":
+                break
+            stop = i + 1
         lines[at:stop] = new_lines
     elif value is not None:
         last = start
@@ -1078,11 +1090,15 @@ def drop(repo: Path, args: argparse.Namespace) -> int:
         if name not in profiles:
             known = ", ".join(sorted(profiles)) or "none"
             raise ModelError(f"unknown profile {name!r} (known: {known})")
-        resolve_names(repo, entries)
+        _check_shape(entries)
         current = split_names(profiles[name].get("models", ""))
         gone = {base_of(e) for e in entries}
         for entry in entries:
             if base_of(entry) not in {base_of(c) for c in current}:
+                # a name the profile lacks gets `use`'s typo hint; a name it holds
+                # is dropped without asking Kilo — a retired model is no longer
+                # listed, and it is the one an operator most wants out
+                resolve_names(repo, [entry])
                 raise ModelError(
                     f"profile {name!r} has no {base_of(entry)!r} "
                     f"(its models: {', '.join(current) or 'none'})"

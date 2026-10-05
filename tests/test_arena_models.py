@@ -305,6 +305,32 @@ def test_drop_every_model_is_refused_and_the_file_is_unchanged(repo, kilo, capsy
     assert local.read_bytes() == before
 
 
+def test_drop_removes_a_model_kilo_no_longer_lists_without_calling_kilo(repo, kilo, capsys):
+    """168: a retired model is in the profile and not in Kilo's list; `drop` takes it out."""
+    kilo.listing = SMALL
+    local = profile_with(repo, "old:free,a:free")
+    code, _, _ = run(["-p", "p1", "model", "drop", "old:free", "-y"], capsys)
+    assert code == 0
+    assert local.read_text() == "[arena.profile.p1]\nmodels = a:free\n"
+    assert kilo.calls == []
+
+
+def test_drop_of_a_profile_name_works_when_kilo_is_unreachable(repo, kilo, capsys):
+    """168: `KiloError` from the list is no reason to keep a name the profile holds."""
+    kilo.error = models.KiloError("no kilo binary found")
+    local = profile_with(repo, "old:free,a:free")
+    assert run(["-p", "p1", "model", "drop", "old:free", "-y"], capsys)[0] == 0
+    assert local.read_text() == "[arena.profile.p1]\nmodels = a:free\n"
+
+
+def test_drop_still_refuses_a_bad_variant_without_calling_kilo(repo, kilo, capsys):
+    local = profile_with(repo, "a:free,b-free")
+    before = local.read_bytes()
+    code, _, err = run(["-p", "p1", "model", "drop", "a:free@bad!", "-y"], capsys)
+    assert code == 2 and "bad variant" in err
+    assert local.read_bytes() == before and kilo.calls == []
+
+
 def test_drop_with_no_ini_names_the_missing_profile(repo, kilo, capsys):
     code, _, err = run(["model", "drop", "a:free", "-y"], capsys)
     assert code == 2 and "'default'" in err and len(err.splitlines()) == 1
