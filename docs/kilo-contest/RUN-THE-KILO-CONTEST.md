@@ -552,6 +552,75 @@ scoring side of the record is `contest-bench/README.md`: the same input
 data fed to every entry, ranked by what came out, against a fake provider,
 never a live one.
 
+### Judging a finished round: the score table, then the cross phase
+
+Round 158. When every agent is in a terminal state and the models have written
+their tests, the judge is one command with two stages, in this order.
+
+```bash
+python3 contest-bench/harness/setup_worktrees.py <out>/entrants.json --wt <out>/wt --ideal <ref>
+```
+
+```bash
+python3 scripts/judge_epic_round.py --round NN --base <sha> --runs <out>/wt --cross --ideal <ref>
+```
+
+1. **The score table**, as before: one row per worktree (gate, commits, files,
+   `+/-`, test files and functions, off-ticket files, pushed, sha). It is printed
+   first, so a round with a failing hard gate is read before anything else runs.
+2. **The cross phase**, after it, only with `--cross`. Rows are *whose tests*: every
+   entry that added or changed a file under `tests/` (the names `git diff` reports
+   for `tests/` against the base; an entry that touched nothing there is a column
+   and no row).
+   Columns are *whose code*: every entry, the base, and with `--ideal REF` the
+   candidate ideal. A cell is `passed/total` of that entry's own changed test
+   files run on that code, and under the matrix every failing test is named with
+   its first `E ` line and one class:
+
+   - `api` — an ImportError, AttributeError or a signature `TypeError`: the test
+     names something only its author's code has. A different implementation, not
+     a bug (a test module that cannot be imported at all is this, too).
+   - `base` — the same test also fails on the base: the author asked for
+     something nobody was asked for. Not a finding.
+   - `behaviour` — everything else. A **lead, not a verdict**: reproduce it by
+     hand on the code, and a reproduced bug gets its own ticket.
+
+   A cell that could not run says why instead of `0/0` (`n/a`, with a note: a
+   path that is not a repo, a ref git cannot archive, a test that outlived
+   `--cell-timeout`).
+
+   Between the matrix and the full list the judge prints **Leads**, the two
+   things worth reading first (`cross.md` has them under `## Leads`, `cross.json`
+   under `leads`): every `behaviour` failure, and every *discriminating* test — one
+   the base fails, some code passes and other code fails. The class of that test is
+   `base`, so on its own it reads as "nobody was asked for this"; the lead says who
+   did what the test asks and who did not (round 157: a test of the lock written
+   before the child starts, which the two entries without the fix fail and the rest pass).
+
+How a cell runs: the implementation is a `git archive` of the worktree's `HEAD`
+(or of the ref) in a scratch directory, the author's test files are copied in as
+`tests/_xcross_<entry>_<file>` — never into a worktree, which is only read —
+and `pytest -n 4` runs them against a private short basetemp. The scratch
+copy and the basetemp are deleted with the cell, and a cell that outlives
+`--cell-timeout` (300 s) has its whole process group, xdist workers included,
+ended; round 151 ran the box out of inodes before that cleanup existed. Cells
+run one at a time; `--jobs N` runs N at once when the box can take it.
+
+`cross.json` (the raw cells: counts, classes, nodes, `E ` lines) and `cross.md`
+(the table and the failing cells) are written to `contest-out/NN/` next to
+`SUMMARY.md`; `--cross-out DIR` moves both. A worktree named `base` or `ideal`
+(`setup_worktrees.py` makes both) is that column; without one the column is the
+`--base` / `--ideal` ref. The phase never takes the round down: if it cannot
+start, the score table is already on the screen and the judge says why.
+
+What the matrix is for, and what it is not. An entry's tests are bound to its
+author's own helper names, so most off-diagonal cells of an API-heavy ticket are
+`api` and say little; the diagonal says whether each entry's own tests are green
+on its own code, and a `behaviour` cell is the only place another entry's test
+found something the bench did not. Round 151's two real bugs (a cache that
+outlived the drop, a linked worktree left with Kilo's own `.gitignore`) came out
+of exactly such cells.
+
 ---
 
 ## Known limits
