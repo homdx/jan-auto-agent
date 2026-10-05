@@ -169,7 +169,7 @@ def test_a1_one_failing_start_still_leaves_a_working_tap_or_a_backend_error(tmp_
     created: list = []
     _install_tap(monkeypatch, _failing_tap_class({1}, created))
     try:
-        one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+        one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     except ContestBackendError:
         return
     assert len(_patches(one.fake)) == 1
@@ -185,7 +185,7 @@ def test_a1_a_start_that_always_fails_is_a_backend_error_not_an_oserror(tmp_path
     created: list = []
     _install_tap(monkeypatch, _failing_tap_class({"all"}, created))
     with pytest.raises(ContestBackendError):
-        one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+        one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     assert len(_patches(one.fake)) == 1, "the PATCH went out before the reconnect"
 
 
@@ -193,7 +193,7 @@ def test_a1_a_normal_reconnect_hears_the_reloaded_stream(tmp_path, live):
     repo = _repo(tmp_path / "repo")
     one = live(repo)
     old = one.backend._tap
-    one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+    one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     tap = one.backend._tap
     assert tap is not old
     assert _tap_alive(tap)
@@ -286,7 +286,7 @@ def test_a2_interrupt_mid_reconnect_leaves_no_live_tap(tmp_path, live, monkeypat
 
     def reconnect():
         try:
-            one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+            one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -315,6 +315,11 @@ class _StubClient:
 
     def set_model_limit(self, provider_id, model_id, limit):
         self.limits.append((provider_id, model_id, dict(limit)))
+
+    def model_limits(self, provider_id, model_id):
+        # round 153: the backend reads the window back after a push; a stub that
+        # kept the push answers with it
+        return dict(self.limits[-1][2]) if self.limits else None
 
 
 class _DummyTap:
@@ -347,7 +352,7 @@ def test_a3_an_injected_tap_with_events_log_is_never_rebuilt(tmp_path, monkeypat
     # a server with no base_url at all: nothing may read it when tap= is given
     backend = KiloBackend(object(), str(repo), events_log=str(tmp_path / "e.jsonl"),
                           client=client, tap=tap)
-    backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+    backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     assert client.limits, "the limit was not sent"
     assert backend._tap is tap
     assert not tap.stopped
@@ -364,7 +369,7 @@ def test_a4_a_reload_that_keeps_the_stream_is_bounded_and_logged(tmp_path, live,
     one = live(repo, client=client)
     started = time.monotonic()
     try:
-        one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+        one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     except ContestBackendError:
         pass
     took = time.monotonic() - started
@@ -383,7 +388,7 @@ def test_b5_a_tracked_rule_file_does_not_block_the_push(tmp_path, live):
     repo = _repo(tmp_path / "repo")
     _track(repo, ".kilo/rules/x.md", "# a rule\n")
     one = live(repo)
-    one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+    one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     assert len(_patches(one.fake)) == 1
 
 
@@ -393,7 +398,7 @@ def test_b5_a_tracked_project_file_refuses_the_push(tmp_path, live, name):
     _track(repo, name)
     one = live(repo)
     with pytest.raises(KiloLimitRefused):
-        one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+        one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     assert _patches(one.fake) == []
     assert (repo / name).read_text(encoding="utf-8") == '{"provider": {}}\n'
 
@@ -431,7 +436,7 @@ def test_b6_git_that_does_not_answer_refuses_the_push(tmp_path, live, monkeypatc
     one = live(repo)
     _break_git(monkeypatch, how)
     with pytest.raises(KiloLimitRefused):
-        one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+        one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     assert _patches(one.fake) == []
 
 
@@ -441,7 +446,7 @@ def test_b6_git_that_does_not_answer_deletes_nothing(tmp_path, monkeypatch, how)
     target = repo / ".kilo" / "kilo.jsonc"
     target.parent.mkdir()
     target.write_text(json.dumps({"provider": {"kenary": {"models": {
-        "m:free": {"limit": LIMIT}}}}}), encoding="utf-8")
+        "agent-a:free": {"limit": LIMIT}}}}}), encoding="utf-8")
     _break_git(monkeypatch, how)
     drop_stale_kilo_file(str(repo))
     assert target.is_file()
@@ -546,7 +551,7 @@ def test_b9_a_worktree_push_leaves_the_main_exclude_byte_identical(tmp_path, liv
     exclude = _common_exclude(main)
     before = exclude.read_bytes() if exclude.exists() else None
     one = live(wt)
-    one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+    one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     assert len(_patches(one.fake)) == 1
     after = exclude.read_bytes() if exclude.exists() else None
     assert after == before, "the operator's main info/exclude was edited"
@@ -560,11 +565,11 @@ def test_b9_a_worktree_push_leaves_the_main_exclude_byte_identical(tmp_path, liv
 def test_r_the_written_project_file_stays_out_of_git_status(tmp_path, live):
     repo = _repo(tmp_path / "repo")
     one = live(repo)
-    one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+    one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     target = repo / ".kilo" / "kilo.jsonc"      # what Kilo writes on the patch
     target.parent.mkdir(exist_ok=True)
     target.write_text(json.dumps({"provider": {"kenary": {"models": {
-        "m:free": {"limit": LIMIT}}}}}, indent=2), encoding="utf-8")
+        "agent-a:free": {"limit": LIMIT}}}}}, indent=2), encoding="utf-8")
     assert _git(repo, "status", "--porcelain", "--untracked-files=all") == ""
 
 
@@ -626,7 +631,7 @@ def _kilo_writes(directory: Path) -> None:
     target = directory / ".kilo" / "kilo.jsonc"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps({"provider": {"kenary": {"models": {
-        "m:free": {"limit": LIMIT}}}}}, indent=2), encoding="utf-8")
+        "agent-a:free": {"limit": LIMIT}}}}}, indent=2), encoding="utf-8")
 
 
 def test_b10_kilo_s_own_ignore_file_does_not_let_the_push_show(tmp_path, live):
@@ -635,7 +640,7 @@ def test_b10_kilo_s_own_ignore_file_does_not_let_the_push_show(tmp_path, live):
     (repo / ".kilo" / "rules" / "x.md").write_text("# rule\n", encoding="utf-8")
     (repo / ".kilo" / ".gitignore").write_text(KILO_OWN_GITIGNORE, encoding="utf-8")
     one = live(repo)
-    one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+    one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     _kilo_writes(repo)
     status = _git(repo, "status", "--porcelain", "--untracked-files=all")
     assert "kilo.jsonc" not in status, status
@@ -651,7 +656,7 @@ def test_b10w_in_a_linked_worktree_too(tmp_path, live):
     (wt / ".kilo" / "rules" / "x.md").write_text("# rule\n", encoding="utf-8")
     (wt / ".kilo" / ".gitignore").write_text(KILO_OWN_GITIGNORE, encoding="utf-8")
     one = live(wt)
-    one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+    one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     _kilo_writes(wt)
     status = _git(wt, "status", "--porcelain", "--untracked-files=all")
     assert "kilo.jsonc" not in status, status
@@ -661,9 +666,9 @@ def test_b11_a_second_push_after_the_kilo_dir_went_is_hidden_again(tmp_path, liv
     import shutil
     repo = _repo(tmp_path / "repo")
     one = live(repo)
-    one.backend.set_model_limit("kenary", "m:free", dict(LIMIT))
+    one.backend.set_model_limit("kenary", "agent-a:free", dict(LIMIT))
     shutil.rmtree(repo / ".kilo", ignore_errors=True)     # the drop at the end of a leg
     two = live(repo)
-    two.backend.set_model_limit("kenary", "m:free", {**LIMIT, "context": 90_000})
+    two.backend.set_model_limit("kenary", "agent-a:free", {**LIMIT, "context": 90_000})
     _kilo_writes(repo)
     assert _git(repo, "status", "--porcelain", "--untracked-files=all") == ""
