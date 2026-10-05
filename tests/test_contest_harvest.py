@@ -434,7 +434,12 @@ def test_run_tests_summary_and_tail_agree(round_, tmp_path):
     spec = importlib.util.spec_from_file_location("judge_before", JUDGE_BEFORE)
     before = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(before)
-    assert before.run_tests(str(wt.path)) == summary
+    if importlib.util.find_spec("pytest_timeout"):
+        assert before.run_tests(str(wt.path)) == summary
+    else:
+        # The old module always passed `--timeout=180`; without the plugin
+        # pytest exits 4 there, while the gate leaves the flag out (KC-76).
+        assert summary.startswith("tests:PASS")
 
     _edit(wt, "tests/test_probe.py",
           "def test_probe():\n    assert False, 'boom-marker-42'\n")
