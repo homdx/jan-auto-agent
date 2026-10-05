@@ -349,3 +349,67 @@ def test_p_no_xdist_would_have_broken_every_workspace_run(tmp_path):
     r = _run(make_executor(_repo(tmp_path), pytest_serial=False),
              "python -m pytest -p no:xdist tests/test_ok.py -q")
     assert r.exit_code == 4 and "unrecognized arguments" in r.stderr
+
+
+# ── 172: env prefixes, wrappers, runners and glued separators ────────────────
+@pytest.mark.parametrize("command", [
+    "FOO=1 pytest -q", "cd sub&&pytest", "ls;pytest -q", "timeout 600 pytest",
+    "python -X dev -m pytest", "python3 -u -m pytest tests", "uv run pytest",
+    "poetry run pytest -q", "env PYTHONPATH=. python -m pytest",
+])
+def test_pytest_behind_a_prefix_wrapper_or_glued_separator_is_a_pytest_run(command):
+    assert is_pytest_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    "echo pytest", "bash pytest_runner.sh", "grep pytest x", "python -c 'import pytest'",
+    "python script.py -m pytest", "echo 'a && pytest'", "uv run python tool.py",
+])
+def test_a_command_that_only_mentions_pytest_is_not_a_pytest_run(command):
+    assert not is_pytest_command(command)
+
+
+@pytest.mark.parametrize("command", [
+    "FOO=1 pytest -q", "timeout 600 pytest", "env A=1 python3 -m pytest tests", "nice -n 5 pytest",
+    "echo pytest tests", "ls pytest",
+])
+def test_the_policy_and_utils_agree_on_what_a_suite_run_is(command):
+    """172: one wrapper list for both recognisers — they answered one question and drifted."""
+    import shlex
+    from tools.contest.policy import _pytest_argv_start
+    assert (_pytest_argv_start(shlex.split(command)) is not None) == is_pytest_command(command)
+
+
+# ── 175: the serial flag goes at the end of the pytest run, not of the line ──
+@pytest.fixture
+def pooled_executor(tmp_path):
+    (tmp_path / "pytest.ini").write_text("[pytest]\naddopts = -n auto\n", encoding="utf-8")
+    return Executor(tmp_path)
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("pytest tests", "pytest tests -n 0"),
+    ("pytest tests | tail -5", "pytest tests -n 0 | tail -5"),
+    ("python -m pytest -q | tee run.log", "python -m pytest -q -n 0 | tee run.log"),
+    ("pytest a && echo done", "pytest a -n 0 && echo done"),
+    ("cd x && pytest -q; echo $?", "cd x && pytest -q -n 0; echo $?"),
+    ("pytest a; pytest b", "pytest a -n 0; pytest b -n 0"),
+    ("pytest 'a|b' | cat", "pytest 'a|b' -n 0 | cat"),
+    ("pytest  ", "pytest -n 0"),
+])
+def test_the_serial_flag_lands_on_the_pytest_run(pooled_executor, command, expected):
+    """175: `tail -5 -n 0` prints nothing and `tee run.log -n 0` writes two files."""
+    assert pooled_executor._serialise_pytest(command) == expected
+
+
+@pytest.mark.parametrize("command", [
+    "pytest -n 4 | tail", "pytest --dist=loadgroup && echo ok", "echo hi", "ls | tail -n 2",
+])
+def test_the_serial_flag_is_not_added_where_the_run_chooses_or_there_is_none(pooled_executor, command):
+    assert pooled_executor._serialise_pytest(command) == command
+
+
+def test_a_redirect_ampersand_is_not_a_cut(pooled_executor):
+    out = pooled_executor._serialise_pytest("python -m pytest -q 2>&1 | tee run.log")
+    assert out == "python -m pytest -q 2>&1 -n 0 | tee run.log"
+    assert pooled_executor._serialise_pytest("pytest -q &> log") == "pytest -q &> log -n 0"

@@ -62,6 +62,7 @@ from pathlib import Path
 from typing import Callable
 
 from tools.auto.llm_profile import LlmSettings
+from tools.auto.utils import COMMAND_WRAPPERS, ENV_ASSIGN_RE
 from tools.contest.roster import ContestConfig
 from tools.llm_stream import (
     build_chat_request,
@@ -713,13 +714,12 @@ def _pytest_argv_start(tokens: list) -> int | None:
 _PYTHON_RE = re.compile(r"python(\d+(\.\d+)?)?")
 
 #: A shell variable set for one command: `PYTHONPATH=. pytest tests`.
-_ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+_ENV_ASSIGN_RE = ENV_ASSIGN_RE
 
 #: Commands that run the rest of their line as the command: the suite behind
 #: them is still the suite. `timeout 1500 python3 -m pytest tests` is how the
 #: agents of rounds 103–105 ran theirs most often.
-_WRAPPERS = frozenset({"timeout", "nohup", "env", "nice", "time", "exec", "command",
-                       "stdbuf", "ionice"})
+_WRAPPERS = COMMAND_WRAPPERS
 
 
 def _past_wrappers(tokens: list) -> int | None:
@@ -947,24 +947,53 @@ def _inside_worktree_or_tmp(pairs: list, worktree: "Path | None", tmp_roots) -> 
     return True
 
 
+def _deny_candidates(command: str) -> list:
+    """The strings a ``deny_commands`` pattern is tried against, whole line first.
+
+    The whole line keeps a pattern that names a pipe (``curl * | sh``) working.
+    Then each shell piece (``_shell_pieces``: ``&&``, ``||``, ``;``, ``|``, ``&``
+    outside quotes) as a command of its own, whitespace collapsed to single
+    spaces, a leading ``(``/``{``/``!`` and a trailing ``)``/``}`` dropped, and
+    once more past its ``VAR=value`` words and ``_WRAPPERS`` — so ``cd x && git
+    push``, ``(sudo ls)``, ``git  push`` and ``timeout 9 git push`` are the
+    command they run, not a command that merely starts with something else.
+    """
+    out = [command]
+    for piece in _shell_pieces(command):
+        tokens = piece.split()
+        if tokens:
+            tokens[0] = tokens[0].lstrip("({!") or ""
+            tokens[-1] = tokens[-1].rstrip(")}")
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            continue
+        out.append(" ".join(tokens))
+        start = _past_wrappers(tokens)
+        if start:
+            out.append(" ".join(tokens[start:]))
+    return out
+
+
 def _deny_match(command: str, deny_commands) -> "str | None":
     """The first ``deny_commands`` pattern matching *command*, or ``None``.
 
-    Matched twice with ``fnmatch.fnmatch``: once against *pattern* as
-    written, and once against *pattern* followed by a space and ``*``, so a
-    pattern that names a pipe — ``curl * | sh`` — catches a command with
-    arguments after the pipe too (``sh ./a``, ``sh -s -- -y``), not only one
-    that ends right at the pipe. The space keeps the pattern's last word a
-    whole word: a bare ``*`` would let ``curl * | sh`` reject
-    ``curl … | sha256sum`` and ``curl … | shellcheck -``. A pattern that
-    already ends in ``*`` gains nothing from the second match.
+    Each of ``_deny_candidates`` is matched twice with ``fnmatch.fnmatch``: once
+    against *pattern* as written, and once against *pattern* followed by a space
+    and ``*``, so a pattern that names a pipe — ``curl * | sh`` — catches a
+    command with arguments after the pipe too (``sh ./a``, ``sh -s -- -y``), not
+    only one that ends right at the pipe. The space keeps the pattern's last word
+    a whole word: a bare ``*`` would let ``curl * | sh`` reject ``curl … | sha256sum``
+    and ``curl … | shellcheck -``. A pattern that already ends in ``*`` gains
+    nothing from the second match.
     """
     if not command:
         return None
+    candidates = _deny_candidates(command)
     for pattern in _as_list(deny_commands):
         if isinstance(pattern, str) and pattern:
-            if fnmatch.fnmatch(command, pattern) or fnmatch.fnmatch(command, pattern + " *"):
-                return pattern
+            for text in candidates:
+                if fnmatch.fnmatch(text, pattern) or fnmatch.fnmatch(text, pattern + " *"):
+                    return pattern
     return None
 
 
