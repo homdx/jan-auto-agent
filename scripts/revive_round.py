@@ -85,6 +85,15 @@ def state_path(target: str, any_leg: bool = False) -> Path:
     return folder / "state.json"
 
 
+def agent_name(entry) -> str:
+    """The name of one `state.json` agent row: its spec is a dict, older files a
+    bare string, and a damaged one anything — `"?"` when there is no name."""
+    spec = entry.get("agent") if isinstance(entry, dict) else None
+    if isinstance(spec, dict):
+        return str(spec.get("name") or "?")
+    return spec if isinstance(spec, str) and spec else "?"
+
+
 def revive_agents(agents: list[dict], only: str | None = None, dead: bool = False) -> list[str]:
     """Set the revivable agents in *agents* back to WAITING, in place; the revived names.
 
@@ -95,7 +104,9 @@ def revive_agents(agents: list[dict], only: str | None = None, dead: bool = Fals
     states = (*REVIVE, DEAD_STATE) if dead else REVIVE
     revived: list[str] = []
     for agent in agents:
-        name = agent.get("agent", {}).get("name", "?")
+        if not isinstance(agent, dict):
+            continue
+        name = agent_name(agent)
         before = agent.get("state")
         if before not in states or (only is not None and name != only):
             continue
@@ -124,14 +135,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         agents = data["agents"]
-    except (OSError, ValueError, KeyError) as exc:
+        if not isinstance(agents, list):
+            raise ValueError("not a round state: no agents list")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         print(f"revive_round: {path} is unreadable: {exc}", file=sys.stderr)
         return 1
 
     names = revive_agents(agents, only=args.agent, dead=args.dead)
     revived = len(names)
     for agent in agents:
-        name = agent.get("agent", {}).get("name", "?")
+        if not isinstance(agent, dict):
+            continue
+        name = agent_name(agent)
         if name in names:
             print(f"{name}: {agent['revived_from']['state']} -> {REVIVED_STATE}")
         else:

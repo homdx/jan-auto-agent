@@ -37,7 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from scripts.revive_round import (BACKUP_NAME, DEAD_STATE, REVIVE, REVIVED_STATE, leg_folders,
+from scripts.revive_round import (BACKUP_NAME, DEAD_STATE, REVIVE, REVIVED_STATE, agent_name,
+                                  leg_folders,
                                   revive_agents)
 from tools.contest import cli as contest_cli
 from tools.contest import roster
@@ -281,12 +282,19 @@ def build_run_line(nn: int, prof: dict[str, str], passthrough: list[str]) -> lis
             "--base", f"{REF_PREFIX}{nn}", *flags]
 
 
-def _map_exit(code: int, state: Path, started: float) -> int:
+def _map_exit(code: int, state: Path, started: float,
+              written: Optional[bytes] = None) -> int:
+    """The runner's exit as arena's. *written* is what arena itself put in
+    *state* just before the start (`run rerun`): a different body afterwards is
+    the runner's rewrite even when a coarse-mtime filesystem gives it the same
+    mtime as arena's write (bug 178)."""
     if code in (EXIT_OK, EXIT_FAILED):
         return code
     if code == 2:
         try:
             ran = state.stat().st_mtime >= started
+            if not ran and written is not None:
+                ran = state.read_bytes() != written
         except OSError:
             ran = False
         return EXIT_NO_READY if ran else EXIT_FAILED
@@ -294,7 +302,7 @@ def _map_exit(code: int, state: Path, started: float) -> int:
 
 
 def _run_child(repo: Path, nn: int, line: list[str], state: Path,
-               started: Optional[float] = None) -> int:
+               started: Optional[float] = None, written: Optional[bytes] = None) -> int:
     """Print *line*, run it as the foreground child under the lock file, map its exit.
 
     *state* is the round's `state.json`: a runner exit of 2 is "no agent ready"
@@ -326,7 +334,7 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
         return output.refuse(f"cannot start the runner: {err}")
     finally:
         lock.unlink(missing_ok=True)
-    return _map_exit(code, state, started)
+    return _map_exit(code, state, started, written)
 
 
 def run_start(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int:
@@ -390,12 +398,24 @@ def list_rows(repo: Path, config, now: Optional[float] = None,
     rows = []
     for nn, folders in groups.items():
         legs = sorted(f for f in folders if f[0])
-        last = round_folder(repo, config, nn)
+        # Bug 177: pick from the folders found, never a re-derived `NN` path —
+        # an unpadded `7/` or `8.1/` has no `07/` beside it. A base with a
+        # state.json wins (the padded one first), else the highest leg, as
+        # `round_folder` says.
+        bases = sorted((f for _leg, f in folders if not _leg),
+                       key=lambda f: (not (f / "state.json").is_file(), f.name != f"{nn:02d}"))
+        if bases and ((bases[0] / "state.json").is_file() or not legs):
+            last = bases[0]
+        else:
+            last = legs[-1][1]
         state = last / "state.json"
         try:
             mtime = state.stat().st_mtime
         except OSError:
-            mtime = last.stat().st_mtime
+            try:
+                mtime = last.stat().st_mtime
+            except OSError:
+                mtime = 0.0
         data = None
         try:
             data = json.loads(state.read_text(encoding="utf-8"))
@@ -587,11 +607,11 @@ def build_rerun_line(nn: int, base: str, prof: dict[str, str], passthrough: list
 
 def _rerun_refusal(data: dict, args: argparse.Namespace) -> Optional[str]:
     """Why `--agent NAME` cannot be brought back, or None."""
-    names = [_agent_name(a.get("agent")) for a in data["agents"] if isinstance(a, dict)]
+    names = [agent_name(a) for a in data["agents"] if isinstance(a, dict)]
     if args.agent not in names:
         return f"no agent {args.agent!r} in the round (agents: {', '.join(names) or 'none'})"
     state = next(str(a.get("state")) for a in data["agents"]
-                 if isinstance(a, dict) and _agent_name(a.get("agent")) == args.agent)
+                 if isinstance(a, dict) and agent_name(a) == args.agent)
     if state == DEAD_STATE and not args.dead:
         return f"{args.agent} is {DEAD_STATE} — add --dead to bring it back"
     if state not in (*REVIVE, DEAD_STATE):
@@ -647,7 +667,7 @@ def run_rerun(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
     except (RoundError, GitRefError, profile.ProfileError, OSError) as err:
         return output.refuse(str(err))
 
-    before = {_agent_name(a.get("agent")): a.get("state")
+    before = {agent_name(a): a.get("state")
               for a in data["agents"] if isinstance(a, dict)}
     revived = revive_agents([a for a in data["agents"] if isinstance(a, dict)],
                             only=args.agent or None, dead=args.dead)
@@ -662,8 +682,10 @@ def run_rerun(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
         return EXIT_OK
     try:
         shutil.copy2(state, state.with_name(BACKUP_NAME))
-        state.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        body = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
+        state.write_bytes(body)
         wrote = state.stat().st_mtime
     except OSError as err:
         return output.refuse(f"cannot write {state}: {err}")
-    return _run_child(repo, nn, line, state, started=math.nextafter(wrote, math.inf))
+    return _run_child(repo, nn, line, state, started=math.nextafter(wrote, math.inf),
+                      written=body)

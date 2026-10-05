@@ -280,3 +280,47 @@ def test_revive_round_script_output_without_the_new_flags(tmp_path, capsys):
     assert capsys.readouterr().out.splitlines()[:3] == [
         "a: STALLED (kept)", "d: DEAD -> WAITING", "r: READY (kept)"]
     assert path.read_bytes() == before
+
+
+# ── 179: an agent spec that is a bare string or null ─────────────────────────
+def test_revive_agents_reads_a_bare_string_null_and_missing_spec():
+    """179: older or damaged `state.json` rows no longer raise `AttributeError`."""
+    agents = [{"agent": "opus", "state": "STALLED"},
+              {"agent": None, "state": "GAVE_UP"},
+              {"state": "ERROR"},
+              {"agent": {"name": "kimi"}, "state": "READY"},
+              "junk"]
+    assert revive_round.revive_agents(agents) == ["opus", "?", "?"]
+    assert agents[0]["state"] == "WAITING" and agents[3]["state"] == "READY"
+
+
+def test_revive_agents_only_picks_the_string_spec_by_name():
+    agents = [{"agent": "opus", "state": "STALLED"}, {"agent": "kimi", "state": "STALLED"}]
+    assert revive_round.revive_agents(agents, only="kimi") == ["kimi"]
+    assert agents[0]["state"] == "STALLED"
+
+
+@pytest.mark.parametrize("body", ['{"agents": "x"}', "[]", '{"agents": 5}'])
+def test_the_script_calls_a_malformed_agents_list_unreadable(tmp_path, capsys, body):
+    path = tmp_path / "state.json"
+    path.write_text(body, encoding="utf-8")
+    assert revive_round.main([str(path)]) == 1
+    assert "unreadable" in capsys.readouterr().err
+
+
+def test_the_script_revives_a_state_with_a_bare_string_agent(tmp_path, capsys):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"agents": [{"agent": "opus", "state": "STALLED"}]}), encoding="utf-8")
+    assert revive_round.main([str(path)]) == 0
+    assert json.loads(path.read_text())["agents"][0]["state"] == "WAITING"
+    assert "opus: STALLED -> WAITING" in capsys.readouterr().out
+
+
+def test_run_rerun_dry_run_names_a_bare_string_agent(repo, spawn, capsys):
+    folder = repo / "out" / "01"
+    _write(folder / "state.json", json.dumps(
+        {"base_sha": SHA, "agents": [{"agent": "opus", "state": "STALLED"}]}))
+    code = cli.main(["run", "rerun", "1", "--agent", "opus", "--dry-run"])
+    out = capsys.readouterr().out
+    assert code == 0 and "opus: STALLED -> WAITING" in out and "1 to revive" in out
+    assert spawn.seen == []
