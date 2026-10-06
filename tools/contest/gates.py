@@ -296,6 +296,38 @@ def _end_process_group(proc: subprocess.Popen) -> None:
             continue
         else:
             break
+    _end_group_members(pgid)
+
+
+#: How long the leader's exit may leave the group's other members to go (seconds).
+_GROUP_SWEEP_SEC = 2.0
+
+
+def _end_group_members(pgid: int) -> None:
+    """KILL what the leader's exit left in its group, and wait until the group is empty.
+
+    `proc.wait` returns when the group's *leader* has exited, and a leader that
+    dies on TERM says nothing of its members: a worker still in its own TERM
+    handling, or one that ignores TERM, outlives it, and the harvest returned with
+    a suite's process still running (round 184's cross matrix: a group alive
+    right after the end, on every implementation alike). While the group exists
+    its id is not reused, so signalling `pgid` is still the group's own; the
+    sweep stops when the group is gone, at the first error, or after
+    `_GROUP_SWEEP_SEC`. Fail-open like the rest.
+    """
+    deadline = time.monotonic() + _GROUP_SWEEP_SEC
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return                                       # nobody left in the group
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(0.02)
 
 
 #: pytest's `--durations=10` row: `<time> <phase> <nodeid>`, printed last.
