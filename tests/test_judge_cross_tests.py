@@ -791,3 +791,61 @@ def test_the_matrix_names_the_test_that_only_some_entries_pass(trees, tmp_path, 
     md = (out / "cross.md").read_text(encoding="utf-8")
     assert "## Leads" in md and md.index("## Leads") < md.index("## Failures")
     assert "passes on: b, e" in md and "fails on: a" in md
+
+
+# ── 191: a ref the entries' checkouts do not have ────────────────────────────
+
+def test_an_ideal_only_the_judges_own_checkout_has_is_a_column(trees, tmp_path, monkeypatch):
+    """Round 146: separate clones, the ideal committed only where the judge runs."""
+    base, repo, ts = trees
+    home, _ = _repo(tmp_path / "home")                      # another repo: not the entries'
+    _write(home / "pkg" / "mod.py", _MOD_A)
+    _git(home, "add", "-A")
+    _git(home, "commit", "-q", "-m", "the ideal, only here")
+    ideal = _git(home, "rev-parse", "HEAD")
+    assert judge._resolve([str(p) for _, p in ts], ideal) is None
+    monkeypatch.setattr(judge, "REPO_ROOT", str(home))
+    said = []
+    data = judge.cross_tests(ts, base, ideal=ideal, workers=0, log=said.append)
+    assert data["impls"] == ["a", "b", "base", "ideal"]
+    cell = _cell(data, "a", "ideal")
+    assert (cell["passed"], cell["total"]) == (2, 2)
+    assert data["skipped"] == {}
+    assert not any("resolves in no checkout" in line for line in said)
+
+
+def test_a_ref_found_nowhere_is_said_not_dropped(trees, tmp_path, monkeypatch):
+    base, repo, ts = trees
+    nowhere = tmp_path / "not-a-repo"
+    nowhere.mkdir()
+    monkeypatch.setattr(judge, "REPO_ROOT", str(nowhere))
+    missing = "0" * 40
+    said = []
+    out = tmp_path / "out"
+    data = judge.cross_tests(ts, base, ideal=missing, out_dir=str(out), workers=0,
+                             log=said.append)
+    assert data["impls"] == ["a", "b", "base"]
+    assert data["skipped"] == {"ideal": missing}
+    lines = [line for line in said if "resolves in no checkout" in line]
+    assert lines == [f"cross: --ideal {missing} resolves in no checkout (the entries' or "
+                     f"{nowhere}) — no ideal column"]
+    md = (out / "cross.md").read_text(encoding="utf-8")
+    assert f"- ideal: `{missing}` — resolves in no checkout, no column" in md
+    assert json.loads((out / "cross.json").read_text(encoding="utf-8"))["skipped"] == {
+        "ideal": missing}
+
+
+def test_a_branch_name_resolves_in_the_entries_checkouts_before_the_judges(trees, tmp_path,
+                                                                           monkeypatch):
+    """`--base competition` names the entries' branch; the judge's own may differ."""
+    base, repo, ts = trees
+    _git(repo, "branch", "-f", "judge191-base", base)
+    home, _ = _repo(tmp_path / "home")
+    _write(home / "pkg" / "mod.py", _MOD_A)                  # this "base" already has special()
+    _git(home, "add", "-A")
+    _git(home, "commit", "-q", "-m", "another judge191-base")
+    _git(home, "branch", "-f", "judge191-base", "HEAD")
+    monkeypatch.setattr(judge, "REPO_ROOT", str(home))
+    data = judge.cross_tests(ts, "judge191-base", workers=0, log=lambda *a: None)
+    cell = _cell(data, "a", "base")
+    assert (cell["passed"], cell["total"]) == (1, 2)         # the entries' base: no special()

@@ -606,7 +606,8 @@ def _render_failures_md(providers, impls, by):
     return lines
 
 
-def _render_markdown(providers, impls, by, base, ideal, ticket=None, round_no=None):
+def _render_markdown(providers, impls, by, base, ideal, ticket=None, round_no=None,
+                     skipped=None):
     """The same two views as `cross.md`."""
     rows = [p[0] for p in providers]
     cols = [i[0] for i in impls]
@@ -615,8 +616,11 @@ def _render_markdown(providers, impls, by, base, ideal, ticket=None, round_no=No
         lines.append(f"- round: {round_no}")
     if ticket:
         lines.append(f"- ticket: {ticket}")
-    lines.append(f"- base: `{base}`")
-    lines.append(f"- ideal: `{ideal}`" if ideal else "- ideal: —")
+    skipped = skipped or {}
+    gone = " — resolves in no checkout, no column"
+    lines.append(f"- base: `{base}`" + (gone if "base" in skipped else ""))
+    lines.append((f"- ideal: `{ideal}`" + (gone if "ideal" in skipped else ""))
+                 if ideal else "- ideal: —")
     lines.append("")
     lines.append("Rows are whose tests, columns are whose code; a cell is `passed/total`,")
     lines.append("`n/a` when the cell never ran. `api` is a name or signature only one")
@@ -668,7 +672,7 @@ def cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOUT
     except Exception as e:  # the cross phase never takes the run down with it
         log(f"cross: the phase did not finish — {type(e).__name__}: {e}")
         return {"round": round_no, "ticket": ticket, "base": base, "ideal": ideal,
-                "tests": [], "impls": [], "cells": []}
+                "skipped": {}, "tests": [], "impls": [], "cells": []}
 
 
 def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOUT,
@@ -688,12 +692,25 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
     # tree with that name IS the column, and the ref is not archived a second
     # time under the same name (two `base` columns shared one cell dict)
     named = {name for name, _ in trees}
-    anchor = _resolve(repos, base) if repos and base and "base" not in named else None
-    if anchor:
-        impls.append(("base", str(base), anchor))
-    ideal_repo = _resolve(repos, ideal) if repos and ideal and "ideal" not in named else None
-    if ideal_repo:
-        impls.append(("ideal", str(ideal), ideal_repo))
+    # 191: a ref is looked for in the entries' checkouts first, then in the one
+    # the judge runs from — a round of separate clones has its ideal only here —
+    # and a ref found nowhere is said, not dropped: a matrix without its ideal
+    # column looked complete (round 146's first run, "9 × 13", no word).
+    homes = list(repos)
+    if os.path.isdir(REPO_ROOT) and not any(
+            os.path.realpath(str(r)) == os.path.realpath(REPO_ROOT) for r in homes):
+        homes.append(REPO_ROOT)
+    skipped = {}
+    for column, ref in (("base", base), ("ideal", ideal)):
+        if not ref or column in named:
+            continue
+        home = _resolve(homes, ref)
+        if home:
+            impls.append((column, str(ref), home))
+        else:
+            skipped[column] = str(ref)
+            log(f"cross: --{column} {ref} resolves in no checkout (the entries' or "
+                f"{REPO_ROOT}) — no {column} column")
 
     log(f"\nCross — every entry's own tests, run on every implementation "
         f"(cells: {len(providers)} × {len(impls)})")
@@ -746,6 +763,7 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
         log("\nno cell failed")
 
     data = {"round": round_no, "ticket": ticket, "base": base, "ideal": ideal,
+            "skipped": skipped,
             "tests": [p[0] for p in providers],
             "impls": [i[0] for i in impls],
             "leads": leads,
@@ -754,7 +772,7 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
                        "failures": c["failures"]}
                       for pn, in_, c in cells]}
 
-    md = _render_markdown(providers, impls, by, base, ideal, ticket, round_no)
+    md = _render_markdown(providers, impls, by, base, ideal, ticket, round_no, skipped)
     if out_dir:
         try:
             os.makedirs(out_dir, exist_ok=True)
