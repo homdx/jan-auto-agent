@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import models, output, profile, rounds, tickets
+from . import judging, models, output, profile, rounds, tickets
 
 # ── exit codes ───────────────────────────────────────────────────────────────
 #: The one exit-code table every `arena` command returns from.
@@ -290,6 +290,25 @@ def _run_rerun(args: argparse.Namespace) -> int:
     return rounds.run_rerun(REPO_ROOT, args, profiles.get(active, {}))
 
 
+# ── AR-64: run judge ─────────────────────────────────────────────────────────
+def _run_judge_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("run", help="the round NN, or one leg NN.K")
+    p.add_argument("--ideal", metavar="REF",
+                   help="a candidate-ideal ref: scored as the `ideal` column and row")
+    p.add_argument("--jobs", type=int, default=1, metavar="N",
+                   help="cross cells at once (default 1: cells are timing-sensitive)")
+    p.add_argument("--cell-timeout", type=int, metavar="SEC",
+                   help="wall clock one cross cell may spend (the judge's default: 300)")
+    p.add_argument("--no-cross", action="store_true",
+                   help="the score table only, no cross matrix")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the commands, run nothing")
+
+
+def _run_judge(args: argparse.Namespace) -> int:
+    return judging.run_judge(REPO_ROOT, args)
+
+
 # ── AR-6: issue list / view ──────────────────────────────────────────────────
 def _issue_list_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--state", metavar="S", help="keep only this state")
@@ -521,6 +540,8 @@ OBJECTS: dict[str, Object] = {
                          add_arguments=_run_view_arguments, handler=_run_view),
             "rerun": Verb("rerun failed or named agents", "AR-5",
                           add_arguments=_run_rerun_arguments, handler=_run_rerun),
+            "judge": Verb("score a round and run every entry's tests on every entry's code",
+                          "AR-64", add_arguments=_run_judge_arguments, handler=_run_judge),
         },
     ),
     "entry": Object(
