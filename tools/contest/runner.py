@@ -4143,6 +4143,16 @@ def _parts_say_working(parts, window: float, now: float) -> bool:
     return False
 
 
+def _retry_waited_of(idle) -> float:
+    """Round 146: the seconds a wait's deadline was moved for the provider's
+    retries (`IdleResult.retry_waited`), ``0.0`` when the result has none — an
+    OpenRouter turn, a stub, a result from before the field. Never raises."""
+    value = getattr(idle, "retry_waited", 0.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return max(0.0, float(value))
+
+
 def _is_working(working) -> bool:
     """KC-58 §2: is there work the churn sample cannot see? A `working` that
     raises is `False` — a read failure is never a reason to extend a turn."""
@@ -5708,6 +5718,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             if clock.suite_waited > 0:
                 # KC-58: how long this turn's whole-root suites queued for a slot
                 turn["suite_wait_sec"] = int(clock.suite_waited)
+            retry_waited = _retry_waited_of(idle)
+            if retry_waited > 0:
+                # round 146: how long the provider kept Kilo retrying — time the
+                # deadline gave back to the turn
+                turn["provider_wait_sec"] = int(retry_waited)
             if stalled:
                 turn["idle_status"] = "stalled"
                 error, state = stalled[0], AgentState.STALLED
@@ -5724,7 +5739,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # inside that time is still a silence stall.
                 silence = float(config.idle_event_timeout_sec or 0)
                 limit = (float(config.turn_timeout_sec) + clock.granted + clock.gate_added
-                         + clock.suite_waited)
+                         + clock.suite_waited + retry_waited)
                 quiet = 0 < silence and idle.elapsed < limit
                 if quiet:
                     turn["idle_status"] = "stalled"

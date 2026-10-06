@@ -86,7 +86,7 @@ unknown key fails at load time with its name. Put local values in
 | `max_parallel` | 3 | sessions at once; `--max-parallel N` for one round |
 | `legs`, `legs_by_size` | 1; `L=3` | legs per round, by the ticket's `**Size:**`; `--legs N` overrides both |
 | `max_rework`, `max_continues_per_attempt` | 2, 2 | reworks after the first turn; nudges for an idle turn with edits and no commit |
-| `turn_timeout_sec`, `turn_extend_sec`, `turn_max_sec` | 3600, 600, 7200 | the turn clock: a floor, extended while the tree changes, up to a ceiling |
+| `turn_timeout_sec`, `turn_extend_sec`, `turn_max_sec` | 3600, 600, 7200 | the turn clock: a floor, extended while the tree changes, up to a ceiling; the seconds Kilo spends retrying a failing provider are given back on top (`provider_wait_sec` in the turn) |
 | `idle_event_timeout_sec` | 900 | no event this long → the session is aborted |
 | `first_touch_sec` | 420 | no file touched this long → a nudge, then a fresh session, then `DEAD` |
 | `agent_max_sec` | 5400 | one agent's hard limit; at it the agent ends `STALLED`, its tree scored as it stands |
@@ -337,6 +337,24 @@ record with no limit, prompt or output, and a `Compaction exhausted` of the
 same agent in its `events.jsonl` a minute before it) and, with `--apply`,
 drops them and keeps the old file. Run it with no round running, once per
 checkout.
+
+**Where Kilo compacts a small window, and what a failing provider costs a turn.**
+Kilo compacts a session after the step that reaches `limit.input -
+min(20 000, output)`, and the runner hands it `input = compact_at_percent of
+the budget + that reserve` (`context_memory.kilo_limit`), so the compact point
+is the share of the budget — for every window. Until round 146 `input` was
+capped at the budget, and under about 100 000 the cap won: a 32 000 budget with
+a 32 000 output compacted at 12 000, about Kilo's own base context, and the
+ticket was summarised away within a few steps (apertus-70b-instruct,
+qwen-sea-lion). A turn's deadline has the same kind of leak: a streak of
+`session.status retry` events — Kilo waiting to try a failing provider again,
+from the first retry to the model's next output — is time the agent could not
+work in, and moves the deadline by its length (never by more than the turn's
+own `turn_timeout_sec`; KC-64's retry count and KC-61's bound still end a
+provider that never answers). glm-4.7-flash had spent 32 of its 70 minutes
+that way, twice, and ended `STALLED no idle after 70m … unchanged for 10m` with
+a real tree. With `turn_extend_sec = 0` the turn clock is fixed and nothing is
+given back.
 
 **Putting ended agents back to work: `scripts/revive_round.py`.** `--resume`
 restarts only the agents that were mid-flight. An agent that already ended
