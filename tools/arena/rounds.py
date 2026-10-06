@@ -115,8 +115,25 @@ def _cmdline(proc_root: Path, pid: str) -> Optional[list[str]]:
     return [w.decode("utf-8", "replace") for w in raw.split(b"\0") if w]
 
 
+def _as_int(text: str) -> Optional[int]:
+    """`int(text)`, or None when `int()` refuses it.
+
+    Bug 185: `str.isdigit()` is no stand-in for that — `'²'.isdigit()` is True and
+    `int('²')` raises, as does an `int()` of a 4300+ digit string. This reads what
+    the runner's own argparse `type=int` would: `07` is 7.
+    """
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
 def _matches(words: Optional[list[str]], nn: int) -> bool:
-    """`tools.contest`, `run` and `--ticket NN` / `--ticket=NN` (`07` is 7)."""
+    """`tools.contest`, `run` and `--ticket NN` / `--ticket=NN` (`07` is 7).
+
+    Every process on the box passes through here, so a word that is no number is
+    a process that is not round NN — never an exception (bug 185).
+    """
     if not words or "tools.contest" not in words or "run" not in words:
         return False
     for i, word in enumerate(words):
@@ -125,7 +142,7 @@ def _matches(words: Optional[list[str]], nn: int) -> bool:
             value = words[i + 1]
         elif word.startswith("--ticket="):
             value = word.split("=", 1)[1]
-        if value is not None and value.isdigit() and int(value) == nn:
+        if value is not None and _as_int(value) == nn:
             return True
     return False
 
@@ -199,8 +216,11 @@ def integration_branch(repo: Path, flag: Optional[str], prof: dict[str, str]) ->
             branch = ""
         if not branch:
             raise RoundError("HEAD is detached — pass --branch or set the profile's branch")
+    # Bug 186: `show-ref --verify` takes an exact ref name. `rev-parse --verify`
+    # evaluates revision syntax, so `main~1`, `main^` or `main@{1}` "existed" and a
+    # round was built off an older commit than the branch's tip, without a word.
     try:
-        git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{branch}")
+        git(repo, "show-ref", "--verify", "-q", f"refs/heads/{branch}")
     except GitRefError:
         raise RoundError(f"branch {branch!r} does not exist") from None
     return branch

@@ -257,7 +257,9 @@ def _ref_numbers(repo: Path) -> set:
                  "refs/heads/" + rounds.REF_PREFIX)
     for line in listed.splitlines():
         name = line.rpartition(rounds.REF_PREFIX)[2]
-        if name.isdigit():
+        # Bug 185: ASCII digits only, and a length `int()` takes — `'²'.isdigit()` is
+        # True, `int('²')` raises, and `arena run` never writes such a ref.
+        if re.fullmatch(r"[0-9]{1,18}", name):
             found.add(int(name))
     return found
 
