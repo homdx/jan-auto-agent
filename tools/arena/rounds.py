@@ -354,6 +354,12 @@ def run_start(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
         branch = integration_branch(repo, args.branch, prof)
         if round_alive(repo, nn, PROC_ROOT):
             raise RoundError(f"round {nn} is already running in {repo}")
+        # AR-14 §5: the lower open tickets intake would hand out first, named
+        # before `arena-round/NN` is built. Deferred import: tickets imports us.
+        from . import tickets as _tickets
+        if _tickets.report_intake_blockers(repo, branch, nn,
+                                           getattr(args, "output", "table")):
+            return EXIT_USAGE
         dirty = _dirty_tasks(repo)
         if dirty:
             raise RoundError(f"{TASKS_DIR}/ has uncommitted files: {', '.join(dirty)} — "

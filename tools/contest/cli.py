@@ -194,8 +194,10 @@ OPEN = "open"
 #: already duplicates that script's status regex: the runner does not read
 #: `scripts/`. Anything else is still on offer — `open`, but also `running` or
 #: `wip` when a round runs on another machine, and a ticket with no status line
-#: at all — and a session prompted without a ticket would get it.
-PARKED = ("landed", "queued")
+#: at all — and a session prompted without a ticket would get it. `closed`
+#: (AR-14) is parked too: a closed ticket is no longer wanted at all, so it must
+#: not block a higher round at intake.
+PARKED = ("landed", "queued", "closed")
 
 #: Exit codes.
 EXIT_OK, EXIT_NO_READY, EXIT_FAILED = 0, 2, 1
@@ -234,9 +236,13 @@ KNOWN_SIZES = ("XS", "S", "M", "L")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _status_of(body: str) -> str:
-    """The body's `**Status:**` first word, lower-cased; `""` when absent."""
+    """The body's `**Status:**` first word, lower-cased; `""` when absent.
+
+    Punctuation that trails the word is not part of it, the way
+    `next_task._status` reads it: `queued, judged on arena` is `queued`.
+    """
     match = _STATUS_RE.search(body)
-    return match.group(1).strip("`*").lower() if match else ""
+    return match.group(1).strip("`*,;:.-").lower() if match else ""
 
 
 def _missing_labels(body: str) -> list:

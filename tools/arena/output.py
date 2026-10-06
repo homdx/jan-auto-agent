@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import textwrap
 from typing import Any, Iterable, Mapping
 
 MASK = "***"
@@ -123,4 +124,85 @@ def refuse(msg: str) -> int:
     """Print `arena: <scrubbed msg>` as one stderr line and return 2."""
     one_line = " ".join(scrub(str(msg)).splitlines())
     print(f"arena: {one_line}", file=sys.stderr)
+    return 2
+
+
+# ── AR-14: the flow block — "you are here, the error is here" ─────────────────
+#: The three marks of a flow step: done, the step that failed, not reached.
+MARKS = {"ok": "[✓]", "fail": "[✗]", "todo": "[ ]"}
+
+#: A refusal line's width, so `where:` wraps and the continuation lines align.
+REFUSE_WIDTH = 78
+
+
+def flow_line(flow) -> str:
+    """`(step, state[, detail])` → `[✓] a → [✗] b: why → [ ] c`, one line."""
+    parts = []
+    for item in flow:
+        step, state = item[0], item[1]
+        detail = item[2] if len(item) > 2 else ""
+        text = f"{step}: {detail}" if detail else step
+        parts.append(f"{MARKS.get(state, MARKS['todo'])} {text}")
+    return " → ".join(parts)
+
+
+def flow_json(flow) -> list:
+    """The same steps as `[{"step": …, "state": …}]` for `-o json`."""
+    return [{"step": item[0], "state": item[1]} for item in flow]
+
+
+def _one_line(text: str) -> str:
+    """*text* as one scrubbed line — a message that carries a newline is not one."""
+    return " ".join(scrub(str(text)).splitlines())
+
+
+def _wrap(label: str, text: str) -> str:
+    """`  <label>: <text>` wrapped to `REFUSE_WIDTH`, the continuation lines aligned
+    under the text, not the label."""
+    prefix = f"  {label}: "
+    lines = textwrap.wrap(scrub(str(text)), width=max(24, REFUSE_WIDTH - len(prefix)),
+                          break_long_words=False, break_on_hyphens=False) or [""]
+    return "\n".join([prefix + lines[0]]
+                     + [" " * len(prefix) + line for line in lines[1:]])
+
+
+def _hint_line(hint: Mapping) -> str:
+    """`  → <why>:  <command>` — the command stays on one line, so it is pasteable."""
+    why = scrub(str(hint.get("why") or ""))
+    command = scrub(str(hint.get("command") or ""))
+    text = f"{why}:  {command}" if command else why
+    return f"  → {text}"
+
+
+def refuse_ctx(msg, *, where=None, ticket=None, flow=None, hints=None, fmt="table",
+               stream=None) -> int:
+    """A refusal with the flow block: the error line, then `where:`, `ticket:` and
+    `flow:`, then one `  → ` hint per way out. Exit 2, everything on stderr.
+
+    `flow` is `(step, state[, detail])` and `hints` `[{"why": …, "command": …}]`.
+    `-o json` puts the same under `error`, `where`, `ticket`, `flow` and `hints`.
+
+    Every field is printed: one the failing step did not reach yet is `?`, never
+    dropped and never guessed.
+    """
+    out = stream if stream is not None else sys.stderr
+    message = _one_line(msg)
+    if fmt != "json":
+        print(f"arena: {message}", file=out)
+        print(_wrap("where:", str(where) if where else "?"), file=out)
+        print(_wrap("ticket:", str(ticket) if ticket else "?"), file=out)
+        print(f"  flow:  {scrub(flow_line(flow))}", file=out)
+        for hint in hints or []:
+            print(_hint_line(hint), file=out)
+    else:
+        # one object a script can `json.loads`, the same fields as the text block
+        print(json.dumps({
+            "error": message,
+            "where": scrub(str(where) if where else "?"),
+            "ticket": scrub(str(ticket) if ticket else "?"),
+            "flow": flow_json(flow) if flow else [],
+            "hints": [{"why": scrub(str(h.get("why") or "")),
+                       "command": scrub(str(h.get("command") or ""))}
+                      for h in (hints or [])],
+        }), file=out)
     return 2

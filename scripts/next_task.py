@@ -27,9 +27,10 @@ TICKET_RE = re.compile(r"^(\d+)-.*\.md$")
 
 # A ticket whose **Status:** line starts with one of these is not on offer:
 # `landed` — merged, the round is over; `queued` — written, but not this
-# round (INDEX.md "Next rounds" says when). Everything else (`open`, no
-# status line at all — the tasks/ tickets have none) is handed out.
-SKIP_STATUS = ("landed", "queued")
+# round (INDEX.md "Next rounds" says when); `closed` — no longer wanted at all
+# (AR-14 `arena issue close`), its `**Closed:**` line says why. Everything else
+# (`open`, no status line at all — the tasks/ tickets have none) is handed out.
+SKIP_STATUS = ("landed", "queued", "closed")
 
 
 def load_tickets(tasks_dir):
@@ -55,9 +56,11 @@ def load_tickets(tasks_dir):
 def _status(body):
     """The **Status:** line's first word, lower-cased — `_field` wants a
     single back-quoted token and the epic tickets' status lines carry
-    commit shas and dates after it."""
+    commit shas and dates after it. The note after the word is not part of
+    it: `queued (judged on arena)` and `queued, judged on arena` both read
+    `queued` (AR-14's `arena issue queue --note`)."""
     m = re.search(r"^\*\*Status:\*\*\s*(\S+)", body, re.MULTILINE)
-    return m.group(1).strip("`*").lower() if m else ""
+    return m.group(1).strip("`*,;:.-").lower() if m else ""
 
 
 def _field(body, label):

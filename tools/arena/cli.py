@@ -371,6 +371,53 @@ def _issue_create(args: argparse.Namespace) -> int:
     return tickets.issue_create(REPO_ROOT, args, prof)
 
 
+# ── AR-14: issue queue / open / close / reopen / edit ───────────────────────
+def _issue_status_arguments(verb: str, reason: bool = False):
+    """`queue`/`open`/`close`/`reopen` share one shape: NN, --branch and one flag.
+
+    `close` takes `--reason` (the `**Closed:**` line); the others take `--note`
+    (the words after the status word).
+    """
+    def add_arguments(p: argparse.ArgumentParser) -> None:
+        p.add_argument("number", metavar="NN", help="the ticket's round number")
+        p.add_argument("--branch", help="integration branch (default: profile's branch, then HEAD)")
+        if reason:
+            p.add_argument("--reason", metavar="TEXT",
+                           help="why it is closed; the **Closed:** line")
+        else:
+            p.add_argument("--note", metavar="TEXT",
+                           help="the words after the **Status:** word")
+        _late_globals(p, "p", "y", "o")
+
+    return add_arguments
+
+
+def _issue_status_handler(verb: str):
+    """Run one status verb: `arena issue queue 145 --branch ctx-overflow-fix`."""
+    def handle(args: argparse.Namespace) -> int:
+        try:
+            prof = _issue_profile(args)
+        except profile.ProfileError as err:
+            return output.refuse(str(err))
+        return tickets.issue_status(REPO_ROOT, args, prof, verb)
+
+    return handle
+
+
+def _issue_edit_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("number", metavar="NN", help="the ticket's round number")
+    p.add_argument("--branch", help="integration branch (default: profile's branch, then HEAD)")
+    _late_globals(p, "p", "y", "o")
+
+
+def _issue_edit(args: argparse.Namespace) -> int:
+    try:
+        prof = _issue_profile(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    return tickets.issue_edit(REPO_ROOT, args, prof)
+
+
 # ── AR-59: model available / use / drop ──────────────────────────────────────
 def _late_globals(p: argparse.ArgumentParser, *names: str) -> None:
     """Accept `-p`, `-y`, `-o` after the verb too: `arena model use a -p p1 -y`.
@@ -510,7 +557,7 @@ OBJECTS: dict[str, Object] = {
         },
     ),
     "issue": Object(
-        "tickets: draft, list, view, land",
+        "tickets: create, list, view, queue, open, close, reopen, edit, land",
         {
             "create": Verb(
                 "draft a ticket into .arena/drafts/",
@@ -522,6 +569,20 @@ OBJECTS: dict[str, Object] = {
                          add_arguments=_issue_list_arguments, handler=_issue_list),
             "view": Verb("show one ticket", "AR-6",
                          add_arguments=_issue_view_arguments, handler=_issue_view),
+            "queue": Verb("park a ticket: **Status:** queued", "AR-14",
+                          add_arguments=_issue_status_arguments("queue"),
+                          handler=_issue_status_handler("queue")),
+            "open": Verb("put a parked ticket back on offer: **Status:** open", "AR-14",
+                         add_arguments=_issue_status_arguments("open"),
+                         handler=_issue_status_handler("open")),
+            "close": Verb("drop a ticket: **Status:** closed, with a reason", "AR-14",
+                          add_arguments=_issue_status_arguments("close", reason=True),
+                          handler=_issue_status_handler("close")),
+            "reopen": Verb("bring a closed ticket back: **Status:** open", "AR-14",
+                           add_arguments=_issue_status_arguments("reopen"),
+                           handler=_issue_status_handler("reopen")),
+            "edit": Verb("edit a ticket's text in $EDITOR, then commit it", "AR-14",
+                         add_arguments=_issue_edit_arguments, handler=_issue_edit),
             "land": Verb("land a ticket's winning entry", "AR-8"),
         },
     ),

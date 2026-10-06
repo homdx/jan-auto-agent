@@ -1,6 +1,6 @@
 # AR-14 — `arena issue queue / open / close / reopen / edit`: the only writers of `**Status:**`, on any branch; `run start` names the ticket that blocks intake
 
-**Status:** queued
+**Status:** landed
 **Severity:** MEDIUM
 **File:** tools/arena/tickets.py
 **Symbol:** set_status, cmd_issue_queue, cmd_issue_open, cmd_issue_close, cmd_issue_reopen, cmd_issue_edit, blocking_tickets
