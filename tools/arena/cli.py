@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import judging, models, output, profile, rounds, tickets
+from . import basecheck, judging, models, output, profile, rounds, tickets
 
 # ── exit codes ───────────────────────────────────────────────────────────────
 #: The one exit-code table every `arena` command returns from.
@@ -309,6 +309,27 @@ def _run_judge(args: argparse.Namespace) -> int:
     return judging.run_judge(REPO_ROOT, args)
 
 
+# ── AR-25: base check ────────────────────────────────────────────────────────
+def _base_check_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--ref", metavar="REF",
+                   help="the ref to check (default: the profile's branch, then HEAD)")
+    p.add_argument("--force", action="store_true", help="ignore the cache")
+    p.add_argument("--keep", action="store_true",
+                   help="leave the worktree and print its path")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the sha, the worktree and the commands, run nothing")
+    _late_globals(p, "p", "o")
+
+
+def _base_check(args: argparse.Namespace) -> int:
+    try:
+        profiles, active = _load(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    # No profile at all: no `branch`, so the ref is HEAD.
+    return basecheck.run_base_check(REPO_ROOT, args, profiles.get(active, {}))
+
+
 # ── AR-6: issue list / view ──────────────────────────────────────────────────
 def _issue_list_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--state", metavar="S", help="keep only this state")
@@ -497,6 +518,17 @@ def _model_unset_role(args: argparse.Namespace) -> int:
 
 
 OBJECTS: dict[str, Object] = {
+    "base": Object(
+        "the base commit's own checks, on a clean checkout",
+        {
+            "check": Verb(
+                "run the base's own checks on a clean checkout, cached per sha",
+                "AR-25",
+                add_arguments=_base_check_arguments,
+                handler=_base_check,
+            ),
+        },
+    ),
     "profile": Object(
         "named run settings ([arena.profile.NAME])",
         {

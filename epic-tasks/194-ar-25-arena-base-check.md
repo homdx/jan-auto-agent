@@ -1,6 +1,6 @@
 # AR-25 — `arena base check`: the base's own checks on a clean checkout, cached per sha
 
-**Status:** queued
+**Status:** landed
 **Severity:** LOW
 **File:** tools/arena/basecheck.py
 **Symbol:** run_base_check, build_steps, run_steps, read_cache, write_cache
@@ -159,3 +159,25 @@ All cases above pass.
 - Tests wait on events, never on sleeps or tight timeouts.
 - No unrelated repository changes.
 - Commit subject starts with the round number: `194: …`.
+
+---
+
+## Round 194 (p152, gate on): who won and what the cross matrix found
+
+Six of ten entries shipped a patch (`mimo-v2-5`: provider "model not found: mimo-v2-5:free"; `nemotron-3-super-free`,
+`ling-3-0-flash-sante-free`, `agnes-3-flash`: bynara answered HTTP 400 "Could not read the request body." at 0 tokens).
+Round took 55 minutes; the cross judge (`arena run judge 194`, `--jobs 1`, 6 x 7 cells) ran once, then again with the ideal.
+
+Landed: the entry of `sensenova-6-8-flash-lite-var1` (48 own tests; the other entries' tests pass on it 116 times, the
+next best code 91), with three changes found while judging:
+
+1. A step was a pytest step when `"pytest"` was in its command line, so a stand-in command on a `tests` step lost its
+   `FAILED …` lines. `Step.pytest` now says it (`PYTEST_STEPS`).
+2. When the last output line was itself a `FAILED …` line the row said it twice (`FAILED x; FAILED x`). Said once now.
+3. The refusal for a failed `git worktree add` did not name it; it does.
+
+Left as the entry had it, a judgement call: a cached row's `summary` ends in ` (cached)` (the JSON rows also carry
+`cached: true`), and `--dry-run` prints the bare sha. Three cross cells of other entries read the summary unchanged on a
+hit and fail on it; the ticket says only that a hit is printed with `cached` in its rows.
+
+Almost every other cross failure is `api` (names and signatures only one entry has): nothing discriminated on the base.
