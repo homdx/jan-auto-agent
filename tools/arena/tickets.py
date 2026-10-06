@@ -585,8 +585,9 @@ def _scrubbed(value):
 
 def issue_view(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int:
     """`arena issue view NN [--branch B]`: the md text, then one `! flag` line each."""
-    if not re.fullmatch(r"\d+", str(args.number)):
-        return output.refuse(f"issue view: {args.number!r} is not a ticket number")
+    # Bug 187: at most 18 digits — `int()` of a 4300+ digit string raises
+    if not re.fullmatch(r"\d{1,18}", str(args.number)):
+        return output.refuse(f"issue view: {args.number!r:.60} is not a ticket number")
     nn = int(args.number)
     try:
         branch, tickets = _branch_and_scan(repo, args, prof)

@@ -494,27 +494,33 @@ def run_list(repo: Path, args: argparse.Namespace) -> int:
 
 
 # ── run view ─────────────────────────────────────────────────────────────────
-#: `NN` or `NN.K`, digits only; `07.2` is round 7 leg 2.
-_VIEW_ARG = re.compile(r"^(\d+)(?:\.(\d+))?$")
+#: `NN` or `NN.K`, digits only; `07.2` is round 7 leg 2. Bug 187: at most 18 digits
+#: a part — `int()` of a 4300+ digit string raises, and no round has such a number.
+_VIEW_ARG = re.compile(r"^(\d{1,18})(?:\.(\d{1,18}))?$")
 
 #: The `-o json` columns, one row per agent in `state.json` order.
 VIEW_COLUMNS = ["agent", "state", "attempt", "tokens", "commit"]
 
 
+def _count(value) -> int:
+    """*value* as a token count: a number, finite — anything else is 0.
+
+    Bug 184: `json.loads` reads `NaN` and `Infinity`, and `int()` of either raises
+    (ValueError, OverflowError), so a `state.json` holding one ended `run view -o
+    json` in a traceback.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if isinstance(value, float) and not math.isfinite(value):
+        return 0
+    return int(value)
+
+
 def _total_tokens(tokens) -> int:
     """`input + output + reasoning` as an integer; 0 for a missing or odd value."""
-    if isinstance(tokens, bool):
-        return 0
-    if isinstance(tokens, (int, float)):
-        return int(tokens)
     if not isinstance(tokens, dict):
-        return 0
-    total = 0
-    for key in ("input", "output", "reasoning"):
-        value = tokens.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            total += int(value)
-    return total
+        return _count(tokens)
+    return sum(_count(tokens.get(key)) for key in ("input", "output", "reasoning"))
 
 
 def _agent_name(agent) -> str:
@@ -565,7 +571,7 @@ def run_view(repo: Path, args: argparse.Namespace) -> int:
     """
     match = _VIEW_ARG.match(str(args.run))
     if not match:
-        return output.refuse(f"run view: {args.run!r} is not NN or NN.K")
+        return output.refuse(f"run view: {args.run!r:.60} is not NN or NN.K")
     nn = int(match.group(1))
     leg = int(match.group(2)) if match.group(2) is not None else None
     try:
@@ -662,7 +668,7 @@ def run_rerun(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
     match = _VIEW_ARG.match(str(args.run))
     try:
         if not match:
-            raise RoundError(f"run rerun: {args.run!r} is not NN or NN.K")
+            raise RoundError(f"run rerun: {args.run!r:.60} is not NN or NN.K")
         if bool(args.failed) == bool(args.agent):
             raise RoundError("run rerun: give --failed or --agent NAME, one of them")
         nn = int(match.group(1))
