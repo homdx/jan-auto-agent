@@ -172,6 +172,14 @@ def _profile_set_arguments(p: argparse.ArgumentParser) -> None:
 _POSITIVE_INT = re.compile(r"[1-9][0-9]*")
 _BACKENDS = ("kilo", "openrouter")
 
+#: Bug 183: roster's parser has `inline_comment_prefixes=(";", "#")`, which cut a
+#: value at a `;` or `#` that starts it or follows whitespace (`str.isspace()`, a
+#: no-break space too). `write_profile_keys` writes `key = value`, so such a value
+#: went to disk whole and came back truncated — `extra = --note "a ; b"` read as
+#: `--note "a`, and the profile no longer loaded. There is no way to escape it in
+#: the ini, so the value is refused.
+_INLINE_COMMENT = re.compile(r"(?:^|\s)[;#]")
+
 
 def _set_values(pairs: list[str]) -> dict[str, Optional[str]]:
     """`KEY=VALUE` words → `{key: value}`, `None` for `KEY=`. `ProfileError` to refuse."""
@@ -196,6 +204,10 @@ def _set_values(pairs: list[str]) -> dict[str, Optional[str]]:
         # section in contest.local.ini, which `write_profile_keys` edits as text
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
             raise profile.ProfileError(f"{key}: the value holds a control character or a newline")
+        if _INLINE_COMMENT.search(value):
+            raise profile.ProfileError(
+                f"{key}: a ';' or '#' that starts the value or follows a space would be "
+                "read as a comment in the ini — leave the space out")
         if key in ("max_parallel", "legs") and value and not _POSITIVE_INT.fullmatch(value):
             raise profile.ProfileError(f"{key} must be a positive integer, not {value!r}")
         if key == "backend" and value and value not in _BACKENDS:
