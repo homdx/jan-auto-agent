@@ -992,6 +992,32 @@ def test_kilo_limit_is_the_real_window_and_input_is_the_compact_point():
     assert cm.kilo_limit(None, 32_000) is None
 
 
+@pytest.mark.parametrize("size, output", [
+    (32_000, 32_000),    # round 146: the publicai models — Kilo compacted them at 12 000
+    (32_000, None),
+    (64_000, 32_000),
+    (98_777, None),      # round 145's glm-4.5-flash
+    (50_000, 20_000),
+    (20_000, 4_000),     # a reserve under Kilo's 20 000 is Kilo's reserve
+])
+def test_kilo_compacts_a_small_window_at_the_percent_not_at_the_size_minus_its_reserve(
+        size, output):
+    """Round 146: ``input`` was capped at the budget, and Kilo compacts at
+    ``input - min(20 000, output)``. For a budget under about 100 000 the cap
+    is *below* percent + reserve — a 32 000 budget with a 32 000 output was
+    handed ``input = 32 000`` and compacted at 12 000, 37 % of it and about the
+    size of Kilo's own base context (11.4 k): the ticket was summarised away
+    within a few steps, and the agent answered that it could not see one. The
+    compact point is the share of the budget — the one `compact_at_percent`
+    names and the runner's own watch fires at — whatever the budget."""
+    limit = cm.kilo_limit(size, output, 80)
+    reserved = min(cm.KILO_COMPACT_RESERVE, limit["output"])
+    assert limit["input"] - reserved == int(size * 80 / 100)
+    # the hard wall is still the real window, and `input` stays under it
+    assert limit["context"] == size + limit["output"]
+    assert limit["input"] < limit["context"]
+
+
 def test_the_file_one_overflow_wrote_is_what_the_next_round_hands_kilo(tmp_path, monkeypatch):
     """The whole ticket: an overflow that names the limit is written to the
     shared file, and the next round's server gets that size as `limit.context`,

@@ -4881,9 +4881,15 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             return
         pushed_limit[0] = size
         pushed_spec[0] = limit
+        # Kilo compacts after the step that reaches `input - min(20 000, output)`:
+        # that is the number to print, not `input`, which sits a reserve above it
+        # (round 146: for a small window `input` is above the size itself)
+        compact_point = max(0, int(limit.get("input") or 0)
+                            - min(context_memory.KILO_COMPACT_RESERVE,
+                                  int(limit.get("output") or 0)))
         _log.info("%s: Kilo now sizes %s/%s = %s (compact at %g %% of it, after %s "
                   "tokens) — was %s", spec.name, spec.provider_id, spec.model_id, f"{size:,}",
-                  percent, f"{limit.get('input') or 0:,}",
+                  percent, f"{compact_point:,}",
                   f"{declared:,}" if isinstance(declared, int) else "unknown")
 
     def context_watch(turn: dict) -> "_ContextWatch | None":

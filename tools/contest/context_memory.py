@@ -413,7 +413,12 @@ def kilo_limit(size, output, percent: float = DEFAULT_COMPACT_AT_PERCENT) -> dic
     preflight ``compaction.threshold_percent`` is skipped mid-turn (live, laguna:
     one compact at a turn's start, then 53 % inside the turn). So ``input`` is
     *percent* of the budget plus Kilo's reserve: the step past *percent* of the
-    budget compacts, the same share the runner's own gate uses.
+    budget compacts, the same share the runner's own gate uses. Round 146: that
+    holds for every budget — ``input`` was capped at the budget, and under
+    about 100 000 the cap sat below percent + reserve, so Kilo compacted at
+    ``size - reserve`` instead (a 32 000 budget with a 32 000 output: at
+    12 000, 37 %, about Kilo's own base context). ``input`` may be above the
+    budget; Kilo's hard wall is ``context``, which is above it by ``output``.
 
     ``context`` stays the model's real window, ``size + output`` — Kilo treats it
     as a hard wall, and a cut one ends turns in ``Compaction exhausted`` (live,
@@ -432,7 +437,7 @@ def kilo_limit(size, output, percent: float = DEFAULT_COMPACT_AT_PERCENT) -> dic
     except (TypeError, ValueError):
         share = 0.0
     if math.isfinite(share) and 0 < share < 100:
-        at = min(size, int(size * share / 100) + min(KILO_COMPACT_RESERVE, reserve))
+        at = int(size * share / 100) + min(KILO_COMPACT_RESERVE, reserve)
     else:
         at = size
     return {"context": size + reserve, "input": at, "output": reserve}
