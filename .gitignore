@@ -33,3 +33,4 @@ runs/
 
 # AR-1: arena drafts and local state.
 .arena/
+claim-check-out/
