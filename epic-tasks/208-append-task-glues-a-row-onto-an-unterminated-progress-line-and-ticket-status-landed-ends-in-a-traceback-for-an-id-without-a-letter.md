@@ -40,6 +40,11 @@ One file per bug in `tests_bugfix/` (`test_<script>_<what>_208.py`), each failin
 40 — a row after an unterminated last line is its own row; the new row keeps the file's own line ending (`\r\n` file → `\r\n` row); a terminated file gets no blank line; a new file still gets its header and first row; `next_task.recorded` then sees both tickets;
 41 — landing a ticket whose heading starts with a number, and one with no heading at all, prints what comes next (exit 0, the `git push` line present, the status already committed); a ticket with a family still lists its own epic first.
 
+## Review material
+
+Review tests (held by the operator, outside the repo): `test_append_task_missing_final_newline`, `test_ticket_status_landed_next_steps`.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

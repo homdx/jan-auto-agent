@@ -35,6 +35,11 @@ Probed: a `PROGRESS.csv` starting `\xff\xfe…` → `UnicodeDecodeError: 'utf-8'
 One file per bug in `tests_bugfix/` (`test_<area>_<what>_207.py`), each failing on the old code:
 35 — `_number` of `nan`/`inf` is `None`, finite floats still truncate, `load` keeps the good records of a file with one non-finite size; 36 — `_number(inf)` and `_number(nan)` are `0`, a token dict with `Infinity` still gets its row; 37 — a binary fixture under `tests/` is a file in the row, a test file with a Latin-1 byte still counts its tests, a Latin-1 commit message is a row, the shrink gate reads a bridge file with a Latin-1 byte, an absent bridge is still `None`; 38 — a red step and a green step with undecodable stdout and stderr are rows (red keeps a summary), later steps still run, a step that cannot start is still a failed row; 39 — an undecodable file, a NUL byte, a huge field are read as empty, the script hands out the ticket, a readable file still skips the recorded ticket.
 
+## Review material
+
+Review tests (held by the operator, outside the repo): `test_contest_memory_non_finite`, `test_contest_gates_undecodable_git_output`, `test_arena_base_check_undecodable_output`, `test_arena_base_check_non_utf8_212`, `test_next_task_unreadable_progress`.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

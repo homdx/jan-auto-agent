@@ -43,6 +43,11 @@ Not in scope, a decision for the operator: `basecheck._hit` accepts a cached pas
 
 An independent review (`bugs-to-review/`, `test_arena_set_status_text_round_trip` and `…_set_status_text_210`) re-found 12–14 and its regression tests still fail on this tree (11 round-trip cases, the CRLF `close`/`reopen`/plain-change cases, the `**Closed:**`-above-`**Status:**` case). Two extra cases worth pinning: a `**Closed:**` line that is the *last* line takes its own newline with it, and `reopen` after a note keeps the note out but moves nothing else.
 
+## Review material
+
+Review tests (held by the operator, outside the repo): `test_arena_set_status_text_round_trip` (11 tests, 15 failing cases here), `test_arena_set_status_text_210`; report `bugs-to-review/6.txt`, bugs 12–15.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

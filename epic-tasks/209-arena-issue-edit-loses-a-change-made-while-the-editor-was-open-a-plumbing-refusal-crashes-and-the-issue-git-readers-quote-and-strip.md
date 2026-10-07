@@ -36,6 +36,11 @@ The `hints` expression is `[ {…} if "moved from" in message else [ {…} ] ] +
 43 — `GitRefError("git read-tree: cannot read the index")`, `"git commit-tree: Author identity unknown"`, `"branch 'x' does not exist"`, injected: exit 2, three hints, all `{why, command}`, text and json;
 44 — a ticket named `02-баг.md` is found on a branch; an unstaged ` M epic-tasks/07-x.md` is named whole; a modified tracked `.arena/…` file is not counted; renames and spaces in names.
 
+## Review material
+
+Review tests (held by the operator, outside the repo): `test_arena_issue_edit_concurrent` (9 failing cases here), `test_arena_issue_git_reads_211`, `test_arena_dirty_tasks_path`.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

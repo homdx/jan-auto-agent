@@ -38,6 +38,11 @@ The runbook says "an answer is cached by section text: a second run sends nothin
 One file per bug in `tests_bugfix/` (`test_lenz_<what>_204.py`), each failing on the old code:
 23 — the two claims above, only the second is kept (also a claim naming a symbol of a temp repo); 24 — the three slash sentences are public and `tools/contest/cli.py`, `tests/`, `scripts/x.sh` stay internal; 25 — `[]` and `null` cache files; 26 — the six sentences above round-trip unchanged and `- a`, `* a`, `+ a`, `1. a`, `12) a`, `1.2. a` lose only their marker; 27 — a temp git repo with `my module.py` and `ф.py`; 28 — a fully cached section needs no key and sends nothing (assert no network call); `--json` with nothing to send writes `[]`.
 
+## Review material
+
+Review tests (held by the operator, outside the repo): `test_lenz_split_sentences_numbers_218`, `test_lenz_repo_symbols_names_219`, and the filter/extract cases of `test_claim_check_scripts`.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

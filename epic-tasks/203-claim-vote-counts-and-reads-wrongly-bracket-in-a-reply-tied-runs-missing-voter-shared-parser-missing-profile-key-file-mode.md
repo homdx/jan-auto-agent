@@ -54,6 +54,11 @@ One file per bug in `tests_bugfix/` (`test_claim_vote_<what>_203.py`), each fail
 19 — four voters, one silent: `unanimous` is False and the verdict is still decided by the three that voted;
 20 — two threads and a barrier: each gets its own model; 21 — a misspelt profile and a missing Kilo file are rows with `errors`, the others still vote; 22 — a new file is `0600`, an existing file keeps its mode.
 
+## Review material
+
+Review tests (held by the operator, outside the repo): `test_claim_vote_parse_votes_215`, `test_claim_vote_acceptance_213`, `test_claim_vote_shared_parser_216`, `test_claim_vote_profile_file_mode_217`, and the voter cases of `test_claim_check_scripts`.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

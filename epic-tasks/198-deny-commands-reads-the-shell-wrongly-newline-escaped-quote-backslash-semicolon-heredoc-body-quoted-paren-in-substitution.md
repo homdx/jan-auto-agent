@@ -39,6 +39,11 @@ Keep `_MAX_NESTING`, the behaviour of 164/187 and the public names. A reader tha
 
 One file per bug in `tests_bugfix/` (`test_policy_<what>_198.py`), failing on the old code. Cases: `echo hi⏎git push`, the same with `\r\n`, a blank line between, a tab-indented second line; `echo \"; git push`, `echo \\"; git push` (the escaped backslash then a real quote), `echo '\"'; git push`; `echo \; git push` (allowed), `find . -exec ls {} \; ` (allowed), `echo a \; b; git push` (denied); the two heredoc forms (body with `;`, `<<-`, quoted and unquoted delimiter, a heredoc followed by `&& git push` on the delimiter's line, two heredocs on one line, a heredoc with no terminator — the rest of the text is then still searched, never skipped); lines that only look like a heredoc and stay commands (`cat <<< 'x'; git push`, `echo $((1 << 2)); git push`); an apostrophe in a heredoc body (`don't`) must not hide a `$(git push)` that follows the heredoc; an unquoted heredoc's body with `$(git push)` is a push, a quoted one (`<<'EOF'`) may be either, say which in the commit; `echo "$(printf ')' ; git push)"`, a `'`-quoted `(` and an escaped `\)`, a nested depth 3. Plus the whole of 164's and 187's existing tests, unchanged and green. A table-driven test of ~40 lines (command, expected pattern or `None`) is welcome: a model tends to fix the four named lines and break a fifth.
 
+## Review material
+
+Review report `bugs-to-review/6.txt`, bugs 8–11 (its regression test file is `test_contest_deny_pieces_escapes_and_newlines`, plus `test_contest_deny_newline_and_keywords` for the newline and keyword cases) — held by the operator, outside the repo. The keyword cases (`then git push`) are ticket 205, bug 32.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

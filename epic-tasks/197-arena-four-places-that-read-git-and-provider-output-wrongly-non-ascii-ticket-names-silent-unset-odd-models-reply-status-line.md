@@ -38,6 +38,11 @@ One file per bug in `tests_bugfix/` (`test_arena_<what>_197.py`), each failing o
 
 An independent review (`bugs-to-review/`, bugs 206–209, tests `test_arena_ticket_name_non_ascii_206`, `…unset_inherited_key_207`, `…direct_models_field_shape_208`, `…dirty_tasks_names_209`) reports the same four defects, and its regression tests still fail on this tree (6, 5, 15 and 4 failing cases). The same two readers (quoted ticket names, a stripped `git status` line) are repeated in `tickets.py` — that is ticket 209, bug 44; fix the shared reader once, here or there, and say which in the commit.
 
+## Review material
+
+Review tests (held by the operator, outside the repo so a round does not copy them): `test_arena_ticket_name_non_ascii_206`, `test_arena_unset_inherited_key_207`, `test_arena_direct_models_field_shape_208`, `test_arena_dirty_tasks_names_209` — 6, 5, 15 and 4 failing cases on this tree.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

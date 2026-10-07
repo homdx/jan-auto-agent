@@ -39,6 +39,11 @@ So four spellings of a whole-suite run never take the round's suite slot, and th
 34 — `-kfoo`, `-mslow`, `-k=foo` name a subset; `-q`, `-x`, `-n 4`, `--tb=short` do not;
 and the **drift guard of ticket 163**, over these commands: for every command in one shared table `is_full_suite_command(c)` is true only if `is_pytest_command(c)` is, and the two agree on what the pytest argument list is.
 
+## Review material
+
+Review tests (held by the operator, outside the repo): `test_contest_suite_command_shape` (19 failing cases here).
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

@@ -41,6 +41,11 @@ Same as 4 for `.arena`/contest overflow memory: a future `at` never ages out, an
 
 One file per bug in `tests_bugfix/` (`test_<area>_<what>_199.py`), failing on the old code. Cover: 1 — `queued)`, `(landed)`, `—`, `landed,`, `` `open` `` for both readers and that the two agree on a table of ~15 words; 2 — `Open`, `open,`, two spaces, tab, and that the produced command parked on a real temp git repo leaves the file `**Status:** queued` and one commit; 3 — `retries` 0, -1, 1 with a held lock and a `sleep` seam that records calls; 4/7 — a record at `now + 1 s`, `now + 10 days`, `now - days - 1`, exactly at the edge; 6 — ` `, `\x85`, `\x0b`, `\x0c` in an old value and in a neighbouring line, the file loads and holds exactly the keys it had plus the changed one.
 
+## Review material
+
+Review report `bugs-to-review/6.txt`, bugs 1–4, 6, 7 and 16 (a probed repro for each; its test files are held by the operator, outside the repo).
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

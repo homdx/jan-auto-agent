@@ -54,6 +54,11 @@ One file per bug in `tests_bugfix/` (`test_policy_<what>_201.py`), each failing 
 - 15: `cat <<\EOF`, `cat <<E"O"F`, `cat <<'E'OF`, `cat <<"EOF"` each with `⏎x; git push⏎EOF` (allowed) and with `⏎x⏎EOF⏎git push` (denied).
 - Plus 164's, 187's and 198's tests unchanged and green, and the black box: `python3 -m pytest contest-bench/198/acceptance_198.py -n 0 -q` on the new tree (43 passed).
 
+## Review material
+
+Review report `bugs-to-review/6.txt` has no bug 12–15 of this ticket: they were found by judging round 198 (`contest-bench/198`); the review's own deny tests are listed in ticket 205.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash

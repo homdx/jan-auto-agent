@@ -50,6 +50,11 @@
 29 — the five option spellings above plus `git --git-dir=x --work-tree=y push`, `git -C a -C b push`, `git -c a=b -c c=d push`; 30 — the five command-word spellings and a pattern with a path still matching as written; 31 — `sudo git push`, `sudo -u root git push`, `xargs git push`, `xargs -n1 git push`, `nice -n 5 git push`; 32 — `then`/`do`/`else`/`elif`/`if`/`while`/`until` lines.
 **The false-positive side is the same size:** `git -C wt status`, `git -c x=y log`, `git --no-pager diff`, `git pushd` (not a git subcommand), `echo git push`, `"git push"` as a quoted argument, `sudo ls`, `xargs echo`, `echo then git push` are all *not* denied; the other default patterns (`git reset --hard*`, …) see through a directory and a quote too.
 
+## Review material
+
+Review tests (held by the operator, outside the repo): `test_contest_deny_git_options_and_wrappers` (29 failing cases here), `test_contest_deny_newline_and_keywords`.
+The operator keeps these outside the repo on purpose: a round that can read the reviewer's fix would copy it, and the competition would measure nothing.
+
 ## Acceptance
 
 ```bash
