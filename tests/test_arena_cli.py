@@ -45,11 +45,43 @@ def test_missing_or_malformed_arguments_are_one_line_usage_errors(argv, capsys):
     assert "usage:" not in err
 
 
-def test_unimplemented_verb_names_its_ticket(capsys):
-    assert cli.main(["issue", "land"]) == 2
+def test_unimplemented_verb_names_its_ticket(capsys, monkeypatch):
+    """Every real verb has a handler now, so the placeholder path is a fake verb."""
+    verbs = dict(cli.OBJECTS["entry"].verbs)
+    verbs["judge"] = cli.Verb("judge", "AR-65")
+    monkeypatch.setitem(cli.OBJECTS, "entry", cli.Object("entry", verbs))
+    assert cli.main(["entry", "judge"]) == 2
     assert capsys.readouterr().err.strip() == (
-        "arena: issue land is not implemented yet (AR-8)"
+        "arena: entry judge is not implemented yet (AR-65)"
     )
+
+
+def test_ar8_verbs_parse_their_own_arguments(monkeypatch):
+    """AR-8: `entry merge` and `issue land` are handlers, not placeholders."""
+    seen = []
+
+    def capture(args):
+        seen.append(args)
+        return 0
+
+    entry = cli.Object("entry", dict(cli.OBJECTS["entry"].verbs))
+    issue = cli.Object("issue", dict(cli.OBJECTS["issue"].verbs))
+    entry.verbs["merge"].handler = capture
+    issue.verbs["land"].handler = capture
+    monkeypatch.setitem(cli.OBJECTS, "entry", entry)
+    monkeypatch.setitem(cli.OBJECTS, "issue", issue)
+
+    assert cli.main(["entry", "merge", "195", "glm-4-7",
+                     "--uncommitted", "--squash"]) == 0
+    assert (seen[0].number, seen[0].agent) == ("195", "glm-4-7")
+    assert seen[0].uncommitted and seen[0].squash and seen[0].passthrough == []
+
+    assert cli.main(["issue", "land", "195", "-m", "done", "--score", "19/19",
+                     "--note", "twice", "--", "src/x.py"]) == 0
+    assert seen[1].number == "195" and seen[1].message == "done"
+    assert seen[1].score == "19/19" and seen[1].note == "twice"
+    assert seen[1].passthrough == ["src/x.py"]
+    assert not seen[0].yes and not seen[1].yes
 
 
 def test_passthrough_after_double_dash_is_kept_verbatim(monkeypatch):

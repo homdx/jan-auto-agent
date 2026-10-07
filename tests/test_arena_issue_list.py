@@ -204,10 +204,13 @@ def test_view_refusals(repo, capsys):
     assert code == 2 and len(err.splitlines()) == 1
 
 
-def test_land_still_unimplemented(capsys):
-    # `issue create` landed in round 145 (AR-7); `issue land` is AR-8.
+def test_land_is_implemented(capsys):
+    # `issue create` landed in round 145 (AR-7); `issue land` is AR-8, and it has
+    # a handler now — a missing NN is a usage error, not the placeholder's message.
     code, _, err = _run(capsys, "issue", "land")
-    assert code == 2 and "not implemented" in err
+    assert code == 2 and "NN" in err and "not implemented" not in err
+    code, out, _ = _run(capsys, "issue", "land", "--help")
+    assert code == 0 and "--score" in out and "--note" in out and "NN" in out
 
 
 def _snapshot(repo: Path):

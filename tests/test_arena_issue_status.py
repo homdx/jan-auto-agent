@@ -872,10 +872,12 @@ def test_the_verb_is_registered_with_its_flags(repo, capsys):
         assert verb in out
 
 
-def test_land_is_still_the_unimplemented_one(repo, capsys):
-    assert cli.OBJECTS["issue"].verbs["land"].handler is None
-    code, _, err = _run(capsys, "issue", "land", str(NN))
-    assert code == 2 and "not implemented" in err and "AR-8" in err
+def test_land_has_a_handler_in_ar8(capsys):
+    """AR-8: `issue land` is a handler with its own arguments, not a placeholder."""
+    verb = cli.OBJECTS["issue"].verbs["land"]
+    assert verb.handler is not None and verb.add_arguments is not None
+    code, out, _ = _run(capsys, "issue", "land", "--help")
+    assert code == 0 and "--score" in out and "--note" in out and "NN" in out
 
 
 # 8 ─ what the judge of round 150 found missing in the winner, each now pinned

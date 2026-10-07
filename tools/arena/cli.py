@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import basecheck, judging, models, output, profile, rounds, tickets
+from . import basecheck, judging, merge, models, output, profile, rounds, tickets
 
 # ── exit codes ───────────────────────────────────────────────────────────────
 #: The one exit-code table every `arena` command returns from.
@@ -451,6 +451,42 @@ def _issue_edit(args: argparse.Namespace) -> int:
     return tickets.issue_edit(REPO_ROOT, args, prof)
 
 
+# ── AR-8: entry merge / issue land ───────────────────────────────────────────
+def _entry_merge_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("number", metavar="NN", help="the round number")
+    p.add_argument("agent", metavar="AGENT", help="the entrant to merge")
+    p.add_argument("--uncommitted", action="store_true",
+                   help="merge the .diff: the tree the agent left, not a commit")
+    p.add_argument("--squash", action="store_true",
+                   help="fold a patch with several commits into one")
+    _late_globals(p, "p", "y")
+
+
+def _entry_merge(args: argparse.Namespace) -> int:
+    try:
+        prof = _issue_profile(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    return merge.entry_merge(REPO_ROOT, args, prof)
+
+
+def _issue_land_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("number", metavar="NN", help="the ticket's round number")
+    p.add_argument("-m", "--message", metavar="SUBJECT", help="the commit's subject")
+    p.add_argument("--score", metavar="TEXT",
+                   help="READY/TOTAL, e.g. `19/19 on contest-bench/NN`")
+    p.add_argument("--note", metavar="TEXT", help="a line under the commit's body")
+    _late_globals(p, "p", "y")
+
+
+def _issue_land(args: argparse.Namespace) -> int:
+    try:
+        prof = _issue_profile(args)
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
+    return merge.issue_land(REPO_ROOT, args, prof)
+
+
 # ── AR-59: model available / use / drop ──────────────────────────────────────
 def _late_globals(p: argparse.ArgumentParser, *names: str) -> None:
     """Accept `-p`, `-y`, `-o` after the verb too: `arena model use a -p p1 -y`.
@@ -627,7 +663,12 @@ OBJECTS: dict[str, Object] = {
                            handler=_issue_status_handler("reopen")),
             "edit": Verb("edit a ticket's text in $EDITOR, then commit it", "AR-14",
                          add_arguments=_issue_edit_arguments, handler=_issue_edit),
-            "land": Verb("land a ticket's winning entry", "AR-8"),
+            "land": Verb(
+                "land a ticket's winning entry: the closing commit",
+                "AR-8",
+                add_arguments=_issue_land_arguments,
+                handler=_issue_land,
+            ),
         },
     ),
     "run": Object(
@@ -652,7 +693,12 @@ OBJECTS: dict[str, Object] = {
     "entry": Object(
         "one agent's result in a round",
         {
-            "merge": Verb("merge an agent's entry", "AR-8"),
+            "merge": Verb(
+                "merge an agent's entry into the integration branch: the first commit",
+                "AR-8",
+                add_arguments=_entry_merge_arguments,
+                handler=_entry_merge,
+            ),
         },
     ),
 }

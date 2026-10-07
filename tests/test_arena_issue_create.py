@@ -658,12 +658,13 @@ def test_no_api_key_reaches_the_refusals_of_the_setup(repo, capsys, monkeypatch)
 
 # ── the rest of the issue object ─────────────────────────────────────────────
 
-def test_issue_land_is_still_not_implemented_and_list_shows_the_draft(
+def test_issue_land_is_implemented_and_list_shows_the_draft(
         repo, monkeypatch, capsys):
     writer, reviewer = _fakes(monkeypatch)
     assert _run(capsys, "issue", "create", "brief")[0] == 0
+    # AR-8: `issue land` is a handler — a missing NN is a usage error, one line.
     code, out, err = _run(capsys, "issue", "land")
-    assert code == 2 and "not implemented" in err and err.count("\n") == 1, err
+    assert code == 2 and "not implemented" not in err and err.count("\n") == 1, err
     code, out, err = _run(capsys, "-o", "json", "issue", "list")
     assert code == 0, err
     rows = json.loads(out)
