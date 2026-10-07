@@ -443,6 +443,193 @@ def test_no_entry_with_tests_is_an_empty_matrix_and_no_error(trees, tmp_path):
     assert (out / "cross.json").is_file() and (out / "cross.md").is_file()
 
 
+# ── 202: a round whose tests are in tests_bugfix/ ─────────────────────────────
+#
+# A bug-fix ticket ships its tests in `tests_bugfix/`, and the matrix looked in
+# `tests/` only: round 198's six entries each committed 1-5 files there, the
+# judge printed "cells: 0 × 7" and "no cell failed", and exit code 0.
+
+
+_TEST_ONE = """\
+import pkg.mod as mod
+
+
+def test_shared_is_one():
+    assert mod.shared() == 1
+"""
+
+_TEST_TWO = """\
+import pkg.mod as mod
+
+
+def test_shared_is_two():
+    assert mod.shared() == 2
+"""
+
+#: `shared()` moved to 2 and a test that asks for it by name.
+_MOD_TWO = """\
+def shared():
+    return 2
+
+
+def other():
+    return 10
+"""
+
+
+def _bugfix_entry(base, repo, root, name, test_text, mod_text=None):
+    """One entry whose only test change is a file in `tests_bugfix/`."""
+    wt = _entry(repo, base, root, name)
+    if mod_text is not None:
+        _write(wt / "pkg" / "mod.py", mod_text)
+    _write(wt / "tests_bugfix" / "test_fx.py", test_text)
+    _commit(wt, f"{name}: a tests_bugfix test")
+    return wt
+
+
+def test_changed_tests_reads_both_roots(trees, tmp_path):
+    """`tests_bugfix/` is a test root too, and a path in neither root is not a test."""
+    base, repo, _ts = trees
+    wt = _bugfix_entry(base, repo, tmp_path, "pfx", _TEST_ONE)
+    assert judge.changed_tests(str(wt), base) == ["tests_bugfix/test_fx.py"]
+    # git cannot read the path at all: the fail-open side, never an exception
+    assert judge.changed_tests(str(tmp_path / "not-a-repo"), base) == []
+
+
+def test_a_round_whose_tests_are_only_in_tests_bugfix_is_crossed(trees, tmp_path):
+    """Round 198: the matrix has the same rows and columns as a `tests/` round."""
+    base, repo, _ts = trees
+    p = _bugfix_entry(base, repo, tmp_path, "pfx2", _TEST_ONE)
+    q = _bugfix_entry(base, repo, tmp_path, "qfx", _TEST_TWO, _MOD_TWO)
+    data = judge.cross_tests([("pfx2", p), ("qfx", q)], base, workers=0, log=lambda *a: None)
+
+    assert data["tests"] == ["pfx2", "qfx"], data["tests"]
+    assert data["impls"] == ["pfx2", "qfx", "base"], data["impls"]
+    assert len(data["cells"]) == 6
+    # each entry's own test, and the base: one test each, one failure nowhere here
+    for tests, code in (("pfx2", "base"), ("pfx2", "pfx2"), ("qfx", "qfx")):
+        assert (_cell(data, tests, code)["passed"], _cell(data, tests, code)["total"]) == (1, 1)
+
+    # q moved shared(): p's test the base satisfies is a lead against q's code
+    beh = data["leads"]["behaviour"]
+    assert [(b["tests"], b["code"]) for b in beh] == [("pfx2", "qfx")]
+    assert beh[0]["node"].startswith("tests_bugfix/")
+    assert beh[0]["node"].endswith("::test_shared_is_one")
+    assert data["leads_count"] == len(data["leads"]["behaviour"]) + len(data["leads"]["discriminating"])
+
+
+def test_the_same_basename_in_both_roots_is_two_files_and_neither_wins(trees, tmp_path):
+    """Two files called `test_same.py`, one per root: both are copied, both are collected.
+
+    The copy keeps its own root, and the root goes into the module name too —
+    pytest imports a test file by its basename alone, so one name per cell is an
+    `import file mismatch` and the cell is a collection error instead of a suite.
+    """
+    base, repo, _ts = trees
+    wt = _entry(repo, base, tmp_path, "bothfx")
+    _write(wt / "tests" / "test_same.py", _TEST_A)
+    _write(wt / "tests_bugfix" / "test_same.py", _TEST_B)
+    _commit(wt, "bothfx: the same basename in both roots")
+
+    files = judge.changed_tests(str(wt), base)
+    assert files == ["tests/test_same.py", "tests_bugfix/test_same.py"], files
+    scratch = tmp_path / "scratch"
+    copied = judge._copy_tests(str(wt), files, str(scratch), "bothfx")
+    assert copied == ["tests/_xcross_bothfx_test_same.py",
+                      "tests_bugfix/_xcross_bothfx_tests_bugfix_test_same.py"], copied
+    assert all((scratch / c).is_file() for c in copied)
+
+    data = judge.cross_tests([("bothfx", wt)], base, workers=0, log=lambda *a: None)
+    cell = _cell(data, "bothfx", "bothfx")
+    assert (cell["passed"], cell["total"]) == (2, 4), cell     # both files ran
+    nodes = {f["node"] for f in cell["failures"]}
+    assert len(nodes) == 2
+    assert any(n.startswith("tests/") for n in nodes), nodes
+    assert any(n.startswith("tests_bugfix/") for n in nodes), nodes
+
+
+def test_the_same_basename_in_two_subdirectories_is_two_files(trees, tmp_path):
+    """`tests/a/test_dup.py` and `tests/b/test_dup.py` must not share one copied name.
+
+    One name for both is pytest's `import file mismatch`: the cell reads 0/1 on the
+    entry's own code, a failure nobody wrote.
+    """
+    base, repo, _ts = trees
+    wt = _entry(repo, base, tmp_path, "subfx")
+    _write(wt / "tests" / "a" / "test_dup.py", _TEST_A)
+    _write(wt / "tests_bugfix" / "b" / "test_dup.py", _TEST_A.replace("_a", "_b"))
+    _commit(wt, "subfx: two test_dup.py in different folders")
+    files = judge.changed_tests(str(wt), base)
+    copied = judge._copy_tests(str(wt), files, str(tmp_path / "scratch"), "subfx")
+    assert len(set(os.path.basename(c) for c in copied)) == len(copied) == 2, copied
+    data = judge.cross_tests([("subfx", wt)], base, workers=0, log=lambda *a: None)
+    cell = _cell(data, "subfx", "subfx")
+    assert cell["total"] == 4 and cell["note"] == "", cell   # 2 files x 2 tests, no collection error
+
+
+def test_an_entry_without_a_test_change_is_a_column_and_no_row_outside_tests(trees, tmp_path):
+    base, repo, _ts = trees
+    p = _bugfix_entry(base, repo, tmp_path, "pfx3", _TEST_ONE)
+    q = _bugfix_entry(base, repo, tmp_path, "qfx3", _TEST_TWO, _MOD_TWO)
+    quiet = _entry(repo, base, tmp_path, "quietfx")
+    _write(quiet / "pkg" / "mod.py", _MOD_TWO)
+    _commit(quiet, "quietfx: code only")
+    data = judge.cross_tests([("pfx3", p), ("qfx3", q), ("quietfx", quiet)], base,
+                             workers=0, log=lambda *a: None)
+    assert data["tests"] == ["pfx3", "qfx3"]
+    assert data["impls"] == ["pfx3", "qfx3", "quietfx", "base"]
+    assert len(data["cells"]) == 8
+    assert (_cell(data, "pfx3", "quietfx")["passed"],
+            _cell(data, "pfx3", "quietfx")["total"]) == (0, 1)
+
+
+def test_no_cell_at_all_says_nothing_was_crossed(trees, tmp_path):
+    """0 × N cells is not a clean matrix: the verdict a run prints must not appear."""
+    base, repo, _ts = trees
+    quiet = _entry(repo, base, tmp_path, "quietfx2")
+    _write(quiet / "pkg" / "mod.py", _MOD_TWO)
+    _commit(quiet, "quietfx2: code only")
+    out = tmp_path / "out"
+    _write(out / "SUMMARY.md", "# Round 198\n")
+    lines = []
+    data = judge.cross_tests([("quietfx2", quiet)], base, out_dir=str(out), log=lines.append)
+
+    assert data["tests"] == [] and data["cells"] == []
+    assert data["nothing_crossed"] is True
+    assert data["leads"] == {"behaviour": [], "discriminating": []}
+    assert data["leads_count"] == 0
+    assert data["leads_count"] == len(data["leads"]["behaviour"]) + len(data["leads"]["discriminating"])
+
+    text = " ".join(lines)
+    assert text.count(judge.NOTHING_CROSSED) == 2, lines      # once at the top, once at the end
+    assert "no cell failed" not in text, text
+    assert "Leads" not in text, text
+    md = (out / "cross.md").read_text(encoding="utf-8")
+    assert judge.NOTHING_CROSSED in md
+    assert "no cell failed" not in md and "## Leads" not in md
+    assert (out / "SUMMARY.md").read_text(encoding="utf-8").endswith(judge.NOTHING_CROSSED + "\n")
+
+
+def test_the_cli_exits_2_when_the_matrix_had_no_cell(trees, tmp_path):
+    """A judge that crossed nothing must not look like a judge that found nothing."""
+    base, repo, _ts = trees
+    quiet = _entry(repo, base, tmp_path, "quietfx3")
+    _write(quiet / "pkg" / "mod.py", _MOD_TWO)
+    _commit(quiet, "quietfx3: code only")
+    out = tmp_path / "contest-out" / "158"
+    cmd = [sys.executable, str(JUDGE), "--round", "158", "--tasks", str(repo / "epic-tasks"),
+           "--base", base, "--cross", "--cell-timeout", "120", "--cross-out", str(out),
+           "--worktree", f"quietfx3={quiet}"]
+    proc = subprocess.run(cmd, cwd=str(repo), capture_output=True, text=True, timeout=300)
+    assert proc.returncode == judge.EXIT_NO_CROSS == 2, proc.stdout + proc.stderr
+    assert proc.stdout.count(judge.NOTHING_CROSSED) == 2
+    assert "no cell failed" not in proc.stdout
+    assert "cells: 0" in proc.stdout
+    md = (out / "cross.md").read_text(encoding="utf-8")
+    assert judge.NOTHING_CROSSED in md
+    assert json.loads((out / "cross.json").read_text(encoding="utf-8"))["leads_count"] == 0
+
+
 def test_the_classes_are_ordered_api_then_base_then_behaviour():
     classify = judge._classify
     assert classify("t::x", "E   AttributeError: module 'm' has no attribute 'n'", {"t::x"}) == "api"

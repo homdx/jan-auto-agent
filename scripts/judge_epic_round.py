@@ -33,7 +33,7 @@ against every other entry's code, the base, and a candidate ideal. An entry's
 tests find what the bench misses — round 151's cache that outlived the drop,
 its linked worktree left with Kilo's own `.gitignore`.
 
-Exit codes: 0 scored · 1 usage / nothing to score.
+Exit codes: 0 scored · 1 usage / nothing to score · 2 nothing was crossed.
 
 KC-5: the scoring itself lives in `tools/contest/gates.py` (`judge_worktree`)
 so the contest runner can import it; this file is the operator CLI over it and
@@ -82,8 +82,26 @@ BEHAVIOUR = "behaviour"   # a candidate bug in I, to be reproduced by hand
 #: so it can never be mistaken for a test of I's own tree.
 _CROSS_NAME = "_xcross_"
 
-#: The test root the ticket names: `git diff --name-only <base> -- tests/`.
-TEST_ROOT = "tests/"
+#: The test roots an entry may put its tests in. `tests/` is the ordinary one;
+#: a round that fixes a historical bug ships its tests in `tests_bugfix/`
+#: instead, and a judge that looked in one root only scored round 198's six
+#: entries as zero cells (bug 16). A path in neither root is not a test.
+TEST_ROOTS = ("tests/", "tests_bugfix/")
+
+#: The first root, the one every matrix before 202 knew. Kept as the fallback
+#: for a path that names neither root, and as the name callers still use.
+TEST_ROOT = TEST_ROOTS[0]
+
+#: What a matrix with no cells says, in place of "no cell failed": the two
+#: sentences read the same at the end of the output and the second judged
+#: nothing. On stdout, in cross.md and in SUMMARY.md, once at the top and
+#: once at the bottom, and behind the exit code below.
+NOTHING_CROSSED = (
+    f"cross: no entry changed a test under {' or '.join(TEST_ROOTS)} — nothing was crossed"
+)
+
+#: `--cross` with no cell to run: the phase did not judge the round.
+EXIT_NO_CROSS = 2
 
 #: The cell's own suite runs with this many xdist workers, per the ticket.
 CROSS_WORKERS = 4
@@ -146,6 +164,18 @@ def _modname(text):
     return s or "x"
 
 
+def _root_tag(root):
+    """The part of *root* that goes into a copied test's module name.
+
+    `tests/` needs none: the file sits in the directory its name already
+    stands for. Any other root does, because pytest imports a test file by its
+    basename alone — two files called `_xcross_p_x.py`, one per root, make the
+    second one `import file mismatch` and the whole cell is a collection error
+    instead of two suites. `tests_bugfix/` → `tests_bugfix`.
+    """
+    return "" if root == TEST_ROOT else _modname(root)
+
+
 def _git(cwd, *args):
     """`git <args>` in *cwd* as `(returncode, stdout)`; never raises.
 
@@ -163,18 +193,22 @@ def _git(cwd, *args):
 def changed_tests(path, base):
     """The test files *path* added or changed against *base* — `[]` if unreadable.
 
-    `git diff --name-only <base> -- tests/`: base against the worktree, so a
-    test an agent left uncommitted is crossed too. Anything git cannot name is
-    dropped, which is the fail-open side of the ticket.
+    `git diff --name-only <base> -- tests/ tests_bugfix/`: base against the
+    worktree, so a test an agent left uncommitted is crossed too. A path in
+    neither root is not a test, and one root missing from the tree is not an
+    error — git ignores an unmatched pathspec — so a round whose whole suite
+    is in `tests_bugfix/` is still seen. Anything git cannot name is dropped,
+    which is the fail-open side of the ticket.
     """
     try:
-        rc, out = _git(path, "diff", "--name-only", "--no-renames", base, "--", TEST_ROOT)
+        rc, out = _git(path, "diff", "--name-only", "--no-renames", base,
+                       "--", *TEST_ROOTS)
     except Exception:
         return []
     if rc:
         return []
     return [f for f in out.splitlines()
-            if f.startswith(TEST_ROOT) and f.lower().endswith(".py")]
+            if f.lower().endswith(".py") and any(f.startswith(r) for r in TEST_ROOTS)]
 
 
 def _resolve(repos, ref):
@@ -217,7 +251,14 @@ def _materialize(repo, ref, dest):
 
 
 def _copy_tests(entry, files, dest, label):
-    """P's changed test files into a scratch I, under `tests/_xcross_<P>_…`.
+    """P's changed test files into a scratch I, keeping each one's own root.
+
+    `tests/x.py` becomes `tests/_xcross_<P>_x.py`; `tests_bugfix/x.py` becomes
+    `tests_bugfix/_xcross_<P>_tests_bugfix_x.py`. The root stays in the path,
+    and it also goes into the module name, because pytest imports a test file
+    by its basename alone — a basename that exists in both roots is two files
+    and one collection error without it. The directory the file came from is
+    kept for the same reason.
 
     Returns the relative paths copied — `[]` when none of them is readable,
     which is a cell that says so rather than an empty suite that says `0/0`.
@@ -227,18 +268,27 @@ def _copy_tests(entry, files, dest, label):
         src = os.path.join(entry, rel)
         if not os.path.isfile(src):
             continue  # the diff named a file the worktree does not carry
-        stem = rel[len(TEST_ROOT):] if rel.startswith(TEST_ROOT) else os.path.basename(rel)
+        root, rest = next(((r, rel[len(r):]) for r in TEST_ROOTS if rel.startswith(r)),
+                          (TEST_ROOT, rel))
+        # the path below the root stays in the module name: `tests/a/test_x.py` and
+        # `tests/b/test_x.py` are two files, and one name for both is an
+        # `import file mismatch` — a false 0/1 on the entry's own code
+        stem = rest
+        tag = _root_tag(root)
         # a module name: pytest imports the file by its basename, and a `.` or
         # a `/` in it is a package path — `_xcross_agnes-2.5-flash_test_x` is
         # `ModuleNotFoundError: No module named '_xcross_agnes-2'`, which would
         # read as `api` for every cell of an entry named like a model or a
-        # judge folder (`apertus-v1-5-8b.GAVE_UP`)
-        dst = os.path.join(dest, TEST_ROOT,
-                           f"{_CROSS_NAME}{_modname(label)}_{_modname(os.path.splitext(stem)[0])}.py")
+        # judge folder (`apertus-v1-5-8b.GAVE_UP`). The root goes in too, when
+        # the root is not the one the file sits in.
+        name = (f"{_CROSS_NAME}{_modname(label)}"
+                + (f"_{tag}_" if tag else "_")
+                + f"{_modname(os.path.splitext(stem)[0])}.py")
+        dst = os.path.join(dest, root, name)
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(src, dst)
-            out.append(os.path.join(TEST_ROOT, os.path.basename(dst)))
+            out.append(os.path.join(root, name))
         except OSError:
             continue
     return out
@@ -622,6 +672,12 @@ def _render_markdown(providers, impls, by, base, ideal, ticket=None, round_no=No
     lines.append((f"- ideal: `{ideal}`" + (gone if "ideal" in skipped else ""))
                  if ideal else "- ideal: —")
     lines.append("")
+    if not rows:
+        # A matrix with no rows is not a quiet one: nothing was run, so the
+        # table, the leads and "no cell failed" would all say "all is well".
+        lines.append(NOTHING_CROSSED)
+        lines.append("")
+        return "\n".join(lines)
     lines.append("Rows are whose tests, columns are whose code; a cell is `passed/total`,")
     lines.append("`n/a` when the cell never ran. `api` is a name or signature only one")
     lines.append("implementation has, `base` also fails on the base, `behaviour` is a")
@@ -675,6 +731,60 @@ def cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOUT
                 "skipped": {}, "tests": [], "impls": [], "cells": []}
 
 
+def _append_summary(out_dir):
+    """Add the one line to `SUMMARY.md` in *out_dir*, when one is there: `""` otherwise.
+
+    The round's runner owns that file, so it is only ever appended to, never
+    rewritten; the line is not repeated if it is already there. A file that
+    cannot be read or written is left alone — the line still stands in
+    cross.md and on stdout, and the run never dies over a summary.
+    """
+    path = os.path.join(out_dir, "SUMMARY.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        if NOTHING_CROSSED in text:
+            return ""
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n" + NOTHING_CROSSED + "\n")
+        return ", SUMMARY.md"
+    except OSError:
+        return ""
+
+
+def _cross_empty(impls, skipped, base, ideal, out_dir, round_no, ticket, log):
+    """No entry changed a test the judge can see: nothing was crossed.
+
+    Not a clean matrix — a matrix that ran and failed nothing prints "no cell
+    failed", and a judge reading only the last line took a zero-cell run for a
+    judged round. The line goes to stdout twice, into cross.md and, when one is
+    there, into the round's SUMMARY.md; the exit code is 2.
+    """
+    log(NOTHING_CROSSED)
+    data = {"round": round_no, "ticket": ticket, "base": base, "ideal": ideal,
+            "skipped": skipped,
+            "tests": [], "impls": [i[0] for i in impls],
+            "leads": {"behaviour": [], "discriminating": []}, "leads_count": 0,
+            "nothing_crossed": True, "note": NOTHING_CROSSED, "cells": []}
+    md = _render_markdown([], impls, {}, base, ideal, ticket, round_no, skipped)
+    if out_dir:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "cross.json"), "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=1, ensure_ascii=False)
+                fh.write("\n")
+            with open(os.path.join(out_dir, "cross.md"), "w", encoding="utf-8") as fh:
+                fh.write(md + "\n")
+            log(f"\ncross -> {os.path.join(out_dir, 'cross.json')}, "
+                f"{os.path.join(out_dir, 'cross.md')}{_append_summary(out_dir)}")
+        except OSError as e:
+            log(f"cross: could not write {out_dir} — {e} (the matrix above stands)")
+    data["markdown"] = md
+    log("")
+    log(NOTHING_CROSSED)
+    return data
+
+
 def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOUT,
                  workers=CROSS_WORKERS, out_dir=None, round_no=None, ticket=None,
                  log=_say):
@@ -714,6 +824,8 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
 
     log(f"\nCross — every entry's own tests, run on every implementation "
         f"(cells: {len(providers)} × {len(impls)})")
+    if not providers:
+        return _cross_empty(impls, skipped, base, ideal, out_dir, round_no, ticket, log)
 
     # one line per finished cell: a real round is some ninety cells and minutes
     # long, and a judge that says nothing until the end looks hung
@@ -767,6 +879,10 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
             "tests": [p[0] for p in providers],
             "impls": [i[0] for i in impls],
             "leads": leads,
+            # the count the lists add up to: a reader of cross.json must never
+            # have to work one out, and never be handed a number that is not it
+            "leads_count": len(leads["behaviour"]) + len(leads["discriminating"]),
+            "nothing_crossed": False,
             "cells": [{"tests": pn, "code": in_, "passed": c["passed"], "total": c["total"],
                        "note": c["note"], "kinds": c["kinds"],
                        "failures": c["failures"]}
@@ -850,13 +966,15 @@ def main():
         if r.get("off_ticket_files"):
             print(f"  {r['agent']} touched off-ticket: {r['off_ticket_files']}")
 
+    crossed = True
     if a.cross:
         # zero-padded like `contest-out/<NN>` of the runner (`_round_out_dir`),
         # so cross.json / cross.md land next to SUMMARY.md also for round 7
         out_dir = a.cross_out or os.path.join("contest-out", f"{a.round:02d}")
-        cross_tests(trees, a.base, ideal=a.ideal, jobs=a.jobs,
-                    cell_timeout=a.cell_timeout, out_dir=out_dir,
-                    round_no=a.round, ticket=name)
+        data = cross_tests(trees, a.base, ideal=a.ideal, jobs=a.jobs,
+                           cell_timeout=a.cell_timeout, out_dir=out_dir,
+                           round_no=a.round, ticket=name)
+        crossed = not data.get("nothing_crossed", False)
 
     print("\nWhat this script cannot score — read the diffs for these:")
     print("  1. Does it do what the ticket's Acceptance list says, item by item?")
@@ -872,7 +990,7 @@ def main():
             for r in rows:
                 wr.writerow({k: r.get(k, "") for k in wr.fieldnames})
         print(f"\nscorecard -> {a.csv}")
-    return 0
+    return EXIT_NO_CROSS if not crossed else 0
 
 
 if __name__ == "__main__":

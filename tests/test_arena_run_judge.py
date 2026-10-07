@@ -180,6 +180,18 @@ def test_the_judges_exit_code_is_the_commands_and_a_failed_setup_stops_it(repo, 
     assert code == 5 and len(rec.lines) == 2
 
 
+def test_the_judges_nothing_crossed_code_comes_through_and_dry_run_runs_nothing(repo, monkeypatch, capsys):
+    _round(repo)
+    rec = Recorder(codes=[0, 2])
+    monkeypatch.setattr(judging, "RUN", rec)
+    code, _, _ = _judge(capsys, "184")
+    assert code == 2 and len(rec.lines) == 2
+    rec = Recorder()
+    monkeypatch.setattr(judging, "RUN", rec)
+    code, out, _ = _judge(capsys, "184", "--dry-run")
+    assert code == 0 and rec.lines == [] and "judge_epic_round.py" in out
+
+
 def test_a_loaded_box_gets_one_note_and_is_not_refused(repo, rec, capsys, monkeypatch):
     _round(repo)
     monkeypatch.setattr(judging, "LOADAVG", lambda: (99.0, 50.0, 20.0))
