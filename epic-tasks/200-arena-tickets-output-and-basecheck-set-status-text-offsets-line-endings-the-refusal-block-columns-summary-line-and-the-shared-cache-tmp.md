@@ -39,6 +39,10 @@ Not in scope, a decision for the operator: `basecheck._hit` accepts a cached pas
 
 `tests_bugfix/test_arena_set_status_text_200.py` (12, 13, 14: Closed above and below Status, no Closed, a reason with a trailing space, CRLF and LF, several close/reopen cycles are the identity, a missing status still raises `ValueError`) and `tests_bugfix/test_arena_refusal_block_200.py` (15: the exact text for the §7 example, a multi-line `command`, `-o json` unchanged except for folded newlines), plus one each for `_summary` (stderr warning after pytest's line) and `write_cache` (two threads writing at once leave a valid file and no `.tmp`).
 
+## Second review (cross-check on `arena` @ `00355fd`)
+
+An independent review (`bugs-to-review/`, `test_arena_set_status_text_round_trip` and `…_set_status_text_210`) re-found 12–14 and its regression tests still fail on this tree (11 round-trip cases, the CRLF `close`/`reopen`/plain-change cases, the `**Closed:**`-above-`**Status:**` case). Two extra cases worth pinning: a `**Closed:**` line that is the *last* line takes its own newline with it, and `reopen` after a note keeps the note out but moves nothing else.
+
 ## Acceptance
 
 ```bash

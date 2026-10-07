@@ -34,6 +34,10 @@ The shape of each model's fields is never checked: `pricing` as a string, `curre
 
 One file per bug in `tests_bugfix/` (`test_arena_<what>_197.py`), each failing on the old code. Cover: a ticket `07-а.md` and `07-"q".md` on a branch and as a base; a key in `contest.ini` with `profile set key=` and `unset-role` (exit code, message, nothing written); the twelve malformed replies of the operator's trial, a cut body, a 200 with an error object (nothing but a one-line hint, no traceback); ` M` with an unstaged file, a non-ASCII name, a rename.
 
+## Second review (cross-check on `arena` @ `00355fd`)
+
+An independent review (`bugs-to-review/`, bugs 206–209, tests `test_arena_ticket_name_non_ascii_206`, `…unset_inherited_key_207`, `…direct_models_field_shape_208`, `…dirty_tasks_names_209`) reports the same four defects, and its regression tests still fail on this tree (6, 5, 15 and 4 failing cases). The same two readers (quoted ticket names, a stripped `git status` line) are repeated in `tickets.py` — that is ticket 209, bug 44; fix the shared reader once, here or there, and say which in the commit.
+
 ## Acceptance
 
 ```bash
