@@ -46,7 +46,7 @@ from scripts.ticket_status import INDEX_ROW, STATUS_RE, TICKET_RE, remote_of
 from tools.contest import cli as contest_cli
 
 from . import output, rounds, tickets
-from .gitref import GitRefError, git, read_utf8
+from .gitref import GitRefError, git, ls_tree_names, read_utf8
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = rounds.EXIT_OK, rounds.EXIT_FAILED, rounds.EXIT_USAGE
 
@@ -583,7 +583,10 @@ def read_ticket(repo: Path, nn: int) -> Optional[tuple[str, str]]:
     """
     ref = f"{rounds.REF_PREFIX}{nn}"
     try:
-        names = git(repo, "ls-tree", "--name-only", f"{ref}:{TASKS_DIR}/").splitlines()
+        # Bug 206: the shared `ls-tree -z` reader — a name git would have quoted here
+        # was invisible to `merge` too, not only to `find_ticket`.
+        names = [name.rsplit("/", 1)[-1]
+                 for name in ls_tree_names(repo, ref, TASKS_DIR + "/")]
     except GitRefError:
         names = []
     found = _numbered(names, nn)

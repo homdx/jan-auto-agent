@@ -279,6 +279,26 @@ def _ticket_body(tasks_dir, name, at=None) -> str:
         return ""
 
 
+def _tree_names(repo, at, folder, recursive=False) -> list:
+    r"""The names under *folder* in *at*'s tree: `ls-tree -z`, NUL-split, unquoted.
+
+    Bug 206: without `-z` git C-quotes a name holding a non-ASCII letter, a `"` or
+    a `\` (`"epic-tasks/\320\260.md"`), and no ticket pattern knows such a string —
+    a hand-named ticket was invisible on a base. `tools/arena/gitref.py` reads the
+    same thing through `ls_tree_names`; this side keeps `run_git` and its `[]`
+    contract, so a base that cannot be read is "no ticket there", not an exception.
+    """
+    args = ["ls-tree"]
+    if recursive:
+        args.append("-r")
+    args += ["-z", "--name-only", str(at), str(folder)]
+    proc = run_git(["git", *args], cwd=str(repo), encoding="utf-8",
+                   errors="surrogateescape")
+    if proc.returncode:
+        return []
+    return [name for name in proc.stdout.split("\0") if name]
+
+
 def _tickets(tasks_dir, at=None) -> list:
     """`(number, path, status, body)` per `NN-*.md`, in numeric order.
 
@@ -293,10 +313,9 @@ def _tickets(tasks_dir, at=None) -> list:
     """
     tasks_dir = Path(tasks_dir)
     if at:
-        rel_dir = Path(tasks_dir).name
-        listed = gates.git(str(tasks_dir.parent), "ls-tree", "-r", "--name-only",
-                           str(at), rel_dir)
-        names = [line.rsplit("/", 1)[-1] for line in listed.splitlines() if line.strip()]
+        names = [name.rsplit("/", 1)[-1]
+                 for name in _tree_names(tasks_dir.parent, at, Path(tasks_dir).name,
+                                         recursive=True)]
     else:
         names = [path.name for path in tasks_dir.glob("*.md")]
     found = []
@@ -336,9 +355,8 @@ def ticket_file(repo, tasks_dir, round_no, at) -> tuple:
         rel = tasks_dir.resolve().relative_to(repo.resolve()).as_posix()
     except ValueError:
         return "", None
-    listed = gates.git(str(repo), "ls-tree", "--name-only", str(at), rel + "/")
-    for line in listed.splitlines():
-        base_name = line.rsplit("/", 1)[-1]
+    for full in _tree_names(repo, at, rel + "/"):
+        base_name = full.rsplit("/", 1)[-1]
         match = re.match(r"^0*(\d+)-.*\.md$", base_name)
         if not match or int(match.group(1)) != round_no:
             continue
@@ -875,8 +893,7 @@ def _target_failures(repo, base_ref: str) -> list:
         return []
     missing = []
     for rel in (*_TARGET_FILES, "epic-tasks"):
-        listed = gates.git(str(repo), "ls-tree", "--name-only", base_ref, "--", rel)
-        if not listed:
+        if not _tree_names(repo, base_ref, rel):
             missing.append(rel)
     if not missing:
         return []

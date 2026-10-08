@@ -52,6 +52,54 @@ def git(repo: Path, *args: str, env: Optional[dict] = None,
     return out.strip() if strip else out
 
 
+def ls_tree_names(repo: Path, ref: str, folder: str, recursive: bool = False) -> list[str]:
+    r"""The file names under *folder* in *ref*'s tree, quoted names included.
+
+    Bug 206: `ls-tree --name-only` C-quotes a name holding a non-ASCII letter, a
+    `"` or a `\` (`"epic-tasks/\320\260.md"`), and no ticket pattern knows such a
+    string — a hand-named ticket was invisible on a branch or a base. `-z` turns
+    the names into NUL-separated bytes and turns the quoting off, so the names
+    come back as git holds them. `strip=False`: the NULs are the separators, and
+    a stripped result would keep them anyway but loses any leading blank.
+    `GitRefError` when *ref* cannot be read, as `git` does — the caller decides
+    whether that is `[]` or a refusal.
+    """
+    extra = ["-r"] if recursive else []
+    raw = git(repo, "ls-tree", *extra, "-z", "--name-only", ref, folder, strip=False)
+    return [name for name in raw.split("\0") if name]
+
+
+def status_paths(repo: Path, pathspec: Optional[str] = None) -> list[str]:
+    """The untracked and modified paths under *pathspec*, by their real names.
+
+    Bug 209: `git()` strips the whole output, so the first `status --porcelain`
+    line lost its leading space (` M epic-tasks/01-a.md` → `M epic-tasks/…`) and
+    `line[3:]` cut a letter — the refusal named `pic-tasks/01-a.md`. `-z` gives
+    NUL-separated records, `XY<space>path`, so the path comes from the record, a
+    non-ASCII name is its own name and a rename is its new name. `GitRefError`
+    when git cannot answer.
+    """
+    args = ["status", "--porcelain", "-z", "--untracked-files=all"]
+    if pathspec:
+        args += ["--", pathspec]
+    raw = git(repo, *args, strip=False)
+    out: list[str] = []
+    renamed = False
+    for record in raw.split("\0"):
+        if not record:
+            continue
+        if renamed:
+            # `-z` puts the OLD name second in an `R ` / `C ` pair — `old -> new`
+            # over a tab becomes `new\0old`, so the name worth keeping was first.
+            renamed = False
+            continue
+        if len(record) < 3 or record[2] != " ":
+            continue  # not `XY<space>path`: an unreadable record, skipped
+        out.append(record[3:])
+        renamed = record[0] in ("R", "C")
+    return out
+
+
 def printable(text: str) -> str:
     """*text* (from `git` or `read_utf8`) with each undecodable byte as U+FFFD,
     safe to print or to search; never feed it back to git as content."""

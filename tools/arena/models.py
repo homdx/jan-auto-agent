@@ -80,6 +80,7 @@ import concurrent.futures
 import contextlib
 import difflib
 import glob
+import http.client
 import io
 import json
 import math
@@ -562,17 +563,54 @@ def _with_models(text: str, name: str, value: str) -> str:
     return _with_key(text, name, "models", value)
 
 
+def _still_set(repo: Path, local_text: str, name: str, keys: list[str]) -> list[str]:
+    """The keys of *name* that are still set once *local_text* is the local file.
+
+    `contest.ini` then *local_text*, the order the round reads them in.
+    """
+    if not keys:
+        return []
+    parser = roster._new_parser()
+    committed = repo / "contest.ini"
+    if committed.is_file():
+        try:
+            parser.read(committed, encoding="utf-8")
+        except (configparser.Error, OSError, UnicodeDecodeError):
+            pass
+    if local_text:
+        try:
+            parser.read_string(local_text)
+        except (configparser.Error, UnicodeDecodeError):
+            pass
+    section = f"{profile.SECTION_PREFIX}{name}"
+    return [key for key in keys
+            if parser.has_option(section, key) and parser.get(section, key).strip()]
+
+
 def write_profile_keys(repo: Path, name: str, values: dict[str, Optional[str]]) -> None:
     """Set (or, for `None`, remove) profile keys in `contest.local.ini`.
 
     The one ini writer: atomic (`mkstemp` + `os.replace`), the file mode kept,
     every key applied to the text before the one write.
+
+    Bug 207: a key the committed `contest.ini` sets cannot be removed here — there
+    is no empty override the ini format would read as gone. Such a remove is a
+    `ModelError` naming the file, written nothing; before the fix it was a silent
+    no-op with the preview saying the key was gone, and `issue create` went on
+    writing the ticket with the model that was meant to be removed.
     """
     path = repo / roster.LOCAL_FILENAME
     try:
         text = path.read_bytes().decode("utf-8") if path.exists() else ""
         for key, value in values.items():
             text = _with_key(text, name, key, value)
+        kept = _still_set(repo, text, name,
+                          [key for key, value in values.items() if value is None])
+        if kept:
+            raise ModelError(
+                f"{', '.join(kept)} is set in contest.ini, which "
+                f"{roster.LOCAL_FILENAME} cannot override with an empty value — "
+                f"unset the line in contest.ini ({roster.LOCAL_FILENAME} unchanged)")
         data = text.encode("utf-8")
         fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(repo))
         try:
@@ -685,6 +723,11 @@ def _direct_for(provider: str, url: str, key: str, now: float) -> list[dict]:
         recs = _direct_records(url, key, now)
     except urllib.error.HTTPError as err:
         raise ModelError(f"{provider}: direct list failed: HTTP {err.code}") from err
+    except http.client.HTTPException as err:
+        # Bug 208: a cut body is `http.client.IncompleteRead` or `BadStatusLine`, an
+        # HTTPException that is neither an OSError nor a ValueError, so it escaped the
+        # one-line hint and was a traceback instead.
+        raise ModelError(f"{provider}: direct list failed: {_hide(str(err), key)}") from err
     except (OSError, ValueError) as err:
         raise ModelError(f"{provider}: direct list failed: {_hide(str(err), key)}") from err
     for r in recs:

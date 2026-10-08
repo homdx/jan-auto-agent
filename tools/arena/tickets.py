@@ -30,7 +30,8 @@ from tools.contest import cli as contest_cli
 from tools.contest import draft as contest_draft
 
 from . import models, output, profile, rounds
-from .gitref import GitRefError, git, printable, read_utf8, tree_with_file
+from .gitref import (GitRefError, git, ls_tree_names, printable, read_utf8,
+                     status_paths, tree_with_file)
 
 #: Every state `scan` computes, in the order the first match wins.
 STATES = ("landed", "closed", "running", "done", "queued", "draft", "open")
@@ -101,8 +102,10 @@ def _folder_names(folder: Path) -> list[str]:
 
 
 def _branch_names(repo: Path, branch: str) -> list[str]:
-    listed = git(repo, "ls-tree", "--name-only", branch, rounds.TASKS_DIR + "/")
-    return [line.rsplit("/", 1)[-1] for line in listed.splitlines()]
+    # Bug 206: the names come from `ls-tree -z`, so a name with a non-ASCII letter,
+    # a `"` or a `\` is its own name, not the C-quoted escape git prints without `-z`.
+    return [name.rsplit("/", 1)[-1]
+            for name in ls_tree_names(repo, branch, rounds.TASKS_DIR + "/")]
 
 
 def subject_numbers(subject: str) -> set:
@@ -761,20 +764,20 @@ def _head_branch(repo: Path) -> str:
 
 
 def _modified(repo: Path) -> list[str]:
-    """The checkout's untracked or modified files, `git status --porcelain` paths.
+    """The checkout's untracked or modified files, by path.
 
     `.arena/` is excluded: arena's own state and a refused edit's kept temp file
-    are not the operator's uncommitted work.
+    are not the operator's uncommitted work. Bug 209 (and 44): read through
+    `gitref.status_paths` — the stripped `status --porcelain` line cut a letter,
+    so a name that no longer started with `.arena/` counted as the operator's
+    work, and a clean checkout read `(1 modified)`.
     """
-    return [line[3:] for line in git(repo, "status", "--porcelain",
-                                     "--untracked-files=all").splitlines()
-            if line.strip() and not line[3:].startswith(".arena/")]
+    return [path for path in status_paths(repo) if not path.startswith(".arena/")]
 
 
 def _uncommitted(repo: Path, rel: str) -> list[str]:
     """*rel*'s untracked or modified entries — a dirty ticket file is a refusal."""
-    listed = git(repo, "status", "--porcelain", "--untracked-files=all", "--", rel)
-    return [line[3:] for line in listed.splitlines() if line.strip()]
+    return status_paths(repo, rel)
 
 
 def _local_branches(repo: Path) -> list[str]:
@@ -798,11 +801,10 @@ def _round_state(repo: Path, nn: int) -> str:
 def _on_branch(repo: Path, branch: str, nn: int) -> list[str]:
     """The names of ticket *nn* on *branch*'s `epic-tasks/`, `[]` when there is none."""
     try:
-        listed = git(repo, "ls-tree", "--name-only", f"refs/heads/{branch}",
-                     rounds.TASKS_DIR + "/")
+        names = ls_tree_names(repo, f"refs/heads/{branch}", rounds.TASKS_DIR + "/")
     except GitRefError:
         return []
-    return rounds._numbered([line.rsplit("/", 1)[-1] for line in listed.splitlines()], nn)
+    return rounds._numbered([name.rsplit("/", 1)[-1] for name in names], nn)
 
 
 def _in_folder(repo: Path, folder: str, nn: int) -> list[str]:
@@ -1427,8 +1429,7 @@ def blocking_tickets(repo: Path, branch: str, number: int) -> list[dict]:
     """
     repo = Path(repo)
     try:
-        listed = git(repo, "ls-tree", "--name-only", f"refs/heads/{branch}",
-                     rounds.TASKS_DIR + "/")
+        names = ls_tree_names(repo, f"refs/heads/{branch}", rounds.TASKS_DIR + "/")
     except GitRefError:
         return []
     # A progress file that will not decode is not a blocker: `run start` never
@@ -1438,8 +1439,8 @@ def blocking_tickets(repo: Path, branch: str, number: int) -> list[dict]:
     except (OSError, ValueError):
         recorded = {}
     found = []
-    for line in listed.splitlines():
-        name = line.rsplit("/", 1)[-1]
+    for full in names:
+        name = full.rsplit("/", 1)[-1]
         match = rounds._TICKET_RE.match(name)
         if not match or name.endswith(contest_draft.REJECTED_SUFFIX):
             continue

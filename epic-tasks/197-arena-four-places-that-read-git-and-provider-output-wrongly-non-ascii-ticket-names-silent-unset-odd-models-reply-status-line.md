@@ -1,6 +1,6 @@
 # 197 — arena: four places that read git and provider output wrongly (quoted ticket names, silent unset, odd `/models` reply, status line)
 
-**Status:** queued
+**Status:** landed
 **Origin:** operator review of the arena, bugs 206–209
 **Severity:** LOW (all four; 207 and 206 are silent, 208 is a traceback, 209 is cosmetic)
 **File:** tools/arena/rounds.py

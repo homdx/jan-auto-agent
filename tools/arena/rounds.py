@@ -44,7 +44,8 @@ from tools.contest import cli as contest_cli
 from tools.contest import roster
 
 from . import output, profile
-from .gitref import GitRefError, commit_file_on, git, read_utf8, tree_with_file
+from .gitref import (GitRefError, commit_file_on, git, ls_tree_names, read_utf8,
+                     status_paths, tree_with_file)
 
 #: The ref prefix (`arena-round/7`); the full ref is under `refs/heads/`.
 REF_PREFIX = "arena-round/"
@@ -196,8 +197,8 @@ def find_ticket(repo: Path, nn: int, branch: str) -> tuple[str, str]:
             raise RoundError(f"more than one ticket {nn} in {rel}/: {', '.join(found)}")
         if found:
             return found[0], read_utf8(folder / found[0])
-    listed = git(repo, "ls-tree", "--name-only", branch, TASKS_DIR + "/")
-    found = _numbered([line.rsplit("/", 1)[-1] for line in listed.splitlines()], nn)
+    names = ls_tree_names(repo, branch, TASKS_DIR + "/")
+    found = _numbered([name.rsplit("/", 1)[-1] for name in names], nn)
     if len(found) > 1:
         raise RoundError(f"more than one ticket {nn} in {TASKS_DIR}/ on {branch}: "
                          f"{', '.join(found)}")
@@ -227,9 +228,14 @@ def integration_branch(repo: Path, flag: Optional[str], prof: dict[str, str]) ->
 
 
 def _dirty_tasks(repo: Path) -> list[str]:
-    """Untracked or modified files under the checkout's `epic-tasks/`."""
-    listed = git(repo, "status", "--porcelain", "--untracked-files=all", "--", TASKS_DIR + "/")
-    return [line[3:] for line in listed.splitlines() if line.strip()]
+    """Untracked or modified files under the checkout's `epic-tasks/`, by their real names.
+
+    Bug 209: `git()` stripped the whole `status --porcelain` output, so the first
+    line lost its leading space and `line[3:]` cut a letter — the refusal named
+    `pic-tasks/01-a.md` instead of the file, and a non-ASCII name came back with
+    its quote escapes, a rename as `old -> new`.
+    """
+    return status_paths(repo, TASKS_DIR + "/")
 
 
 def open_status(text: str) -> str:

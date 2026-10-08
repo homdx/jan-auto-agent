@@ -475,7 +475,11 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
     if isinstance(data, list):
         models = data
     elif isinstance(data, dict):
-        models = data.get("text") or data.get("data") or data.get("models") or []
+        models = data.get("text") or data.get("data") or data.get("models")
+        # Bug 208: a 200 whose body is an error object is not an empty list — it is
+        # the one-line failure the callers report, never a silent zero models.
+        if models is None and data.get("error") is not None:
+            raise ValueError(f"/models reply is an error: {str(data.get('error'))[:80]!r}")
     else:
         models = None
     # Bug 188: a reply of another shape (`null`, `"ok"`, `{"text": "Unauthorized"}`)
@@ -483,41 +487,64 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
     # traceback, nor a string iterated into one-letter "models".
     if not isinstance(models, list):
         raise ValueError(f"/models reply is not a model list: {str(data)[:80]!r}")
+    # Accept any recognised tool-capability token; skip only when capabilities are
+    # present but none of these tokens appears.
+    TOOL_CAPS = {"tool-use", "tools", "tool_calling", "function_calling",
+                 "function-calling", "toolcall"}
     rows = []
     for m in models:
-        if isinstance(m, str):
-            m = {"id": m}
-        if not isinstance(m, dict):
-            continue
-        mid = m.get("id") or m.get("name") or ""
-        if not mid:
-            continue
-        caps = m.get("capabilities") or []
-        # Accept any recognised tool-capability token; skip only when capabilities
-        # are present but none of these tokens appears.
-        TOOL_CAPS = {"tool-use", "tools", "tool_calling", "function_calling",
-                     "function-calling", "toolcall"}
-        if caps and not (TOOL_CAPS & set(caps)):
-            # Also accept when the model has an explicit tools:true flag
-            if not m.get("tools"):
+        # Bug 208: the shape of an entry is never promised by a provider. A `pricing`
+        # that is a string, a `capabilities` list of objects, a numeric `min_plan` or
+        # an object `id` each used to raise out of the loop. A field of the wrong type
+        # is that entry skipped, never a traceback: a bad entry costs one row, not the
+        # provider's whole list.
+        try:
+            if isinstance(m, str):
+                m = {"id": m}
+            if not isinstance(m, dict):
                 continue
-        pricing = m.get("pricing") or {}
-        # Some providers price in non-USD "pollen" or similar currencies; treat
-        # those as free-tier (no real cost to the user via the API key).
-        pricing_currency = pricing.get("currency", "").lower()
-        if pricing_currency and pricing_currency not in ("usd", ""):
-            pass  # non-USD currency — treat as free-tier, skip paid_fields check
-        elif paid_fields(pricing):
+            mid = m.get("id") or m.get("name") or ""
+            if not isinstance(mid, str) or not mid:
+                continue  # an id of another shape is not a model name
+            caps = m.get("capabilities")
+            if caps is None:
+                caps = []
+            elif not isinstance(caps, list) or any(not isinstance(c, str) for c in caps):
+                continue  # a shape we cannot read as a list of tokens
+            caps = list(caps)
+            if caps and not (TOOL_CAPS & set(caps)):
+                # Also accept when the model has an explicit tools:true flag
+                if not m.get("tools"):
+                    continue
+            pricing = m.get("pricing")
+            if pricing is None:
+                pricing = {}
+            elif not isinstance(pricing, dict):
+                continue  # `paid_fields` wants a mapping
+            plan = m.get("min_plan")
+            if plan is None:
+                plan = ""
+            elif not isinstance(plan, str):
+                continue  # a number or a list is not a plan name
+            # Some providers price in non-USD "pollen" or similar currencies; treat
+            # those as free-tier (no real cost to the user via the API key).
+            currency = pricing.get("currency")
+            currency = currency.lower() if isinstance(currency, str) else ""
+            if currency and currency not in ("usd", ""):
+                pass  # non-USD currency — treat as free-tier, skip paid_fields check
+            elif paid_fields(pricing):
+                continue
+            ctx = m.get("context_window") or m.get("context_length") or 0
+            plan = plan.upper()
+            if not pricing:
+                status, note = MAYBE, "no pricing info"
+            elif plan and plan not in ("BASIC", "FREE"):
+                status, note = MAYBE, f"min_plan={plan}"
+            else:
+                status, note = FREE, ""
+            rows.append((mid, status, ctx, note))
+        except (TypeError, ValueError, AttributeError):
             continue
-        ctx = m.get("context_window") or m.get("context_length") or 0
-        plan = (m.get("min_plan") or "").upper()
-        if not pricing:
-            status, note = MAYBE, "no pricing info"
-        elif plan and plan not in ("BASIC", "FREE", ""):
-            status, note = MAYBE, f"min_plan={plan}"
-        else:
-            status, note = FREE, ""
-        rows.append((mid, status, ctx, note))
     print(f"  direct api: checked {len(models)} models")
     # Inject known-free models not returned by the /models endpoint
     existing_ids = {r[0] for r in rows}
