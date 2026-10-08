@@ -664,39 +664,22 @@ def _unquote_token(token: str) -> str:
 
 
 def _subs_in_text(text: str) -> list:
-    """The ``$(…)`` and backtick bodies of *text*, respecting quotes and escapes.
+    """The ``$(…)`` and backtick bodies of *text*, the body of a heredoc.
 
     Used for the body of a heredoc whose delimiter was not quoted: the shell
     still runs command substitutions inside it, though a ``;`` in the body is
-    data and not a separator.
+    data and not a separator. A quote there is a plain character too — the
+    shell expands ``$(git push)`` in a body of ``don't\\nEOF$(git push)``, so
+    an apostrophe must not open a quote that swallows the rest (ticket 213).
+    Only a backslash escapes, and quotes count again inside a ``$(…)``, which
+    is a command line of its own.
     """
     out: list = []
-    n, i, quote = len(text), 0, ""
+    n, i = len(text), 0
     while i < n:
         c = text[i]
-        if quote == "'":
-            if c == "'":
-                quote = ""
-            i += 1
-            continue
-        if quote == '"':
-            if c == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if c == '"':
-                quote = ""
-            i += 1
-            continue
         if c == "\\":
             i += 2
-            continue
-        if c == "'":
-            quote = "'"
-            i += 1
-            continue
-        if c == '"':
-            quote = '"'
-            i += 1
             continue
         if c == "`":
             end = text.find("`", i + 1)
@@ -981,8 +964,10 @@ def _scan(command: str) -> tuple:
     if in_heredoc:
         # an unterminated heredoc: the rest is still searched, never skipped
         body = command[hd_start:]
-        if not hd_quoted:
-            subs.extend(_subs_in_text(body))
+        # quoted or not: an unclosed heredoc is a reader's guess, so its
+        # substitutions are searched (fail closed) — and with quotes blind,
+        # as _scan(body) below is not: an apostrophe there swallows the rest
+        subs.extend(_subs_in_text(body))
         more_pieces, more_subs = _scan(body)
         pieces.extend(more_pieces)
         subs.extend(more_subs)

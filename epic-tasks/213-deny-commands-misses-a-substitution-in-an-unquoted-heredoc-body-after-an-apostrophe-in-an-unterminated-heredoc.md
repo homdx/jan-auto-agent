@@ -1,6 +1,6 @@
 # 213 — `deny_commands` misses a `$(…)` in an unquoted heredoc body when the body has an apostrophe and the heredoc is never closed
 
-**Status:** queued
+**Status:** landed
 **Origin:** round 198 judging (cross matrix: agnes-2-5-flash's `test_table_driven` on the landed ideal `67b8311`), reproduced by hand on the ideal
 **Severity:** MEDIUM (a denied command passes: fail-open)
 **File:** tools/contest/policy.py
