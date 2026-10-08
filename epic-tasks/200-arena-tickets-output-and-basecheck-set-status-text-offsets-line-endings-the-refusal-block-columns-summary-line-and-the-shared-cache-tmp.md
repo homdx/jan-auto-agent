@@ -1,6 +1,6 @@
 # 200 — arena tickets, output and basecheck: `set_status_text` offsets and line endings, the refusal block's columns, the summary line, the shared cache temp file
 
-**Status:** queued
+**Status:** landed
 **Origin:** operator review of AR-14 (150) and AR-25 (194), bugs 12–15 and two findings
 **Severity:** MEDIUM (12: a ticket loses a line), LOW (13, 14, 15, summary, cache temp)
 **File:** tools/arena/tickets.py

@@ -28,6 +28,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -196,20 +197,28 @@ def write_cache(repo: Path, cache: Mapping[str, dict]) -> bool:
     """Write the cache atomically: a temporary file, then a rename.
 
     `False` when the write fails — a lost cache is the next run's job, not an
-    error, and the verdict stands. No `.tmp` survives, either way.
+    error, and the verdict stands. No `.tmp` survives, either way. Bug 200: the
+    temp file is `mkstemp`'s own unique name next to the cache, not one fixed
+    name shared by every process — two `base check` runs at once would then
+    write into each other's file, or one would lose it before the `replace`.
     """
     path = cache_path(repo)
-    tmp = path.with_name(path.name + ".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
+                                   dir=str(path.parent))
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(cache, indent=2, sort_keys=True) + "\n")
         os.replace(tmp, path)
         return True
     except OSError:
         return False
     finally:
         try:
-            tmp.unlink()
+            os.unlink(tmp)
         except OSError:
             pass
 
@@ -249,14 +258,20 @@ def _hit(cache: Mapping[str, dict], sha: str) -> Optional[list[dict]]:
 
 
 def _summary(step: Step, proc: subprocess.CompletedProcess) -> str:
-    """The last non-empty line of the step's output, cut to 120 characters.
+    """The last non-empty line of the step's *stdout*, cut to 120 characters.
 
     For a failed pytest step up to five of its `FAILED …` lines are appended
     after it, so one run names the red tests.
+
+    Bug 200: stderr comes in only when stdout is empty — a step that prints its
+    pytest summary and then its warnings on stderr showed the warning, not
+    `N passed in …s`.
     """
     stdout = str(getattr(proc, "stdout", "") or "")
-    stderr = str(getattr(proc, "stderr", "") or "")
-    lines = [line.strip() for line in f"{stdout}\n{stderr}".splitlines() if line.strip()]
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        stderr = str(getattr(proc, "stderr", "") or "")
+        lines = [line.strip() for line in stderr.splitlines() if line.strip()]
     if not lines:
         return ""
     summary = lines[-1][:SUMMARY_LIMIT]

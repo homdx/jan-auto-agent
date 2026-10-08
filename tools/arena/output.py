@@ -134,21 +134,31 @@ MARKS = {"ok": "[✓]", "fail": "[✗]", "todo": "[ ]"}
 #: A refusal line's width, so `where:` wraps and the continuation lines align.
 REFUSE_WIDTH = 78
 
+#: The label column's width: `ticket:` plus one space is the widest label, so
+#: `where:` takes two trailing spaces and `flow:` three — every value starts ten
+#: characters in, in the same column (spec 150 §7).
+LABEL_WIDTH = len("ticket:") + 1
+
+
+def _label(label: str) -> str:
+    """*label* as the block's label column, colon and its padding to one width."""
+    return f"  {(label.rstrip(':') + ':').ljust(LABEL_WIDTH)}"
+
 
 def flow_line(flow) -> str:
     """`(step, state[, detail])` → `[✓] a → [✗] b: why → [ ] c`, one line."""
     parts = []
     for item in flow:
         step, state = item[0], item[1]
-        detail = item[2] if len(item) > 2 else ""
-        text = f"{step}: {detail}" if detail else step
+        detail = _one_line(item[2]) if len(item) > 2 else ""
+        text = f"{_one_line(step)}: {detail}" if detail else _one_line(step)
         parts.append(f"{MARKS.get(state, MARKS['todo'])} {text}")
     return " → ".join(parts)
 
 
 def flow_json(flow) -> list:
     """The same steps as `[{"step": …, "state": …}]` for `-o json`."""
-    return [{"step": item[0], "state": item[1]} for item in flow]
+    return [{"step": _one_line(item[0]), "state": _one_line(item[1])} for item in flow]
 
 
 def _one_line(text: str) -> str:
@@ -158,9 +168,10 @@ def _one_line(text: str) -> str:
 
 def _wrap(label: str, text: str) -> str:
     """`  <label>: <text>` wrapped to `REFUSE_WIDTH`, the continuation lines aligned
-    under the text, not the label."""
-    prefix = f"  {label}: "
-    lines = textwrap.wrap(scrub(str(text)), width=max(24, REFUSE_WIDTH - len(prefix)),
+    under the text, not the label. Bug 200-15: the label carries its own colon, so
+    the column is `  where:  ` rather than `  where::`."""
+    prefix = _label(label)
+    lines = textwrap.wrap(_one_line(text), width=max(24, REFUSE_WIDTH - len(prefix)),
                           break_long_words=False, break_on_hyphens=False) or [""]
     return "\n".join([prefix + lines[0]]
                      + [" " * len(prefix) + line for line in lines[1:]])
@@ -168,8 +179,8 @@ def _wrap(label: str, text: str) -> str:
 
 def _hint_line(hint: Mapping) -> str:
     """`  → <why>:  <command>` — the command stays on one line, so it is pasteable."""
-    why = scrub(str(hint.get("why") or ""))
-    command = scrub(str(hint.get("command") or ""))
+    why = _one_line(hint.get("why") or "")
+    command = _one_line(hint.get("command") or "")
     text = f"{why}:  {command}" if command else why
     return f"  → {text}"
 
@@ -189,20 +200,20 @@ def refuse_ctx(msg, *, where=None, ticket=None, flow=None, hints=None, fmt="tabl
     message = _one_line(msg)
     if fmt != "json":
         print(f"arena: {message}", file=out)
-        print(_wrap("where:", str(where) if where else "?"), file=out)
-        print(_wrap("ticket:", str(ticket) if ticket else "?"), file=out)
-        print(f"  flow:  {scrub(flow_line(flow))}", file=out)
+        print(_wrap("where", str(where) if where else "?"), file=out)
+        print(_wrap("ticket", str(ticket) if ticket else "?"), file=out)
+        print(_label("flow") + flow_line(flow), file=out)
         for hint in hints or []:
             print(_hint_line(hint), file=out)
     else:
         # one object a script can `json.loads`, the same fields as the text block
         print(json.dumps({
             "error": message,
-            "where": scrub(str(where) if where else "?"),
-            "ticket": scrub(str(ticket) if ticket else "?"),
+            "where": _one_line(str(where) if where else "?"),
+            "ticket": _one_line(str(ticket) if ticket else "?"),
             "flow": flow_json(flow) if flow else [],
-            "hints": [{"why": scrub(str(h.get("why") or "")),
-                       "command": scrub(str(h.get("command") or ""))}
+            "hints": [{"why": _one_line(h.get("why") or ""),
+                       "command": _one_line(h.get("command") or "")}
                       for h in (hints or [])],
         }), file=out)
     return 2

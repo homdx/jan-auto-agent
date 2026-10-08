@@ -647,8 +647,10 @@ RUN_START_FLOW = ("branch found", "ticket found", "intake", "build arena-round/N
 
 #: The `**Status:**` line, the whole line — its word and the note after it.
 _STATUS_LINE_RE = re.compile(r"^[ \t]*\*\*Status:\*\*[ \t]*[^\n]*$", re.MULTILINE)
-#: The `**Closed:**` line `close` adds under it and `reopen` removes, newline kept.
-_CLOSED_LINE_RE = re.compile(r"^[ \t]*\*\*Closed:\*\*[ \t]*[^\n]*\r?\n?", re.MULTILINE)
+#: The `**Closed:**` line `close` adds under it and `reopen` removes. Bug 200-13:
+#: no `\r?\n?` here — an ending the pattern claims is one the removal code stops
+#: taking a second of, which is what ate the blank line after the line.
+_CLOSED_LINE_RE = re.compile(r"^[ \t]*\*\*Closed:\*\*[ \t]*[^\n]*$", re.MULTILINE)
 
 #: `git worktree list --porcelain` says *branch* is checked out in this checkout.
 _HERE = object()
@@ -690,31 +692,69 @@ def closed_reason(text: str) -> str:
     return match.group(0).split("**Closed:**", 1)[1].strip()
 
 
+def _lines(text: str) -> list[tuple[str, str]]:
+    """*text* as `(line, ending)` pairs, the endings `\\r\\n`, `\\n` or `""`.
+
+    Split on `\\n` only, a lone `\\r` is not a break here: a ticket blob may hold
+    one (bug 185), and `splitlines` would call it a line and re-join it changed.
+    """
+    lines: list[tuple[str, str]] = []
+    start = 0
+    while (pos := text.find("\n", start)) != -1:
+        line = text[start:pos]
+        if line.endswith("\r"):
+            lines.append((line[:-1], "\r\n"))
+        else:
+            lines.append((line, "\n"))
+        start = pos + 1
+    lines.append((text[start:], ""))
+    return lines
+
+
 def set_status_text(text: str, word: str, note: str = "", reason: str = "") -> str:
     """*text* with its `**Status:**` line set to *word*/*note*, its `**Closed:**`
     line written for `closed` and removed otherwise; everything else byte for byte.
 
     `ValueError` when there is no `**Status:**` line: the position of the line is
     never invented here, and a status that is added is added with `issue edit`.
+
+    One pass over the lines, bug 200: the status line and the `**Closed:**` line
+    are found in the same text, so a `**Closed:**` sitting *above* the status
+    line no longer shifts the status line's offsets into the middle of a later
+    line. The new lines take the status line's own ending, so a `\\r\\n` ticket
+    stays `\\r\\n`; the old `**Closed:**` line goes with its own ending only, so
+    `close` then `reopen` is the identity.
     """
-    match = _STATUS_LINE_RE.search(text)
-    if match is None:
+    lines = _lines(text)
+    status_i = next((i for i, (body, _) in enumerate(lines) if _STATUS_LINE_RE.match(body)),
+                    None)
+    if status_i is None:
         raise ValueError("no **Status:** line")
-    if (hit := _CLOSED_LINE_RE.search(text)) is not None:
-        # the old reason goes first: keeping it would leave two **Closed:** lines
-        # when the ticket is closed again, and its removal shifts the status line
-        end = hit.end()
-        if end < len(text) and text[end] == "\n":
-            end += 1
-        text = text[:hit.start()] + text[end:]
-    line = f"**Status:** {word}"
+    closed_i = next((i for i, (body, _) in enumerate(lines)
+                     if i != status_i and _CLOSED_LINE_RE.match(body)), None)
+
     note = (note or "").strip()
+    status = f"**Status:** {word}"
     if note:
-        line += f" {note if note.startswith('(') else '(' + note + ')'}"
-    if word == "closed" and (reason or "").strip():
-        line += "\n**Closed:** " + reason.strip()
-    text = text[:match.start()] + line + text[match.end():]
-    return text
+        status += f" {note if note.startswith('(') else '(' + note + ')'}"
+    reason = (reason or "").strip()
+    block = [status]
+    if word == "closed" and reason:
+        block.append(f"**Closed:** {reason}")
+    # the status line's ending, or `\\n` when it was the file's last line and has
+    # none — a `**Closed:**` under it still needs a break of its own
+    ending = lines[status_i][1] or "\n"
+
+    out: list[str] = []
+    for i, (body, end) in enumerate(lines):
+        if i == closed_i:
+            continue  # the old line goes with its own ending and nothing else
+        if i == status_i:
+            out.extend(body_ + (ending if j < len(block) - 1 else end)
+                       for j, body_ in enumerate(block))
+        else:
+            out.append(body + end)
+    return "".join(out)
 
 
 # ── the git facts a verb needs ────────────────────────────────────────────────
