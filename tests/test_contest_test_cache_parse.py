@@ -11,7 +11,7 @@ from tools.contest.testcache import (
     PytestRun, Summary, classify_with_llm, parse_pytest, progress_line, summarise,
 )
 
-DATA = Path(__file__).parent / "data" / "sandbox_pytest_commands.txt"
+DATA = Path(__file__).resolve().parent / "data" / "sandbox_pytest_commands.txt"
 
 
 def run(roots, flags=()):

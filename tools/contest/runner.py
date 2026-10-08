@@ -4425,6 +4425,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 cached = test_cache_gate.ask(props, ws.path)
                 if cached:
                     decision = Decision(reply="reject", layer="test-cache", reason=cached)
+                    _log.info("%s: test cache hit — %s", spec.name, cached[:160])
         policy.record(decision, event, agent_dir / "decisions.jsonl", context=fill_now)
         run.permissions["allowed" if decision.reply == "once" else "rejected"] += 1
         if decision.layer == "gate":
