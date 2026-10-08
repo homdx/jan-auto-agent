@@ -825,6 +825,10 @@ class ScoreStore:
         self.path = Path(path)
         self.days = days
         self._lock = threading.Lock()
+        #: the newest `at` this store has written: a thread whose own `at` is a
+        #: few ms older than a record that landed first must not read that record
+        #: as "from the future" and drop it
+        self._newest = 0.0
 
     def load(self, now: Optional[float] = None) -> list[dict]:
         """Records inside the age cut, the newest per provider+model; `[]` if unreadable."""
@@ -854,9 +858,11 @@ class ScoreStore:
         if self.days <= 0:
             return
         with self._lock:
-            kept = [r for r in self.load(now)
+            stamp = time.time() if now is None else now
+            kept = [r for r in self.load(max(stamp, self._newest))
                     if (r["provider"], r["model"]) != (record["provider"], record["model"])]
             _write_json_atomic(self.path, kept + [record])
+            self._newest = max(self._newest, record["at"])
 
 
 def _clean_score(entry: object) -> Optional[dict]:
