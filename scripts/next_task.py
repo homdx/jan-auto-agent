@@ -60,7 +60,7 @@ def _status(body):
     it: `queued (judged on arena)` and `queued, judged on arena` both read
     `queued` (AR-14's `arena issue queue --note`)."""
     m = re.search(r"^\*\*Status:\*\*\s*(\S+)", body, re.MULTILINE)
-    return m.group(1).strip("`*,;:.-").lower() if m else ""
+    return m.group(1).strip("`*,;:.-()[]{}<>—–'\"").lower() if m else ""
 
 
 def _field(body, label):

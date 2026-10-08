@@ -97,7 +97,7 @@ from typing import Callable, Iterable, Optional
 
 from tools.auto.llm_profile import LlmSettings
 from tools.contest import cli as contest_cli
-from tools.contest import draft, roster
+from tools.contest import context_memory, draft, roster
 from tools.contest.kilo_client import _version_key
 
 from . import output, profile
@@ -211,7 +211,9 @@ class ModelCache:
         keep = []
         for entry in data:
             record = _clean_record(entry)
-            if record is not None and stamp - record["at"] <= self.days * _DAY:
+            if record is not None and context_memory._is_within_age(
+                record["at"], stamp, self.days
+            ):
                 keep.append(record)
         return keep
 
@@ -515,7 +517,9 @@ def _with_key(text: str, name: str, key: str, value: Optional[str]) -> str:
     no change.
     """
     nl = "\r\n" if "\r\n" in text else "\n"
-    lines = text.splitlines(keepends=True)
+    lines = re.split(r"(?<=\n)", text)
+    while lines and lines[-1] == "":
+        lines.pop()
     header = re.compile(r"^\[" + re.escape(profile.SECTION_PREFIX + name) + r"\]\s*(?:[;#].*)?$")
     start = next((i for i, ln in enumerate(lines) if header.match(ln.rstrip("\r\n"))), None)
     new_lines = [] if value is None else [f"{key} = {value}{nl}"]
@@ -793,7 +797,9 @@ class ScoreStore:
         newest: dict[tuple[str, str], dict] = {}
         for entry in data:
             rec = _clean_score(entry)
-            if rec is None or stamp - rec["at"] > self.days * _DAY:
+            if rec is None or not context_memory._is_within_age(
+                rec["at"], stamp, self.days
+            ):
                 continue
             key = (rec["provider"], rec["model"])
             if key not in newest or rec["at"] >= newest[key]["at"]:

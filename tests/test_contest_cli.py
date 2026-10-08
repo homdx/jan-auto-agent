@@ -467,7 +467,7 @@ def test_intake_names_the_ticket_the_sessions_would_get_and_both_ways_out(
     assert " ".join(label.split()) == "intake: run that one instead:"
     assert run_cmd.strip() == "run --ticket 53 --models x --max-parallel 2"
     park = _park_line(captured)
-    assert park == ("sed -i '3s/^\\*\\*Status:\\*\\* open/**Status:** queued/' epic-tasks/" + KC53
+    assert park == ("sed -i '3s/^\\*\\*Status:\\*\\*.*$/**Status:** queued/' epic-tasks/" + KC53
                     + " && git commit -m 'epic-tasks: KC-14 queued — round 53 runs elsewhere' "
                       "-- epic-tasks/" + KC53)
     assert lines[3] == "intake:   or park it, then re-run:  " + park

@@ -242,7 +242,7 @@ def _status_of(body: str) -> str:
     `next_task._status` reads it: `queued, judged on arena` is `queued`.
     """
     match = _STATUS_RE.search(body)
-    return match.group(1).strip("`*,;:.-").lower() if match else ""
+    return match.group(1).strip("`*,;:.-()[]{}<>—–'\"").lower() if match else ""
 
 
 def _missing_labels(body: str) -> list:
@@ -928,7 +928,7 @@ def _park_line(body, name, number: int, rel_dir) -> str:
     match = _STATUS_RE.search(body)
     line_no = body[:match.start()].count("\n") + 1 if match else 0
     if line_no:
-        sed = "'" + str(line_no) + "s/^\\*\\*Status:\\*\\* " + word + "/**Status:** queued/'"
+        sed = "'" + str(line_no) + "s/^\\*\\*Status:\\*\\*.*$/**Status:** queued/'"
     else:
         sed = "'1s/^/**Status:** queued\\n/'"
     message = rel_dir + ": " + _title_id(body, name) + " queued — round " \

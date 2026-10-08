@@ -463,6 +463,11 @@ def smallest_size(records, provider: str, model: str,
     return best[0] if best is not None else None
 
 
+def _is_within_age(record_at: float, stamp: float, keep_days: float, day_seconds: float = _DAY) -> bool:
+    age = stamp - record_at
+    return 0 <= age <= keep_days * day_seconds
+
+
 def load(path, *, days: float = DEFAULT_DAYS, now: float | None = None) -> list[OverflowRecord]:
     """The records of *path* still inside *days* of *now*, in file order.
 
@@ -496,7 +501,7 @@ def load(path, *, days: float = DEFAULT_DAYS, now: float | None = None) -> list[
     out = []
     for entry in data:
         record = OverflowRecord.from_dict(entry)
-        if record is None or record.at < stamp - keep:
+        if record is None or not _is_within_age(record.at, stamp, keep / _DAY):
             continue
         out.append(record)
     return out
