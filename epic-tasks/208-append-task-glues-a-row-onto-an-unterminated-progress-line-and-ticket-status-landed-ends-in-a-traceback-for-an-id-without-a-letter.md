@@ -1,6 +1,6 @@
 # 208 — `append_task.py` glues a new row onto an unterminated `PROGRESS.csv` line, and `ticket_status.py landed NN` ends in a traceback for a ticket with no letter-led id
 
-**Status:** queued
+**Status:** landed
 **Origin:** operator review (`bugs-to-review/test_append_task_missing_final_newline.py`, `test_ticket_status_landed_next_steps.py`), probed on `arena` @ `00355fd`
 **Severity:** MEDIUM (40: the second ticket is handed out again, round after round — silent), LOW (41: a traceback after the status was already committed)
 **File:** scripts/append_task.py

@@ -123,7 +123,10 @@ def next_steps(status: str, number: int, repo: Path, tasks_dir: Path, base: str)
         nxt = sorted(k for k, v in statuses.items() if v in ("queued", "open") and k != n)
         # the landed ticket's own epic first: `KC-9` → `KC-`; old epics' parked
         # tickets only when this one has nothing left
-        family = re.match(r"[A-Za-z]+-?", titles.get(n, "")).group(0) if titles.get(n) else ""
+        # a ticket whose heading starts with a number (`# 150 — …`), or has no
+        # heading (the file name), has no family: every ticket still to land
+        m = re.match(r"[A-Za-z]+-?", titles.get(n, ""))
+        family = m.group(0) if m else ""
         nxt = [k for k in nxt if titles[k].startswith(family)] or nxt
         lines = [f"", f"next, on {branch}:", f"  1. check the log, then push:",
                  f"       git push {remote} {branch}"]
