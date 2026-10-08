@@ -31,7 +31,7 @@ with the retry budget of `[claim_vote]` — `error_retries`, `error_retry_wait_s
 because a free tier answers a burst with 429 and the answers are lost).
 
 One-time setup, writes three profiles from Kilo's files into `contest.local.ini`
-(gitignored; the key is copied, never printed), or write the sections by hand:
+(gitignored; the key is copied, never printed, and never world-readable), or write the sections by hand:
 
 ```bash
 python3 scripts/claim_vote.py --add-profiles \
@@ -74,6 +74,13 @@ free models that answered every claim): 36.6 right, 0.14 wrong, 3.2 undecided
 Four families, unanimous: 0.08 wrong, 3.9 undecided.  Asking one model again
 adds almost nothing (see `REPORT.md`: Sensenova gave the same verdict in 38–40
 of 40 claims across 6 identical-prompt runs).
+
+A model's own verdict is its **strict** plurality across runs: if the runs tie
+(even number, or three different answers) the model abstains (`UNSURE`), so a
+self-contradicting model is visible rather than masked by the first run's
+insertion order.  A voter with no vote on a particular claim — silent, lost
+batch, or unreadable reply — counts against unanimity; the rule is "every
+voter", not "every voter that happened to answer".
 
 ## Rules that keep it honest
 
