@@ -1,6 +1,6 @@
 # 203 — `claim_vote.py` counts and reads wrongly: a bracket in a reply, a tied model, a voter that said nothing, a shared parser, a missing profile, a key file readable by all
 
-**Status:** queued
+**Status:** landed
 **Origin:** operator review (`bugs-to-review/`, bugs 17, 18, 213, 214, 215, 216, 217 and the "left unchanged" voter finding), each re-probed on `arena` @ `00355fd` (CLAIM-1 merged from `origin/arena` @ `03a77c5`)
 **Severity:** HIGH (18, 19: a claim is accepted that a voter did not commit to — the one rule the claim check exists for), LOW (17, 20, 21, 22)
 **File:** scripts/claim_vote.py
