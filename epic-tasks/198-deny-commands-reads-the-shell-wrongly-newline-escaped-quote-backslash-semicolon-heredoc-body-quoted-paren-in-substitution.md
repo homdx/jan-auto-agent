@@ -1,6 +1,6 @@
 # 198 — `deny_commands` reads the shell wrongly: a newline, an escaped quote, `\;`, a heredoc body and a quoted `)` inside `$( … )`
 
-**Status:** queued
+**Status:** landed — round 198, winner sensenova-6-7-flash-lite, 67b8311 as-is
 **Origin:** operator review of the contest policy, bugs 8–11; extends 164 (the per-piece match) and 187 (the substitutions) — read both and `131` before touching `_shell_pieces`
 **Severity:** HIGH (8, 9, 11: a denied command passes), LOW (10: a harmless line is refused)
 **File:** tools/contest/policy.py
