@@ -659,32 +659,349 @@ def _unquote_token(token: str) -> str:
     return token
 
 
-def _shell_pieces(command: str) -> list:
-    """*command* as its shell pieces: the runs of text a `&&`, `||`, `;`, `|` or
-    `&` joins outside quotes, so the suite piece of `cd /repo && pytest tests`
-    is what is measured and a `|` inside a quoted string stays in its token."""
-    pieces: list = []
-    current: list = []
-    quote = ""
-    for char in command:
-        if quote:
-            current.append(char)
-            if char == quote:
+def _subs_in_text(text: str) -> list:
+    """The ``$(…)`` and backtick bodies of *text*, respecting quotes and escapes.
+
+    Used for the body of a heredoc whose delimiter was not quoted: the shell
+    still runs command substitutions inside it, though a ``;`` in the body is
+    data and not a separator.
+    """
+    out: list = []
+    n, i, quote = len(text), 0, ""
+    while i < n:
+        c = text[i]
+        if quote == "'":
+            if c == "'":
                 quote = ""
+            i += 1
             continue
-        if char in "\"'":
-            quote = char
-            current.append(char)
+        if quote == '"':
+            if c == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if c == '"':
+                quote = ""
+            i += 1
             continue
-        if char in "|&;":
-            if current:
-                pieces.append("".join(current))
-                current = []
+        if c == "\\":
+            i += 2
             continue
-        current.append(char)
-    if current:
-        pieces.append("".join(current))
-    return [piece for piece in pieces if piece.strip()]
+        if c == "'":
+            quote = "'"
+            i += 1
+            continue
+        if c == '"':
+            quote = '"'
+            i += 1
+            continue
+        if c == "`":
+            end = text.find("`", i + 1)
+            end = n if end < 0 else end
+            out.append(text[i + 1:end])
+            i = end + 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            depth, j, q = 1, i + 2, ""
+            while j < n and depth:
+                d = text[j]
+                if q == "'":
+                    if d == "'":
+                        q = ""
+                elif q == '"':
+                    if d == "\\":
+                        j += 2
+                        continue
+                    if d == '"':
+                        q = ""
+                elif d == "\\":
+                    j += 2
+                    continue
+                elif d == "'":
+                    q = "'"
+                elif d == '"':
+                    q = '"'
+                elif d == "(":
+                    depth += 1
+                elif d == ")":
+                    depth -= 1
+                j += 1
+            out.append(text[i + 2:j - 1 if depth == 0 else j])
+            i = j
+            continue
+        i += 1
+    return out
+
+
+def _scan(command: str) -> tuple:
+    """Walk *command* once as a shell would, returning ``(pieces, subs)``.
+
+    ``pieces`` are the runs of text a ``|``, ``&``, ``;`` or newline joins
+    outside quotes and unescaped, with heredoc bodies dropped — so the suite
+    piece of ``cd /repo && pytest tests`` is what is measured and a ``|``
+    inside a quoted string stays in its token. ``subs`` are the command lines
+    the shell runs *inside* *command*: the bodies of ``$(…)``, ``<(…)``,
+    ``>(…)``, backticks, and the bodies of ``$(…)``/backticks inside a heredoc
+    whose delimiter was not quoted. A reader that cannot make sense of the
+    text (an unclosed quote) fails closed: the rest of the line is still one
+    piece, never skipped.
+    """
+    if not isinstance(command, str) or not command:
+        return [], []
+    n = len(command)
+    i = 0
+    pieces: list = []
+    subs: list = []
+    cur: list = []
+
+    quote = ""          # the quote of the current command-line scope
+    scopes: list = []   # stack of ["subst", depth, quote] for $(…)/<(…)/>(…)
+    in_heredoc = False
+    hd_delim = ""
+    hd_dash = False
+    hd_quoted = False
+    pending: list = []  # heredocs awaiting their body: (delim, dash, quoted)
+    hd_start = 0
+
+    while i < n:
+        c = command[i]
+
+        if in_heredoc:
+            ls = i
+            while i < n and command[i] != "\n":
+                i += 1
+            line = command[ls:i]
+            if (line.lstrip("\t") if hd_dash else line) == hd_delim:
+                body = command[hd_start:ls]
+                if not hd_quoted:
+                    subs.extend(_subs_in_text(body))
+                i = i + 1 if i < n else i
+                if pending:
+                    hd_delim, hd_dash, hd_quoted = pending.pop(0)
+                    hd_start = i
+                else:
+                    in_heredoc = False
+            else:
+                i += 1
+            continue
+
+        if scopes:
+            top = scopes[-1]
+            q = top[2]
+            if q == "'":
+                if c == "'":
+                    top[2] = ""
+                cur.append(c)
+                i += 1
+                continue
+            if q == '"':
+                if c == "\\" and i + 1 < n:
+                    cur.append(c)
+                    cur.append(command[i + 1])
+                    i += 2
+                    continue
+                if c == '"':
+                    top[2] = ""
+                cur.append(c)
+                i += 1
+                continue
+            if c == "\\":
+                cur.append(c)
+                if i + 1 < n:
+                    cur.append(command[i + 1])
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if c == "'":
+                top[2] = "'"
+                cur.append(c)
+                i += 1
+                continue
+            if c == '"':
+                top[2] = '"'
+                cur.append(c)
+                i += 1
+                continue
+            if c == "`":
+                end = command.find("`", i + 1)
+                end = n if end < 0 else end
+                subs.append(command[i + 1:end])
+                cur.append(command[i:end + 1])
+                i = end + 1
+                continue
+            if c == "$" and i + 1 < n and command[i + 1] == "(":
+                scopes.append(["subst", 1, "", i + 2])
+                cur.append(c)
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            if c == "(":
+                top[1] += 1
+                cur.append(c)
+                i += 1
+                continue
+            if c == ")":
+                top[1] -= 1
+                if top[1] <= 0:
+                    subs.append(command[top[3]:i])
+                    scopes.pop()
+                cur.append(c)
+                i += 1
+                continue
+            cur.append(c)
+            i += 1
+            continue
+
+        if quote == "'":
+            if c == "'":
+                quote = ""
+            cur.append(c)
+            i += 1
+            continue
+        if quote == '"':
+            if c == "$" and i + 1 < n and command[i + 1] == "(":
+                scopes.append(["subst", 1, "", i + 2])
+                cur.append(c)
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            if c == "`":
+                end = command.find("`", i + 1)
+                end = n if end < 0 else end
+                subs.append(command[i + 1:end])
+                cur.append(command[i:end + 1])
+                i = end + 1
+                continue
+            if c == "\\" and i + 1 < n:
+                cur.append(c)
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                quote = ""
+            cur.append(c)
+            i += 1
+            continue
+        if c == "\\":
+            cur.append(c)
+            if i + 1 < n:
+                cur.append(command[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if c == "'":
+            quote = "'"
+            cur.append(c)
+            i += 1
+            continue
+        if c == '"':
+            quote = "" if quote == '"' else '"'
+            cur.append(c)
+            i += 1
+            continue
+        if c == "`":
+            end = command.find("`", i + 1)
+            end = n if end < 0 else end
+            subs.append(command[i + 1:end])
+            cur.append(command[i:end + 1])
+            i = end + 1
+            continue
+        if c in "$<>" and i + 1 < n and command[i + 1] == "(":
+            if c == "$" or not quote:
+                scopes.append(["subst", 1, "", i + 2])
+                cur.append(c)
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            cur.append(c)
+            i += 1
+            continue
+        if c == "<" and i + 1 < n and command[i + 1] == "<":
+            dash = command[i + 2:i + 3] == "-"
+            j = i + (3 if dash else 2)
+            delim: list = []
+            parts: list = []
+            while j < n and command[j] not in " \t\n;|&<>":
+                d = command[j]
+                if d == "'":
+                    k = command.find("'", j + 1)
+                    if k < 0:
+                        break
+                    delim.append(command[j + 1:k])
+                    parts.append(True)
+                    j = k + 1
+                elif d == '"':
+                    k = j + 1
+                    while k < n and command[k] != '"':
+                        k += 2 if command[k] == "\\" else 1
+                    if k < n:
+                        delim.append(command[j + 1:k])
+                        parts.append(True)
+                        j = k + 1
+                    else:
+                        break
+                elif d == "\\":
+                    if j + 1 < n:
+                        delim.append(command[j + 1])
+                        parts.append(True)
+                        j += 2
+                    else:
+                        break
+                else:
+                    delim.append(d)
+                    parts.append(False)
+                    j += 1
+            delimiter = "".join(delim)
+            if delimiter:
+                cur.append(command[i:j])
+                pending.append((delimiter, dash, bool(parts) and all(parts)))
+                i = j
+                continue
+            cur.append(c)
+            i += 1
+            continue
+        if c in "|&;\n":
+            if cur:
+                pieces.append("".join(cur))
+                cur = []
+            if c == "\n" and pending:
+                hd_delim, hd_dash, hd_quoted = pending.pop(0)
+                hd_start = i + 1
+                in_heredoc = True
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+
+    if in_heredoc:
+        # an unterminated heredoc: the rest is still searched, never skipped
+        body = command[hd_start:]
+        if not hd_quoted:
+            subs.extend(_subs_in_text(body))
+        more_pieces, more_subs = _scan(body)
+        pieces.extend(more_pieces)
+        subs.extend(more_subs)
+    elif cur:
+        pieces.append("".join(cur))
+
+    return ([p for p in pieces if p.strip()], [s for s in subs if s.strip()])
+
+
+def _shell_pieces(command: str) -> list:
+    """*command* as its shell pieces: the runs of text a `&&`, `||`, `;`, `|`,
+    `&` or newline joins outside quotes, so the suite piece of
+    `cd /repo && pytest tests` is what is measured and a `|` inside a quoted
+    string stays in its token."""
+    return _scan(command)[0]
+
+
+def _substitutions(command: str) -> list:
+    """The command lines a shell would run *inside* *command*: the bodies of
+    ``$(…)``, ``<(…)``, ``>(…)``, backticks, and the bodies of ``$(…)`` and
+    backticks inside a heredoc whose delimiter was not quoted. Text in single
+    quotes is literal to the shell, so ``echo '$(git push)'`` yields nothing."""
+    return _scan(command)[1]
 
 
 def _pytest_argv_start(tokens: list) -> int | None:
@@ -951,38 +1268,6 @@ def _inside_worktree_or_tmp(pairs: list, worktree: "Path | None", tmp_roots) -> 
 #: Shells whose ``-c`` argument is a command line of its own.
 _SHELL_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
 _MAX_NESTING = 4
-
-
-def _substitutions(command: str) -> list:
-    """The command lines a shell would run *inside* *command*: the bodies of
-    ``$(…)``, ``<(…)``, ``>(…)`` and backticks. Text in single quotes is
-    literal to the shell, so ``echo '$(git push)'`` yields nothing."""
-    out: list = []
-    n, i, quote = len(command), 0, ""
-    while i < n:
-        c = command[i]
-        if quote == "'":
-            quote = "" if c == "'" else quote
-        elif c == "\\":
-            i += 1
-        elif c == "'" and not quote:
-            quote = "'"
-        elif c == '"':
-            quote = "" if quote == '"' else '"'
-        elif c == "`":
-            end = command.find("`", i + 1)
-            end = n if end < 0 else end
-            out.append(command[i + 1:end])
-            i = end
-        elif c in "$<>" and command[i + 1:i + 2] == "(" and not (c in "<>" and quote):
-            depth, j = 1, i + 2
-            while j < n and depth:
-                depth += (command[j] == "(") - (command[j] == ")")
-                j += 1
-            out.append(command[i + 2:j - 1 if depth == 0 else j])
-            i = j - 1
-        i += 1
-    return out
 
 
 def _inline_scripts(piece: str) -> list:
