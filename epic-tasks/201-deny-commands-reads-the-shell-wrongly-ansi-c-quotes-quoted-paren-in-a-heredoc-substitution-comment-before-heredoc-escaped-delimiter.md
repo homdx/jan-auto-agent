@@ -1,6 +1,6 @@
 # 201 — `deny_commands` reads the shell wrongly, second pass: `$'…'` quotes, a quoted `)` in a heredoc's `$( … )`, `# <<EOF` in a comment, `<<\EOF` and `<<E"O"F`
 
-**Status:** queued
+**Status:** landed
 **Origin:** judging round 198 (black box `contest-bench/198`, then probes of the best entry), bugs 12–15; extends 198 — read it, 164, 187 and `131` before touching `_scan` / `_line_pieces`
 **Severity:** HIGH (12, 13, 14: a denied command passes), LOW (15: a harmless line is refused)
 **File:** tools/contest/policy.py

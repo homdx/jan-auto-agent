@@ -663,16 +663,193 @@ def _unquote_token(token: str) -> str:
     return token
 
 
+#: The escapes an ANSI-C string (``$'…'``) turns into a single character.
+#: Anything else after the backslash is not an escape the shell defines, and
+#: the reader keeps the backslash as written rather than guess.
+_ANSI_C_SIMPLE = {
+    "n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v",
+    "\\": "\\", "'": "'", '"': '"', "?": "?",
+}
+_ANSI_C_HEX = frozenset("0123456789abcdefABCDEF")
+_ANSI_C_OCTAL = frozenset("01234567")
+
+
+def _ansi_c_close(text: str, dollar: int) -> int:
+    """The index of the `'` that closes the ``$'…'`` at ``text[dollar]``.
+
+    ``\\`` escapes the next character inside an ANSI-C string, so `\\'` is a
+    quote *character* and not the end of the string, and ``\\\\`` is a
+    backslash. ``-1`` when the string never closes: the reader leaves the
+    text as written rather than guessing where it ran off the line.
+    """
+    i, n = dollar + 2, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            return i
+        i += 1
+    return -1
+
+
+def _ansi_c_end(text: str, dollar: int) -> int:
+    """The index to read on after the ``$'…'`` at ``text[dollar]``.
+
+    ``len(text)`` whether the string closed on its last character or never
+    closed at all: to a walker the two look the same, and taking the rest of
+    the text as the string hides nothing it could hide either way.
+    """
+    close = _ansi_c_close(text, dollar)
+    return len(text) if close < 0 else close + 1
+
+
+def _ansi_c_body(text: str, dollar: int) -> str:
+    """The raw, still-escaped text of the ``$'…'`` at ``text[dollar]``."""
+    close = _ansi_c_close(text, dollar)
+    if close < 0:
+        return ""
+    return text[dollar + 2:close]
+
+
+def _ansi_c_decode(body: str) -> str:
+    """The text of an ANSI-C string body, ``\\n``, ``\\t``, ``\\\\``, ``\\'``,
+    ``\\"``, ``\\?``, ``\\xHH`` and ``\\NNN`` decoded.
+
+    An escape the shell does not define keeps its backslash, so a body that
+    cannot be read is still returned as text rather than as an exception: the
+    caller never invents a command word it cannot read, and no failure reaches
+    the caller either.
+    """
+    out: list = []
+    i, n = 0, len(body)
+    while i < n:
+        c = body[i]
+        if c != "\\":
+            out.append(c)
+            i += 1
+            continue
+        if i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        d = body[i + 1]
+        if d in _ANSI_C_SIMPLE:
+            out.append(_ANSI_C_SIMPLE[d])
+            i += 2
+            continue
+        if d in "xX":
+            hexdigits = body[i + 2:i + 4]
+            if len(hexdigits) == 2 and all(ch in _ANSI_C_HEX for ch in hexdigits):
+                out.append(chr(int(hexdigits, 16)))
+                i += 4
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if d in _ANSI_C_OCTAL:
+            j = i + 1
+            while j < n and j - i < 4 and body[j] in _ANSI_C_OCTAL:
+                j += 1
+            out.append(chr(int(body[i + 1:j], 8)))
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _ansi_c_expand(text: str) -> str:
+    """*text* with every ``$'…'`` replaced by the word it names.
+
+    ``bash -c $'git push'`` and ``eval $'git push'`` are read as if the string
+    had been written without its quotes — the shell hands the decoded text to
+    the shell or to ``eval`` — so the body is what runs, and a body that is
+    one word is quoted again to keep it one word. A string that never closes
+    is left exactly as written: the reader then sees ``$'…'`` and invents no
+    command word out of it.
+    """
+    out: list = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "$" and i + 1 < n and text[i + 1] == "'":
+            close = _ansi_c_close(text, i)
+            if close < 0:
+                out.append(text[i:n])
+                i = n
+            else:
+                out.append(shlex.quote(_ansi_c_decode(_ansi_c_body(text, i))))
+                i = close + 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _find_sub_end(text: str, start: int, opener: str) -> int:
+    """The index of the character that closes the substitution just opened.
+
+    The matching ``)`` when *opener* is ``$(``, the next unescaped backtick
+    when it is a backtick. Quotes, ``$'…'``, escapes and nested substitutions
+    are respected, so a ``)`` inside a quoted string or inside a nested
+    ``$(…)`` or backtick does not end the outer one. ``len(text)`` when the
+    substitution never closes: the reader then takes the rest of the text as
+    its body, which is the body the shell would also have had to run.
+    """
+    n = len(text)
+    i, depth = start, 1 if opener == "$(" else 0
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            i = _ansi_c_end(text, i)
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            i = _find_sub_end(text, i + 2, "$(") + 1
+            continue
+        if c == "`":
+            i = _find_sub_end(text, i + 1, "`") + 1
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            i = n if j >= n else j + 1
+            continue
+        if opener == "$(" and c == "(":
+            depth += 1
+            i += 1
+            continue
+        if opener == "$(" and c == ")" and depth == 1:
+            return i
+        i += 1
+    return n
+
+
 def _subs_in_text(text: str) -> list:
-    """The ``$(…)`` and backtick bodies of *text*, the body of a heredoc.
+    """The ``$(…)`` and backtick bodies of *text*, respecting quotes and escapes.
 
     Used for the body of a heredoc whose delimiter was not quoted: the shell
-    still runs command substitutions inside it, though a ``;`` in the body is
-    data and not a separator. A quote there is a plain character too — the
-    shell expands ``$(git push)`` in a body of ``don't\\nEOF$(git push)``, so
-    an apostrophe must not open a quote that swallows the rest (ticket 213).
-    Only a backslash escapes, and quotes count again inside a ``$(…)``, which
-    is a command line of its own.
+    runs command substitutions inside it, though a ``;`` in the body is data
+    and not a separator. The body is read as *text* — where a quote is a plain
+    character, so ``don't`` is data — except inside a ``$(…)`` or backtick
+    opened in it, where the shell reads it as a command again and quotes,
+    escapes and ``$'…'`` all work there, so a ``)`` inside a quoted string
+    does not end the substitution. Each body is returned whole, with the
+    substitutions it contains in turn, so a nested push is found at the next
+    level rather than by this reader.
     """
     out: list = []
     n, i = len(text), 0
@@ -681,39 +858,20 @@ def _subs_in_text(text: str) -> list:
         if c == "\\":
             i += 2
             continue
-        if c == "`":
-            end = text.find("`", i + 1)
-            end = n if end < 0 else end
-            out.append(text[i + 1:end])
-            i = end + 1
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            i = _ansi_c_end(text, i)
             continue
         if c == "$" and i + 1 < n and text[i + 1] == "(":
-            depth, j, q = 1, i + 2, ""
-            while j < n and depth:
-                d = text[j]
-                if q == "'":
-                    if d == "'":
-                        q = ""
-                elif q == '"':
-                    if d == "\\":
-                        j += 2
-                        continue
-                    if d == '"':
-                        q = ""
-                elif d == "\\":
-                    j += 2
-                    continue
-                elif d == "'":
-                    q = "'"
-                elif d == '"':
-                    q = '"'
-                elif d == "(":
-                    depth += 1
-                elif d == ")":
-                    depth -= 1
-                j += 1
-            out.append(text[i + 2:j - 1 if depth == 0 else j])
-            i = j
+            end = _find_sub_end(text, i + 2, "$(")
+            out.append(text[i + 2:end])
+            out.extend(_subs_in_text(text[i + 2:end]))
+            i = end + 1
+            continue
+        if c == "`":
+            end = _find_sub_end(text, i + 1, "`")
+            out.append(text[i + 1:end])
+            out.extend(_subs_in_text(text[i + 1:end]))
+            i = end + 1
             continue
         i += 1
     return out
@@ -748,6 +906,7 @@ def _scan(command: str) -> tuple:
     hd_quoted = False
     pending: list = []  # heredocs awaiting their body: (delim, dash, quoted)
     hd_start = 0
+    word_start = True   # the next character would start a word: # is a comment
 
     while i < n:
         c = command[i]
@@ -767,6 +926,8 @@ def _scan(command: str) -> tuple:
                     hd_start = i
                 else:
                     in_heredoc = False
+                # the delimiter's newline ended a word: # can open a comment
+                word_start = True
             else:
                 i += 1
             continue
@@ -798,6 +959,13 @@ def _scan(command: str) -> tuple:
                     i += 2
                 else:
                     i += 1
+                continue
+            if c == "$" and i + 1 < n and command[i + 1] == "'":
+                # $'…' inside a substitution: \ escapes there, so \' is a quote
+                # character and not the end of the string
+                end = _ansi_c_end(command, i)
+                cur.append(command[i:end])
+                i = end
                 continue
             if c == "'":
                 top[2] = "'"
@@ -832,6 +1000,8 @@ def _scan(command: str) -> tuple:
                 if top[1] <= 0:
                     subs.append(command[top[3]:i])
                     scopes.pop()
+                    # a closed $(…) or <(…) is part of the word it ends in
+                    word_start = False
                 cur.append(c)
                 i += 1
                 continue
@@ -839,10 +1009,20 @@ def _scan(command: str) -> tuple:
             i += 1
             continue
 
+        # a # that starts a word opens a comment that runs to the end of the
+        # line: nothing in it is a heredoc, a quote or a substitution, so a
+        # <<EOF in a comment declares no heredoc and a ; in it no separator.
+        # A # inside a word (a#b, $#) and a # in a quoted string are data.
+        if c == "#" and word_start:
+            while i < n and command[i] != "\n":
+                i += 1
+            continue
+
         if quote == "'":
             if c == "'":
                 quote = ""
             cur.append(c)
+            word_start = False
             i += 1
             continue
         if quote == '"':
@@ -867,6 +1047,7 @@ def _scan(command: str) -> tuple:
             if c == '"':
                 quote = ""
             cur.append(c)
+            word_start = False
             i += 1
             continue
         if c == "\\":
@@ -876,15 +1057,26 @@ def _scan(command: str) -> tuple:
                 i += 2
             else:
                 i += 1
+            word_start = False
             continue
         if c == "'":
             quote = "'"
             cur.append(c)
+            word_start = False
             i += 1
+            continue
+        if c == "$" and i + 1 < n and command[i + 1] == "'":
+            # $'…' is an ANSI-C string: \ escapes there, so \' is a quote
+            # character and the string runs on to the next bare '
+            end = _ansi_c_end(command, i)
+            cur.append(command[i:end])
+            word_start = False
+            i = end
             continue
         if c == '"':
             quote = "" if quote == '"' else '"'
             cur.append(c)
+            word_start = False
             i += 1
             continue
         if c == "`":
@@ -892,6 +1084,7 @@ def _scan(command: str) -> tuple:
             end = n if end < 0 else end
             subs.append(command[i + 1:end])
             cur.append(command[i:end + 1])
+            word_start = False
             i = end + 1
             continue
         if c in "$<>" and i + 1 < n and command[i + 1] == "(":
@@ -899,9 +1092,11 @@ def _scan(command: str) -> tuple:
                 scopes.append(["subst", 1, "", i + 2])
                 cur.append(c)
                 cur.append(command[i + 1])
+                word_start = False
                 i += 2
                 continue
             cur.append(c)
+            word_start = False
             i += 1
             continue
         if c == "<" and i + 1 < n and command[i + 1] == "<":
@@ -928,6 +1123,15 @@ def _scan(command: str) -> tuple:
                         j = k + 1
                     else:
                         break
+                elif d == "$" and j + 1 < n and command[j + 1] == "'":
+                    # $'…' is a quote too: its body is quote-removed, so the
+                    # delimiter of <<$'EOF' is EOF and the body is data.
+                    k = _ansi_c_close(command, j)
+                    if k < 0:
+                        break
+                    delim.append(_ansi_c_decode(_ansi_c_body(command, j)))
+                    parts.append(True)
+                    j = k + 1
                 elif d == "\\":
                     if j + 1 < n:
                         delim.append(command[j + 1])
@@ -942,10 +1146,12 @@ def _scan(command: str) -> tuple:
             delimiter = "".join(delim)
             if delimiter:
                 cur.append(command[i:j])
-                pending.append((delimiter, dash, bool(parts) and all(parts)))
+                pending.append((delimiter, dash, any(parts)))
+                word_start = False
                 i = j
                 continue
             cur.append(c)
+            word_start = False
             i += 1
             continue
         if c in "|&;\n":
@@ -956,9 +1162,19 @@ def _scan(command: str) -> tuple:
                 hd_delim, hd_dash, hd_quoted = pending.pop(0)
                 hd_start = i + 1
                 in_heredoc = True
+            # a separator leaves the next character free to start a word
+            word_start = True
             i += 1
             continue
+        if c in " \t()":
+            # whitespace, ( and ) leave the next character free to start one too
+            cur.append(c)
+            word_start = True
+            i += 1
+            continue
+        # any other character is part of the word it is in
         cur.append(c)
+        word_start = False
         i += 1
 
     if in_heredoc:
@@ -1261,9 +1477,14 @@ _MAX_NESTING = 4
 
 def _inline_scripts(piece: str) -> list:
     """The script a piece hands to a shell: ``bash -c '…'`` (also ``-lc``,
-    behind wrappers) and ``eval …``."""
+    behind wrappers) and ``eval …``.
+
+    The piece is first read through ``_ansi_c_expand``: ``bash -c $'git push'``
+    and ``eval $'git push'`` hand the decoded string to the shell, so the body
+    is what runs, not the ``$'…'`` it was written in.
+    """
     try:
-        tokens = shlex.split(piece)
+        tokens = shlex.split(_ansi_c_expand(piece))
     except ValueError:
         return []
     start = _past_wrappers(tokens)
