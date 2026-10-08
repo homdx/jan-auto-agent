@@ -1,6 +1,6 @@
 # 199 — contest and arena small readers and stores: status punctuation, the park `sed`, `retries <= 0`, records from the future, Unicode line breaks in the ini
 
-**Status:** queued
+**Status:** landed — round 199
 **Origin:** operator review, bugs 1–4, 6, 7 (bug 5, `TicketStore.create`, is already fixed by `bc56155`)
 **Severity:** MEDIUM (2, 6), LOW (1, 4, 7), INSIGNIFICANT (3)
 **File:** tools/contest/cli.py
