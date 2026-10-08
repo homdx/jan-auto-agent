@@ -1,6 +1,6 @@
 # 212 — a repeated pytest run on an unchanged tree is answered from the round's own earlier run, in one line, instead of running for minutes
 
-**Status:** queued
+**Status:** landed — round 212
 **Origin:** sandbox rounds 900 and 901 in qwen26 (corpus: `scripts/test_run_corpus.py`, 30 + 12 pytest runs of 13 free/regular models)
 **Severity:** MEDIUM
 **File:** tools/contest/testcache.py
