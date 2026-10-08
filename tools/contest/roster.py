@@ -284,6 +284,11 @@ class AgentSpec:
         return f"{self.provider_id}/{self.model_id}"
 
 
+#: Ticket 212: the bash patterns that must reach the permission handler for the
+#: test cache to see a pytest run at all.
+TEST_CACHE_ASK_PATTERNS = ("*pytest*", "*py.test*")
+
+
 @dataclass(frozen=True)
 class ContestConfig:
     """The round: its limits, its roster and the gate's LLM profile.
@@ -568,6 +573,15 @@ class ContestConfig:
         rules = [dict(rule) for rule in BASE_RULES]
         for pattern in self.ask_commands:
             rules.append({"permission": "bash", "pattern": pattern, "action": "ask"})
+        if self.test_cache:
+            # Ticket 212: Kilo only asks for a bash command that matches an ask
+            # rule, so a plain `pytest tests -q` (no redirect, no `tee`) never
+            # reaches the permission handler — and the cache with it. Round 199
+            # showed 1 ask in 11 pytest runs. The policy answers these `once`
+            # as it does any command inside the worktree.
+            for pattern in TEST_CACHE_ASK_PATTERNS:
+                if pattern not in self.ask_commands:
+                    rules.append({"permission": "bash", "pattern": pattern, "action": "ask"})
         for pattern in self.deny_commands:
             rules.append({"permission": "bash", "pattern": pattern, "action": "deny"})
         return rules

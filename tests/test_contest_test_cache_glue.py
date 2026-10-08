@@ -122,3 +122,15 @@ def test_the_config_keys_default_off_and_refuse_a_bad_share(tmp_path):
     ini.write_text("[contest]\ntest_cache_share = everyone\n[contest.agent.a]\nmodel = kenary/agnes-2-5-flash:free\n")
     with pytest.raises(roster.RosterError):
         roster.load_roster(ini)
+
+
+def test_a_plain_pytest_command_must_reach_the_permission_handler_when_the_cache_is_on(tmp_path):
+    """Round 199: Kilo asks only for bash that matches an ask rule, so without these a `pytest -q` is invisible to the cache."""
+    ini = tmp_path / "contest.ini"
+    agent = "[contest.agent.a]\nmodel = kenary/agnes-2-5-flash:free\n"
+    ini.write_text("[contest]\ntest_cache = on\nask_commands = *>*\ndeny_commands = git push*\n" + agent)
+    rules = [(r.get("pattern"), r["action"]) for r in roster.load_roster(ini).session_rules()]
+    assert ("*pytest*", "ask") in rules and ("*py.test*", "ask") in rules
+    assert rules.index(("*pytest*", "ask")) < rules.index(("git push*", "deny"))   # a deny still wins
+    ini.write_text("[contest]\ntest_cache = off\nask_commands = *>*\n" + agent)
+    assert ("*pytest*", "ask") not in [(r.get("pattern"), r["action"]) for r in roster.load_roster(ini).session_rules()]
