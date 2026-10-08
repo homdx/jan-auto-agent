@@ -9,7 +9,8 @@ to /verify. Prints a human text and writes a JSON for later automation.
 
 Credits are scarce, so every answer is cached on disk by claim text and a
 repeated claim never costs a second credit.  The key comes from LENZ_API_KEY,
-else it is asked for on the console (never written to disk).
+else it is asked for on the console (never written to disk), and only when a
+request must actually go out: a fully cached run needs no key.
 
     python3 scripts/lenz_claim_filter.py kc-bug-report.md --json out.json
     python3 scripts/lenz_claim_filter.py report.md --dry-run   # no network
@@ -40,10 +41,20 @@ VERIFY_CREDITS = 10     # what one /verify costs, for the console estimate
 # repo: a path, a ticket id, a backticked identifier with _ or a dot-suffix.
 _TICKET = re.compile(r"\b(?:KC|FL|AR|AUTO|SLOW|GATE1)-[\w-]*\d")
 _BACKTICK = re.compile(r"`([^`]+)`")
-_PATHLIKE = re.compile(r"(?:\w+/)+\w|\.(?:py|md|ini|json|csv|sh)\b")
+_PATHLIKE = re.compile(r"(?:\w+/)+\w|\b\w+/(?![\w/])|\.(?:py|md|ini|json|csv|sh)\b")
+# Ordinary words that carry a slash ("read/write", "TCP/IP") and plain
+# fractions ("24/7") are not paths; they are cut out before _PATHLIKE looks,
+# or a public claim holding one is never sent and is voted CODE-CHECK.
+_SLASH_WORDS = re.compile(
+    r"(?<![\w/.])(?:and/or|either/or|read/write|r/w|input/output|i/o|tcp/ip|"
+    r"client/server|yes/no|true/false|on/off|pass/fail|success/failure|"
+    r"enable/disable|enabled/disabled|start/stop|open/close|get/set|up/down|"
+    r"left/right|min/max|he/she|s/he|his/her|km/h|w/o|w/)(?![\w/])"
+    r"|(?<![\w/.])\d+/\d+(?![\w/])", re.I)
 _LABEL = re.compile(r"^([A-Z][\w' ]{1,20}):\s+")
 _NOT_CLAIMS = {"fix", "where", "proof", "severity", "impact"}
 _SYMBOL = re.compile(r"^[_a-zA-Z]\w*(?:\(\))?$")
+_SNAKE = re.compile(r"\b[_a-zA-Z]\w*_\w+\b")    # a bare foo_bar outside backticks
 
 # Words that mark a claim about the outside world; used only to rank.
 _HINTS = re.compile(
@@ -56,11 +67,14 @@ _HINTS = re.compile(
 def _repo_symbols(root: Path) -> set[str]:
     """Names defined in the repo's own code: def/class names and file stems."""
     names: set[str] = set()
+    # -z: NUL-separated and unquoted, so "my module.py" stays one file and a
+    # non-ASCII name is not C-quoted; surrogateescape keeps any bytes readable.
     try:
-        files = subprocess.run(["git", "ls-files", "*.py"], cwd=root, text=True,
-                               capture_output=True, check=True).stdout.split()
+        raw = subprocess.run(["git", "ls-files", "-z", "*.py"], cwd=root,
+                             capture_output=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
-        files = []
+        raw = b""
+    files = [f for f in raw.decode("utf-8", "surrogateescape").split("\0") if f]
     for rel in files:
         names.add(Path(rel).stem)
         try:
@@ -78,7 +92,10 @@ def split_sentences(text: str) -> list[str]:
         line = line.strip()
         if not line or line.startswith(("|", "#", "```")):
             continue
-        line = re.sub(r"^[-*\d.\s]+", "", line).replace("**", "")
+        # one real list marker ("- ", "* ", "+ ", "1. ", "12) ", "1.2. ") and
+        # only that: "404 is ...", "3.5 seconds ...", "-1 is ..." keep their words
+        line = re.sub(r"^(?:[-*+]|\d+(?:\.\d+)*[.)])\s+", "", line, count=1)
+        line = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"\1", line)   # bold, not "2 ** 10"
         label = _LABEL.match(line)
         if label:                      # "Fix: ..." is advice, "Where: ..." a pointer
             if label.group(1).lower() in _NOT_CLAIMS:
@@ -98,12 +115,15 @@ _CODEISH = re.compile(r"[(]|::|_\w|\w_|\.\w+\b")
 
 def is_internal(sentence: str, symbols: set[str]) -> bool:
     """True when the sentence is about this repo, not about the world."""
-    if _TICKET.search(sentence) or _PATHLIKE.search(sentence) or _OURS.search(sentence):
+    if (_TICKET.search(sentence) or _PATHLIKE.search(_SLASH_WORDS.sub(" ", sentence))
+            or _OURS.search(sentence)):
         return True
     for tok in _BACKTICK.findall(sentence):
         if tok in symbols or _CODEISH.search(tok):
             return True
-    return False
+    # a repo name written bare; only snake_case ones, a plain word ("render")
+    # is too often an English word as well
+    return any(tok in symbols for tok in _SNAKE.findall(sentence))
 
 
 def pick_claims(text: str, root: Path, limit: int) -> tuple[list[str], int]:
@@ -132,9 +152,12 @@ class Cache:
     def __init__(self, path: Path) -> None:
         self.path = path
         try:
-            self.data: dict = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            self.data = {}
+            data = {}
+        # valid JSON that is not an object ([] or null) is an empty cache too;
+        # the next put rewrites the file as an object
+        self.data: dict = data if isinstance(data, dict) else {}
 
     @staticmethod
     def key(endpoint: str, claim: str) -> str:
@@ -205,12 +228,15 @@ def extract_claims(section: str, key: str, cache: Cache) -> list[str]:
     return hit
 
 
-def pick_extracted(claims: list[str], limit: int) -> list[str]:
-    """Public-looking extracted claims, hint-bearing first, deduped, capped."""
+def pick_extracted(claims: list[str], limit: int,
+                   symbols: set[str] | None = None) -> list[str]:
+    """Public-looking extracted claims, hint-bearing first, deduped, capped.
+    A claim about this repo (is_internal, as in pick_claims) is never sent."""
+    symbols = symbols or set()
     seen: set[str] = set()
     keep: list[str] = []
     for c in claims:
-        if normalize(c) in seen or _TICKET.search(c) or not _HINTS.search(c):
+        if normalize(c) in seen or not _HINTS.search(c) or is_internal(c, symbols):
             continue
         seen.add(normalize(c))
         keep.append(c)
@@ -304,23 +330,35 @@ def main(argv: list[str] | None = None) -> int:
             print("  -", sec.splitlines()[0][:100])
         return 0
 
-    key = api_key()
+    # The key is asked for only when something must go out: a fully cached
+    # run (every section, every claim) and an empty send need none.
+    keys: list[str] = []
+
+    def need_key() -> str:
+        if not keys:
+            keys.append(api_key())
+        return keys[0]
+
     extracted: list[str] = []
     for sec in sections:
+        key = need_key() if cache.get("extract", sec) is None else ""
         extracted += extract_claims(sec, key, cache)
-    claims = pick_extracted(extracted, args.max)
+    claims = pick_extracted(extracted, args.max, _repo_symbols(args.repo_root))
     fresh = sum(1 for c in claims if not cache.get("assess", c))
     print(f"{len(sections)} sections -> {len(extracted)} claims (free) -> "
           f"{len(claims)} public-looking; {fresh} will cost a credit each, "
           f"{len(claims) - fresh} are cached")
     if not claims:
+        if args.json:                      # the next stage never reads a stale file
+            args.json.write_text("[]\n", encoding="utf-8")
         return 0
-    rows = assess(claims, key, cache)
+    rows = assess(claims, need_key() if fresh else "", cache)
     report = {"source": str(args.report), "sentences": len(extracted),
               "internal": len(extracted) - len(claims), "rows": rows, "verify": None}
     worst = most_doubtful(rows) if args.verify else None
     if worst is not None:
         claim = rows[worst].get("claim") or claims[worst]
+        key = "" if cache.get("verify", claim) else need_key()
         report["verify"] = {"claim_text": claim, "result": verify(claim, key, cache)}
     print(render(report))
     if args.json:

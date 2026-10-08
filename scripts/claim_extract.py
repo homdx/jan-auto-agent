@@ -10,7 +10,8 @@ them in step 2 (``scripts/claim_vote.py``).
     python3 scripts/claim_extract.py report.md --out claims.json
     python3 scripts/claim_extract.py report.md --dry-run     # no network
 
-The key comes from LENZ_API_KEY, else it is asked for on the console.
+The key comes from LENZ_API_KEY, else it is asked for on the console -- and
+only when a section is not cached yet.
 """
 from __future__ import annotations
 
@@ -37,7 +38,10 @@ def main(argv: list[str] | None = None) -> int:
             print("-", sec.splitlines()[0][:100])
         return 0
     cache = lf.Cache(args.cache)
-    key = lf.api_key()
+    # ask for the key only when a section is not cached: a second run sends
+    # nothing and so needs none
+    todo = [sec for sec in sections if cache.get("extract", sec) is None]
+    key = lf.api_key() if todo else ""
     seen: set[str] = set()
     claims: list[dict] = []
     for sec in sections:

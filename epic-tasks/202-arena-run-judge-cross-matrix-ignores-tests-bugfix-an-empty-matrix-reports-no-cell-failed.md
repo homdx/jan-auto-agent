@@ -1,6 +1,6 @@
 # 202 — `arena run judge`: the cross matrix only looks in `tests/`, so a round whose tests are in `tests_bugfix/` gets an empty matrix and "no cell failed"
 
-**Status:** queued
+**Status:** landed — `b7d422d` (cross matrix reads tests_bugfix/, an empty matrix exits 2)
 **Origin:** judging round 198 (`./arena run judge 198` → "cells: 0 × 7", exit 0), bug 16
 **Severity:** MEDIUM (a judging step that reports success having judged nothing; the leads it exists to find are never produced)
 **File:** scripts/judge_epic_round.py

@@ -1,6 +1,6 @@
 # 204 — `lenz_claim_filter.py` and `claim_extract.py` send the wrong claims and ask for a key first: internal claims, slash words, a cache that is not an object, lost leading numbers, repo symbol names, `LENZ_API_KEY` before need
 
-**Status:** queued
+**Status:** landed — round 204, winner Opus5 (as-is: code, tests, RUNBOOK), black-box bench 36/36; the Sonet5, Luna6 variants did not land
 **Origin:** operator review (`bugs-to-review/`, bugs 19, 20, 21, 22, 218, 219 and the cached-run scripts), each re-probed on `arena` @ `00355fd`
 **Severity:** LOW (23–28; 23 and 24 cost a paid Lenz credit or a wrong `CODE-CHECK`, 25 is a traceback, 26 and 27 feed the voters a sentence nobody wrote)
 **File:** scripts/lenz_claim_filter.py

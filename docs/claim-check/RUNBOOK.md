@@ -18,7 +18,8 @@ python3 scripts/claim_extract.py report.md --dry-run      # sections only, no ne
 Take away: `claims.json`, a list of `{claim, section}`.  The report is cut at its
 `##`/`###` headings and each section goes to Lenz `/extract`, which is free
 (1000 calls a day) and returns self-contained claims.  Answers are cached in
-`~/.cache/lenz/claims.json` by section text: a second run sends nothing.  A
+`~/.cache/lenz/claims.json` by section text: a second run sends nothing and
+does not ask for the key (it is read only when a section is not cached yet).  A
 report of 10 sections costs 10 of the 1000 calls.
 
 ## Stage 2 — vote (free models, several runs each)
@@ -87,13 +88,16 @@ voter", not "every voter that happened to answer".
 - **Never accept votes on a claim about our own code.**  A model that cannot see
   `gates.py` still says TRUE to "`_SUMMARY_LINE` does not parse node IDs with
   spaces" because it sounds right.  `needs_code` marks these; the check is a
-  heuristic (paths, tickets, `identifiers`), so read the TRUE rows with a
-  repo-specific look as well.
+  heuristic (paths, tickets, `identifiers`, a bare `snake_case` name the repo
+  defines; ordinary slash words such as `read/write` or `TCP/IP` are not
+  paths), so read the TRUE rows with a repo-specific look as well.
 - **A model that gives no votes is a result.**  `votes=0/N` with an error or a
   `raw_head` in `votes.json` is a model to drop from the roster, not a bug to chase.
 - **No credit is spent anywhere in this runbook.**  `/assess` and `/verify` (1
   and 10 credits) are the paid tie-break and live in `scripts/lenz_claim_filter.py`
-  behind `--verify`; use them only on a `SPLIT` about a public fact.
+  behind `--verify`; use them only on a `SPLIT` about a public fact.  That
+  script drops repo claims too (`is_internal`), asks for the key only when a
+  request must go out, and with `--json` writes `[]` when nothing is left to send.
 
 ## One command, logs included
 
