@@ -39,6 +39,9 @@ the config defaults, and this file asserts that.
 
 from __future__ import annotations
 
+import atexit
+import shutil
+import tempfile
 import subprocess
 import sys
 import time
@@ -76,7 +79,12 @@ from tools.contest.runner import (  # noqa: E402
 )
 from tools.contest.workspace import Workspace  # noqa: E402
 
-COMMITTED = REPO_ROOT / "contest.ini"
+# Hermetic: the committed contest.ini alone, copied where no contest.local.ini sits next to
+# it, so an operator's local overrides never change what these tests see.
+_COMMITTED_DIR = Path(tempfile.mkdtemp(prefix="committed-ini-"))
+atexit.register(shutil.rmtree, _COMMITTED_DIR, ignore_errors=True)
+shutil.copy(REPO_ROOT / "contest.ini", _COMMITTED_DIR / "contest.ini")
+COMMITTED = _COMMITTED_DIR / "contest.ini"
 
 #: What round 107's five kenary agents got, as Kilo recorded it in events.jsonl.
 QUOTA_MESSAGE = (
