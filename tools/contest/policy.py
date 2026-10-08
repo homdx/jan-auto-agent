@@ -180,7 +180,11 @@ def gate_time_back_sec(tries) -> float:
 REPLIES: tuple[str, ...] = ("once", "reject")
 #: ``context`` (KC-69) is the runner's own refusal of an ask made in a session
 #: at or past ``compact_at_percent`` of its size — the policy never returns it.
-LAYERS: tuple[str, ...] = ("mechanical", "gate", "gate-failed", "budget", "context")
+#: ``test-cache`` (212) is the runner's answer to a pytest ask it already ran on
+#: the same tree: a reject carrying the earlier result, never the policy's.
+LAYERS: tuple[str, ...] = (
+    "mechanical", "gate", "gate-failed", "budget", "context", "test-cache",
+)
 
 #: A reason is sent to the agent as the tool error and written to
 #: decisions.jsonl — one line, so it stays readable in both places.
