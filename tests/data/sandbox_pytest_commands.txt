@@ -1,0 +1,31 @@
+timeout 1200000 python3 -m pytest .smoke_tests/ -q 2>&1 | tail -20
+timeout 1200000 python3 -m pytest .regression_tests/ -q 2>&1 | tail -20
+timeout 1200000 python3 -m pytest tests_bugfix -n 4 -q 2>&1 | tail -20
+python3 -m pytest tests/test_sandbox_full_suite_900.py -q
+python3 -m pytest .smoke_tests/ -q --tb=no 2>&1 | tail -20
+python3 -m pytest .smoke_tests/ .regression_tests/ -q --tb=no 2>&1 | tail -20
+python3 -m pytest tests_bugfix -n 4 -q --tb=no 2>&1 | tail -20
+python3 -m pytest .smoke_tests/ .regression_tests/ -q 2>&1 | tail -30
+python3 -m pytest tests_bugfix -n 4 -q 2>&1 | tail -30
+python3 -m pytest tests/test_sandbox_full_suite_900.py -q 2>&1 | tail -10
+cat pytest.ini 2>/dev/null || cat pyproject.toml 2>/dev/null | head -50
+python3 -m pytest .smoke_tests/ .regression_tests/ tests_bugfix -q -n 4 2>&1 | tail -20
+time python3 -m pytest .smoke_tests/ .regression_tests/ tests_bugfix -q -n 4 2>&1 | tail -20
+python3 -m pytest .smoke_tests/ && python3 -m pytest .regression_tests/ && python3 -m pytest tests_bugfix/
+pytest -n auto tests/test_run_suite.py
+python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4 --durations=0
+python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4 --durations=0 --timeout=1200000
+cd "$PWD" && { time python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4 ; } 2>&1 | tail -30
+cd /home/renat/Project/opensource/github/agent-offline/rounds/901-laguna-s-2-1 && /usr/bin/time -v python3 -m pytest .smoke_tests/ .regression_tests/ tests_bugfix -q -n 4 2>&1 | tail -30
+python3 -m pytest tests/smoke_tests tests/regression_tests -q -n 4 --collect-only && echo "full suite -n 4 completed"
+python3 -m pytest tests -q -n 4
+python3 -m pytest tests -q -n 4 --timeout 300000
+python3 -m pytest tests -q -n 4 --timeout 600000
+cd /home/renat/Project/opensource/github/agent-offline/rounds/901-sensenova-6-7-flash-lite && { time (python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4 && python3 -m pytest tests_bugfix -q -n 4); } 2>&1 | tail -60
+ls tests/ | head -40; echo ---; cat pytest.ini; echo ---; ls .smoke_tests .regression_tests tests_bugfix | head -40
+python3 -c "import xdist, pytest; print('xdist', xdist.__version__, 'pytest', pytest.__version__)"; ls tests/ | grep -c '^test_'; ls tests_bugfix | head; ls tests/*policy* 2>/dev/null | head -30
+T0=$(date +%s); python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4; RC=$?; T1=$(date +%s); echo "RUN1_TIERS rc=$RC wall=$((T1-T0))s"; exit 0
+ls tests/ | head -50 && echo "---" && ls .smoke_tests/ | head -20 && echo "---" && ls .regression_tests/ | head -20 && echo "---" && ls tests_bugfix/ | head -30 && echo "---" && cat pytest.ini
+time python3 -m pytest .smoke_tests .regression_tests tests_bugfix -q -n 4
+cat pytest.ini 2>/dev/null || cat setup.cfg 2>/dev/null || cat pyproject.toml 2>/dev/null | grep -A 10 pytest || echo "No pytest config found"
+time python3 -m pytest .smoke_tests/ .regression_tests/ tests_bugfix -q -n 4
