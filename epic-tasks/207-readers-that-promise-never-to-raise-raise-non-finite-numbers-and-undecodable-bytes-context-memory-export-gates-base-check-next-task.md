@@ -1,6 +1,6 @@
 # 207 — readers that promise "never an exception" raise: a `NaN`/`Infinity` in context memory and export, a non-UTF-8 byte in `gates`, `arena base check` and `next_task`
 
-**Status:** queued
+**Status:** landed
 **Origin:** operator review (`bugs-to-review/`: `test_contest_memory_non_finite.py`, `test_contest_gates_undecodable_git_output.py`, `test_arena_base_check_undecodable_output.py`, `test_next_task_unreadable_progress.py`, bug 212), probed on `arena` @ `00355fd`
 **Severity:** LOW (each needs an unusual byte or number, but each ends a long step in a traceback and loses its result: a base check after its minutes, a harvest, a round's start)
 **File:** tools/contest/context_memory.py

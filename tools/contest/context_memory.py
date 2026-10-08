@@ -148,12 +148,14 @@ def _number(value) -> int | None:
     if isinstance(value, str):
         raw = value.replace(",", "").strip()
     elif isinstance(value, (int, float)):
-        raw = str(int(value))
+        raw = value
     else:
         return None
     try:
+        # the float -> int step is inside the try: `int(nan)` is a ValueError and
+        # `int(inf)` an OverflowError, and `json.loads` hands out both
         out = int(raw)
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         return None
     return out if out > 0 else None
 
@@ -490,7 +492,7 @@ def load(path, *, days: float = DEFAULT_DAYS, now: float | None = None) -> list[
         return []
     try:
         raw = Path(path).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return []
     try:
         data = json.loads(raw)

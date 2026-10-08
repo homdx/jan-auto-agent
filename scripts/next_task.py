@@ -19,6 +19,7 @@ Exit codes: 0 a ticket was printed · 3 the folder is finished · 1 usage error.
 """
 import argparse
 import csv
+import io
 import os
 import re
 import sys
@@ -71,9 +72,17 @@ def _field(body, label):
 def recorded(progress_path):
     if not os.path.exists(progress_path) or os.path.getsize(progress_path) == 0:
         return {}
-    with open(progress_path, newline="", encoding="utf-8") as fh:
+    # a file that will not decode, a field past the csv limit or a NUL byte reads
+    # as an empty file, the way `run start`'s intake and the harvest read it
+    try:
+        with open(progress_path, newline="", encoding="utf-8") as fh:
+            text = fh.read()
+        if "\x00" in text:  # newer csv modules parse a NUL; older ones raise
+            return {}
         return {(r.get("ticket") or "").strip(): (r.get("outcome") or "").strip()
-                for r in csv.DictReader(fh)}
+                for r in csv.DictReader(io.StringIO(text, newline=""))}
+    except (UnicodeDecodeError, csv.Error, OSError):
+        return {}
 
 
 def main():

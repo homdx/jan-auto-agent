@@ -82,7 +82,7 @@ def git(cwd, *args, check=False):
     git cannot answer after the ladder — that is their contract, and
     `judge_worktree` is written on it.
     """
-    r = run_git(["git", *args], cwd=cwd)
+    r = run_git(["git", *args], cwd=cwd, errors="replace")
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} in {cwd}: {r.stderr.strip()}")
     return r.stdout.strip()
@@ -91,7 +91,7 @@ def git(cwd, *args, check=False):
 def extract_shrink(cwd, rev):
     """The text of `def _shrink` at *rev*, or None if the file/def is absent."""
     src = subprocess.run(["git", "show", f"{rev}:{BRIDGE}"], cwd=cwd,
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, errors="replace")
     if src.returncode:
         return None
     lines = src.stdout.splitlines()
@@ -244,7 +244,8 @@ def _pytest(cwd, *args, budget: float = 0.0) -> subprocess.CompletedProcess:
     timeout = ["--timeout=180"] if importlib.util.find_spec("pytest_timeout") else []
     cmd = [sys.executable, "-m", "pytest", *args, *timeout]
     if budget <= 0:
-        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                              errors="replace")
 
     outs = [tempfile.NamedTemporaryFile("w+", encoding="utf-8", errors="replace",
                                         delete=False) for _ in (0, 1)]
@@ -477,7 +478,7 @@ def run_tests_detail(cwd, budget_sec: float = 0.0) -> tuple[str, list[str]]:
         tail.extend(lines[-FAIL_TAIL_LINES:] or _tail(r.stderr))
     if os.path.isfile(os.path.join(cwd, TIER_CHECK)) and not any(t.endswith("budget✗") for t in out):
         r = subprocess.run([sys.executable, TIER_CHECK, "--check"],
-                           cwd=cwd, capture_output=True, text=True)
+                           cwd=cwd, capture_output=True, text=True, errors="replace")
         if r.returncode == 0:
             out.append("tiers:PASS")
         else:
@@ -555,8 +556,10 @@ def judge_worktree(name, path, base, declared, want_tests):
     row["test_files"] = len(tests)
     new_tests = 0
     for f in tests:
+        # the scorecard counts `def test_` lines: a fixture's or a Latin-1 byte
+        # is a replacement character, never a traceback out of `harvest`
         blob = subprocess.run(["git", "show", f"HEAD:{f}"], cwd=path,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, errors="replace")
         if blob.returncode == 0:
             new_tests += len(re.findall(r"^\s*def test_", blob.stdout, re.M))
     row["test_funcs"] = new_tests

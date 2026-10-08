@@ -284,7 +284,7 @@ def run_steps(
         start = time.monotonic()
         try:
             proc = runner(list(step.command), cwd=str(worktree),
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, errors="replace")
         except OSError as err:
             proc = subprocess.CompletedProcess(list(step.command), 127, "", str(err))
         rows.append({
