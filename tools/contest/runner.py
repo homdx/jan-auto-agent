@@ -227,6 +227,8 @@ from tools.contest.kilo_client import (
     SessionRef,
     kilo_neighbours,
 )
+from tools.contest import testcache as _testcache
+from tools.contest.testcache_glue import TestCacheGate
 from tools.contest.policy import (HARD_DENYLIST, Decision, Policy, PolicyContext,
                                   is_full_suite_command)
 from tools.contest.roster import AgentSpec, ContestConfig
@@ -4352,6 +4354,22 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         except Exception:  # noqa: BLE001 — a history that cannot be read is empty
             return False
 
+    # Ticket 212: the round's test-run cache, one gate per agent over one file.
+    # Off (`None`) unless `[contest] test_cache = on`; every failure of it is
+    # "run the command", so it never stands between an agent and its tests.
+    test_cache_gate = None
+    if getattr(config, "test_cache", False):
+        try:
+            _gate_settings = getattr(policy, "_settings", None)
+            test_cache_gate = TestCacheGate(
+                out_dir / "test-cache.jsonl", agent=spec.name,
+                share=getattr(config, "test_cache_share", "round"),
+                classify=((lambda cmd: _testcache.classify_with_llm(cmd, _gate_settings))
+                          if getattr(config, "test_cache_llm", True) and _gate_settings is not None
+                          else None))
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("%s: test cache unavailable: %s", spec.name, exc)
+
     def on_permission(event: dict) -> tuple:
         props = event.get("properties") or {}
         run.permissions["asked"] += 1
@@ -4401,6 +4419,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             context_full[0] = True
         else:
             decision = policy.decide(event, ctx)
+            if (test_cache_gate is not None and decision.reply == "once"
+                    and props.get("permission") == "bash"):
+                test_cache_gate.harvest(recent)
+                cached = test_cache_gate.ask(props, ws.path)
+                if cached:
+                    decision = Decision(reply="reject", layer="test-cache", reason=cached)
         policy.record(decision, event, agent_dir / "decisions.jsonl", context=fill_now)
         run.permissions["allowed" if decision.reply == "once" else "rejected"] += 1
         if decision.layer == "gate":

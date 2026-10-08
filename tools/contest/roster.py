@@ -119,6 +119,9 @@ CONTEST_KEYS = (
     "harvest_budget_sec",
     "deadline_commit",
     "agent_suite_slots",
+    "test_cache",
+    "test_cache_share",
+    "test_cache_llm",
     "agent_suite_max_sec",
     "pytest_workers_per_agent",
     "pytest_workers_few_agents",
@@ -387,6 +390,14 @@ class ContestConfig:
     #: queue off: every reply is immediate and `_TEST_RUNS_LOCK` is the only
     #: serialization, which is today's behaviour byte for byte.
     agent_suite_slots: int = 1
+    #: ticket 212: a repeated pytest run on an unchanged tree is answered from the
+    #: round's own earlier run (a `reject` carrying one line). Off until a round
+    #: has judged it. `test_cache_share`: `round` = one agent's run serves any
+    #: other's on an identical tree, `agent` = only its own. `test_cache_llm`: a
+    #: command the parser cannot read is put to the gate model once.
+    test_cache: bool = False
+    test_cache_share: str = "round"
+    test_cache_llm: bool = True
     #: KC-58: how long one holder may keep the next waiter out. Past it the
     #: holder stops blocking and the next waiter goes in beside it — its
     #: pytest is not killed, because the agent is still running. 0 is no
@@ -906,6 +917,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     # rather than read as 0; a negative ceiling would unblock every holder at
     # once, which is also a typo rather than a setting.
     agent_suite_slots = limit("agent_suite_slots", 1)
+    test_cache_share = scalar("test_cache_share", "round")
+    if test_cache_share not in ("round", "agent"):
+        raise RosterError(f"[contest] test_cache_share must be round or agent, got {test_cache_share!r}")
     agent_suite_max_sec = limit("agent_suite_max_sec", 900)
     if agent_suite_slots < 0:
         raise RosterError(f"[contest] agent_suite_slots must be >= 0, got {agent_suite_slots}")
@@ -1004,6 +1018,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         harvest_budget_sec=max(0, limit("harvest_budget_sec", 900)),
         deadline_commit=flag("deadline_commit", True),
         agent_suite_slots=agent_suite_slots,
+        test_cache=flag("test_cache", False),
+        test_cache_share=test_cache_share,
+        test_cache_llm=flag("test_cache_llm", True),
         agent_suite_max_sec=agent_suite_max_sec,
         pytest_workers_per_agent=pytest_workers_per_agent,
         pytest_workers_few_agents=pytest_workers_few_agents,
