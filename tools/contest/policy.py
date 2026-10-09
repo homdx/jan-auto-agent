@@ -1184,9 +1184,12 @@ def _scan(command: str) -> tuple:
         # substitutions are searched (fail closed) — and with quotes blind,
         # as _scan(body) below is not: an apostrophe there swallows the rest
         subs.extend(_subs_in_text(body))
-        more_pieces, more_subs = _scan(body)
-        pieces.extend(more_pieces)
-        subs.extend(more_subs)
+        # a quote in the body is a plain character, so the text is read line by
+        # line: an apostrophe on one line must not swallow the next
+        for line in body.split("\n"):
+            more_pieces, more_subs = _scan(line)
+            pieces.extend(more_pieces)
+            subs.extend(more_subs)
     elif cur:
         pieces.append("".join(cur))
 
