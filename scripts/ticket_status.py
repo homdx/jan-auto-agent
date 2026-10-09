@@ -44,7 +44,9 @@ import re
 import subprocess
 from pathlib import Path
 
-STATUS_RE = re.compile(r"^(\*\*Status:\*\*\s*)(\S+)(.*)$", re.MULTILINE)
+# `[ \t]*`, not `\s*`: an empty Status line must not read (and then overwrite) the
+# first word of the line below it.
+STATUS_RE = re.compile(r"^(\*\*Status:\*\*[ \t]*)(\S+)(.*)$", re.MULTILINE)
 TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
 #: `| 48 | `KC-9` | queued — …` → the status word in the third cell.
 INDEX_ROW = r"^(\|\s*0*{n}\s*\|[^|\n]*\|\s*)([^|\n]*?)(\s*\|)"

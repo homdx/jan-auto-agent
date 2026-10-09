@@ -94,7 +94,7 @@ def retry_with_backoff(call, attempts: int = 3, sleep_fn=None,
     try with no retry (still raises on failure, never sleeps).
     """
     sleep = sleep_fn or time.sleep
-    attempts = max(1, int(attempts))
+    attempts = max(1, int(attempts or 0))  # falsy (None, 0, "") is one try, as documented
     last_exc: "BaseException | None" = None
     for attempt in range(attempts):
         try:

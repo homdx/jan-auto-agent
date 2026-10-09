@@ -599,7 +599,8 @@ def issue_view(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> in
             print(f"arena: no ticket {nn} in .arena/drafts/, {rounds.TASKS_DIR}/ "
                   f"or on {branch}", file=sys.stderr)
             return rounds.EXIT_FAILED
-        text = _text(repo, branch, found.where, Path(found.path).name.split(":")[-1])
+        # the file name is what follows the last `/`; it may itself hold a `:`
+        text = _text(repo, branch, found.where, found.path.rsplit("/", 1)[-1])
     except (rounds.RoundError, GitRefError, profile.ProfileError, OSError) as err:
         return output.refuse(str(err))
     if args.output == "json":
@@ -859,9 +860,13 @@ def _in_folder(repo: Path, folder: str, nn: int) -> list[str]:
 
 
 def _body_on_branch(repo: Path, branch: str, name: str) -> str:
-    """The ticket's text from *branch*'s tree — the status is written on the branch."""
-    return printable(git(repo, "show", f"refs/heads/{branch}:{rounds.TASKS_DIR}/{name}",
-                         strip=False))
+    """The ticket's text from *branch*'s tree — the status is written on the branch.
+
+    The blob's own bytes (an undecodable one stays a surrogate): this is the text the
+    verbs and `edit` commit back, and `printable` — U+FFFD for each such byte — is
+    for the screen only. `_ticket_text_desc` applies it where the text is shown.
+    """
+    return git(repo, "show", f"refs/heads/{branch}:{rounds.TASKS_DIR}/{name}", strip=False)
 
 
 # ── the flow block's text ─────────────────────────────────────────────────────
@@ -912,11 +917,11 @@ def _ticket_text_desc(repo: Path, branch: str, nn: int, found: Optional[dict]) -
     state = _round_state(repo, nn)
     if not found:
         return (f"{nn} (?) on {branch}: ? · Status: ? · round {nn}: {state}")
-    name = f"{rounds.TASKS_DIR}/{found['name']}" if found.get("name") else "?"
-    title = found.get("ar") or ""
+    name = f"{rounds.TASKS_DIR}/{printable(found['name'])}" if found.get("name") else "?"
+    title = printable(found.get("ar") or "")
     head = f"{nn} ({title})" if title else f"{nn}"
-    word = found.get("word") or ""
-    note = found.get("note") or ""
+    word = printable(found.get("word") or "")
+    note = printable(found.get("note") or "")
     status = (f"Status: {word}" + (f" ({note})" if note else "")) if word else "Status: missing"
     return f"{head} {name} on {branch} · {status} · round {nn}: {state}"
 
@@ -1395,7 +1400,9 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
         if base_sha is None:
             raise GitRefError(f"branch {branch!r} does not exist")
         base_blob = git(repo, "rev-parse", f"{base_sha}:{rel}")
-        text = printable(git(repo, "show", base_blob, strip=False))
+        # the blob's own bytes, as `_body_on_branch` returns them: `printable` is for
+        # the screen, and the edit commits back what it read
+        text = git(repo, "show", base_blob, strip=False)
     except GitRefError as err:
         return _refuse(str(err), args, where=where,
                        ticket=_ticket_text_desc(repo, branch, nn, None),

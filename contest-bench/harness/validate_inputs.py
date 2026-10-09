@@ -23,7 +23,10 @@ def md5(p: Path) -> str:
 
 
 def patch_files(text: str) -> set:
-    return set(re.findall(r"^diff --git a/(\S+) b/", text, re.M))
+    """Every path the patch touches: both sides of each `diff --git a/OLD b/NEW` header,
+    which differ for a rename."""
+    return {path for pair in re.findall(r"^diff --git a/(\S+) b/(\S+)", text, re.M)
+            for path in pair}
 
 
 def main():
@@ -75,7 +78,8 @@ def main():
         if head == basesha:
             problems.append(f"{name}: worktree HEAD == base — patch not applied")
             continue
-        changed = set(subprocess.run(["git", "diff", "--name-only", f"{base}..HEAD"], cwd=d, capture_output=True, text=True).stdout.split())
+        # --no-renames: a rename is its old path and its new one, as the patch names both
+        changed = set(subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}..HEAD"], cwd=d, capture_output=True, text=True).stdout.split())
         src = (repo / e["source"]).resolve()
         if src.suffix == ".zip":
             with zipfile.ZipFile(src) as z:

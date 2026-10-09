@@ -55,7 +55,9 @@ TASKS_DIR = contest_cli.TASKS_DIR
 
 #: `07-x.md` is round 7 — the same match as `gates.ticket_for_round`.
 _TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
-_STATUS_LINE = re.compile(r"^\*\*Status:\*\*.*$", re.MULTILINE)
+# No `$`: in MULTILINE mode it only matches before a `\n`, so a CRLF line's `\r`
+# would have to be taken by the match and the replacement would drop it.
+_STATUS_LINE = re.compile(r"^\*\*Status:\*\*[^\r\n]*", re.MULTILINE)
 #: A round folder: `06` or `06.2`.
 _ROUND_DIR = re.compile(r"^(\d+)(?:\.(\d+))?$")
 

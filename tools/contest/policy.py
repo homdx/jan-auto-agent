@@ -1655,6 +1655,12 @@ def _deny_candidates(command: str, _depth: int = 0) -> list:
         if _depth < _MAX_NESTING:
             nested += _inline_scripts(piece)
         tokens = piece.split()
+        # every bare group opener / closer goes, not only the first and last token:
+        # `( ( git push ) )`, `! ( git push )` and `{ { git push; }; }` are a push.
+        while tokens and not tokens[0].strip("({!"):
+            tokens.pop(0)
+        while tokens and not tokens[-1].strip(")}"):
+            tokens.pop()
         if tokens:
             tokens[0] = tokens[0].lstrip("({!") or ""
             tokens[-1] = tokens[-1].rstrip(")}")

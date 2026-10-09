@@ -205,7 +205,7 @@ EXIT_OK, EXIT_NO_READY, EXIT_FAILED = 0, 2, 1
 #: `**Status:** open — round 55 …` → `open`. `next_task.py`'s `_status`,
 #: duplicated the way `gates.declared_files` already duplicates that ticket's
 #: `**File:**` parse instead of importing a script.
-_STATUS_RE = re.compile(r"^\*\*Status:\*\*\s*(\S+)", re.MULTILINE)
+_STATUS_RE = re.compile(r"^\*\*Status:\*\*[ \t]*(\S+)", re.MULTILINE)
 
 #: `# KC-16 — \`python3 -m tools.contest run …\`` → `KC-16`.
 _TITLE_RE = re.compile(r"^#\s*([A-Za-z0-9_.-]+)", re.MULTILINE)

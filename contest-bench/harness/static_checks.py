@@ -64,10 +64,16 @@ if scen_path:
     for section, key, default in getattr(mod, "CONFIG_KEYS", []):
         m = re.search(r"^\[" + re.escape(section) + r"\](.*?)(?=^\[|\Z)", ini, re.S | re.M)
         body = m.group(1) if m else ""
-        checks.append(ck(f"S.{key} documented in agents.ini [{section}]", key in body, "present" if key in body else "missing"))
+        # the key is a whole identifier (`max_retries` does not document `retries`) and its
+        # value is the default, not a longer number that begins with it (`0.5` is not a
+        # default of `0`). A commented example (`#key = 3`) or prose still documents it.
+        name = r"(?<![A-Za-z0-9_])" + re.escape(key) + r"(?![A-Za-z0-9_])"
+        assign = name + r"[ \t]*=[ \t]*"
+        documented = bool(re.search(name, body))
+        checks.append(ck(f"S.{key} documented in agents.ini [{section}]", documented, "present" if documented else "missing"))
         checks.append(ck(f"S.{key} default {default} in agents.ini",
-                         bool(re.search(re.escape(key) + r"\s*=\s*" + re.escape(str(default)) + r"\b", body)),
-                         re.findall(re.escape(key) + r"\s*=\s*\S+", body)[:1]))
+                         bool(re.search(assign + re.escape(str(default)) + r"(?![\w.])", body)),
+                         re.findall(assign + r"\S+", body)[:1]))
 
 info = {"base": base[:7], "commits": ncommits, "diff_lines_tools": f"+{added}/-{removed}", "changed": changed,
         "new_tests": new_tests, "n_new_test_fns": n_new_test_fns,

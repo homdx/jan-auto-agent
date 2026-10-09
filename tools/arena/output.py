@@ -148,7 +148,7 @@ def _label(label: str) -> str:
 def flow_line(flow) -> str:
     """`(step, state[, detail])` → `[✓] a → [✗] b: why → [ ] c`, one line."""
     parts = []
-    for item in flow:
+    for item in flow or ():
         step, state = item[0], item[1]
         detail = _one_line(item[2]) if len(item) > 2 else ""
         text = f"{_one_line(step)}: {detail}" if detail else _one_line(step)
@@ -158,7 +158,7 @@ def flow_line(flow) -> str:
 
 def flow_json(flow) -> list:
     """The same steps as `[{"step": …, "state": …}]` for `-o json`."""
-    return [{"step": _one_line(item[0]), "state": _one_line(item[1])} for item in flow]
+    return [{"step": _one_line(item[0]), "state": _one_line(item[1])} for item in flow or ()]
 
 
 def _one_line(text: str) -> str:
@@ -202,7 +202,7 @@ def refuse_ctx(msg, *, where=None, ticket=None, flow=None, hints=None, fmt="tabl
         print(f"arena: {message}", file=out)
         print(_wrap("where", str(where) if where else "?"), file=out)
         print(_wrap("ticket", str(ticket) if ticket else "?"), file=out)
-        print(_label("flow") + flow_line(flow), file=out)
+        print(_label("flow") + (flow_line(flow) or "?"), file=out)
         for hint in hints or []:
             print(_hint_line(hint), file=out)
     else:

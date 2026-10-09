@@ -50,6 +50,15 @@ def longest(rs, f):
     return max(((r.get(f) or "").strip() for r in rs), key=len, default="")
 
 
+def severity(rs):
+    """The most severe rating any row gives, upper-cased; "" when none rates it.
+
+    Not `longest`: that picks the longest *word* (MEDIUM beat HIGH).
+    """
+    return min(((r.get("severity") or "").strip().upper() for r in rs),
+               key=lambda rating: SEV.get(rating, SEV[""]), default="")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--truth", required=True)
@@ -64,16 +73,37 @@ def main():
     # constructor that binds it, the attribute it lands on. Those are one bug and
     # one ticket. A `duplicate_of` column naming the canonical finding folds the
     # aliases in rather than filing the same work three times.
+    # An alias is folded into the row its `duplicate_of` chain ends in. A chain that ends
+    # in a name that is not a REAL row (missing, mistyped, FALSE) or that loops back on
+    # itself has no canonical row to fold into: its aliases are one bug all the same, so
+    # the first of them is the ticket and the rest fold into it. A defect is never
+    # dropped for naming a bad canonical.
+    real_rows = {(r.get("finding") or "").strip(): r for r in truth_rows
+                 if (r.get("truth") or "").strip().upper() == "REAL"}
+    order = {key: i for i, key in enumerate(real_rows)}
+
+    def end_of(key):
+        path = []
+        while key in real_rows and key not in path:
+            path.append(key)
+            nxt = (real_rows[key].get("duplicate_of") or "").strip()
+            if not nxt:
+                return key                      # a canonical row
+            key = nxt
+        if key in real_rows:                    # a cycle: its first row stands for it
+            return min(path[path.index(key):], key=order.get)
+        return key                              # names a finding that is not a REAL row
+
+    groups = defaultdict(list)
+    for key in real_rows:
+        groups[end_of(key)].append(key)
     aliases = defaultdict(list)
-    real = []
-    for r in truth_rows:
-        if (r.get("truth") or "").strip().upper() != "REAL":
-            continue
-        canon = (r.get("duplicate_of") or "").strip()
-        if canon:
-            aliases[canon].append(r["finding"])
-        else:
-            real.append(r)
+    heads = []
+    for end, members in groups.items():
+        head = end if end in real_rows else members[0]
+        heads.append(head)
+        aliases[head] = [m for m in members if m != head]
+    real = [real_rows[h] for h in sorted(heads, key=order.get)]
     if not real:
         print("no REAL findings in the ground truth — nothing to file")
         return 0
@@ -82,8 +112,11 @@ def main():
     verdict = read(a.verdicts)
     os.makedirs(a.out, exist_ok=True)
 
-    real.sort(key=lambda r: SEV.get(
-        longest(verdict.get(r["finding"], []) + detail.get(r["finding"], []), "severity").upper(), 5))
+    def rating(finding):
+        """The severity a ticket shows: the most severe any row gives, MEDIUM unrated."""
+        return severity(verdict.get(finding, []) + detail.get(finding, [])) or "MEDIUM"
+
+    real.sort(key=lambda r: SEV.get(rating(r["finding"]), SEV[""]))
 
     index = ["# Task index\n",
              f"{len(real)} confirmed defect(s), highest severity first.\n",
@@ -94,7 +127,7 @@ def main():
         d, v = detail.get(k, []), verdict.get(k, [])
         both = v + d
         file_, _, symbol = k.partition("::")
-        sev = longest(both, "severity").upper() or "MEDIUM"
+        sev = rating(k)
         title = longest(d, "title") or f"Fix {symbol or file_}"
         name = f"{i:02d}-{slug(symbol or os.path.basename(file_))}.md"
 

@@ -55,6 +55,34 @@ def load(paths):
     return rows, problems
 
 
+def verdict_of(r):
+    """A row's verdict, upper-cased; "" when the cell is empty or the row was cut short
+    (`csv.DictReader` gives a missing trailing field as None, not "")."""
+    return (r.get("verdict") or "").strip().upper()
+
+
+def agreement_of(rs, n_reviewers):
+    """SOLO / SPLIT / UNANIMOUS for the rows *rs* of one finding.
+
+    By reviewers, not rows: a reviewer who judged one symbol under two task-ids is one
+    reviewer, and one who said two different things disagrees with herself.
+    """
+    by_rv = defaultdict(set)
+    for r in rs:
+        by_rv[r["_reviewer"]].add(verdict_of(r))
+    if len(by_rv) == 1 and n_reviewers > 1:
+        return "SOLO"
+    return "SPLIT" if len(set().union(*by_rv.values()) - {""}) > 1 else "UNANIMOUS"
+
+
+def verdicts_by_reviewer(rs):
+    """`{reviewer: "A"}`, or `"A|B"` for a reviewer who gave two verdicts."""
+    by_rv = defaultdict(set)
+    for r in rs:
+        by_rv[r["_reviewer"]].add(verdict_of(r))
+    return {rv: "|".join(sorted(vs)) for rv, vs in by_rv.items()}
+
+
 def key_of(r):
     """Group by what the row describes, not by the id the agent assigned."""
     f, sym = (r.get("file") or "").strip(), (r.get("symbol") or "").strip()
@@ -94,11 +122,11 @@ def main():
           + f" {'no-evidence':>12} {'no-disproof':>12}")
     for rv in reviewers:
         mine = [r for r in rows if r["_reviewer"] == rv]
-        c = Counter(r.get("verdict", "").strip().upper() for r in mine)
-        confirmed = [r for r in mine if r.get("verdict", "").strip().upper() == "CONFIRMED"]
+        c = Counter(verdict_of(r) for r in mine)
+        confirmed = [r for r in mine if verdict_of(r) == "CONFIRMED"]
         blind = sum(1 for r in confirmed if not (r.get("evidence") or "").strip())
         nodis = sum(1 for r in mine
-                    if r.get("verdict", "").strip().upper() in ("CONFIRMED", "ALREADY_FIXED")
+                    if verdict_of(r) in ("CONFIRMED", "ALREADY_FIXED")
                     and not (r.get("disproof") or "").strip())
         print(f"  {rv:22} {len(mine):>5} "
               + " ".join(f"{c.get(v, 0):>10}" for v in VERDICTS)
@@ -109,27 +137,28 @@ def main():
     print("                 verdict — the check that catches pattern-matching.\n")
 
     # ── agreement per finding ────────────────────────────────────────────────
-    unanimous, split, singleton = [], [], []
-    for k, rs in groups.items():
-        verdicts = {r["_reviewer"]: (r.get("verdict") or "").strip().upper() for r in rs}
-        distinct = set(verdicts.values())
-        if len(rs) == 1 and len(reviewers) > 1:
-            singleton.append((k, rs[0]))
-        elif len(distinct) == 1:
-            unanimous.append((k, rs, distinct.pop()))
-        else:
-            split.append((k, rs, verdicts))
-
     def worst_sev(rs):
         sevs = [(r.get("severity") or "").strip().upper() for r in rs]
         return sorted(sevs, key=lambda s: SEVERITY_ORDER.get(s, 5))[0]
+
+    # the same buckets as the --csv pivot's `agreement` column
+    unanimous, split, singleton = [], [], []
+    for k, rs in groups.items():
+        verdicts = verdicts_by_reviewer(rs)
+        kind = agreement_of(rs, len(reviewers))
+        if kind == "SOLO":
+            singleton.append((k, rs))
+        elif kind == "UNANIMOUS":
+            unanimous.append((k, rs, next(iter(set(verdicts.values())))))
+        else:
+            split.append((k, rs, verdicts))
 
     if split:
         print(f"── SPLIT VERDICTS ({len(split)}) — read these first " + "─" * 20)
         for k, rs, verdicts in sorted(split, key=lambda x: SEVERITY_ORDER.get(worst_sev(x[1]), 5)):
             print(f"\n  {k}   [worst severity: {worst_sev(rs) or '?'}]")
             for rv in sorted(verdicts):
-                row = next(r for r in rs if r["_reviewer"] == rv)
+                row = next(r for r in rs if r["_reviewer"] == rv)   # its evidence, first row
                 ev = (row.get("evidence") or "").strip().replace("\n", " ")
                 print(f"    {rv:20} {verdicts[rv]:15} {(row.get('severity') or ''):9} "
                       f"{ev[:60]}")
@@ -144,10 +173,11 @@ def main():
 
     if singleton:
         print(f"── SEEN BY ONE REVIEWER ({len(singleton)}) — incl. NEW-* finds " + "─" * 10)
-        for k, r in sorted(singleton, key=lambda x: SEVERITY_ORDER.get(
-                (x[1].get("severity") or "").strip().upper(), 5)):
-            print(f"  {r['_reviewer']:20} {(r.get('verdict') or ''):15} "
-                  f"{(r.get('severity') or ''):9} {r.get('task_id', ''):8} {k[:40]}")
+        for k, rs in sorted(singleton, key=lambda x: SEVERITY_ORDER.get(worst_sev(x[1]), 5)):
+            verdict = verdicts_by_reviewer(rs)[rs[0]["_reviewer"]]
+            tasks = ",".join(sorted({(r.get("task_id") or "").strip() for r in rs} - {""}))
+            print(f"  {rs[0]['_reviewer']:20} {verdict:15} "
+                  f"{worst_sev(rs):9} {tasks:8} {k[:40]}")
         print("\n  A NEW-* row nobody else found is either the best result of the\n"
               "  run or a hallucination. There is no third option — check it.\n")
 
@@ -196,12 +226,9 @@ def write_merged_csv(path, groups, reviewers, worst_sev):
     def row_for(k, rs):
         by_rv = defaultdict(list)
         for r in rs:
-            by_rv[r["_reviewer"]].append((r.get("verdict") or "").strip().upper())
+            by_rv[r["_reviewer"]].append(verdict_of(r))
         tally = Counter(v for vs in by_rv.values() for v in vs)
-        if len(by_rv) == 1 and len(reviewers) > 1:
-            agreement = "SOLO"
-        else:
-            agreement = "SPLIT" if len(set(tally) - {""}) > 1 else "UNANIMOUS"
+        agreement = agreement_of(rs, len(reviewers))
         out = {
             "finding": k,
             "severity": worst_sev(rs) or "",
