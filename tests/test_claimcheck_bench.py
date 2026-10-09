@@ -1,9 +1,11 @@
 """CC-0: the claim-check bench — fixture shas, the key, the scorer and the real checks."""
 
 import importlib.util
+import io
 import json
 import subprocess
 import sys
+import tarfile
 from collections import Counter
 from pathlib import Path
 
@@ -93,6 +95,29 @@ def test_fixture_truth_is_stated(fx):
     for c in FIXTURE["claims"]:
         if c["expect"]:
             assert (c["truth_base"], c["truth_head"]) == want[c["expect"]], c["id"]
+
+
+def _behaviours(fx, sha, dest):
+    """behaviours.py run over the fixture's tree at *sha*."""
+    blob = subprocess.run(["git", "archive", sha], cwd=fx.root, capture_output=True, check=True).stdout
+    dest.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+        tar.extractall(dest)
+    out = subprocess.run([sys.executable, str(BENCH / "behaviours.py"), str(dest)],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr[-2000:]
+    return json.loads(out.stdout)
+
+
+@pytest.mark.parametrize("side", ["base", "head"])
+def test_key_agrees_with_running_the_code(fx, tmp_path, side):
+    """The key was computed from probe strings; the code, run, says the same for every claim."""
+    seen = _behaviours(fx, fx.base_sha if side == "base" else fx.head_sha, tmp_path / side)
+    judged = [c for c in FIXTURE["claims"] if c["kind"] in ("code", "world", "mixed", "dangling")]
+    assert {c["id"] for c in judged} == set(seen)
+    wrong = {c["id"]: (seen[c["id"]], c[f"truth_{side}"])
+             for c in judged if seen[c["id"]] != c[f"truth_{side}"]}
+    assert wrong == {}, "observed != key"
 
 
 def test_how_names_the_deciding_lines(fx):
@@ -193,7 +218,7 @@ def test_scorer_deltas():
     assert t["expected"] == {"fixed": 20, "still": 10, "gone": 2, "new": 2}
     assert t["confusion"]["fixed"] == {"FIXED": 19, "STILL": 1}
     assert t["delta"]["fix_right"] == round(29 / 30, 4)
-    assert t["delta"]["fixed_as_still"] == 0
+    assert t["delta"]["still_as_fixed"] == 0
 
 
 def _cli(tmp_path, table_votes, key, thresholds):

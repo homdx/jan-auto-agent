@@ -48,3 +48,10 @@ Verdicts: UNSURE 28, CODE-CHECK 2.
   ask for ≥ 60 % coverage, so there is nothing to recalibrate against yet.
 
 Raw output: `claim-check-out/cc-20261009T170317Z/` (not committed).
+
+**After the first commit (review, same day):** two fixture claims were reworded because
+their key was not decidable from the code as worded — `f003` (now "does not strip the
+whitespace of the items") and `f028` (now "`PASS*` without comparing the ids with the
+failed count"). Both were UNSURE/CODE-CHECK in the run above, so no number in this file
+moves; the run was not repeated for two claims. `behaviours.py` now runs the fixture's
+code and checks all 74 code/world/mixed/dangling claims against the key at both shas.

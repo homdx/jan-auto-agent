@@ -27,7 +27,8 @@ has no answer to be right about: it is counted in ``no_truth`` only.
 A ``delta.json`` (a list of ``{id|claim, change}``, or ``{"deltas": [...]}``)
 is scored against each claim's ``expect``: the confusion of expected against
 measured change, and ``fix_right`` — the share of ``fixed``/``still`` claims
-whose change is ``FIXED``/``STILL`` respectively.
+whose change is ``FIXED``/``STILL`` respectively; ``still_as_fixed`` counts the
+``still`` claims reported ``FIXED`` — the costly error, a bug called gone that is not.
 
 With ``--thresholds``, each target of the claim file's set is checked; exit 1
 when one is missed. A target whose metric is ``null`` or absent from this
@@ -167,7 +168,7 @@ def score_deltas(deltas, truth) -> dict:
             "expected": dict(expected),
             "confusion": {k: dict(v) for k, v in sorted(confusion.items())},
             "delta": {"fix_right": round(fix_hits / fix_total, 4) if fix_total else None,
-                      "fixed_as_still": confusion.get("still", Counter())["FIXED"]}}
+                      "still_as_fixed": confusion.get("still", Counter())["FIXED"]}}
 
 
 # ── thresholds ────────────────────────────────────────────────────────────
@@ -204,7 +205,7 @@ def _pct(x) -> str:
 def render(table: dict) -> str:
     if "confusion" in table:
         lines = [f"set={table['set']}  fix_right={_pct(table['delta']['fix_right'])}  "
-                 f"fixed_as_still={table['delta']['fixed_as_still']}",
+                 f"still_as_fixed={table['delta']['still_as_fixed']}",
                  f"{'expect':8} " + " ".join(f"{c:>7}" for c in CHANGES)]
         for exp, row in table["confusion"].items():
             lines.append(f"{exp:8} " + " ".join(f"{row.get(c, 0):>7}" for c in CHANGES))

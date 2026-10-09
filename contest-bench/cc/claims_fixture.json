@@ -34,7 +34,7 @@
   },
   {
    "id": "f003",
-   "claim": "`config.get_list` keeps the spaces around each item of the comma-separated list.",
+   "claim": "`config.get_list` does not strip the whitespace of the items it returns.",
    "kind": "code",
    "truth": true,
    "truth_base": true,
@@ -384,7 +384,7 @@
   },
   {
    "id": "f028",
-   "claim": "`gates.gate_flaky` reports `PASS*` without checking that every failed test was rerun.",
+   "claim": "`gates.gate_flaky` reports `PASS*` when the rerun passes, without checking that `failed_ids` holds as many ids as `bad` tests failed.",
    "kind": "code",
    "truth": true,
    "truth_base": true,

@@ -356,7 +356,7 @@
   {
    "id": "f028",
    "kind": "still",
-   "what": "PASS* over a partial rerun",
+   "what": "PASS* without comparing the ids with the failed count",
    "file": "gates.py",
    "symbol": "gate_flaky",
    "at": "base",

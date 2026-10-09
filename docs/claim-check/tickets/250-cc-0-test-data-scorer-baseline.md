@@ -116,6 +116,14 @@ target in `thresholds.json`, the note says why.
   no-evidence voters decide; the expected value is near zero. If it is not, the epic's
   premise (§1) is wrong and the epic stops here.
 
+## Follow-up (review of the first commit)
+
+* `f003` and `f028` reworded (their key was not decidable from the code as worded).
+* `contest-bench/cc/behaviours.py` runs the fixture and observes every code, world, mixed
+  and dangling claim; `test_key_agrees_with_running_the_code` compares it with the key at
+  both shas, so the key no longer rests on the probe strings alone.
+* `score_cc.py`: `fixed_as_still` is now `still_as_fixed` (a `still` claim called FIXED).
+
 ## Not in scope
 
 The behaviour of any later ticket; the thresholds are recorded here, enforced from CC-6.
