@@ -104,7 +104,8 @@ def run_git(
         An attempt that could not be made or did not finish; never swallowed.
     """
     proc: Optional[subprocess.CompletedProcess] = None
-    for attempt in range(max(1, retries)):
+    bounded = max(1, retries)
+    for attempt in range(bounded):
         proc = subprocess.run(
             list(cmd),
             cwd=str(cwd) if cwd is not None else None,
@@ -116,7 +117,7 @@ def run_git(
         )
         if (
             proc.returncode == 0
-            or attempt == retries - 1
+            or attempt == bounded - 1
             or not _attempted(proc.stderr or "")
         ):
             return proc
@@ -124,7 +125,7 @@ def run_git(
             "git %s: index held by another git — retry %d/%d in %.2fs",
             " ".join(str(c) for c in cmd),
             attempt + 1,
-            retries - 1,
+            bounded - 1,
             backoff_s,
         )
         (sleep or _backoff)(backoff_s)

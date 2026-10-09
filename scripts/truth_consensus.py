@@ -45,6 +45,16 @@ def longest(rs, field):
     return max(((r.get(field) or "").strip() for r in rs), key=len, default="")
 
 
+def severity(rs):
+    """The most severe rating any adjudicator gave, upper-cased; "" when none rated it.
+
+    Not `longest`: that picks the longest *word*, so MEDIUM beat HIGH and the order of the
+    files decided a tie.
+    """
+    return min(((r.get("severity") or "").strip().upper() for r in rs),
+               key=lambda rating: SEV.get(rating, SEV[""]), default="")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csvs", nargs="+")
@@ -55,6 +65,9 @@ def main():
                          "code). Without one, splits stay open — which is correct, "
                          "because a majority of models can be confidently wrong together")
     a = ap.parse_args()
+    # adjudicators are named from the file stem, lower-cased (truth-Bob.csv -> bob)
+    if a.arbiter:
+        a.arbiter = a.arbiter.strip().lower()
 
     paths = [p for pat in a.csvs for p in sorted(glob.glob(pat))] or a.csvs
     rows = load(paths)
@@ -82,6 +95,10 @@ def main():
                 arbitrated[k] = (votes[a.arbiter], votes)
             else:
                 disputed[k] = (votes, rs)
+        else:
+            # every vote is UNDECIDED: nobody decided it, so it is left open for a human —
+            # neither settled nor dropped from the report
+            disputed[k] = (votes, rs)
 
     L = [f"# Adjudication\n",
          f"{len(adjudicators)} adjudicators · {len(g)} findings · "
@@ -89,12 +106,12 @@ def main():
          f"Adjudicators: {', '.join(adjudicators)}\n"]
 
     real = [(k, rs) for k, (t, rs) in settled.items() if t == "REAL"]
-    real.sort(key=lambda x: SEV.get(longest(x[1], "severity").upper(), 5))
+    real.sort(key=lambda x: SEV.get(severity(x[1]), SEV[""]))
     L.append(f"\n## Confirmed real ({len(real)}) — these become work\n")
     if not real:
         L.append("_none_\n")
     for k, rs in real:
-        L.append(f"### `{k}` — {longest(rs, 'severity') or 'unrated'}\n")
+        L.append(f"### `{k}` — {severity(rs) or 'unrated'}\n")
         L.append(f"- **consequence:** {longest(rs, 'consequence')}")
         L.append(f"- **evidence:** {longest(rs, 'evidence')}")
         L.append(f"- **how checked:** {longest(rs, 'how')}")

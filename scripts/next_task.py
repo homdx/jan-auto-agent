@@ -19,6 +19,7 @@ Exit codes: 0 a ticket was printed · 3 the folder is finished · 1 usage error.
 """
 import argparse
 import csv
+import io
 import os
 import re
 import sys
@@ -27,9 +28,10 @@ TICKET_RE = re.compile(r"^(\d+)-.*\.md$")
 
 # A ticket whose **Status:** line starts with one of these is not on offer:
 # `landed` — merged, the round is over; `queued` — written, but not this
-# round (INDEX.md "Next rounds" says when). Everything else (`open`, no
-# status line at all — the tasks/ tickets have none) is handed out.
-SKIP_STATUS = ("landed", "queued")
+# round (INDEX.md "Next rounds" says when); `closed` — no longer wanted at all
+# (AR-14 `arena issue close`), its `**Closed:**` line says why. Everything else
+# (`open`, no status line at all — the tasks/ tickets have none) is handed out.
+SKIP_STATUS = ("landed", "queued", "closed")
 
 
 def load_tickets(tasks_dir):
@@ -55,9 +57,11 @@ def load_tickets(tasks_dir):
 def _status(body):
     """The **Status:** line's first word, lower-cased — `_field` wants a
     single back-quoted token and the epic tickets' status lines carry
-    commit shas and dates after it."""
-    m = re.search(r"^\*\*Status:\*\*\s*(\S+)", body, re.MULTILINE)
-    return m.group(1).strip("`*").lower() if m else ""
+    commit shas and dates after it. The note after the word is not part of
+    it: `queued (judged on arena)` and `queued, judged on arena` both read
+    `queued` (AR-14's `arena issue queue --note`)."""
+    m = re.search(r"^\*\*Status:\*\*[ \t]*(\S+)", body, re.MULTILINE)
+    return m.group(1).strip("`*,;:.-()[]{}<>—–'\"").lower() if m else ""
 
 
 def _field(body, label):
@@ -68,9 +72,17 @@ def _field(body, label):
 def recorded(progress_path):
     if not os.path.exists(progress_path) or os.path.getsize(progress_path) == 0:
         return {}
-    with open(progress_path, newline="", encoding="utf-8") as fh:
+    # a file that will not decode, a field past the csv limit or a NUL byte reads
+    # as an empty file, the way `run start`'s intake and the harvest read it
+    try:
+        with open(progress_path, newline="", encoding="utf-8") as fh:
+            text = fh.read()
+        if "\x00" in text:  # newer csv modules parse a NUL; older ones raise
+            return {}
         return {(r.get("ticket") or "").strip(): (r.get("outcome") or "").strip()
-                for r in csv.DictReader(fh)}
+                for r in csv.DictReader(io.StringIO(text, newline=""))}
+    except (UnicodeDecodeError, csv.Error, OSError):
+        return {}
 
 
 def main():

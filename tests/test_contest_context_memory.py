@@ -225,7 +225,10 @@ def test_smallest_size_is_the_smallest_the_model_has_ever_given(tmp_path):
     # record still wins over it: hy3's 104 065 in the ticket's table
     assert cm.smallest_size(records, "kenary", "agent-a:free") == 104_065
     assert cm.size_of(_record(limit=500, last_ok=900)) == 500
-    assert cm.size_of(_record(limit=None, last_ok=999)) == 999
+    # round 145: a last_ok under context_min_window sizes nothing; with the
+    # floor off (0) it is what it always was
+    assert cm.size_of(_record(limit=None, last_ok=999), 0) == 999
+    assert cm.size_of(_record(limit=None, last_ok=999)) is None
     assert cm.size_of(_record(limit=None, last_ok=None)) is None
     # a neighbour's overflow says nothing about this model
     assert cm.smallest_size(records, "kenary", "unknown:free") is None
@@ -415,6 +418,77 @@ def test_an_overflow_that_names_no_limit_is_remembered_with_only_the_last_ok(tmp
     assert cm.size_of(record) == 110_000
 
 
+#: Round 146: Kilo's own end of a compaction that could not get a session under
+#: the wall Kilo holds. The provider named nothing; the number it would leave in
+#: the memory is only where the session stood when Kilo gave up.
+KILO_WALL_OVERFLOW = {
+    "name": "ContextOverflowError",
+    "data": {"message": "Compaction exhausted: context still exceeds model limits "
+                        "after 3 attempts"},
+}
+
+
+def test_kilo_s_compaction_exhausted_ends_the_turn_but_is_not_remembered(tmp_path, caplog):
+    """Round 146: apertus-70b's declared 32 000 became 22 561 out of one of these,
+    the next agent compacted at 80 % of it, and Kilo's wall came down with it.
+
+    The turn ends as every overflow does — the same STALLED, the same two turns
+    — and the memory gets nothing: no file at all, so no size for the next agent.
+    """
+    caplog.set_level("INFO", logger="tools.contest.runner")
+    memory = tmp_path / "context-memory.json"
+    scenario = _overflow_scenario(KILO_WALL_OVERFLOW, 22_561)
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                   max_continues_per_attempt=0)
+    assert run.state is tr.AgentState.STALLED
+    assert run.last_error == "context overflow"
+    assert [t["kind"] for t in run.turns] == ["initial", "rework"]
+
+    assert cm.load(memory) == []
+    assert not memory.exists()
+    assert cm.smallest_size(cm.load(memory), "kenary", "agent-a:free") is None
+    assert any("Kilo's own wall" in r.getMessage() for r in caplog.records)
+
+
+def test_a_compaction_exhausted_does_not_lower_a_size_already_remembered(tmp_path):
+    """The memory holds the provider's own 200 000; Kilo's wall adds nothing to it."""
+    memory = _memory(tmp_path)
+    before = cm.load(memory)
+    scenario = _overflow_scenario(KILO_WALL_OVERFLOW, 22_561)
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                   max_continues_per_attempt=0)
+    assert run.state is tr.AgentState.STALLED
+    assert cm.load(memory) == before
+    assert cm.smallest_size(cm.load(memory), "kenary", "agent-a:free") == SIZE
+
+
+def test_a_compaction_exhausted_under_another_name_is_not_remembered_either(tmp_path):
+    """The words decide, not the error's name: a gateway that wraps Kilo's text in
+    a plain 400 reads as an overflow by its size words — and writes nothing."""
+    memory = tmp_path / "context-memory.json"
+    error = {"name": "APIError", "data": {
+        "message": KILO_WALL_OVERFLOW["data"]["message"].lower(), "statusCode": 400}}
+    scenario = _overflow_scenario(error, 110_000)
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                   max_continues_per_attempt=0)
+    assert run.state is tr.AgentState.STALLED
+    assert run.last_error == "context overflow"
+    assert cm.load(memory) == []
+
+
+def test_the_providers_own_overflow_is_still_remembered_next_to_kilo_s_wall(tmp_path):
+    """The guard against a loop must not turn the memory off: KC-67's own cases
+    (the provider names the limit, or names nothing) are written as before."""
+    memory = tmp_path / "context-memory.json"
+    for n, (error, last_ok) in enumerate(((SENSENOVA_OVERFLOW, 260_000),
+                                          (KENARY_OVERFLOW, 110_000))):
+        sandbox = tmp_path / f"run{n}"      # one sandbox per run, one memory for both
+        sandbox.mkdir()
+        _run(sandbox, _overflow_scenario(error, last_ok), memory=memory,
+             max_continues_per_attempt=0)
+    assert [r.last_ok for r in cm.load(memory)] == [260_000, 110_000]
+
+
 def test_an_overflow_one_step_jumped_into_is_remembered_but_sizes_nothing(tmp_path):
     """KC-73's live runs: the last reply went through at 14 179 and asked for a
     pile of `read`s; their results (~134 000 tokens) overflowed a ~120 000
@@ -523,13 +597,11 @@ def test_a_memory_the_runner_cannot_write_ends_the_overflow_the_way_it_does_toda
     and the failure is a warning, not a raise into the round."""
     caplog.set_level("WARNING", logger="tools.contest.runner")
     memory = tmp_path / "read-only" / "context-memory.json"
-    memory.parent.mkdir()
-    memory.parent.chmod(0o500)
-    try:
-        _sb, _fake, _h, run, _ = _run(tmp_path, _overflow_scenario(SENSENOVA_OVERFLOW, 260_000),
-                                       memory=memory, max_continues_per_attempt=0)
-    finally:
-        memory.parent.chmod(0o755)
+    # a FILE where the folder should be: the write fails for every user — a
+    # chmod 0o500 folder is writable for root, which is who a container runs as
+    memory.parent.write_text("not a folder", encoding="utf-8")
+    _sb, _fake, _h, run, _ = _run(tmp_path, _overflow_scenario(SENSENOVA_OVERFLOW, 260_000),
+                                   memory=memory, max_continues_per_attempt=0)
     assert run.state is tr.AgentState.STALLED
     assert run.last_error == "context overflow"
     assert any("context memory" in record.message for record in caplog.records)
@@ -920,6 +992,32 @@ def test_kilo_limit_is_the_real_window_and_input_is_the_compact_point():
     assert cm.kilo_limit(None, 32_000) is None
 
 
+@pytest.mark.parametrize("size, output", [
+    (32_000, 32_000),    # round 146: the publicai models — Kilo compacted them at 12 000
+    (32_000, None),
+    (64_000, 32_000),
+    (98_777, None),      # round 145's glm-4.5-flash
+    (50_000, 20_000),
+    (20_000, 4_000),     # a reserve under Kilo's 20 000 is Kilo's reserve
+])
+def test_kilo_compacts_a_small_window_at_the_percent_not_at_the_size_minus_its_reserve(
+        size, output):
+    """Round 146: ``input`` was capped at the budget, and Kilo compacts at
+    ``input - min(20 000, output)``. For a budget under about 100 000 the cap
+    is *below* percent + reserve — a 32 000 budget with a 32 000 output was
+    handed ``input = 32 000`` and compacted at 12 000, 37 % of it and about the
+    size of Kilo's own base context (11.4 k): the ticket was summarised away
+    within a few steps, and the agent answered that it could not see one. The
+    compact point is the share of the budget — the one `compact_at_percent`
+    names and the runner's own watch fires at — whatever the budget."""
+    limit = cm.kilo_limit(size, output, 80)
+    reserved = min(cm.KILO_COMPACT_RESERVE, limit["output"])
+    assert limit["input"] - reserved == int(size * 80 / 100)
+    # the hard wall is still the real window, and `input` stays under it
+    assert limit["context"] == size + limit["output"]
+    assert limit["input"] < limit["context"]
+
+
 def test_the_file_one_overflow_wrote_is_what_the_next_round_hands_kilo(tmp_path, monkeypatch):
     """The whole ticket: an overflow that names the limit is written to the
     shared file, and the next round's server gets that size as `limit.context`,
@@ -1146,3 +1244,139 @@ def test_the_fill_after_a_compact_is_the_summary_not_the_reply_before_it():
     after = {"info": {"role": "assistant", "tokens": {"input": 11_000, "output": 50}}, "parts": []}
     backend = type("B", (), {"messages": lambda self, s: [before, summary, after]})()
     assert runner_mod._context_tokens(backend, None) == 11_050
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# round 149: a loose remembered window must not lock a model small
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _loose_record(**over) -> cm.OverflowRecord:
+    """A loose record — KC-73's pattern: last_ok far below what grew past it."""
+    base = dict(at=time.time(), round="149", agent="agent-a",
+                provider="kenary", model="agent-a:free",
+                limit=None, last_ok=33_000, grew=200_000, prompt=None)
+    base.update(over)
+    return cm.OverflowRecord(**base)
+
+
+def test_a_loose_record_far_below_the_declared_window_sizes_nothing():
+    """Ticket 149 test 1: 33 000 / 200 000 under Kilo's 262 144 is 13 % of the
+    wall — not evidence of it — so ``size_of`` returns None and
+    ``_context_budget`` keeps Kilo's window."""
+    record = _loose_record()
+    assert cm.size_of(record, 32_000, declared=262_144) is None
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=262_144)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (262_144, "kilo")
+
+
+def test_a_loose_record_with_no_window_and_a_fallback_sizes_nothing():
+    """Ticket 149 test 2: no Kilo window, fallback 128 000 — 33 000 is 26 % of
+    it, under the 60 % share, so KC-73 holds: the fallback is what sizes."""
+    record = _loose_record()
+    assert cm.size_of(record, 32_000, fallback=128_000) is None
+    config = replace(tr.make_config(["agent-a"]), context_limit_fallback=128_000)
+    assert runner_mod._context_budget(config.agents[0], [record.to_dict()],
+                                      config) == (128_000, "fallback")
+
+
+def test_glm_s_loose_record_near_the_declared_wall_still_sizes_the_model():
+    """Ticket 149 test 3: glm-4.5-flash — 81 311 went through and ~42 000 more
+    overflowed a 131 072 window: 62 % of the wall, so it counts."""
+    record = _loose_record(last_ok=81_311, grew=42_000)
+    assert cm.size_of(record, 32_000, declared=131_072) == 81_311
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=131_072)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (81_311, "remembered")
+
+
+def test_a_tight_record_under_a_declared_window_still_sizes_the_model():
+    """Ticket 149 test 4: a tight 40 000 under Kilo's 131 072 sizes as before."""
+    record = _loose_record(last_ok=40_000, grew=1_000)
+    assert cm.size_of(record, 32_000, declared=131_072) == 40_000
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=131_072)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (40_000, "remembered")
+
+
+def test_a_small_declared_window_lowers_the_floor_for_a_tight_record():
+    """Ticket 149 test 5: Kilo declares 32 768; a tight 28 000 is under
+    context_min_window but at 85 % of the declared window — the floor drops
+    to share × D and the model is remembered at 28 000."""
+    record = _loose_record(last_ok=28_000, grew=500)
+    assert cm.size_of(record, 32_000, declared=32_768) == 28_000
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=32_768)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (28_000, "remembered")
+
+
+def test_a_fallback_window_lowers_the_floor_for_a_tight_record_with_no_declared():
+    """Ticket 152 test 6: Kilo declares nothing, so the wall is the round's
+    ``context_limit_fallback`` — the same number `size_of` already measures a
+    loose record against, and now the same number the floor drops against. A
+    tight 28 000 of a 32 768 fallback is 85 %, so the model is remembered.
+    With neither a declared window nor a fallback the floor stands at
+    context_min_window and the same record sizes nothing: there is no wall to
+    call 28 000 close to."""
+    record = _loose_record(last_ok=28_000, grew=500)
+    share_pct = cm.full_refusal_percent(None)
+    assert record.last_ok >= share_pct / 100.0 * 32_768, "85 % of the fallback"
+    assert cm.size_of(record, 32_000, fallback=32_768) == 28_000
+    assert cm.size_of(record, 32_000, declared=None, fallback=32_768) == 28_000
+    assert cm.size_of(record, 32_000, fallback=None) is None
+    assert cm.size_of(record, 32_000) is None
+    config = replace(tr.make_config(["agent-a"]), context_limit_fallback=32_768)
+    assert runner_mod._context_budget(config.agents[0], [record.to_dict()], config) == (
+        28_000, "remembered")
+    # a declared window above context_min_window lowers the floor not at all,
+    # so the fallback is the only wall that saves this record
+    assert cm.size_of(record, 32_000, declared=131_072) is None
+
+
+def test_a_remembered_size_equal_to_kilo_s_window_is_kilo_s():
+    """Ticket 149 test 7: a remembered size equal to Kilo's window exactly is
+    not smaller, so the source is ``"kilo"``."""
+    record = _loose_record(last_ok=262_144, grew=1_000)
+    spec = replace(tr.make_config(["agent-a"]).agents[0], context_limit=262_144)
+    assert runner_mod._context_budget(spec, [record.to_dict()]) == (262_144, "kilo")
+
+
+def test_the_next_round_s_overlay_carries_nothing_for_a_loose_small_record(
+        tmp_path, monkeypatch):
+    """Ticket 149 test 1 (overlay half): a loose 33 000 under Kilo's 262 144
+    hands Kilo nothing — intake's window stands, no ``limit`` in the overlay."""
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+    memory = tmp_path / "context-memory.json"
+    assert cm.add(memory, _loose_record()) is True
+    base = _config(tmp_path, memory=memory)
+    config = replace(base, agents=(replace(base.agents[0], context_limit=262_144),))
+    out, content = contest_cli._with_remembered_limits(config, tmp_path / "out" / "149", None)
+    assert out.agents[0].context_limit == 262_144
+    assert content is None
+
+
+def test_a_kc73_loop_guard_a_loose_record_does_not_compact_every_turn(tmp_path):
+    """Ticket 149 test 6: the memory holds a loose 45 000 / 200 000 record and
+    Kilo declares 262 144. Without the fix the record sizes the model at
+    45 000, the runner compacts at 36 000, and every turn (the round prompt
+    alone is 15–20k) earns a compact — KC-73's hy3/agnes failure. With the
+    fix Kilo's window stays in charge: six turns under 80 % of 262 144 compact
+    no more often than every 3 turns, and the run ends READY."""
+    memory = tmp_path / "context-memory.json"
+    assert cm.add(memory, _loose_record(last_ok=45_000, grew=200_000)) is True
+    base = _config(tmp_path, memory=memory, max_rework=5)
+    config = replace(base, agents=(replace(base.agents[0], context_limit=262_144),))
+    fills = [50_000, 55_000, 60_000, 65_000, 70_000, 75_000]
+    turns = []
+    for i, fill in enumerate(fills):
+        on_prompt = tr.work_ready if i == len(fills) - 1 else tr.work_no_test
+        tokens = {"input": fill - 6_000, "cache": {"read": 6_000},
+                  "reasoning": 0, "output": 0}
+        turns.append({"on_prompt": on_prompt, "events": ["busy", "idle"],
+                      "message_info": {"tokens": tokens}})
+    sb, fake, _h, run, _ = tr._run_one(tmp_path, {"turns": turns}, config)
+    tr._assert_ready(run, sb.ws("agent-a"))
+    compacts = sum(1 for turn in run.turns if turn.get("compacted"))
+    assert compacts <= len(run.turns) // 3, (
+        f"{compacts} compacts in {len(run.turns)} turns — the loose record "
+        "locked the model small again")
+    for turn in run.turns:
+        assert turn["context_source"] == "kilo"
+        assert turn["context_size"] == 262_144
+    assert not any(p.endswith("/summarize") for p, _ in _posts(fake))

@@ -56,12 +56,15 @@ import json
 import logging
 import os
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from tools.auto.llm_profile import LlmSettings
+from tools.auto.utils import (COMMAND_WRAPPERS, ENV_ASSIGN_RE, pytest_argv_start,
+                              pytest_segments, split_command)
 from tools.contest.roster import ContestConfig
 from tools.llm_stream import (
     build_chat_request,
@@ -178,7 +181,11 @@ def gate_time_back_sec(tries) -> float:
 REPLIES: tuple[str, ...] = ("once", "reject")
 #: ``context`` (KC-69) is the runner's own refusal of an ask made in a session
 #: at or past ``compact_at_percent`` of its size — the policy never returns it.
-LAYERS: tuple[str, ...] = ("mechanical", "gate", "gate-failed", "budget", "context")
+#: ``test-cache`` (212) is the runner's answer to a pytest ask it already ran on
+#: the same tree: a reject carrying the earlier result, never the policy's.
+LAYERS: tuple[str, ...] = (
+    "mechanical", "gate", "gate-failed", "budget", "context", "test-cache",
+)
 
 #: A reason is sent to the agent as the tool error and written to
 #: decisions.jsonl — one line, so it stays readable in both places.
@@ -636,9 +643,11 @@ def _unresolved_var(command) -> bool:
 
 #: The options that name a subset of the tests rather than a directory: a
 #: `-k`/`-m` run is a targeted one whatever else it is given. `=` forms too, so
-#: `-k=foo` reads the same as `-k foo`.
-_SELECTOR_OPTIONS = frozenset({"-k", "--keywords", "-m", "--markers"})
-_SELECTOR_PREFIXES = ("-k=", "--keywords=", "-m=", "--markers=")
+#: `-k=foo` reads the same as `-k foo`; 206: and the attached forms `-kfoo` /
+#: `-mslow` (a single-dash token that starts with `-k` or `-m`), and
+#: `--deselect`, which leaves part of the root out.
+_SELECTOR_OPTIONS = frozenset({"-k", "--keywords", "-m", "--markers", "--deselect"})
+_SELECTOR_PREFIXES = ("-k", "-m", "--keywords=", "--markers=", "--deselect=")
 
 #: An option that ends the invocation instead of running anything at all —
 #: `--collect-only` included: it imports the suite in seconds and runs none of it.
@@ -657,69 +666,586 @@ def _unquote_token(token: str) -> str:
     return token
 
 
-def _shell_pieces(command: str) -> list:
-    """*command* as its shell pieces: the runs of text a `&&`, `||`, `;`, `|` or
-    `&` joins outside quotes, so the suite piece of `cd /repo && pytest tests`
-    is what is measured and a `|` inside a quoted string stays in its token."""
-    pieces: list = []
-    current: list = []
-    quote = ""
-    for char in command:
-        if quote:
-            current.append(char)
-            if char == quote:
-                quote = ""
-            continue
-        if char in "\"'":
-            quote = char
-            current.append(char)
-            continue
-        if char in "|&;":
-            if current:
-                pieces.append("".join(current))
-                current = []
-            continue
-        current.append(char)
-    if current:
-        pieces.append("".join(current))
-    return [piece for piece in pieces if piece.strip()]
+#: The escapes an ANSI-C string (``$'…'``) turns into a single character.
+#: Anything else after the backslash is not an escape the shell defines, and
+#: the reader keeps the backslash as written rather than guess.
+_ANSI_C_SIMPLE = {
+    "n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v",
+    "\\": "\\", "'": "'", '"': '"', "?": "?",
+}
+_ANSI_C_HEX = frozenset("0123456789abcdefABCDEF")
+_ANSI_C_OCTAL = frozenset("01234567")
 
 
-def _pytest_argv_start(tokens: list) -> int | None:
-    """The index of the `pytest` token, or `None` when the command has no suite.
+def _ansi_c_close(text: str, dollar: int) -> int:
+    """The index of the `'` that closes the ``$'…'`` at ``text[dollar]``.
 
-    Only the command position counts: `echo pytest tests` and `ls pytest tests`
-    are not pytest runs, whatever token follows the tool. The position is past
-    `VAR=value` and the wrappers of `_WRAPPERS`, so `timeout 1500 python3 -m
-    pytest tests` is the suite it runs. Matched by basename,
-    so `/opt/venv/bin/pytest` is a suite too. `python -m pytest` counts as well,
-    with the argv starting after `pytest`: the two `-m` and `pytest` tokens have
-    to sit next to each other, so a `python -c "..."` that happens to name
-    `pytest` later on is not a suite.
+    ``\\`` escapes the next character inside an ANSI-C string, so `\\'` is a
+    quote *character* and not the end of the string, and ``\\\\`` is a
+    backslash. ``-1`` when the string never closes: the reader leaves the
+    text as written rather than guessing where it ran off the line.
     """
-    start = _past_wrappers(tokens)
-    if start is None or start >= len(tokens):
-        return None
-    head = tokens[start].rsplit("/", 1)[-1]
-    if head in ("pytest", "py.test"):
-        return start
-    if _PYTHON_RE.fullmatch(head):
-        if tokens[start + 1:start + 3] == ["-m", "pytest"]:
-            return start + 2
-    return None
+    i, n = dollar + 2, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            return i
+        i += 1
+    return -1
 
 
-#: `python`, `python3`, `python3.10` — the interpreters a `-m pytest` runs under.
-_PYTHON_RE = re.compile(r"python(\d+(\.\d+)?)?")
+def _ansi_c_end(text: str, dollar: int) -> int:
+    """The index to read on after the ``$'…'`` at ``text[dollar]``.
+
+    ``len(text)`` whether the string closed on its last character or never
+    closed at all: to a walker the two look the same, and taking the rest of
+    the text as the string hides nothing it could hide either way.
+    """
+    close = _ansi_c_close(text, dollar)
+    return len(text) if close < 0 else close + 1
+
+
+def _ansi_c_body(text: str, dollar: int) -> str:
+    """The raw, still-escaped text of the ``$'…'`` at ``text[dollar]``."""
+    close = _ansi_c_close(text, dollar)
+    if close < 0:
+        return ""
+    return text[dollar + 2:close]
+
+
+def _ansi_c_decode(body: str) -> str:
+    """The text of an ANSI-C string body, ``\\n``, ``\\t``, ``\\\\``, ``\\'``,
+    ``\\"``, ``\\?``, ``\\xHH`` and ``\\NNN`` decoded.
+
+    An escape the shell does not define keeps its backslash, so a body that
+    cannot be read is still returned as text rather than as an exception: the
+    caller never invents a command word it cannot read, and no failure reaches
+    the caller either.
+    """
+    out: list = []
+    i, n = 0, len(body)
+    while i < n:
+        c = body[i]
+        if c != "\\":
+            out.append(c)
+            i += 1
+            continue
+        if i + 1 >= n:
+            out.append(c)
+            i += 1
+            continue
+        d = body[i + 1]
+        if d in _ANSI_C_SIMPLE:
+            out.append(_ANSI_C_SIMPLE[d])
+            i += 2
+            continue
+        if d in "xX":
+            hexdigits = body[i + 2:i + 4]
+            if len(hexdigits) == 2 and all(ch in _ANSI_C_HEX for ch in hexdigits):
+                out.append(chr(int(hexdigits, 16)))
+                i += 4
+                continue
+            out.append(c)
+            i += 1
+            continue
+        if d in _ANSI_C_OCTAL:
+            j = i + 1
+            while j < n and j - i < 4 and body[j] in _ANSI_C_OCTAL:
+                j += 1
+            out.append(chr(int(body[i + 1:j], 8)))
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _ansi_c_expand(text: str) -> str:
+    """*text* with every ``$'…'`` replaced by the word it names.
+
+    ``bash -c $'git push'`` and ``eval $'git push'`` are read as if the string
+    had been written without its quotes — the shell hands the decoded text to
+    the shell or to ``eval`` — so the body is what runs, and a body that is
+    one word is quoted again to keep it one word. A string that never closes
+    is left exactly as written: the reader then sees ``$'…'`` and invents no
+    command word out of it.
+    """
+    out: list = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "$" and i + 1 < n and text[i + 1] == "'":
+            close = _ansi_c_close(text, i)
+            if close < 0:
+                out.append(text[i:n])
+                i = n
+            else:
+                out.append(shlex.quote(_ansi_c_decode(_ansi_c_body(text, i))))
+                i = close + 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _find_sub_end(text: str, start: int, opener: str) -> int:
+    """The index of the character that closes the substitution just opened.
+
+    The matching ``)`` when *opener* is ``$(``, the next unescaped backtick
+    when it is a backtick. Quotes, ``$'…'``, escapes and nested substitutions
+    are respected, so a ``)`` inside a quoted string or inside a nested
+    ``$(…)`` or backtick does not end the outer one. ``len(text)`` when the
+    substitution never closes: the reader then takes the rest of the text as
+    its body, which is the body the shell would also have had to run.
+    """
+    n = len(text)
+    i, depth = start, 1 if opener == "$(" else 0
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            i = _ansi_c_end(text, i)
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            i = _find_sub_end(text, i + 2, "$(") + 1
+            continue
+        if c == "`":
+            i = _find_sub_end(text, i + 1, "`") + 1
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            i = n if j >= n else j + 1
+            continue
+        if opener == "$(" and c == "(":
+            depth += 1
+            i += 1
+            continue
+        if opener == "$(" and c == ")" and depth == 1:
+            return i
+        i += 1
+    return n
+
+
+def _subs_in_text(text: str) -> list:
+    """The ``$(…)`` and backtick bodies of *text*, respecting quotes and escapes.
+
+    Used for the body of a heredoc whose delimiter was not quoted: the shell
+    runs command substitutions inside it, though a ``;`` in the body is data
+    and not a separator. The body is read as *text* — where a quote is a plain
+    character, so ``don't`` is data — except inside a ``$(…)`` or backtick
+    opened in it, where the shell reads it as a command again and quotes,
+    escapes and ``$'…'`` all work there, so a ``)`` inside a quoted string
+    does not end the substitution. Each body is returned whole, with the
+    substitutions it contains in turn, so a nested push is found at the next
+    level rather than by this reader.
+    """
+    out: list = []
+    n, i = len(text), 0
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            i = _ansi_c_end(text, i)
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "(":
+            end = _find_sub_end(text, i + 2, "$(")
+            out.append(text[i + 2:end])
+            out.extend(_subs_in_text(text[i + 2:end]))
+            i = end + 1
+            continue
+        if c == "`":
+            end = _find_sub_end(text, i + 1, "`")
+            out.append(text[i + 1:end])
+            out.extend(_subs_in_text(text[i + 1:end]))
+            i = end + 1
+            continue
+        i += 1
+    return out
+
+
+def _scan(command: str) -> tuple:
+    """Walk *command* once as a shell would, returning ``(pieces, subs)``.
+
+    ``pieces`` are the runs of text a ``|``, ``&``, ``;`` or newline joins
+    outside quotes and unescaped, with heredoc bodies dropped — so the suite
+    piece of ``cd /repo && pytest tests`` is what is measured and a ``|``
+    inside a quoted string stays in its token. ``subs`` are the command lines
+    the shell runs *inside* *command*: the bodies of ``$(…)``, ``<(…)``,
+    ``>(…)``, backticks, and the bodies of ``$(…)``/backticks inside a heredoc
+    whose delimiter was not quoted. A reader that cannot make sense of the
+    text (an unclosed quote) fails closed: the rest of the line is still one
+    piece, never skipped.
+    """
+    if not isinstance(command, str) or not command:
+        return [], []
+    n = len(command)
+    i = 0
+    pieces: list = []
+    subs: list = []
+    cur: list = []
+
+    quote = ""          # the quote of the current command-line scope
+    scopes: list = []   # stack of ["subst", depth, quote] for $(…)/<(…)/>(…)
+    in_heredoc = False
+    hd_delim = ""
+    hd_dash = False
+    hd_quoted = False
+    pending: list = []  # heredocs awaiting their body: (delim, dash, quoted)
+    hd_start = 0
+    word_start = True   # the next character would start a word: # is a comment
+
+    while i < n:
+        c = command[i]
+
+        if in_heredoc:
+            ls = i
+            while i < n and command[i] != "\n":
+                i += 1
+            line = command[ls:i]
+            if (line.lstrip("\t") if hd_dash else line) == hd_delim:
+                body = command[hd_start:ls]
+                if not hd_quoted:
+                    subs.extend(_subs_in_text(body))
+                i = i + 1 if i < n else i
+                if pending:
+                    hd_delim, hd_dash, hd_quoted = pending.pop(0)
+                    hd_start = i
+                else:
+                    in_heredoc = False
+                # the delimiter's newline ended a word: # can open a comment
+                word_start = True
+            else:
+                i += 1
+            continue
+
+        if scopes:
+            top = scopes[-1]
+            q = top[2]
+            if q == "'":
+                if c == "'":
+                    top[2] = ""
+                cur.append(c)
+                i += 1
+                continue
+            if q == '"':
+                if c == "\\" and i + 1 < n:
+                    cur.append(c)
+                    cur.append(command[i + 1])
+                    i += 2
+                    continue
+                if c == '"':
+                    top[2] = ""
+                cur.append(c)
+                i += 1
+                continue
+            if c == "\\":
+                cur.append(c)
+                if i + 1 < n:
+                    cur.append(command[i + 1])
+                    i += 2
+                else:
+                    i += 1
+                continue
+            if c == "$" and i + 1 < n and command[i + 1] == "'":
+                # $'…' inside a substitution: \ escapes there, so \' is a quote
+                # character and not the end of the string
+                end = _ansi_c_end(command, i)
+                cur.append(command[i:end])
+                i = end
+                continue
+            if c == "'":
+                top[2] = "'"
+                cur.append(c)
+                i += 1
+                continue
+            if c == '"':
+                top[2] = '"'
+                cur.append(c)
+                i += 1
+                continue
+            if c == "`":
+                end = command.find("`", i + 1)
+                end = n if end < 0 else end
+                subs.append(command[i + 1:end])
+                cur.append(command[i:end + 1])
+                i = end + 1
+                continue
+            if c == "$" and i + 1 < n and command[i + 1] == "(":
+                scopes.append(["subst", 1, "", i + 2])
+                cur.append(c)
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            if c == "(":
+                top[1] += 1
+                cur.append(c)
+                i += 1
+                continue
+            if c == ")":
+                top[1] -= 1
+                if top[1] <= 0:
+                    subs.append(command[top[3]:i])
+                    scopes.pop()
+                    # a closed $(…) or <(…) is part of the word it ends in
+                    word_start = False
+                cur.append(c)
+                i += 1
+                continue
+            cur.append(c)
+            i += 1
+            continue
+
+        # a # that starts a word opens a comment that runs to the end of the
+        # line: nothing in it is a heredoc, a quote or a substitution, so a
+        # <<EOF in a comment declares no heredoc and a ; in it no separator.
+        # A # inside a word (a#b, $#) and a # in a quoted string are data.
+        if c == "#" and word_start:
+            while i < n and command[i] != "\n":
+                i += 1
+            continue
+
+        if quote == "'":
+            if c == "'":
+                quote = ""
+            cur.append(c)
+            word_start = False
+            i += 1
+            continue
+        if quote == '"':
+            if c == "$" and i + 1 < n and command[i + 1] == "(":
+                scopes.append(["subst", 1, "", i + 2])
+                cur.append(c)
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            if c == "`":
+                end = command.find("`", i + 1)
+                end = n if end < 0 else end
+                subs.append(command[i + 1:end])
+                cur.append(command[i:end + 1])
+                i = end + 1
+                continue
+            if c == "\\" and i + 1 < n:
+                cur.append(c)
+                cur.append(command[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                quote = ""
+            cur.append(c)
+            word_start = False
+            i += 1
+            continue
+        if c == "\\":
+            cur.append(c)
+            if i + 1 < n:
+                cur.append(command[i + 1])
+                i += 2
+            else:
+                i += 1
+            word_start = False
+            continue
+        if c == "'":
+            quote = "'"
+            cur.append(c)
+            word_start = False
+            i += 1
+            continue
+        if c == "$" and i + 1 < n and command[i + 1] == "'":
+            # $'…' is an ANSI-C string: \ escapes there, so \' is a quote
+            # character and the string runs on to the next bare '
+            end = _ansi_c_end(command, i)
+            cur.append(command[i:end])
+            word_start = False
+            i = end
+            continue
+        if c == '"':
+            quote = "" if quote == '"' else '"'
+            cur.append(c)
+            word_start = False
+            i += 1
+            continue
+        if c == "`":
+            end = command.find("`", i + 1)
+            end = n if end < 0 else end
+            subs.append(command[i + 1:end])
+            cur.append(command[i:end + 1])
+            word_start = False
+            i = end + 1
+            continue
+        if c in "$<>" and i + 1 < n and command[i + 1] == "(":
+            if c == "$" or not quote:
+                scopes.append(["subst", 1, "", i + 2])
+                cur.append(c)
+                cur.append(command[i + 1])
+                word_start = False
+                i += 2
+                continue
+            cur.append(c)
+            word_start = False
+            i += 1
+            continue
+        if c == "<" and i + 1 < n and command[i + 1] == "<":
+            dash = command[i + 2:i + 3] == "-"
+            j = i + (3 if dash else 2)
+            delim: list = []
+            parts: list = []
+            while j < n and command[j] not in " \t\n;|&<>":
+                d = command[j]
+                if d == "'":
+                    k = command.find("'", j + 1)
+                    if k < 0:
+                        break
+                    delim.append(command[j + 1:k])
+                    parts.append(True)
+                    j = k + 1
+                elif d == '"':
+                    k = j + 1
+                    while k < n and command[k] != '"':
+                        k += 2 if command[k] == "\\" else 1
+                    if k < n:
+                        delim.append(command[j + 1:k])
+                        parts.append(True)
+                        j = k + 1
+                    else:
+                        break
+                elif d == "$" and j + 1 < n and command[j + 1] == "'":
+                    # $'…' is a quote too: its body is quote-removed, so the
+                    # delimiter of <<$'EOF' is EOF and the body is data.
+                    k = _ansi_c_close(command, j)
+                    if k < 0:
+                        break
+                    delim.append(_ansi_c_decode(_ansi_c_body(command, j)))
+                    parts.append(True)
+                    j = k + 1
+                elif d == "\\":
+                    if j + 1 < n:
+                        delim.append(command[j + 1])
+                        parts.append(True)
+                        j += 2
+                    else:
+                        break
+                else:
+                    delim.append(d)
+                    parts.append(False)
+                    j += 1
+            delimiter = "".join(delim)
+            if delimiter:
+                cur.append(command[i:j])
+                pending.append((delimiter, dash, any(parts)))
+                word_start = False
+                i = j
+                continue
+            cur.append(c)
+            word_start = False
+            i += 1
+            continue
+        if c in "|&;\n":
+            if cur:
+                pieces.append("".join(cur))
+                cur = []
+            if c == "\n" and pending:
+                hd_delim, hd_dash, hd_quoted = pending.pop(0)
+                hd_start = i + 1
+                in_heredoc = True
+            # a separator leaves the next character free to start a word
+            word_start = True
+            i += 1
+            continue
+        if c in " \t()":
+            # whitespace, ( and ) leave the next character free to start one too
+            cur.append(c)
+            word_start = True
+            i += 1
+            continue
+        # any other character is part of the word it is in
+        cur.append(c)
+        word_start = False
+        i += 1
+
+    if in_heredoc:
+        # an unterminated heredoc: the rest is still searched, never skipped
+        body = command[hd_start:]
+        # quoted or not: an unclosed heredoc is a reader's guess, so its
+        # substitutions are searched (fail closed) — and with quotes blind,
+        # as _scan(body) below is not: an apostrophe there swallows the rest
+        subs.extend(_subs_in_text(body))
+        # a quote in the body is a plain character, so the text is read line by
+        # line: an apostrophe on one line must not swallow the next
+        for line in body.split("\n"):
+            more_pieces, more_subs = _scan(line)
+            pieces.extend(more_pieces)
+            subs.extend(more_subs)
+    elif cur:
+        pieces.append("".join(cur))
+
+    return ([p for p in pieces if p.strip()], [s for s in subs if s.strip()])
+
+
+def _shell_pieces(command: str) -> list:
+    """*command* as its shell pieces: the runs of text a `&&`, `||`, `;`, `|`,
+    `&` or newline joins outside quotes, so the suite piece of
+    `cd /repo && pytest tests` is what is measured and a `|` inside a quoted
+    string stays in its token."""
+    return _scan(command)[0]
+
+
+def _substitutions(command: str) -> list:
+    """The command lines a shell would run *inside* *command*: the bodies of
+    ``$(…)``, ``<(…)``, ``>(…)``, backticks, and the bodies of ``$(…)`` and
+    backticks inside a heredoc whose delimiter was not quoted. Text in single
+    quotes is literal to the shell, so ``echo '$(git push)'`` yields nothing."""
+    return _scan(command)[1]
+
+
+def _pytest_argvs(piece: str) -> list:
+    """The pytest argument lists of one shell piece: ``[]`` when it runs no pytest.
+
+    206: the command position, the interpreter, its options before ``-m``, the
+    ``uv run``-style runners and the wrappers are read by
+    ``tools.auto.utils.pytest_argv_start`` — the recogniser ``is_pytest_command``
+    uses — so the suite slot and the executor never disagree about what a pytest
+    run is (``python3 -u -m pytest tests``, ``uv run pytest tests``). The piece
+    is split with ``shlex``, so ``PYTEST_ADDOPTS="-q -x" pytest tests`` keeps its
+    quoted value in one word; quoting that does not parse falls back to
+    ``_CMD_TOKEN``, quotes stripped.
+    """
+    try:
+        parts = split_command(piece, True)
+    except ValueError:
+        parts = [_unquote_token(t) for t in _CMD_TOKEN.findall(piece)]
+    argvs = []
+    for seg in pytest_segments(parts):
+        start = pytest_argv_start(seg)
+        if start is not None:
+            argvs.append(seg[start:])
+    return argvs
+
 
 #: A shell variable set for one command: `PYTHONPATH=. pytest tests`.
-_ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+_ENV_ASSIGN_RE = ENV_ASSIGN_RE
 
 #: Commands that run the rest of their line as the command: the suite behind
 #: them is still the suite. `timeout 1500 python3 -m pytest tests` is how the
 #: agents of rounds 103–105 ran theirs most often.
-_WRAPPERS = frozenset({"timeout", "nohup", "env", "nice", "time", "exec", "command",
-                       "stdbuf", "ionice"})
+_WRAPPERS = COMMAND_WRAPPERS
 
 
 def _past_wrappers(tokens: list) -> int | None:
@@ -755,7 +1281,9 @@ def _targeted_run(args: list) -> bool:
     """Whether *args* names a subset of the tests, or runs nothing at all.
 
     A token ending in `_SUITE_FILE_SUFFIXES` is a test file, one carrying a
-    `::` names a node, and a `-k`/`-m` selector names a subset by expression.
+    `::` names a node, and a `-k`/`-m` selector names a subset by expression —
+    separate (`-k foo`), `=` (`-k=foo`) or attached (`-kfoo`, `-mslow`, 206),
+    and `--deselect` too.
     `--help` and friends run no suite. Every other `-…` token is an option —
     `-n 4`, `-q`, `--rootdir`, `--maxfail` — and carries no information about
     how much of the suite runs.
@@ -792,12 +1320,8 @@ def is_full_suite_command(command) -> bool:
     if not isinstance(command, str) or not command or "\x00" in command:
         return False
     try:
-        for piece in _shell_pieces(command):
-            tokens = [_unquote_token(t) for t in _CMD_TOKEN.findall(piece)]
-            start = _pytest_argv_start(tokens)
-            if start is not None and not _targeted_run(tokens[start + 1:]):
-                return True
-        return False
+        return any(not _targeted_run(args)
+                   for piece in _shell_pieces(command) for args in _pytest_argvs(piece))
     except Exception:  # noqa: BLE001 — a read failure is not a suite
         return False
 
@@ -947,25 +1471,252 @@ def _inside_worktree_or_tmp(pairs: list, worktree: "Path | None", tmp_roots) -> 
     return True
 
 
+#: Shells whose ``-c`` argument is a command line of its own.
+_SHELL_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"})
+_MAX_NESTING = 4
+
+
+def _inline_scripts(piece: str) -> list:
+    """The script a piece hands to a shell: ``bash -c '…'`` (also ``-lc``,
+    behind wrappers) and ``eval …``.
+
+    The piece is first read through ``_ansi_c_expand``: ``bash -c $'git push'``
+    and ``eval $'git push'`` hand the decoded string to the shell, so the body
+    is what runs, not the ``$'…'`` it was written in.
+    """
+    try:
+        tokens = shlex.split(_ansi_c_expand(piece))
+    except ValueError:
+        return []
+    start = _deny_command_start(tokens)
+    if start is None:
+        return []
+    name = tokens[start].rsplit("/", 1)[-1]
+    rest = tokens[start + 1:]
+    if name == "eval":
+        return [" ".join(rest)] if rest else []
+    if name in _SHELL_NAMES:
+        for k, tok in enumerate(rest):
+            if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
+                return [rest[k + 1]] if k + 1 < len(rest) else []
+    return []
+
+
+#: 205 (31): words that run their argument as the command, for ``deny_commands``
+#: only, mapped to their options that take a separate value. ``COMMAND_WRAPPERS``
+#: is shared with ``is_pytest_command`` and stays as it is: `sudo pytest` is not
+#: a question the suite recogniser has to answer, `sudo git push` is a push.
+_DENY_WRAPPERS = {
+    "sudo": ("-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T", "-R",
+             "--user", "--group", "--close-from", "--chdir", "--host", "--prompt",
+             "--role", "--type", "--other-user", "--command-timeout", "--chroot"),
+    "doas": ("-u", "-C"),
+    "xargs": ("-n", "-L", "-P", "-s", "-d", "-E", "-I", "-a", "--max-args",
+              "--max-lines", "--max-procs", "--max-chars", "--delimiter", "--eof",
+              "--replace", "--arg-file", "--process-slot-var"),
+    "nice": ("-n", "--adjustment"),
+    "ionice": ("-c", "-n", "-p", "-P", "-u", "--class", "--classdata"),
+    "setsid": (),
+    "stdbuf": ("-i", "-o", "-e", "--input", "--output", "--error"),
+    "chroot": ("--userspec", "--groups"),
+    "timeout": ("-s", "-k", "--signal", "--kill-after"),
+    "env": ("-u", "-C", "--unset", "--chdir"),
+    "nohup": (), "time": ("-f", "-o", "--format", "--output"), "exec": ("-a",),
+    "command": (),
+}
+
+#: The wrappers whose first plain argument is theirs, not the command's:
+#: `timeout 9 git push`, `chroot /srv git push`.
+_DENY_WRAPPER_OPERAND = frozenset({"timeout", "chroot"})
+
+#: 205 (32): shell reserved words that can stand where a command word stands;
+#: the command they lead to is the next word. `fi`, `done` and `}` close a
+#: compound and run nothing — a piece that holds only them is no command.
+_SHELL_RESERVED = frozenset({"if", "then", "elif", "else", "fi", "do", "done", "while",
+                             "until", "time", "!", "{", "}"})
+
+#: 205 (29): `git`'s global options that take the next word as their value.
+#: Every other word starting with `-` before the subcommand is a value-less flag
+#: (`--no-pager`, `-P`, `--bare`, `--git-dir=x`, `--exec-path=x`).
+# `--exec-path` and `--list-cmds` take a value only glued on with `=`: a bare
+# `--exec-path` is a flag of its own, so `git --exec-path push` is still read
+# as a push (the deny side errs towards denying).
+_GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                                "--config-env", "--super-prefix", "--attr-source"})
+
+
+def _command_word(word: str) -> str:
+    """The name the shell looks *word* up by: past a directory (`/usr/bin/git`,
+    `./git`). Quotes and backslashes are gone already — the word came out of
+    ``shlex.split`` — so `"git"`, `\\git` and `g"i"t` are `git` here."""
+    return word.rsplit("/", 1)[-1]
+
+
+def _deny_command_start(tokens: list) -> int | None:
+    """The index of the command a deny pattern is about, ``None`` when there is none.
+
+    Past ``VAR=value`` words, leading shell reserved words (``then``, ``do``,
+    ``!``, ``{``, a leading ``(``) and the wrappers of ``_DENY_WRAPPERS`` with
+    their own options — so `then git push`, `sudo -u root git push` and
+    `xargs -n1 git push` all point at `git`. A piece made only of `fi`/`done`/`}`
+    has no command.
+    """
+    i = 0
+    while i < len(tokens):
+        word = tokens[i]
+        if _ENV_ASSIGN_RE.fullmatch(word) or word in _SHELL_RESERVED:
+            i += 1
+            continue
+        name = _command_word(word)
+        if name not in _DENY_WRAPPERS:
+            return i
+        takes_value = _DENY_WRAPPERS[name]
+        i += 1
+        while i < len(tokens) and tokens[i].startswith("-") and tokens[i] != "-":
+            flag = tokens[i]
+            i += 1
+            if flag == "--":
+                break
+            if flag in takes_value and i < len(tokens):
+                i += 1
+        if name in _DENY_WRAPPER_OPERAND and i < len(tokens):
+            i += 1
+    return None
+
+
+def _deny_normalised(piece: str) -> list:
+    """*piece* spelled the way the shell runs it, ``[]`` when it runs no command.
+
+    The words are read the way the shell reads them (``shlex``, through
+    ``_ansi_c_expand``), the command found by ``_deny_command_start``, its word
+    reduced to the name it is looked up by (``_command_word``), and for `git`
+    the global options before the subcommand dropped: `sudo /usr/bin/"git" -C wt
+    --no-pager push origin` is `git push origin`. The arguments after the command
+    word are re-quoted only where they need it, so `echo "git push"` stays an
+    `echo` and `curl x "| sh"` is not `curl x | sh`. A command word that still
+    holds a space after unquoting (`"git push"` as a whole) names no program and
+    is left alone. Two spellings come back: the command word as the shell
+    reads it with its directory kept, then the bare name — so `sudo
+    /usr/bin/git push` still meets a pattern that names `/usr/bin/git push*`.
+    """
+    try:
+        tokens = shlex.split(_ansi_c_expand(piece))
+    except ValueError:
+        return []
+    tokens = [t.lstrip("(") if k == 0 else t for k, t in enumerate(tokens)]
+    tokens = [t for t in tokens if t]
+    start = _deny_command_start(tokens)
+    if start is None:
+        return []
+    word = tokens[start]
+    if not word or any(c.isspace() for c in word):
+        return []
+    name = _command_word(word)
+    rest = tokens[start + 1:]
+    if rest:
+        rest[-1] = rest[-1].rstrip(")}")
+        rest = [t for t in rest if t]
+    if name == "git":
+        k = 0
+        while k < len(rest) and rest[k].startswith("-"):
+            flag = rest[k]
+            k += 1
+            if flag in _GIT_VALUE_OPTIONS and k < len(rest):
+                k += 1
+        rest = rest[k:]
+    args = [shlex.quote(t) for t in rest]
+    return list(dict.fromkeys(" ".join([w] + args) for w in (word, name)))
+
+
+def _deny_candidates(command: str, _depth: int = 0) -> list:
+    """The strings a ``deny_commands`` pattern is tried against, whole line first.
+
+    The whole line keeps a pattern that names a pipe (``curl * | sh``) working.
+    Then each shell piece (``_shell_pieces``: ``&&``, ``||``, ``;``, ``|``, ``&``
+    outside quotes) as a command of its own, whitespace collapsed to single
+    spaces, a leading ``(``/``{``/``!`` and a trailing ``)``/``}`` dropped, and
+    once more past its ``VAR=value`` words and ``_WRAPPERS`` — so ``cd x && git
+    push``, ``(sudo ls)``, ``git  push`` and ``timeout 9 git push`` are the
+    command they run, not a command that merely starts with something else.
+    What a command runs inside ``$(…)``, backticks, ``<(…)``, ``bash -c '…'``
+    and ``eval`` is a command line too and is expanded the same way (to a
+    nesting depth of ``_MAX_NESTING``), so ``echo $(git push)`` is a push.
+    205: and each piece once more as the shell runs it (``_deny_normalised``),
+    so ``git -C . push``, ``/usr/bin/git push``, ``"git" push``, ``sudo git
+    push``, ``xargs git push`` and ``then git push`` are ``git push``. The
+    spelling as written is still tried: a pattern holding a path
+    (``/usr/bin/git push*``) matches what was typed.
+    """
+    out = [command]
+    nested: list = []
+    if _depth < _MAX_NESTING:
+        nested = _substitutions(command)
+    for piece in _shell_pieces(command):
+        if _depth < _MAX_NESTING:
+            nested += _inline_scripts(piece)
+        tokens = piece.split()
+        # every bare group opener / closer goes, not only the first and last token:
+        # `( ( git push ) )`, `! ( git push )` and `{ { git push; }; }` are a push.
+        while tokens and not tokens[0].strip("({!"):
+            tokens.pop(0)
+        while tokens and not tokens[-1].strip(")}"):
+            tokens.pop()
+        if tokens:
+            tokens[0] = tokens[0].lstrip("({!") or ""
+            tokens[-1] = tokens[-1].rstrip(")}")
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            continue
+        out.append(" ".join(tokens))
+        start = _past_wrappers(tokens)
+        if start:
+            out.append(" ".join(tokens[start:]))
+        for normalised in _deny_normalised(piece):
+            if normalised not in out:
+                out.append(normalised)
+    for inner in nested:
+        if inner.strip():
+            out.extend(_deny_candidates(inner, _depth + 1))
+    return out
+
+
 def _deny_match(command: str, deny_commands) -> "str | None":
     """The first ``deny_commands`` pattern matching *command*, or ``None``.
 
-    Matched twice with ``fnmatch.fnmatch``: once against *pattern* as
-    written, and once against *pattern* followed by a space and ``*``, so a
-    pattern that names a pipe — ``curl * | sh`` — catches a command with
-    arguments after the pipe too (``sh ./a``, ``sh -s -- -y``), not only one
-    that ends right at the pipe. The space keeps the pattern's last word a
-    whole word: a bare ``*`` would let ``curl * | sh`` reject
-    ``curl … | sha256sum`` and ``curl … | shellcheck -``. A pattern that
-    already ends in ``*`` gains nothing from the second match.
+    Each of ``_deny_candidates`` is matched twice with ``fnmatch.fnmatch``: once
+    against *pattern* as written, and once against *pattern* followed by a space
+    and ``*``, so a pattern that names a pipe — ``curl * | sh`` — catches a
+    command with arguments after the pipe too (``sh ./a``, ``sh -s -- -y``), not
+    only one that ends right at the pipe. The space keeps the pattern's last word
+    a whole word: a bare ``*`` would let ``curl * | sh`` reject ``curl … | sha256sum``
+    and ``curl … | shellcheck -``. A pattern that already ends in ``*`` gains
+    nothing from the second match.
+
+    205: a ``*`` glued to the end of a word (``git push*``, ``git reset
+    --hard*``) ends that word, it does not extend it: the pattern is the word
+    alone or the word followed by anything that is not a word character (a
+    space, a closing backtick), so ``git pushd`` — no git subcommand — is not
+    ``git push*``. A ``*`` after anything else (``sudo
+    *``, ``rm -rf /*``) is the plain glob it always was.
     """
     if not command:
         return None
+    candidates = _deny_candidates(command)
     for pattern in _as_list(deny_commands):
         if isinstance(pattern, str) and pattern:
-            if fnmatch.fnmatch(command, pattern) or fnmatch.fnmatch(command, pattern + " *"):
-                return pattern
+            globs = _deny_globs(pattern)
+            for text in candidates:
+                if any(fnmatch.fnmatch(text, glob) for glob in globs):
+                    return pattern
     return None
+
+
+def _deny_globs(pattern: str) -> tuple:
+    """The ``fnmatch`` globs *pattern* stands for (see ``_deny_match``)."""
+    if len(pattern) > 1 and pattern.endswith("*") and (pattern[-2].isalnum()
+                                                      or pattern[-2] == "_"):
+        return (pattern[:-1], pattern[:-1] + "[!A-Za-z0-9_-]*")
+    return (pattern, pattern + " *")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

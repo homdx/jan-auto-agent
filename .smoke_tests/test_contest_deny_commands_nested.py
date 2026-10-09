@@ -1,0 +1,1 @@
+../tests/test_contest_deny_commands_nested.py

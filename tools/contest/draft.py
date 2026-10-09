@@ -656,9 +656,15 @@ def _new_under_existing(repo: Path, rel: str) -> bool:
     """Whether *rel* is a file the repo does not have yet, under a directory it does.
 
     A new test file is normal, so `tests/test_new.py` passes while
-    `no/such/dir/x.py` does not.
+    `no/such/dir/x.py` does not. A ticket that starts a new package names
+    files in a directory the repo does not have yet — `tools/arena/cli.py` —
+    so one new directory level under an existing one passes too; two invented
+    levels (`no/such/dir/x.py`) are still a made-up path.
     """
-    return _safe_rel(rel) and (repo / rel).parent.is_dir()
+    if not _safe_rel(rel):
+        return False
+    parent = (repo / rel).parent
+    return parent.is_dir() or (parent != repo and parent.parent.is_dir())
 
 
 def lint_ticket(text, artifact, *, repo=None, tasks_dir=None, round_no=None) -> list:
@@ -903,7 +909,7 @@ def _review_rounds(text, brief, *, prompt, llm_call, review_call, rounds,
 def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
                  collect_fn: Optional[Callable] = None, write: bool = True,
                  format_spec: str = None, review_call: Optional[Callable] = None,
-                 review_rounds=None, commit: bool = False) -> DraftResult:
+                 review_rounds=None, commit: bool = False, out_dir=None) -> DraftResult:
     """One brief, one collect run, one ticket — drafted, reviewed, committed.
 
     *llm_call* is a callable taking the prompt text and returning the draft — a
@@ -911,6 +917,13 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     *config* supplies the map budget and the review's round count; *round_no* the
     ticket number, else the next free one; *out* the file to write, else
     `epic-tasks/<NN>-<slug>.md`.
+
+    *out_dir* is the folder that default name — and a refused draft's
+    `<NN>-<slug>.rejected.md` — is written into instead of `epic-tasks/`, so a
+    draft can sit in `.arena/drafts/` where `arena run start` finds it. *out*
+    still wins over it, and `commit=True` with *out_dir* is a `ValueError`: a
+    draft outside `epic-tasks/` is never committed. The lint's own "round is
+    taken" check keeps reading `epic-tasks/` either way.
 
     *review_call* is the gate model's callable, KC-80's second step: with it the
     lint's clean ticket is judged against the brief and the checklist, and a
@@ -933,9 +946,17 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     """
     if not isinstance(brief, str) or not brief.strip():
         raise ValueError("draft_ticket: the brief is empty")
+    if out_dir is not None and commit:
+        # A draft outside `epic-tasks/` is a draft, not a ticket: the commit would
+        # add it to the leg branch where the round reads it from.
+        raise ValueError("draft_ticket: commit=True with out_dir — a draft outside "
+                         f"{TASKS_DIR}/ is never committed")
 
     repo = Path(repo)
     tasks_dir = repo / TASKS_DIR
+    # Where the ticket is written; `epic-tasks/` keeps its role for the lint's
+    # taken-round check and for nothing else.
+    write_dir = Path(out_dir) if out_dir is not None else tasks_dir
     collect_dir = repo / COLLECT_DIR
     budget = _as_budget(getattr(config, "draft_map_budget", DEFAULT_MAP_BUDGET)
                         if config is not None else DEFAULT_MAP_BUDGET)
@@ -984,7 +1005,7 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
             rounds=review_rounds, artifact=artifact, repo=repo, tasks_dir=tasks_dir,
             number=number)
 
-    target = Path(out) if out else tasks_dir / f"{number:02d}-{slug_for(title_of(text), round_no=number)}.md"
+    target = Path(out) if out else write_dir / f"{number:02d}-{slug_for(title_of(text), round_no=number)}.md"
     if problems:
         rejected_path = _write(target.with_name(target.stem + REJECTED_SUFFIX), text) if write else None
         return DraftResult(path=None, rejected=True, problems=tuple(problems),

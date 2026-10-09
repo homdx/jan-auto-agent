@@ -127,6 +127,48 @@ def _child_session(event: dict, parents) -> str | None:
     return None
 
 
+#: Round 146: Kilo doubles the delay of a retry it repeats on its own, so any
+#: error a provider keeps answering — a 400 that is never going to pass included
+#: — crosses `max_retry_wait` without the provider ever naming a time. The
+#: crossing is at most about twice the bound (the delay doubles, with jitter and
+#: a beat skipped now and then), so a delay past this many times the bound is a
+#: time the provider stated, whichever attempt it comes on.
+_BACKOFF_CROSSING_FACTOR = 4.0
+
+
+def _retry_past_the_bound(wait: float | None, attempt, named: bool,
+                          bound: float) -> str | None:
+    """Round 146: what a Kilo `retry` status is, against `max_retry_wait`.
+
+    ``None`` — a blip, the wait goes on. ``"quota"`` — a reset the provider
+    named: the *first* retry of a streak (Kilo resets ``attempt`` after every
+    success, and a daily quota ends at ``attempt: 1``, KC-64), a retry whose text
+    is a quota phrase, or a delay no doubling could have reached from the bound.
+    ``"backoff"`` — the same error repeated until Kilo's own backoff grew past the
+    bound: the provider has named nothing, so it is not a quota.
+
+    *wait* is seconds to the retry, ``None`` when Kilo gave no (numeric) time —
+    then only a quota phrase decides, as before. An ``attempt`` that is no
+    number counts as the first retry: today's verdict, fail-open.
+
+    Bug 210/49: a ``NaN`` *wait* is no time at all — ``nan <= bound`` is
+    False, so it fell through and read as a long delay (``"quota"`` on a first
+    retry, ``"backoff"`` after). It is treated as ``None``: "Kilo gave no
+    numeric time". ``inf`` is a real, very long delay and stays one.
+    """
+    if wait is not None and wait != wait:      # NaN is the one value unequal to itself
+        wait = None
+    if wait is None:
+        return "quota" if named else None
+    if wait <= bound:
+        return None
+    first = (not isinstance(attempt, int) or isinstance(attempt, bool)
+             or attempt <= 1)
+    if named or first or wait > _BACKOFF_CROSSING_FACTOR * bound:
+        return "quota"
+    return "backoff"
+
+
 def _is_busy(event: dict) -> bool:
     """KC-63: a sign the session started working on a prompt.
 
@@ -296,6 +338,11 @@ class IdleResult:
     #: read, output or not. A turn that went idle empty after one is the
     #: provider's doing, not the model's.
     provider_errors: int = 0
+    #: Round 146: the seconds of this wait that were a streak of ``retry``
+    #: statuses — Kilo waiting to try a failing provider again — and that a wait
+    #: armed with ``on_deadline`` therefore added to its own deadline. ``0.0`` for
+    #: a wait with no turn clock, and for a turn the provider never failed in.
+    retry_waited: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1252,6 +1299,38 @@ class KiloClient:
         self._model_limits[key] = answer
         return answer
 
+    def model_limits(self, provider_id: str, model_id: str) -> dict | None:
+        """Round 153: the model's whole ``limit`` from a *fresh* ``GET /provider``.
+
+        The read-back of a ``PATCH /config`` — never :attr:`_model_limits`, which
+        may hold the number the patch was meant to replace. Live, 7.6.2: the
+        patch answers 200 and writes ``.kilo/kilo.jsonc``, yet a model whose
+        ``limit`` the server's own config content (the spawn's
+        ``KILO_CONFIG_CONTENT``) sets keeps that limit field by field, and this
+        is the only read that shows it — the field this patch compared against.
+
+        ``None`` when the offer cannot be read, when the provider or the model is
+        absent, when the model carries no ``limit``, or when it is not a dict: a
+        caller that cannot see the limit it asked for must keep its fallback
+        armed, never guess a match. Nothing here raises.
+        """
+        try:
+            offer = self.providers()
+        except (KiloHttpError, ValueError, TypeError, OSError):
+            return None
+        if not isinstance(offer, dict):
+            return None
+        for entry in offer.get("all") or []:
+            if not isinstance(entry, dict) or entry.get("id") != str(provider_id):
+                continue
+            models = entry.get("models")
+            if not isinstance(models, dict):
+                continue
+            model = models.get(model_id)
+            raw = model.get("limit") if isinstance(model, dict) else None
+            return dict(raw) if isinstance(raw, dict) else None
+        return None
+
     # ── the session ────────────────────────────────────────────────────────
 
     def create_session(self, provider_id: str, model_id: str, *, rules: list,
@@ -1333,6 +1412,22 @@ class KiloClient:
         status, resp = self._request("POST", path, body, timeout=COMPACT_TIMEOUT_SEC)
         self._check(status, resp, "POST", path)
         return None
+
+    def set_model_limit(self, provider_id: str, model_id: str, limit: dict) -> None:
+        """Round 145: ``PATCH /config`` — the model's ``limit`` for this client's
+        directory, taken by the running server at once.
+
+        Live, 7.6.2: sent with the session's own ``directory`` the server answers
+        200, ``GET /provider`` shows the new ``limit.context``, and the next step
+        of a session past ``limit.input`` is compacted by Kilo itself (83 657
+        tokens to a summary and a 2 885-token reply). Sent without it, the patch
+        lands in the *server's* project and no session sees it. The server keeps
+        it as ``.kilo/kilo.jsonc`` in that directory — the caller keeps the file
+        out of git (`KiloBackend.set_model_limit`).
+        """
+        body = {"provider": {provider_id: {"models": {model_id: {"limit": dict(limit)}}}}}
+        status, resp = self._request("PATCH", "/config", body)
+        self._check(status, resp, "PATCH", "/config")
 
     def delete_session(self, session: SessionRef) -> None:
         """``DELETE /session/{id}`` — 200 on 7.6.2; KC-49's variant probe
@@ -1577,6 +1672,13 @@ class KiloClient:
         the provider's text in ``data.message`` and ``next`` in ``data.retryAt``,
         and the session is aborted first: that is a quota reset until midnight,
         not a blip, and the silence clock must not be the thing that names it.
+        Round 146: that is the *first* retry of a streak, a retry whose text is a
+        quota phrase, or a delay past ``_BACKOFF_CROSSING_FACTOR`` times the
+        bound. A later retry that is past the bound without any of them is
+        Kilo's own doubling of an error it keeps repeating (round 146: a 400,
+        nine attempts, 519 s): the wait ends and the session is aborted just
+        the same, but as ``ProviderUnavailable`` with ``data.attempts`` — the
+        provider named no reset (`_retry_past_the_bound`).
         A retry inside the bound is only a beat, and a ``next`` that is missing
         or is not a number is judged by ``quota_re``, a compiled pattern over the
         provider's text. Both omitted — every pre-KC-61 caller — a
@@ -1624,6 +1726,18 @@ class KiloClient:
         provider_errors = 0
         started = time.monotonic()
         deadline = started + float(timeout)
+        # Round 146: a streak of retries — the first ``retry`` status since the
+        # model last produced anything — is time the provider took, not the
+        # agent's, and with a turn clock armed (``on_deadline``) every second of
+        # it moves the deadline. ``retry_mark`` is where the streak was last
+        # counted up to (``None`` outside one), ``retry_waited`` what it has
+        # added so far, bounded by the turn's own ``timeout``: the retry count
+        # (KC-64) and the delay bound (KC-61) end a provider that never answers,
+        # and this keeps a quiet one from holding the deadline for good.
+        retry_mark: float | None = None
+        retry_waited = 0.0
+        retry_streak = 0.0
+        retry_cap = max(0.0, float(timeout))
         session_id = session.id
         # KC-12: the silence clock. None (or a non-positive number) is off,
         # and then the loop below is KC-1's, event for event.
@@ -1656,6 +1770,26 @@ class KiloClient:
         # clock called the agent STALLED — 0 files, 0 permissions counted.
         children: set = set()
 
+        def settle_retries(now: float, *, ended: bool = False) -> None:
+            """Round 146: add the streak's seconds up to *now* to the deadline."""
+            nonlocal deadline, retry_mark, retry_waited, retry_streak
+            if retry_mark is None:
+                return
+            if on_deadline is not None:
+                gave = max(0.0, min(now - retry_mark, retry_cap - retry_waited))
+                deadline += gave
+                retry_waited += gave
+                retry_streak += gave
+            if ended:
+                if retry_streak >= 1.0:
+                    _log.info("%s: the provider's retries ended after %.0f s — the turn's "
+                              "deadline moved by as much (%.0f s so far)",
+                              session_id, retry_streak, retry_waited)
+                retry_streak = 0.0
+                retry_mark = None
+            else:
+                retry_mark = now
+
         def wanted(event: dict) -> bool:
             nonlocal saw_busy
             etype = event.get("type")
@@ -1686,6 +1820,7 @@ class KiloClient:
             # on a quota that resets in fourteen hours.
             if (silence is not None or quiet_window is not None or etype in _SESSION_EVENTS
                     or (max_retry_wait is not None and etype == "session.status")
+                    or (on_deadline is not None and etype == "session.status")
                     or (retries_limit and etype in ("session.status",
                                                      "message.part.updated"))):
                 return True
@@ -1693,6 +1828,7 @@ class KiloClient:
 
         while True:
             now = time.monotonic()
+            settle_retries(now)
             overall_left = deadline - now
             silence_left = None
             if silence is not None:
@@ -1730,7 +1866,8 @@ class KiloClient:
                 open_tool = _open_tool_report(open_parts, now) if quiet else None
                 return IdleResult(status="timeout", elapsed=time.monotonic() - started,
                                   permissions=permissions, questions=questions,
-                                  open_tool=open_tool, stale_skipped=stale)
+                                  open_tool=open_tool, stale_skipped=stale,
+                                  retry_waited=retry_waited)
             event = tap.wait(wanted, left)
             if event is None:
                 continue
@@ -1764,6 +1901,7 @@ class KiloClient:
                 if isinstance(part, dict) and \
                         part.get("type") in ("step-start", "reasoning", "tool", "step-finish"):
                     retries_without_output = 0
+                    settle_retries(last_seen, ended=True)
 
             if etype in ("permission.asked", "permission.v2.asked"):
                 try:
@@ -1802,6 +1940,8 @@ class KiloClient:
                 _st = props.get("status")
                 if isinstance(_st, dict) and _st.get("type") == "retry":
                     provider_errors += 1
+                    if retry_mark is None:
+                        retry_mark = last_seen
             if etype == "session.status" and max_retry_wait is not None:
                 # KC-61: Kilo's own retry, and how long before it retries. `next`
                 # is epoch milliseconds, so it is the wall clock the wait is
@@ -1813,8 +1953,12 @@ class KiloClient:
                     wait = (float(nxt) / 1000.0 - time.time()
                             if isinstance(nxt, (int, float))
                             and not isinstance(nxt, bool) else None)
-                    if (wait is not None and wait > float(max_retry_wait)) or \
-                            (wait is None and quota_re is not None and quota_re.search(message)):
+                    attempt = status.get("attempt")
+                    far = _retry_past_the_bound(
+                        wait, attempt,
+                        quota_re is not None and quota_re.search(message) is not None,
+                        float(max_retry_wait))
+                    if far == "quota":
                         # a quota reset, not a blip: stop Kilo's own
                         # sleep-and-retry and hand the provider's text back, so
                         # the round never waits for the silence clock to name it
@@ -1823,6 +1967,19 @@ class KiloClient:
                             status="error",
                             error={"name": "ProviderQuota",
                                    "data": {"message": message, "retryAt": nxt}},
+                            elapsed=elapsed, permissions=permissions,
+                            questions=questions, stale_skipped=stale)
+                    if far == "backoff":
+                        # round 146: the same error again and again, and Kilo's
+                        # own doubling took the next try past the bound. The
+                        # wait ends here as KC-61 always ended it — but the
+                        # provider named no reset, so the agent is not a quota:
+                        # `ProviderUnavailable`, with the attempt it came to.
+                        self._abort_quietly(session)
+                        return IdleResult(
+                            status="error",
+                            error={"name": "ProviderUnavailable",
+                                   "data": {"message": message, "attempts": attempt}},
                             elapsed=elapsed, permissions=permissions,
                             questions=questions, stale_skipped=stale)
             if etype == "session.status" and retries_limit:
@@ -1852,10 +2009,11 @@ class KiloClient:
                 compacted = True
                 continue
             if etype == "session.error":
+                settle_retries(last_seen, ended=True)
                 return IdleResult(status="error", error=props.get("error", props),
                                   elapsed=elapsed, permissions=permissions,
                                   questions=questions, stale_skipped=stale,
-                                  compacted=compacted)
+                                  compacted=compacted, retry_waited=retry_waited)
             if etype == "tap.closed":
                 return IdleResult(status="closed", error=props.get("error"),
                                   elapsed=elapsed, permissions=permissions,
@@ -1868,7 +2026,9 @@ class KiloClient:
                 # KC-63, diagnostic only: how the next variant of a stale idle
                 # gets noticed. The result does not change.
                 _log.warning("%s: idle without busy after %.1fs", session_id, elapsed)
+            settle_retries(last_seen, ended=True)
             return IdleResult(status="idle", elapsed=elapsed,
                               permissions=permissions, questions=questions,
                               stale_skipped=stale, compacted=compacted,
-                              provider_errors=provider_errors)
+                              provider_errors=provider_errors,
+                              retry_waited=retry_waited)

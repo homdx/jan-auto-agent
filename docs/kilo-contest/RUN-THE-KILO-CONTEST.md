@@ -86,12 +86,12 @@ unknown key fails at load time with its name. Put local values in
 | `max_parallel` | 3 | sessions at once; `--max-parallel N` for one round |
 | `legs`, `legs_by_size` | 1; `L=3` | legs per round, by the ticket's `**Size:**`; `--legs N` overrides both |
 | `max_rework`, `max_continues_per_attempt` | 2, 2 | reworks after the first turn; nudges for an idle turn with edits and no commit |
-| `turn_timeout_sec`, `turn_extend_sec`, `turn_max_sec` | 3600, 600, 7200 | the turn clock: a floor, extended while the tree changes, up to a ceiling |
+| `turn_timeout_sec`, `turn_extend_sec`, `turn_max_sec` | 3600, 600, 7200 | the turn clock: a floor, extended while the tree changes, up to a ceiling; the seconds Kilo spends retrying a failing provider are given back on top (`provider_wait_sec` in the turn) |
 | `idle_event_timeout_sec` | 900 | no event this long → the session is aborted |
 | `first_touch_sec` | 420 | no file touched this long → a nudge, then a fresh session, then `DEAD` |
 | `agent_max_sec` | 5400 | one agent's hard limit; at it the agent ends `STALLED`, its tree scored as it stands |
 | `max_error_retries`, `error_retry_max_backoff_sec` | 30, 60 | retryable provider errors in a row before `ERROR` |
-| `provider_retry_max_wait_sec`, `quota_patterns` | 300 | a reset further out than this, or a quota message, ends the agent `ERROR provider_quota` |
+| `provider_retry_max_wait_sec`, `quota_patterns` | 300 | a reset further out than this on the first retry of a streak, a quota message, or a delay past four times this, ends the agent `ERROR provider_quota`; a later retry that only Kilo's own doubling pushed past it ends it `ERROR provider_unavailable` |
 | `harvest_budget_sec`, `deadline_commit` | 900, true | the harvest's clock; uncommitted work at the deadline is committed for the agent |
 | `agent_suite_slots`, `pytest_workers_*` | 1, auto | how many agents run pytest at once, and with how many workers |
 | `tmp_roots`, `deny_commands`, `ask_commands` | | the policy: paths allowed outside the worktree, commands always refused, commands sent to the gate |
@@ -315,9 +315,46 @@ missing or unreadable. A Ctrl-C leaves the state saved (the runner aborts
 the sessions and re-raises after saving), so the resume is the continuation.
 A provider outage does not need one: retryable session errors are re-prompted
 in the same session within the round's own budgets (KC-19, KC-64), and a
-quota — a reset time further out than `provider_retry_max_wait_sec` — ends
-the agent `ERROR provider_quota` at once, with the reset time printed once
-per provider at the round's end.
+quota — a reset time further out than `provider_retry_max_wait_sec` on the
+first retry of a streak, or whose text is a quota phrase — ends the agent
+`ERROR provider_quota` at once, with the reset time printed once per
+provider at the round's end. A provider that keeps answering the same error
+(round 146: a 400, nine retries) reaches the bound by Kilo's own doubling of
+the delay; that names no reset, so it ends `ERROR provider_unavailable after
+N retries`, not a quota.
+
+**The context memory and Kilo's `Compaction exhausted`.** The memory
+(`contest-out/context-memory.json`, `context_memory_days`) keeps what a
+provider's own overflow said about a model's window. Kilo's own
+`ContextOverflowError: Compaction exhausted: context still exceeds model
+limits after 3 attempts` is the wall Kilo holds speaking — the declared window, or
+the one the runner pushed from this memory — and names no size: it ends the
+turn as any overflow does and writes nothing (round 146: seventeen such
+records had lowered apertus-70b-instruct's declared 32 000 to 22 561 and
+apertus-v1.5-70b-thinking's to 30 241). Records written before that fix stay
+until they age out; `scripts/purge_memory_wall_records.py` finds them (a
+record with no limit, prompt or output, and a `Compaction exhausted` of the
+same agent in its `events.jsonl` a minute before it) and, with `--apply`,
+drops them and keeps the old file. Run it with no round running, once per
+checkout.
+
+**Where Kilo compacts a small window, and what a failing provider costs a turn.**
+Kilo compacts a session after the step that reaches `limit.input -
+min(20 000, output)`, and the runner hands it `input = compact_at_percent of
+the budget + that reserve` (`context_memory.kilo_limit`), so the compact point
+is the share of the budget — for every window. Until round 146 `input` was
+capped at the budget, and under about 100 000 the cap won: a 32 000 budget with
+a 32 000 output compacted at 12 000, about Kilo's own base context, and the
+ticket was summarised away within a few steps (apertus-70b-instruct,
+qwen-sea-lion). A turn's deadline has the same kind of leak: a streak of
+`session.status retry` events — Kilo waiting to try a failing provider again,
+from the first retry to the model's next output — is time the agent could not
+work in, and moves the deadline by its length (never by more than the turn's
+own `turn_timeout_sec`; KC-64's retry count and KC-61's bound still end a
+provider that never answers). glm-4.7-flash had spent 32 of its 70 minutes
+that way, twice, and ended `STALLED no idle after 70m … unchanged for 10m` with
+a real tree. With `turn_extend_sec = 0` the turn clock is fixed and nothing is
+given back.
 
 **Putting ended agents back to work: `scripts/revive_round.py`.** `--resume`
 restarts only the agents that were mid-flight. An agent that already ended
@@ -529,6 +566,27 @@ and rerun. Never `always` — under `external_directory` it whitelists the
 pattern for the rest of the session (PROBE.md, fact 4), and the policy's
 replies are exactly `once` and `reject`.
 
+**The deny list.** `deny_commands` (`git push*, sudo *, rm -rf /*, curl * |
+sh, wget * | sh`) is refused before anything else looks at the command. A
+pattern is matched against the whole line, against each shell piece (`&&`,
+`||`, `;`, `|`, `&`, newline outside quotes; `$(…)`, backticks, `bash -c` and
+`eval` bodies), and against each piece **as the shell runs it** (205): the
+command word without its directory, quotes or backslash (`/usr/bin/git`,
+`"git"`, `\git`), past `VAR=value`, reserved words (`then`, `do`, `else`,
+`!`, `{`, `(`) and the wrappers that run their argument (`env`, `timeout`,
+`nohup`, `sudo`, `doas`, `xargs`, `nice`, `ionice`, `setsid`, `stdbuf`,
+`chroot`, … with their own options), and for `git` past its global options
+(`-C dir`, `-c k=v`, `-P`, and the long ones that set the repository or the pager). So `git -C wt push`,
+`sudo -u root git push` and `if x; then git push; fi` are all `git push*`.
+A `*` glued to a word ends the word: `git push*` is `git push` and `git push
+…`, not `git pushd`. A pattern holding a path (`/usr/bin/git push*`) still
+matches what was typed, behind a wrapper too (`sudo /usr/bin/git push`). The matcher is a pattern filter on the command's
+*spelling*, not a sandbox: text a command builds or reads at run time — `echo
+'git push' | sh`, `sh -c "$(…)"`, a here-string, `python -c
+"os.system('git push')"` — is not seen: that text comes from stdin or a computed value, nothing
+the matcher can read ahead of time. The checkouts' cut push URL is the
+backstop for `git push`.
+
 ---
 
 ## Hand-over
@@ -552,6 +610,75 @@ scoring side of the record is `contest-bench/README.md`: the same input
 data fed to every entry, ranked by what came out, against a fake provider,
 never a live one.
 
+### Judging a finished round: the score table, then the cross phase
+
+Round 158. When every agent is in a terminal state and the models have written
+their tests, the judge is one command with two stages, in this order.
+
+```bash
+python3 contest-bench/harness/setup_worktrees.py <out>/entrants.json --wt <out>/wt --ideal <ref>
+```
+
+```bash
+python3 scripts/judge_epic_round.py --round NN --base <sha> --runs <out>/wt --cross --ideal <ref>
+```
+
+1. **The score table**, as before: one row per worktree (gate, commits, files,
+   `+/-`, test files and functions, off-ticket files, pushed, sha). It is printed
+   first, so a round with a failing hard gate is read before anything else runs.
+2. **The cross phase**, after it, only with `--cross`. Rows are *whose tests*: every
+   entry that added or changed a file under `tests/` (the names `git diff` reports
+   for `tests/` against the base; an entry that touched nothing there is a column
+   and no row).
+   Columns are *whose code*: every entry, the base, and with `--ideal REF` the
+   candidate ideal. A cell is `passed/total` of that entry's own changed test
+   files run on that code, and under the matrix every failing test is named with
+   its first `E ` line and one class:
+
+   - `api` — an ImportError, AttributeError or a signature `TypeError`: the test
+     names something only its author's code has. A different implementation, not
+     a bug (a test module that cannot be imported at all is this, too).
+   - `base` — the same test also fails on the base: the author asked for
+     something nobody was asked for. Not a finding.
+   - `behaviour` — everything else. A **lead, not a verdict**: reproduce it by
+     hand on the code, and a reproduced bug gets its own ticket.
+
+   A cell that could not run says why instead of `0/0` (`n/a`, with a note: a
+   path that is not a repo, a ref git cannot archive, a test that outlived
+   `--cell-timeout`).
+
+   Between the matrix and the full list the judge prints **Leads**, the two
+   things worth reading first (`cross.md` has them under `## Leads`, `cross.json`
+   under `leads`): every `behaviour` failure, and every *discriminating* test — one
+   the base fails, some code passes and other code fails. The class of that test is
+   `base`, so on its own it reads as "nobody was asked for this"; the lead says who
+   did what the test asks and who did not (round 157: a test of the lock written
+   before the child starts, which the two entries without the fix fail and the rest pass).
+
+How a cell runs: the implementation is a `git archive` of the worktree's `HEAD`
+(or of the ref) in a scratch directory, the author's test files are copied in as
+`tests/_xcross_<entry>_<file>` — never into a worktree, which is only read —
+and `pytest -n 4` runs them against a private short basetemp. The scratch
+copy and the basetemp are deleted with the cell, and a cell that outlives
+`--cell-timeout` (300 s) has its whole process group, xdist workers included,
+ended; round 151 ran the box out of inodes before that cleanup existed. Cells
+run one at a time; `--jobs N` runs N at once when the box can take it.
+
+`cross.json` (the raw cells: counts, classes, nodes, `E ` lines) and `cross.md`
+(the table and the failing cells) are written to `contest-out/NN/` next to
+`SUMMARY.md`; `--cross-out DIR` moves both. A worktree named `base` or `ideal`
+(`setup_worktrees.py` makes both) is that column; without one the column is the
+`--base` / `--ideal` ref. The phase never takes the round down: if it cannot
+start, the score table is already on the screen and the judge says why.
+
+What the matrix is for, and what it is not. An entry's tests are bound to its
+author's own helper names, so most off-diagonal cells of an API-heavy ticket are
+`api` and say little; the diagonal says whether each entry's own tests are green
+on its own code, and a `behaviour` cell is the only place another entry's test
+found something the bench did not. Round 151's two real bugs (a cache that
+outlived the drop, a linked worktree left with Kilo's own `.gitignore`) came out
+of exactly such cells.
+
 ---
 
 ## Known limits
@@ -563,6 +690,10 @@ never a live one.
 - **Serial rounds.** One ticket per round, N agents on it; round N+1 starts
   from round N's merged head. Parallel rounds would produce N conflicting
   versions of the same file.
+- **The deny list reads spellings.** `deny_commands` sees through paths,
+  quotes, wrappers, reserved words and git's global options, but not a
+  command assembled at run time (`echo 'git push' | sh`, `python -c …`); see
+  "The deny list" under the gate.
 - **Mechanical harvest only.** READY is decided by `gates.py`'s checks — the
   `PROGRESS.csv` row, the one commit, nothing pushed, a test file in the
   diff, `_shrink` byte-identical — never by a model reading the patch. The

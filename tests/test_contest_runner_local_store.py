@@ -42,6 +42,9 @@ that rule is also the gate's.
 
 from __future__ import annotations
 
+import atexit
+import shutil
+import tempfile
 import argparse
 import json
 import os
@@ -85,7 +88,12 @@ from tools.contest.runner import (  # noqa: E402
 )
 from tools.contest.workspace import Workspace  # noqa: E402
 
-COMMITTED = REPO_ROOT / "contest.ini"
+# Hermetic: the committed contest.ini alone, copied where no contest.local.ini sits next to
+# it, so an operator's local overrides never change what these tests see.
+_COMMITTED_DIR = Path(tempfile.mkdtemp(prefix="committed-ini-"))
+atexit.register(shutil.rmtree, _COMMITTED_DIR, ignore_errors=True)
+shutil.copy(REPO_ROOT / "contest.ini", _COMMITTED_DIR / "contest.ini")
+COMMITTED = _COMMITTED_DIR / "contest.ini"
 MODEL_CHECK = REPO_ROOT / "scripts" / "py_model_test.py"
 
 #: The wordings Kilo's own store uses, from round 107's kilo-serve.log and from
@@ -952,6 +960,8 @@ def test_the_find_free_line_goes_out_at_intake(monkeypatch, tmp_path, capsys):
     root = _store_proc(tmp_path / "proc")
     monkeypatch.setattr(model_check, "_PROC_ROOT", str(root))
     monkeypatch.setattr(model_check, "find_free", lambda *a, **kw: 0)
+    # no Kilo is run here, but `main` looks for the binary first: stand one in
+    monkeypatch.setattr(model_check, "find_kilo", lambda explicit: "/bin/kilo")
     monkeypatch.setattr(sys, "argv", ["py_model_test.py", "--find-free", "openrouter"])
 
     assert model_check.main() == 0

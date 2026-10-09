@@ -44,10 +44,12 @@ import re
 import subprocess
 from pathlib import Path
 
-STATUS_RE = re.compile(r"^(\*\*Status:\*\*\s*)(\S+)(.*)$", re.MULTILINE)
+# `[ \t]*`, not `\s*`: an empty Status line must not read (and then overwrite) the
+# first word of the line below it.
+STATUS_RE = re.compile(r"^(\*\*Status:\*\*[ \t]*)(\S+)(.*)$", re.MULTILINE)
 TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
 #: `| 48 | `KC-9` | queued — …` → the status word in the third cell.
-INDEX_ROW = r"^(\|\s*0*{n}\s*\|[^|\n]*\|\s*)(\S+)"
+INDEX_ROW = r"^(\|\s*0*{n}\s*\|[^|\n]*\|\s*)([^|\n]*?)(\s*\|)"
 VALID_WRITE = ("open", "queued", "landed")
 
 
@@ -123,7 +125,10 @@ def next_steps(status: str, number: int, repo: Path, tasks_dir: Path, base: str)
         nxt = sorted(k for k, v in statuses.items() if v in ("queued", "open") and k != n)
         # the landed ticket's own epic first: `KC-9` → `KC-`; old epics' parked
         # tickets only when this one has nothing left
-        family = re.match(r"[A-Za-z]+-?", titles.get(n, "")).group(0) if titles.get(n) else ""
+        # a ticket whose heading starts with a number (`# 150 — …`), or has no
+        # heading (the file name), has no family: every ticket still to land
+        m = re.match(r"[A-Za-z]+-?", titles.get(n, ""))
+        family = m.group(0) if m else ""
         nxt = [k for k in nxt if titles[k].startswith(family)] or nxt
         lines = [f"", f"next, on {branch}:", f"  1. check the log, then push:",
                  f"       git push {remote} {branch}"]
@@ -205,7 +210,9 @@ def main(argv=None) -> int:
         note = f"`{args.sha}`" + (f" — {note}" if note else "")
 
     if note is None:
-        rest = match.group(3)
+        # a landed ticket sent back to open/queued must not keep the old sha
+        was_landed = match.group(2).strip("`*").lower() == "landed"
+        rest = "" if was_landed and args.status != "landed" else match.group(3)
     elif args.status == "landed":
         rest = f" {note}"  # the repo's form: landed `sha` — note
     elif note.startswith((" —", " -")):
@@ -223,7 +230,11 @@ def main(argv=None) -> int:
         rows = index.read_text()
         row_re = re.compile(INDEX_ROW.format(n=args.number), re.MULTILINE)
         if row_re.search(rows):
-            index.write_text(row_re.sub(lambda m: m.group(1) + args.status, rows, count=1))
+            # the whole status cell is rewritten: only the first word used to be,
+            # so a flip kept the old sha (`open `abc`` / a landed row with the
+            # previous winner's sha)
+            cell = f"landed `{args.sha}`" if args.status == "landed" else args.status
+            index.write_text(row_re.sub(lambda m: m.group(1) + cell + m.group(3), rows, count=1))
             paths.append(str(index.relative_to(repo)))
             print(f"{paths[-1]}: row {args.number} -> {args.status}")
 

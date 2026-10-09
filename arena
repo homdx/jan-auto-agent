@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""arena — AR-1: the repo-root launcher for `tools.arena.cli.main`.
+
+The launcher's own directory goes first on `sys.path`, so `./arena` (or a
+symlink / absolute path to it) works from any working directory, and the
+`scripts/` imports of later tickets resolve against this checkout — not
+whatever `tools` package the caller's cwd happens to hold. No `.py` suffix:
+`githooks/pre-commit` rejects only new root `*.py` files.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from tools.arena.cli import main  # noqa: E402 — needs the path above
+
+if __name__ == "__main__":
+    sys.exit(main())

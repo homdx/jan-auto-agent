@@ -57,6 +57,8 @@ _HELP_COMMANDS = (
     # picking the models, and putting a stopped round's ended agents back
     ["scripts/py_model_test.py", "--help"],
     ["scripts/revive_round.py", "--help"],
+    # the context memory's records Kilo's own wall wrote (round 146)
+    ["scripts/purge_memory_wall_records.py", "--help"],
 )
 
 _FLAG_RE = re.compile(r"--[a-z][a-z0-9-]*")

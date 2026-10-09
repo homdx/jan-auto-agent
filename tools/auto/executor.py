@@ -69,7 +69,7 @@ from pathlib import Path
 from typing import Optional
 
 from tools.agent_trace import tracer
-from tools.auto.utils import is_pytest_command, is_xdist_flag   # RUN-3
+from tools.auto.utils import is_pytest_command, is_xdist_flag, pytest_piece_spans   # RUN-3
 
 logger = logging.getLogger(__name__)
 
@@ -851,14 +851,20 @@ class Executor:
         if not self._pytest_serial or not is_pytest_command(command):
             return command
         try:
-            parts = shlex.split(command, posix=(os.name != "nt"))
+            shlex.split(command, posix=(os.name != "nt"))
         except ValueError:
             return command          # un-parseable quoting — don't guess at the flags
-        if any(is_xdist_flag(p) for p in parts[1:]):
-            return command
+        command = command.rstrip()
         if not self._pytest_config_requests_pool():
             return command
-        return f"{command.rstrip()} {_PYTEST_SERIAL_FLAG}"
+        # the flag goes at the end of each pytest run, not of the line: what
+        # follows a `|` or `&&` is another command's argument list
+        for start, end in reversed(pytest_piece_spans(command)):
+            parts = shlex.split(command[start:end], posix=(os.name != "nt"))
+            if any(is_xdist_flag(p) for p in parts[1:]):
+                continue
+            command = f"{command[:end]} {_PYTEST_SERIAL_FLAG}{command[end:]}"
+        return command
 
     def _pytest_config_requests_pool(self) -> bool:
         """Cached: does this repo's pytest config (or ``PYTEST_ADDOPTS``) ask for xdist workers?"""

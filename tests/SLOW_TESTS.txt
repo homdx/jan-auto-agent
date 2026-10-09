@@ -58,5 +58,6 @@ test_contest_pytest_workers_plugin.py
 test_contest_runner.py
 test_faq_agent_validate.py
 test_gate1_presence_llm_profile.py
+test_judge_cross_tests.py
 test_llm_stream_response_format.py
 test_llm_stream_think_effort.py

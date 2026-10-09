@@ -66,6 +66,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
 from tools.contest.kilo_client import (
@@ -76,6 +77,7 @@ from tools.contest.kilo_client import (
     KiloServer,
     SessionRef,
     _deadline_grant,
+    _context_limit_of,
     _permission_answer,
 )
 
@@ -85,7 +87,14 @@ __all__ = [
     "ContestBackend",
     "ContestBackendError",
     "KiloBackend",
+    "KiloLimitKept",
+    "KiloLimitRefused",
+    "KiloTapReconnectError",
+    "KILO_PROJECT_FILE",
+    "KILO_PROJECT_FILE_NAMES",
     "OpenRouterBackend",
+    "drop_stale_kilo_file",
+    "tracked_kilo_files",
 ]
 
 _LOG = logging.getLogger(__name__)
@@ -124,6 +133,71 @@ class ContestBackendError(Exception):
     back as ``IdleResult(status="error")`` with ``data.isRetryable`` set, so
     the runner's ``_retryable()`` decides.
     """
+
+
+class KiloLimitRefused(ContestBackendError):
+    """The workspace will not take the model's ``limit`` at all.
+
+    Raised by :meth:`KiloBackend.set_model_limit` when the push would rewrite a
+    tracked project file into the agent's diff, and in two cases: the checkout
+    already tracks one, so an ignore rule would not help; or ``git`` did not
+    answer at all (Round 151) — a timeout, an index it refuses to read — so the
+    check cannot tell the two apart, and a push taken on a blind index is the
+    one a tracked file survives in the diff unseen.
+
+    Round 148: the only reason ``set_model_limit`` can refuse, and the only one
+    that will refuse again the same way on the next call. The runner remembers
+    it (`push_refused`) so the check is not re-run for the same size, and a
+    watch that was standing by that refusal stays armed — a window that was
+    never handed to Kilo is exactly what the watch is for. Every other failure
+    is a plain :class:`ContestBackendError`: it is retryable, and the runner
+    does not remember it."""
+
+
+class KiloTapReconnectError(ContestBackendError):
+    """Round 151: the limit did go over, but the workspace's event stream did
+    not come back.
+
+    A `PATCH /config` on 7.6.2 disposes the directory's instance and ends its
+    ``/event`` stream, so the tap has to be reopened for the next turn to be
+    heard at all (`KiloBackend._reconnect_tap`). That reopen can fail — the log
+    directory cannot be made, the log cannot be opened — and it is a different
+    failure from the push: the server answered the patch and now sizes the
+    session by the window the caller asked for, so the caller must remember the
+    window as handed over and keep its in-turn watch off. The two failures are
+    otherwise identical to a caller that catches only
+    :class:`ContestBackendError`, and today the reconnect's error is read as
+    "the window was not handed to Kilo" — which un-remembers a window Kilo does
+    hold and re-patches, and reloads Kilo, for every later prompt.
+    """
+
+
+class KiloLimitKept(ContestBackendError):
+    """Round 153: the patch landed, and the server kept its own window anyway.
+
+    Live, 7.6.2: a model whose ``limit`` the server's own config content carries
+    (the round's spawn ``KILO_CONFIG_CONTENT`` — or the operator's) keeps it
+    field by field. A ``PATCH /config`` for a smaller one answers 200, writes
+    ``.kilo/kilo.jsonc``, disposes the instance and reopens the stream — and the
+    next ``GET /provider`` still reports the content's limit. The window never
+    went over, even though the server said 200 and this round's stream is fine,
+    which is why a caller that trusts the status code stands its in-turn watch
+    down for a turn Kilo sizes by the old, larger window: the refusal the memory
+    just recorded.
+
+    ``kept`` is the ``limit.context`` the read-back reported, ``None`` when the
+    read-back could not be read at all: the caller cannot tell which window Kilo
+    sizes by and must keep the watch armed either way. It is remembered like a
+    :class:`KiloLimitRefused` — the server's own content does not change inside
+    a round, so the same size is not re-patched, and reloaded, every prompt.
+
+    Unlike :class:`KiloLimitRefused` the file *was* written: the caller drops it
+    on the way out with the limit it pushed.
+    """
+
+    def __init__(self, message: str, *, kept: int | None = None) -> None:
+        super().__init__(message)
+        self.kept = kept
 
 
 @runtime_checkable
@@ -293,6 +367,341 @@ class ContestBackend(Protocol):
 # Kilo
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: Round 148: the project config a `PATCH /config` writes into the workspace.
+#: Kilo keeps the patch there, so the file outlives the turn that wrote it.
+KILO_PROJECT_FILE = ".kilo/kilo.jsonc"
+
+#: Round 151: the two names that config may sit under. They are the only paths
+#: a `PATCH /config` rewrites, and therefore the only ones the guards below
+#: refuse over: a tracked ``.kilo/rules/x.md`` is the agent's own file and
+#: never blocks the push — `.kilo/.gitignore` keeps the untracked file out of
+#: the diff, and only a tracked one can land in it.
+KILO_PROJECT_FILE_NAMES = (".kilo/kilo.jsonc", ".kilo/kilo.json")
+
+#: Round 151: the ignore file that keeps `KILO_PROJECT_FILE_NAMES` out of the
+#: agent's tree, inside the workspace — never in git's own exclude (see
+#: `_exclude_kilo_dir` for why there is no exclude ours alone to write to).
+_KILO_IGNORE_PATH = (".kilo", ".gitignore")
+
+#: Its whole content: the two names a `PATCH /config` writes, and its own name,
+#: so the file hides itself too and `git add -A` stages none of ours. A rule
+#: file the agent adds in `.kilo/` is not among those names and stays committable.
+_KILO_IGNORE_LINES = ("kilo.jsonc", "kilo.json", ".gitignore")
+
+#: Round 151: how long the guards wait for `git`. The check runs once per
+#: remembered size per agent, so a short bound is enough — and a `git` that
+#: cannot read its own index will not answer in any time at all, which is
+#: exactly why the caller has to refuse rather than wait longer.
+_KILO_GIT_TIMEOUT = 10.0
+
+
+
+def _git(directory, *args, timeout: float = 30.0) -> tuple:
+    """One `git` in *directory*: ``(ran, stdout.strip())``.
+
+    ``(False, "")`` on any failure — not a checkout, no `git`, a timeout, a
+    refused tree — so a caller can tell "git answered no" from "git never
+    answered". Never raises: this is a workspace check, not a round step.
+    """
+    try:
+        out = subprocess.run(["git", "-C", str(directory), *args],
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+    return out.returncode == 0, out.stdout.strip()
+
+
+def _tracked_project_files(directory) -> tuple:
+    """Round 151: ``(files, answered)`` — the project files *directory* tracks,
+    and whether `git` answered at all.
+
+    *files* is a subset of :data:`KILO_PROJECT_FILE_NAMES`, by name: the two
+    paths a `PATCH /config` rewrites, and the only ones that can land in the
+    agent's diff. A tracked ``.kilo/rules/x.md`` is not reported.
+
+    *answered* is False only when `git` said nothing — no `git`, a timeout, an
+    index it cannot read. Silence is not "nothing is tracked", and a caller
+    that protects a file must refuse on it. A directory that is not a checkout
+    *does* answer ("not a git repository") and is reported answered with no
+    files: there is no diff there to protect.
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(directory), "ls-files", ".kilo"],
+                              capture_output=True, text=True,
+                              timeout=_KILO_GIT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return [], False
+    if proc.returncode == 0:
+        tracked = [line.strip() for line in (proc.stdout or "").splitlines()
+                   if line.strip()]
+        return [p for p in tracked if p in KILO_PROJECT_FILE_NAMES], True
+    text = ((proc.stderr or "") + (proc.stdout or "")).lower()
+    if "not a git repository" in text:
+        return [], True
+    return [], False
+
+
+def _jsonc_value(text: str):
+    """`json.loads` over a ``.jsonc`` document: comments and trailing commas stripped.
+
+    ``None`` when it is not a JSON object at all — the file is then unattributable,
+    and the caller keeps it rather than deleting a file it cannot read.
+    """
+    out, quote, i, n = [], None, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = min(n, i + 2)
+            continue
+        out.append(ch)
+        i += 1
+    try:
+        return json.loads(re.sub(r",(\s*[}\]])", r"\1", "".join(out)))
+    except (ValueError, TypeError):
+        return None
+
+
+def _holds_limit(node, limit: dict) -> bool:
+    """Whether *node* still carries *limit*, nested anywhere.
+
+    A sub-dict match, not equality: Kilo may keep other config next to the
+    limit it was patched with, and the limit object itself may carry keys the
+    patch did not send. A limit that no longer matches is not this round's, and
+    that is what keeps an agent-authored file alive to the harvest.
+    """
+    if isinstance(node, dict):
+        if all(node.get(key) == value for key, value in limit.items()):
+            return True
+        return any(_holds_limit(value, limit) for value in node.values())
+    if isinstance(node, list):
+        return any(_holds_limit(value, limit) for value in node)
+    return False
+
+
+def _file_carries_limit(target: Path, limit: dict) -> bool:
+    """Whether *target* still holds the limit this round pushed, as read back."""
+    if not isinstance(limit, dict) or not limit:
+        return False
+    try:
+        return _holds_limit(_jsonc_value(target.read_text(encoding="utf-8")), limit)
+    except OSError:
+        return False
+
+
+def tracked_kilo_files(directory) -> list:
+    """The project-file names the checkout of *directory* already tracks.
+
+    Round 151: only the two names a `PATCH /config` rewrites are reported, so a
+    tracked ``.kilo/rules/x.md`` no longer blocks the push — the untracked file
+    is kept out of the diff by `.kilo/.gitignore`, and only a tracked one would
+    land in it.
+
+    Raises :class:`KiloLimitRefused` when `git` did not answer (no `git`, a
+    timeout, an index it cannot read) rather than returning ``[]``: silence is
+    "unknown", and a push taken on an unknown index rewrites a tracked
+    ``.kilo/kilo.jsonc`` into the agent's diff unseen — the whole point of the
+    check. ``[]`` means `git` answered and named no project file.
+    """
+    files, answered = _tracked_project_files(directory)
+    if not answered:
+        raise KiloLimitRefused(
+            f"git did not answer in {directory} — the push would be blind, and a "
+            "tracked .kilo/kilo.jsonc there would land in the agent's diff")
+    return files
+
+
+def drop_stale_kilo_file(directory, expected_limit: dict | None = None,
+                         *, assume_stale: bool = False) -> bool:
+    """Round 148/151: delete the *untracked* project file this round wrote.
+
+    ``KILO_PROJECT_FILE`` outlives the turn that wrote it, and a respawned
+    server (`--resume`, `scripts/revive_round.py`) finds it on spawn — so the
+    round deletes its own before that server starts and again when the run ends.
+    Kilo marks the file `configProtected`, which is why the deletion checks the
+    index first: only a file the checkout does not track is this round's, and
+    only that goes.
+
+    Round 151: untracked is not the same as this round's. One the agent wrote on
+    purpose is, and it has to survive to the harvest — the gate saw the edit,
+    and a deletion at the end of the run would erase what the round asked for.
+    So a file goes only when it is exactly what the runner pushed for this
+    workspace: *expected_limit* is the ``limit`` `set_model_limit` sent, and one
+    that no longer carries it is left alone. ``expected_limit=None`` — the run
+    pushed nothing — keeps every untracked file, which is the agent's.
+    *assume_stale* is the pre-spawn call, where this run has pushed nothing yet,
+    so an untracked project file there is a leftover of an earlier attempt and
+    goes without a content compare.
+
+    The `.kilo/.gitignore` `set_model_limit` wrote goes with the file it hides
+    (`_drop_kilo_ignore`), and so does an empty `.kilo/`. One the agent wrote on
+    purpose keeps its ignore, because that is what keeps *it* out of
+    `git add -A` for the rest of the round.
+
+    True when one was removed; False when there was nothing to do — no file, a
+    tracked one, an agent's, a directory `git` will not answer. Never raises: a
+    stale file is a nuisance, not a round.
+    """
+    files, answered = _tracked_project_files(directory)
+    if not answered or files:
+        return False
+    for name in KILO_PROJECT_FILE_NAMES:
+        try:
+            target = Path(directory) / name
+            if not target.is_file():
+                continue
+            if expected_limit is not None:
+                if not _file_carries_limit(target, expected_limit):
+                    continue
+            elif not assume_stale:
+                continue
+            target.unlink()
+            _drop_kilo_ignore(directory)
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _kilo_ignore_path(directory) -> Path:
+    return Path(directory) / _KILO_IGNORE_PATH[0] / _KILO_IGNORE_PATH[1]
+
+
+def _exclude_kilo_dir(directory: str) -> None:
+    """The project-file names ignored *in the workspace itself*, once per directory.
+
+    Round 148 wrote ``.kilo/`` to the checkout's ``info/exclude``, and a linked
+    worktree's ``git rev-parse --git-path info/exclude`` answers the repository's
+    *common* exclude — the file every worktree shares, the operator's own
+    checkout included, not the worktree's own. A round would then leave ``.kilo/``
+    in the operator's real exclude forever, an entry no round wrote it for.
+
+    Round 151: there is no exclude that is ours alone. Per-worktree
+    ``<common>/worktrees/<name>/info/exclude`` is read by no one — checked with
+    ``check-ignore -v`` on git 2.34.1, where the worktree's
+    ``--git-path info/exclude`` still resolves the common file — so a linked
+    worktree gets no exclude edit at all, which left the workspace's
+    ``.kilo/kilo.jsonc`` untracked but visible: a ``git add -A`` in the agent's
+    own turn would have staged it into the agent's diff, and it would have been
+    *tracked* afterwards, which is what `tracked_kilo_files` refuses forever.
+    A rule file the agent adds in ``.kilo/`` stays committable either way, and
+    this does not touch the agent's tree unless it was empty of our own:
+    ``.kilo/.gitignore`` with exactly the two names a ``PATCH /config`` writes
+    and its own name, so ``git status`` and ``git add -A`` see none of ours.
+
+    A ``.kilo/.gitignore`` that is already there with other content is the
+    agent's, and a warning is logged instead of an edit — a write to it would
+    land in the agent's diff. The file goes with the project file in
+    `drop_stale_kilo_file`. Never raises: an unignored project file is a nuisance,
+    not a round.
+
+    Except Kilo's own. Live, 7.6.2: an instance that opens a workspace with a
+    ``.kilo/`` and no ``.kilo/.gitignore`` writes one — ``node_modules``,
+    ``package.json``, the lock files, ``.gitignore``, ``agent-manager.json`` —
+    and never rewrites one that is there. It names neither project file, so a
+    ``.kilo/`` the agent made (``.kilo/rules/``) or a reload after a patch leaves
+    Kilo's file in place and ``kilo.jsonc`` in plain view. A file that ignores
+    itself and is not tracked is never in the agent's diff, whoever wrote it, so
+    the missing names are appended to it; one that is tracked, or does not hide
+    itself, is still the agent's and is still only warned about.
+    """
+    # round 155: no per-directory memory of a file already in place — the
+    # agent's `git clean -fdx` or `rm -rf .kilo`, or the drop at the end of a
+    # leg, removes it behind any cache, and Kilo's reload then writes its own
+    # without the project names. One read per push (once per size) is nothing.
+    # round 148's contract: a directory that is not a git checkout has no diff
+    # to keep anything out of, and nothing is written there
+    ok, inside = _git(directory, "rev-parse", "--is-inside-work-tree",
+                      timeout=_KILO_GIT_TIMEOUT)
+    if not ok or inside != "true":
+        return
+    try:
+        path = _kilo_ignore_path(directory)
+        if path.exists():
+            text = path.read_text(encoding="utf-8")
+            lines = {line.strip() for line in text.splitlines()}
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            text, lines = "", set()
+        missing = [line for line in _KILO_IGNORE_LINES if line not in lines]
+        if missing:
+            if lines:
+                if not _hides_itself_untracked(directory, lines):
+                    _LOG.warning("%s: .kilo/.gitignore is the agent's and ignores none of %s "
+                                 "— the window may show in the diff",
+                                 directory, ", ".join(missing))
+                    return
+                with path.open("a", encoding="utf-8") as fh:
+                    if text and not text.endswith("\n"):
+                        fh.write("\n")
+                    fh.write("".join(line + "\n" for line in missing))
+            else:
+                path.write_text("".join(line + "\n" for line in _KILO_IGNORE_LINES),
+                                encoding="utf-8")
+    except OSError:
+        return
+
+
+def _hides_itself_untracked(directory, lines: set) -> bool:
+    """Whether a ``.kilo/.gitignore`` with *lines* can never reach the agent's diff:
+    it ignores itself and the checkout does not track it. A `git` that does not
+    answer is a no — the file is then left as it is."""
+    if ".gitignore" not in lines:
+        return False
+    ok, out = _git(directory, "ls-files", "--", "/".join(_KILO_IGNORE_PATH),
+                   timeout=_KILO_GIT_TIMEOUT)
+    return ok and not out
+
+
+def _drop_kilo_ignore(directory) -> None:
+    """The ignore file `set_model_limit` wrote, when the project file goes.
+
+    Only ours goes: one that carries anything besides `_KILO_IGNORE_LINES` is the
+    agent's, and an agent's file is never deleted here. An empty ``.kilo/`` goes
+    too, whether or not it still held the file — a directory the guard created
+    for a patch it has just taken back is the round's, not the agent's.
+    """
+    try:
+        path = _kilo_ignore_path(directory)
+        if path.is_file() and \
+                {line.strip() for line in path.read_text(encoding="utf-8").splitlines()} \
+                == set(_KILO_IGNORE_LINES):
+            path.unlink()
+        parent = path.parent
+        if parent.is_dir():
+            parent.rmdir()
+    except OSError:
+        pass
+
+
+#: Round 160: the least time `_reconnect_tap` gives the old tap to exit after
+#: its stop — the stop shuts the socket, so the reader is gone well inside it.
+#: Not cut by the reconnect's deadline: a join of zero is what left two taps
+#: on one log.
+_OLD_TAP_JOIN_SEC = 2.0
+
+
 class KiloBackend:
     """:class:`ContestBackend` backed by a Kilo server — today's default.
 
@@ -308,6 +717,7 @@ class KiloBackend:
                  tap: EventTap | None = None) -> None:
         if client is None:
             client = KiloClient(server, directory)
+        tap_args = None
         if tap is None:
             base = getattr(server, "base_url", None)
             if not isinstance(base, str) or not base:
@@ -316,9 +726,22 @@ class KiloBackend:
             if not events_log:
                 raise ContestBackendError("KiloBackend needs an events_log path for its tap")
             tap = EventTap(base, directory, events_log).start()
+            # round 145/151: what a reconnect after `set_model_limit` needs to
+            # rebuild this backend's own tap. Only set when the backend built
+            # the tap: an injected `tap=` is the caller's, and `_tap_args is
+            # None` is the marker that leaves it alone instead of rebuilding
+            # over it — which also keeps `server.base_url` unread for one that
+            # has none to read.
+            tap_args = (base, directory, events_log)
         self._client = client
         self._tap = tap
+        self._directory = directory
+        self._tap_args = tap_args
         self._interrupted = False
+        # round 151: held by `_reconnect_tap` and `interrupt` alike, so a Ctrl-C
+        # between "stop the old tap" and "publish the new one" cannot leave two
+        # live readers on one stream and a wait that no one will wake
+        self._tap_lock = threading.Lock()
 
     # ── the protocol ────────────────────────────────────────────────────────
 
@@ -350,6 +773,242 @@ class KiloBackend:
     def mark(self) -> int | None:
         return self._tap.mark()
 
+    def set_model_limit(self, provider_id: str, model_id: str, limit: dict) -> None:
+        """Round 145: the model's ``limit`` for this workspace, at once (see
+        `KiloClient.set_model_limit`). Kilo writes it to ``.kilo/kilo.jsonc`` in
+        the workspace, so ``.kilo/`` goes into the checkout's ``info/exclude``
+        first — never a file in the agent's tree, its diff or
+        its commit.
+
+        Round 148: not when the checkout already **tracks** ``.kilo/``. There
+        ``info/exclude`` does nothing — the patch would rewrite a tracked file
+        and land in the agent's diff. The push is then refused with a warning
+        *and* :class:`KiloLimitRefused`: a silent return would look to the
+        caller like a window Kilo now holds, and the runner's in-turn watch —
+        the fallback for exactly a window that was not handed over — would stand
+        down for a turn Kilo still sizes by its own 131 072. The refusal is
+        structural and cannot change between calls, so the caller remembers it.
+
+        Round 153: a 200 is not the answer, either. After the reconnect the
+        model is read back from ``GET /provider`` and compared with what was
+        sent; a limit the server keeps of its own is
+        :class:`KiloLimitKept`, the same "the window never went over" case a
+        caller has to remember with its watch still armed.
+
+        Raises `ContestBackendError`, the tracked case as
+        `KiloLimitRefused`, the reconnect case — any failure of it, round
+        161 — as `KiloTapReconnectError`, the read-back case as
+        `KiloLimitKept`; the caller logs and goes on, with its watch still
+        armed — or remembered as pushed, in the one case that is this round's
+        stream and not its window."""
+        tracked = tracked_kilo_files(self._directory)
+        if tracked:
+            shown = ", ".join(tracked[:3]) + (" …" if len(tracked) > 3 else "")
+            _LOG.warning("%s: the workspace tracks %s — the remembered window is "
+                         "not handed to Kilo: the patch would land in the agent's diff",
+                         self._directory, shown)
+            raise KiloLimitRefused(
+                f"the workspace tracks {shown} — the patch would rewrite it and land "
+                "in the agent's diff")
+        _exclude_kilo_dir(self._directory)
+        try:
+            self._client.set_model_limit(provider_id, model_id, limit)
+        except KiloHttpError as exc:
+            raise ContestBackendError(str(exc)) from exc
+        # the patch landed, so Kilo now holds the window: only this round's
+        # stream of it is left to fix, and it comes back as
+        # `KiloTapReconnectError` — never as the plain error a caller would
+        # read as "the window was not handed over"
+        with self._tap_lock:
+            before = self._tap
+        try:
+            self._reconnect_tap()
+        except KiloTapReconnectError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — round 161: the window went over
+            self._give_up_stale_tap(before, exc)
+            raise KiloTapReconnectError(
+                f"the event stream for {self._directory} could not be reopened after "
+                f"the config reload: {exc}") from exc
+        self._readback_limit(provider_id, model_id, limit)
+
+    def _give_up_stale_tap(self, before: EventTap, error: Exception) -> None:
+        """Round 161: a reconnect that broke anywhere but `_start_tap`.
+
+        `_start_tap` wraps its own failure, but the old tap's `stop()` or
+        `join()` raising (or anything else between the reload and the swap)
+        came out of `set_model_limit` raw: the runner read it as a window that
+        never went over, re-sent the PATCH — and reloaded Kilo — every turn, and
+        the next wait sat out its silence clock, because the reconnect's first
+        wait had consumed the old tap's one ``tap.closed``. When nothing new was
+        published the old tap is stopped best-effort and that end recorded
+        again, as 160 does for the double start failure; a tap already swapped
+        in is live and gets no second ``tap.closed``. Never raises.
+        """
+        with self._tap_lock:
+            if self._tap is not before:
+                return
+        try:
+            before.stop()
+        except Exception:  # noqa: BLE001 — the tap is given up either way
+            pass
+        try:
+            # memory only: the next caller's wait on it wakes at once
+            before._close_with("the event stream could not be reopened after the "
+                               f"config reload: {error}")
+        except Exception:  # noqa: BLE001
+            _LOG.warning("%s: the old event tap could not record its end — the "
+                         "next wait on it runs to its silence clock", self._directory)
+
+    def _readback_limit(self, provider_id: str, model_id: str, limit: dict) -> None:
+        """Round 153: prove the push took, by reading the model back.
+
+        Live, 7.6.2: ``limit.context`` the server's own config content carries
+        outranks a ``PATCH /config``, field by field — the patch answers 200 and
+        writes the file, and the next ``GET /provider`` still reports it.
+        ``limit.context`` is compared always and ``limit.input`` when the push
+        sent one; ``output`` is Kilo's own reserve and stays out of it. Anything
+        the read-back reports that is not this limit — a different number, no
+        limit, an offer it would not read — is a window that never went over, so
+        :class:`KiloLimitKept` keeps the caller's in-turn watch armed.
+
+        A reconnect failure above never reaches here: the stream is this
+        round's problem, and the window is not.
+        """
+        seen = self._client.model_limits(provider_id, model_id)
+        want_context = _context_limit_of((limit or {}).get("context"))
+        want_input = _context_limit_of((limit or {}).get("input"))
+        if seen is None:
+            raise KiloLimitKept(
+                f"the read-back for {provider_id}/{model_id} did not come back with a "
+                "limit — the offer shows none for the model, or it would not answer")
+        got_context = _context_limit_of(seen.get("context"))
+        got_input = _context_limit_of(seen.get("input"))
+        if got_context != want_context or (want_input is not None
+                                           and got_input != want_input):
+            raise KiloLimitKept(
+                f"the read-back reports {got_context:,} for {provider_id}/{model_id} "
+                f"where the patch asked for {want_context:,}", kept=got_context)
+
+    def _start_tap(self, base: str, directory: str, log: str) -> EventTap:
+        """Round 151: a new `EventTap` on this backend's own log, retried once.
+
+        Both attempts failing raises :class:`KiloTapReconnectError`,
+        never a bare `OSError`: the caller is otherwise about to wait on a
+        stream nobody reads, and that reads to the runner as a window that never
+        went over rather than as a broken stream.
+        """
+        error: Exception | None = None
+        for attempt in (1, 2):
+            try:
+                return EventTap(base, directory, log).start()
+            except Exception as exc:  # noqa: BLE001 — a tap that cannot start is no tap
+                error = exc
+                _LOG.warning("%s: event tap start attempt %d failed: %s",
+                             directory, attempt, exc)
+        raise KiloTapReconnectError(
+            f"the event stream for {directory} could not be reopened after the "
+            f"config reload: {error}") from error
+
+    def _reconnect_tap(self, settle: float = 5.0) -> None:
+        """Round 145: the workspace's event stream after a config reload.
+
+        Live, 7.6.2: a `PATCH /config` disposes the directory's instance and the
+        `/event` stream for it ends (``tap.closed: stream ended``); the old tap
+        never hears another event, so every later wait sits out its silence
+        clock (live: a 34-second compact waited 600 s). The old tap is given up
+        to *settle* seconds to see its end, stopped, and a new one is started
+        on the same log and waits for ``server.connected``. Marks are per tap:
+        the caller takes its next mark after this returns. A tap this backend
+        did not build (a test's) is left alone.
+
+        Round 151: a new tap that cannot be started is retried once and then
+        raises :class:`KiloTapReconnectError`. Every wait shares the one
+        deadline of *settle* seconds and logs its timeout, so a reload that does
+        not end the stream cannot hold the round for three times *settle*.
+        `interrupt` holds the same lock: a Ctrl-C mid-swap stops the tap being
+        replaced, and a swap that publishes into an already-interrupted backend
+        stops its own tap straight away. Round 159: that lock is held only to
+        read and to publish `self._tap`, never across a wait or a start.
+
+        Round 160: the old tap is stopped and joined **before** the new one
+        starts — one writer on ``events.jsonl`` at a time. 151 started the new
+        tap first, and a stream the reload did not end (or a join cut to zero by
+        a spent deadline) left both taps appending the same events to the log
+        the legs' pytest report and the idle watch read back. Nothing is lost by
+        the order: after a reload Kilo has ended the old stream already, so the
+        old tap was never a live fallback. The join gets at least
+        `_OLD_TAP_JOIN_SEC`, since `stop` shuts the socket and the reader is gone
+        within it; one that still runs is logged.
+        """
+        if self._tap_args is None:
+            return
+        deadline = time.monotonic() + max(0.0, float(settle))
+        base, directory, log = self._tap_args
+        # round 159: the lock covers reading and publishing `self._tap` only.
+        # The waits and the start below run without it, so an `interrupt()`
+        # (Ctrl-C) never waits on a reload — 151 held it across all of them,
+        # up to *settle* seconds and the whole of a start that hangs.
+        with self._tap_lock:
+            old = self._tap
+            if self._interrupted:
+                # a Ctrl-C before the reconnect: no new stream is opened for a
+                # backend that is being given up
+                old.stop()
+                return
+        left = max(0.0, deadline - time.monotonic())
+        saw_end = False
+        try:
+            saw_end = old.wait(lambda e: e.get("type") == "tap.closed", left) is not None
+        except Exception:  # noqa: BLE001 — a tap that cannot wait is stopped anyway
+            pass
+        if not saw_end:
+            _LOG.warning("%s: the old event stream did not end within %.0fs of the "
+                         "config reload — stopping it", directory, settle)
+        old.stop()
+        if not old.join(max(_OLD_TAP_JOIN_SEC, deadline - time.monotonic())):
+            _LOG.warning("%s: the old event tap is still running %.0fs after its stop "
+                         "— the new tap shares %s with it", directory,
+                         _OLD_TAP_JOIN_SEC, log)
+        try:
+            new_tap = self._start_tap(base, directory, log)
+        except KiloTapReconnectError:
+            # the wait above consumed the old tap's one `tap.closed`: the
+            # next caller's wait on it must still wake at once, not sit out
+            # its silence clock. Memory only — its log is closed by now.
+            old._close_with("the event stream could not be reopened after "
+                            "the config reload")
+            raise
+        with self._tap_lock:
+            self._tap = new_tap
+            interrupted = self._interrupted
+            if interrupted:
+                # an interrupt that came while the new tap was being started
+                # stopped the old one; this one is stopped here, under the lock
+                # it would have taken
+                new_tap.stop()
+        if interrupted:
+            # stopped above: when this returns, no tap thread of ours runs on
+            new_tap.join(_OLD_TAP_JOIN_SEC)
+            return
+        left = max(0.0, deadline - time.monotonic())
+        connected = False
+        try:
+            seen = new_tap.wait(lambda e: e.get("type") in ("server.connected", "tap.closed"),
+                                left)
+        except Exception:  # noqa: BLE001 — the stream is open; the event is a courtesy
+            seen = None
+        if seen is not None and seen.get("type") == "tap.closed":
+            # an interrupt (or the stream's end) landed during this wait, which
+            # consumed its `tap.closed`: record it again, so the caller's next
+            # wait on this tap still wakes at once
+            new_tap._close_with((seen.get("properties") or {}).get("error") or "stopped")
+            return
+        connected = seen is not None
+        if not connected:
+            _LOG.warning("%s: the reconnected event stream did not report "
+                         "server.connected within %.0fs", directory, settle)
+
     def abort(self, session: SessionRef) -> None:
         try:
             self._client.abort(session)
@@ -357,8 +1016,11 @@ class KiloBackend:
             _LOG.warning("abort(%r) failed: %s", getattr(session, "id", session), exc)
 
     def interrupt(self, session: SessionRef | None = None) -> None:
-        self._interrupted = True
-        self._tap.stop()
+        # round 151: the same lock `_reconnect_tap` holds, so the tap being
+        # stopped is always the one that is or is about to be published
+        with self._tap_lock:
+            self._interrupted = True
+            self._tap.stop()
 
     def interrupted(self) -> bool:
         return self._interrupted
@@ -406,8 +1068,9 @@ class KiloBackend:
         return self._client.messages(session)
 
     def close(self) -> None:
-        self._tap.stop()
-        self._tap.join(2.0)
+        with self._tap_lock:
+            self._tap.stop()
+            self._tap.join(2.0)
 
 
 #: How long `_wait_for_stream` waits for a tap's reader to open its stream.

@@ -79,15 +79,29 @@ def main():
     d = os.path.dirname(a.progress)
     if d:
         os.makedirs(d, exist_ok=True)
+    # csv writes where the file ends: a PROGRESS.csv an editor or a hand left
+    # without its final newline got the new row glued onto its last line, so
+    # next_task.py read one row and handed the new ticket out again. The file's
+    # own line ending ends that line first, and the row keeps that ending too.
+    eol, tail = "\r\n", ""
+    if existed:
+        with open(a.progress, "rb") as fh:
+            data = fh.read()
+        eol = "\r\n" if b"\r\n" in data else "\n"
+        if not data.endswith((b"\n", b"\r")):
+            tail = eol
     with open(a.progress, "a", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=COLUMNS)
+        fh.write(tail)
+        w = csv.DictWriter(fh, fieldnames=COLUMNS, lineterminator=eol)
         if not existed:
             w.writeheader()
         w.writerow(row)
         fh.flush()
         os.fsync(fh.fileno())
 
-    n = sum(1 for _ in open(a.progress, encoding="utf-8")) - 1
+    # rows, not lines: a note may hold a quoted line break
+    with open(a.progress, newline="", encoding="utf-8") as fh:
+        n = sum(1 for _ in csv.DictReader(fh))
     print(f"recorded #{n}: {row['outcome']} {row['ticket']}"
           + (f" @ {row['commit']}" if row["commit"] else "") + f" -> {a.progress}")
     return 0

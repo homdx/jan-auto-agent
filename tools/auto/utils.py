@@ -161,7 +161,7 @@ def fsync_directory(directory: "str | Path") -> None:
         )
 
 
-def atomic_write_text(path: "str | Path", content: str) -> None:
+def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = False) -> None:
     """Write *content* to *path* atomically (temp file + ``os.replace``).
 
     ``os.replace`` is a single filesystem rename, which POSIX and Windows both
@@ -173,6 +173,12 @@ def atomic_write_text(path: "str | Path", content: str) -> None:
 
     Used for state that must survive an interrupted run (plan.json,
     progress.json, tickets) so a mid-write kill can never corrupt it.
+
+    ``exclusive=True`` makes it a create-only write: the temp file is
+    hard-linked into place (``os.link`` fails if *path* exists), so of two
+    racing writers exactly one wins and the other gets ``FileExistsError``
+    instead of silently replacing the winner's file. A filesystem without
+    hard links falls back to the plain replace.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,7 +190,17 @@ def atomic_write_text(path: "str | Path", content: str) -> None:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_name, path)
+        if exclusive:
+            try:
+                os.link(tmp_name, path)
+            except FileExistsError:
+                raise
+            except OSError:
+                os.replace(tmp_name, path)
+            else:
+                os.unlink(tmp_name)
+        else:
+            os.replace(tmp_name, path)
         fsync_directory(path.parent)
     except BaseException:
         try:
@@ -434,8 +450,13 @@ def human_duration(seconds: float) -> str:
     """Format *seconds* as a compact human-readable duration.
 
     Examples: 0.4 -> '0.4s', 42 -> '42s', 125 -> '2m 5s', 3725 -> '1h 2m 5s',
-    90061 -> '1d 1h 1m 1s'. Negative values get a leading '-'.
+    90061 -> '1d 1h 1m 1s'. Negative values get a leading '-'. A value that
+    is not a finite number has no duration to spell out, so it is echoed as
+    'nan', 'inf' or '-inf' (``int()`` of those raises) — a log line that
+    formats a bad clock reading must not itself crash.
     """
+    if seconds != seconds or abs(seconds) == float("inf"):
+        return str(float(seconds))
     sign = "-" if seconds < 0 else ""
     s = abs(float(seconds))
     if s < 1:
@@ -463,8 +484,25 @@ PYTEST_TOKENS = ("pytest", "py.test")
 
 # Shell tokens that end one command and start the next — a pytest invocation
 # is recognised at a command position: the first token, or the one after
-# any of these (``cd sub && pytest``).
-_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", "|", "&"})
+# any of these (``cd sub && pytest``, and unspaced ``cd sub&&pytest`` — the
+# command is split with ``punctuation_chars`` so a glued separator is a token).
+_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")", "{", "!"})
+
+#: A shell variable set for one command: ``PYTHONPATH=. pytest tests``.
+ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+
+#: Commands that run the rest of their line as the command: the suite behind
+#: them is still the suite. ONE list for ``is_pytest_command`` and the contest
+#: policy's ``_past_wrappers`` (they answer the same question and drifted once).
+COMMAND_WRAPPERS = frozenset({"timeout", "nohup", "env", "nice", "time", "exec", "command",
+                              "stdbuf", "ionice"})
+
+#: The options of those wrappers that take a separate value.
+WRAPPER_VALUE_FLAGS = ("-n", "-s", "-k", "--signal", "--kill-after", "-o", "-e",
+                       "-i", "-c", "-u", "--unset")
+
+#: Project runners: ``uv run pytest``, ``poetry run pytest`` — ``run`` is theirs.
+_RUNNERS = frozenset({"uv", "poetry", "pipenv", "pdm", "hatch", "rye"})
 
 # An xdist flag in every spelling: ``-n 4`` / ``-n4`` / ``-nauto`` / ``--dist=loadgroup``
 # / ``--numprocesses 4`` / ``--numprocesses=4``. Anchored, so ``--no-header``
@@ -485,24 +523,145 @@ def _basename(token: str) -> str:
     return token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
 
 
+def _command_word(seg: list[str]) -> int:
+    """Index of the real command word of one command, past ``VAR=value``, the
+    ``COMMAND_WRAPPERS`` with their options, ``xvfb-run`` and ``uv run``-style runners."""
+    i = 0
+    while i < len(seg):
+        word = seg[i]
+        if ENV_ASSIGN_RE.fullmatch(word):
+            i += 1
+            continue
+        name = _basename(word)
+        if name in _RUNNERS and i + 1 < len(seg) and seg[i + 1] == "run":
+            i += 2
+            continue
+        if name in COMMAND_WRAPPERS or name == "xvfb-run":
+            i += 1
+            while i < len(seg) and seg[i].startswith("-"):
+                flag = seg[i]
+                i += 1
+                if flag in WRAPPER_VALUE_FLAGS and i < len(seg):
+                    i += 1
+            if name == "timeout" and i < len(seg):
+                i += 1                  # the duration
+            continue
+        break
+    return i
+
+
+def pytest_argv_start(seg: list[str]) -> int | None:
+    """Index of the first pytest argument of one command, or ``None`` when the
+    command is not a pytest run (206: the contest's suite slot reads the same
+    answer, so the two recognisers cannot drift again).
+
+    ``pytest tests`` → 1, ``python3 -u -m pytest tests`` → 4, ``uv run pytest``
+    → 3; the index may equal ``len(seg)`` when pytest is given no argument.
+    """
+    i = _command_word(seg)
+    if i >= len(seg):
+        return None
+    base = _basename(seg[i])
+    if base in PYTEST_TOKENS or base in ("pytest.exe", "py.test.exe"):
+        return i + 1
+    # ``python -m pytest``: the interpreter is matched by name (``python``,
+    # ``python3``, ``python3.11``, ``python.exe``, the ``py`` launcher) so the
+    # absolute-path rewrite the executor performs does not defeat it; options
+    # before ``-m`` (``-X dev``, ``-u``, ``-W ignore``) are skipped, ``-c`` is code.
+    if base == "py" or base.startswith("python"):
+        k = i + 1
+        while k < len(seg):
+            tok = seg[k]
+            if tok == "-m":
+                if k + 1 < len(seg) and _basename(seg[k + 1]) in PYTEST_TOKENS:
+                    return k + 2
+                return None
+            if tok in ("-X", "-W"):
+                k += 2
+            elif tok.startswith("-") and tok != "-c":
+                k += 1
+            else:
+                break
+    return None
+
+
+def _segment_runs_pytest(seg: list[str]) -> bool:
+    return pytest_argv_start(seg) is not None
+
+
+def pytest_segments(parts: list[str]) -> list[list[str]]:
+    """*parts* (a ``split_command`` result) cut into its commands at the
+    ``_COMMAND_SEPARATORS``: ``cd sub && pytest`` is ``[cd, sub]`` and ``[pytest]``."""
+    segs: list[list[str]] = []
+    seg: list[str] = []
+    for part in [*parts, ";"]:
+        if part in _COMMAND_SEPARATORS:
+            if seg:
+                segs.append(seg)
+            seg = []
+        else:
+            seg.append(part)
+    return segs
+
+
 def _tokens_run_pytest(parts: list[str]) -> bool:
-    expect_command = True
-    for i, part in enumerate(parts):
-        base = _basename(part)
-        if expect_command:
-            if base in PYTEST_TOKENS or base in ("pytest.exe", "py.test.exe"):
-                return True
-            # ``python -m pytest``: the module is two tokens on. The
-            # interpreter is matched by name (``python``, ``python3``,
-            # ``python3.11``, ``python.exe``, the ``py`` launcher) so the
-            # absolute-path rewrite the executor performs does not defeat it.
-            if (base == "py" or base.startswith("python")) and i + 2 < len(parts):
-                if parts[i + 1] == "-m" and _basename(parts[i + 2]) in PYTEST_TOKENS:
-                    return True
-            expect_command = False
-        elif part in _COMMAND_SEPARATORS:
-            expect_command = True
-    return False
+    return any(_segment_runs_pytest(seg) for seg in pytest_segments(parts))
+
+
+def split_command(cmd: str, posix: bool) -> list[str]:
+    """``shlex`` split that also cuts a glued ``&&`` / ``;`` / ``|`` into its own token."""
+    lex = shlex.shlex(cmd, posix=posix, punctuation_chars=True)
+    lex.whitespace_split = True
+    return list(lex)
+
+
+def pytest_piece_spans(command: str) -> list[tuple[int, int]]:
+    """``(start, end)`` of every pytest run in *command*, as character offsets.
+
+    A piece is the text between the unquoted ``|``, ``&``, ``;`` and newline of
+    a command line, so ``pytest tests | tail -5`` is two pieces and only the
+    first is a run; the ``&`` of a redirect (``2>&1``, ``&>log``) is not a cut.
+    ``Executor._serialise_pytest`` adds its flag at the end of each span, not at
+    the end of the line — the end of the line may be somebody else's argument
+    list (``tail -5 -n 0`` prints nothing; ``tee run.log -n 0`` writes two files).
+    A piece whose quoting does not parse is not a run.
+    """
+    cuts: list[tuple[int, int]] = []
+    start, quote, i, n = 0, "", 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote == '"':
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch == "\\":
+            i += 1
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "|;\n" or (ch == "&" and not _is_redirect_amp(command, i)):
+            cuts.append((start, i))
+            start = i + 1
+        i += 1
+    cuts.append((start, n))
+    spans = []
+    for lo, hi in cuts:
+        piece = command[lo:hi]
+        if not piece.strip():
+            continue
+        try:
+            parts = split_command(piece, os.name != "nt")
+        except ValueError:
+            continue
+        if parts and _segment_runs_pytest(parts):
+            spans.append((lo, lo + len(piece.rstrip())))
+    return spans
+
+
+def _is_redirect_amp(command: str, i: int) -> bool:
+    """Whether the ``&`` at *i* belongs to a redirect: ``>&``, ``<&`` or ``&>``."""
+    before = command[:i].rstrip()
+    return before.endswith((">", "<")) or command[i + 1:i + 2] == ">"
 
 
 def is_pytest_command(command: str) -> bool:
@@ -526,7 +685,7 @@ def is_pytest_command(command: str) -> bool:
     parsed = False
     for posix in (os.name != "nt", os.name == "nt"):
         try:
-            parts = shlex.split(cmd, posix=posix)
+            parts = split_command(cmd, posix)
         except ValueError:
             continue
         parsed = True

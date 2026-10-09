@@ -1,7 +1,9 @@
-"""setup_worktrees.py <entrants.json> --wt <dir> [--repo <path>] [name ...]
+"""setup_worktrees.py <entrants.json> --wt <dir> [--repo <path>] [--ideal REF] [name ...]
 
 One git worktree per entrant at the ticket base with that entrant's patch
-applied and committed, plus a `base` worktree (unpatched) as the reference.
+applied and committed, plus a `base` worktree (unpatched) as the reference and,
+with `--ideal REF`, an `ideal` worktree (a detached checkout of REF): the judge's
+cross phase (`judge_epic_round.py --cross`) takes both as columns of its matrix.
 
 entrants.json:
 {
@@ -44,6 +46,9 @@ def main():
     ap.add_argument("entrants")
     ap.add_argument("--wt", required=True)
     ap.add_argument("--repo", default=".")
+    ap.add_argument("--ideal", default=None, metavar="REF",
+                    help="also check out this ref as a detached `ideal` worktree, "
+                         "the judge's cross matrix column for a candidate ideal")
     ap.add_argument("names", nargs="*")
     a = ap.parse_intermixed_args()
     repo = Path(a.repo).resolve()
@@ -51,7 +56,7 @@ def main():
     wt = Path(a.wt).resolve()
     wt.mkdir(parents=True, exist_ok=True)
     default_base = cfg["base"]
-    names = a.names or ["base"] + list(cfg["entrants"])
+    names = a.names or ["base"] + list(cfg["entrants"]) + (["ideal"] if a.ideal else [])
     for name in names:
         d = wt / name
         if d.exists():
@@ -60,6 +65,16 @@ def main():
         if name == "base":
             sh(["git", "worktree", "add", "-q", "--detach", str(d), default_base], cwd=repo)
             print(f"[base] {default_base}")
+            continue
+        if name == "ideal":
+            if not a.ideal:
+                print(f"[ideal] no --ideal REF given — not set up")
+                continue
+            sh(["git", "worktree", "add", "-q", "--detach", str(d), a.ideal], cwd=repo)
+            print(f"[ideal] {a.ideal}")
+            continue
+        if name not in cfg["entrants"]:
+            print(f"[{name}] not in {a.entrants} — not set up")
             continue
         e = cfg["entrants"][name]
         if e.get("duplicate_of"):

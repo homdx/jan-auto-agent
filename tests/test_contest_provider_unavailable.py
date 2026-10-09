@@ -36,6 +36,9 @@ transport are on a wall clock.
 
 from __future__ import annotations
 
+import atexit
+import shutil
+import tempfile
 import json
 import subprocess
 import sys
@@ -80,7 +83,12 @@ from tools.contest.runner import (  # noqa: E402
 from tools.contest.workspace import Workspace  # noqa: E402
 
 
-COMMITTED = REPO_ROOT / "contest.ini"
+# Hermetic: the committed contest.ini alone, copied where no contest.local.ini sits next to
+# it, so an operator's local overrides never change what these tests see.
+_COMMITTED_DIR = Path(tempfile.mkdtemp(prefix="committed-ini-"))
+atexit.register(shutil.rmtree, _COMMITTED_DIR, ignore_errors=True)
+shutil.copy(REPO_ROOT / "contest.ini", _COMMITTED_DIR / "contest.ini")
+COMMITTED = _COMMITTED_DIR / "contest.ini"
 
 #: The round's own limit: ten short retries in a row is ~12 min on round 106's
 #: cadence, instead of the 60 min both bynara agents sat WAITING.

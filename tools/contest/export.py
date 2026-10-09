@@ -312,7 +312,7 @@ def _number(value) -> int:
     """*value* as an int, `0` for the malformed — a bad cell is not a bad row."""
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 

@@ -119,6 +119,9 @@ CONTEST_KEYS = (
     "harvest_budget_sec",
     "deadline_commit",
     "agent_suite_slots",
+    "test_cache",
+    "test_cache_share",
+    "test_cache_llm",
     "agent_suite_max_sec",
     "pytest_workers_per_agent",
     "pytest_workers_few_agents",
@@ -151,7 +154,11 @@ CONTEST_KEYS = (
     "compact_at_percent",
     "summary_at_percent",
     "context_limit_fallback",
+    "context_min_window",
+    "context_full_refusal_percent",
+    "context_watch_sec",
     "draft_llm_profile",
+    "draft_review_llm_profile",
     "draft_map_budget",
     "draft_review_rounds",
 )
@@ -277,6 +284,11 @@ class AgentSpec:
         return f"{self.provider_id}/{self.model_id}"
 
 
+#: Ticket 212: the bash patterns that must reach the permission handler for the
+#: test cache to see a pytest run at all.
+TEST_CACHE_ASK_PATTERNS = ("*pytest*", "*py.test*")
+
+
 @dataclass(frozen=True)
 class ContestConfig:
     """The round: its limits, its roster and the gate's LLM profile.
@@ -383,6 +395,14 @@ class ContestConfig:
     #: queue off: every reply is immediate and `_TEST_RUNS_LOCK` is the only
     #: serialization, which is today's behaviour byte for byte.
     agent_suite_slots: int = 1
+    #: ticket 212: a repeated pytest run on an unchanged tree is answered from the
+    #: round's own earlier run (a `reject` carrying one line). Off until a round
+    #: has judged it. `test_cache_share`: `round` = one agent's run serves any
+    #: other's on an identical tree, `agent` = only its own. `test_cache_llm`: a
+    #: command the parser cannot read is put to the gate model once.
+    test_cache: bool = False
+    test_cache_share: str = "round"
+    test_cache_llm: bool = True
     #: KC-58: how long one holder may keep the next waiter out. Past it the
     #: holder stops blocking and the next waiter goes in beside it — its
     #: pytest is not killed, because the agent is still running. 0 is no
@@ -461,6 +481,25 @@ class ContestConfig:
     #: point. KC-67's memory sizes those from their own overflow instead; set
     #: this only for a roster of models known to be that small.
     context_limit_fallback: int = 0
+    #: Round 145: the smallest window a remembered ``last_ok`` may size a model
+    #: by, in tokens; a provider refusal of a session smaller than this is never
+    #: read as an overflow by size words alone. 0 = the floor off.
+    context_min_window: int = 32000
+    #: Round 145/149: "close enough to the wall to be evidence", as a percent.
+    #: (1) a refusal with no words about a size is an overflow when the session
+    #: holds at least this percent of its window. (2) a loose memory record
+    #: sizes the model only when its last_ok is at least this percent of the
+    #: window Kilo declares (or of context_limit_fallback when Kilo declares
+    #: nothing). 0 = both readings off.
+    context_full_refusal_percent: float = 60.0
+    #: Round 145: seconds between two reads of a running turn's fill, for a
+    #: model sized by the memory or the fallback rather than by Kilo; at
+    #: ``compact_at_percent`` the turn is stopped and the next prompt compacts.
+    #: 0 = off. Both defaults stay: this dataclass default is 0, so a config
+    #: built in code is the watch off and the round is unchanged; the ini read
+    #: below and the shipped ``contest.ini`` both default to 10, so a loaded
+    #: round arms it.
+    context_watch_sec: float = 0.0
     #: KC-59: how ``prepare_round`` builds each agent's checkout — one of
     #: ``WORKSPACE_KINDS``. ``clone`` (the default) makes a fresh local clone
     #: per agent, ``worktree`` keeps the pre-KC-59 worktree per agent.
@@ -506,6 +545,13 @@ class ContestConfig:
     #: be resolved: ``run`` never fails on it, only ``draft`` refuses.
     draft_llm_profile: str = ""
     draft_settings: LlmSettings | None = None
+    #: The profile behind ``[contest] draft_review_llm_profile`` — the model that
+    #: reviews a drafted ticket. Unset, the review stays on the gate's model; set,
+    #: tickets get their own writer/reviewer pair and the round's gate is not
+    #: touched. ``draft_review_settings`` is ``None`` when the key is unset or the
+    #: section cannot be resolved (fail-open, like the draft's own profile).
+    draft_review_llm_profile: str = ""
+    draft_review_settings: LlmSettings | None = None
     #: KC-79: the character budget each collect map gets in the draft's prompt.
     #: A budget the operator sets, never a model window hard-coded in the code.
     draft_map_budget: int = 8000
@@ -527,6 +573,15 @@ class ContestConfig:
         rules = [dict(rule) for rule in BASE_RULES]
         for pattern in self.ask_commands:
             rules.append({"permission": "bash", "pattern": pattern, "action": "ask"})
+        if self.test_cache:
+            # Ticket 212: Kilo only asks for a bash command that matches an ask
+            # rule, so a plain `pytest tests -q` (no redirect, no `tee`) never
+            # reaches the permission handler — and the cache with it. Round 199
+            # showed 1 ask in 11 pytest runs. The policy answers these `once`
+            # as it does any command inside the worktree.
+            for pattern in TEST_CACHE_ASK_PATTERNS:
+                if pattern not in self.ask_commands:
+                    rules.append({"permission": "bash", "pattern": pattern, "action": "ask"})
         for pattern in self.deny_commands:
             rules.append({"permission": "bash", "pattern": pattern, "action": "deny"})
         return rules
@@ -865,11 +920,20 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     # a typo is 0 too — the rule stands down rather than sizing every prompt
     # against a nonsense number.
     context_limit_fallback = int(num("context_limit_fallback", 0))
+    # Round 145: the two numbers that keep a plan's cap out of the memory — the
+    # same fail-open read; `context_memory.min_window` / `full_refusal_percent`
+    # apply the default rule to whatever comes through
+    context_min_window = int(num("context_min_window", 32000))
+    context_full_refusal_percent = num("context_full_refusal_percent", 60.0)
+    context_watch_sec = num("context_watch_sec", 10.0)
 
     # KC-58: 0 slots is "the queue is off", so a negative count is refused
     # rather than read as 0; a negative ceiling would unblock every holder at
     # once, which is also a typo rather than a setting.
     agent_suite_slots = limit("agent_suite_slots", 1)
+    test_cache_share = scalar("test_cache_share", "round")
+    if test_cache_share not in ("round", "agent"):
+        raise RosterError(f"[contest] test_cache_share must be round or agent, got {test_cache_share!r}")
     agent_suite_max_sec = limit("agent_suite_max_sec", 900)
     if agent_suite_slots < 0:
         raise RosterError(f"[contest] agent_suite_slots must be >= 0, got {agent_suite_slots}")
@@ -910,6 +974,19 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         except (ValueError, RosterError) as exc:
             _log.warning("[contest] draft_llm_profile: %s — `contest draft` will refuse to run",
                          exc)
+    # The ticket reviewer's own profile, resolved the same fail-open way: a typo
+    # here stops `contest draft` only, never a round.
+    draft_review_profile = scalar("draft_review_llm_profile", "")
+    draft_review_settings = None
+    if draft_review_profile:
+        try:
+            _expand(parser, (draft_review_profile,))
+            draft_review_settings, _ = resolve_llm_profile(
+                parser, "contest", "draft_review_llm_profile", defaults=DEFAULTS_DRAFT
+            )
+        except (ValueError, RosterError) as exc:
+            _log.warning("[contest] draft_review_llm_profile: %s — `contest draft` "
+                         "will refuse to review", exc)
     draft_map_budget = safe_getint(parser, "contest", "draft_map_budget", fallback=8000)
     if draft_map_budget <= 0:
         draft_map_budget = 8000
@@ -955,6 +1032,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         harvest_budget_sec=max(0, limit("harvest_budget_sec", 900)),
         deadline_commit=flag("deadline_commit", True),
         agent_suite_slots=agent_suite_slots,
+        test_cache=flag("test_cache", False),
+        test_cache_share=test_cache_share,
+        test_cache_llm=flag("test_cache_llm", True),
         agent_suite_max_sec=agent_suite_max_sec,
         pytest_workers_per_agent=pytest_workers_per_agent,
         pytest_workers_few_agents=pytest_workers_few_agents,
@@ -977,6 +1057,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         compact_at_percent=compact_at_percent,
         summary_at_percent=summary_at_percent,
         context_limit_fallback=context_limit_fallback,
+        context_min_window=context_min_window,
+        context_full_refusal_percent=context_full_refusal_percent,
+        context_watch_sec=context_watch_sec,
         workspace_kind=workspace_kind,
         variant=scalar("variant", "highest") or "highest",
         probe_ttl_days=int(scalar("probe_ttl_days", "7") or "7"),
@@ -993,6 +1076,8 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         openrouter_llm_profile=openrouter_profile,
         draft_llm_profile=draft_profile,
         draft_settings=draft_settings,
+        draft_review_llm_profile=draft_review_profile,
+        draft_review_settings=draft_review_settings,
         draft_map_budget=draft_map_budget,
         draft_review_rounds=draft_review_rounds,
     )

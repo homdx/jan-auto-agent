@@ -30,6 +30,9 @@ The cases, from the ticket's acceptance list:
 
 from __future__ import annotations
 
+import atexit
+import shutil
+import tempfile
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError, replace
@@ -54,7 +57,12 @@ from tools.contest.roster import (
     load_roster,
 )
 
-COMMITTED = REPO_ROOT / "contest.ini"
+# Hermetic: the committed contest.ini alone, copied where no contest.local.ini sits next to
+# it, so an operator's local overrides never change what these tests see.
+_COMMITTED_DIR = Path(tempfile.mkdtemp(prefix="committed-ini-"))
+atexit.register(shutil.rmtree, _COMMITTED_DIR, ignore_errors=True)
+shutil.copy(REPO_ROOT / "contest.ini", _COMMITTED_DIR / "contest.ini")
+COMMITTED = _COMMITTED_DIR / "contest.ini"
 LOCAL = "contest.local.ini"
 
 #: The api_key the committed contest.ini asks the environment for.
@@ -883,7 +891,7 @@ model = kenary/laguna-s-2-1:free
 
 def test_exported_key_sets_match_the_dataclass():
     assert set(CONTEST_KEYS) == set(ContestConfig.__dataclass_fields__) - {
-        "agents", "gate_settings", "openrouter_settings", "draft_settings",
+        "agents", "gate_settings", "openrouter_settings", "draft_settings", "draft_review_settings",
     }
     assert set(AGENT_KEYS) == {"model", "kilo_agent", "variant"}
     assert AGENT_SECTION_PREFIX == "contest.agent."

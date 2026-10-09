@@ -75,7 +75,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from tools.contest import context_memory, draft, export, gates, probe_memory
-from tools.contest.backend import KiloBackend, OpenRouterBackend
+from tools.contest.backend import KiloBackend, OpenRouterBackend, drop_stale_kilo_file
 from tools.contest.kilo_client import (
     KiloClient,
     KiloHttpError,
@@ -100,6 +100,7 @@ from tools.contest.roster import (
 from tools.contest.runner import (
     WORKERS_FILE,
     _age,
+    _context_limit_fallback,
     RELAY_STATES,
     AgentState,
     RoundState,
@@ -139,10 +140,12 @@ __all__ = [
     "DEFAULT_ROSTER",
     "GATE_PLACEHOLDER_MODEL",
     "TASKS_DIR",
+    "DraftSetupError",
     "Intake",
     "agents_from_models",
     "cmd_run",
     "cmd_draft",
+    "draft_callables",
     "cmd_status",
     "export_patches",
     "gate_model_refusals",
@@ -191,8 +194,10 @@ OPEN = "open"
 #: already duplicates that script's status regex: the runner does not read
 #: `scripts/`. Anything else is still on offer — `open`, but also `running` or
 #: `wip` when a round runs on another machine, and a ticket with no status line
-#: at all — and a session prompted without a ticket would get it.
-PARKED = ("landed", "queued")
+#: at all — and a session prompted without a ticket would get it. `closed`
+#: (AR-14) is parked too: a closed ticket is no longer wanted at all, so it must
+#: not block a higher round at intake.
+PARKED = ("landed", "queued", "closed")
 
 #: Exit codes.
 EXIT_OK, EXIT_NO_READY, EXIT_FAILED = 0, 2, 1
@@ -200,7 +205,7 @@ EXIT_OK, EXIT_NO_READY, EXIT_FAILED = 0, 2, 1
 #: `**Status:** open — round 55 …` → `open`. `next_task.py`'s `_status`,
 #: duplicated the way `gates.declared_files` already duplicates that ticket's
 #: `**File:**` parse instead of importing a script.
-_STATUS_RE = re.compile(r"^\*\*Status:\*\*\s*(\S+)", re.MULTILINE)
+_STATUS_RE = re.compile(r"^\*\*Status:\*\*[ \t]*(\S+)", re.MULTILINE)
 
 #: `# KC-16 — \`python3 -m tools.contest run …\`` → `KC-16`.
 _TITLE_RE = re.compile(r"^#\s*([A-Za-z0-9_.-]+)", re.MULTILINE)
@@ -231,9 +236,13 @@ KNOWN_SIZES = ("XS", "S", "M", "L")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _status_of(body: str) -> str:
-    """The body's `**Status:**` first word, lower-cased; `""` when absent."""
+    """The body's `**Status:**` first word, lower-cased; `""` when absent.
+
+    Punctuation that trails the word is not part of it, the way
+    `next_task._status` reads it: `queued, judged on arena` is `queued`.
+    """
     match = _STATUS_RE.search(body)
-    return match.group(1).strip("`*").lower() if match else ""
+    return match.group(1).strip("`*,;:.-()[]{}<>—–'\"").lower() if match else ""
 
 
 def _missing_labels(body: str) -> list:
@@ -270,6 +279,26 @@ def _ticket_body(tasks_dir, name, at=None) -> str:
         return ""
 
 
+def _tree_names(repo, at, folder, recursive=False) -> list:
+    r"""The names under *folder* in *at*'s tree: `ls-tree -z`, NUL-split, unquoted.
+
+    Bug 206: without `-z` git C-quotes a name holding a non-ASCII letter, a `"` or
+    a `\` (`"epic-tasks/\320\260.md"`), and no ticket pattern knows such a string —
+    a hand-named ticket was invisible on a base. `tools/arena/gitref.py` reads the
+    same thing through `ls_tree_names`; this side keeps `run_git` and its `[]`
+    contract, so a base that cannot be read is "no ticket there", not an exception.
+    """
+    args = ["ls-tree"]
+    if recursive:
+        args.append("-r")
+    args += ["-z", "--name-only", str(at), str(folder)]
+    proc = run_git(["git", *args], cwd=str(repo), encoding="utf-8",
+                   errors="surrogateescape")
+    if proc.returncode:
+        return []
+    return [name for name in proc.stdout.split("\0") if name]
+
+
 def _tickets(tasks_dir, at=None) -> list:
     """`(number, path, status, body)` per `NN-*.md`, in numeric order.
 
@@ -284,10 +313,9 @@ def _tickets(tasks_dir, at=None) -> list:
     """
     tasks_dir = Path(tasks_dir)
     if at:
-        rel_dir = Path(tasks_dir).name
-        listed = gates.git(str(tasks_dir.parent), "ls-tree", "-r", "--name-only",
-                           str(at), rel_dir)
-        names = [line.rsplit("/", 1)[-1] for line in listed.splitlines() if line.strip()]
+        names = [name.rsplit("/", 1)[-1]
+                 for name in _tree_names(tasks_dir.parent, at, Path(tasks_dir).name,
+                                         recursive=True)]
     else:
         names = [path.name for path in tasks_dir.glob("*.md")]
     found = []
@@ -297,6 +325,50 @@ def _tickets(tasks_dir, at=None) -> list:
             body = _ticket_body(tasks_dir, name, at)
             found.append((int(match.group(1)), tasks_dir / name, _status_of(body), body))
     return sorted(found, key=lambda item: item[0])
+
+
+#: AR-3: the temp folders `ticket_file` wrote a base-only ticket into; `cmd_run`
+#: removes them when it returns, a failure included.
+_TEMP_TICKET_DIRS: list = []
+
+
+def ticket_file(repo, tasks_dir, round_no, at) -> tuple:
+    """AR-3: `(name, path)` of the ticket numbered *round_no* — `("", None)` for none.
+
+    The checkout's own file first: `(name, tasks_dir / name)`, today's path.
+    Else, when the base *at* holds the ticket (`git ls-tree --name-only <at>
+    <rel>/`, the same `^0*(\\d+)-.*\\.md$` match as `gates.ticket_for_round`),
+    its text is written to a file of the same name in a fresh temp folder, so
+    `declared_files` and `ticket_size` read a real file. `arena run start`
+    builds such a base (`arena-round/NN`) without touching the checkout.
+    """
+    repo, tasks_dir = Path(repo), Path(tasks_dir)
+    try:
+        name = gates.ticket_for_round(tasks_dir, round_no)[0]
+    except OSError:
+        name = None
+    if name:
+        return name, tasks_dir / name
+    if not at:
+        return "", None
+    try:
+        rel = tasks_dir.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        return "", None
+    for full in _tree_names(repo, at, rel + "/"):
+        base_name = full.rsplit("/", 1)[-1]
+        match = re.match(r"^0*(\d+)-.*\.md$", base_name)
+        if not match or int(match.group(1)) != round_no:
+            continue
+        r = run_git(["git", "show", f"{at}:{rel}/{base_name}"], cwd=str(repo))
+        if r.returncode:
+            return "", None
+        folder = Path(tempfile.mkdtemp(prefix="contest-ticket-"))
+        _TEMP_TICKET_DIRS.append(folder)
+        path = folder / base_name
+        path.write_text(r.stdout, encoding="utf-8")
+        return base_name, path
+    return "", None
 
 
 def _title_id(body: str, name: str) -> str:
@@ -821,8 +893,7 @@ def _target_failures(repo, base_ref: str) -> list:
         return []
     missing = []
     for rel in (*_TARGET_FILES, "epic-tasks"):
-        listed = gates.git(str(repo), "ls-tree", "--name-only", base_ref, "--", rel)
-        if not listed:
+        if not _tree_names(repo, base_ref, rel):
             missing.append(rel)
     if not missing:
         return []
@@ -857,7 +928,8 @@ def _run_line(argv, number: int) -> str:
         else:
             words.append(word)
             i += 1
-    return "python3 -m tools.contest " + " ".join(words)
+    # shell-quoted, so a brief with a space or a parenthesis pastes back as one argument
+    return "python3 -m tools.contest " + shlex.join(words)
 
 
 def _park_line(body, name, number: int, rel_dir) -> str:
@@ -870,11 +942,10 @@ def _park_line(body, name, number: int, rel_dir) -> str:
     cannot hold the `\*` the sed expression needs.
     """
     file_ref = rel_dir + "/" + name
-    word = _status_of(body)
     match = _STATUS_RE.search(body)
     line_no = body[:match.start()].count("\n") + 1 if match else 0
     if line_no:
-        sed = "'" + str(line_no) + "s/^\\*\\*Status:\\*\\* " + word + "/**Status:** queued/'"
+        sed = "'" + str(line_no) + "s/^\\*\\*Status:\\*\\*.*$/**Status:** queued/'"
     else:
         sed = "'1s/^/**Status:** queued\\n/'"
     message = rel_dir + ": " + _title_id(body, name) + " queued — round " \
@@ -1541,6 +1612,12 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
     found = gates.ticket_for_round(tasks_dir, round_no)
     name = found[0]
     ticket_path = tasks_dir / name if name else None
+    if not name and at:
+        # AR-3: a ticket only at the base — `ticket_file`'s temp copy stands in
+        name, ticket_path = ticket_file(repo, tasks_dir, round_no, at)
+        if ticket_path is not None:
+            body = ticket_path.read_text(encoding="utf-8")
+            found = (name, body.splitlines()[0].lstrip("# ").strip() if body else "", [])
     title = ""
     if ticket_path is None or not ticket_path.is_file():
         failures.append(f"no ticket numbered {round_no} in {tasks_dir}")
@@ -1891,7 +1968,8 @@ def _start_server(config: ContestConfig, out_dir: Path, env: dict | None = None)
     return KiloServer.attach(config.server)
 
 
-def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None):
+def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None,
+                   workspaces=()):
     """``(server, make_backend)`` for ``run_round``: one ``ContestBackend`` per worktree.
 
     ``backend = kilo`` starts (or attaches to) the ``kilo serve`` process the
@@ -1904,6 +1982,13 @@ def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None
     *env* goes to both: the server for `KILO_CONFIG_CONTENT` (KC-35), and the
     OpenRouter agents' subprocess for KC-65's worker count — without it the
     sizing rule would be a Kilo-only rule.
+
+    *workspaces* get their stale ``.kilo`` project file dropped before the server
+    is started (Round 151): Kilo reads a workspace's copy of the config on
+    spawn, so a file an earlier attempt left there would size the resumed
+    agents by a window this round never chose. The drop is untracked-only — a
+    file the checkout tracks is the agent's — and keeps the cleanup
+    `runner.finish` does at the end of the run.
     """
     if config.backend == "openrouter":
         settings = config.openrouter_settings
@@ -1913,9 +1998,11 @@ def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None
                 "the agents' own base_url and api_key")
         def make_backend(workspace):
             return OpenRouterBackend(settings.api_key, settings.base_url,
-                                     str(workspace.path), extra_env=env or None)
+                                      str(workspace.path), extra_env=env or None)
         return None, make_backend
 
+    for workspace in workspaces:
+        drop_stale_kilo_file(str(workspace.path), assume_stale=True)
     server = _start_server(config, out_dir, env=env)
 
     def make_backend(workspace):
@@ -2058,8 +2145,12 @@ def _context_memory_lines(config: ContestConfig, out_dir: Path) -> list[str]:
                                       days=context_memory.days_of(config))
     except Exception:  # noqa: BLE001 — no memory is no line, never a failed plan
         return []
-    return context_memory.plan_lines(records, config.agents,
-                                     percent=context_memory.compact_at_percent(config))
+    return context_memory.plan_lines(
+        records, config.agents,
+        percent=context_memory.compact_at_percent(config),
+        min_window=context_memory.min_window(config),
+        fallback=_context_limit_fallback(getattr(config, "context_limit_fallback", None)),
+        share_pct=context_memory.full_refusal_percent(config))
 
 
 def _with_remembered_limits(config: ContestConfig, out_dir: Path,
@@ -2076,16 +2167,23 @@ def _with_remembered_limits(config: ContestConfig, out_dir: Path,
     inside a turn — the KC-67 gate between prompts only ever saw the turn's edges
     (round 70: 263 159 input tokens in the first turn).
 
-    A model intake knows the size of keeps intake's number — the memory never
-    overrides Kilo. An attached server reads its own config and never sees the
-    overlay, so it gets nothing. ``compact_at_percent = 0`` sends the window
-    with ``input`` at the full budget: Kilo keeps its own compact there.
-    Fail-open like the rest of the memory: a memory or an operator value that
-    cannot be read is the config and *content* unchanged.
+    A model whose size intake knows keeps intake's number unless the memory
+    holds a smaller one — a provider that refused below the window it declares
+    (round 145) — and then the smaller one is handed over. Round 149: a loose
+    memory record only wins when it is close enough to the declared window to
+    be evidence of it (`context_memory.remembered` measures that against
+    *agent*'s own ``context_limit``, the fallback and
+    ``context_full_refusal_percent``). An attached server reads its own config
+    and never sees the overlay, so it gets nothing. ``compact_at_percent = 0``
+    sends the window with ``input`` at the full budget: Kilo keeps its own
+    compact there. Fail-open like the rest of the memory: a memory or an
+    operator value that cannot be read is the config and *content* unchanged.
     """
     if config.server != "spawn":
         return config, content
     percent = context_memory.compact_at_percent(config)
+    share_pct = context_memory.full_refusal_percent(config)
+    fallback = _context_limit_fallback(getattr(config, "context_limit_fallback", None))
     try:
         records = context_memory.load(context_memory.memory_path(config, out_dir),
                                       days=context_memory.days_of(config))
@@ -2093,8 +2191,16 @@ def _with_remembered_limits(config: ContestConfig, out_dir: Path,
         return config, content
     agents, providers = [], {}
     for agent in config.agents:
-        size, output = (None, None) if agent.context_limit else \
-            context_memory.remembered(records, agent.provider_id, agent.model_id)
+        size, output = context_memory.remembered(
+            records, agent.provider_id, agent.model_id,
+            context_memory.min_window(config),
+            declared=agent.context_limit, fallback=fallback, share_pct=share_pct)
+        if agent.context_limit and (size is None or size >= agent.context_limit):
+            # Kilo's declared window stands unless the provider has refused
+            # below it (round 145: zai's glm-4.5-flash, 131 072 declared,
+            # refused at 98 777) — then the smaller one is the window
+            size = None
+            output = None
         limit = context_memory.kilo_limit(size, output, percent)
         if limit is None:
             agents.append(agent)
@@ -2239,6 +2345,15 @@ def _dry_run(repo, result: Intake, config: ContestConfig, out_dir: Path, args, *
 
 
 def cmd_run(args: argparse.Namespace) -> int:
+    """`_cmd_run`, with AR-3's base-only ticket copies removed when it returns."""
+    try:
+        return _cmd_run(args)
+    finally:
+        while _TEMP_TICKET_DIRS:
+            shutil.rmtree(_TEMP_TICKET_DIRS.pop(), ignore_errors=True)
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
     """`run --ticket NN …` — the round on the real repo, the patches in `<out>/`.
 
     `intake` first (exit 1 with one line per failure); then `prepare_round` at
@@ -2320,7 +2435,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         ticket_name = gates.ticket_for_round(tasks_dir, args.ticket)[0]
     except OSError:
         ticket_name = None    # no tasks dir to read is no size, as an unreadable file is
-    size = ticket_size(tasks_dir / ticket_name) if ticket_name else None
+    if ticket_name:
+        size = ticket_size(tasks_dir / ticket_name)
+    else:
+        # AR-3: a ticket only at the base is sized from its temp copy
+        ticket_name, base_ticket = ticket_file(repo, tasks_dir, args.ticket, args.base)
+        size = ticket_size(base_ticket) if base_ticket else None
     legs, legs_from = _legs_choice(config, args, size)
     # KC-43: a relay's legs are not resumable — a round of one leg is
     if args.resume and legs > 1:
@@ -2456,7 +2576,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                       f"{leg - 1} left it", file=sys.stderr)
                 break
         try:
-            server, make_backend = _make_backends(config, leg_out, env=env or None)
+            server, make_backend = _make_backends(config, leg_out, env=env or None,
+                                                  workspaces=workspaces)
         except (KiloServerError, FileNotFoundError, OSError) as exc:
             print(f"server: {exc}", file=sys.stderr)
             if agent_tmp_created:
@@ -2589,6 +2710,78 @@ def _same_model(a, b) -> bool:
     return bool(model_a) and model_a == model_b
 
 
+class DraftSetupError(ValueError):
+    """The draft's writer or its reviewer cannot be prepared.
+
+    The message is the whole line `cmd_draft` prints after `draft: ` — a draft
+    profile that is unset or does not resolve, a reviewer profile that does not
+    resolve, no reviewer profile without `--no-review`, a reviewer that is the
+    writer. A `ValueError` so a caller that already refuses `ValueError` can
+    reuse this check: `arena issue create` raises no model name, URL or key here
+    either, and no model is called until the callables are asked for a draft.
+    """
+
+
+def draft_callables(config, no_review: bool) -> tuple:
+    """`(llm_call, review_call)` for one draft; `DraftSetupError` when either is unset.
+
+    The preparation `cmd_draft` used to keep inline, so the two commands that
+    draft a ticket — `contest draft` and `arena issue create` — cannot disagree
+    about who writes and who reviews. The writer is the profile `[contest]
+    draft_llm_profile` names; the reviewer is `[contest] draft_review_llm_profile`
+    when it is set, else the gate's model. Both are built by `draft.llm_call_for`,
+    so no model name, URL or key lives in this module or in the caller. Nothing
+    is called here — the callables are handed to `draft.draft_ticket`, which asks
+    them for the draft.
+    """
+    if config.draft_settings is None:
+        # `run` needs no draft profile: the refusal is here, not at load time, so
+        # a round never fails because someone typed the profile's section wrong.
+        if not config.draft_llm_profile:
+            reason = ("[contest] draft_llm_profile is not set — name an LlmSettings "
+                      "section (base_url, api_key, model) in " + LOCAL_FILENAME +
+                      " and set it under [contest]")
+        else:
+            reason = ("[contest] draft_llm_profile = " + config.draft_llm_profile +
+                      " does not resolve — that section needs base_url, api_key "
+                      "and model")
+        raise DraftSetupError(reason + " — `run` needs no draft profile")
+
+    review_call = None
+    if not no_review:
+        # The reviewer is `[contest] draft_review_llm_profile` when it is set —
+        # tickets then have their own writer/reviewer pair and the round's gate
+        # keeps its model — and the gate's model otherwise: the same resolution
+        # and transport the gate uses, and no model, URL or key in this module.
+        review_settings = config.gate_settings
+        review_key = "gate_llm_profile"
+        if config.draft_review_llm_profile:
+            if config.draft_review_settings is None:
+                raise DraftSetupError("[contest] draft_review_llm_profile = "
+                                      + config.draft_review_llm_profile + " does not "
+                                      "resolve — that section needs base_url, api_key "
+                                      "and model")
+            review_settings = config.draft_review_settings
+            review_key = "draft_review_llm_profile"
+        elif not config.gate_llm_profile:
+            raise DraftSetupError("[contest] gate_llm_profile is not set — the review "
+                                  "runs on the gate's model, so name it in "
+                                  + LOCAL_FILENAME + " as run does, or pass --no-review")
+        # A model reviewing its own ticket approves its own blind spots: the
+        # reviewer must be a different model from the drafter, not just a
+        # different section naming the same one.
+        if _same_model(review_settings, config.draft_settings):
+            raise DraftSetupError("the review model is the draft model ("
+                                  + str(getattr(config.draft_settings, "model", "")) +
+                                  ") — set a different model under [contest] " + review_key +
+                                  " or draft_llm_profile in " + LOCAL_FILENAME +
+                                  ", or pass --no-review")
+        review_call = draft.llm_call_for(review_settings,
+                                         system=draft.REVIEW_SYSTEM_PROMPT)
+
+    return draft.llm_call_for(config.draft_settings), review_call
+
+
 def cmd_draft(args: argparse.Namespace) -> int:
     """`draft --target REPO "brief" [--round NN] [--out FILE] [--run] [--no-review]`.
 
@@ -2620,41 +2813,11 @@ def cmd_draft(args: argparse.Namespace) -> int:
     except RosterError as exc:
         print(f"draft: {exc}", file=sys.stderr)
         return EXIT_FAILED
-    if config.draft_settings is None:
-        # `run` needs no draft profile: the refusal is here, not at load time, so
-        # a round never fails because someone typed the profile's section wrong.
-        if not config.draft_llm_profile:
-            reason = ("[contest] draft_llm_profile is not set — name an LlmSettings "
-                      "section (base_url, api_key, model) in " + LOCAL_FILENAME +
-                      " and set it under [contest]")
-        else:
-            reason = ("[contest] draft_llm_profile = " + config.draft_llm_profile +
-                      " does not resolve — that section needs base_url, api_key "
-                      "and model")
-        print("draft: " + reason + " — `run` needs no draft profile", file=sys.stderr)
+    try:
+        llm_call, review_call = draft_callables(config, getattr(args, "no_review", False))
+    except DraftSetupError as exc:
+        print(f"draft: {exc}", file=sys.stderr)
         return EXIT_FAILED
-
-    review_call = None
-    if not getattr(args, "no_review", False):
-        # the reviewer is the gate's model: the same resolution and transport the
-        # gate uses, and no model, URL or key in this module
-        if not config.gate_llm_profile:
-            print("draft: [contest] gate_llm_profile is not set — the review runs on "
-                  "the gate's model, so name it in " + LOCAL_FILENAME +
-                  " as run does, or pass --no-review", file=sys.stderr)
-            return EXIT_FAILED
-        # A model reviewing its own ticket approves its own blind spots: the
-        # reviewer must be a different model from the drafter, not just a
-        # different section naming the same one.
-        if _same_model(config.gate_settings, config.draft_settings):
-            print("draft: the review model is the draft model ("
-                  + str(getattr(config.draft_settings, "model", "")) + ") — set a "
-                  "different model under [contest] gate_llm_profile or "
-                  "draft_llm_profile in " + LOCAL_FILENAME + ", or pass --no-review",
-                  file=sys.stderr)
-            return EXIT_FAILED
-        review_call = draft.llm_call_for(config.gate_settings,
-                                         system=draft.REVIEW_SYSTEM_PROMPT)
 
     try:
         result = draft.draft_ticket(
@@ -2663,7 +2826,7 @@ def cmd_draft(args: argparse.Namespace) -> int:
             config=config,
             round_no=args.round,
             out=args.out,
-            llm_call=draft.llm_call_for(config.draft_settings),
+            llm_call=llm_call,
             review_call=review_call,
             commit=True,
         )
@@ -2732,6 +2895,19 @@ def cmd_status(args: argparse.Namespace) -> int:
         except (RosterError, OSError) as exc:
             print(f"status: cannot find the round's folder: {exc}", file=sys.stderr)
             return EXIT_FAILED
+    # Round 148: a round of legs writes `<NN>.1 … <NN>.K` and no `<NN>/state.json`;
+    # only the last leg's file is the whole round (revive_round.py's rule), so a
+    # bare round folder with no state of its own reads its highest leg.
+    if not (out_dir / "state.json").is_file():
+        legs = sorted(
+            (int(leg), sibling)
+            for sibling in out_dir.parent.glob(f"{out_dir.name}.*")
+            for stem, dot, leg in [sibling.name.rpartition(".")]
+            if dot and stem == out_dir.name and leg.isdigit() and sibling.is_dir()
+        )
+        if legs:
+            out_dir = legs[-1][1]
+            print(f"status: a round of legs — {out_dir.name}", file=sys.stderr)
     state_path = out_dir / "state.json"
     if not state_path.is_file():
         print(f"status: no {state_path} — nothing to report", file=sys.stderr)

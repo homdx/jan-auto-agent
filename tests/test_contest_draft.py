@@ -1191,3 +1191,170 @@ def test_no_rules_file_no_rules_section(tmp_path):
     assert draft_mod.repo_rules(tmp_path, 8000) is None
     (tmp_path / "CLAUDE.md").write_text("c")
     assert draft_mod.repo_rules(tmp_path, 8000) == ("CLAUDE.md", "c")
+
+
+def test_a_new_package_one_directory_deep_is_not_a_problem(collected):
+    """A ticket that starts a package names files in a directory still to create."""
+    artifact = draft_mod.load_artifact(collected / draft_mod.COLLECT_DIR)
+    problems = lint_of(ticket_text(also="`tests/newpkg/cli.py`"), artifact, collected)
+    assert problems == []
+
+
+def _with_review_profile(roster: Path, model: str = "stub/review") -> Path:
+    """Add `[contest] draft_review_llm_profile` and its section to *roster*."""
+    text = roster.read_text().replace(
+        "[contest]\n", "[contest]\ndraft_review_llm_profile = review_model\n", 1)
+    text += ("\n[review_model]\nbase_url = http://127.0.0.1:3/v1\n"
+             f"api_key = unset-in-the-test\nmodel = {model}\n")
+    roster.write_text(text)
+    return roster
+
+
+def test_draft_review_profile_is_read_from_the_roster(tmp_path):
+    """The ticket reviewer resolves on its own; unset, it stays None."""
+    from tools.contest.roster import load_roster
+    plain = load_roster(_roster(tmp_path))
+    assert plain.draft_review_llm_profile == "" and plain.draft_review_settings is None
+    config = load_roster(_with_review_profile(_roster(tmp_path)))
+    assert config.draft_review_llm_profile == "review_model"
+    assert config.draft_review_settings.model == "stub/review"
+    assert config.gate_settings.model == "stub/gate"
+
+
+def test_cmd_draft_reviews_with_the_draft_review_profile(collected, tmp_path, monkeypatch, capsys):
+    """With its own reviewer set, the review goes to it, not to the gate's model."""
+    roster = _with_review_profile(_roster(tmp_path))
+    used = []
+
+    def call_for(settings, system=None):
+        used.append((settings.model, system is not None))
+        return lambda p: ticket_text() if system is None else '{"ok": true, "problems": []}'
+
+    monkeypatch.setattr(draft_mod, "llm_call_for", call_for)
+    contest_cli.cmd_draft(_args(collected, roster=roster))
+    reviewers = [model for model, is_review in used if is_review]
+    assert reviewers == ["stub/review"]
+
+
+def test_cmd_draft_refuses_a_review_profile_that_is_the_drafter(collected, tmp_path, monkeypatch, capsys):
+    """The same-model check applies to the ticket reviewer and names its key."""
+    roster = _with_review_profile(_roster(tmp_path), model="stub/draft")
+    monkeypatch.setattr(draft_mod, "llm_call_for",
+                        lambda settings, system=None: (lambda p: ticket_text()))
+    code = contest_cli.cmd_draft(_args(collected, roster=roster))
+    assert code == contest_cli.EXIT_FAILED
+    assert "draft_review_llm_profile" in capsys.readouterr().err
+
+
+def test_cmd_draft_refuses_a_review_profile_that_does_not_resolve(collected, tmp_path, capsys):
+    """A review key naming a missing section refuses and names the key."""
+    roster = _roster(tmp_path)
+    roster.write_text(roster.read_text().replace(
+        "[contest]\n", "[contest]\ndraft_review_llm_profile = no_such_section\n", 1))
+    code = contest_cli.cmd_draft(_args(collected, roster=roster))
+    assert code == contest_cli.EXIT_FAILED
+    assert "draft_review_llm_profile = no_such_section" in capsys.readouterr().err
+
+
+# ── AR-7: the drafts folder ──────────────────────────────────────────────────
+
+
+def test_out_dir_writes_the_ticket_into_the_drafts_folder(collected, tmp_path):
+    """The same `<NN>-<slug>.md` name, another folder: `epic-tasks/` is not touched."""
+    drafts = tmp_path / "drafts"
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(),
+                                    out_dir=drafts)
+    assert result.rejected is False
+    assert result.path is not None and result.path.exists()
+    assert result.path.parent == drafts
+    assert result.path.name.startswith("01-")
+    assert result.path.read_text(encoding="utf-8").startswith("# KC-90")
+    assert _tickets(collected) == [], "nothing is written into epic-tasks/"
+
+
+def test_out_dir_writes_the_rejected_draft_there(collected, tmp_path):
+    drafts = tmp_path / "drafts"
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: "not a ticket at all",
+                                    out_dir=drafts)
+    assert result.rejected is True and result.path is None
+    assert result.rejected_path is not None and result.rejected_path.exists()
+    assert result.rejected_path.parent == drafts
+    assert result.rejected_path.name.endswith(draft_mod.REJECTED_SUFFIX)
+    assert _tickets(collected) == []
+
+
+def test_out_wins_over_out_dir(collected, tmp_path):
+    explicit = tmp_path / "elsewhere" / "my-ticket.md"
+    result = draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(),
+                                    out_dir=tmp_path / "drafts", out=explicit)
+    assert result.path == explicit
+    assert not (tmp_path / "drafts").exists()
+
+
+def test_a_draft_outside_the_tasks_folder_is_never_committed(collected, tmp_path):
+    with pytest.raises(ValueError, match="commit=True with out_dir"):
+        draft_mod.draft_ticket(BRIEF, repo=collected, llm_call=lambda p: ticket_text(),
+                               out_dir=tmp_path / "drafts", commit=True)
+
+
+# ── AR-7: one preparation of the writer and the reviewer ─────────────────────
+
+
+def test_draft_callables_refuses_a_setup_it_cannot_prepare(collected, tmp_path, monkeypatch):
+    """Every refusal `cmd_draft` prints is a `DraftSetupError`, and no model is built."""
+    from tools.contest.roster import load_roster
+
+    def roster(name: str, **kwargs) -> Path:
+        folder = tmp_path / name
+        folder.mkdir()
+        (folder / "contest.ini").write_text(_roster(tmp_path, **kwargs).read_text())
+        return folder / "contest.ini"
+
+    no_draft = roster("no_draft", with_draft=False)
+    no_gate = roster("no_gate", with_gate=False)
+    same_model = roster("same_model", gate_model="stub/draft")
+    unresolved = roster("unresolved")
+    unresolved.write_text(unresolved.read_text().replace(
+        "draft_llm_profile = draft_model\n", "draft_llm_profile = no_such_section\n"))
+
+    built = []
+
+    def call_for(settings, system=None):
+        built.append(settings.model)
+        return lambda prompt: ticket_text()
+
+    monkeypatch.setattr(draft_mod, "llm_call_for", call_for)
+
+    for path, needle in ((no_draft, "draft_llm_profile is not set"),
+                         (unresolved, "no_such_section does not resolve"),
+                         (no_gate, "gate_llm_profile is not set"),
+                         (same_model, "the review model is the draft model")):
+        with pytest.raises(contest_cli.DraftSetupError) as caught:
+            contest_cli.draft_callables(load_roster(path), no_review=False)
+        assert needle in str(caught.value), path.name
+
+    assert built == [], "no model is called while the setup refuses"
+
+
+def test_draft_callables_builds_the_writer_and_the_reviewer(collected, tmp_path, monkeypatch):
+    """The writer on the draft profile, the reviewer on the gate's; `--no-review` adds none."""
+    from tools.contest.roster import load_roster
+
+    built = []
+
+    def call_for(settings, system=None):
+        built.append((settings.model, system == draft_mod.REVIEW_SYSTEM_PROMPT))
+        return lambda prompt: ticket_text()
+
+    monkeypatch.setattr(draft_mod, "llm_call_for", call_for)
+    config = load_roster(_roster(tmp_path))
+
+    writer, reviewer = contest_cli.draft_callables(config, no_review=False)
+    assert sorted(built) == [("stub/draft", False), ("stub/gate", True)]
+    assert writer is not None and reviewer is not None
+
+    built_so_far = len(built)
+    writer, reviewer = contest_cli.draft_callables(config, no_review=True)
+    assert reviewer is None
+    assert len(built) == built_so_far + 1 and built[-1] == ("stub/draft", False), \
+        "no reviewer is built for --no-review"

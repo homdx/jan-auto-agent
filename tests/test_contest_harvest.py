@@ -434,7 +434,12 @@ def test_run_tests_summary_and_tail_agree(round_, tmp_path):
     spec = importlib.util.spec_from_file_location("judge_before", JUDGE_BEFORE)
     before = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(before)
-    assert before.run_tests(str(wt.path)) == summary
+    if importlib.util.find_spec("pytest_timeout"):
+        assert before.run_tests(str(wt.path)) == summary
+    else:
+        # The old module always passed `--timeout=180`; without the plugin
+        # pytest exits 4 there, while the gate leaves the flag out (KC-76).
+        assert summary.startswith("tests:PASS")
 
     _edit(wt, "tests/test_probe.py",
           "def test_probe():\n    assert False, 'boom-marker-42'\n")
@@ -590,6 +595,22 @@ def test_slow_kc57():
     time.sleep(90)
 """
 
+#: `_SLOW`, and it drops a marker beside itself the moment it starts. `-v` prints
+#: the node id before the test body runs, so once the marker exists the line that
+#: names the test is already in the output: the marker says the nested pytest got
+#: through interpreter start, plugins, `conftest.py` and collection — the one thing
+#: the `the budget hit in:` line needs and a starved process cannot promise inside a
+#: fixed budget (KC-184).
+_SLOW_MARKED = """\
+import pathlib
+import time
+
+
+def test_slow_kc57():
+    pathlib.Path(__file__).with_suffix(".started").write_text("started")
+    time.sleep(90)
+"""
+
 
 def _live_pytest(cwd: Path) -> list:
     """The pids of a live pytest still working inside *cwd* — `/proc`, fail-open.
@@ -620,12 +641,22 @@ def test_run_tests_detail_ends_the_suite_at_the_harvest_budget(round_, tmp_path,
     """KC-57 §1: a root that outlives `budget_sec` is ended by its process group.
     The summary says `budget✗` and not `PASS` or a failure of the tree, the tail
     names where the budget hit, nothing of the suite is left running, and the
-    call returns at the budget rather than the suite's own runtime."""
+    call returns at the budget rather than the suite's own runtime.
+
+    KC-184: the *name* of the test the budget hit in is only there when the nested
+    pytest reached the test before the budget ran out, which on a starved process
+    is the machine's speed, not the rule. Every other assertion holds on every
+    attempt; the name is asserted once the slow test's marker says it was reached.
+    A 3.0 s budget spent in start-up is retried once with 60 s in one piece — a
+    ladder of short budgets pays the start-up again on every rung, and 3+6+12+24 s
+    was seen to run out under the ticket's load — still under the 90 s the slow
+    test sleeps. A nested pytest that never reaches its test is a failure, not a skip."""
     repo, base, ticket = round_
     wt = _worktree(repo, base, tmp_path)
     _accepting(wt)
-    _edit(wt, "tests/test_slow_kc57.py", _SLOW)
+    _edit(wt, "tests/test_slow_kc57.py", _SLOW_MARKED)
     _commit(wt, "a test that outlives the budget")
+    started = wt.path / "tests" / "test_slow_kc57.started"
 
     ended: list = []
     real_end = gates_mod._end_process_group
@@ -636,23 +667,32 @@ def test_run_tests_detail_ends_the_suite_at_the_harvest_budget(round_, tmp_path,
 
     monkeypatch.setattr(gates_mod, "_end_process_group", end_and_record)
 
-    start = time.monotonic()
-    summary, tail = run_tests_detail(str(wt.path), budget_sec=3.0)
-    took = time.monotonic() - start
+    for budget in (3.0, 60.0):                          # the rule, then start-up's slack
+        started.unlink(missing_ok=True)
+        ended.clear()
+        start = time.monotonic()
+        summary, tail = run_tests_detail(str(wt.path), budget_sec=budget)
+        took = time.monotonic() - start
 
-    assert summary.startswith("tests:budget✗")
-    assert took < 15                                    # the budget, not the 90 s suite
-    assert len(ended) == 1                              # the group was ended, once
-    try:
-        os.killpg(ended[0], 0)
-    except ProcessLookupError:
-        pass                                           # every member of it is gone
+        assert summary.startswith("tests:budget✗")
+        assert took < budget + 12                       # the budget, not the 90 s suite
+        assert len(ended) == 1                          # the group was ended, once
+        try:
+            os.killpg(ended[0], 0)
+        except ProcessLookupError:
+            pass                                       # every member of it is gone
+        else:
+            pytest.fail("the harvest's pytest process group is still alive")
+        time.sleep(0.5)
+        assert _live_pytest(wt.path) == []
+        assert any("--- tests: ended after the harvest budget" in line for line in tail), tail
+        if started.exists():
+            break                                       # else spent in start-up: not what is pinned
     else:
-        pytest.fail("the harvest's pytest process group is still alive")
-    time.sleep(0.5)
-    assert _live_pytest(wt.path) == []
+        pytest.fail(f"the nested pytest did not reach its slow test in {budget:g} s")
+
     assert any("the budget hit in:" in line and "test_slow_kc57.py::test_slow_kc57" in line
-               for line in tail)
+               for line in tail), tail
 
 
 def test_run_tests_detail_without_a_budget_is_today_behaviour(round_, tmp_path, monkeypatch):
