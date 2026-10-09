@@ -1,6 +1,6 @@
 # 210 — review leftovers: a cached base-check pass ignores the step list, no warning under three voters, the summary line of a step is stderr's, JSONC comments after a value, a NaN retry wait
 
-**Status:** queued
+**Status:** landed `1dbec29` — a cached base-check pass needs every current step, a quorum warning, JSONC comments, NaN wait is no time; 47 stays as 200 decided
 **Origin:** operator review (`bugs-to-review/6.txt`, "Findings that were not changed"), each re-probed on `arena` @ `fda510c`; the review left them unchanged because each needs a decision or is pinned by an existing test — the decisions are made below so the round does not have to ask
 **Severity:** LOW (45, 46), INSIGNIFICANT (47, 48, 49)
 **File:** tools/arena/basecheck.py
