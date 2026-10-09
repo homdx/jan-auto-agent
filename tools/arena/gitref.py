@@ -69,7 +69,8 @@ def ls_tree_names(repo: Path, ref: str, folder: str, recursive: bool = False) ->
     return [name for name in raw.split("\0") if name]
 
 
-def status_paths(repo: Path, pathspec: Optional[str] = None) -> list[str]:
+def status_paths(repo: Path, pathspec: Optional[str] = None,
+                 tracked_only: bool = False) -> list[str]:
     """The untracked and modified paths under *pathspec*, by their real names.
 
     Bug 209: `git()` strips the whole output, so the first `status --porcelain`
@@ -77,7 +78,7 @@ def status_paths(repo: Path, pathspec: Optional[str] = None) -> list[str]:
     `line[3:]` cut a letter — the refusal named `pic-tasks/01-a.md`. `-z` gives
     NUL-separated records, `XY<space>path`, so the path comes from the record, a
     non-ASCII name is its own name and a rename is its new name. `GitRefError`
-    when git cannot answer.
+    when git cannot answer. `tracked_only` leaves the untracked (`??`) files out.
     """
     args = ["status", "--porcelain", "-z", "--untracked-files=all"]
     if pathspec:
@@ -95,8 +96,10 @@ def status_paths(repo: Path, pathspec: Optional[str] = None) -> list[str]:
             continue
         if len(record) < 3 or record[2] != " ":
             continue  # not `XY<space>path`: an unreadable record, skipped
-        out.append(record[3:])
         renamed = record[0] in ("R", "C")
+        if tracked_only and record[:2] == "??":
+            continue
+        out.append(record[3:])
     return out
 
 

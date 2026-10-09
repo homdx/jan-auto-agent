@@ -509,6 +509,9 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
             caps = m.get("capabilities")
             if caps is None:
                 caps = []
+            elif isinstance(caps, dict):
+                # `{"tools": true}`: the keys set to a true value are the tokens
+                caps = [k for k, v in caps.items() if isinstance(k, str) and v]
             elif not isinstance(caps, list) or any(not isinstance(c, str) for c in caps):
                 continue  # a shape we cannot read as a list of tokens
             caps = list(caps)

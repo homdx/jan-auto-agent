@@ -46,7 +46,7 @@ from scripts.ticket_status import INDEX_ROW, STATUS_RE, TICKET_RE, remote_of
 from tools.contest import cli as contest_cli
 
 from . import output, rounds, tickets
-from .gitref import GitRefError, git, ls_tree_names, read_utf8
+from .gitref import GitRefError, git, ls_tree_names, read_utf8, status_paths
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = rounds.EXIT_OK, rounds.EXIT_FAILED, rounds.EXIT_USAGE
 
@@ -112,14 +112,13 @@ def _head_branch(repo: Path) -> str:
 def _tracked_changes(repo: Path) -> list[str]:
     """The tracked paths the tree has changed; untracked files are not changes here.
 
-    `strip=False`: the default `.strip()` eats the `M` line's leading space, and a
-    ` M src/thing.py` then reads `rc/thing.py` — the path is at index 3 either way.
+    Review bug 220: read through `gitref.status_paths` (`status -z`). The hand-cut
+    `status --porcelain` got the first line's leading space right with `strip=False`
+    but not git's QUOTING of a name with a space or a non-ASCII letter: `"my file.py"`
+    with its quotes is not `my file.py`, so a follow-up edit passed after `--` was
+    refused as "changes not in the commit".
     """
-    out = []
-    for line in git(repo, "status", "--porcelain", strip=False).splitlines():
-        if line.strip() and line[:2] != "??":
-            out.append(line[3:].rsplit(" -> ", 1)[-1].strip())
-    return out
+    return status_paths(repo, tracked_only=True)
 
 
 def _status_lines(repo: Path, path: str) -> list[str]:
@@ -640,10 +639,7 @@ def _bench_paths(repo: Path, bench: Path) -> list[str]:
     shows up here. Read-only — the `git add` is `issue_land`'s, after every refusal,
     so a refused land leaves the bench untracked and the checkout exactly as it was.
     """
-    return sorted(line[3:].rsplit(" -> ", 1)[-1].strip()
-                  for line in git(repo, "status", "--porcelain", "--untracked-files=all",
-                                  "--", bench.as_posix(), strip=False).splitlines()
-                  if line.strip())
+    return sorted(status_paths(repo, bench.as_posix()))  # review bug 220: raw names, `-z`
 
 
 def _landed_word_of(text: str) -> str:
@@ -687,6 +683,41 @@ def landed_note(nn: int, record: Optional[dict], score: str = "",
         sha = f"{str(record.get('sha') or '?')[:7]} {'+ follow-up' if follow_up else 'as-is'}"
         words += [agent, sha]
     return ", ".join(words)
+
+
+def _snapshot(path: Path) -> Optional[bytes]:
+    """The bytes of *path*, `None` when it is not there."""
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _undo_land(repo: Path, originals: dict[str, Optional[bytes]], paths: list[str],
+               staged_before: set[str]) -> None:
+    """Put back what `issue_land` wrote before git refused: the files as they were and
+    the paths it staged taken out of the index again (what the operator staged stays).
+
+    Review bug 220: the ticket and `INDEX.md` are written BEFORE `git add` and `git
+    commit`, so a refusal of either — a `pre-commit` hook saying no, a path git would
+    not take — left the ticket `landed` on disk and staged, against "a refused land
+    leaves the checkout exactly as it was", and the next `issue land` then said "has
+    uncommitted changes".
+    """
+    for rel, old in originals.items():
+        try:
+            if old is None:
+                (repo / rel).unlink(missing_ok=True)
+            else:
+                (repo / rel).write_bytes(old)
+        except OSError:
+            pass
+    unstage = [path for path in paths if path not in staged_before]
+    if unstage:
+        try:
+            git(repo, "reset", "-q", "--", *unstage)
+        except GitRefError:
+            pass
 
 
 def issue_land(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int:
@@ -752,6 +783,14 @@ def issue_land(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> in
     except (MergeError, GitRefError, rounds.RoundError, ValueError, OSError) as err:
         return output.refuse(str(err))
 
+    originals = {ticket_rel: _snapshot(repo / ticket_rel)}
+    if new_rows is not None:
+        originals[INDEX_FILE] = _snapshot(repo / INDEX_FILE)
+    paths: list[str] = []
+    try:
+        staged_before = set(_cached_paths(repo))
+    except GitRefError as err:
+        return output.refuse(str(err))
     try:
         (repo / ticket_rel).write_text(new_text, encoding="utf-8", errors="surrogateescape")
         if new_rows is not None:
@@ -783,7 +822,8 @@ def issue_land(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> in
             message = f"{message}\n\n{trailer}"
         message += "\n"
         sha = _commit(repo, message, paths)
-    except (MergeError, GitRefError) as err:
+    except (MergeError, GitRefError, OSError) as err:
+        _undo_land(repo, originals, paths, staged_before)
         return output.refuse(str(err))
 
     branch = _head_branch(repo) or round_branch(repo, nn, prof)

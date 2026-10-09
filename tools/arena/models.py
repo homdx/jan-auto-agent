@@ -726,13 +726,13 @@ def _direct_for(provider: str, url: str, key: str, now: float) -> list[dict]:
         recs = _direct_records(url, key, now)
     except urllib.error.HTTPError as err:
         raise ModelError(f"{provider}: direct list failed: HTTP {err.code}") from err
-    except http.client.HTTPException as err:
+    except (OSError, ValueError, http.client.HTTPException) as err:
         # Bug 208: a cut body is `http.client.IncompleteRead` or `BadStatusLine`, an
         # HTTPException that is neither an OSError nor a ValueError, so it escaped the
-        # one-line hint and was a traceback instead.
-        raise ModelError(f"{provider}: direct list failed: {_hide(str(err), key)}") from err
-    except (OSError, ValueError) as err:
-        raise ModelError(f"{provider}: direct list failed: {_hide(str(err), key)}") from err
+        # one-line hint and was a traceback instead. A message that is empty
+        # (`ResponseNotReady()`) names the exception, never a blank reason.
+        detail = _hide(str(err), key) or type(err).__name__
+        raise ModelError(f"{provider}: direct list failed: {detail}") from err
     for r in recs:
         r["provider"] = provider
     return recs

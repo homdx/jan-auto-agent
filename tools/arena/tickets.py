@@ -734,7 +734,11 @@ def set_status_text(text: str, word: str, note: str = "", reason: str = "") -> s
                      if i != status_i and _CLOSED_LINE_RE.match(body)), None)
 
     note = (note or "").strip()
-    status = f"**Status:** {word}"
+    # the line's indentation is the ticket's, not ours: `  **Status:** open` stays
+    # indented when it becomes `queued` (review bug 210)
+    head = lines[status_i][0]
+    indent = head[:len(head) - len(head.lstrip(" \t"))]
+    status = f"{indent}**Status:** {word}"
     if note:
         status += f" {note if note.startswith('(') else '(' + note + ')'}"
     reason = (reason or "").strip()
