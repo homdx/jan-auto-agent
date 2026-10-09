@@ -1,6 +1,6 @@
 # 209 — `arena issue edit` overwrites a ticket that changed while the editor was open, its plumbing refusal crashes, and AR-14's git readers repeat bugs 206 and 209
 
-**Status:** queued
+**Status:** landed `140677e` — issue edit refuses a ticket changed under $EDITOR (CAS base taken at the read); a plumbing refusal prints its hints
 **Origin:** operator review (`bugs-to-review/test_arena_issue_edit_concurrent.py`, bug 211 `test_arena_issue_git_reads_211.py`), probed on `arena` @ `00355fd`
 **Severity:** MEDIUM (42: another change to the ticket is silently gone), LOW (43: a traceback instead of a refusal; 44: a wrong name in a refusal, a "not found" for a ticket that exists)
 **File:** tools/arena/tickets.py
