@@ -1008,23 +1008,47 @@ def _worktree_or_refuse(repo: Path, branch: str, args, verb: str, nn: int, flow:
                    {"why": "then the same command again", "command": _cmd(verb, nn, branch)}])
 
 
-def _commit_plumbed(repo: Path, branch: str, rel: str, content: str, subject: str) -> str:
+def _blob_at(repo: Path, commit: str, rel: str) -> Optional[str]:
+    """*rel*'s blob sha in *commit*'s tree, `None` when the path is not there."""
+    return _rev(repo, f"{commit}:{rel}")
+
+
+def _commit_plumbed(repo: Path, branch: str, rel: str, content: str, subject: str,
+                    expect: Optional[str] = None, blob: Optional[str] = None) -> str:
     """One commit on *branch* in a temporary index; the new sha.
 
     `update-ref`'s old value makes it a compare-and-swap: a branch that moved
     between the read and the write is refused, and nothing is lost.
+
+    Bug 42: "between the read and the write" has to mean the caller's read, not
+    a `rev-parse` one line above the write. `issue edit` reads the ticket, then
+    keeps `$EDITOR` open for minutes; a tip taken here, after the editor closed,
+    already holds any commit made meanwhile, and the editor's text — made from
+    the *old* tip's blob — was committed over it. So a caller that read the
+    ticket passes the tip it read from (*expect*) and the blob it read (*blob*):
+    a tip that moved is refused when *rel*'s blob moved with it; a tip that moved
+    for another file only is built on, which is safe because this ticket's blob
+    is still the one the edit started from. Without *expect* (the status verbs,
+    whose read and write are a few lines apart) the tip read here is the base,
+    as before.
     """
-    expect = _rev(repo, f"refs/heads/{branch}")
-    if expect is None:
-        raise GitRefError(f"branch {branch!r} does not exist")
     tip = f"refs/heads/{branch}"
-    tree = tree_with_file(repo, tip, rel, content)
-    sha = git(repo, "commit-tree", tree, "-p", tip, "-m", subject)
-    git(repo, "update-ref", tip, sha, expect)
     current = _rev(repo, tip)
-    if current != sha:
+    if current is None:
+        raise GitRefError(f"branch {branch!r} does not exist")
+    if expect is not None and current != expect and _blob_at(repo, current, rel) != blob:
         raise GitRefError(f"git update-ref {tip}: the branch moved from {expect[:7]} to "
-                          f"{str(current)[:7]} — another arena call committed first")
+                          f"{current[:7]} and {rel} changed with it — the edit was made "
+                          f"from {expect[:7]}'s text, so it would overwrite that change")
+    # built on the sha just checked, never on the ref name again: a commit landing
+    # between this line and `update-ref` is the compare-and-swap's to refuse
+    tree = tree_with_file(repo, current, rel, content)
+    sha = git(repo, "commit-tree", tree, "-p", current, "-m", subject)
+    git(repo, "update-ref", tip, sha, current)
+    now = _rev(repo, tip)
+    if now != sha:
+        raise GitRefError(f"git update-ref {tip}: the branch moved from {current[:7]} to "
+                          f"{str(now)[:7]} — another arena call committed first")
     return sha
 
 
@@ -1258,6 +1282,33 @@ def _editor_path(repo: Path, name: str) -> Path:
     return tmp / name
 
 
+def _disk_bytes(repo: Path, rel: str) -> Optional[bytes]:
+    """*rel*'s bytes in the checkout, `None` when there is no such file."""
+    try:
+        return (Path(repo) / rel).read_bytes()
+    except OSError:
+        return None
+
+
+def _changed_while_editing(repo: Path, args, nn: int, branch: str, rel: str, path: Path,
+                           where: str, ticket: str) -> int:
+    """Bug 42's refusal on the checked-out path: the ticket changed under `$EDITOR`.
+
+    The usual `commit` refusal — what changed it first, then the edited text kept
+    for the operator to merge by hand, then the same command again.
+    """
+    root = os.path.realpath(str(Path(repo)))
+    return _refuse(
+        f"{rel} changed while the editor was open — the edit was made from the text "
+        f"before that change, so it is not committed over it",
+        args, where=where, ticket=ticket,
+        flow=_flow(EDIT_FLOW, 9, f"the commit refused it: {rel} changed while editing"),
+        hints=[{"why": f"what changed {branch}", "command": f"git log -3 --oneline {branch}"},
+               {"why": "the file as it is now", "command": f"git -C {root} diff HEAD -- {rel}"},
+               {"why": "the edited text, kept here", "command": str(path)},
+               {"why": "then the same command again", "command": _cmd("edit", nn, branch)}])
+
+
 def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
     """`arena issue edit NN [--branch B]`: $EDITOR on the ticket, then lint and commit.
 
@@ -1331,7 +1382,16 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
     name = names[0]
     rel = f"{rounds.TASKS_DIR}/{name}"
     try:
-        text = _body_on_branch(repo, branch, name)
+        # Bug 42: the compare-and-swap's base is taken here, with the read — not
+        # after `$EDITOR` closes. The tip, the ticket's blob in it, and the text are
+        # one snapshot (the text is read by the blob's sha, so a commit landing
+        # between two of these reads cannot split them); the writer below refuses
+        # when the ticket is no longer this blob.
+        base_sha = _rev(repo, f"refs/heads/{branch}")
+        if base_sha is None:
+            raise GitRefError(f"branch {branch!r} does not exist")
+        base_blob = git(repo, "rev-parse", f"{base_sha}:{rel}")
+        text = printable(git(repo, "show", base_blob, strip=False))
     except GitRefError as err:
         return _refuse(str(err), args, where=where,
                        ticket=_ticket_text_desc(repo, branch, nn, None),
@@ -1357,6 +1417,9 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
                 hints=[{"why": "set one for this call",
                         "command": f"EDITOR=vi arena issue edit {nn} --branch {branch}"}])
         editor = "vi"
+    # the checked-out file's bytes as the editor opens: a write to it while the
+    # editor is open (a second terminal, another arena call) is a change too
+    disk_before = _disk_bytes(repo, rel) if wt is _HERE else None
     path = _editor_path(repo, name)
     path.write_text(text, encoding="utf-8", errors="surrogateescape")
     try:
@@ -1405,6 +1468,14 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
                    {"why": "then the same command again", "command": _cmd("edit", nn, branch)}])
 
     if wt is _HERE:
+        # Bug 42, the checked-out path: `git commit --only -- <rel>` commits the
+        # editor's text over whatever the branch and the file hold *now*. A commit
+        # that changed the ticket while the editor was open (its blob on the tip is
+        # not the one read) or a write to the file itself (its bytes are not the
+        # ones the editor opened over) is refused, before the file is touched.
+        if (_blob_at(repo, f"refs/heads/{branch}", rel) != base_blob
+                or _disk_bytes(repo, rel) != disk_before):
+            return _changed_while_editing(repo, args, nn, branch, rel, path, where, ticket)
         dirty = _uncommitted(repo, rel)
         if dirty:
             return _refuse(
@@ -1429,14 +1500,22 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
                                   {"why": "the edited text, kept here", "command": str(path)}])
     else:
         try:
-            sha = _commit_plumbed(repo, branch, rel, new_text, f"{nn}: ticket edited")
+            sha = _commit_plumbed(repo, branch, rel, new_text, f"{nn}: ticket edited",
+                                  expect=base_sha, blob=base_blob)
         except GitRefError as err:
             message = str(err)
-            hints = ([{"why": "what moved the branch", "command": f"git log -3 --oneline {branch}"}
-                      if "moved from" in message
-                      else [{"why": "what the commit refused", "command": f"git -C {os.path.realpath(str(repo))} status"}]
-                      ]) + [{"why": "the edited text, kept here", "command": str(path)},
-                           {"why": "then the same command again", "command": _cmd("edit", nn, branch)}]
+            # Bug 43: the conditional picks one *dict*. It used to pick a dict or a
+            # one-item *list*, so any refusal but a moved branch (a corrupt index,
+            # `Author identity unknown`, a vanished branch) put a list among the
+            # hints and the printer's `.get` on it was a traceback on top of a
+            # refusal already decided — and the kept-text hint never printed.
+            first = ({"why": "what moved the branch", "command": f"git log -3 --oneline {branch}"}
+                     if "moved from" in message
+                     else {"why": "what the commit refused",
+                           "command": f"git -C {os.path.realpath(str(repo))} status"})
+            hints = [first,
+                     {"why": "the edited text, kept here", "command": str(path)},
+                     {"why": "then the same command again", "command": _cmd("edit", nn, branch)}]
             return _refuse(message, args, where=where, ticket=ticket,
                            flow=_flow(EDIT_FLOW, 9, "the commit refused it"), hints=hints)
     try:
