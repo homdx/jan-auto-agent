@@ -566,6 +566,27 @@ and rerun. Never `always` — under `external_directory` it whitelists the
 pattern for the rest of the session (PROBE.md, fact 4), and the policy's
 replies are exactly `once` and `reject`.
 
+**The deny list.** `deny_commands` (`git push*, sudo *, rm -rf /*, curl * |
+sh, wget * | sh`) is refused before anything else looks at the command. A
+pattern is matched against the whole line, against each shell piece (`&&`,
+`||`, `;`, `|`, `&`, newline outside quotes; `$(…)`, backticks, `bash -c` and
+`eval` bodies), and against each piece **as the shell runs it** (205): the
+command word without its directory, quotes or backslash (`/usr/bin/git`,
+`"git"`, `\git`), past `VAR=value`, reserved words (`then`, `do`, `else`,
+`!`, `{`, `(`) and the wrappers that run their argument (`env`, `timeout`,
+`nohup`, `sudo`, `doas`, `xargs`, `nice`, `ionice`, `setsid`, `stdbuf`,
+`chroot`, … with their own options), and for `git` past its global options
+(`-C dir`, `-c k=v`, `-P`, and the long ones that set the repository or the pager). So `git -C wt push`,
+`sudo -u root git push` and `if x; then git push; fi` are all `git push*`.
+A `*` glued to a word ends the word: `git push*` is `git push` and `git push
+…`, not `git pushd`. A pattern holding a path (`/usr/bin/git push*`) still
+matches what was typed, behind a wrapper too (`sudo /usr/bin/git push`). The matcher is a pattern filter on the command's
+*spelling*, not a sandbox: text a command builds or reads at run time — `echo
+'git push' | sh`, `sh -c "$(…)"`, a here-string, `python -c
+"os.system('git push')"` — is not seen: that text comes from stdin or a computed value, nothing
+the matcher can read ahead of time. The checkouts' cut push URL is the
+backstop for `git push`.
+
 ---
 
 ## Hand-over
@@ -669,6 +690,10 @@ of exactly such cells.
 - **Serial rounds.** One ticket per round, N agents on it; round N+1 starts
   from round N's merged head. Parallel rounds would produce N conflicting
   versions of the same file.
+- **The deny list reads spellings.** `deny_commands` sees through paths,
+  quotes, wrappers, reserved words and git's global options, but not a
+  command assembled at run time (`echo 'git push' | sh`, `python -c …`); see
+  "The deny list" under the gate.
 - **Mechanical harvest only.** READY is decided by `gates.py`'s checks — the
   `PROGRESS.csv` row, the one commit, nothing pushed, a test file in the
   diff, `_shrink` byte-identical — never by a model reading the patch. The

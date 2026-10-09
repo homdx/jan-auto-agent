@@ -1490,7 +1490,7 @@ def _inline_scripts(piece: str) -> list:
         tokens = shlex.split(_ansi_c_expand(piece))
     except ValueError:
         return []
-    start = _past_wrappers(tokens)
+    start = _deny_command_start(tokens)
     if start is None:
         return []
     name = tokens[start].rsplit("/", 1)[-1]
@@ -1502,6 +1502,132 @@ def _inline_scripts(piece: str) -> list:
             if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
                 return [rest[k + 1]] if k + 1 < len(rest) else []
     return []
+
+
+#: 205 (31): words that run their argument as the command, for ``deny_commands``
+#: only, mapped to their options that take a separate value. ``COMMAND_WRAPPERS``
+#: is shared with ``is_pytest_command`` and stays as it is: `sudo pytest` is not
+#: a question the suite recogniser has to answer, `sudo git push` is a push.
+_DENY_WRAPPERS = {
+    "sudo": ("-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T", "-R",
+             "--user", "--group", "--close-from", "--chdir", "--host", "--prompt",
+             "--role", "--type", "--other-user", "--command-timeout", "--chroot"),
+    "doas": ("-u", "-C"),
+    "xargs": ("-n", "-L", "-P", "-s", "-d", "-E", "-I", "-a", "--max-args",
+              "--max-lines", "--max-procs", "--max-chars", "--delimiter", "--eof",
+              "--replace", "--arg-file", "--process-slot-var"),
+    "nice": ("-n", "--adjustment"),
+    "ionice": ("-c", "-n", "-p", "-P", "-u", "--class", "--classdata"),
+    "setsid": (),
+    "stdbuf": ("-i", "-o", "-e", "--input", "--output", "--error"),
+    "chroot": ("--userspec", "--groups"),
+    "timeout": ("-s", "-k", "--signal", "--kill-after"),
+    "env": ("-u", "-C", "--unset", "--chdir"),
+    "nohup": (), "time": ("-f", "-o", "--format", "--output"), "exec": ("-a",),
+    "command": (),
+}
+
+#: The wrappers whose first plain argument is theirs, not the command's:
+#: `timeout 9 git push`, `chroot /srv git push`.
+_DENY_WRAPPER_OPERAND = frozenset({"timeout", "chroot"})
+
+#: 205 (32): shell reserved words that can stand where a command word stands;
+#: the command they lead to is the next word. `fi`, `done` and `}` close a
+#: compound and run nothing — a piece that holds only them is no command.
+_SHELL_RESERVED = frozenset({"if", "then", "elif", "else", "fi", "do", "done", "while",
+                             "until", "time", "!", "{", "}"})
+
+#: 205 (29): `git`'s global options that take the next word as their value.
+#: Every other word starting with `-` before the subcommand is a value-less flag
+#: (`--no-pager`, `-P`, `--bare`, `--git-dir=x`, `--exec-path=x`).
+# `--exec-path` and `--list-cmds` take a value only glued on with `=`: a bare
+# `--exec-path` is a flag of its own, so `git --exec-path push` is still read
+# as a push (the deny side errs towards denying).
+_GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                                "--config-env", "--super-prefix", "--attr-source"})
+
+
+def _command_word(word: str) -> str:
+    """The name the shell looks *word* up by: past a directory (`/usr/bin/git`,
+    `./git`). Quotes and backslashes are gone already — the word came out of
+    ``shlex.split`` — so `"git"`, `\\git` and `g"i"t` are `git` here."""
+    return word.rsplit("/", 1)[-1]
+
+
+def _deny_command_start(tokens: list) -> int | None:
+    """The index of the command a deny pattern is about, ``None`` when there is none.
+
+    Past ``VAR=value`` words, leading shell reserved words (``then``, ``do``,
+    ``!``, ``{``, a leading ``(``) and the wrappers of ``_DENY_WRAPPERS`` with
+    their own options — so `then git push`, `sudo -u root git push` and
+    `xargs -n1 git push` all point at `git`. A piece made only of `fi`/`done`/`}`
+    has no command.
+    """
+    i = 0
+    while i < len(tokens):
+        word = tokens[i]
+        if _ENV_ASSIGN_RE.fullmatch(word) or word in _SHELL_RESERVED:
+            i += 1
+            continue
+        name = _command_word(word)
+        if name not in _DENY_WRAPPERS:
+            return i
+        takes_value = _DENY_WRAPPERS[name]
+        i += 1
+        while i < len(tokens) and tokens[i].startswith("-") and tokens[i] != "-":
+            flag = tokens[i]
+            i += 1
+            if flag == "--":
+                break
+            if flag in takes_value and i < len(tokens):
+                i += 1
+        if name in _DENY_WRAPPER_OPERAND and i < len(tokens):
+            i += 1
+    return None
+
+
+def _deny_normalised(piece: str) -> list:
+    """*piece* spelled the way the shell runs it, ``[]`` when it runs no command.
+
+    The words are read the way the shell reads them (``shlex``, through
+    ``_ansi_c_expand``), the command found by ``_deny_command_start``, its word
+    reduced to the name it is looked up by (``_command_word``), and for `git`
+    the global options before the subcommand dropped: `sudo /usr/bin/"git" -C wt
+    --no-pager push origin` is `git push origin`. The arguments after the command
+    word are re-quoted only where they need it, so `echo "git push"` stays an
+    `echo` and `curl x "| sh"` is not `curl x | sh`. A command word that still
+    holds a space after unquoting (`"git push"` as a whole) names no program and
+    is left alone. Two spellings come back: the command word as the shell
+    reads it with its directory kept, then the bare name — so `sudo
+    /usr/bin/git push` still meets a pattern that names `/usr/bin/git push*`.
+    """
+    try:
+        tokens = shlex.split(_ansi_c_expand(piece))
+    except ValueError:
+        return []
+    tokens = [t.lstrip("(") if k == 0 else t for k, t in enumerate(tokens)]
+    tokens = [t for t in tokens if t]
+    start = _deny_command_start(tokens)
+    if start is None:
+        return []
+    word = tokens[start]
+    if not word or any(c.isspace() for c in word):
+        return []
+    name = _command_word(word)
+    rest = tokens[start + 1:]
+    if rest:
+        rest[-1] = rest[-1].rstrip(")}")
+        rest = [t for t in rest if t]
+    if name == "git":
+        k = 0
+        while k < len(rest) and rest[k].startswith("-"):
+            flag = rest[k]
+            k += 1
+            if flag in _GIT_VALUE_OPTIONS and k < len(rest):
+                k += 1
+        rest = rest[k:]
+    args = [shlex.quote(t) for t in rest]
+    return list(dict.fromkeys(" ".join([w] + args) for w in (word, name)))
 
 
 def _deny_candidates(command: str, _depth: int = 0) -> list:
@@ -1517,6 +1643,11 @@ def _deny_candidates(command: str, _depth: int = 0) -> list:
     What a command runs inside ``$(…)``, backticks, ``<(…)``, ``bash -c '…'``
     and ``eval`` is a command line too and is expanded the same way (to a
     nesting depth of ``_MAX_NESTING``), so ``echo $(git push)`` is a push.
+    205: and each piece once more as the shell runs it (``_deny_normalised``),
+    so ``git -C . push``, ``/usr/bin/git push``, ``"git" push``, ``sudo git
+    push``, ``xargs git push`` and ``then git push`` are ``git push``. The
+    spelling as written is still tried: a pattern holding a path
+    (``/usr/bin/git push*``) matches what was typed.
     """
     out = [command]
     nested: list = []
@@ -1536,6 +1667,9 @@ def _deny_candidates(command: str, _depth: int = 0) -> list:
         start = _past_wrappers(tokens)
         if start:
             out.append(" ".join(tokens[start:]))
+        for normalised in _deny_normalised(piece):
+            if normalised not in out:
+                out.append(normalised)
     for inner in nested:
         if inner.strip():
             out.extend(_deny_candidates(inner, _depth + 1))
@@ -1553,16 +1687,32 @@ def _deny_match(command: str, deny_commands) -> "str | None":
     a whole word: a bare ``*`` would let ``curl * | sh`` reject ``curl … | sha256sum``
     and ``curl … | shellcheck -``. A pattern that already ends in ``*`` gains
     nothing from the second match.
+
+    205: a ``*`` glued to the end of a word (``git push*``, ``git reset
+    --hard*``) ends that word, it does not extend it: the pattern is the word
+    alone or the word followed by anything that is not a word character (a
+    space, a closing backtick), so ``git pushd`` — no git subcommand — is not
+    ``git push*``. A ``*`` after anything else (``sudo
+    *``, ``rm -rf /*``) is the plain glob it always was.
     """
     if not command:
         return None
     candidates = _deny_candidates(command)
     for pattern in _as_list(deny_commands):
         if isinstance(pattern, str) and pattern:
+            globs = _deny_globs(pattern)
             for text in candidates:
-                if fnmatch.fnmatch(text, pattern) or fnmatch.fnmatch(text, pattern + " *"):
+                if any(fnmatch.fnmatch(text, glob) for glob in globs):
                     return pattern
     return None
+
+
+def _deny_globs(pattern: str) -> tuple:
+    """The ``fnmatch`` globs *pattern* stands for (see ``_deny_match``)."""
+    if len(pattern) > 1 and pattern.endswith("*") and (pattern[-2].isalnum()
+                                                      or pattern[-2] == "_"):
+        return (pattern[:-1], pattern[:-1] + "[!A-Za-z0-9_-]*")
+    return (pattern, pattern + " *")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
