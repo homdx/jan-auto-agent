@@ -486,7 +486,7 @@ PYTEST_TOKENS = ("pytest", "py.test")
 # is recognised at a command position: the first token, or the one after
 # any of these (``cd sub && pytest``, and unspaced ``cd sub&&pytest`` — the
 # command is split with ``punctuation_chars`` so a glued separator is a token).
-_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", "{", "!"})
+_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")", "{", "!"})
 
 #: A shell variable set for one command: ``PYTHONPATH=. pytest tests``.
 ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
@@ -550,13 +550,20 @@ def _command_word(seg: list[str]) -> int:
     return i
 
 
-def _segment_runs_pytest(seg: list[str]) -> bool:
+def pytest_argv_start(seg: list[str]) -> int | None:
+    """Index of the first pytest argument of one command, or ``None`` when the
+    command is not a pytest run (206: the contest's suite slot reads the same
+    answer, so the two recognisers cannot drift again).
+
+    ``pytest tests`` → 1, ``python3 -u -m pytest tests`` → 4, ``uv run pytest``
+    → 3; the index may equal ``len(seg)`` when pytest is given no argument.
+    """
     i = _command_word(seg)
     if i >= len(seg):
-        return False
+        return None
     base = _basename(seg[i])
     if base in PYTEST_TOKENS or base in ("pytest.exe", "py.test.exe"):
-        return True
+        return i + 1
     # ``python -m pytest``: the interpreter is matched by name (``python``,
     # ``python3``, ``python3.11``, ``python.exe``, the ``py`` launcher) so the
     # absolute-path rewrite the executor performs does not defeat it; options
@@ -566,29 +573,42 @@ def _segment_runs_pytest(seg: list[str]) -> bool:
         while k < len(seg):
             tok = seg[k]
             if tok == "-m":
-                return k + 1 < len(seg) and _basename(seg[k + 1]) in PYTEST_TOKENS
+                if k + 1 < len(seg) and _basename(seg[k + 1]) in PYTEST_TOKENS:
+                    return k + 2
+                return None
             if tok in ("-X", "-W"):
                 k += 2
             elif tok.startswith("-") and tok != "-c":
                 k += 1
             else:
                 break
-    return False
+    return None
 
 
-def _tokens_run_pytest(parts: list[str]) -> bool:
+def _segment_runs_pytest(seg: list[str]) -> bool:
+    return pytest_argv_start(seg) is not None
+
+
+def pytest_segments(parts: list[str]) -> list[list[str]]:
+    """*parts* (a ``split_command`` result) cut into its commands at the
+    ``_COMMAND_SEPARATORS``: ``cd sub && pytest`` is ``[cd, sub]`` and ``[pytest]``."""
+    segs: list[list[str]] = []
     seg: list[str] = []
     for part in [*parts, ";"]:
         if part in _COMMAND_SEPARATORS:
-            if seg and _segment_runs_pytest(seg):
-                return True
+            if seg:
+                segs.append(seg)
             seg = []
         else:
             seg.append(part)
-    return False
+    return segs
 
 
-def _split_command(cmd: str, posix: bool) -> list[str]:
+def _tokens_run_pytest(parts: list[str]) -> bool:
+    return any(_segment_runs_pytest(seg) for seg in pytest_segments(parts))
+
+
+def split_command(cmd: str, posix: bool) -> list[str]:
     """``shlex`` split that also cuts a glued ``&&`` / ``;`` / ``|`` into its own token."""
     lex = shlex.shlex(cmd, posix=posix, punctuation_chars=True)
     lex.whitespace_split = True
@@ -630,7 +650,7 @@ def pytest_piece_spans(command: str) -> list[tuple[int, int]]:
         if not piece.strip():
             continue
         try:
-            parts = _split_command(piece, os.name != "nt")
+            parts = split_command(piece, os.name != "nt")
         except ValueError:
             continue
         if parts and _segment_runs_pytest(parts):
@@ -665,7 +685,7 @@ def is_pytest_command(command: str) -> bool:
     parsed = False
     for posix in (os.name != "nt", os.name == "nt"):
         try:
-            parts = _split_command(cmd, posix)
+            parts = split_command(cmd, posix)
         except ValueError:
             continue
         parsed = True

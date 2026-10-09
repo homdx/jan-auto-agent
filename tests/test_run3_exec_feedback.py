@@ -374,10 +374,10 @@ def test_a_command_that_only_mentions_pytest_is_not_a_pytest_run(command):
     "echo pytest tests", "ls pytest",
 ])
 def test_the_policy_and_utils_agree_on_what_a_suite_run_is(command):
-    """172: one wrapper list for both recognisers — they answered one question and drifted."""
-    import shlex
-    from tools.contest.policy import _pytest_argv_start
-    assert (_pytest_argv_start(shlex.split(command)) is not None) == is_pytest_command(command)
+    """172: one wrapper list for both recognisers — they answered one question and drifted.
+    206: and one recogniser, ``utils.pytest_argv_start``, under both."""
+    from tools.contest.policy import _pytest_argvs
+    assert bool(_pytest_argvs(command)) == is_pytest_command(command)
 
 
 # ── 175: the serial flag goes at the end of the pytest run, not of the line ──

@@ -63,7 +63,8 @@ from pathlib import Path
 from typing import Callable
 
 from tools.auto.llm_profile import LlmSettings
-from tools.auto.utils import COMMAND_WRAPPERS, ENV_ASSIGN_RE
+from tools.auto.utils import (COMMAND_WRAPPERS, ENV_ASSIGN_RE, pytest_argv_start,
+                              pytest_segments, split_command)
 from tools.contest.roster import ContestConfig
 from tools.llm_stream import (
     build_chat_request,
@@ -642,9 +643,11 @@ def _unresolved_var(command) -> bool:
 
 #: The options that name a subset of the tests rather than a directory: a
 #: `-k`/`-m` run is a targeted one whatever else it is given. `=` forms too, so
-#: `-k=foo` reads the same as `-k foo`.
-_SELECTOR_OPTIONS = frozenset({"-k", "--keywords", "-m", "--markers"})
-_SELECTOR_PREFIXES = ("-k=", "--keywords=", "-m=", "--markers=")
+#: `-k=foo` reads the same as `-k foo`; 206: and the attached forms `-kfoo` /
+#: `-mslow` (a single-dash token that starts with `-k` or `-m`), and
+#: `--deselect`, which leaves part of the root out.
+_SELECTOR_OPTIONS = frozenset({"-k", "--keywords", "-m", "--markers", "--deselect"})
+_SELECTOR_PREFIXES = ("-k", "-m", "--keywords=", "--markers=", "--deselect=")
 
 #: An option that ends the invocation instead of running anything at all —
 #: `--collect-only` included: it imports the suite in seconds and runs none of it.
@@ -1212,32 +1215,29 @@ def _substitutions(command: str) -> list:
     return _scan(command)[1]
 
 
-def _pytest_argv_start(tokens: list) -> int | None:
-    """The index of the `pytest` token, or `None` when the command has no suite.
+def _pytest_argvs(piece: str) -> list:
+    """The pytest argument lists of one shell piece: ``[]`` when it runs no pytest.
 
-    Only the command position counts: `echo pytest tests` and `ls pytest tests`
-    are not pytest runs, whatever token follows the tool. The position is past
-    `VAR=value` and the wrappers of `_WRAPPERS`, so `timeout 1500 python3 -m
-    pytest tests` is the suite it runs. Matched by basename,
-    so `/opt/venv/bin/pytest` is a suite too. `python -m pytest` counts as well,
-    with the argv starting after `pytest`: the two `-m` and `pytest` tokens have
-    to sit next to each other, so a `python -c "..."` that happens to name
-    `pytest` later on is not a suite.
+    206: the command position, the interpreter, its options before ``-m``, the
+    ``uv run``-style runners and the wrappers are read by
+    ``tools.auto.utils.pytest_argv_start`` — the recogniser ``is_pytest_command``
+    uses — so the suite slot and the executor never disagree about what a pytest
+    run is (``python3 -u -m pytest tests``, ``uv run pytest tests``). The piece
+    is split with ``shlex``, so ``PYTEST_ADDOPTS="-q -x" pytest tests`` keeps its
+    quoted value in one word; quoting that does not parse falls back to
+    ``_CMD_TOKEN``, quotes stripped.
     """
-    start = _past_wrappers(tokens)
-    if start is None or start >= len(tokens):
-        return None
-    head = tokens[start].rsplit("/", 1)[-1]
-    if head in ("pytest", "py.test"):
-        return start
-    if _PYTHON_RE.fullmatch(head):
-        if tokens[start + 1:start + 3] == ["-m", "pytest"]:
-            return start + 2
-    return None
+    try:
+        parts = split_command(piece, True)
+    except ValueError:
+        parts = [_unquote_token(t) for t in _CMD_TOKEN.findall(piece)]
+    argvs = []
+    for seg in pytest_segments(parts):
+        start = pytest_argv_start(seg)
+        if start is not None:
+            argvs.append(seg[start:])
+    return argvs
 
-
-#: `python`, `python3`, `python3.10` — the interpreters a `-m pytest` runs under.
-_PYTHON_RE = re.compile(r"python(\d+(\.\d+)?)?")
 
 #: A shell variable set for one command: `PYTHONPATH=. pytest tests`.
 _ENV_ASSIGN_RE = ENV_ASSIGN_RE
@@ -1281,7 +1281,9 @@ def _targeted_run(args: list) -> bool:
     """Whether *args* names a subset of the tests, or runs nothing at all.
 
     A token ending in `_SUITE_FILE_SUFFIXES` is a test file, one carrying a
-    `::` names a node, and a `-k`/`-m` selector names a subset by expression.
+    `::` names a node, and a `-k`/`-m` selector names a subset by expression —
+    separate (`-k foo`), `=` (`-k=foo`) or attached (`-kfoo`, `-mslow`, 206),
+    and `--deselect` too.
     `--help` and friends run no suite. Every other `-…` token is an option —
     `-n 4`, `-q`, `--rootdir`, `--maxfail` — and carries no information about
     how much of the suite runs.
@@ -1318,12 +1320,8 @@ def is_full_suite_command(command) -> bool:
     if not isinstance(command, str) or not command or "\x00" in command:
         return False
     try:
-        for piece in _shell_pieces(command):
-            tokens = [_unquote_token(t) for t in _CMD_TOKEN.findall(piece)]
-            start = _pytest_argv_start(tokens)
-            if start is not None and not _targeted_run(tokens[start + 1:]):
-                return True
-        return False
+        return any(not _targeted_run(args)
+                   for piece in _shell_pieces(command) for args in _pytest_argvs(piece))
     except Exception:  # noqa: BLE001 — a read failure is not a suite
         return False
 
