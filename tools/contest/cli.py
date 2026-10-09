@@ -928,7 +928,8 @@ def _run_line(argv, number: int) -> str:
         else:
             words.append(word)
             i += 1
-    return "python3 -m tools.contest " + " ".join(words)
+    # shell-quoted, so a brief with a space or a parenthesis pastes back as one argument
+    return "python3 -m tools.contest " + shlex.join(words)
 
 
 def _park_line(body, name, number: int, rel_dir) -> str:
@@ -941,7 +942,6 @@ def _park_line(body, name, number: int, rel_dir) -> str:
     cannot hold the `\*` the sed expression needs.
     """
     file_ref = rel_dir + "/" + name
-    word = _status_of(body)
     match = _STATUS_RE.search(body)
     line_no = body[:match.start()].count("\n") + 1 if match else 0
     if line_no:
