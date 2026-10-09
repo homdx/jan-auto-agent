@@ -1,6 +1,6 @@
 # CC-0 — the shared test data, the scorer, the baseline and the package skeleton
 
-**Status:** draft
+**Status:** done (operator, see `contest-bench/cc/BASELINE.md`)
 **Severity:** MEDIUM (nothing else in the epic can be scored without it)
 **File:** `contest-bench/cc/make_fixture.py`
 **Symbol:** `build_fixture`, `score`
@@ -64,6 +64,13 @@ a commit or a ticket by name. Of the code claims, 20 have `expect` set to `fixed
 `still`, 2 to `gone`, 2 to `new`: the CC-7 key. Every claim's truth is established by
 reading the fixture, written down in `how`, and re-checked by `test_fixture_truth_is_stated`.
 
+*As built:* the two counts above cannot both hold in 50 code claims — the 20 `fixed`,
+10 `still` and 2 `gone` claims are true at base by definition (32), leaving 18 for the
+false side (2 `new` + 16 near misses). The CC-7 key wins: **32 true / 18 false** at base;
+at head the split is 12 true / 36 false / 2 undecided (`gone`). The 6 commit/ticket
+claims are 3 + 3. Each claim's truth is computed from a *probe* (the text whose presence
+at a commit makes it true) by `make_fixture.py --write`, never typed in.
+
 `claims_real.json`: **30** claims about *this* repository at a pinned sha
 (`real_sha`, recorded in the file), taken from `kc-bug-report.md` and the review files.
 Each has `truth` and `how`; `how` is a command or a reading that settles it, and
@@ -99,7 +106,7 @@ target in `thresholds.json`, the note says why.
 | `test_claim_files_are_well_formed` | ids unique, kinds from the allowed set, counts per kind as above |
 | `test_scorer_counts` | a hand-made `votes.json` → exact right/wrong/undecided/coverage |
 | `test_scorer_exit_code_on_threshold` | below threshold → exit 1; at threshold → 0 |
-| `test_real_checks_agree_with_recorded_truth` | `real_checks.py` run on the runnable claims, marked `slow`, skipped without a git checkout of the pinned sha |
+| `test_real_checks_agree_with_recorded_truth` | `real_checks.py` run on the runnable claims (all 30; ≈2 s, so not marked `slow` — the repo has no such marker), skipped without a git checkout of the pinned sha |
 
 ## Acceptance (the operator's)
 

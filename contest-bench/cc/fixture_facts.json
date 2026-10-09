@@ -1,0 +1,435 @@
+{
+ "base_sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+ "head_sha": "5b24122fb5025836b1e7ef668802b5a9573ab096",
+ "facts": [
+  {
+   "id": "f001",
+   "kind": "fixed",
+   "what": "wrong ini section",
+   "file": "config.py",
+   "symbol": "load_timeout",
+   "at": "base",
+   "text": "parser.getfloat(\"defaults\", \"timeout\"",
+   "lines": [
+    20,
+    20
+   ]
+  },
+  {
+   "id": "f002",
+   "kind": "fixed",
+   "what": "truthiness of a non-empty string",
+   "file": "config.py",
+   "symbol": "parse_bool",
+   "at": "base",
+   "text": "return bool(value)",
+   "lines": [
+    36,
+    36
+   ]
+  },
+  {
+   "id": "f003",
+   "kind": "fixed",
+   "what": "items not stripped",
+   "file": "config.py",
+   "symbol": "get_list",
+   "at": "base",
+   "text": "return [item for item in raw.split(\",\") if item]",
+   "lines": [
+    42,
+    42
+   ]
+  },
+  {
+   "id": "f004",
+   "kind": "fixed",
+   "what": "prefix without a separator",
+   "file": "paths.py",
+   "symbol": "is_inside",
+   "at": "base",
+   "text": "return child.startswith(parent)\n",
+   "lines": [
+    15,
+    15
+   ]
+  },
+  {
+   "id": "f005",
+   "kind": "fixed",
+   "what": "off-by-one slice",
+   "file": "paths.py",
+   "symbol": "split_ext",
+   "at": "base",
+   "text": "name[:i - 1]",
+   "lines": [
+    28,
+    28
+   ]
+  },
+  {
+   "id": "f006",
+   "kind": "fixed",
+   "what": "guard after the action",
+   "file": "paths.py",
+   "symbol": "write_marker",
+   "at": "base",
+   "text": "handle.write(text)\n    if not is_inside(target, root):",
+   "lines": [
+    35,
+    36
+   ]
+  },
+  {
+   "id": "f007",
+   "kind": "fixed",
+   "what": "shallow copy handed out",
+   "file": "store.py",
+   "symbol": "Store.items",
+   "at": "base",
+   "text": "return dict(self._data)",
+   "lines": [
+    46,
+    46
+   ]
+  },
+  {
+   "id": "f008",
+   "kind": "fixed",
+   "what": "exception swallowed in one branch",
+   "file": "store.py",
+   "symbol": "Store.load",
+   "at": "base",
+   "text": "except ValueError:\n            self._data = {}",
+   "lines": [
+    22,
+    23
+   ]
+  },
+  {
+   "id": "f009",
+   "kind": "fixed",
+   "what": "`or` hides falsy values",
+   "file": "store.py",
+   "symbol": "Store.get",
+   "at": "base",
+   "text": "return self._data.get(key) or default",
+   "lines": [
+    35,
+    35
+   ]
+  },
+  {
+   "id": "f010",
+   "kind": "fixed",
+   "what": "delete of a missing key raises",
+   "file": "store.py",
+   "symbol": "Store.delete",
+   "at": "base",
+   "text": "del self._data[key]",
+   "lines": [
+    42,
+    42
+   ]
+  },
+  {
+   "id": "f011",
+   "kind": "fixed",
+   "what": "exception swallowed in one branch",
+   "file": "pipeline.py",
+   "symbol": "run_step",
+   "at": "base",
+   "text": "except KeyError:\n        return None",
+   "lines": [
+    17,
+    18
+   ]
+  },
+  {
+   "id": "f012",
+   "kind": "fixed",
+   "what": "0 on a failed subprocess",
+   "file": "pipeline.py",
+   "symbol": "run_command",
+   "at": "base",
+   "text": "if proc.returncode != 0:\n        return 0",
+   "lines": [
+    26,
+    27
+   ]
+  },
+  {
+   "id": "f013",
+   "kind": "fixed",
+   "what": "re.M without re.S reads one line",
+   "file": "pipeline.py",
+   "symbol": "parse_header",
+   "at": "base",
+   "text": "re.search(r\"^Files:\\s*(.+)$\", text, re.M)",
+   "lines": [
+    44,
+    44
+   ]
+  },
+  {
+   "id": "f014",
+   "kind": "fixed",
+   "what": "off-by-one range",
+   "file": "pipeline.py",
+   "symbol": "count_steps",
+   "at": "base",
+   "text": "range(1, len(steps))",
+   "lines": [
+    50,
+    50
+   ]
+  },
+  {
+   "id": "f015",
+   "kind": "fixed",
+   "what": "exit 5 passes",
+   "file": "gates.py",
+   "symbol": "check_exit",
+   "at": "base",
+   "text": "returncode in (0, 5)",
+   "lines": [
+    6,
+    6
+   ]
+  },
+  {
+   "id": "f016",
+   "kind": "fixed",
+   "what": "declared directory not a prefix",
+   "file": "gates.py",
+   "symbol": "gate_paths",
+   "at": "base",
+   "text": "if f not in declared]",
+   "lines": [
+    11,
+    11
+   ]
+  },
+  {
+   "id": "f017",
+   "kind": "fixed",
+   "what": "guard after the action",
+   "file": "gates.py",
+   "symbol": "run_gate",
+   "at": "base",
+   "text": "apply(changes)\n    if not allowed:",
+   "lines": [
+    21,
+    22
+   ]
+  },
+  {
+   "id": "f018",
+   "kind": "fixed",
+   "what": "retry loop without a bound",
+   "file": "retry.py",
+   "symbol": "retry_call",
+   "at": "base",
+   "text": "while True:",
+   "lines": [
+    24,
+    24
+   ]
+  },
+  {
+   "id": "f019",
+   "kind": "fixed",
+   "what": "retries a permanent error",
+   "file": "retry.py",
+   "symbol": "retry_call",
+   "at": "base",
+   "text": "except Exception:\n            attempt += 1",
+   "lines": [
+    27,
+    28
+   ]
+  },
+  {
+   "id": "f020",
+   "kind": "fixed",
+   "what": "case-sensitive match",
+   "file": "retry.py",
+   "symbol": "is_transient",
+   "at": "base",
+   "text": "text = str(exc)\n",
+   "lines": [
+    12,
+    12
+   ]
+  },
+  {
+   "id": "f021",
+   "kind": "still",
+   "what": "bad value silently 0",
+   "file": "config.py",
+   "symbol": "load_workers",
+   "at": "base",
+   "text": "except ValueError:\n        return 0",
+   "lines": [
+    28,
+    29
+   ]
+  },
+  {
+   "id": "f022",
+   "kind": "still",
+   "what": "file handle leaked",
+   "file": "config.py",
+   "symbol": "read_config",
+   "at": "base",
+   "text": "handle = open(path, encoding=\"utf-8\")",
+   "lines": [
+    13,
+    13
+   ]
+  },
+  {
+   "id": "f023",
+   "kind": "still",
+   "what": "absolute name escapes the root",
+   "file": "paths.py",
+   "symbol": "safe_join",
+   "at": "base",
+   "text": "return os.path.join(root, name)",
+   "lines": [
+    20,
+    20
+   ]
+  },
+  {
+   "id": "f024",
+   "kind": "still",
+   "what": "non-atomic write",
+   "file": "store.py",
+   "symbol": "Store.save",
+   "at": "base",
+   "text": "with open(self.path, \"w\"",
+   "lines": [
+    30,
+    30
+   ]
+  },
+  {
+   "id": "f025",
+   "kind": "still",
+   "what": "stops at the first failure",
+   "file": "pipeline.py",
+   "symbol": "run_all",
+   "at": "base",
+   "text": "except StepError:\n            break",
+   "lines": [
+    37,
+    38
+   ]
+  },
+  {
+   "id": "f026",
+   "kind": "still",
+   "what": "print instead of logging",
+   "file": "pipeline.py",
+   "symbol": "log_step",
+   "at": "base",
+   "text": "print(f\"{name}: {status}\")",
+   "lines": [
+    54,
+    54
+   ]
+  },
+  {
+   "id": "f027",
+   "kind": "still",
+   "what": "deletions count as size",
+   "file": "gates.py",
+   "symbol": "gate_size",
+   "at": "base",
+   "text": "abs(added) + abs(deleted) <= limit",
+   "lines": [
+    16,
+    16
+   ]
+  },
+  {
+   "id": "f028",
+   "kind": "still",
+   "what": "PASS* over a partial rerun",
+   "file": "gates.py",
+   "symbol": "gate_flaky",
+   "at": "base",
+   "text": "if rerun(failed_ids) == 0:\n        return f\"PASS*{bad}\"",
+   "lines": [
+    29,
+    30
+   ]
+  },
+  {
+   "id": "f029",
+   "kind": "still",
+   "what": "uncapped backoff",
+   "file": "retry.py",
+   "symbol": "backoff",
+   "at": "base",
+   "text": "return base * 2 ** attempt",
+   "lines": [
+    18,
+    18
+   ]
+  },
+  {
+   "id": "f030",
+   "kind": "still",
+   "what": "deadline checked after the call",
+   "file": "retry.py",
+   "symbol": "with_deadline",
+   "at": "base",
+   "text": "result = fn()\n    if clock() > deadline:",
+   "lines": [
+    34,
+    35
+   ]
+  },
+  {
+   "id": "f031",
+   "kind": "gone",
+   "what": "renamed at head",
+   "file": "paths.py",
+   "symbol": "norm_path",
+   "at": "base",
+   "text": "def norm_path(path):\n    \"\"\"Lower-case *path* and drop trailing slashes.\"\"\"\n    return path.lower()",
+   "lines": [
+    6,
+    8
+   ]
+  },
+  {
+   "id": "f033",
+   "kind": "new",
+   "what": "regression: newline dropped",
+   "file": "store.py",
+   "symbol": "Store.save",
+   "at": "head",
+   "text": "ensure_ascii=False))\n",
+   "lines": [
+    32,
+    32
+   ]
+  },
+  {
+   "id": "f034",
+   "kind": "new",
+   "what": "regression: backoff dropped",
+   "file": "retry.py",
+   "symbol": "retry_call",
+   "at": "head",
+   "text": "            sleep(delay)\n",
+   "lines": [
+    29,
+    29
+   ]
+  }
+ ]
+}

@@ -1,0 +1,15 @@
+{
+ "note": "The targets of EPIC-CC.md section 6.2. Recorded by CC-0, enforced from CC-6 on (score_cc.py --thresholds exits 1 on a miss). A target is moved only with a note saying why, never silently.",
+ "targets": [
+  {"id": "fixture-code-coverage", "set": "fixture", "metric": "kinds.code.coverage", "op": ">=", "value": 0.60,
+   "note": "code claims decided unanimously on the fixture; the no-evidence baseline (BASELINE.md) is 0 by the tool's rule and near 0 in raw votes"},
+  {"id": "fixture-wrong-rate", "set": "fixture", "metric": "overall.wrong_rate", "op": "<=", "value": 0.03,
+   "note": "wrong among the unanimous verdicts on all 80 fixture claims"},
+  {"id": "real-wrong-rate", "set": "real", "metric": "overall.wrong_rate", "op": "<=", "value": 0.05,
+   "note": "wrong among the unanimous verdicts on the 30 real claims (truth by real_checks.py)"},
+  {"id": "fabricated-quotes-caught", "set": null, "metric": null, "op": ">=", "value": 1.0,
+   "note": "100 % of the injected fabricated quotes are downgraded; a deterministic test of CC-6 (verify_quotes), not a measure of a live run, so n/a here"},
+  {"id": "fixture-fix-right", "set": "fixture", "metric": "delta.fix_right", "op": ">=", "value": 0.90,
+   "note": "FIXED/STILL right on the fixture's 20 fixed + 10 still claims (CC-7's delta.json)"}
+ ]
+}

@@ -1,0 +1,1091 @@
+{
+ "set": "fixture",
+ "base_sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+ "head_sha": "5b24122fb5025836b1e7ef668802b5a9573ab096",
+ "note": "truth_base/truth_head computed by make_fixture.py from the probes; `truth` repeats truth_base for scripts/claim_vote.py",
+ "claims": [
+  {
+   "id": "f001",
+   "claim": "`config.load_timeout` reads `timeout` from the `[defaults]` section, not from `[pipeline]`.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "config.py",
+    "load_timeout"
+   ],
+   "expect": "fixed",
+   "how": "base: read config.py:20-20; head: read config.py:18-20"
+  },
+  {
+   "id": "f002",
+   "claim": "`config.parse_bool` returns True for the string \"0\".",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "config.py",
+    "parse_bool"
+   ],
+   "expect": "fixed",
+   "how": "base: read config.py:36-36; head: read config.py:32-36"
+  },
+  {
+   "id": "f003",
+   "claim": "`config.get_list` keeps the spaces around each item of the comma-separated list.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "config.py",
+    "get_list"
+   ],
+   "expect": "fixed",
+   "how": "base: read config.py:42-42; head: read config.py:39-42"
+  },
+  {
+   "id": "f004",
+   "claim": "`paths.is_inside` compares with a bare `startswith`, so `/a/bc` counts as inside `/a/b`.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "paths.py",
+    "is_inside"
+   ],
+   "expect": "fixed",
+   "how": "base: read paths.py:15-15; head: read paths.py:11-15"
+  },
+  {
+   "id": "f005",
+   "claim": "`paths.split_ext` drops the last character of the stem.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "paths.py",
+    "split_ext"
+   ],
+   "expect": "fixed",
+   "how": "base: read paths.py:28-28; head: read paths.py:23-28"
+  },
+  {
+   "id": "f006",
+   "claim": "`paths.write_marker` writes the file before it checks that the target is inside the root.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "paths.py",
+    "write_marker"
+   ],
+   "expect": "fixed",
+   "how": "base: read paths.py:35-36; head: read paths.py:31-38"
+  },
+  {
+   "id": "f007",
+   "claim": "`Store.items` in `store.py` returns a shallow copy, so nested values are shared with the store.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "store.py",
+    "Store.items"
+   ],
+   "expect": "fixed",
+   "how": "base: read store.py:46-46; head: read store.py:47-49"
+  },
+  {
+   "id": "f008",
+   "claim": "`Store.load` turns a file that is not valid JSON into an empty store instead of raising.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "store.py",
+    "Store.load"
+   ],
+   "expect": "fixed",
+   "how": "base: read store.py:22-23; head: read store.py:16-27"
+  },
+  {
+   "id": "f009",
+   "claim": "`Store.get` returns the default when the stored value is falsy, such as 0.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "store.py",
+    "Store.get"
+   ],
+   "expect": "fixed",
+   "how": "base: read store.py:35-35; head: read store.py:34-38"
+  },
+  {
+   "id": "f010",
+   "claim": "`Store.delete` raises KeyError for a key that is not in the store.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "store.py",
+    "Store.delete"
+   ],
+   "expect": "fixed",
+   "how": "base: read store.py:42-42; head: read store.py:43-45"
+  },
+  {
+   "id": "f011",
+   "claim": "`pipeline.run_step` swallows a KeyError raised by the step and returns None.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "pipeline.py",
+    "run_step"
+   ],
+   "expect": "fixed",
+   "how": "base: read pipeline.py:17-18; head: read pipeline.py:13-18"
+  },
+  {
+   "id": "f012",
+   "claim": "`pipeline.run_command` returns 0 when the command fails.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "pipeline.py",
+    "run_command"
+   ],
+   "expect": "fixed",
+   "how": "base: read pipeline.py:26-27; head: read pipeline.py:21-24"
+  },
+  {
+   "id": "f013",
+   "claim": "`pipeline.parse_header` reads only the first line of a `Files:` field that wraps onto the next line.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "pipeline.py",
+    "parse_header"
+   ],
+   "expect": "fixed",
+   "how": "base: read pipeline.py:44-44; head: read pipeline.py:38-41"
+  },
+  {
+   "id": "f014",
+   "claim": "`pipeline.count_steps` never counts the first step.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "pipeline.py",
+    "count_steps"
+   ],
+   "expect": "fixed",
+   "how": "base: read pipeline.py:50-50; head: read pipeline.py:44-46"
+  },
+  {
+   "id": "f015",
+   "claim": "`gates.check_exit` treats pytest's exit code 5 as a pass.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "gates.py",
+    "check_exit"
+   ],
+   "expect": "fixed",
+   "how": "base: read gates.py:6-6; head: read gates.py:4-6"
+  },
+  {
+   "id": "f016",
+   "claim": "`gates.gate_paths` reports a file under a declared directory such as `docs/` as undeclared.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "gates.py",
+    "gate_paths"
+   ],
+   "expect": "fixed",
+   "how": "base: read gates.py:11-11; head: read gates.py:9-12"
+  },
+  {
+   "id": "f017",
+   "claim": "`gates.run_gate` applies the changes before it checks `allowed`.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "gates.py",
+    "run_gate"
+   ],
+   "expect": "fixed",
+   "how": "base: read gates.py:21-22; head: read gates.py:20-25"
+  },
+  {
+   "id": "f018",
+   "claim": "`retry.retry_call` retries forever; it has no limit on the number of attempts.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "retry.py",
+    "retry_call"
+   ],
+   "expect": "fixed",
+   "how": "base: read retry.py:24-24; head: read retry.py:21-29"
+  },
+  {
+   "id": "f019",
+   "claim": "`retry.retry_call` retries on any Exception, not only on TransientError.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "retry.py",
+    "retry_call"
+   ],
+   "expect": "fixed",
+   "how": "base: read retry.py:27-28; head: read retry.py:21-29"
+  },
+  {
+   "id": "f020",
+   "claim": "`retry.is_transient` matches \"timeout\" case-sensitively, so \"Timeout\" is not transient.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "retry.py",
+    "is_transient"
+   ],
+   "expect": "fixed",
+   "how": "base: read retry.py:12-12; head: read retry.py:10-13"
+  },
+  {
+   "id": "f021",
+   "claim": "`config.load_workers` returns 0 when `workers` is not an integer.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "config.py",
+    "load_workers"
+   ],
+   "expect": "still",
+   "how": "base: read config.py:28-29; head: read config.py:28-29"
+  },
+  {
+   "id": "f022",
+   "claim": "`config.read_config` opens the file and never closes it.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "config.py",
+    "read_config"
+   ],
+   "expect": "still",
+   "how": "base: read config.py:13-13; head: read config.py:13-13"
+  },
+  {
+   "id": "f023",
+   "claim": "`paths.safe_join` does not reject an absolute `name`, so its result can leave `root`.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "paths.py",
+    "safe_join"
+   ],
+   "expect": "still",
+   "how": "base: read paths.py:20-20; head: read paths.py:20-20"
+  },
+  {
+   "id": "f024",
+   "claim": "`Store.save` writes the file in place, not through a temporary file and a rename.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "store.py",
+    "Store.save"
+   ],
+   "expect": "still",
+   "how": "base: read store.py:30-30; head: read store.py:31-31"
+  },
+  {
+   "id": "f025",
+   "claim": "`pipeline.run_all` stops at the first failing step and drops the steps after it.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "pipeline.py",
+    "run_all"
+   ],
+   "expect": "still",
+   "how": "base: read pipeline.py:37-38; head: read pipeline.py:33-34"
+  },
+  {
+   "id": "f026",
+   "claim": "`pipeline.log_step` prints with `print()` rather than through `logging`.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "pipeline.py",
+    "log_step"
+   ],
+   "expect": "still",
+   "how": "base: read pipeline.py:54-54; head: read pipeline.py:50-50"
+  },
+  {
+   "id": "f027",
+   "claim": "`gates.gate_size` adds the deleted lines to the added lines before comparing with the limit.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "gates.py",
+    "gate_size"
+   ],
+   "expect": "still",
+   "how": "base: read gates.py:16-16; head: read gates.py:17-17"
+  },
+  {
+   "id": "f028",
+   "claim": "`gates.gate_flaky` reports `PASS*` without checking that every failed test was rerun.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "gates.py",
+    "gate_flaky"
+   ],
+   "expect": "still",
+   "how": "base: read gates.py:29-30; head: read gates.py:30-31"
+  },
+  {
+   "id": "f029",
+   "claim": "`retry.backoff` has no upper bound on the wait it returns.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "retry.py",
+    "backoff"
+   ],
+   "expect": "still",
+   "how": "base: read retry.py:18-18; head: read retry.py:18-18"
+  },
+  {
+   "id": "f030",
+   "claim": "`retry.with_deadline` checks the deadline only after the call has returned.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "retry.py",
+    "with_deadline"
+   ],
+   "expect": "still",
+   "how": "base: read retry.py:34-35; head: read retry.py:34-35"
+  },
+  {
+   "id": "f031",
+   "claim": "`paths.norm_path` lower-cases the path it is given.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": null,
+   "anchors": [
+    "paths.py",
+    "norm_path"
+   ],
+   "expect": "gone",
+   "how": "base: read paths.py:6-8; head: no `norm_path` in paths.py"
+  },
+  {
+   "id": "f032",
+   "claim": "`paths.norm_path` strips every trailing slash, not just one.",
+   "kind": "code",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": null,
+   "anchors": [
+    "paths.py",
+    "norm_path"
+   ],
+   "expect": "gone",
+   "how": "base: read paths.py:6-8; head: no `norm_path` in paths.py"
+  },
+  {
+   "id": "f033",
+   "claim": "`Store.save` writes the JSON without a trailing newline.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": true,
+   "anchors": [
+    "store.py",
+    "Store.save"
+   ],
+   "expect": "new",
+   "how": "base: read store.py:28-31; head: read store.py:32-32"
+  },
+  {
+   "id": "f034",
+   "claim": "`retry.retry_call` waits the same `delay` before every retry instead of backing off.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": true,
+   "anchors": [
+    "retry.py",
+    "retry_call"
+   ],
+   "expect": "new",
+   "how": "base: read retry.py:21-29; head: read retry.py:29-29"
+  },
+  {
+   "id": "f035",
+   "claim": "`config.load_timeout` falls back to 60 seconds when the key is unset.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "config.py",
+    "load_timeout"
+   ],
+   "expect": null,
+   "how": "base: read config.py:18-20; head: read config.py:18-20"
+  },
+  {
+   "id": "f036",
+   "claim": "`config.load_name` returns None when `name` is unset.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "config.py",
+    "load_name"
+   ],
+   "expect": null,
+   "how": "base: read config.py:45-47; head: read config.py:45-47"
+  },
+  {
+   "id": "f037",
+   "claim": "`config.get_list` splits the value on semicolons.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "config.py",
+    "get_list"
+   ],
+   "expect": null,
+   "how": "base: read config.py:39-42; head: read config.py:39-42"
+  },
+  {
+   "id": "f038",
+   "claim": "`paths.is_inside` resolves symlinks with `os.path.realpath` before comparing.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "paths.py",
+    "is_inside"
+   ],
+   "expect": null,
+   "how": "base: read paths.py:11-15; head: read paths.py:11-15"
+  },
+  {
+   "id": "f039",
+   "claim": "`paths.split_ext` treats the whole of `.bashrc` as an extension.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "paths.py",
+    "split_ext"
+   ],
+   "expect": null,
+   "how": "base: read paths.py:23-28; head: read paths.py:23-28"
+  },
+  {
+   "id": "f040",
+   "claim": "`paths.marker_names` returns the marker files in modification-time order.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "paths.py",
+    "marker_names"
+   ],
+   "expect": null,
+   "how": "base: read paths.py:41-43; head: read paths.py:41-43"
+  },
+  {
+   "id": "f041",
+   "claim": "`Store.load` raises StoreError when the file does not exist.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "store.py",
+    "Store.load"
+   ],
+   "expect": null,
+   "how": "base: read store.py:15-26; head: read store.py:16-27"
+  },
+  {
+   "id": "f042",
+   "claim": "`Store.put` refuses to overwrite a key that is already in the store.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "store.py",
+    "Store.put"
+   ],
+   "expect": null,
+   "how": "base: read store.py:37-38; head: read store.py:40-41"
+  },
+  {
+   "id": "f043",
+   "claim": "`Store.__len__` counts only the keys whose value is not None.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "store.py",
+    "Store.__len__"
+   ],
+   "expect": null,
+   "how": "base: read store.py:48-49; head: read store.py:51-52"
+  },
+  {
+   "id": "f044",
+   "claim": "`pipeline.run_command` passes `check=True`, so a failing command raises CalledProcessError.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "pipeline.py",
+    "run_command"
+   ],
+   "expect": null,
+   "how": "base: read pipeline.py:23-28; head: read pipeline.py:21-24"
+  },
+  {
+   "id": "f045",
+   "claim": "`pipeline.run_step` retries a failing step once before raising StepError.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "pipeline.py",
+    "run_step"
+   ],
+   "expect": null,
+   "how": "base: read pipeline.py:13-20; head: read pipeline.py:13-18"
+  },
+  {
+   "id": "f046",
+   "claim": "`pipeline.parse_header` matches the `Files:` label case-insensitively.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "pipeline.py",
+    "parse_header"
+   ],
+   "expect": null,
+   "how": "base: read pipeline.py:42-45; head: read pipeline.py:38-41"
+  },
+  {
+   "id": "f047",
+   "claim": "`gates.check_exit` treats exit code 1 as a pass.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "gates.py",
+    "check_exit"
+   ],
+   "expect": null,
+   "how": "base: read gates.py:4-6; head: read gates.py:4-6"
+  },
+  {
+   "id": "f048",
+   "claim": "`gates.summary_line` prints `PASS` for a gate that passed.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "gates.py",
+    "summary_line"
+   ],
+   "expect": null,
+   "how": "base: read gates.py:34-35; head: read gates.py:35-36"
+  },
+  {
+   "id": "f049",
+   "claim": "`retry.backoff` starts from a base of 1 second by default.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "retry.py",
+    "backoff"
+   ],
+   "expect": null,
+   "how": "base: read retry.py:16-18; head: read retry.py:16-18"
+  },
+  {
+   "id": "f050",
+   "claim": "`retry.with_deadline` uses `time.time` as its default clock.",
+   "kind": "code",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "retry.py",
+    "with_deadline"
+   ],
+   "expect": null,
+   "how": "base: read retry.py:32-37; head: read retry.py:32-37"
+  },
+  {
+   "id": "f051",
+   "claim": "In Python's `re` module, `re.M` makes `^` and `$` match at every line boundary.",
+   "kind": "world",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: re.MULTILINE (Python docs, `re`)"
+  },
+  {
+   "id": "f052",
+   "claim": "`subprocess.run` does not raise on a non-zero exit status unless `check=True` is passed.",
+   "kind": "world",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: subprocess.run (Python docs)"
+  },
+  {
+   "id": "f053",
+   "claim": "`copy.copy` of a dict that holds lists shares those lists with the original.",
+   "kind": "world",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: shallow copy (Python docs, `copy`)"
+  },
+  {
+   "id": "f054",
+   "claim": "`configparser` section names are case-sensitive.",
+   "kind": "world",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: configparser docs (sections are case-sensitive, keys are not)"
+  },
+  {
+   "id": "f055",
+   "claim": "`json.dumps` escapes non-ASCII characters by default.",
+   "kind": "world",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: ensure_ascii defaults to True"
+  },
+  {
+   "id": "f056",
+   "claim": "`re.S` makes `^` match at the start of every line.",
+   "kind": "world",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: re.S is DOTALL, `.` matches newline; `^` is re.M"
+  },
+  {
+   "id": "f057",
+   "claim": "`str.rstrip('/')` removes at most one trailing slash.",
+   "kind": "world",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: rstrip removes every trailing character in the set"
+  },
+  {
+   "id": "f058",
+   "claim": "`dict.get(key, default)` returns the default when the stored value is None.",
+   "kind": "world",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: get returns the stored None; default only for a missing key"
+  },
+  {
+   "id": "f059",
+   "claim": "Python's `range(1, n)` yields n items.",
+   "kind": "world",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: range(1, n) yields n - 1 items"
+  },
+  {
+   "id": "f060",
+   "claim": "`except Exception` catches KeyboardInterrupt.",
+   "kind": "world",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [],
+   "expect": null,
+   "how": "world fact: KeyboardInterrupt derives from BaseException"
+  },
+  {
+   "id": "f061",
+   "claim": "`pipeline.run_command` passes `check=False` to `subprocess.run`, which then does not raise on a non-zero exit.",
+   "kind": "mixed",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "pipeline.py",
+    "run_command"
+   ],
+   "expect": null,
+   "how": "base: read pipeline.py:25-25; head: read pipeline.py:23-23; plus the world part: true"
+  },
+  {
+   "id": "f062",
+   "claim": "`pipeline.parse_header` uses `re.M` without `re.S`, so `.` in its pattern does not match a newline.",
+   "kind": "mixed",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": false,
+   "anchors": [
+    "pipeline.py",
+    "parse_header"
+   ],
+   "expect": null,
+   "how": "base: read pipeline.py:44-44; head: read pipeline.py:38-41; plus the world part: true"
+  },
+  {
+   "id": "f063",
+   "claim": "`Store.save` passes `ensure_ascii=False`, so non-ASCII characters are written as themselves.",
+   "kind": "mixed",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "store.py",
+    "Store.save"
+   ],
+   "expect": null,
+   "how": "base: read store.py:31-31; head: read store.py:32-32; plus the world part: true"
+  },
+  {
+   "id": "f064",
+   "claim": "`config.read_config` uses `configparser.ConfigParser`, whose option names are case-sensitive.",
+   "kind": "mixed",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "config.py",
+    "read_config"
+   ],
+   "expect": null,
+   "how": "base: read config.py:12-12; head: read config.py:12-12; plus the world part: false"
+  },
+  {
+   "id": "f065",
+   "claim": "`paths.split_ext` uses `str.rfind`, which returns -1 when the dot is absent.",
+   "kind": "mixed",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "paths.py",
+    "split_ext"
+   ],
+   "expect": null,
+   "how": "base: read paths.py:25-25; head: read paths.py:25-25; plus the world part: true"
+  },
+  {
+   "id": "f066",
+   "claim": "`gates.check_exit` accepts exit code 5, which is the code pytest uses for an internal error.",
+   "kind": "mixed",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "gates.py",
+    "check_exit"
+   ],
+   "expect": null,
+   "how": "base: read gates.py:6-6; head: read gates.py:4-6; plus the world part: false"
+  },
+  {
+   "id": "f067",
+   "claim": "`retry.retry_call` uses `time.sleep` as its default sleep, which takes seconds as a float.",
+   "kind": "mixed",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "retry.py",
+    "retry_call"
+   ],
+   "expect": null,
+   "how": "base: read retry.py:21-21; head: read retry.py:21-21; plus the world part: true"
+  },
+  {
+   "id": "f068",
+   "claim": "`Store.items` builds its copy with `dict()`, and `dict()` of a dict copies the nested lists too.",
+   "kind": "mixed",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "store.py",
+    "Store.items"
+   ],
+   "expect": null,
+   "how": "base: read store.py:46-46; head: read store.py:47-49; plus the world part: false"
+  },
+  {
+   "id": "f069",
+   "claim": "`scheduler.py` runs the pipeline's steps in parallel threads.",
+   "kind": "dangling",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "scheduler.py"
+   ],
+   "expect": null,
+   "how": "base: no file scheduler.py; head: no file scheduler.py"
+  },
+  {
+   "id": "f070",
+   "claim": "`Store.compact` in `store.py` removes the keys whose value is None.",
+   "kind": "dangling",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "store.py",
+    "Store.compact"
+   ],
+   "expect": null,
+   "how": "base: no `Store.compact` in store.py; head: no `Store.compact` in store.py"
+  },
+  {
+   "id": "f071",
+   "claim": "`gates.check_coverage` fails a change whose coverage is below 80 %.",
+   "kind": "dangling",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "gates.py",
+    "check_coverage"
+   ],
+   "expect": null,
+   "how": "base: no `check_coverage` in gates.py; head: no `check_coverage` in gates.py"
+  },
+  {
+   "id": "f072",
+   "claim": "`retry.retry_async` awaits the call between retries.",
+   "kind": "dangling",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "retry.py",
+    "retry_async"
+   ],
+   "expect": null,
+   "how": "base: no `retry_async` in retry.py; head: no `retry_async` in retry.py"
+  },
+  {
+   "id": "f073",
+   "claim": "`config.load_profile` reads the `[profile]` section.",
+   "kind": "dangling",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "config.py",
+    "load_profile"
+   ],
+   "expect": null,
+   "how": "base: no `load_profile` in config.py; head: no `load_profile` in config.py"
+  },
+  {
+   "id": "f074",
+   "claim": "`paths.expand_user` expands a leading `~` in a path.",
+   "kind": "dangling",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "paths.py",
+    "expand_user"
+   ],
+   "expect": null,
+   "how": "base: no `expand_user` in paths.py; head: no `expand_user` in paths.py"
+  },
+  {
+   "id": "f075",
+   "claim": "Ticket `epic-tasks/01-store-errors.md` has the status done.",
+   "kind": "ticket",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": true,
+   "anchors": [
+    "epic-tasks/01-store-errors.md"
+   ],
+   "expect": null,
+   "how": "base: read epic-tasks/01-store-errors.md (the text is absent); head: read epic-tasks/01-store-errors.md:3-3"
+  },
+  {
+   "id": "f076",
+   "claim": "Ticket `epic-tasks/02-store-get.md` declares `store.py` in its **File:** field.",
+   "kind": "ticket",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "epic-tasks/02-store-get.md"
+   ],
+   "expect": null,
+   "how": "base: read epic-tasks/02-store-get.md:4-4; head: read epic-tasks/02-store-get.md:4-4"
+  },
+  {
+   "id": "f077",
+   "claim": "Ticket `epic-tasks/03-retry-bound.md` is marked done.",
+   "kind": "ticket",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "epic-tasks/03-retry-bound.md"
+   ],
+   "expect": null,
+   "how": "base: read epic-tasks/03-retry-bound.md:3-3; head: read epic-tasks/03-retry-bound.md:3-3"
+  },
+  {
+   "id": "f078",
+   "claim": "Commit d36d59e adds `retry.py`.",
+   "kind": "commit",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "d36d59e"
+   ],
+   "expect": null,
+   "how": "git show --stat --format= d36d59e60eda0da6b04b0e230abeea4ab75b4aaf"
+  },
+  {
+   "id": "f079",
+   "claim": "Commit d36d59e changes only `config.py`.",
+   "kind": "commit",
+   "truth": false,
+   "truth_base": false,
+   "truth_head": false,
+   "anchors": [
+    "d36d59e"
+   ],
+   "expect": null,
+   "how": "git show --stat --format= d36d59e60eda0da6b04b0e230abeea4ab75b4aaf"
+  },
+  {
+   "id": "f080",
+   "claim": "The subject of commit d36d59e is `fixture: base`.",
+   "kind": "commit",
+   "truth": true,
+   "truth_base": true,
+   "truth_head": true,
+   "anchors": [
+    "d36d59e"
+   ],
+   "expect": null,
+   "how": "git log -1 --format=%s d36d59e60eda0da6b04b0e230abeea4ab75b4aaf"
+  }
+ ]
+}
