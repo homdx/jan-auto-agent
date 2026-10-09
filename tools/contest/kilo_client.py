@@ -150,7 +150,14 @@ def _retry_past_the_bound(wait: float | None, attempt, named: bool,
     *wait* is seconds to the retry, ``None`` when Kilo gave no (numeric) time —
     then only a quota phrase decides, as before. An ``attempt`` that is no
     number counts as the first retry: today's verdict, fail-open.
+
+    Bug 210/49: a ``NaN`` *wait* is no time at all — ``nan <= bound`` is
+    False, so it fell through and read as a long delay (``"quota"`` on a first
+    retry, ``"backoff"`` after). It is treated as ``None``: "Kilo gave no
+    numeric time". ``inf`` is a real, very long delay and stays one.
     """
+    if wait is not None and wait != wait:      # NaN is the one value unequal to itself
+        wait = None
     if wait is None:
         return "quota" if named else None
     if wait <= bound:

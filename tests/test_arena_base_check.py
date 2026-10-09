@@ -153,10 +153,16 @@ def _cache(repo: Path) -> dict:
 
 
 def _pass_entry() -> dict:
-    """A stored pass of the shape `run_base_check` writes."""
+    """A stored pass of the shape `run_base_check` writes, one row per step.
+
+    Ticket 210 (bug 45): a hit needs every step of the current list among the
+    stored rows, so the entry names all four; two summaries are empty.
+    """
     return {"at": 1, "ok": True,
             "steps": [{"step": "tests", "ok": True, "seconds": 0.1, "summary": "s"},
-                       {"step": "tiers", "ok": True, "seconds": 0.0, "summary": ""}]}
+                       {"step": "tests_bugfix", "ok": True, "seconds": 0.1, "summary": "s"},
+                       {"step": "tiers", "ok": True, "seconds": 0.0, "summary": ""},
+                       {"step": "clocks", "ok": True, "seconds": 0.0}]}
 
 
 def _detached(tree: Path) -> bool:
@@ -343,7 +349,20 @@ def test_a_cached_row_without_a_summary_is_just_cached(repo, monkeypatch, capsys
     monkeypatch.setattr(basecheck, "RUN", rec)
     code, out, _ = _check(capsys, "-o", "json")
     assert code == 0 and rec.calls == []
-    assert [r["summary"] for r in json.loads(out)] == ["s (cached)", "(cached)"]
+    assert [r["summary"] for r in json.loads(out)] == ["s (cached)", "s (cached)",
+                                                       "(cached)", "(cached)"]
+
+
+def test_a_stored_pass_missing_a_current_step_is_no_hit(repo, monkeypatch, capsys):
+    """Ticket 210 (bug 45): a pass stored before a step was added is run again."""
+    _install(good_steps(), monkeypatch)
+    entry = _pass_entry()
+    entry["steps"] = [s for s in entry["steps"] if s["step"] != "clocks"]
+    _write(repo.root / ".arena" / "base-check.json", json.dumps({repo.head: entry}))
+    rec = Recorder()
+    monkeypatch.setattr(basecheck, "RUN", rec)
+    code, out, _ = _check(capsys)
+    assert code == 0 and len(rec.calls) == 4 and "cached" not in out
 
 
 def test_force_ignores_the_cache(repo, monkeypatch, capsys):

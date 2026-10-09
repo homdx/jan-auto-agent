@@ -223,11 +223,21 @@ def write_cache(repo: Path, cache: Mapping[str, dict]) -> bool:
             pass
 
 
-def _hit(cache: Mapping[str, dict], sha: str) -> Optional[list[dict]]:
+def _hit(cache: Mapping[str, dict], sha: str,
+         names: Optional[Sequence[str]] = None) -> Optional[list[dict]]:
     """The stored step rows for *sha*, when it was a pass; else None.
 
     Only a pass is a hit — a red base is run again next time — and a stored entry
     that is not what was written is no hit at all: fail-open to a real run.
+
+    Bug 210/45: a pass is a pass *for a step list*. A pass stored when there
+    were three steps said nothing about a fourth added since, yet it was a hit
+    and the table printed three rows and a green verdict for a check that never
+    ran. Now every name in *names* (the steps this run would run; `None` is the
+    current `STEPS`) must be among the stored rows, or it is no hit and the check
+    runs for real, overwriting the entry. Nothing else is required — a stored
+    row for a step since dropped does not spoil the hit — and the cache keeps
+    its format.
     """
     entry = cache.get(sha)
     if not isinstance(entry, dict) or entry.get("ok") is not True:
@@ -254,7 +264,11 @@ def _hit(cache: Mapping[str, dict], sha: str) -> Optional[list[dict]]:
         })
     # A hit is a pass, so every stored step must have passed too: a mangled or
     # red entry is no hit at all and is run for real.
-    return rows if rows and all(row["ok"] for row in rows) else None
+    if not rows or not all(row["ok"] for row in rows):
+        return None
+    wanted = [name for name, _ in STEPS] if names is None else list(names)
+    stored = {row["step"] for row in rows}
+    return rows if all(name in stored for name in wanted) else None
 
 
 def _summary(step: Step, proc: subprocess.CompletedProcess) -> str:
@@ -363,7 +377,7 @@ def run_base_check(
         return EXIT_OK
 
     if not getattr(args, "force", False):
-        hit = _hit(read_cache(repo), sha)
+        hit = _hit(read_cache(repo), sha, [step.name for step in steps])
         if hit is not None:
             _print(hit, sha, fmt)
             return EXIT_OK

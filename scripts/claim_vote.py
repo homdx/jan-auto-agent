@@ -104,11 +104,69 @@ def read_ini(root: Path) -> configparser.ConfigParser:
     return parser
 
 
+def strip_jsonc_comments(text: str) -> str:
+    """*text* with its JSONC comments gone, every string literal left as it was.
+
+    Bug 210/48: ``kilo.jsonc`` is JSONC, and the old reader dropped only a line
+    that was *nothing but* a ``//`` comment. A comment after a value
+    (``"baseURL": "https://x", // note``) or a ``/* … */`` block reached
+    ``json.loads`` and ``--add-profiles`` / ``--models`` died with a traceback.
+    This walks the text once and knows when it is inside a string, so a ``//``
+    in ``"https://…"`` is the string's, not a comment. A ``//`` comment ends at
+    the line's end (the newline is kept, so a parse error still names the right
+    line); a ``/* … */`` block becomes one space, so it never glues two tokens
+    together; an unterminated block simply runs to the end of the text and the
+    JSON that is left decides whether it parses.
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            # a string literal, copied whole: a backslash escapes the next
+            # character (``\"`` does not end it), and nothing in it is a comment
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            out.append(" ")
+            i = n if end < 0 else end + 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def _kilo_settings(ref: str) -> LlmSettings:
-    """``provider/model`` -> settings from Kilo's own files; the key is never printed."""
+    """``provider/model`` -> settings from Kilo's own files; the key is never printed.
+
+    Bug 210/48: ``kilo.jsonc`` is read as JSONC (``strip_jsonc_comments``), and a file
+    that still does not parse is one ``ValueError`` line naming the file and
+    the place — never the text itself, which may carry a key — so ``ask``
+    records it as the voter's error and ``--add-profiles`` refuses with it. A
+    config that parses but has no such provider is the same one-line error.
+    """
     provider, model = ref.split("/", 1)
-    text = re.sub(r"^\s*//.*$", "", KILO_CONFIG.read_text(encoding="utf-8"), flags=re.M)
-    base = json.loads(text)["provider"][provider]["options"]["baseURL"]
+    try:
+        config = json.loads(strip_jsonc_comments(KILO_CONFIG.read_text(encoding="utf-8")))
+    except json.JSONDecodeError as err:
+        raise ValueError(f"{KILO_CONFIG}: not valid JSONC "
+                         f"(line {err.lineno}, column {err.colno}: {err.msg})") from None
+    try:
+        base = config["provider"][provider]["options"]["baseURL"]
+    except (KeyError, TypeError, IndexError):
+        # `[]`, `{"provider": {}}` or a provider without options: one line too, a
+        # TypeError was the traceback `--add-profiles` still printed
+        raise ValueError(f"{KILO_CONFIG}: no provider {provider!r} with "
+                         "options.baseURL") from None
+    if not isinstance(base, str):
+        raise ValueError(f"{KILO_CONFIG}: provider {provider!r} options.baseURL is not a string")
     key = json.loads(KILO_AUTH.read_text(encoding="utf-8"))[provider]["key"]
     return LlmSettings(base_url=base.rstrip("/"), api_key=key, model=model,
                        temperature=0.3, max_tokens=4000)
@@ -318,7 +376,15 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.add_profiles:
-        for name in add_profiles(args.add_profiles, args.repo_root):
+        # Bug 210/48: Kilo's files unreadable, unparsable or without the
+        # provider is one refusal line on stderr and exit 2, not a traceback.
+        try:
+            names = add_profiles(args.add_profiles, args.repo_root)
+        except (ValueError, OSError, KeyError) as exc:
+            detail = f"no {exc} entry" if isinstance(exc, KeyError) else str(exc)
+            print(f"claim_vote: --add-profiles refused: {detail}", file=sys.stderr)
+            return 2
+        for name in names:
             print(f"[{name}] in {roster.LOCAL_FILENAME}")
         return 0
     parser = read_ini(args.repo_root)
@@ -330,6 +396,13 @@ def main(argv: list[str] | None = None) -> int:
         n.strip() for n in parser.get(SECTION, "llm_profiles", fallback="").split(",") if n.strip()]
     if not args.claims or not voters:
         ap.error("need claims.json and voters: --profiles, --models, or [claim_vote] llm_profiles")
+    if len(voters) < MIN_COMMITTED:
+        # Bug 210/46: below the quorum no claim can ever be accepted — `tally`
+        # needs MIN_COMMITTED committed models — and the table was all UNSURE
+        # with no word why. One line says so before the run; the run goes on
+        # (its votes are still worth reading) and the exit code is unchanged.
+        print(f"claim_vote: {len(voters)} voters, quorum is {MIN_COMMITTED}: "
+              "no claim can be accepted", file=sys.stderr)
 
     raw = json.loads(args.claims.read_text(encoding="utf-8"))
     claims = [c if isinstance(c, dict) else {"claim": c, "truth": None} for c in raw]
