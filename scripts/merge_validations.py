@@ -76,11 +76,15 @@ def agreement_of(rs, n_reviewers):
 
 
 def verdicts_by_reviewer(rs):
-    """`{reviewer: "A"}`, or `"A|B"` for a reviewer who gave two verdicts."""
+    """`{reviewer: "A"}`, or `"A|B"` for a reviewer who gave two verdicts.
+
+    A blank row is no verdict, as `agreement_of` reads it: a reviewer with a blank and a
+    CONFIRMED row said CONFIRMED, not `|CONFIRMED`. Blank only when every row is blank.
+    """
     by_rv = defaultdict(set)
     for r in rs:
         by_rv[r["_reviewer"]].add(verdict_of(r))
-    return {rv: "|".join(sorted(vs)) for rv, vs in by_rv.items()}
+    return {rv: "|".join(sorted(vs - {""} or vs)) for rv, vs in by_rv.items()}
 
 
 def key_of(r):
@@ -149,7 +153,9 @@ def main():
         if kind == "SOLO":
             singleton.append((k, rs))
         elif kind == "UNANIMOUS":
-            unanimous.append((k, rs, next(iter(set(verdicts.values())))))
+            # the one verdict given; a reviewer who left it blank does not make it ""
+            agreed = set(verdicts.values()) - {""}
+            unanimous.append((k, rs, agreed.pop() if agreed else ""))
         else:
             split.append((k, rs, verdicts))
 

@@ -42,7 +42,7 @@ DENIED = {
     "esc-sq-in-dq": "echo '\"'; git push",
     "esc-dq-in-dq": 'echo "a\\"b"; git push',
     # 10 — escaped ; stays an argument, but a real one after it still separates
-    "esc-semi-then-real": "echo a \; b; git push",
+    "esc-semi-then-real": "echo a \\; b; git push",
     # heredoc: the line after the body, the rest of the delimiter's line
     "hd-after": "cat <<EOF\nhi\nEOF\ngit push",
     "hd-after-quoted": "cat <<'EOF'\nx\nEOF\ngit push",
@@ -66,8 +66,8 @@ ALLOWED = {
     "plain-other": "git status",
     "echo": "echo hi",
     "sq-literal": "echo '$(git push)'",
-    "esc-semi": "echo \; git push",
-    "find-exec": "find . -exec ls {} \;",
+    "esc-semi": "echo \\; git push",
+    "find-exec": "find . -exec ls {} \\;",
     "hd-body-semi": "cat > f <<'EOF'\nx; git push\nEOF",
     "hd-body-semi-unquoted": "cat > f <<EOF\nx; git push\nEOF",
     "hd-body-dash": "cat <<-EOF\n\tx; git push\n\tEOF",

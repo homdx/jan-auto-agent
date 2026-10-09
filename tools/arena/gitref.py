@@ -96,7 +96,8 @@ def status_paths(repo: Path, pathspec: Optional[str] = None,
             continue
         if len(record) < 3 or record[2] != " ":
             continue  # not `XY<space>path`: an unreadable record, skipped
-        renamed = record[0] in ("R", "C")
+        # either column: a rename found in the work tree (`git add -N`) is ` R new\0old`
+        renamed = "R" in record[:2] or "C" in record[:2]
         if tracked_only and record[:2] == "??":
             continue
         out.append(record[3:])
