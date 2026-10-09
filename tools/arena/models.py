@@ -632,11 +632,14 @@ def write_models(repo: Path, name: str, value: str) -> None:
     write_profile_keys(repo, name, {"models": value})
 
 
-def _confirm(name: str, before: str, after: str, yes: bool) -> bool:
-    """Print `models =` before → after; ask unless *yes*. EOF is a no."""
+def _confirm(name: str, before: str, after: str, yes: bool,
+             extra: Optional[dict] = None) -> bool:
+    """Print `models =` before → after (and the *extra* keys); ask unless *yes*. EOF is a no."""
     print(f"profile {name!r} — models =")
     print(f"  before: {before or '(none)'}")
     print(f"  after:  {after}")
+    for key, value in (extra or {}).items():
+        print(f"  also:   {key} = {value if value is not None else '(removed)'}")
     if yes:
         return True
     try:
@@ -1142,12 +1145,15 @@ def use(repo: Path, args: argparse.Namespace) -> int:
         check_not_judge(repo, entries)
         before = profiles.get(name, {}).get("models", "").strip()
         after = ",".join(entries)
-        if before == after:
+        # 211: the profile's other keys in the same call (`--set KEY=VALUE`)
+        extra = dict(getattr(args, "set_values", None) or {})
+        if before == after and not extra:
             print(f"profile {name!r}: models = {after} (unchanged)")
             return EXIT_OK
-        if not _confirm(name, before, after, args.yes):
+        if not _confirm(name, before, after, args.yes, extra):
             raise ModelError(f"not applied — {roster.LOCAL_FILENAME} unchanged")
-        write_models(repo, name, after)
+        write_profile_keys(repo, name, {**({"models": after} if before != after else {}),
+                                        **extra})
     except (ModelError, profile.ProfileError) as err:
         return output.refuse(str(err))
     return EXIT_OK

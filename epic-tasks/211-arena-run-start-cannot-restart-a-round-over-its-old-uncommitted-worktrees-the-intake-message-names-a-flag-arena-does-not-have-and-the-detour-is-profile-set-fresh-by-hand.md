@@ -1,6 +1,6 @@
 # 211 — arena cannot restart a round over its old uncommitted worktrees: the intake message names a flag `arena run start` does not have, and the way out is a hand-run `contest` call or a profile edit and its undo
 
-**Status:** queued
+**Status:** landed
 **Origin:** operator session, round 198 relaunch on the new profile `p198` (2026-10-08); the operator asked "why was it started like this and not through arena — is that a bug?"
 **Severity:** MEDIUM (a missing arena path; the first answer given to the operator was a bypass of arena)
 **File:** tools/arena/cli.py

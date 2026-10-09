@@ -258,6 +258,12 @@ def _run_start_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--branch", help="integration branch (default: profile's branch, then HEAD)")
     p.add_argument("--fresh-ticket", action="store_true",
                    help="rebuild arena-round/NN when it holds another ticket text or tip")
+    p.add_argument("--fresh", action="store_true",
+                   help="discard the old round's uncommitted worktrees (this start only, "
+                        "never stored in the profile)")
+    p.add_argument("--no-backup", action="store_true",
+                   help="with --fresh: do not copy contest-out/NN aside first")
+    _late_globals(p, "y")
 
 
 def _run_start(args: argparse.Namespace) -> int:
@@ -265,6 +271,7 @@ def _run_start(args: argparse.Namespace) -> int:
         profiles, active = _load(args)
     except profile.ProfileError as err:
         return output.refuse(str(err))
+    args.active_profile = active
     # no profile file, or no profile by the active name: no profile flags
     return rounds.run_start(REPO_ROOT, args, profiles.get(active, {}))
 
@@ -549,7 +556,19 @@ def _model_test(args: argparse.Namespace) -> int:
     return models.test(REPO_ROOT, args)
 
 
+def _model_use_arguments(p: argparse.ArgumentParser) -> None:
+    _model_names_arguments(p)
+    p.add_argument("--set", dest="set_pairs", action="append", nargs="+", default=[],
+                   metavar="KEY=VALUE",
+                   help="also set the profile's other keys (repeatable): "
+                        "--set max_parallel=15 branch=arena")
+
+
 def _model_use(args: argparse.Namespace) -> int:
+    try:
+        args.set_values = _set_values([w for group in args.set_pairs for w in group])
+    except profile.ProfileError as err:
+        return output.refuse(str(err))
     return models.use(REPO_ROOT, args)
 
 
@@ -613,7 +632,7 @@ OBJECTS: dict[str, Object] = {
             "use": Verb(
                 "set a profile's models by name",
                 "AR-59",
-                add_arguments=_model_names_arguments,
+                add_arguments=_model_use_arguments,
                 handler=_model_use,
             ),
             "drop": Verb(

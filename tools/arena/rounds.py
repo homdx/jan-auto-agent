@@ -41,7 +41,7 @@ from scripts.revive_round import (BACKUP_NAME, DEAD_STATE, REVIVE, REVIVED_STATE
                                   leg_folders,
                                   revive_agents)
 from tools.contest import cli as contest_cli
-from tools.contest import roster
+from tools.contest import roster, workspace
 
 from . import output, profile
 from .gitref import (GitRefError, commit_file_on, git, ls_tree_names, read_utf8,
@@ -370,6 +370,93 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
     return _map_exit(code, state, started, written)
 
 
+# ── 211: the old round's uncommitted worktrees, and the one-shot `--fresh` ───
+def dirty_worktrees(repo: Path, config, nn: int) -> list[tuple[Path, int, int]]:
+    """`(worktree, modified, untracked)` for each `<rounds_dir>/NN-*` holding uncommitted work.
+
+    The same read the runner's intake refuses on (`workspace._dirty_outside_runs`:
+    the round's own `runs/` scratch is not work). `RoundError` when git cannot
+    answer — a tree that cannot be read is not reported clean.
+    """
+    root = workspace._resolve_rounds_dir(Path(repo), str(config.rounds_dir))
+    found = []
+    if not root.is_dir():
+        return found
+    for tree in sorted(root.glob(f"{nn:02d}-*")):
+        if not (tree / ".git").exists():
+            continue
+        try:
+            lines = workspace._dirty_outside_runs(tree)
+        except workspace.WorkspaceError as err:
+            raise RoundError(str(err)) from err
+        if lines:
+            untracked = sum(1 for line in lines if line.startswith("??"))
+            found.append((tree, len(lines) - untracked, untracked))
+    return found
+
+
+def _tree_label(repo: Path, tree: Path) -> str:
+    try:
+        return str(tree.relative_to(Path(repo).resolve()))
+    except ValueError:
+        return str(tree)
+
+
+def _refusal_over_dirty(repo: Path, nn: int, dirty: list[tuple[Path, int, int]]) -> str:
+    """The intake's refusal in arena's words: what to run in arena, not in `tools.contest`."""
+    names = ", ".join(_tree_label(repo, t) for t, _m, _u in dirty[:3])
+    more = f" and {len(dirty) - 3} more" if len(dirty) > 3 else ""
+    return (f"{names}{more} hold{'s' if len(dirty) == 1 else ''} uncommitted work from the "
+            f"old round — rerun with `arena run start {nn} --fresh` to discard it, or "
+            f"`arena run rerun {nn} --failed` to continue it")
+
+
+def _print_dirty(repo: Path, dirty: list[tuple[Path, int, int]]) -> None:
+    for tree, modified, untracked in dirty:
+        print(output.scrub(f"  {_tree_label(repo, tree)}: M {modified}, ?? {untracked}"))
+
+
+def _profile_name(args: argparse.Namespace) -> str:
+    """The profile this start runs on: the one `cli` resolved, else `-p`, else `default`."""
+    return getattr(args, "active_profile", None) or getattr(args, "profile", None) or "default"
+
+
+def _confirm_discard(count: int, yes: bool) -> bool:
+    """`discard N worktrees? [y/N]`; `-y` skips the question, no terminal is a no."""
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return input(f"discard {count} worktree{'s' if count != 1 else ''}? [y/N] "
+                     ).strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def backup_round_folder(repo: Path, config, nn: int, name: str) -> Optional[Path]:
+    """Copy `<out_dir>/NN` to `NN.<name>-<UTC stamp>` beside it; never over an existing folder.
+
+    None when the round has no folder yet. The result never matches `_ROUND_DIR`,
+    so `run list` and `run view` do not take it for a leg.
+    """
+    base = contest_cli._round_out_dir(Path(repo), config, nn)
+    if not base.is_dir():
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = base.with_name(f"{base.name}.{name}-{stamp}")
+    extra = 1
+    while target.exists():
+        extra += 1
+        target = base.with_name(f"{base.name}.{name}-{stamp}-{extra}")
+    try:
+        shutil.copytree(base, target, symlinks=True)
+    except (OSError, shutil.Error) as err:
+        shutil.rmtree(target, ignore_errors=True)
+        raise RoundError(f"cannot back up {base}: {err}") from err
+    return target
+
+
 def run_start(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int:
     """`arena run start NN`: refusals first, then the ref, the record and the child."""
     repo = Path(repo)
@@ -390,12 +477,39 @@ def run_start(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
         if dirty:
             raise RoundError(f"{TASKS_DIR}/ has uncommitted files: {', '.join(dirty)} — "
                              "move drafts to .arena/drafts/")
+        # 211: `--fresh` is a spoken word — this flag, or the profile's `fresh=yes`
+        # (named, never silent), or one after `--`; never stored by arena itself.
+        if getattr(args, "fresh", False) and "--fresh" not in line:
+            line.append("--fresh")
+        fresh = "--fresh" in line
+        old_trees = dirty_worktrees(repo, config, nn)
+        if old_trees and not fresh:
+            raise RoundError(_refusal_over_dirty(repo, nn, old_trees))
+        if fresh:
+            if str(prof.get("fresh", "")).strip() and profile.fresh_on(prof["fresh"]):
+                print(f"profile {_profile_name(args)} has fresh=yes: "
+                      "this start discards uncommitted work")
+            if old_trees:
+                print(f"--fresh discards uncommitted work in {len(old_trees)} worktree"
+                      f"{'s' if len(old_trees) != 1 else ''}:")
+                _print_dirty(repo, old_trees)
+                if not _confirm_discard(len(old_trees), getattr(args, "yes", False)):
+                    raise RoundError("not discarded — add -y to discard without a terminal "
+                                     "(nothing was changed)")
         name, text = find_ticket(repo, nn, branch)
         content = open_status(text)
         sha = build_round_ref(repo, nn, branch, name, content, fresh=args.fresh_ticket,
                               state_exists=_has_state(repo, config, nn), yes=args.yes)
     except (RoundError, GitRefError, profile.ProfileError, OSError) as err:
         return output.refuse(str(err))
+
+    if fresh and not getattr(args, "no_backup", False):
+        try:
+            kept = backup_round_folder(repo, config, nn, _profile_name(args))
+        except RoundError as err:
+            return output.refuse(str(err))
+        if kept is not None:
+            print(output.scrub(f"old results kept in {_tree_label(repo, kept)}"))
 
     record = {
         "branch": branch,
