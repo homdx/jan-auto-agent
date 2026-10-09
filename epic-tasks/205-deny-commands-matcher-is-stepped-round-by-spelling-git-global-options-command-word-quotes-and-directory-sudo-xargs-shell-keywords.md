@@ -1,6 +1,6 @@
 # 205 — `deny_commands` matches the spelling, not the command: `git -C . push`, `/usr/bin/git push`, `"git" push`, `\git push`, `sudo git push`, `xargs git push` and `then git push` all pass `git push*`
 
-**Status:** landed `d442aee` — deny_commands sees through git options, command-word spellings, wrappers and keywords
+**Status:** landed `f20b262` — deny_commands sees through git options, command-word spellings, wrappers and keywords
 **Origin:** operator review (`bugs-to-review/`: the "left unchanged" High finding and `test_contest_deny_git_options_and_wrappers.py`, `test_contest_deny_newline_and_keywords.py`), probed on `arena` @ `00355fd`
 **Severity:** HIGH (a denied command runs; `git push*` is the contest's first and most important deny pattern)
 **File:** tools/contest/policy.py

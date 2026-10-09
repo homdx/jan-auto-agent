@@ -1,6 +1,6 @@
 # 206 — `policy.is_full_suite_command` and `utils.is_pytest_command` disagree about what a pytest run is: `python3 -u -m pytest tests`, `uv run pytest tests`, `PYTEST_ADDOPTS="-q -x" pytest tests` skip the suite slot, and `pytest tests -kfoo` takes it
 
-**Status:** landed `8aa8370` — the suite slot and is_pytest_command share one pytest recogniser; attached -k/-m selectors are targeted
+**Status:** landed `bbc5861` — the suite slot and is_pytest_command share one pytest recogniser; attached -k/-m selectors are targeted
 **Origin:** operator review (`bugs-to-review/test_contest_suite_command_shape.py`), probed on `arena` @ `00355fd`
 **Severity:** LOW (a wasted or a bypassed suite slot: an agent can run the whole suite more often than the round allows, or be refused a targeted run)
 **File:** tools/contest/policy.py
