@@ -932,6 +932,11 @@ def _refuse(msg, args, *, where=None, ticket=None, flow=None, hints=None) -> int
                              fmt=getattr(args, "output", "table"))
 
 
+def _hint_path(text) -> str:
+    """A path or ref in a printed hint, shell-quoted so a space in it does not split it."""
+    return shlex.quote(str(text))
+
+
 def _verb_flags(verb: str, reason: str = "", note: str = "") -> str:
     """The `--reason` / `--note` flags *verb* gets, quoted — a hint must be pasteable."""
     out = ""
@@ -1013,7 +1018,7 @@ def _worktree_or_refuse(repo: Path, branch: str, args, verb: str, nn: int, flow:
             args, where=where, ticket=ticket,
             flow=_flow(flow, 1, "worktree list unreadable"),
             hints=[{"why": "the read that failed",
-                    "command": f"git -C {os.path.realpath(str(repo))} worktree list"},
+                    "command": f"git -C {_hint_path(os.path.realpath(str(repo)))} worktree list"},
                    {"why": "then the same command again", "command": _cmd(verb, nn, branch)}])
 
 
@@ -1077,10 +1082,10 @@ def _write_and_commit(repo: Path, args, prof, verb, nn, branch, name, text, new_
                     args, where=where, ticket=ticket,
                     flow=_flow(STATUS_FLOW, 6, f"uncommitted: {', '.join(dirty)}"),
                     hints=[
-                        {"why": "see them", "command": f"git -C {root} diff -- {rel}"},
+                        {"why": "see them", "command": f"git -C {_hint_path(root)} diff -- {_hint_path(rel)}"},
                         {"why": "keep them, then run the same command again",
-                         "command": f"git -C {root} commit --only -m \"{nn}: ticket\" -- {rel}"},
-                        {"why": "drop them", "command": f"git -C {root} restore -- {rel}"},
+                         "command": f"git -C {_hint_path(root)} commit --only -m \"{nn}: ticket\" -- {_hint_path(rel)}"},
+                        {"why": "drop them", "command": f"git -C {_hint_path(root)} restore -- {_hint_path(rel)}"},
                         {"why": "then the same command again", "command": _cmd(verb, nn, branch, note=note)},
                     ])
             # `--only` commits this one path: other staged or modified files stay out
@@ -1096,7 +1101,7 @@ def _write_and_commit(repo: Path, args, prof, verb, nn, branch, name, text, new_
         moved = "cannot lock ref" in message or "moved from" in message
         first = ({"why": f"what moved {branch}", "command": f"git log -3 --oneline {branch}"}
                  if moved
-                 else {"why": "what the commit refused", "command": f"git -C {root} status"})
+                 else {"why": "what the commit refused", "command": f"git -C {_hint_path(root)} status"})
         return _refuse(message, args, where=where, ticket=ticket,
                        flow=_flow(STATUS_FLOW, 7,
                                   f"{branch} moved while committing" if moved
@@ -1147,7 +1152,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
             args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
             flow=_flow(STATUS_FLOW, 1, f"checked out in {wt}"),
             hints=[{"why": f"run it there instead",
-                    "command": f"cd {wt} && arena issue {verb} {nn}{_verb_flags(verb, reason, note)}"}])
+                    "command": f"cd {_hint_path(wt)} && arena issue {verb} {nn}{_verb_flags(verb, reason, note)}"}])
 
     names = _on_branch(repo, branch, nn)
     checkout = _in_folder(repo, rounds.TASKS_DIR, nn)
@@ -1170,7 +1175,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
                 args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
                 flow=_flow(STATUS_FLOW, 2, f"draft only: {DRAFTS_DIR}/{file}"),
                 hints=[{"why": f"publish it first",
-                        "command": f"arena issue create --file {DRAFTS_DIR}/{file}"}])
+                        "command": f"arena issue create --file {_hint_path(f'{DRAFTS_DIR}/{file}')}"}])
         if checkout:
             file = checkout[0]
             rel = f"{rounds.TASKS_DIR}/{file}"
@@ -1313,7 +1318,7 @@ def _changed_while_editing(repo: Path, args, nn: int, branch: str, rel: str, pat
         args, where=where, ticket=ticket,
         flow=_flow(EDIT_FLOW, 9, f"the commit refused it: {rel} changed while editing"),
         hints=[{"why": f"what changed {branch}", "command": f"git log -3 --oneline {branch}"},
-               {"why": "the file as it is now", "command": f"git -C {root} diff HEAD -- {rel}"},
+               {"why": "the file as it is now", "command": f"git -C {_hint_path(root)} diff HEAD -- {_hint_path(rel)}"},
                {"why": "the edited text, kept here", "command": str(path)},
                {"why": "then the same command again", "command": _cmd("edit", nn, branch)}])
 
@@ -1348,7 +1353,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
             f"{branch} is checked out in {wt} — its working tree would go stale",
             args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
             flow=_flow(EDIT_FLOW, 1, f"checked out in {wt}"),
-            hints=[{"why": f"run it there instead", "command": f"cd {wt} && arena issue edit {nn}"}])
+            hints=[{"why": f"run it there instead", "command": f"cd {_hint_path(wt)} && arena issue edit {nn}"}])
 
     names = _on_branch(repo, branch, nn)
     if len(names) > 1:
@@ -1371,7 +1376,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
                 args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
                 flow=_flow(EDIT_FLOW, 2, "draft only"),
                 hints=[{"why": "publish it first",
-                        "command": f"arena issue create --file {DRAFTS_DIR}/{drafts[0]}"}])
+                        "command": f"arena issue create --file {_hint_path(f'{DRAFTS_DIR}/{drafts[0]}')}"}])
         if checkout:
             rel = f"{rounds.TASKS_DIR}/{checkout[0]}"
             return _refuse(
@@ -1494,9 +1499,9 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
                 f"into the commit",
                 args, where=where, ticket=ticket,
                 flow=_flow(EDIT_FLOW, 9, f"uncommitted: {', '.join(dirty)}"),
-                hints=[{"why": "see them", "command": f"git -C {os.path.realpath(str(repo))} diff -- {rel}"},
-                       {"why": "keep them", "command": f"git -C {os.path.realpath(str(repo))} commit --only -m \"{nn}: ticket\" -- {rel}"},
-                       {"why": "drop them", "command": f"git -C {os.path.realpath(str(repo))} restore -- {rel}"},
+                hints=[{"why": "see them", "command": f"git -C {_hint_path(os.path.realpath(str(repo)))} diff -- {_hint_path(rel)}"},
+                       {"why": "keep them", "command": f"git -C {_hint_path(os.path.realpath(str(repo)))} commit --only -m \"{nn}: ticket\" -- {_hint_path(rel)}"},
+                       {"why": "drop them", "command": f"git -C {_hint_path(os.path.realpath(str(repo)))} restore -- {_hint_path(rel)}"},
                        {"why": "the edited text, kept here", "command": str(path)},
                        {"why": "then the same command again", "command": _cmd("edit", nn, branch)}])
         (repo / rel).write_text(new_text, encoding="utf-8", errors="surrogateescape")
