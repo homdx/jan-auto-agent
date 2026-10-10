@@ -93,6 +93,8 @@ run with `rejected` (every downgrade, with the quote), and per claim `id`, `kind
 `[claim_vote]` sets `code_batch`, `pack_chars` (`--pack-chars`), `pack_chunks` and
 `pack_chunk_chars`. The fabrication rate is a number: `rejected` per voter and per run.
 
+Did a fix land? The same claims at two commits, `scripts/claim_diff.py claims.json --target . --base main --head origin/kc --check` (CC-7): FIXED / STILL / NEW / GONE / UNCLEAR, see [BEFORE-AFTER.md](BEFORE-AFTER.md).
+
 The offline check of the chain (fake voters, the fixture's 80 claims, no network):
 
 ```bash
