@@ -8,9 +8,9 @@ read-only window on a repository that anchors are resolved against and CC-3 /
 CC-4 read evidence from; `PathRepoView` (anchors.py) is the one over a
 directory, CC-2's `Target.view()` is the one over a pinned worktree.
 
-`Chunk` and `Pack` are types here, with the smallest honest bodies: CC-5 owns
-the real `Pack.render` (budget, headers) and `Pack.find` (whitespace and
-line-number-prefix normalisation) and replaces the two methods, nothing else.
+`Chunk` and `Pack` are types here. CC-5 (`pack.py`) owns the two methods of `Pack`:
+`render` (the text the voter reads) and `find` (what counts as a verbatim quote
+of a chunk); they live in `pack.py` and are called from here, so the rule has one home.
 """
 
 from __future__ import annotations
@@ -67,26 +67,29 @@ class Chunk:
 
 @dataclass(frozen=True)
 class Pack:
-    """The evidence for one claim at one commit."""
+    """The evidence for one claim at one commit.
+
+    `chunks` are in rank order. `truncated` is True whenever the budget dropped or cut
+    anything; `omitted` and `cut` say how many chunks (CC-5 sets both; a `Pack` built
+    by hand may leave them 0)."""
 
     claim: str
     sha: str
     chunks: tuple
     truncated: bool
+    omitted: int = 0   # chunks the budget dropped
+    cut: int = 0       # chunks it cut (at a line, or a line over the cap)
 
     def render(self) -> str:
-        """The text the voter reads. CC-5 replaces this body."""
-        return "\n\n".join(chunk.text for chunk in self.chunks)
+        """The text the voter reads (`tools.claimcheck.pack.render_pack`)."""
+        from tools.claimcheck.pack import render_pack   # pack.py imports this module
+        return render_pack(self)
 
     def find(self, quote: str) -> Optional[str]:
-        """The id of the first chunk whose text contains *quote*, else None.
-        CC-5 replaces this body (whitespace and line-number-prefix normalisation)."""
-        if not quote:
-            return None
-        for chunk in self.chunks:
-            if quote in chunk.text:
-                return chunk.id
-        return None
+        """The id of the one chunk that contains *quote* verbatim, else None
+        (`tools.claimcheck.pack.find_quote`: the only place the rule lives)."""
+        from tools.claimcheck.pack import find_quote
+        return find_quote(self, quote)
 
 
 @runtime_checkable

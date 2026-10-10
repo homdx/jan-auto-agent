@@ -407,9 +407,11 @@ def test_model_types_have_the_epic_shape():
     assert (r.qualname, r.lines, r.sha, r.candidates) == ("", (0, 0), "", ())
     pack = Pack("c", "sha", (Chunk("src:a.py:1-2", "source", "a.py", 1, 2, "x = 1", "why"),
                              Chunk("note:1", "note", "", 0, 0, "second", "why")), False)
-    assert pack.render() == "x = 1\n\nsecond"
-    assert pack.find("second") == "note:1" and pack.find("x = 1") == "src:a.py:1-2"
-    assert pack.find("absent") is None and pack.find("") is None
+    # CC-5 owns what `render` prints and what `find` accepts (tests/test_claimcheck_pack.py);
+    # here only that the methods exist on the type and the counters default to "nothing trimmed".
+    assert pack.render().startswith("EVIDENCE for the claim, at commit sha")
+    assert pack.find("second chunk text") is None and pack.find("") is None
+    assert (pack.omitted, pack.cut) == (0, 0)
 
 
 def test_claim_vote_uses_classify_with_a_view(view):

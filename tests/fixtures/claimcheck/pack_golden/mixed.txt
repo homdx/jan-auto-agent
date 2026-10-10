@@ -1,0 +1,18 @@
+EVIDENCE for the claim, at commit 3f2a9c1
+[[note:dangling:Policy._mechanical]]  (note)
+`Policy._mechanical` does not exist at 3f2a9c1; the file `tools/contest/policy.py` exists and defines: `Policy`, `decide`.
+[[src:tools/contest/gates.py:120-143]]  (source)
+ 120| def _declared_paths(body):
+ 121|     paths = []
+ 122|     for line in body.splitlines():
+ 123|         paths.append(line.strip())
+# … 20 lines omitted (124-143)
+[[git:a73e389:header]]  (git)
+commit a73e3894f1c2b6d0e5a7c9b1d3f5e7a9b1c3d5e7
+Author: Ann <ann@example.com>
+Date:   2026-01-01T00:00:00+00:00
+
+    gates: read every declared path
+
+ tools/contest/gates.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
