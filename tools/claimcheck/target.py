@@ -189,7 +189,11 @@ _VIEW_GIT = frozenset(("show diff log cat-file rev-parse ls-tree ls-files grep b
                        "merge-base rev-list").split())
 #: options that write a file or start a program (`-O<pager>`, `--output=`, a textconv filter).
 _VIEW_FORBIDDEN = ("--output", "--ext-diff", "--textconv", "--open-files-in-pager",
-                   "--exec-path", "--git-dir", "--work-tree", "--config-env")
+                   "--exec-path", "--git-dir", "--work-tree", "--config-env",
+                   "--contents")   # blame --contents reads a file outside the commit
+#: a diff driver is named by the commit's .gitattributes and defined in the operator's config;
+#: git runs its textconv / external diff by default, so the view turns both off for these.
+_NO_FILTERS = frozenset(("show", "diff", "log"))
 
 
 class _TargetView(PathRepoView):
@@ -208,6 +212,8 @@ class _TargetView(PathRepoView):
                    or (arg == "-c" and i + 1 < len(args) and "=" in args[i + 1]))
             if bad:
                 raise TargetError(f"git {args[0]} {arg}: refused, it writes or runs a program")
+        if args[0] in _NO_FILTERS:
+            args = (args[0], "--no-textconv", "--no-ext-diff", *args[1:])
         return _git(self.root, *args, strip=False)
 
 
