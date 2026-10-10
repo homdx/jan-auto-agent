@@ -1,6 +1,7 @@
 """CC-1: claim anchors — extraction, resolution against a repository, code/world/mixed (offline)."""
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -46,9 +47,16 @@ FILES = {
 }
 
 
+# Fixed dates: the fixture's HEAD is one sha everywhere. A random one was all digits
+# about one run in forty, and "at 87577327" is no anchor by design (all-digit only after "commit").
+_DATES = {"GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
+          "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
 def _git(root, *args):
     return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=root,
-                          capture_output=True, text=True, check=True).stdout.strip()
+                          capture_output=True, text=True, check=True,
+                          env={**os.environ, **_DATES}).stdout.strip()
 
 
 @pytest.fixture(scope="module")
