@@ -56,7 +56,49 @@ prompt cache cannot return one answer N times.  `--fixed-prompt` sends the
 identical prompt every run: the control.  `--models provider/model` reads Kilo's
 files directly when a model has no profile yet.
 
-## Stage 3 — read the table
+### Stage 2, on the evidence: `--target` (CC-6)
+
+A claim about the code can be judged when the voters see the code. Give the repository
+the claims are about and the commit to judge at:
+
+```bash
+python3 scripts/claim_vote.py claims.json --target . --ref origin/kc --runs 3 --out votes.json
+python3 scripts/claim_vote.py claims.json --target . --ref origin/kc --base origin/main \
+    --report report.md --runs 3 --out votes.json      # + the git evidence of main..kc, the sha check
+```
+
+The commit is pinned once (`--ref`, resolved to a sha; `--fetch` fetches first) and checked
+out as a read-only worktree under `--scratch` (default `claim-check-out/scratch/`); the
+operator's own checkout is never read. Each claim's anchors are resolved there and
+classified: a `world` claim goes as before; a `code` or `mixed` claim goes with its
+**evidence pack** (source, git with `--base`, a note for an anchor that is not there),
+`code_batch` claims per request. The rules in the prompt: the evidence is the only source
+for a claim about the repository; UNSURE when it does not decide; a TRUE or FALSE names
+the chunk (`[[id]]`) and copies up to 200 characters from it.
+
+**The quote check.** A TRUE/FALSE on a claim with a pack stands only when the chunk it
+names is in *that claim's* pack and holds the quote verbatim (gutters and whitespace
+aside, `Pack.find_all`); otherwise it becomes UNSURE and is counted in `rejected` with the
+reason, `chunk_not_in_pack` or `quote_not_in_pack`. A world claim needs neither. The
+unanimity rule is unchanged and gets the checked votes, so a code claim can now be
+accepted: no `CODE-CHECK` row with `--target`.
+
+`votes.json` then has `target` (`repo`, `ref`, `sha`, `base`, `warnings`), each voter's
+run with `rejected` (every downgrade, with the quote), and per claim `id`, `kind`,
+`dangling`, `sha`, `evidence` (the chunk ids the votes that stood cited), `quotes`,
+`rejected` (`{reason: n}`) and `downgrades`. The `verdicts:` line ends with
+`rejected quotes: N`, `warnings: …` and the sha: a report that names another sha than
+`--ref` (`--report report.md`, or `--expect-sha`) is a warning there, not a stop.
+
+`[claim_vote]` sets `code_batch`, `pack_chars` (`--pack-chars`), `pack_chunks` and
+`pack_chunk_chars`. The fabrication rate is a number: `rejected` per voter and per run.
+
+The offline check of the chain (fake voters, the fixture's 80 claims, no network):
+
+```bash
+python3 contest-bench/280/acceptance_280.py
+```
+
 
 `claim_vote.py` prints one line per claim and writes `votes.json`:
 
@@ -65,7 +107,7 @@ files directly when a model has no profile yet.
 | `TRUE` / `FALSE` | at least 3 models committed and agree | a world fact; accept only with the rule below |
 | `SPLIT` | committed models tie | look it up, or run it |
 | `UNSURE` | fewer than 3 models committed | nobody knows; ignore or check |
-| `CODE-CHECK` | the claim is about this repo's code | the models cannot see the code: read it or run the repro |
+| `CODE-CHECK` | the claim is about this repo's code (no `--target`) | the models cannot see the code: read it, run the repro, or vote again with `--target` |
 
 **The acceptance rule: unanimity across families.**  Pick one model from each of
 3 different families (Sensenova, Agnes, Nemotron, ...) and accept a verdict only
@@ -85,7 +127,8 @@ voter", not "every voter that happened to answer".
 
 ## Rules that keep it honest
 
-- **Never accept votes on a claim about our own code.**  A model that cannot see
+- **Never accept votes on a claim about our own code the voters did not see.**  (With
+  `--target` they see it, and the quote check is what keeps them honest.)  A model that cannot see
   `gates.py` still says TRUE to "`_SUMMARY_LINE` does not parse node IDs with
   spaces" because it sounds right.  `needs_code` marks these; the check is a
   heuristic (paths, tickets, `identifiers`, a bare `snake_case` name the repo

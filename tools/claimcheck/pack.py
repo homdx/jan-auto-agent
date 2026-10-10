@@ -12,8 +12,9 @@ this module decides what survives, in what order and in what text:
 * `assemble_pack` — the half of `build_pack` that needs no provider: merge, rank, trim of
   chunks the caller already holds. `build_pack` ends in it; the tests drive it directly.
 * `render_pack` — the exact text the voter reads, in a stable format a golden file pins.
-* `find_quote` — which chunk a quote is *verbatim* from, if any. CC-6's `verify_quotes` is
-  built on it, and this is the only place the rule lives (see its docstring).
+* `find_quote` / `find_all_quote` — which chunk (the first, or every one) a quote is
+  *verbatim* from. CC-6's `verify_quotes` is built on `find_all_quote`, and this is the only
+  place the rule lives (see its docstring).
 * `PackBudget` — the limits, read from `[claim_vote]` with defaults.
 
 Decisions the ticket left open, made here and pinned by a test each:
@@ -224,8 +225,9 @@ def normalise_quote(quote: str) -> str:
     return _norm(" ".join(lines))
 
 
-def find_quote(pack: Pack, quote: str) -> Optional[str]:
-    """The id of the chunk of *pack* that *quote* is a verbatim quote of, else None.
+def find_all_quote(pack: Pack, quote: str) -> list:
+    """The ids of every chunk of *pack* that *quote* is a verbatim quote of, in pack (rank)
+    order; [] when none is.
 
     The rule — the only place it lives; CC-6's `verify_quotes` calls it:
 
@@ -235,19 +237,25 @@ def find_quote(pack: Pack, quote: str) -> Optional[str]:
     * the quote must lie inside **one** chunk, and inside one run of its lines: a quote that
       runs across two chunks, or across an omission marker, is not a quote of either;
     * a marker line (`# … 5 lines omitted (10-14)`) is not a quoted line;
-    * a quote shorter than `MIN_QUOTE` characters after normalising proves nothing: None;
-    * of several chunks that hold the quote, the first in pack (rank) order.
+    * a quote shorter than `MIN_QUOTE` characters after normalising proves nothing: [].
+
+    One line can sit in two chunks (a function's `src:` chunk and the `git:` hunk that
+    changed it): both are listed, so a voter that names the lower-ranked one is still right.
     """
     if not isinstance(quote, str):
-        return None
+        return []
     needle = normalise_quote(quote)
     if len(needle) < MIN_QUOTE:
-        return None
-    for chunk in pack.chunks:
-        for run in _segments(chunk):
-            if needle in run:
-                return chunk.id
-    return None
+        return []
+    return [chunk.id for chunk in pack.chunks
+            if any(needle in run for run in _segments(chunk))]
+
+
+def find_quote(pack: Pack, quote: str) -> Optional[str]:
+    """The id of the first chunk, in pack (rank) order, that *quote* is a verbatim quote of,
+    else None: the first element of `find_all_quote`, whose docstring holds the rule."""
+    found = find_all_quote(pack, quote)
+    return found[0] if found else None
 
 
 # ------------------------------------------------------------------ render

@@ -8,9 +8,9 @@ read-only window on a repository that anchors are resolved against and CC-3 /
 CC-4 read evidence from; `PathRepoView` (anchors.py) is the one over a
 directory, CC-2's `Target.view()` is the one over a pinned worktree.
 
-`Chunk` and `Pack` are types here. CC-5 (`pack.py`) owns the two methods of `Pack`:
-`render` (the text the voter reads) and `find` (what counts as a verbatim quote
-of a chunk); they live in `pack.py` and are called from here, so the rule has one home.
+`Chunk` and `Pack` are types here. CC-5 (`pack.py`) owns the methods of `Pack`:
+`render` (the text the voter reads) and `find` / `find_all` (what counts as a verbatim
+quote of a chunk); they live in `pack.py` and are called from here, so the rule has one home.
 """
 
 from __future__ import annotations
@@ -90,6 +90,12 @@ class Pack:
         (`tools.claimcheck.pack.find_quote`: the only place the rule lives)."""
         from tools.claimcheck.pack import find_quote
         return find_quote(self, quote)
+
+    def find_all(self, quote: str) -> list:
+        """Every chunk id that contains *quote* verbatim, in rank order; `find` is its first
+        element (`tools.claimcheck.pack.find_all_quote`)."""
+        from tools.claimcheck.pack import find_all_quote
+        return find_all_quote(self, quote)
 
 
 @runtime_checkable
