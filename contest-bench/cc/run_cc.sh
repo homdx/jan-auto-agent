@@ -20,9 +20,10 @@ cd "$repo" || exit 1
 python3 "$here/make_fixture.py" --build "$out/fixture-repo" | tee "$out/fixture.log" || exit 1
 base=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['base_sha'])" "$here/claims_fixture.json")
 real=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['real_sha'])" "$here/claims_real.json")
-mkdir -p "$out/fixture-base" "$out/real-tree"
-git -C "$out/fixture-repo" archive "$base" | tar -x -C "$out/fixture-base"
-git archive "$real" | tar -x -C "$out/real-tree" || { echo "run_cc: $real is not in this repository"; exit 2; }
+# git checkouts, not exports: CC-1's classifier resolves a commit claim through git
+git clone -q --shared "$out/fixture-repo" "$out/fixture-base" && git -C "$out/fixture-base" checkout -q "$base"
+git clone -q --shared "$repo" "$out/real-tree" && git -C "$out/real-tree" checkout -q "$real" \
+    || { echo "run_cc: $real is not in this repository"; exit 2; }
 
 status=0
 for set in fixture real; do

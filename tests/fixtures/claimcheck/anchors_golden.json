@@ -1,0 +1,805 @@
+[
+ {
+  "claim": "`config.load_timeout` reads `timeout` from the `[defaults]` section, not from `[pipeline]`.",
+  "anchors": [
+   [
+    "symbol",
+    "config.load_timeout",
+    1,
+    20
+   ]
+  ]
+ },
+ {
+  "claim": "`Store.items` in `store.py` returns a shallow copy, so nested values are shared with the store.",
+  "anchors": [
+   [
+    "symbol",
+    "Store.items",
+    1,
+    12
+   ],
+   [
+    "path",
+    "store.py",
+    18,
+    26
+   ]
+  ]
+ },
+ {
+  "claim": "`gates.check_exit` treats pytest's exit code 5 as a pass.",
+  "anchors": [
+   [
+    "symbol",
+    "gates.check_exit",
+    1,
+    17
+   ]
+  ]
+ },
+ {
+  "claim": "`gates.gate_flaky` reports `PASS*` when the rerun passes, without checking that `failed_ids` holds as many ids as `bad` tests failed.",
+  "anchors": [
+   [
+    "symbol",
+    "gates.gate_flaky",
+    1,
+    17
+   ],
+   [
+    "symbol",
+    "failed_ids",
+    81,
+    91
+   ]
+  ]
+ },
+ {
+  "claim": "`pipeline.run_command` passes `check=True`, so a failing command raises CalledProcessError.",
+  "anchors": [
+   [
+    "symbol",
+    "pipeline.run_command",
+    1,
+    21
+   ]
+  ]
+ },
+ {
+  "claim": "In Python's `re` module, `re.M` makes `^` and `$` match at every line boundary.",
+  "anchors": [
+   [
+    "symbol",
+    "re.M",
+    26,
+    30
+   ]
+  ]
+ },
+ {
+  "claim": "`subprocess.run` does not raise on a non-zero exit status unless `check=True` is passed.",
+  "anchors": [
+   [
+    "symbol",
+    "subprocess.run",
+    1,
+    15
+   ]
+  ]
+ },
+ {
+  "claim": "`configparser` section names are case-sensitive.",
+  "anchors": []
+ },
+ {
+  "claim": "`dict.get(key, default)` returns the default when the stored value is None.",
+  "anchors": [
+   [
+    "symbol",
+    "dict.get",
+    1,
+    9
+   ]
+  ]
+ },
+ {
+  "claim": "`pipeline.run_command` passes `check=False` to `subprocess.run`, which then does not raise on a non-zero exit.",
+  "anchors": [
+   [
+    "symbol",
+    "pipeline.run_command",
+    1,
+    21
+   ],
+   [
+    "symbol",
+    "subprocess.run",
+    48,
+    62
+   ]
+  ]
+ },
+ {
+  "claim": "`Store.save` passes `ensure_ascii=False`, so non-ASCII characters are written as themselves.",
+  "anchors": [
+   [
+    "symbol",
+    "Store.save",
+    1,
+    11
+   ]
+  ]
+ },
+ {
+  "claim": "`gates.check_exit` accepts exit code 5, which is the code pytest uses for an internal error.",
+  "anchors": [
+   [
+    "symbol",
+    "gates.check_exit",
+    1,
+    17
+   ]
+  ]
+ },
+ {
+  "claim": "`Store.items` builds its copy with `dict()`, and `dict()` of a dict copies the nested lists too.",
+  "anchors": [
+   [
+    "symbol",
+    "Store.items",
+    1,
+    12
+   ]
+  ]
+ },
+ {
+  "claim": "`scheduler.py` runs the pipeline's steps in parallel threads.",
+  "anchors": [
+   [
+    "path",
+    "scheduler.py",
+    1,
+    13
+   ]
+  ]
+ },
+ {
+  "claim": "`Store.compact` in `store.py` removes the keys whose value is None.",
+  "anchors": [
+   [
+    "symbol",
+    "Store.compact",
+    1,
+    14
+   ],
+   [
+    "path",
+    "store.py",
+    20,
+    28
+   ]
+  ]
+ },
+ {
+  "claim": "`gates.check_coverage` fails a change whose coverage is below 80 %.",
+  "anchors": [
+   [
+    "symbol",
+    "gates.check_coverage",
+    1,
+    21
+   ]
+  ]
+ },
+ {
+  "claim": "Ticket `epic-tasks/01-store-errors.md` has the status done.",
+  "anchors": [
+   [
+    "path",
+    "epic-tasks/01-store-errors.md",
+    8,
+    37
+   ]
+  ]
+ },
+ {
+  "claim": "Commit d36d59e adds `retry.py`.",
+  "anchors": [
+   [
+    "commit",
+    "d36d59e",
+    7,
+    14
+   ],
+   [
+    "path",
+    "retry.py",
+    21,
+    29
+   ]
+  ]
+ },
+ {
+  "claim": "The subject of commit d36d59e is `fixture: base`.",
+  "anchors": [
+   [
+    "commit",
+    "d36d59e",
+    22,
+    29
+   ]
+  ]
+ },
+ {
+  "claim": "`_pytest` in `tools/contest/gates.py` always appends `--timeout=180` to the pytest command.",
+  "anchors": [
+   [
+    "symbol",
+    "_pytest",
+    1,
+    8
+   ],
+   [
+    "path",
+    "tools/contest/gates.py",
+    14,
+    36
+   ]
+  ]
+ },
+ {
+  "claim": "`gates._pytest` adds `--timeout=180` only when `importlib.util.find_spec(\"pytest_timeout\")` finds the plugin.",
+  "anchors": [
+   [
+    "symbol",
+    "gates._pytest",
+    1,
+    14
+   ],
+   [
+    "symbol",
+    "importlib.util.find_spec",
+    48,
+    72
+   ]
+  ]
+ },
+ {
+  "claim": "Without the `pytest-timeout` plugin every root run by `gates.run_tests_detail` exits with code 4, because `_pytest` passes `--timeout=180`.",
+  "anchors": [
+   [
+    "symbol",
+    "gates.run_tests_detail",
+    55,
+    77
+   ],
+   [
+    "symbol",
+    "_pytest",
+    107,
+    114
+   ]
+  ]
+ },
+ {
+  "claim": "`Policy._mechanical` in `tools/contest/policy.py` approves a command whose paths are all inside the worktree before it checks `deny_commands`.",
+  "anchors": [
+   [
+    "symbol",
+    "Policy._mechanical",
+    1,
+    19
+   ],
+   [
+    "path",
+    "tools/contest/policy.py",
+    25,
+    48
+   ],
+   [
+    "symbol",
+    "deny_commands",
+    127,
+    140
+   ]
+  ]
+ },
+ {
+  "claim": "`Policy.decide(\"cat $HOME/.ssh/id_rsa\")` is approved with the reason \"bash: no path outside worktree/tmp_roots\".",
+  "anchors": [
+   [
+    "symbol",
+    "Policy.decide",
+    1,
+    14
+   ]
+  ]
+ },
+ {
+  "claim": "`runner._dirty_tree` raises `TreeReadError` when `git status` cannot be read.",
+  "anchors": [
+   [
+    "symbol",
+    "runner._dirty_tree",
+    1,
+    19
+   ],
+   [
+    "symbol",
+    "TreeReadError",
+    29,
+    42
+   ]
+  ]
+ },
+ {
+  "claim": "`gates.judge_worktree` runs `git diff --numstat` with rename detection, so a renamed file shows up as `old => new`.",
+  "anchors": [
+   [
+    "symbol",
+    "gates.judge_worktree",
+    1,
+    21
+   ]
+  ]
+ },
+ {
+  "claim": "`git diff --numstat -M` prints a renamed file as `a => b`.",
+  "anchors": []
+ },
+ {
+  "claim": "`tests/test_contest_draft.py` picks the first non-empty `.py` file of the sorted `rglob` for its prompt test.",
+  "anchors": [
+   [
+    "path",
+    "tests/test_contest_draft.py",
+    1,
+    28
+   ]
+  ]
+ },
+ {
+  "claim": "`tools/contest/gates.py::_declared_files_v2` merges the `**File:**` and `**Also touches:**` fields.",
+  "anchors": [
+   [
+    "symbol",
+    "tools/contest/gates.py::_declared_files_v2",
+    1,
+    43
+   ]
+  ]
+ },
+ {
+  "claim": "Commit a73e389 changed only the ticket text of KC-34, not `tools/contest/gates.py`.",
+  "anchors": [
+   [
+    "commit",
+    "a73e389",
+    7,
+    14
+   ],
+   [
+    "ticket",
+    "KC-34",
+    47,
+    52
+   ],
+   [
+    "path",
+    "tools/contest/gates.py",
+    59,
+    81
+   ]
+  ]
+ },
+ {
+  "claim": "Ticket `epic-tasks/123-kc76-the-contest-runs-on-a-target-repo-not-only-on-its-own-tree.md` has the status landed.",
+  "anchors": [
+   [
+    "path",
+    "epic-tasks/123-kc76-the-contest-runs-on-a-target-repo-not-only-on-its-own-tree.md",
+    8,
+    89
+   ]
+  ]
+ },
+ {
+  "claim": "`contest.ini` lists `sudo *` in `deny_commands`, and an `fnmatch` `*` matches any characters, spaces included.",
+  "anchors": [
+   [
+    "path",
+    "contest.ini",
+    1,
+    12
+   ],
+   [
+    "symbol",
+    "deny_commands",
+    33,
+    46
+   ]
+  ]
+ },
+ {
+  "claim": "Nothing checks whether the plugin is installed.",
+  "anchors": []
+ },
+ {
+  "claim": "Commit a73e389 fixed only the ticket text of KC-34.",
+  "anchors": [
+   [
+    "commit",
+    "a73e389",
+    7,
+    14
+   ],
+   [
+    "ticket",
+    "KC-34",
+    45,
+    50
+   ]
+  ]
+ },
+ {
+  "claim": "git prints `dir/{a => b}.py` for a rename, and `old => new` in the summary.",
+  "anchors": []
+ },
+ {
+  "claim": "`tools/contest/gates.py:244` adds the flag only when the plugin is found.",
+  "anchors": [
+   [
+    "path",
+    "tools/contest/gates.py:244",
+    1,
+    27
+   ]
+  ]
+ },
+ {
+  "claim": "See gates.py:12-30 and ./docs/notes.md:7 for the two readers.",
+  "anchors": [
+   [
+    "path",
+    "gates.py:12-30",
+    4,
+    18
+   ],
+   [
+    "path",
+    "./docs/notes.md:7",
+    23,
+    40
+   ]
+  ]
+ },
+ {
+  "claim": "`tests/test_contest_draft.py::test_the_prompt_carries_the_source` picks the first file.",
+  "anchors": [
+   [
+    "test",
+    "tests/test_contest_draft.py::test_the_prompt_carries_the_source",
+    1,
+    64
+   ]
+  ]
+ },
+ {
+  "claim": "`test_gates::test_pytest_flag` fails without the plugin.",
+  "anchors": [
+   [
+    "test",
+    "test_gates::test_pytest_flag",
+    1,
+    29
+   ]
+  ]
+ },
+ {
+  "claim": "Bug 12 of KC-5, AR-25 and ticket 123 are one report; CC-3 depends on it.",
+  "anchors": [
+   [
+    "ticket",
+    "KC-5",
+    10,
+    14
+   ],
+   [
+    "ticket",
+    "AR-25",
+    16,
+    21
+   ],
+   [
+    "ticket",
+    "ticket 123",
+    26,
+    36
+   ],
+   [
+    "ticket",
+    "CC-3",
+    53,
+    57
+   ]
+  ]
+ },
+ {
+  "claim": "The fix landed at @afa53f1 and again at `7b4e5f9`, not at deadbeef.",
+  "anchors": [
+   [
+    "commit",
+    "afa53f1",
+    19,
+    26
+   ],
+   [
+    "commit",
+    "7b4e5f9",
+    41,
+    48
+   ]
+  ]
+ },
+ {
+  "claim": "The branch `kc` is ahead of main, and origin/kc has the fix.",
+  "anchors": [
+   [
+    "ref",
+    "kc",
+    12,
+    14
+   ],
+   [
+    "ref",
+    "origin/kc",
+    38,
+    47
+   ]
+  ]
+ },
+ {
+  "claim": "`--timeout`, `True`, `pytest` and `None` are not names from our code.",
+  "anchors": []
+ },
+ {
+  "claim": "`Policy.decide(\"cat $HOME/.ssh/id_rsa\")` is approved.",
+  "anchors": [
+   [
+    "symbol",
+    "Policy.decide",
+    1,
+    14
+   ]
+  ]
+ },
+ {
+  "claim": "`gates.run_tests_detail()` calls `_pytest()` once per root.",
+  "anchors": [
+   [
+    "symbol",
+    "gates.run_tests_detail",
+    1,
+    23
+   ],
+   [
+    "symbol",
+    "_pytest",
+    34,
+    41
+   ]
+  ]
+ },
+ {
+  "claim": "`tools.contest.policy.Policy.decide` is the only entry point.",
+  "anchors": [
+   [
+    "symbol",
+    "tools.contest.policy.Policy.decide",
+    1,
+    35
+   ]
+  ]
+ },
+ {
+  "claim": "Ключ `Policy.decide` не читает contest.ini — юникод ✓.",
+  "anchors": [
+   [
+    "symbol",
+    "Policy.decide",
+    6,
+    19
+   ],
+   [
+    "path",
+    "contest.ini",
+    31,
+    42
+   ]
+  ]
+ },
+ {
+  "claim": "https://example.com/docs/readme.md describes `re.M`.",
+  "anchors": [
+   [
+    "symbol",
+    "re.M",
+    46,
+    50
+   ]
+  ]
+ },
+ {
+  "claim": "The file `requirements.txt` and the file `pyproject.toml` list nothing for it.",
+  "anchors": [
+   [
+    "path",
+    "requirements.txt",
+    10,
+    26
+   ],
+   [
+    "path",
+    "pyproject.toml",
+    42,
+    56
+   ]
+  ]
+ },
+ {
+  "claim": "`Store.__len__` and `Store.save` both touch `_data`.",
+  "anchors": [
+   [
+    "symbol",
+    "Store.__len__",
+    1,
+    14
+   ],
+   [
+    "symbol",
+    "Store.save",
+    21,
+    31
+   ],
+   [
+    "symbol",
+    "_data",
+    45,
+    50
+   ]
+  ]
+ },
+ {
+  "claim": "",
+  "anchors": []
+ },
+ {
+  "claim": "`retry_call` retries `TransientError` only.",
+  "anchors": [
+   [
+    "symbol",
+    "retry_call",
+    1,
+    11
+   ],
+   [
+    "symbol",
+    "TransientError",
+    22,
+    36
+   ]
+  ]
+ },
+ {
+  "claim": "Run `python3 scripts/run_claim_check.sh` from the repository root.",
+  "anchors": [
+   [
+    "path",
+    "scripts/run_claim_check.sh",
+    13,
+    39
+   ]
+  ]
+ },
+ {
+  "claim": "a/b/c/d/e.yaml is read before .collect/model.json.",
+  "anchors": [
+   [
+    "path",
+    "a/b/c/d/e.yaml",
+    0,
+    14
+   ],
+   [
+    "path",
+    ".collect/model.json",
+    30,
+    49
+   ]
+  ]
+ },
+ {
+  "claim": "Bug 7: the harness waits 60 seconds at ticket 4 and exits with code 4.",
+  "anchors": [
+   [
+    "ticket",
+    "ticket 4",
+    39,
+    47
+   ]
+  ]
+ },
+ {
+  "claim": "`HEAD` moved after `commit 0123abc` in `main`.",
+  "anchors": [
+   [
+    "ref",
+    "HEAD",
+    1,
+    5
+   ],
+   [
+    "commit",
+    "0123abc",
+    27,
+    34
+   ]
+  ]
+ },
+ {
+  "claim": "pytest exits with code 5 when it collects no tests.",
+  "anchors": []
+ },
+ {
+  "claim": "Branch `kc-2legs-runbook` holds `dfb81eb`.",
+  "anchors": [
+   [
+    "ref",
+    "kc-2legs-runbook",
+    8,
+    24
+   ],
+   [
+    "commit",
+    "dfb81eb",
+    33,
+    40
+   ]
+  ]
+ },
+ {
+  "claim": "`json.dumps(obj, ensure_ascii=False)` keeps non-ASCII text.",
+  "anchors": [
+   [
+    "symbol",
+    "json.dumps",
+    1,
+    11
+   ]
+  ]
+ },
+ {
+  "claim": "`gates.py` `gates.py` gates.py",
+  "anchors": [
+   [
+    "path",
+    "gates.py",
+    1,
+    9
+   ],
+   [
+    "path",
+    "gates.py",
+    12,
+    20
+   ],
+   [
+    "path",
+    "gates.py",
+    22,
+    30
+   ]
+  ]
+ }
+]

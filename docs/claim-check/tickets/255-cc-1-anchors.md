@@ -1,6 +1,6 @@
 # CC-1 — anchors: what in a claim names the repository, and does it exist
 
-**Status:** open — round 255, `epic-tasks/255-cc-1-anchors-what-in-a-claim-names-the-repository-and-does-it-exist.md`
+**Status:** landed
 **Severity:** HIGH (every later ticket starts from the anchors; the regex `needs_code` leaks today)
 **File:** `tools/claimcheck/anchors.py`
 **Symbol:** `extract_anchors`, `resolve_anchors`, `classify`, `PathRepoView`
@@ -139,3 +139,27 @@ second.
 
 Pack building, the worktree, any LLM call, anchors in languages other than Python for
 symbols.
+
+## As built
+
+Three places where the code is more precise than the text above, found when the 80 + 30 bench
+claims were classified:
+
+* **`mixed` is narrower than "contains a `_HINTS` word".** Taken literally, `git status`,
+  `$HOME`, `rename` or `pytest` in a claim about `Policy.decide` would make 10 of the 20 real code
+  claims `mixed`. A claim is `mixed` only when it *asserts* a world fact: a clause
+  (`, which …`, `, so …`, `, and …`, `because`) together with an outside API (a standard-library or
+  builtin name: `subprocess.run`, `str.rfind`, `dict()`, `re.M`, `fnmatch`) or an exit-code fact.
+  Mentioning `time.time` as a default clock stays `code`.
+* **A dangling anchor is recorded in `ResolvedAnchor.path`.** `classify(claim, resolved)` has no
+  view, so `resolve_anchors` puts the nearest place the repository does have (the module file,
+  the deepest existing directory, `"."` for a bare file name of a kind the repository has) into
+  `path` of an unresolved anchor; `found=False` with `path != ""` is "shaped like ours".
+  `is_dangling(resolved)` names that state.
+* **`PathRepoView.ticket_file`**: a plain number (`ticket 123`) is looked up as `epic-tasks/NN-*.md`;
+  an id with a prefix (`KC-76`) is looked up first by the id written into the file name
+  (`123-kc76-…md`), because there the number is the file's, not the id's, then by number.
+* **A bare lowercase word in backticks is not a symbol** unless it carries an underscore, a
+  capital, a dot, or is written as a call (`run()`). `run`, `read`, `main`, `path` name a
+  standard-library or shell thing as often as ours, and resolving them against any
+  definition of that name made 4 of 10 probe world claims `code`.

@@ -46,6 +46,7 @@ from tools.llm_stream import (  # noqa: E402
     build_chat_request, request_completion, retry_kwargs_from_config, strip_think)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lenz_claim_filter as lf  # noqa: E402  (is_internal: the repo-claim test)
+from tools.claimcheck import anchors as cc_anchors  # noqa: E402  (CC-1: the repo-claim test with a repository)
 
 KILO_CONFIG = Path.home() / ".config" / "kilo" / "kilo.jsonc"
 KILO_AUTH = Path.home() / ".local" / "share" / "kilo" / "auth.json"
@@ -312,14 +313,29 @@ def _strict_plurality(counts: Counter) -> str:
     return counts.most_common(1)[0][0]
 
 
+def claim_kind(claim: str, symbols: "set[str] | None" = None, view=None) -> tuple:
+    """(kind, dangling) of one claim: ``code``, ``world`` or ``mixed``.
+
+    With a ``RepoView`` the claim's anchors are looked up in the repository
+    (CC-1, ``tools/claimcheck/anchors.py``); without one the regex rule
+    ``lenz_claim_filter.is_internal`` decides, as before, and nothing dangles."""
+    if view is not None:
+        resolved = cc_anchors.resolve_anchors(cc_anchors.extract_anchors(claim), view)
+        return cc_anchors.classify(claim, resolved), cc_anchors.is_dangling(resolved)
+    return ("code" if lf.is_internal(claim, symbols or set()) else "world"), False
+
+
 def tally(claims: list[dict], results: list[dict],
-          symbols: "set[str] | None" = None, quorum: int = MIN_COMMITTED) -> list[dict]:
+          symbols: "set[str] | None" = None, quorum: int = MIN_COMMITTED,
+          view=None) -> list[dict]:
     """Per claim: every vote, each model's own majority, and the cross-model one.
 
     UNSURE is an abstention, not a vote: the verdict is decided among TRUE and
     FALSE, ``SPLIT`` on a tie, ``UNSURE`` when nobody committed.  A claim about
     this repo's own code (``needs_code``) is never accepted from votes: the
-    models cannot see the code, so a TRUE there is a plausible guess.
+    models cannot see the code, so a TRUE there is a plausible guess.  With a
+    ``view`` (a ``RepoView``) the test is the anchor classifier, and each row
+    also says ``kind`` (code|world|mixed) and ``dangling``.
     """
     out = []
     # a result read back from a saved JSON has string keys; a live one has ints
@@ -345,11 +361,13 @@ def tally(claims: list[dict], results: list[dict],
         # on this claim (silent, lost batch, unreadable reply) makes unanimous False.
         unanimous = (len(decided) == 1 and committed >= quorum
                      and committed == len(voters))
-        needs_code = lf.is_internal(c["claim"], symbols or set())
+        kind, dangling = claim_kind(c["claim"], symbols, view)
+        needs_code = kind != "world"
         if needs_code and verdict in ("TRUE", "FALSE", "SPLIT"):
             verdict = "CODE-CHECK"
         out.append({"claim": c["claim"], "truth": c.get("truth"), "verdict": verdict,
-                    "needs_code": needs_code, "unanimous": unanimous and not needs_code,
+                    "needs_code": needs_code, "kind": kind, "dangling": dangling,
+                    "unanimous": unanimous and not needs_code,
                     "by_model": model_major,
                     "all_votes": dict(total)})
     return out
@@ -411,7 +429,9 @@ def main(argv: list[str] | None = None) -> int:
     with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
         results = list(pool.map(lambda j: ask(j[0], texts, j[1], args.seed, parser,
                                               args.timeout, batch, args.fixed_prompt), jobs))
-    table = tally(claims, results, lf._repo_symbols(args.symbols_root or args.repo_root))
+    symbols_root = args.symbols_root or args.repo_root
+    table = tally(claims, results, lf._repo_symbols(symbols_root),
+                  view=cc_anchors.PathRepoView(symbols_root))
     report = {"results": results, "claims": table}
     if args.out:
         args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")

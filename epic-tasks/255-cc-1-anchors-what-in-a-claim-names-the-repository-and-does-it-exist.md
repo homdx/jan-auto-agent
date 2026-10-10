@@ -1,6 +1,6 @@
 # 255 — CC-1: anchors: what in a claim names the repository, and does it exist
 
-**Status:** open
+**Status:** landed
 **Severity:** HIGH (every later ticket starts from the anchors; the regex `needs_code` leaks today)
 **File:** `tools/claimcheck/anchors.py`
 **Symbol:** `extract_anchors`, `resolve_anchors`, `classify`, `PathRepoView`
