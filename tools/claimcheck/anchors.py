@@ -23,6 +23,7 @@ CC-5 turns it into evidence ("`X` does not exist at <sha7>").
 from __future__ import annotations
 
 import ast
+import bisect
 import builtins
 import keyword
 import os
@@ -173,13 +174,17 @@ def extract_anchors(claim: str) -> list:
     Pure: no I/O, no clock. Kinds claim the text in a fixed priority — commit,
     ticket, test, path, symbol, ref — so a `path::test` is one anchor and `gates.py`
     is a path, not the dotted symbol `gates.py`. `claim[a.start:a.end] == a.text`."""
-    taken: list = []
+    starts: list = []   # the taken spans, sorted and disjoint: only the two neighbours
+    ends: list = []     # of a new span can overlap it (a scan of all was quadratic)
     found: list = []
     for finder in _FINDERS:
         for kind, start, end in finder(claim):
-            if start >= end or any(start < b and a < end for a, b in taken):
+            i = bisect.bisect_left(starts, start)
+            if (start >= end or (i > 0 and ends[i - 1] > start)
+                    or (i < len(starts) and starts[i] < end)):
                 continue
-            taken.append((start, end))
+            starts.insert(i, start)
+            ends.insert(i, end)
             found.append(Anchor(kind, claim[start:end], start, end))
     found.sort(key=lambda a: (a.start, a.end))
     return found
