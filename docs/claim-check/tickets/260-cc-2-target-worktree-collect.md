@@ -1,6 +1,6 @@
 # CC-2 — target: a pinned worktree and a cached collect model
 
-**Status:** draft
+**Status:** landed
 **Severity:** HIGH (without a pinned tree there is nothing to read evidence from)
 **File:** `tools/claimcheck/target.py`
 **Symbol:** `RefHint`, `parse_report_ref`, `Target`, `Target.open`, `Target.view`, `Target.collect`, `TargetError`
@@ -129,3 +129,29 @@ or unicode as `scratch`; a `scratch` on a read-only filesystem (a one-line error
 ## Not in scope
 
 Reading evidence (CC-3/4), classification (CC-1), any LLM call.
+
+## As built
+
+Places where the code is more exact than the text above:
+
+* **`RefHint.source` is the matched text as written** (`origin/kc @ afa53f1`, `HEAD 7b4e5f9`); the
+  `sha` is returned lower-case. A `branch X (HEAD sha)` yields the one `HEAD` hint, as listed above.
+  A sha made only of letters is taken after `commit` / `@` only when it has a digit, so
+  "commit defaced" is not a sha.
+* **`Target.open` takes the scratch directory as absolute** (git runs in another directory) and a
+  bare repository as `repo` (`--absolute-git-dir`). A ref starting with `-` and a hex string of 4–6
+  characters that is not a branch or tag are refused. A branch of a URL clone is found as
+  `origin/<ref>`. No hook of the operator's repository runs in the new tree (`core.hooksPath=/dev/null`).
+* **A reused tree is checked, not trusted:** its `HEAD` must be the sha *and* no tracked file may
+  be modified, else it is rebuilt. The lock is one `mkdir` per repository, not per sha, because
+  `git worktree add` itself writes into the repository's `.git/worktrees`.
+* **`fetch=True`** runs `git fetch --all --tags --no-write-fetch-head`; a repository without a
+  remote makes it a no-op, and a missing sha then says "fetch=True would not help".
+* **`collect()` remembers its answer on the target**, failures included: a failed build is one
+  warning, not one per call. The tree's own freshness check (`loader.load`) runs first, so a
+  second `Target` on a reused tree does not rebuild either.
+* **`view().files()` hides `.git` and `.collect/`.** A worktree's `.git` is a file; it was listed
+  as a repository file until `PathRepoView.files` learned to skip it
+  (`tests_bugfix/test_claimcheck_pathrepoview_gitfile_260.py`). `view().git` returns the raw output
+  (a blob keeps its `\r\n`) and accepts exactly the eleven subcommands listed above; `-c` alone
+  stays legal (`git log -c`), `-c core.*` and `--textconv` do not.
