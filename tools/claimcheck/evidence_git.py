@@ -46,7 +46,8 @@ GIT_TIMEOUT = 20.0               # seconds one view.git call may take; then a no
 MAX_BODY = 1200                  # chars of a commit message body in the header chunk
 LARGEST_FILES = 3                # files shown for a commit claim that names none of its files
 MAX_HUNKS = 8                    # hunks per commit, per anchored path of a range, per keyword search
-MAX_DIFF_BYTES = 200 * 1024      # a bigger patch keeps only the hunks with a claim keyword
+MAX_STAT_FILES = 30              # file lines of a --stat kept in a header chunk; the rest is a count
+MAX_DIFF_BYTES = 200 * 1024     # a bigger patch keeps only the hunks with a claim keyword
 MAX_FILE_LINES = 20000           # a file whose diff changes more lines is not fetched at all
 MAX_FETCH_LINES = 40000          # changed lines fetched for one call; the files past it are a note
 HISTORY_LOG = 5                  # commits listed for a path the claim talks history about
@@ -63,7 +64,8 @@ _PATCH_OPTS = ("--unified=3", "--diff-algorithm=myers", "--indent-heuristic")
 _HISTORY = re.compile(r"\b(?:fix(?:es|ed|ing)?|chang(?:e|es|ed|ing)|introduc(?:e|es|ed|ing)"
                       r"|add(?:s|ed|ing)?|remov(?:e|es|ed|ing)|regress\w*)\b", re.I)
 _TICKET_PATH = re.compile(r"^epic-tasks/\d+-[^/]*\.md$")
-_HUNK_AT = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_STAT_TOTAL = re.compile(r"^ \d+ files? changed")
+_HUNK_AT =re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _NL = re.compile(r"\r\n|\r|\n")
 _STATUS = re.compile(r"^\s*\*\*Status:\*\*")
 _C_ESC = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
@@ -187,11 +189,13 @@ class Hunk:
         for i, line in enumerate(self.lines):
             if not any(k in line for k in self.keys):
                 continue
-            win = [j for j in range(max(0, i - RADIUS), min(len(rows), i + RADIUS + 1)) if j not in shown]
-            need = sum(cost[j] for j in win) + _MARK
-            if win and spent + need <= budget:
-                shown.update(win)
-                spent += need
+            for radius in (RADIUS, 1, 0):   # long lines: a narrower window beats losing the line itself
+                win = [j for j in range(max(0, i - radius), min(len(rows), i + radius + 1)) if j not in shown]
+                need = sum(cost[j] for j in win) + _MARK
+                if win and spent + need <= budget:
+                    shown.update(win)
+                    spent += need
+                    break
         at = 0
         for i in sorted(shown):
             if i > at:
@@ -397,8 +401,21 @@ def _fetch_hunks(view, cmd: list, rows: list, files: list, keys: list, prefix: s
     return chunks + _render(hunks[:MAX_HUNKS], prefix, max_chars, why)
 
 
+def _cap_stat(stat: str) -> str:
+    """The first `MAX_STAT_FILES` file lines, the totals line, the first `MAX_STAT_FILES`
+    summary lines (create / delete / rename): a commit of 1500 files is not an 80 KB header."""
+    lines = stat.split("\n")
+    end = next((i for i, l in enumerate(lines) if _STAT_TOTAL.match(l)), len(lines))
+    files, rest = lines[:end], lines[end:]
+    if len(files) > MAX_STAT_FILES:
+        files = files[:MAX_STAT_FILES] + [f" … {len(files) - MAX_STAT_FILES} more files"]
+    if len(rest) > MAX_STAT_FILES + 1:
+        rest = rest[:MAX_STAT_FILES + 1] + [f" … {len(rest) - MAX_STAT_FILES - 1} more summary lines"]
+    return "\n".join(files + rest)
+
+
 def _stat(view, cmd: list) -> str:
-    return _git(view, cmd[0], "--stat=1000,1000", "--summary", *_DIFF_OPTS, *cmd[1:]).strip("\n")
+    return _cap_stat(_git(view, cmd[0], "--stat=1000,1000", "--summary", *_DIFF_OPTS, *cmd[1:]).strip("\n"))
 
 
 # ------------------------------------------------------------------ commit
@@ -427,6 +444,8 @@ def _commit_chunks(r, view, resolved, keys: list, max_chars: int) -> list:
     if not files:   # the claim names none of the commit's files: the largest changes
         ranked = sorted(rows, key=lambda row: (-((row[0] or 0) + (row[1] or 0)), row[3]))
         files = [row[3] for row in ranked[:LARGEST_FILES]]
+        # a binary file has no changed lines to rank by: it is a note, not a hunk — say so
+        files += [row[3] for row in rows if row[0] is None][:LARGEST_FILES]
     return out + _fetch_hunks(view, cmd, rows, files, keys, f"git:{sha7}", max_chars, why)
 
 

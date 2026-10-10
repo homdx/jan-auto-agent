@@ -103,6 +103,14 @@
     "text": "commit dafb6110efdc1b6bb75edb17eed882c098ec971b\nAuthor: Ann <ann@example.com>\nDate:   2026-01-01T00:00:00+00:00\n\n    lib: store and gates\n\n epic-tasks/01-store-errors.md |  15 +++++++++++++++\n lib/gates.py                  |   7 +++++++\n lib/store.py                  |  18 ++++++++++++++++++\n logo.png                      | Bin 0 -> 5 bytes\n 4 files changed, 40 insertions(+)\n create mode 100644 epic-tasks/01-store-errors.md\n create mode 100644 lib/gates.py\n create mode 100644 lib/store.py\n create mode 100644 logo.png"
    },
    {
+    "id": "note:git:binary:logo.png",
+    "kind": "note",
+    "start": 0,
+    "end": 0,
+    "why": "commit dafb611",
+    "text": "binary file: logo.png"
+   },
+   {
     "id": "git:dafb611:epic-tasks/01-store-errors.md:1-15",
     "kind": "git",
     "start": 1,

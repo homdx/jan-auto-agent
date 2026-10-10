@@ -166,3 +166,14 @@ with fixed identity and dates, so the shas are the same on every machine). Mutat
 fix claims 20/20 (target 90 %), commit and ticket claims 6/6, dangling commits 3/3, real
 r026 + r027 2/2; it fails on 4 of 4 broken builds (paths ignored, status dropped, gutter
 off by one, stat missing).
+
+**Judging fixes (the three entries, cross-probed with one neutral script).** Three holes in
+the landed code, each found in a probe that the other entries passed: a header's `--stat`
+kept every file line (200 new files: 10 KB, 1500 files: 80 KB in one chunk — the other
+entries cap it at 30 lines), a hunk over the budget dropped its keyword line when the ±3 lines
+around it did not fit (1000 changed 300-char lines lost `+load_timeout = 9`; the window now
+narrows to ±1 and to the line alone), and a binary file of a commit naming no file was in no
+note (it has no changed lines, so the "largest files" never held it). `MAX_STAT_FILES` = 30.
+Not ported, because the landed code does not share them: Sonnet's entry keeps `\r` in CRLF
+chunks and, like Haiku's, loses the named file of a commit over 200 KB (≈1000 files), Haiku's
+output depends on the operator's `diff.noprefix` (closed by the views' git environment).
