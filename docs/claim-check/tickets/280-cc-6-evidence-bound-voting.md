@@ -1,6 +1,6 @@
 # CC-6 — evidence-bound voting: prompt v2, the quote check, and `--target`
 
-**Status:** open
+**Status:** landed
 **Severity:** HIGH (this is the ticket that makes the epic's promise)
 **File:** `tools/claimcheck/judge.py`
 **Symbol:** `build_prompt_v2`, `parse_votes_v2`, `verify_quotes`, `ask_with_packs`
@@ -182,3 +182,15 @@ Where the first round for this ticket should start: `python3 -m tools.contest ru
 ## Not in scope
 
 Before/after (CC-7), `truth.csv` (CC-8), changing the unanimity rule, executing code.
+
+**Judging and landing (round 280: cloud Opus 5, Sonnet 5, Haiku, three Sensenova, agnes-2-5, nemotron; one neutral probe, the cross matrix, live runs on real models).**
+Landed `64d4db4`: the cloud Opus 5 patch as it came (104 own tests; 16 of 16 of the neutral probe;
+the right split of world claims ten to a request and code claims two). Sonnet 5 (45 own tests) was
+second; Haiku failed Gate 1 (two commits, an edit of `model.py` outside the ticket). Three fixes by hand,
+each found by a **live** run that fake voters had not exposed: `212f66e` (a quote copied over two code
+lines carries a bare newline, which strict JSON forbids: the whole reply was lost; `[progress]` lines
+on stderr), `eb78c27` (a reply that is the rows one after another with no list around them was read as no
+votes: deepseek lost 68 of 80), `98e37ee` (a model with no vote at all, here one out of its free plan, was
+counted as a voter and made every claim non-unanimous: 0 of 80 decided). Live (three free voters of three
+families, one run): fixture 57 of 80 decided, 0 wrong, 32 of 50 code claims; the 30 real claims 11 decided,
+0 wrong. Not taken from the entries: a JSON reply in single quotes (Sensenova var1 reads it).
