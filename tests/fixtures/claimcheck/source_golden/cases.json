@@ -1,0 +1,167 @@
+[
+ {
+  "claim": "`config.load_timeout` reads `timeout` from the `[defaults]` section, not from `[pipeline]`.",
+  "chunks": [
+   {
+    "id": "src:lib/config.py:21-25",
+    "start": 21,
+    "end": 25,
+    "why": "config.load_timeout",
+    "text": " 21| def load_timeout(parser) -> int:\n 22|     \"\"\"The step timeout, in seconds.\"\"\"\n 23|     if not parser.has_section(\"defaults\"):\n 24|         return DEFAULT_TIMEOUT\n 25|     return parser.getint(\"defaults\", \"timeout\", fallback=DEFAULT_TIMEOUT)"
+   }
+  ]
+ },
+ {
+  "claim": "`config.parse_bool` returns True for the string \"0\".",
+  "chunks": [
+   {
+    "id": "src:lib/config.py:28-29",
+    "start": 28,
+    "end": 29,
+    "why": "config.parse_bool",
+    "text": " 28| def parse_bool(text: str) -> bool:\n 29|     return text.strip().lower() in (\"1\", \"yes\", \"true\", \"on\")"
+   }
+  ]
+ },
+ {
+  "claim": "`get_list` in `lib/config.py` does not strip the whitespace of its items.",
+  "chunks": [
+   {
+    "id": "src:lib/config.py:32-34",
+    "start": 32,
+    "end": 34,
+    "why": "get_list",
+    "text": " 32| def get_list(parser, key: str) -> list:\n 33|     raw = parser.get(\"pipeline\", key, fallback=\"\")\n 34|     return [item for item in raw.split(\",\") if item]"
+   }
+  ]
+ },
+ {
+  "claim": "`Store.size` is read-only: its setter raises `AttributeError`.",
+  "chunks": [
+   {
+    "id": "src:lib/store.py:14-16",
+    "start": 14,
+    "end": 16,
+    "why": "Store.size",
+    "text": " 14|     @property\n 15|     def size(self) -> int:\n 16|         return len(self._data)"
+   },
+   {
+    "id": "src:lib/store.py:18-20",
+    "start": 18,
+    "end": 20,
+    "why": "Store.size",
+    "text": " 18|     @size.setter\n 19|     def size(self, value: int) -> None:\n 20|         raise AttributeError(\"size is read-only\")"
+   }
+  ]
+ },
+ {
+  "claim": "`Store.__init__` starts with an empty dict in `self._data`.",
+  "chunks": [
+   {
+    "id": "src:lib/store.py:10-12",
+    "start": 10,
+    "end": 12,
+    "why": "Store.__init__",
+    "text": " 10|     def __init__(self, path: Path) -> None:\n 11|         self.path = Path(path)\n 12|         self._data: dict = {}"
+   }
+  ]
+ },
+ {
+  "claim": "`Store.load` swallows `ValueError` and leaves the store empty.",
+  "chunks": [
+   {
+    "id": "src:lib/store.py:22-26",
+    "start": 22,
+    "end": 26,
+    "why": "Store.load",
+    "text": " 22|     def load(self) -> None:\n 23|         try:\n 24|             self._data = json.loads(self.path.read_text())\n 25|         except (OSError, ValueError):\n 26|             self._data = {}"
+   }
+  ]
+ },
+ {
+  "claim": "`Store` and `Store.save` write through a `.tmp` file and `replace` it.",
+  "chunks": [
+   {
+    "id": "src:lib/store.py:7-37",
+    "start": 7,
+    "end": 37,
+    "why": "Store, Store.save",
+    "text": "  7| class Store:\n  8|     \"\"\"Keys and values in one JSON file.\"\"\"\n  9| \n 10|     def __init__(self, path: Path) -> None:\n 11|         self.path = Path(path)\n 12|         self._data: dict = {}\n 13| \n 14|     @property\n 15|     def size(self) -> int:\n 16|         return len(self._data)\n 17| \n 18|     @size.setter\n 19|     def size(self, value: int) -> None:\n 20|         raise AttributeError(\"size is read-only\")\n 21| \n 22|     def load(self) -> None:\n 23|         try:\n 24|             self._data = json.loads(self.path.read_text())\n 25|         except (OSError, ValueError):\n 26|             self._data = {}\n 27| \n 28|     def get(self, key: str, default=None):\n 29|         return self._data.get(key, default)\n 30| \n 31|     def items(self) -> dict:\n 32|         return self._data\n 33| \n 34|     def save(self) -> None:\n 35|         tmp = self.path.with_suffix(\".tmp\")\n 36|         tmp.write_text(json.dumps(self._data, sort_keys=True))\n 37|         tmp.replace(self.path)"
+   }
+  ]
+ },
+ {
+  "claim": "`run_all` in `lib/runner.py` calls `subprocess.run` with `check=False` and returns 0 when `returncode == 0`.",
+  "chunks": [
+   {
+    "id": "src:lib/runner.py:6-201",
+    "start": 6,
+    "end": 201,
+    "why": "run_all",
+    "text": "   6| def run_all(steps: list, env: dict) -> int:\n   7|     \"\"\"Run every step; the count of steps that failed.\"\"\"\n# … 92 lines omitted (8-99)\n 100|     step_092 = env.get(\"STEP_092\", \"\")\n 101|     step_093 = env.get(\"STEP_093\", \"\")\n 102|     step_094 = env.get(\"STEP_094\", \"\")\n 103|     done = subprocess.run(steps, env=env, check=False)\n 104|     if done.returncode == 0:\n 105|         return 0\n 106|     step_096 = env.get(\"STEP_096\", \"\")\n 107|     step_097 = env.get(\"STEP_097\", \"\")\n# … 94 lines omitted (108-201)"
+   }
+  ]
+ },
+ {
+  "claim": "`lib/config.py` defines `to_int` as a lambda that strips its value.",
+  "chunks": [
+   {
+    "id": "src:lib/config.py:1-34",
+    "start": 1,
+    "end": 34,
+    "why": "lib/config.py",
+    "text": "  1| \"\"\"Settings read from an ini file.\"\"\"\n  2| \n  3| import configparser\n  4| import os\n  5| from typing import TYPE_CHECKING\n  6| \n  7| if TYPE_CHECKING:\n  8|     def typed_section(name: str) -> dict: ...\n  9| \n 10| DEFAULT_TIMEOUT = 30\n 11| \n 12| to_int = lambda value: int(value.strip())\n 13| \n 14| \n 15| def read_config(path: str) -> configparser.ConfigParser:\n 16|     parser = configparser.ConfigParser()\n 17|     parser.read(path, encoding=\"utf-8\")\n 18|     return parser\n 19| \n 20| \n 21| def load_timeout(parser) -> int:\n 22|     \"\"\"The step timeout, in seconds.\"\"\"\n 23|     if not parser.has_section(\"defaults\"):\n 24|         return DEFAULT_TIMEOUT\n 25|     return parser.getint(\"defaults\", \"timeout\", fallback=DEFAULT_TIMEOUT)\n 26| \n 27| \n 28| def parse_bool(text: str) -> bool:\n 29|     return text.strip().lower() in (\"1\", \"yes\", \"true\", \"on\")\n 30| \n 31| \n 32| def get_list(parser, key: str) -> list:\n 33|     raw = parser.get(\"pipeline\", key, fallback=\"\")\n 34|     return [item for item in raw.split(\",\") if item]"
+   }
+  ]
+ },
+ {
+  "claim": "`lib/config.py:24-25` returns `DEFAULT_TIMEOUT` when there is no `[defaults]` section.",
+  "chunks": [
+   {
+    "id": "src:lib/config.py:21-28",
+    "start": 21,
+    "end": 28,
+    "why": "lib/config.py:24-25",
+    "text": " 21| def load_timeout(parser) -> int:\n 22|     \"\"\"The step timeout, in seconds.\"\"\"\n 23|     if not parser.has_section(\"defaults\"):\n 24|         return DEFAULT_TIMEOUT\n 25|     return parser.getint(\"defaults\", \"timeout\", fallback=DEFAULT_TIMEOUT)\n 26| \n 27| \n 28| def parse_bool(text: str) -> bool:"
+   }
+  ]
+ },
+ {
+  "claim": "`tests/store_checks.py::test_get_default` reads a missing key from a loaded store.",
+  "chunks": [
+   {
+    "id": "src:tests/store_checks.py:23-24",
+    "start": 23,
+    "end": 24,
+    "why": "tests/store_checks.py::test_get_default",
+    "text": " 23| def test_get_default(loaded):\n 24|     assert loaded.get(\"missing\", 3) == 3"
+   },
+   {
+    "id": "src:tests/store_checks.py:17-20",
+    "start": 17,
+    "end": 20,
+    "why": "fixture loaded",
+    "text": " 17| @pytest.fixture(name=\"loaded\")\n 18| def _loaded_store(tmp_store):\n 19|     tmp_store.load()\n 20|     return tmp_store"
+   },
+   {
+    "id": "src:tests/store_checks.py:8-10",
+    "start": 8,
+    "end": 10,
+    "why": "fixture tmp_store",
+    "text": "  8| @pytest.fixture\n  9| def tmp_store(tmp_path):\n 10|     return Store(tmp_path / \"s.json\")"
+   }
+  ]
+ },
+ {
+  "claim": "`typed_section` exists only under `TYPE_CHECKING` in `lib/config.py`.",
+  "chunks": [
+   {
+    "id": "src:lib/config.py:8-8",
+    "start": 8,
+    "end": 8,
+    "why": "typed_section",
+    "text": " 8|     def typed_section(name: str) -> dict: ..."
+   }
+  ]
+ }
+]

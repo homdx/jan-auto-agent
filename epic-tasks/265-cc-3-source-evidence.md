@@ -1,10 +1,10 @@
-# CC-3 — source evidence: symbol bodies, keyword windows, collect facts
+# 265 — CC-3: source evidence: symbol bodies, keyword windows, collect facts
 
 **Status:** landed
 **Severity:** HIGH (this is most of what a voter reads)
 **File:** `tools/claimcheck/evidence_source.py`
 **Symbol:** `source_chunks`, `keyword_windows`, `collect_chunks`
-**Round:** —
+**Round:** 265
 **Size:** M
 **Depends on:** CC-1 (`model.py`: `Chunk`, `ResolvedAnchor`, `RepoView`)
 **Also touches:** `tests/test_claimcheck_source.py`, `tests/fixtures/claimcheck/source_golden/`
