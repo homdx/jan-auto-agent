@@ -246,3 +246,17 @@ def test_report_sha_mismatch_is_printed(tmp_path, voters, capsys):
     assert "warning: the report says `deadbee1`" in captured.err
     assert re.search(r"warnings: the report says `deadbee1`, `HEAD` is `[0-9a-f]{7}`", captured.out)
     assert json.loads((tmp_path / "votes.json").read_text())["target"]["warnings"]
+
+
+def test_a_model_with_no_votes_at_all_is_not_a_voter_for_unanimity():
+    """A dead voter (404, no free plan) must not make every claim non-unanimous; found by live run B of round 280."""
+    claims = [{"claim": "c0", "truth": True}, {"claim": "c1", "truth": False}]
+    live = lambda m: {"model": m, "run": 0, "votes": {0: "TRUE", 1: "FALSE"}}  # noqa: E731
+    dead = {"model": "dead/model", "run": 0, "votes": {}, "error": "HTTP 404"}
+    table = cv.tally(claims, [live("a/x"), live("b/y"), live("c/z"), dead])
+    assert [t["verdict"] for t in table] == ["TRUE", "FALSE"]
+    assert all(t["unanimous"] for t in table)
+    # a live model that is silent on one claim still blocks unanimity there
+    part = {"model": "c/z", "run": 0, "votes": {0: "TRUE"}}
+    table = cv.tally(claims, [live("a/x"), live("b/y"), part, dead])
+    assert table[0]["unanimous"] and not table[1]["unanimous"]

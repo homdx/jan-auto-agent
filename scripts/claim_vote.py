@@ -426,7 +426,11 @@ def tally(claims: list[dict], results: list[dict],
     results = [{**r, "votes": {int(k): v for k, v in r["votes"].items()},
                 **({"accepted": {int(k): v for k, v in r["accepted"].items()}}
                    if "accepted" in r else {})} for r in results]
-    voters = {r["model"] for r in results}
+    # a model with no vote at all in any run (dead, out of its free plan, a 404) is not a voter:
+    # counted, it made "every voter committed" false for every claim, and a run with one dead
+    # model decided 0 of 80 (round 280, run B). A lost batch or a silent run of a live model
+    # still counts against unanimity: that model did vote elsewhere.
+    voters = {r["model"] for r in results if r["votes"]} or {r["model"] for r in results}
     for i, c in enumerate(claims):
         per_model: dict[str, list[str]] = {}
         for r in results:
