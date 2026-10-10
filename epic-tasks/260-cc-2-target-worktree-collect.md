@@ -1,10 +1,10 @@
-# CC-2 — target: a pinned worktree and a cached collect model
+# 260 — CC-2: target: a pinned worktree and a cached collect model
 
 **Status:** landed
 **Severity:** HIGH (without a pinned tree there is nothing to read evidence from)
 **File:** `tools/claimcheck/target.py`
 **Symbol:** `RefHint`, `parse_report_ref`, `Target`, `Target.open`, `Target.view`, `Target.collect`, `TargetError`
-**Round:** —
+**Round:** 260
 **Size:** M
 **Depends on:** CC-0
 **Also touches:** `tests/test_claimcheck_target.py`, `tests/fixtures/claimcheck/ref_hints.json`
