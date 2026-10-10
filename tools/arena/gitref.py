@@ -26,9 +26,11 @@ class GitRefError(Exception):
 
 
 def git(repo: Path, *args: str, env: Optional[dict] = None,
-        stdin: Optional[str] = None, strip: bool = True) -> str:
+        stdin: Optional[str] = None, strip: bool = True,
+        timeout: Optional[float] = None) -> str:
     """Run `git <args>` in *repo*; its stdout (stripped unless *strip* is
-    False — a file's text keeps its bytes), or `GitRefError`."""
+    False — a file's text keeps its bytes), or `GitRefError` (also when it
+    runs longer than *timeout* seconds; the process is killed)."""
     try:
         proc = subprocess.run(
             ["git", *args], cwd=str(repo), capture_output=True, env=env,
@@ -40,7 +42,10 @@ def git(repo: Path, *args: str, env: Optional[dict] = None,
             # turned a CRLF ticket's `\r\n` into `\n`, so the blob read back
             # was never the blob on the branch.
             input=None if stdin is None else stdin.encode("utf-8", "surrogateescape"),
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as err:
+        raise GitRefError(printable(f"git {' '.join(args)}: timed out after {err.timeout:g} s")) from err
     except OSError as err:  # no git binary at all
         raise GitRefError(printable(f"git {' '.join(args)}: {err}")) from err
     out = proc.stdout.decode("utf-8", "surrogateescape")

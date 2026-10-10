@@ -485,6 +485,7 @@ def classify(claim: str, resolved) -> str:
 
 # ------------------------------------------------------------------ PathRepoView
 
+GIT_TIMEOUT = 20.0   # seconds one `PathRepoView.git` call may take; a hung git raises GitRefError
 _READ_ONLY_GIT = frozenset((
     "rev-parse rev-list log show diff diff-tree cat-file ls-tree ls-files blame grep "
     "merge-base describe name-rev show-ref for-each-ref shortlog status").split())
@@ -579,5 +580,8 @@ class PathRepoView:
                 raise ValueError(f"git {args[0]} {arg}: refused, it writes or runs a program")
         if args[0] in _NO_FILTERS_GIT:
             args = (args[0], "--no-textconv", "--no-ext-diff", *args[1:])
-        env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat"}
-        return gitref.git(self.root, *args, env=env, strip=False)
+        # the operator's global and system config are not read: `color.ui=always` or
+        # `diff.noprefix` there changed the text a voter is shown (CC-4)
+        env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat",
+               "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+        return gitref.git(self.root, *args, env=env, strip=False, timeout=GIT_TIMEOUT)

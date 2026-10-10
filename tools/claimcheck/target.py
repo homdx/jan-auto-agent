@@ -109,6 +109,8 @@ _AT_NOT_REFS = frozenset(("author", "by", "from", "posted", "mail", "email"))
 _GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                  "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_PREFIX",
                  "GIT_EXTERNAL_DIFF")
+#: seconds one `view().git(...)` call may take (CC-4: a hung git is a note, not a hang)
+VIEW_GIT_TIMEOUT = 20.0
 #: no hook of the operator's repository runs in a tree we make (`post-checkout`), no gc.
 _SAFE_C = ("-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "-c", "core.fsmonitor=false")
 
@@ -121,11 +123,20 @@ def _env() -> dict:
     return env
 
 
-def _run_git(cwd: Optional[Path], *args: str) -> subprocess.CompletedProcess:
-    """`git <args>` in *cwd*; the single place a target runs git (tests count calls here)."""
+def _run_git(cwd: Optional[Path], *args: str, view: bool = False) -> subprocess.CompletedProcess:
+    """`git <args>` in *cwd*; the single place a target runs git (tests count calls here).
+
+    *view*: a read for evidence — the operator's global and system config are not read
+    (`color.ui=always`, `diff.noprefix` changed what a voter is shown) and the call is
+    killed after `VIEW_GIT_TIMEOUT` seconds."""
+    env = _env()
+    if view:
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     try:
         proc = subprocess.run(["git", *_SAFE_C, *args], cwd=None if cwd is None else str(cwd),
-                              capture_output=True, env=_env())
+                              capture_output=True, env=env, timeout=VIEW_GIT_TIMEOUT if view else None)
+    except subprocess.TimeoutExpired as err:
+        raise TargetError(f"git {' '.join(args)}: timed out after {err.timeout:g} s") from err
     except OSError as err:
         raise TargetError(f"git {' '.join(args)}: {err}") from err
     # bytes in, bytes out (gitref bug 185): text mode would turn a CRLF blob's \r\n into \n
@@ -134,9 +145,9 @@ def _run_git(cwd: Optional[Path], *args: str) -> subprocess.CompletedProcess:
         proc.stdout.decode("utf-8", "surrogateescape"), proc.stderr.decode("utf-8", "replace"))
 
 
-def _git(cwd: Optional[Path], *args: str, hint: str = "", strip: bool = True) -> str:
+def _git(cwd: Optional[Path], *args: str, hint: str = "", strip: bool = True, view: bool = False) -> str:
     """stdout of `git <args>` (stripped unless *strip* is False: a blob keeps its bytes); `TargetError` with the command and stderr's first line."""
-    proc = _run_git(cwd, *args)
+    proc = _run_git(cwd, *args, view=True) if view else _run_git(cwd, *args)
     if proc.returncode != 0:
         first = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[0]
         raise TargetError(f"git {' '.join(args)}: {first}{hint}")
@@ -228,7 +239,7 @@ class _TargetView(PathRepoView):
                 raise TargetError(f"git {args[0]} {arg}: refused, it writes or runs a program")
         if args[0] in _NO_FILTERS:
             args = (args[0], "--no-textconv", "--no-ext-diff", *args[1:])
-        return _git(self.root, *args, strip=False)
+        return _git(self.root, *args, strip=False, view=True)
 
 
 # ── the target ────────────────────────────────────────────────────────────────
