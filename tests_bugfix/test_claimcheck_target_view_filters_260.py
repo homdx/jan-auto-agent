@@ -50,3 +50,17 @@ def test_view_git_refuses_blame_contents_of_an_outside_file(evil, tmp_path):
     with T.Target.open(repo, "main", scratch=tmp_path / "s") as t:
         with pytest.raises(T.TargetError):
             t.view().git("blame", "--contents", str(outside), "a.py")
+
+
+def test_view_does_not_see_what_collect_wrote(evil, tmp_path):
+    repo, _ = evil
+    with T.Target.open(repo, "main", scratch=tmp_path / "s") as t:
+        t.collect()
+        v = t.view()
+        assert (t.tree / ".collect").is_dir()
+        assert not v.exists(".collect") and not v.exists(".collect/MODULE_MAP.md")
+        assert not v.exists("./.collect/MODULE_MAP.md")
+        with pytest.raises(FileNotFoundError):
+            v.read(".collect/MODULE_MAP.md")
+        assert not [p for p in v.files() if p.startswith(".collect")]
+        assert v.exists("a.py") and v.read("a.py") == "A=2\n"

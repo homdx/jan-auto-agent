@@ -150,7 +150,7 @@ Places where the code is more exact than the text above:
 * **`collect()` remembers its answer on the target**, failures included: a failed build is one
   warning, not one per call. The tree's own freshness check (`loader.load`) runs first, so a
   second `Target` on a reused tree does not rebuild either.
-* **`view().files()` hides `.git` and `.collect/`.** A worktree's `.git` is a file; it was listed
+* **`view()` hides `.git` and `.collect/`** (`files()`, and since the judging fix `exists()` and `read()` too). A worktree's `.git` is a file; it was listed
   as a repository file until `PathRepoView.files` learned to skip it
   (`tests_bugfix/test_claimcheck_pathrepoview_gitfile_260.py`). `view().git` returns the raw output
   (a blob keeps its `\r\n`) and accepts exactly the eleven subcommands listed above; `-c` alone

@@ -199,9 +199,23 @@ _NO_FILTERS = frozenset(("show", "diff", "log"))
 class _TargetView(PathRepoView):
     """`PathRepoView` over the pinned tree, with the ticket's git allow-list and `TargetError`."""
 
+    @staticmethod
+    def _is_collect(path: str) -> bool:
+        norm = os.path.normpath(path.strip("/")) if path else ""
+        return norm == ".collect" or norm.startswith(".collect" + os.sep)
+
+    # `.collect/` is what Target.collect() wrote, not what the commit holds: files(), exists()
+    # and read() all say so, or a claim naming `.collect/MODULE_MAP.md` would resolve as found.
     def files(self) -> list:
-        # `.collect/` is what Target.collect() wrote, not what the commit holds.
-        return [p for p in super().files() if p != ".collect" and not p.startswith(".collect/")]
+        return [p for p in super().files() if not self._is_collect(p)]
+
+    def exists(self, path: str) -> bool:
+        return False if self._is_collect(path) else super().exists(path)
+
+    def read(self, path: str) -> str:
+        if self._is_collect(path):
+            raise FileNotFoundError(path)
+        return super().read(path)
 
     def git(self, *args: str) -> str:
         if not args or args[0] not in _VIEW_GIT:
