@@ -1,8 +1,6 @@
 # CC-10 — claim check in Gate 1: three voters with the code and a quote, instead of one reader
 
-**Status:** DRAFT — a first sketch written before the live runs of CC-6 were finished. It will be
-completed after the live run (numbers, the voters' roster, the quorum rule and the fallback below
-are hypotheses until then). Do not copy it into `epic-tasks/` as it stands.
+**Status:** DRAFT 2 — completed with the live numbers of round 280 (below). What is still missing before it is cut into `epic-tasks/`: a recorded set of Architect candidates with a known answer, to measure Gate 1 itself (the acceptance section). Do not copy it into `epic-tasks/` as it stands.
 **Severity:** MEDIUM (it is the first place where the epic's tool feeds `--auto` directly)
 **File:** `tools/auto/gate1_filter.py`
 **Symbol:** `Gate1Filter._check_presence` (Stage B), a new `tools/auto/gate1_vote.py`
@@ -78,6 +76,39 @@ changes nothing (the existing Gate 1 tests stay green unchanged); a voter that r
    (4 + 1 wrong). So one good model with the quote check is already strong, and one bad one is not:
    the roster for a single-voter mode is chosen by measured wrong rate, not by availability. To be
    re-measured with `RUNS=3` before this ticket is cut.
+
+## Live numbers (round 280, free models, real runs; the voting of CC-6 on the CC-0 bench)
+
+Six voter sets of three, fixture of 80 claims and 30 real claims, one run each. Settled = every voter
+committed and all agreed, quotes checked by code.
+
+| voters | fixture settled / wrong | real settled / wrong |
+|---|---|---|
+| hy3, deepseek-v4-flash, nemotron-3-ultra (kenary, tokenharbor, bynara) | 57 / 0 | 11 / 0 |
+| cohere north-mini-code, dots-3-note, laguna (openrouter2 + kenary) | 50 / 0 | 11 / 0 |
+| nemotron-3-super, hy3, agnes-2-5 (kenary) | 56 / 0 | 10 / 0 |
+| agnes-3-0-flash, nemotron-3-ultra, laguna (kenary) | 63 / 0 | 16 / 0 |
+
+Per voter alone (settled by itself, quote checked): hy3 76 right of 76 and 18 of 18; agnes-3-0-flash 79 of 79
+and 20 of 21; nemotron-3-ultra 68 of 68 and 21 of 21; dots-3-note 78 of 79 and 19 of 19; **laguna 72 of 77 and
+23 of 25; deepseek-v4-flash 65 of 69 and 12 of 13**. Zero wrong across about 330 settled verdicts, while the
+weakest single voters were wrong on 5 to 7 % of theirs: **the unanimity rule, not any one model, is what
+makes the vote safe.** Cost: a code claim is 0.5 request per voter (two to a request); a Gate 1 candidate is
+one claim, so `code_batch = 1` there and a candidate costs three requests.
+
+What the runs found that fake voters did not (all fixed in CC-6): a quote copied over two code lines carries
+a raw newline; a reply of separate JSON objects without a list; a dead voter counted in the unanimity.
+Gate 1 inherits the fixes, and its own test must use the **real reply shapes**, not only a clean JSON.
+
+### What the numbers say about the open questions
+
+* Q2 (is a unanimous `FALSE` enough to reject): it was right every time it occurred in these runs, and no
+  single voter is trustworthy alone. Draft rule: reject on unanimous `FALSE` of three families **and** keep
+  the existing single reader's `confirmed` as a veto in the first version (`vote_veto_by_reader = on`), to
+  be relaxed only with a measured Gate 1 set.
+* Q5 (one model): see the single-voter text above; the table now says which models qualify (wrong on at most
+  1 in 70 in these runs: hy3, agnes-3-0-flash, nemotron-3-ultra, dots-3-note) and which never do (laguna,
+  deepseek-v4-flash).
 
 ## Not in scope
 
