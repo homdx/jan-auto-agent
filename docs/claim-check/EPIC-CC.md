@@ -223,6 +223,7 @@ prefix normalisation, is not a substring of that chunk. A world claim needs neit
 | 285 | CC-7 | Before and after: the same claims at two commits | M | CC-6 | contest | 5 |
 | 290 | CC-8 | Into the pipeline: `truth.csv`, pending list, one command | M | CC-6 | contest | 5 |
 | 291 | CC-9 | A Lenz comparison hint: the commands and the cost printed after a run, never run (`/extract` free 1000 a day; `/assess` 1 credit, `/verify` 10, from 100 a month + 400) | S | CC-6, CC-8 | contest | 6 |
+| 292 | CC-10 | **Draft, to be completed after the live run:** claim check in Gate 1 — three voters with the code and a quote instead of one reader, behind `[gate1] claim_vote = off` | M | CC-6, CC-8 | contest | 7 |
 
 Why eight contest tickets and not five: an earlier sketch folded CC-3/CC-4 pack assembly
 and the voter changes into one ticket. A round gives one agent one session; an L ticket
