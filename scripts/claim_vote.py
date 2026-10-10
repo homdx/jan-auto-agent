@@ -429,9 +429,10 @@ def main(argv: list[str] | None = None) -> int:
     with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
         results = list(pool.map(lambda j: ask(j[0], texts, j[1], args.seed, parser,
                                               args.timeout, batch, args.fixed_prompt), jobs))
-    symbols_root = args.symbols_root or args.repo_root
-    table = tally(claims, results, lf._repo_symbols(symbols_root),
-                  view=cc_anchors.PathRepoView(symbols_root))
+    # CC-1: --symbols-root names the repo the claims are about, so its anchors are
+    # resolved there; without it the old regex rule decides needs_code.
+    view = cc_anchors.PathRepoView(args.symbols_root) if args.symbols_root else None
+    table = tally(claims, results, lf._repo_symbols(args.symbols_root or args.repo_root), view=view)
     report = {"results": results, "claims": table}
     if args.out:
         args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")

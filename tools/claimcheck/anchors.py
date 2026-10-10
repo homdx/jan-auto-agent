@@ -58,7 +58,7 @@ _CALL = re.compile(r"(?<![\w.])(?P<n>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\(\)")
 _REF_ORIGIN = re.compile(r"(?<![\w/.\-])origin/(?P<n>\w[\w./\-]*\w)")
 _REF_BRANCH = re.compile(r"\b(?i:branch(?:es)?)\s+`?(?P<n>\w[\w./\-]*\w|\w)`?")
 _REF_ON = re.compile(r"\bon\s+`?(?P<n>main|master|HEAD)`?(?![\w/.\-])")
-_REF_HEAD = re.compile(r"(?<![\w/.\-])HEAD(?![\w/.\-])")
+_REF_HEAD = re.compile(r"(?<![\w/.\-])HEAD(?:[~^]\d*)*(?![\w/.\-])")   # HEAD~1 is not HEAD
 _NOT_BRANCH_NAMES = frozenset((
     "the a an of is was has had and or that this it to in on by with for as not than "
     "name names point points protection can will does do are were be been which").split())
@@ -88,7 +88,10 @@ def _is_sha(text: str) -> bool:
 def _commit_spans(claim: str):
     for rx in (_HEX_CUE, _HEX_TICKS):
         for m in rx.finditer(claim):
-            if _is_sha(m.group("h")):
+            # a hash with no letter a-f is a number unless the claim says it is a commit:
+            # one real prefix in forty is all digits ("Commit 480164324 ...")
+            said = m.group(0).lstrip("@ ").lower().startswith(("commit", "sha")) or m.group(0).startswith("@")
+            if said or _is_sha(m.group("h")):
                 yield "commit", m.start("h"), m.end("h")
 
 
@@ -524,8 +527,8 @@ class PathRepoView:
         by_number = [p for p in names if re.match(r"(\d+)-", p[len("epic-tasks/"):])
                      and int(re.match(r"(\d+)-", p[len("epic-tasks/"):]).group(1)) == n]
         if "-" in ticket_id:
-            slug = ticket_id.lower().replace("-", "")
-            by_slug = [p for p in names if re.search(rf"(?<![a-z0-9]){re.escape(slug)}(?![0-9])", p.lower())]
+            slug = "-?".join(re.escape(part) for part in ticket_id.lower().split("-"))   # kc76 and cc-1
+            by_slug = [p for p in names if re.search(rf"(?<![a-z0-9]){slug}(?![0-9])", p.lower())]
             if by_slug:
                 return by_slug[0]
         return by_number[0] if by_number else None
