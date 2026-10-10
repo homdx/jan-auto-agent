@@ -244,7 +244,9 @@ class _Index:
                 if len(text.encode("utf-8", "surrogateescape")) > MAX_PY_BYTES:
                     continue
                 self.line_count[path] = text.count("\n") + 1
-                defs = _definitions(text, path)
+                # bytes that were not UTF-8 reach us as surrogates (read_utf8), which `ast` refuses:
+                # parse them as U+FFFD, line numbers are the same
+                defs = _definitions(text.encode("utf-8", "surrogateescape").decode("utf-8", "replace"), path)
             except (OSError, ValueError, SyntaxError, RecursionError, MemoryError, UnicodeError):
                 continue
             for d in defs:
@@ -401,7 +403,28 @@ def resolve_anchors(anchors, view: RepoView) -> list:
             out.append(_resolve_ticket(a, view, index))
         else:   # commit, ref
             out.append(_resolve_commit(a, view))
-    return out
+    return _prefer_named_file(out, index) if index is not None else out
+
+
+def _prefer_named_file(out: list, index: _Index) -> list:
+    """`X` in `tools/y.py`: a name defined in several files means the one the claim names.
+
+    The first definition by path is the answer for a bare name on its own; when the claim
+    also names a file that holds a definition of it, that file is the answer."""
+    files = {r.path for r in out if r.anchor.kind == "path" and r.found and r.path in index.file_set}
+    if not files:
+        return out
+    fixed = list(out)
+    for i, r in enumerate(out):
+        if r.anchor.kind not in ("symbol", "test") or not (r.found and r.qualname and r.candidates) \
+                or r.path in files:
+            continue
+        last = r.qualname.rsplit(".", 1)[-1]
+        defs = [d for d in index.by_last.get(last, ()) if d.qualname == r.qualname]
+        pick = next((d for d in defs if d.path in files), None)
+        if pick is not None:
+            fixed[i] = _found(r.anchor, pick, [d for d in defs if d is not pick])
+    return fixed
 
 
 # ------------------------------------------------------------------ classification

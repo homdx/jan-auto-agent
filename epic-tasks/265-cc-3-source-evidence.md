@@ -162,3 +162,8 @@ textconv / external diff and took `--contents`, `-c`, `-O` (CC-2's judging fix h
 in the target's view); `git blame` runs a textconv driver too and takes `--no-textconv` (260's
 As built said it had no switch) — both views; `extract_anchors` checked each span against all taken
 spans, quadratic (`"a.py:" × 4000` took 2 s; the edge-case test's 1 s bound flaked under load).
+
+Also found building CC-3 by the second entry (Sonnet), landed with the judging: a symbol in a `.py` file
+with a non-UTF-8 byte resolved as not found (the resolver gave `ast` surrogates, `ast` refused the file,
+every definition in it was skipped); `` `X` in `path` `` resolved to the first file by path that defines X
+when several do — now the file the claim names wins (without one the CC-1 rule, first by path, stays).
