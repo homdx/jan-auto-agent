@@ -1,6 +1,6 @@
 # CC-7 — before and after: the same claims judged at two commits
 
-**Status:** open
+**Status:** landed
 **Severity:** MEDIUM (turns "the fix landed" from a reading into a measurement)
 **File:** `tools/claimcheck/compare.py`
 **Symbol:** `compare`, `Delta`, `classify_delta`
@@ -198,3 +198,12 @@ the same sha twice.
 ## Not in scope
 
 Running tests at either commit, judging a diff that has no claims, writing `truth.csv` (CC-8), changing the unanimity rule or the quote check (CC-6), a new LLM client or ini reader.
+
+**Judging and landing (round 285: cloud Opus 5, Sonnet 5, Haiku 5, three Sensenova, agnes-2-5, nemotron, deepseek, laguna; a black box through the command line against a fake model on a local port, the cross matrix, a live run on ten free voters).**
+Landed: the cloud Opus 5 patch as it came (115 own tests; the black box `contest-bench/285/blackbox_285.py` gives
+20 of 20 `fixed`, 10 of 10 `still`, 2 of 2 `gone`, 2 of 2 `new`, `still_as_fixed` 0, the same with one voter dead).
+Sonnet 5 (117 tests) is equal on the black box; Haiku 5 (30 tests) too, but read `NEW` as "unanimous FALSE at base".
+None of the round's agents passed the black box: two cannot read the fixture file, one returns nothing, two crash,
+one never committed. One fix by hand, found by the **live** run (ten free voters, 730 requests, `still_as_fixed` 0,
+`GONE` 2 of 2, `fix_right` 17 % only because ten voters must all agree): two `still` claims came out `NEW`;
+`NEW` now needs `FALSE` at base. Not taken from the entries: Haiku's stricter NEW (loses the claims whose base had a dissenter).
