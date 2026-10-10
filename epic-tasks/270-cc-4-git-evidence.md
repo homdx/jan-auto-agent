@@ -1,10 +1,10 @@
-# CC-4 — git evidence: a commit, a diff range, a ticket's text, a file's history
+# 270 — CC-4: git evidence: a commit, a diff range, a ticket's text, a file's history
 
 **Status:** landed
 **Severity:** HIGH (claims about "what the fix did" are claims about a diff)
 **File:** `tools/claimcheck/evidence_git.py`
 **Symbol:** `git_chunks`, `hunks_of`, `ticket_chunk`
-**Round:** —
+**Round:** 270
 **Size:** M
 **Depends on:** CC-1 (`model.py`)
 **Also touches:** `tests/test_claimcheck_git.py`, `tests/fixtures/claimcheck/git_golden/`

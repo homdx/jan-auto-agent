@@ -1,0 +1,208 @@
+[
+ {
+  "claim": "Commit {c1:7} made `Store.load` raise on a file that is not valid JSON.",
+  "chunks": [
+   {
+    "id": "git:4aca259:header",
+    "kind": "git",
+    "start": 0,
+    "end": 0,
+    "why": "commit 4aca259",
+    "text": "commit 4aca2595bc3a6b9da74b73882b711668e57b5d3f\nAuthor: Ann <ann@example.com>\nDate:   2026-01-02T00:00:00+00:00\n\n    store: a corrupt file raises (01)\n\n    load caught ValueError and returned an empty store;\n    now only a missing file is empty.\n\n epic-tasks/01-store-errors.md | 2 +-\n lib/store.py                  | 4 ++--\n 2 files changed, 3 insertions(+), 3 deletions(-)"
+   },
+   {
+    "id": "git:4aca259:lib/store.py:11-18",
+    "kind": "git",
+    "start": 11,
+    "end": 18,
+    "why": "commit 4aca259",
+    "text": "diff --git a/lib/store.py b/lib/store.py\nindex 58cfd96..426b000 100644\n--- a/lib/store.py\n+++ b/lib/store.py\n@@ -11,8 +11,8 @@ class Store:\n 11|          try:\n 12|              with open(self.path) as fh:\n 13|                  self._data = json.load(fh)\n   | -        except ValueError:\n 14| +        except FileNotFoundError:\n 15|              self._data = {}\n 16|  \n 17|      def get(self, key, default=None):\n   | -        return self._data.get(key) or default\n 18| +        return self._data.get(key, default)"
+   }
+  ]
+ },
+ {
+  "claim": "Commit {c1:7} changed `lib/store.py` and the ticket.",
+  "chunks": [
+   {
+    "id": "git:4aca259:header",
+    "kind": "git",
+    "start": 0,
+    "end": 0,
+    "why": "commit 4aca259",
+    "text": "commit 4aca2595bc3a6b9da74b73882b711668e57b5d3f\nAuthor: Ann <ann@example.com>\nDate:   2026-01-02T00:00:00+00:00\n\n    store: a corrupt file raises (01)\n\n    load caught ValueError and returned an empty store;\n    now only a missing file is empty.\n\n epic-tasks/01-store-errors.md | 2 +-\n lib/store.py                  | 4 ++--\n 2 files changed, 3 insertions(+), 3 deletions(-)"
+   },
+   {
+    "id": "git:4aca259:lib/store.py:11-18",
+    "kind": "git",
+    "start": 11,
+    "end": 18,
+    "why": "commit 4aca259",
+    "text": "diff --git a/lib/store.py b/lib/store.py\nindex 58cfd96..426b000 100644\n--- a/lib/store.py\n+++ b/lib/store.py\n@@ -11,8 +11,8 @@ class Store:\n 11|          try:\n 12|              with open(self.path) as fh:\n 13|                  self._data = json.load(fh)\n   | -        except ValueError:\n 14| +        except FileNotFoundError:\n 15|              self._data = {}\n 16|  \n 17|      def get(self, key, default=None):\n   | -        return self._data.get(key) or default\n 18| +        return self._data.get(key, default)"
+   },
+   {
+    "id": "gitlog:lib/store.py",
+    "kind": "git",
+    "start": 0,
+    "end": 0,
+    "why": "history of lib/store.py",
+    "text": "git log -n 5 -- lib/store.py\n4aca259 2026-01-02 store: a corrupt file raises (01)\ndafb611 2026-01-01 lib: store and gates"
+   }
+  ]
+ },
+ {
+  "claim": "Commit {c2:7} stopped `check_exit` from passing exit code 5.",
+  "chunks": [
+   {
+    "id": "git:2474452:header",
+    "kind": "git",
+    "start": 0,
+    "end": 0,
+    "why": "commit 2474452",
+    "text": "commit 2474452329e4d2449e83909644ec6648904ab576\nAuthor: Ann <ann@example.com>\nDate:   2026-01-03T00:00:00+00:00\n\n    gates: exit 5 is a failure\n\n lib/gates.py | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)"
+   },
+   {
+    "id": "git:2474452:lib/gates.py:1-6",
+    "kind": "git",
+    "start": 1,
+    "end": 6,
+    "why": "commit 2474452",
+    "text": "diff --git a/lib/gates.py b/lib/gates.py\nindex 0aaf831..c8e2575 100644\n--- a/lib/gates.py\n+++ b/lib/gates.py\n@@ -1,6 +1,6 @@\n 1|  def check_exit(proc):\n 2|      \"\"\"True when the test run passed.\"\"\"\n  | -    return proc.returncode in (0, 5)\n 3| +    return proc.returncode in (0,)\n 4|  \n 5|  \n 6|  def gate_paths(changed, declared):"
+   }
+  ]
+ },
+ {
+  "claim": "Commit {c3:7} renamed `lib/gates.py`.",
+  "chunks": [
+   {
+    "id": "git:fdbe138:header",
+    "kind": "git",
+    "start": 0,
+    "end": 0,
+    "why": "commit fdbe138",
+    "text": "commit fdbe138ac6a77370e7320f33fbcab3803737ca2c\nAuthor: Ann <ann@example.com>\nDate:   2026-01-04T00:00:00+00:00\n\n    rename gates to checks\n\n lib/{gates.py => checks.py} | 0\n 1 file changed, 0 insertions(+), 0 deletions(-)\n rename lib/{gates.py => checks.py} (100%)"
+   },
+   {
+    "id": "git:fdbe138:lib/checks.py:0-0",
+    "kind": "git",
+    "start": 0,
+    "end": 0,
+    "why": "commit fdbe138",
+    "text": "diff --git a/lib/gates.py b/lib/checks.py\nsimilarity index 100%\nrename from lib/gates.py\nrename to lib/checks.py"
+   }
+  ]
+ },
+ {
+  "claim": "Commit {c0:7} added the store, the gates and a logo.",
+  "chunks": [
+   {
+    "id": "git:dafb611:header",
+    "kind": "git",
+    "start": 0,
+    "end": 0,
+    "why": "commit dafb611",
+    "text": "commit dafb6110efdc1b6bb75edb17eed882c098ec971b\nAuthor: Ann <ann@example.com>\nDate:   2026-01-01T00:00:00+00:00\n\n    lib: store and gates\n\n epic-tasks/01-store-errors.md |  15 +++++++++++++++\n lib/gates.py                  |   7 +++++++\n lib/store.py                  |  18 ++++++++++++++++++\n logo.png                      | Bin 0 -> 5 bytes\n 4 files changed, 40 insertions(+)\n create mode 100644 epic-tasks/01-store-errors.md\n create mode 100644 lib/gates.py\n create mode 100644 lib/store.py\n create mode 100644 logo.png"
+   },
+   {
+    "id": "git:dafb611:epic-tasks/01-store-errors.md:1-15",
+    "kind": "git",
+    "start": 1,
+    "end": 15,
+    "why": "commit dafb611",
+    "text": "diff --git a/epic-tasks/01-store-errors.md b/epic-tasks/01-store-errors.md\nnew file mode 100644\nindex 0000000..9f12fc4\n--- /dev/null\n+++ b/epic-tasks/01-store-errors.md\n@@ -0,0 +1,15 @@\n  1| +# 01 — the store swallows a corrupt file\n  2| +\n  3| +**Status:** open\n  4| +**File:** `store.py`\n  5| +\n  6| +---\n  7| +\n  8| +## Why\n  9| +\n 10| +`Store.load` returns an empty store when the file is not valid JSON, so a corrupt\n 11| +file silently loses every key.\n 12| +\n 13| +## What it does\n 14| +\n 15| +`load` raises on bad JSON; a missing file is still an empty store."
+   },
+   {
+    "id": "git:dafb611:lib/gates.py:1-7",
+    "kind": "git",
+    "start": 1,
+    "end": 7,
+    "why": "commit dafb611",
+    "text": "diff --git a/lib/gates.py b/lib/gates.py\nnew file mode 100644\nindex 0000000..0aaf831\n--- /dev/null\n+++ b/lib/gates.py\n@@ -0,0 +1,7 @@\n 1| +def check_exit(proc):\n 2| +    \"\"\"True when the test run passed.\"\"\"\n 3| +    return proc.returncode in (0, 5)\n 4| +\n 5| +\n 6| +def gate_paths(changed, declared):\n 7| +    return [p for p in changed if p not in declared]"
+   },
+   {
+    "id": "git:dafb611:lib/store.py:1-18",
+    "kind": "git",
+    "start": 1,
+    "end": 18,
+    "why": "commit dafb611",
+    "text": "diff --git a/lib/store.py b/lib/store.py\nnew file mode 100644\nindex 0000000..58cfd96\n--- /dev/null\n+++ b/lib/store.py\n@@ -0,0 +1,18 @@\n  1| +\"\"\"A tiny key-value store kept in one JSON file.\"\"\"\n  2| +import json\n  3| +\n  4| +\n  5| +class Store:\n  6| +    def __init__(self, path):\n  7| +        self.path = path\n  8| +        self._data = {}\n  9| +\n 10| +    def load(self):\n 11| +        try:\n 12| +            with open(self.path) as fh:\n 13| +                self._data = json.load(fh)\n 14| +        except ValueError:\n 15| +            self._data = {}\n 16| +\n 17| +    def get(self, key, default=None):\n 18| +        return self._data.get(key) or default"
+   }
+  ]
+ },
+ {
+  "claim": "Commit 0badc0d fixed `Store.get`.",
+  "chunks": [
+   {
+    "id": "note:git:0badc0d",
+    "kind": "note",
+    "start": 0,
+    "end": 0,
+    "why": "commit 0badc0d",
+    "text": "commit 0badc0d is not in this repository"
+   }
+  ]
+ },
+ {
+  "claim": "Ticket 01 is done.",
+  "chunks": [
+   {
+    "id": "ticket:01",
+    "kind": "ticket",
+    "start": 1,
+    "end": 12,
+    "why": "ticket Ticket 01",
+    "text": "  1| # 01 — the store swallows a corrupt file\n  2| \n  3| **Status:** done\n  4| **File:** `store.py`\n  5| \n  6| ---\n  7| \n  8| ## Why\n  9| \n 10| `Store.load` returns an empty store when the file is not valid JSON, so a corrupt\n 11| file silently loses every key.\n 12| \n# … the rest of the ticket omitted (13-15)"
+   }
+  ]
+ },
+ {
+  "claim": "`Store.get` returns the default for a stored 0.",
+  "base": "{c0}",
+  "head": "{c1}",
+  "chunks": [
+   {
+    "id": "diff:dafb611..4aca259:lib/store.py:11-18",
+    "kind": "git",
+    "start": 11,
+    "end": 18,
+    "why": "range dafb6110efdc1b6bb75edb17eed882c098ec971b..4aca2595bc3a6b9da74b73882b711668e57b5d3f",
+    "text": "diff --git a/lib/store.py b/lib/store.py\nindex 58cfd96..426b000 100644\n--- a/lib/store.py\n+++ b/lib/store.py\n@@ -11,8 +11,8 @@ class Store:\n 11|          try:\n 12|              with open(self.path) as fh:\n 13|                  self._data = json.load(fh)\n   | -        except ValueError:\n 14| +        except FileNotFoundError:\n 15|              self._data = {}\n 16|  \n 17|      def get(self, key, default=None):\n   | -        return self._data.get(key) or default\n 18| +        return self._data.get(key, default)"
+   }
+  ]
+ },
+ {
+  "claim": "The fix replaced `ValueError` with FileNotFoundError.",
+  "base": "{c0}",
+  "head": "{c3}",
+  "chunks": [
+   {
+    "id": "diff:dafb611..fdbe138:stat",
+    "kind": "git",
+    "start": 0,
+    "end": 0,
+    "why": "range dafb6110efdc1b6bb75edb17eed882c098ec971b..fdbe138ac6a77370e7320f33fbcab3803737ca2c",
+    "text": "git diff --stat dafb611 fdbe138\n epic-tasks/01-store-errors.md | 2 +-\n lib/{gates.py => checks.py}   | 2 +-\n lib/store.py                  | 4 ++--\n 3 files changed, 4 insertions(+), 4 deletions(-)\n rename lib/{gates.py => checks.py} (80%)"
+   },
+   {
+    "id": "diff:dafb611..fdbe138:lib/store.py:11-18",
+    "kind": "git",
+    "start": 11,
+    "end": 18,
+    "why": "range dafb6110efdc1b6bb75edb17eed882c098ec971b..fdbe138ac6a77370e7320f33fbcab3803737ca2c",
+    "text": "diff --git a/lib/store.py b/lib/store.py\nindex 58cfd96..426b000 100644\n--- a/lib/store.py\n+++ b/lib/store.py\n@@ -11,8 +11,8 @@ class Store:\n 11|          try:\n 12|              with open(self.path) as fh:\n 13|                  self._data = json.load(fh)\n   | -        except ValueError:\n 14| +        except FileNotFoundError:\n 15|              self._data = {}\n 16|  \n 17|      def get(self, key, default=None):\n   | -        return self._data.get(key) or default\n 18| +        return self._data.get(key, default)"
+   }
+  ]
+ },
+ {
+  "claim": "The bug in `lib/store.py` was fixed.",
+  "chunks": [
+   {
+    "id": "gitlog:lib/store.py",
+    "kind": "git",
+    "start": 0,
+    "end": 0,
+    "why": "history of lib/store.py",
+    "text": "git log -n 5 -- lib/store.py\n4aca259 2026-01-02 store: a corrupt file raises (01)\ndafb611 2026-01-01 lib: store and gates"
+   }
+  ]
+ }
+]
