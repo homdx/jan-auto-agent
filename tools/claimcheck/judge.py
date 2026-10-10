@@ -163,7 +163,9 @@ def _rows_to_votes(rows, order: list) -> dict:
 
 def _lists(text: str):
     """Every JSON list in *text*, in order of where it starts."""
-    decoder = json.JSONDecoder()
+    # strict=False: a model copying a code line into "quote" writes the line break as a bare
+    # newline, which strict JSON forbids; the whole reply was lost to it, not just the quote
+    decoder = json.JSONDecoder(strict=False)
     for i, ch in enumerate(text):
         if ch != "[":
             continue

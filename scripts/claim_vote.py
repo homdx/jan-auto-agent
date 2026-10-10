@@ -337,12 +337,19 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
             max_tokens=st.max_tokens, system=cc_judge.SYSTEM,
             user_msg=prompt, num_ctx=st.num_ctx, think=st.think)
         sem = PACER.wait(host)
+        started = time.monotonic()
         try:
             return strip_think(request_completion(url, headers, payload, timeout,
                                                   api_format=st.api_format, **retry))
         finally:
             sem.release()
+            calls[0] += 1
+            # a live run is minutes long and the report comes at the end: one line a request,
+            # so the log shows which voter is alive and how far it has got
+            print(f"[progress] {ref} run{run} request {calls[0]} "
+                  f"{time.monotonic() - started:.0f}s", file=sys.stderr, flush=True)
 
+    calls = [0]
     got = cc_judge.ask_with_packs(items, run, seed, complete, batch=batch,
                                   code_batch=code_batch, fixed=fixed)
     out = {"model": ref, "run": run, "votes": got["votes"], "accepted": got["accepted"],

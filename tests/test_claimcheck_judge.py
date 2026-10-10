@@ -377,3 +377,10 @@ def test_four_voters_two_of_one_family_still_need_all_four():
     table, _r = _run({"fam1/a": reader(), "fam1/b": reader(), "fam2/c": reader(),
                       "fam3/d": reader(lie={items[2][0]})}, items)
     assert table[0]["unanimous"] is True and table[2]["unanimous"] is False
+
+
+def test_parse_keeps_a_quote_with_a_bare_newline():
+    """A voter that copies two code lines into "quote" writes a raw line break; the vote must survive."""
+    reply = '[{"id": 1, "verdict": "TRUE", "chunk": "src:a.py:1-2", "quote": "def f():\n    return 1"}]'
+    votes = judge.parse_votes_v2(reply, [7])
+    assert votes[7].verdict == "TRUE" and votes[7].quote == "def f():\n    return 1"
