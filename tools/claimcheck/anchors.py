@@ -460,7 +460,12 @@ def classify(claim: str, resolved) -> str:
 _READ_ONLY_GIT = frozenset((
     "rev-parse rev-list log show diff diff-tree cat-file ls-tree ls-files blame grep "
     "merge-base describe name-rev show-ref for-each-ref shortlog status").split())
-_FORBIDDEN_GIT_ARGS = ("--output", "--ext-diff", "--open-files-in-pager", "--exec-path")
+_FORBIDDEN_GIT_ARGS = ("--output", "--ext-diff", "--textconv", "--open-files-in-pager", "--exec-path",
+                       "--git-dir", "--work-tree", "--config-env",
+                       "--contents")   # blame --contents reads a file outside the repository
+#: a diff driver is named by the commit's .gitattributes and defined in the operator's config;
+#: git runs its textconv / external diff by default, so the view turns both off for these.
+_NO_FILTERS_GIT = frozenset(("show", "diff", "diff-tree", "log"))
 
 
 class PathRepoView:
@@ -540,8 +545,11 @@ class PathRepoView:
         and no option that writes a file or starts a program."""
         if not args or args[0] not in _READ_ONLY_GIT:
             raise ValueError(f"git {args[0] if args else ''}: not a read-only subcommand")
-        for arg in args:
-            if arg.startswith(_FORBIDDEN_GIT_ARGS) or arg == "-O":
+        for i, arg in enumerate(args):
+            if (arg.startswith(_FORBIDDEN_GIT_ARGS) or arg.startswith("-O")
+                    or (arg == "-c" and i + 1 < len(args) and "=" in args[i + 1])):
                 raise ValueError(f"git {args[0]} {arg}: refused, it writes or runs a program")
+        if args[0] in _NO_FILTERS_GIT:
+            args = (args[0], "--no-textconv", "--no-ext-diff", *args[1:])
         env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat"}
         return gitref.git(self.root, *args, env=env, strip=False)
