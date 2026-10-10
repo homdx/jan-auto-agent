@@ -384,3 +384,13 @@ def test_parse_keeps_a_quote_with_a_bare_newline():
     reply = '[{"id": 1, "verdict": "TRUE", "chunk": "src:a.py:1-2", "quote": "def f():\n    return 1"}]'
     votes = judge.parse_votes_v2(reply, [7])
     assert votes[7].verdict == "TRUE" and votes[7].quote == "def f():\n    return 1"
+
+
+def test_parse_reads_rows_written_as_separate_objects():
+    """A reply of one object a line (no list around them) is read row by row; found by the live smoke."""
+    reply = ('{"id": 1, "verdict": "FALSE", "chunk": "[[src:a.py:1-2]]", "quote": "x = 1 + 2"}\n'
+             '{"id": 2, "verdict": "unsure"}\n')
+    votes = judge.parse_votes_v2(reply, [5, 6])
+    assert votes[5].verdict == "FALSE" and votes[5].quote == "x = 1 + 2"
+    assert votes[6].verdict == "UNSURE"
+    assert judge.parse_votes_v2("no verdicts here", [5]) == {}

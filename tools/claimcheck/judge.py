@@ -177,6 +177,22 @@ def _lists(text: str):
             yield rows
 
 
+def _objects(text: str) -> list:
+    """Every top-level JSON object in *text*, in order (the rows of a reply that has no list)."""
+    decoder = json.JSONDecoder(strict=False)
+    out: list = []
+    i = text.find("{")
+    while i != -1:
+        try:
+            row, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            i = text.find("{", i + 1)
+            continue
+        out.append(row)
+        i = text.find("{", end)
+    return out
+
+
 def parse_votes_v2(text: str, order: list) -> dict:
     """Model reply -> {original claim index: Vote}.
 
@@ -190,7 +206,9 @@ def parse_votes_v2(text: str, order: list) -> dict:
             votes = _rows_to_votes(rows, order)
             if votes:
                 return votes
-    return {}
+    # no list: some models answer with the rows one after another (one object a line, or one
+    # object for a one-claim prompt); round 280's live smoke lost every vote of one voter to it
+    return _rows_to_votes(_objects(_drop_trailing_commas(text)), order)
 
 
 # ------------------------------------------------------------------ the quote check
