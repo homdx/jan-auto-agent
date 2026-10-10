@@ -1,6 +1,6 @@
 # 275 — CC-5: the pack: rank, merge, trim, render, and find a quote
 
-**Status:** open
+**Status:** landed
 **Severity:** HIGH (the pack is what the voter reads; its size and order decide both cost and accuracy)
 **File:** `tools/claimcheck/pack.py`
 **Symbol:** `PackBudget`, `build_pack`, `Pack.render`, `Pack.find`
@@ -162,3 +162,20 @@ The text above was written before the providers existed. Where it differs, this 
 ## Not in scope
 
 The prompt, the vote parser, the downgrade rule (CC-6).
+
+**Judging fixes (seven entries, one neutral probe, the operator bench, the cross matrix).** The
+round was run twice: the first run started from a base without `tools/claimcheck` (CC-0…CC-4
+missing) and was thrown away; the second, on `3d0f10f`, gave six entries and the cloud patch
+`cc-5-275-pack.patch`, which is the base of the landed code (best by the others' tests in every
+column of the cross matrix, 80 own tests). One hole found in it by a probe the other entries
+passed: a path written out in the claim that is neither a file nor a directory in the repository
+(`no/such.py`, no `no/` either) got no note, and the pack said "none found" — as if the claim were
+about nothing; it is a `note:dangling:` now ("does not exist … no file of that name"). Not ported,
+because the landed code does not share them: the merge that looked only at the last chunk of the
+file (`[1-10, 40-50, 8-45]` stayed in two pieces), a marker line counted as a quote, a chunk of
+2391 characters cut by the block overhead taken off `per_chunk` (all `sensenova-var3`), the claim's
+whole text in the header and another empty-pack sentence (`var1`), a view that raises not survived
+(`nemotron`), the chunk id parsed as an integer (`glm`). Ranking every note at 110, CC-4's too, is
+the landed code's choice (a voter must know that a commit is missing) and stays. Also CC-4:
+`%aI` of a newer Git is `…Z` for a zero offset where an older one gives `…+00:00`; the header
+date is written `+00:00` either way, so the golden fixtures do not depend on the Git version.

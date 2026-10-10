@@ -1,6 +1,6 @@
 # CC-5 — the pack: rank, merge, trim, render, and find a quote
 
-**Status:** open
+**Status:** landed
 **Severity:** HIGH (the pack is what the voter reads; its size and order decide both cost and accuracy)
 **File:** `tools/claimcheck/pack.py`
 **Symbol:** `PackBudget`, `build_pack`, `Pack.render`, `Pack.find`

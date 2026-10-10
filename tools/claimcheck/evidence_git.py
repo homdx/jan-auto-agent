@@ -426,6 +426,11 @@ def _commit_chunks(r, view, resolved, keys: list, max_chars: int) -> list:
     head = _git(view, "show", "-s", "--no-color", "--no-show-signature",
                 "--format=%H%x00%an <%ae>%x00%aI%x00%s%x00%b", sha)
     full, author, date, subject, body = (head.split("\0") + [""] * 5)[:5]
+    # A newer Git writes a zero UTC offset of its strict ISO date as ``Z`` where an older one
+    # wrote ``+00:00``. Evidence text is persisted in golden fixtures and must be the same
+    # whichever Git inspects the repository.
+    if date.endswith("Z"):
+        date = date[:-1] + "+00:00"
     body = body.strip("\n")
     if len(body) > MAX_BODY:
         body = body[:MAX_BODY].rstrip() + f"\n[… {len(body) - MAX_BODY} chars of the message cut]"

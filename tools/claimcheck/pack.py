@@ -588,9 +588,11 @@ def _dangling_notes(resolved: list, sha: str, chunks: list, view) -> list:
             names = ", ".join(f"`{p}`" for p in ra.candidates if isinstance(p, str))
             text = (f"`{ra.anchor.text}` is ambiguous: it fits several files ({names}); "
                     f"the claim does not say which.")
-        elif ra.path:
+        elif ra.path or kind == "path":
+            # a file written out in the claim that is not there, nor is its directory: the claim
+            # is about code the repository does not have, and a voter must be told so
             cid = f"note:dangling:{ra.anchor.text}"
-            text = _dangling_text(ra, sha, chunks, reader)
+            text = _dangling_text(ra if ra.path else replace(ra, path="."), sha, chunks, reader)
         else:
             continue
         if cid not in seen and text:
