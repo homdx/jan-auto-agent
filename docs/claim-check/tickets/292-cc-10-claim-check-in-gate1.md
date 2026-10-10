@@ -67,6 +67,18 @@ changes nothing (the existing Gate 1 tests stay green unchanged); a voter that r
 3. The pack's size for a task: the cited block alone, or with its callers and the git history?
 4. Round-trip time: three voters in parallel are as slow as the slowest; a timeout falls back, never blocks.
 
+5. **Only one model is ever available (the question that came with the draft).** Today
+   `claim_vote.py` refuses: with fewer than `MIN_COMMITTED = 3` voters it prints "quorum is 3: no claim
+   can be accepted". A **single-voter mode** (`[gate1] vote_quorum = 1`, never the default) would accept a
+   verdict when that one model commits, its quote is verified by code, and it gives the same verdict in
+   every one of N runs (the prompt varies per run). It is a weaker guarantee than three families, and the
+   draft must say so in the output (`quorum=1`, which model). Live numbers from round 280 run A, each
+   model alone, counting only votes that passed the quote check: hy3 76 right of 76 decided (fixture),
+   21 of 21 (real); nemotron-3-ultra 70 of 70, 22 of 22; **deepseek-v4-flash 65 of 69 and 12 of 13**
+   (4 + 1 wrong). So one good model with the quote check is already strong, and one bad one is not:
+   the roster for a single-voter mode is chosen by measured wrong rate, not by availability. To be
+   re-measured with `RUNS=3` before this ticket is cut.
+
 ## Not in scope
 
 Changing Stage A, A0 or C; the Coder, executor or validators; the unanimity rule; Lenz.
