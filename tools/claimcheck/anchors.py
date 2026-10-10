@@ -499,6 +499,8 @@ class PathRepoView:
                 dirs[:] = [d for d in dirs if d != ".git"]
                 rel = os.path.relpath(folder, self.root)
                 for name in names:
+                    if name == ".git":   # a worktree's or a submodule's `.git` is a file, not a directory
+                        continue
                     path = name if rel == "." else f"{rel}/{name}".replace(os.sep, "/")
                     if os.path.isfile(os.path.join(folder, name)):
                         found.append(path)
