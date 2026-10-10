@@ -159,7 +159,8 @@ Places where the code is more exact than the text above:
   (`--no-textconv --no-ext-diff` are put in front): git runs a diff driver by default, the driver is
   named by the commit's `.gitattributes` and defined in the operator's config, so a plain
   `git show` ran the operator's command. `blame --contents` is refused (it reads a file outside
-  the commit). `blame` still honours a textconv driver; git has no switch for it
-  (`tests_bugfix/test_claimcheck_target_view_filters_260.py`).
+  the commit). `blame` runs a textconv driver by default too and takes `--no-textconv`, so it
+  gets the same switch since CC-3 (`tests_bugfix/test_claimcheck_target_view_filters_260.py`,
+  `tests_bugfix/test_claimcheck_blame_textconv_265.py`).
 * **`view().files()` is a walk of the tree**, so a symlink to a directory is not listed (the
   commit's own file list would list it); `.git` and `.collect/` are hidden either way.

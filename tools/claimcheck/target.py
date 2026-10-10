@@ -193,7 +193,7 @@ _VIEW_FORBIDDEN = ("--output", "--ext-diff", "--textconv", "--open-files-in-page
                    "--contents")   # blame --contents reads a file outside the commit
 #: a diff driver is named by the commit's .gitattributes and defined in the operator's config;
 #: git runs its textconv / external diff by default, so the view turns both off for these.
-_NO_FILTERS = frozenset(("show", "diff", "log"))
+_NO_FILTERS = frozenset(("show", "diff", "log", "blame"))   # blame runs textconv too
 
 
 class _TargetView(PathRepoView):
