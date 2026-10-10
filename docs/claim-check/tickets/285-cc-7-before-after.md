@@ -207,3 +207,10 @@ None of the round's agents passed the black box: two cannot read the fixture fil
 one never committed. One fix by hand, found by the **live** run (ten free voters, 730 requests, `still_as_fixed` 0,
 `GONE` 2 of 2, `fix_right` 17 % only because ten voters must all agree): two `still` claims came out `NEW`;
 `NEW` now needs `FALSE` at base. Not taken from the entries: Haiku's stricter NEW (loses the claims whose base had a dissenter).
+After the fix, live on the fixed code: three kenary free voters (agnes-3-0-flash, mimo-v2-6-flash, nemotron-3-ultra),
+one run, the 34 claims with an `expect`: 28 right, 6 honestly `UNCLEAR`, **0 wrong** (`fixed` 17 of 20, `still` 8 of 10,
+`gone` 2 of 2, `new` 1 of 2; `still_as_fixed` 0; `fix_right` 85 %, under the 90 % line only by `UNCLEAR`). A mixed set
+(three openrouter2 voters + laguna) decided less (`fixed` 11 of 20, every `still` claim `UNCLEAR`) because one voter
+answered nothing on 24 claims and another is wrong 3 times in 50: the voters are chosen by measured wrong rate.
+Also found by the load run, not by the entries: two bug guards of rounds 203/213 still pinned the old "a voter with no
+vote spoils unanimity" and failed after CC-6's fix `98e37ee` (`473b636` updates them).
