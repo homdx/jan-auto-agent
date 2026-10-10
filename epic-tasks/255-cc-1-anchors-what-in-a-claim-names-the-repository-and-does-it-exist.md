@@ -1,10 +1,10 @@
-# CC-1 — anchors: what in a claim names the repository, and does it exist
+# 255 — CC-1: anchors: what in a claim names the repository, and does it exist
 
-**Status:** open — round 255, `epic-tasks/255-cc-1-anchors-what-in-a-claim-names-the-repository-and-does-it-exist.md`
+**Status:** open
 **Severity:** HIGH (every later ticket starts from the anchors; the regex `needs_code` leaks today)
 **File:** `tools/claimcheck/anchors.py`
 **Symbol:** `extract_anchors`, `resolve_anchors`, `classify`, `PathRepoView`
-**Round:** —
+**Round:** 255
 **Size:** M
 **Depends on:** CC-0 (the package skeleton and `contest-bench/cc/`)
 **Also touches:** `tools/claimcheck/model.py`, `tests/test_claimcheck_anchors.py`, `tests/fixtures/claimcheck/anchors_golden.json`
