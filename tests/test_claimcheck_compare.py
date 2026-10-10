@@ -168,20 +168,23 @@ def _changes(got):
 UT = {"verdict": "TRUE", "unanimous": True}
 UF = {"verdict": "FALSE", "unanimous": True}
 TN = {"verdict": "TRUE", "unanimous": False}     # a plurality with a dissenter
+FN = {"verdict": "FALSE", "unanimous": False}    # the same for FALSE
 US = {"verdict": "UNSURE", "unanimous": False}
 SP = {"verdict": "SPLIT", "unanimous": False}
-STATES = {"UT": UT, "UF": UF, "TN": TN, "US": US, "SP": SP}
-# rows: base; columns: head  UT        UF        TN         US         SP
-MATRIX = {"UT": ("STILL", "FIXED", "UNCLEAR", "UNCLEAR", "UNCLEAR"),
-          "UF": ("NEW", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR"),
-          "TN": ("NEW", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR"),
-          "US": ("NEW", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR"),
-          "SP": ("NEW", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR")}
+STATES = {"UT": UT, "UF": UF, "TN": TN, "FN": FN, "US": US, "SP": SP}
+# rows: base; columns: head  UT        UF        TN         FN         US         SP
+# NEW only when the base side says FALSE (round 285 live: TRUE with a dissenter at base is not new)
+MATRIX = {"UT": ("STILL", "FIXED", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR"),
+          "UF": ("NEW", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR"),
+          "TN": ("UNCLEAR",) * 6,
+          "FN": ("NEW", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR"),
+          "US": ("UNCLEAR",) * 6,
+          "SP": ("UNCLEAR",) * 6}
 
 
 @pytest.mark.parametrize("b,h", [(b, h) for b in STATES for h in STATES])
 def test_classify_delta_table(b, h):
-    """Every cell of the 5 x 5 matrix; the anchors found at both sides (no GONE)."""
+    """Every cell of the 6 x 6 matrix; the anchors found at both sides (no GONE)."""
     want = MATRIX[b][list(STATES).index(h)]
     assert cc.classify_delta(STATES[b], STATES[h]) == want
     # a vanished anchor wins over any votes, a world claim over everything

@@ -54,7 +54,7 @@ the claims the branch's tickets make, run base = `main`, head = the branch.
 |---|---|
 | `FIXED` | unanimous `TRUE` at base **and** unanimous `FALSE` at head |
 | `STILL` | unanimous `TRUE` at both |
-| `NEW` | not unanimous-`TRUE` at base (it was `FALSE`, or unknown) and unanimous `TRUE` at head |
+| `NEW` | `FALSE` at base (a plurality of `FALSE` is enough; unsure, split and `TRUE` with a dissenter are not) and unanimous `TRUE` at head — changed after round 285's live run, where "not unanimous `TRUE`" labelled two claims that were true all along `NEW` |
 | `GONE` | the claim's primary anchor (symbol or path) resolved at base and does not at head — the code the claim was about no longer exists under that name; the claim is not decided at head |
 | `UNCLEAR` | anything else: a non-unanimous side, `UNSURE` on either, `FALSE` at both |
 

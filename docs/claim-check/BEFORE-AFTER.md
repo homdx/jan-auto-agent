@@ -22,7 +22,7 @@ share one pool.
 |---|---|
 | `FIXED` | unanimous `TRUE` at base and unanimous `FALSE` at head |
 | `STILL` | unanimous `TRUE` at both |
-| `NEW` | not unanimous `TRUE` at base (`FALSE`, split, unsure) and unanimous `TRUE` at head |
+| `NEW` | `FALSE` at base (a plurality of `FALSE`; split, unsure or `TRUE` with a dissenter stay `UNCLEAR`) and unanimous `TRUE` at head |
 | `GONE` | the claim's primary anchor (its first symbol, else its first path) resolves at base and not at head; the head votes are not read |
 | `UNCLEAR` | anything else: a side that is not unanimous, `UNSURE` on either side, `FALSE` at both |
 | `n/a` | a `world` claim: judged once, at head; it has no before and after |

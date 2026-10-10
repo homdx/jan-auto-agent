@@ -15,7 +15,7 @@ The rule (`classify_delta`), "unanimous TRUE" meaning ``verdict == "TRUE" and un
              head are not read
     FIXED    unanimous TRUE at base and unanimous FALSE at head
     STILL    unanimous TRUE at both
-    NEW      not unanimous TRUE at base (FALSE, split, unsure) and unanimous TRUE at head
+    NEW      FALSE at base (a plurality of FALSE, unanimous or not) and unanimous TRUE at head
     UNCLEAR  anything else: a side that is not unanimous, UNSURE on either, FALSE at both
 
 ``FALSE`` at both is ``UNCLEAR`` on purpose: the claim was never true here, and "fixed" would
@@ -93,7 +93,11 @@ def classify_delta(base: Optional[dict], head: Optional[dict], *, gone: bool = F
         if unanimous_true(head):
             return STILL
         return UNCLEAR
-    if unanimous_true(head):
+    # NEW needs the base side to say FALSE (a plurality is enough, unanimity is not asked): a claim the
+    # voters could not settle at base (TRUE with a dissenter, UNSURE, SPLIT) is not "new" at head. Round
+    # 285's live run (10 free voters) labelled two claims that were true all along NEW under the looser
+    # "not unanimous TRUE"; over all 120 triples of those voters the rule below gave 0 wrong.
+    if unanimous_true(head) and base and base.get("verdict") == "FALSE":
         return NEW
     return UNCLEAR
 
