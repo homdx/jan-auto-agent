@@ -1,4 +1,4 @@
-# CC-5 — the pack: rank, merge, trim, render, and find a quote
+# 275 — CC-5: the pack: rank, merge, trim, render, and find a quote
 
 **Status:** open
 **Severity:** HIGH (the pack is what the voter reads; its size and order decide both cost and accuracy)
@@ -123,6 +123,41 @@ A claim with a dozen anchors; two anchors that resolve to one symbol; a note chu
 chunks; a budget of 1 chunk; a chunk with a line over 2000 characters (cut with a marker,
 the numbering intact); a pack for a `world` claim (not built: the caller must not ask;
 `build_pack` on no anchors returns the empty pack).
+
+## What CC-3 and CC-4 actually return (landed; read before you build)
+
+The text above was written before the providers existed. Where it differs, this section wins.
+
+* **Chunk ids and kinds.** `src:<path>:<a>-<b>` (`source`), `git:<sha7>:header` (`git`, no span),
+  `git:<sha7>:<path>:<a>-<b>` and `diff:<b7>..<h7>:<path>:<a>-<b>` (`git`, a hunk; `a-b` is the
+  hunk's **new-side** span), `diff:<b7>..<h7>:stat`, `gitlog:<path>`, `ticket:<id>` (`ticket`),
+  `note:git:<what>` (`note`; a commit, rev or ticket that is not in the repository, a binary or
+  too-large file). `collect_chunks` give `kind="collect"`. All carry `why`.
+* **Gutters.** A `src:` chunk prints ` 120| def f():` (number right-aligned to the width of its
+  `end`); a gap is one line `# … N lines omitted (a-b)`. A git hunk prints the diff's own
+  lines behind the **new side's** number, ` 18| +    check=False`, and ` ` (blank number) for a
+  `-` line and for `\ No newline`; its `diff --git`/`---`/`+++`/`@@` lines have no gutter. Header,
+  stat, log, ticket and note chunks are plain text. `Pack.find` must strip a gutter of either
+  kind, and must **not** treat a diff's own `+`/`-` as part of the gutter: a quote
+  `+    check=False` is verbatim from the chunk.
+* **Merging is for `src:` chunks of one path only.** Two hunks of one file are different
+  chunks with different meanings (one diff each), and a `git` chunk never merges with a `source`
+  chunk. Rebuild a merged `src:` chunk's text from `view.read(path)` with the same gutter and
+  the gap markers of the lines that stay out; a merged span that no longer fits the budget goes
+  through the trim like any other chunk. A chunk whose lines cannot be read back (the file is
+  over 400 KB, or gone) stays as it is.
+* **A cut chunk is cut the way the provider cuts**: at a line, with a marker line
+  (`# … N lines omitted`, `# … N diff lines cut`); the new marker you add must look like those
+  and must not count as a quoted line.
+* **Notes.** A dangling anchor has `ResolvedAnchor.found=False` and the nearest place the
+  repository does have in `.path` (`is_dangling(resolved)` in `anchors.py`); the "defines: …"
+  list of the note comes from the file's definitions, which `source_chunks` already read — do not
+  parse a file a second time when the chunk list holds its definition list.
+* **Providers never raise** and return `[]` or notes on a bad view; `build_pack` must not raise
+  either, whatever a provider or the view does (a `RepoView` whose `git` hangs, a `read` that
+  fails): an empty pack or a pack with a note, `truncated=False`.
+* The provider functions take `max_chunk_chars`; pass `PackBudget.per_chunk` so that a chunk
+  arrives already within it.
 
 ## Not in scope
 
