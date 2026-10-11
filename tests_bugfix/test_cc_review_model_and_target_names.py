@@ -57,3 +57,15 @@ def test_a_relative_target_is_recorded_absolute(tmp_path, monkeypatch):
     monkeypatch.chdir(r)
     with Target.open(".", "HEAD", scratch=tmp_path / "s") as t:
         assert t.repo == str(r)
+
+
+def test_an_unchanged_replace_asks_kilo_nothing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path)
+    calls = []
+    monkeypatch.setattr(models, "KILO_LIST", lambda repo, providers: calls.append(providers) or LISTING)
+    monkeypatch.setattr(models, "check_not_judge", lambda repo, names: (_ for _ in ()).throw(
+        models.ModelError("is a judge")))
+    path = tmp_path / "contest.local.ini"
+    path.write_text("[arena.profile.p1]\nmodels = a:free,b-free\n")
+    assert cli.main(["-p", "p1", "model", "replace", "a:free", "a:free", "-y"]) == 0
+    assert "(unchanged)" in capsys.readouterr().out and calls == []

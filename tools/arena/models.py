@@ -1224,13 +1224,15 @@ def replace_model(repo: Path, args: argparse.Namespace) -> int:
                 f"profile {name!r} has no {old!r} "
                 f"(its models: {', '.join(current) or 'none'})"
             )
-        resolve_names(repo, new)
-        check_not_judge(repo, new)
         after_list = [new[0] if same_model(c, old) else c for c in current]
         before, after = ",".join(current), ",".join(after_list)
+        # a no-op is answered before Kilo is asked: it was a Kilo call for nothing, and a model
+        # already in the profile refused as a judge although nothing would change
         if before == after:
             print(f"profile {name!r}: models = {after} (unchanged)")
             return EXIT_OK
+        resolve_names(repo, new)
+        check_not_judge(repo, new)
         if not _confirm(name, before, after, args.yes):
             raise ModelError(f"not applied — {roster.LOCAL_FILENAME} unchanged")
         write_models(repo, name, after)
