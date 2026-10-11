@@ -23,6 +23,8 @@ The round has 5 stages. Each stage has one prompt file you hand the model.
 | `docs/RUN-THE-COMPETITION.md` | Operator map — all 5 stages as "hand over / run / take away", plus a full copy-paste command list and how to run against another repo. |
 | `docs/kilo-contest/RUN-THE-KILO-CONTEST.md` | The Kilo contest's operator map — reset (`scripts/contest_reset.sh`) → run (`python3 -m tools.contest run`, `--dry-run`, `status`, `--resume`) → score → judge → merge, the gate's decision record, and the first round on record. |
 | `GROUND-competition.md` | Session-handoff summary: what the harness is, current results, the verified **ground-truth table** (the scoring key for every round), known traps. Read first. |
+| `docs/claim-check/RUNBOOK.md` | The claim check: a report cut into claims (Lenz `/extract`, free), free models of three families vote with the code in front of them (`--target`), and the result lands in `truth.csv` + a stage-3 `pending.md` (`scripts/run_claim_check.sh --truth`). |
+| `docs/claim-check/EPIC-CC.md` | The claim-check epic: anchors, target, evidence, pack, evidence-bound voting, before/after, into the pipeline — the tickets and their order. |
 | `validate1/ANALYTICS-RUNBOOK.md` | Deep reference for the analysis step — every column of `merged.csv` / `harvest.md`, and the `merge` / `harvest` / `truth_consensus` scripts. |
 | `docs/JIRA-FIX3-pullv3.md` | The single ticket used by the earlier 11-model FIX-3 round (the "everyone confirmed a false premise" experiment). Not part of the current loop. |
 

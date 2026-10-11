@@ -154,6 +154,65 @@ RUNS=5 scripts/run_claim_check.sh report.md --profiles a b c
 Writes `claims.json`, `votes.json`, `extract.log`, `vote.log` there; the last
 line of `vote.log` is the verdict counts and the models that returned no votes.
 
+## With the code in front of the voters: into `truth.csv` and the stage-3 queue (CC-8)
+
+```bash
+scripts/run_claim_check.sh report.md --target . --ref origin/kc --truth truth.csv
+scripts/run_claim_check.sh report.md --target . --ref origin/kc --base main --truth truth.csv --dry-run
+python3 scripts/claimcheck_truth.py votes.json --out validate1/truth.csv --pending pending.md --append
+```
+
+`--target REPO`, `--ref REF`, `--base REF` and `--fetch` go to `claim_vote.py` as they are
+(stage 2 on the evidence, above). `--truth FILE` runs `scripts/claimcheck_truth.py` at the end:
+a bare name lands in `claim-check-out/<UTC>/` next to `votes.json`, and so does `pending.md`.
+`--dry-run` prints the three commands and exits 0, with no network and nothing written. The
+script takes both out of the options before `claim_vote.py` sees them. With neither option it
+runs as it always did.
+
+**The acceptance rule, restated.** A claim gets a `truth.csv` row only when it is settled:
+`unanimous` is true and the verdict is `TRUE` (written `REAL`) or `FALSE`. A `verdict: TRUE`
+with a dissenter (`by_model` TRUE, TRUE, FALSE; `unanimous: false`) is **not** settled. It goes
+to `pending.md`, as do `SPLIT`, `UNSURE` and `CODE-CHECK`. A model with no vote at all is not a
+voter: it is left out of `checked_by` and named as `dead:` in `pending.md`'s header.
+
+The columns are `finding,truth,checked_by,duplicate_of,how`:
+
+* `finding` is `<path>::<qualname>` of the claim's first found symbol, else its first found
+  path. Without a target it is the path inside the first cited chunk id, else
+  `claim:<sha1[:8]>`.
+* `checked_by` is `claimcheck:<families>@<sha7>`, with `@<base7>..<head7>` when the votes had
+  `--base`.
+* `how` is the cited chunk ids plus the first quote, at most 160 characters; it is
+  `world fact` for a world claim.
+
+`votes.json` holds no pack and no resolved anchors, so the script rebuilds both at the recorded
+sha. It opens a read-only worktree of exactly that commit under `--scratch`, with no model and
+no network. `--target` overrides the recorded repository when a bench's clone is gone. A
+target that cannot be opened is a warning, not a stop.
+
+`--append` is idempotent: a `finding` already present with the same `truth` is skipped. One
+present with another `truth` is printed as `CONFLICT` and kept as it was, with exit 3.
+
+**Two claims about one place.** Two statements about one function can settle `REAL` and `FALSE`
+in one run. Both rows are written, and the script prints a note. `harvest_report.load_truth`,
+however, keeps only the last row of a `finding`: settle such a finding by hand before scoring.
+
+Where the two files go:
+
+* `truth.csv` is the scoring key: `harvest_report.py validate1/*.csv --truth truth.csv
+  --report …`. It is also one adjudicator among others for `truth_consensus.py` (name it
+  `truth-claimcheck.csv`).
+* `pending.md` is the stage-3 queue (`docs/ADJUDICATE-findings.md`). Each unsettled claim
+  appears once:
+  * grouped SPLIT, then a plurality with a dissenter, then CODE-CHECK, then UNSURE;
+  * with each voter's verdict and the rejected-quote count;
+  * with the pack's chunk ids and their first three lines, so the adjudicator opens the right
+    place.
+
+Expect `pending.md` to be the larger file. Round 280 (three free voters, one run) settled 56
+to 63 of the fixture's 80 claims and 10 to 16 of 30 real ones, with 0 wrong. The offline
+check is `python3 contest-bench/290/acceptance_290.py`.
+
 ## Check that a re-run is free (no network)
 
 `tests/test_claim_check.py` stubs the network and fails if a cached section or
