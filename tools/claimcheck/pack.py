@@ -75,10 +75,12 @@ _CUT_MARKER_MAX = 24      # `# … 999999999 chars cut`
 
 _CHUNK_GUTTER = re.compile(r"^ *\d*\| ?")                 # ` 120| ` and, for a `-` line, `    | `
 _QUOTE_GUTTER = re.compile(r"^(?: *\d+\| ?|  +\| ?)")     # what a voter copies along with a line
+_QUOTE_NUMBER = re.compile(r"^ *\d+\| ?")                # the numbered gutter alone (see find_all_quote)
 _SHOWN = re.compile(r"^ *(\d+)\|(?: |$)")
 _OMITTED = re.compile(r"^# … (\d+) lines? omitted \((\d+)-(\d+)\)$")
 #: every marker line a chunk can carry: CC-3's and CC-4's, and this module's own
-_MARKER_LINE = re.compile(r"^# … \d+ (?:diff )?(?:lines?|chars?) (?:omitted(?: \(\d+-\d+\))?|cut)$")
+_MARKER_LINE = re.compile(r"^# … (?:\d+ (?:diff )?(?:lines?|chars?) (?:omitted(?: \(\d+-\d+\))?|cut)"
+                          r"|the rest of the ticket omitted \(\d+-\d+\))$")   # CC-4's ticket_chunk tail
 _INDEX_HEAD = "# definitions (name  line):"
 _INDEX_ROW = re.compile(r"^#   (\S.*?)  \d+$")
 _INDEX_MORE = re.compile(r"^#   … (\d+) more$")
@@ -172,22 +174,26 @@ def _read(view, path: str) -> Optional[str]:
 # ------------------------------------------------------------------ chunk text
 
 def _has_gutter(chunk: Chunk) -> bool:
-    """A file chunk or a git hunk: its lines carry a `NNN|` number. Header, stat, log, ticket,
-    note and collect chunks are plain text."""
-    return chunk.kind == "source" or (chunk.kind == "git" and chunk.start > 0)
+    """A file chunk, a git hunk or a ticket: its lines carry a `NNN|` number. Header, stat,
+    log, note and collect chunks are plain text."""
+    # ticket_chunk prints ` 6| text` rows: with the gutter kept, a quote of two ticket lines
+    # never matched ("a b" against "a 4| b") and a correct verdict on a ticket claim was UNSURE
+    return chunk.kind == "source" or (chunk.kind in ("git", "ticket") and chunk.start > 0)
 
 
 def _content(chunk: Chunk) -> list:
     """The chunk's lines without gutters; a marker line is None (it is not a quoted line).
     A diff's own `+`/`-`/` ` stay: `+    check=False` is verbatim from the chunk."""
     gutter = _has_gutter(chunk)
+    # a ticket has no removed-line blank gutter: only a number is one (`| a | b |` is a table row)
+    rx = _QUOTE_NUMBER if chunk.kind == "ticket" else _CHUNK_GUTTER
     out: list = []
     for line in chunk.text.split("\n"):
         if _MARKER_LINE.match(line):
             out.append(None)
             continue
         if gutter:
-            m = _CHUNK_GUTTER.match(line)
+            m = rx.match(line)
             if m:
                 line = line[m.end():]
         out.append(line)
@@ -215,12 +221,12 @@ def _segments(chunk: Chunk) -> list:
     return [_norm(" ".join(run)) for run in runs]
 
 
-def normalise_quote(quote: str) -> str:
+def normalise_quote(quote: str, gutter=_QUOTE_GUTTER) -> str:
     """A quote the way `find_quote` compares it: the `NNN|` gutter stripped from each line
     (a diff's own `+`/`-` is not a gutter), runs of whitespace one space, trimmed. Case stays."""
     lines = []
     for line in _LINES.split(quote):
-        m = _QUOTE_GUTTER.match(line)
+        m = gutter.match(line)
         lines.append(line[m.end():] if m else line)
     return _norm(" ".join(lines))
 
@@ -244,11 +250,15 @@ def find_all_quote(pack: Pack, quote: str) -> list:
     """
     if not isinstance(quote, str):
         return []
-    needle = normalise_quote(quote)
-    if len(needle) < MIN_QUOTE:
+    # a code line that itself starts with `  |` (`    | b)` of a continued expression) lost its
+    # text to the blank-gutter rule and the verbatim quote was rejected: the quote is also tried
+    # with the numbered gutter stripped only
+    needles = {n for n in (normalise_quote(quote), normalise_quote(quote, _QUOTE_NUMBER))
+               if len(n) >= MIN_QUOTE}
+    if not needles:
         return []
     return [chunk.id for chunk in pack.chunks
-            if any(needle in run for run in _segments(chunk))]
+            if any(needle in run for run in _segments(chunk) for needle in needles)]
 
 
 def find_quote(pack: Pack, quote: str) -> Optional[str]:

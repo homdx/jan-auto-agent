@@ -404,7 +404,27 @@ def _condensed(f: _File, start: int, end: int, head_end: int, claim: str, why: s
         body = lines[h + 1: e + 1]
         for a, b in _windows(body, claim, budget, width):
             shown.append((h + 2 + a, h + 2 + b))
+        if len(shown) == 1:
+            # no window: the claim names nothing in particular here (or only a token on every
+            # line, dropped as noise). A 220-line body was shown as its signature alone, so the
+            # voter judged the function without one line of it; show its first and last lines.
+            shown += [(h + 2 + a, h + 2 + b) for a, b in _ends(body, budget, width)]
     return _piece(f, start, end, shown, why, index)
+
+
+def _ends(body: list, budget: int, width: int) -> list:
+    """The first and the last lines of *body* (0-based windows) within *budget* characters,
+    half each; the whole body when it fits."""
+    n = len(body)
+    if _span_chars(body, 0, n - 1, width) <= budget:
+        return [(0, n - 1)]
+    half = budget // 2
+    a = _fit_head(body, 0, n - 1, width, half)
+    z, used = n, 0
+    while z - 1 > a + 1 and used + _line_chars(body[z - 1], width) <= half:
+        z -= 1
+        used += _line_chars(body[z], width)
+    return [(0, a)] + ([(z, n - 1)] if z < n else [])
 
 
 def _definition_piece(f: _File, qualname: str, start: int, end: int, claim: str, why: str,

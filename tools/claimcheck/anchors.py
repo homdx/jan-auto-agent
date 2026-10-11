@@ -38,7 +38,12 @@ from tools.claimcheck.model import Anchor, RepoView, ResolvedAnchor
 
 # ------------------------------------------------------------------ extraction
 
-_SUFFIXES = "py|md|ini|json|csv|sh|toml|yaml|yml|txt"
+# any case (`Tests.MD`), and the other languages a target may hold: `App.java`, `run.js` gave no
+# anchor, so a claim about the file went to the voters as a world claim with no evidence. A bare
+# name of a suffix the repository has no file of still resolves to nothing (`Node.js`: world).
+_SUFFIXES = ("(?i:py|pyi|md|rst|ini|cfg|conf|json|jsonl|csv|sh|bash|toml|yaml|yml|txt|xml|html|css|"
+             "js|jsx|ts|tsx|mjs|java|kt|kts|gradle|go|rs|c|h|cc|cpp|hpp|rb|php|cs|swift|scala|sql|"
+             "proto|properties|lock|ipynb|bat|ps1|mk|cmake)")
 _HEX_CUE = re.compile(
     r"(?:(?<!\w)(?i:commits?|sha|at|HEAD)[:\s]\s*|(?<!\w)@)`?(?P<h>[0-9a-f]{7,40})\b")
 _HEX_TICKS = re.compile(r"`(?P<h>[0-9a-f]{7,40})`")
