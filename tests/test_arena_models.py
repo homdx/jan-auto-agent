@@ -547,3 +547,56 @@ def test_the_write_is_atomic_and_keeps_the_files_mode(repo, kilo, capsys):
     assert (local.stat().st_mode & 0o777) == 0o640
     assert sorted(f.name for f in repo.iterdir() if f.name.startswith("contest.local")) == [
         "contest.local.ini"]
+
+
+# ── replace: one model swapped for another, in place ─────────────────────────
+
+
+def test_replace_swaps_in_place_keeps_order_and_repeats_and_other_keys(repo, kilo, capsys):
+    kilo.listing = SMALL
+    text = "[arena.profile.p1]\nmodels = a:free,old:free,b-free,old:free\nlegs = 2\n"
+    local = local_ini(repo, text)
+    code, out, err = run(["-p", "p1", "model", "replace", "old:free", "hy3:free", "-y"], capsys)
+    assert code == 0 and err == ""
+    assert local.read_text() == text.replace("a:free,old:free,b-free,old:free",
+                                             "a:free,hy3:free,b-free,hy3:free")
+    assert "before: a:free,old:free,b-free,old:free" in out
+
+
+def test_replace_matches_the_base_name_whatever_the_variant(repo, kilo, capsys):
+    kilo.listing = SMALL
+    local = local_ini(repo, "[arena.profile.p1]\nmodels = a:free@high,b-free\n")
+    assert run(["-p", "p1", "model", "replace", "a:free", "b-free", "-y"], capsys)[0] == 0
+    assert local.read_text() == "[arena.profile.p1]\nmodels = b-free,b-free\n"
+
+
+def test_replace_refuses_an_old_the_profile_lacks_and_a_new_kilo_lacks(repo, kilo, capsys):
+    kilo.listing = SMALL
+    local = local_ini(repo, "[arena.profile.p1]\nmodels = a:free\n")
+    before = local.read_bytes()
+    code, _, err = run(["-p", "p1", "model", "replace", "zzz:free", "b-free", "-y"], capsys)
+    assert code == 2 and "has no 'zzz:free'" in err and local.read_bytes() == before
+    code, _, err = run(["-p", "p1", "model", "replace", "a:free", "nope:free", "-y"], capsys)
+    assert code == 2 and local.read_bytes() == before
+
+
+def test_replace_takes_one_new_model_and_asks_before_writing(repo, kilo, capsys, monkeypatch):
+    kilo.listing = SMALL
+    local = local_ini(repo, "[arena.profile.p1]\nmodels = a:free\n")
+    before = local.read_bytes()
+    code, _, err = run(["-p", "p1", "model", "replace", "a:free", "b-free,hy3:free", "-y"], capsys)
+    assert code == 2 and "one NEW model" in err and local.read_bytes() == before
+    monkeypatch.setattr("builtins.input", lambda prompt="": "n")
+    code, _, err = run(["-p", "p1", "model", "replace", "a:free", "b-free"], capsys)
+    assert code == 2 and "not applied" in err and local.read_bytes() == before
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    assert run(["-p", "p1", "model", "replace", "a:free", "b-free"], capsys)[0] == 0
+    assert local.read_text() == "[arena.profile.p1]\nmodels = b-free\n"
+
+
+def test_replace_to_the_same_model_changes_nothing(repo, kilo, capsys):
+    kilo.listing = SMALL
+    local = local_ini(repo, "[arena.profile.p1]\nmodels = a:free\n")
+    before = local.read_bytes()
+    code, out, _ = run(["-p", "p1", "model", "replace", "a:free", "a:free", "-y"], capsys)
+    assert code == 0 and "(unchanged)" in out and local.read_bytes() == before

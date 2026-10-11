@@ -576,6 +576,16 @@ def _model_drop(args: argparse.Namespace) -> int:
     return models.drop(REPO_ROOT, args)
 
 
+def _model_replace_arguments(p: argparse.ArgumentParser) -> None:
+    p.add_argument("old", metavar="OLD", help="the model to take out (provider/model, any variant)")
+    p.add_argument("new", metavar="NEW", help="the model to put in its place (provider/model)")
+    _late_globals(p, "p", "y")
+
+
+def _model_replace(args: argparse.Namespace) -> int:
+    return models.replace_model(REPO_ROOT, args)
+
+
 def _model_set_role(args: argparse.Namespace) -> int:
     return models.set_role(REPO_ROOT, args)
 
@@ -640,6 +650,12 @@ OBJECTS: dict[str, Object] = {
                 "AR-59",
                 add_arguments=_model_names_arguments,
                 handler=_model_drop,
+            ),
+            "replace": Verb(
+                "swap one model of a profile for another, in place (OLD NEW)",
+                "AR-59",
+                add_arguments=_model_replace_arguments,
+                handler=_model_replace,
             ),
             "set-role": Verb(
                 "set a profile's ticket writer or reviewer",

@@ -1194,6 +1194,44 @@ def drop(repo: Path, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def replace_model(repo: Path, args: argparse.Namespace) -> int:
+    """`arena model replace OLD NEW [-p PROFILE] [-y]`: swap one model for another in place.
+
+    Every entry of the profile whose base name is OLD becomes NEW, at its own place, so
+    the order and the repeats of the other entries stay. NEW is checked against Kilo's
+    list like `use`'s names, and the profile is written only after the same confirmation.
+    """
+    try:
+        new = split_names(args.new)
+        if len(new) != 1:
+            raise ModelError("replace takes one NEW model (arena model use takes a list)")
+        profiles, name = _selected_profile(repo, args)
+        if name not in profiles:
+            known = ", ".join(sorted(profiles)) or "none"
+            raise ModelError(f"unknown profile {name!r} (known: {known})")
+        _check_shape([args.old, *new])
+        current = split_names(profiles[name].get("models", ""))
+        old = base_of(args.old)
+        if old not in {base_of(c) for c in current}:
+            raise ModelError(
+                f"profile {name!r} has no {old!r} "
+                f"(its models: {', '.join(current) or 'none'})"
+            )
+        resolve_names(repo, new)
+        check_not_judge(repo, new)
+        after_list = [new[0] if base_of(c) == old else c for c in current]
+        before, after = ",".join(current), ",".join(after_list)
+        if before == after:
+            print(f"profile {name!r}: models = {after} (unchanged)")
+            return EXIT_OK
+        if not _confirm(name, before, after, args.yes):
+            raise ModelError(f"not applied — {roster.LOCAL_FILENAME} unchanged")
+        write_models(repo, name, after)
+    except (ModelError, profile.ProfileError) as err:
+        return output.refuse(str(err))
+    return EXIT_OK
+
+
 # ── AR-63: the ticket's writer and reviewer, as profile roles ────────────────
 #: The two ticket roles a profile may hold. A role is not a round agent, so
 #: `check_not_judge` does not apply to it: the ticket writer may also be the gate.
