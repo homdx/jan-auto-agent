@@ -6,9 +6,10 @@
 
 A row is written only for a settled claim (``unanimous`` and TRUE -> ``REAL``, FALSE ->
 ``FALSE``); everything else is the pending list, the stage-3 queue. `votes.json` holds no pack
-and no resolved anchors, so with a recorded ``target.sha`` both are rebuilt there, offline
-(`tools.claimcheck.truth.rebuild`: a read-only worktree of that exact sha under ``--scratch``;
-no model, no network, never fetched). ``--target`` overrides the recorded repository (a bench's
+and no resolved anchors, so with a recorded ``target.sha`` both are rebuilt there
+(`tools.claimcheck.truth.rebuild`: a read-only worktree of that exact sha under ``--scratch``,
+with the recorded ``base_sha`` and pack budget; no model, never fetched; offline for a local
+repository, a URL target is read from its clone, made again over the network when gone). ``--target`` overrides the recorded repository (a bench's
 clone may be gone). A target that cannot be opened is a warning: the keys then come from the
 cited chunk ids and the pending list names those.
 
@@ -166,6 +167,10 @@ def main(argv: "list[str] | None" = None) -> int:
 
     resolved = packs = base_sha = None
     repo = args.target or target.get("repo")
+    if target.get("base") and not target.get("base_sha"):
+        print(f"claimcheck_truth: warning: votes.json records --base {target['base']} as a name, not a sha "
+              "(written before base_sha): it is resolved now, and if it moved since the vote the "
+              "rebuilt diff is not the one the voters saw", file=sys.stderr)
     if target.get("sha") and repo and not args.no_rebuild and votes.get("claims"):
         scratch = args.scratch or args.repo_root / "claim-check-out" / "scratch"
         try:

@@ -620,7 +620,16 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
     with target:
         for warning in target.warnings:
             print(f"claim_vote: warning: {warning}", file=sys.stderr)
-        items, meta = prepare_target(claims, target, budget, args.base)
+        # --base is resolved once, here, and the sha is what votes.json records: a ref name
+        # re-resolved by claimcheck_truth.py after the branch moved rebuilt another diff
+        base_sha = None
+        if args.base:
+            try:
+                base_sha = target.view().git("rev-parse", "--verify", f"{args.base}^{{commit}}").strip()
+            except TargetError as exc:
+                print(f"claim_vote: --base {args.base}: does not resolve ({exc})", file=sys.stderr)
+                return 2
+        items, meta = prepare_target(claims, target, budget, base_sha)
         jobs = [(m, r) for m in voters for r in range(args.runs)]
         with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
             results = list(pool.map(lambda j: ask_v2(j[0], items, j[1], args.seed, parser,
@@ -629,7 +638,10 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
         table = tally(claims, results, meta=meta)
         warnings = list(target.warnings)
         report = {"target": {"repo": target.repo, "ref": target.ref, "sha": target.sha,
-                             "base": args.base, "warnings": warnings},
+                             "base": args.base, "base_sha": base_sha, "warnings": warnings,
+                             # the budget the packs were cut to (--pack-chars may differ from the ini)
+                             "budget": {"chars": budget.chars, "chunks": budget.chunks,
+                                        "per_chunk": budget.per_chunk}},
                   "results": results, "claims": table}
     if args.out:
         args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")

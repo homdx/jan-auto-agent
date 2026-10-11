@@ -15,8 +15,8 @@ positive label needs positive evidence, a plurality is not that.
 `votes.json` holds no pack and no resolved anchors (only the chunk ids accepted votes cited),
 so `scripts/claimcheck_truth.py` rebuilds both at the recorded sha (`rebuild`): `Target.open`
 on the exact sha, CC-6's `prepare_target` for the packs, CC-1's `resolve_anchors` for the keys.
-No model, no network. Without a target (a run without ``--target``, or a target that cannot be
-opened) the key falls back to the path inside the first cited chunk id, else the claim's hash.
+No model; a local target is read offline (a URL target: from its clone, see `rebuild`).
+Without a target (a run without ``--target``, or a target that cannot be opened) the key falls back to the path inside the first cited chunk id, else the claim's hash.
 """
 
 from __future__ import annotations
@@ -361,14 +361,30 @@ def write_truth(path: Path, rows: list, *, append: bool = False) -> tuple:
 
 # ------------------------------------------------------------------ rebuild at the recorded sha
 
+def _budget_of(target_info: dict, parser):
+    """The pack budget the run recorded (``target.budget``, written by claim_vote.py), so the
+    rebuilt packs are the ones the voters saw even when --pack-chars overrode the ini; a report
+    without one (written before the field existed) falls back to the ini's budget."""
+    from tools.claimcheck.pack import PackBudget
+    recorded = target_info.get("budget")
+    if isinstance(recorded, dict):
+        try:
+            return PackBudget(chars=int(recorded["chars"]), chunks=int(recorded["chunks"]),
+                              per_chunk=int(recorded["per_chunk"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+    return PackBudget.from_config(parser)
+
+
 def rebuild(votes: dict, repo, *, scratch, parser=None) -> tuple:
-    """(resolved, packs, base_sha) for every claim of *votes*, rebuilt offline at the recorded
+    """(resolved, packs, base_sha) for every claim of *votes*, rebuilt at the recorded
     ``target.sha`` of *repo*: ``resolve_anchors`` for the keys, CC-6's ``prepare_target`` for
-    the packs (with the recorded ``base``). Raises `TargetError` when the target cannot be
-    opened. No model, no network (the target is never fetched)."""
+    the packs, with the recorded ``base_sha`` and ``budget`` (`_budget_of`). Raises `TargetError`
+    when the target cannot be opened. No model, and the target is never fetched; a local
+    repository is read offline, a URL target from its clone under *scratch* (a missing clone is
+    made again, and its blobs come over the network on checkout)."""
     import sys
     from tools.claimcheck import anchors as cc_anchors
-    from tools.claimcheck.pack import PackBudget
     from tools.claimcheck.target import Target, TargetError
 
     scripts = str(Path(__file__).resolve().parents[2] / "scripts")
@@ -382,14 +398,14 @@ def rebuild(votes: dict, repo, *, scratch, parser=None) -> tuple:
         raise TargetError("votes.json has no target.sha: nothing to rebuild at")
     claims = [{"claim": c.get("claim", "")} for c in votes.get("claims") or []]
     with Target.open(str(repo), sha, scratch=Path(scratch)) as target:
-        base_sha = None
+        base_sha = target_info.get("base_sha") or None
         base = target_info.get("base")
-        if base:
+        if base and not base_sha:     # a votes.json written before base_sha was recorded
             try:
                 base_sha = target.view().git("rev-parse", "--verify", f"{base}^{{commit}}").strip() or None
             except Exception:   # noqa: BLE001 — a base that does not resolve leaves the packs without it
                 base_sha = None
-        items, _meta = claim_vote.prepare_target(claims, target, PackBudget.from_config(parser),
+        items, _meta = claim_vote.prepare_target(claims, target, _budget_of(target_info, parser),
                                                  base_sha)
         view = target.view()
         resolved = [cc_anchors.resolve_anchors(cc_anchors.extract_anchors(c["claim"]), view)
