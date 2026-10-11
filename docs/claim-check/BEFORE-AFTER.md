@@ -6,7 +6,7 @@ at **base** with the pack built at base, and at **head** with the pack built at 
 the `base..head` diff chunks of the paths the claim names, so the voters see what changed.
 
 ```bash
-python3 scripts/claim_diff.py claims.json --target . --base main --head origin/kc \
+python3 scripts/claim_diff.py claims.json --target . --base main --head origin/<head> \
     --profiles a b c --runs 3 --out claim-check-out/diff-kc --check
 python3 contest-bench/cc/score_cc.py claim-check-out/diff-kc/delta.json claims.json   # with a key
 ```

@@ -107,13 +107,13 @@ def next_steps(status: str, number: int, repo: Path, tasks_dir: Path, base: str)
     check = f"python3 scripts/next_task.py --tasks {rel}/ --progress /dev/null"
     if status == "open":
         lower = [k for k, v in statuses.items() if k < n and v not in ("landed", "queued")]
-        lines = [f"", f"next, on {branch}:",
-                 f"  1. check (no server) which ticket the agents get:", f"       {check}"]
+        lines = ["", f"next, on {branch}:",
+                 "  1. check (no server) which ticket the agents get:", f"       {check}"]
         if lower:
             lines += [f"     lower tickets still on offer, intake will refuse: {lower}",
                       *[f"       python3 {me} queued {k}" for k in lower]]
         lines += [f"  2. rewriting the ticket? edit {rel}/ now and commit it yourself",
-                  f"  3. run the round from this branch:",
+                  "  3. run the round from this branch:",
                   f"       python3 -m tools.contest run --ticket {n}",
                   f"  4. after the round: land the winner on {base}, then",
                   f'       python3 {me} landed {n} --sha <sha> --note "round {n} winner <agent>"',
@@ -130,12 +130,12 @@ def next_steps(status: str, number: int, repo: Path, tasks_dir: Path, base: str)
         m = re.match(r"[A-Za-z]+-?", titles.get(n, ""))
         family = m.group(0) if m else ""
         nxt = [k for k in nxt if titles[k].startswith(family)] or nxt
-        lines = [f"", f"next, on {branch}:", f"  1. check the log, then push:",
+        lines = ["", f"next, on {branch}:", "  1. check the log, then push:",
                  f"       git push {remote} {branch}"]
         if nxt:
-            lines += [f"  2. not landed yet: " + ", ".join(f"{titles[k]} ({k})" for k in nxt[:8])
+            lines += ["  2. not landed yet: " + ", ".join(f"{titles[k]} ({k})" for k in nxt[:8])
                       + (" …" if len(nxt) > 8 else ""),
-                      f"     pick one and open its round:",
+                      "     pick one and open its round:",
                       f"       python3 {me} show NN",
                       f"       python3 {me} round NN"]
         return "\n".join(lines)

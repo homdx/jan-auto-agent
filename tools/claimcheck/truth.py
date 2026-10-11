@@ -292,14 +292,18 @@ def merge_rows(existing: list, rows: list) -> tuple:
     known = {f for f, _ in have}
     add, conflicts = [], []
     for r in rows:
-        key = (r["finding"], r["truth"])
+        # Normalize the incoming row the same way as ``existing`` above, so a padded
+        # ``finding`` or a lowercase ``truth`` is not seen as new (duplicate) or conflicting.
+        finding = (r["finding"] or "").strip()
+        truth = (r["truth"] or "").strip().upper()
+        key = (finding, truth)
         if key in have:
             continue
-        if r["finding"] in known:
-            old = sorted(t for f, t in have if f == r["finding"])
-            conflicts.append((r["finding"], "/".join(old), r["truth"]))
+        if finding in known:
+            old = sorted(t for f, t in have if f == finding)
+            conflicts.append((finding, "/".join(old), truth))
             continue
-        add.append(r)
+        add.append({**r, "finding": finding, "truth": truth})
     return add, conflicts
 
 

@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from tools.arena import gitref
 from tools.claimcheck.anchors import PathRepoView
 from tools.collect import cli as collect_cli
 from tools.collect import loader as collect_loader

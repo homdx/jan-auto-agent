@@ -62,9 +62,9 @@ A claim about the code can be judged when the voters see the code. Give the repo
 the claims are about and the commit to judge at:
 
 ```bash
-python3 scripts/claim_vote.py claims.json --target . --ref origin/kc --runs 3 --out votes.json
-python3 scripts/claim_vote.py claims.json --target . --ref origin/kc --base origin/main \
-    --report report.md --runs 3 --out votes.json      # + the git evidence of main..kc, the sha check
+python3 scripts/claim_vote.py claims.json --target . --ref origin/<head> --runs 3 --out votes.json
+python3 scripts/claim_vote.py claims.json --target . --ref origin/<head> --base origin/main \
+    --report report.md --runs 3 --out votes.json      # + the git evidence of main..<head>, the sha check
 ```
 
 The commit is pinned once (`--ref`, resolved to a sha; `--fetch` fetches first) and checked
@@ -93,7 +93,7 @@ run with `rejected` (every downgrade, with the quote), and per claim `id`, `kind
 `[claim_vote]` sets `code_batch`, `pack_chars` (`--pack-chars`), `pack_chunks` and
 `pack_chunk_chars`. The fabrication rate is a number: `rejected` per voter and per run.
 
-Did a fix land? The same claims at two commits, `scripts/claim_diff.py claims.json --target . --base main --head origin/kc --check` (CC-7): FIXED / STILL / NEW / GONE / UNCLEAR, see [BEFORE-AFTER.md](BEFORE-AFTER.md).
+Did a fix land? The same claims at two commits, `scripts/claim_diff.py claims.json --target . --base main --head origin/<head> --check` (CC-7): FIXED / STILL / NEW / GONE / UNCLEAR, see [BEFORE-AFTER.md](BEFORE-AFTER.md).
 
 The offline check of the chain (fake voters, the fixture's 80 claims, no network):
 
@@ -157,8 +157,8 @@ line of `vote.log` is the verdict counts and the models that returned no votes.
 ## With the code in front of the voters: into `truth.csv` and the stage-3 queue (CC-8)
 
 ```bash
-scripts/run_claim_check.sh report.md --target . --ref origin/kc --truth truth.csv
-scripts/run_claim_check.sh report.md --target . --ref origin/kc --base main --truth truth.csv --dry-run
+scripts/run_claim_check.sh report.md --target . --ref origin/<head> --truth truth.csv
+scripts/run_claim_check.sh report.md --target . --ref origin/<head> --base main --truth truth.csv --dry-run
 python3 scripts/claimcheck_truth.py votes.json --out validate1/truth.csv --pending pending.md --append
 ```
 

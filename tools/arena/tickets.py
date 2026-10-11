@@ -882,7 +882,7 @@ def _checkout_text(repo: Path) -> str:
     """`checkout /path on arena (clean)` — the place the operator is standing in."""
     head = _head_branch(repo)
     modified = _modified(repo)
-    clean = f" (clean)" if not modified else f" ({len(modified)} modified)"
+    clean = " (clean)" if not modified else f" ({len(modified)} modified)"
     return f"checkout {os.path.realpath(str(Path(repo)))} on {head or 'detached HEAD'}{clean}"
 
 
@@ -973,7 +973,7 @@ def _branch_refusal(err, repo: Path, args, prof: dict, verb: str, nn: int) -> in
         pass
     if wanted and _rev(repo, f"refs/remotes/origin/{wanted}") is not None:
         where += f" · target branch {wanted} @ ?, on origin only"
-        detail = f"only on origin"
+        detail = "only on origin"
         message = f"{wanted} is only on origin — a remote ref is never written"
         hints = [
             {"why": f"create {wanted} from origin", "command": f"git branch {wanted} origin/{wanted}"},
@@ -992,7 +992,7 @@ def _branch_refusal(err, repo: Path, args, prof: dict, verb: str, nn: int) -> in
     else:
         target = branches[0] if branches else wanted
         if target:
-            hints.append({"why": f"the last branch committed here",
+            hints.append({"why": "the last branch committed here",
                           "command": _cmd(verb, nn, target)})
         if branches:
             hints.append({"why": "or switch to one", "command": f"git switch {branches[0]}"})
@@ -1151,7 +1151,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
             f"{branch} is checked out in {wt} — its working tree would go stale",
             args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
             flow=_flow(STATUS_FLOW, 1, f"checked out in {wt}"),
-            hints=[{"why": f"run it there instead",
+            hints=[{"why": "run it there instead",
                     "command": f"cd {_hint_path(wt)} && arena issue {verb} {nn}{_verb_flags(verb, reason, note)}"}])
 
     names = _on_branch(repo, branch, nn)
@@ -1174,7 +1174,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
                 f"{nn} is only in {DRAFTS_DIR}/ — a draft has no **Status:** line yet",
                 args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
                 flow=_flow(STATUS_FLOW, 2, f"draft only: {DRAFTS_DIR}/{file}"),
-                hints=[{"why": f"publish it first",
+                hints=[{"why": "publish it first",
                         "command": f"arena issue create --file {_hint_path(f'{DRAFTS_DIR}/{file}')}"}])
         if checkout:
             file = checkout[0]
@@ -1209,7 +1209,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
         return _refuse(
             f"{nn} has no **Status:** line — a status verb does not invent where it goes",
             args, where=where, ticket=ticket, flow=_flow(STATUS_FLOW, 3, "no line"),
-            hints=[{"why": f"add `**Status:** open` under the title",
+            hints=[{"why": "add `**Status:** open` under the title",
                     "command": f"arena issue edit {nn} --branch {branch}"}])
     if word not in STATUS_WORDS:
         return _refuse(
@@ -1353,7 +1353,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
             f"{branch} is checked out in {wt} — its working tree would go stale",
             args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
             flow=_flow(EDIT_FLOW, 1, f"checked out in {wt}"),
-            hints=[{"why": f"run it there instead", "command": f"cd {_hint_path(wt)} && arena issue edit {nn}"}])
+            hints=[{"why": "run it there instead", "command": f"cd {_hint_path(wt)} && arena issue edit {nn}"}])
 
     names = _on_branch(repo, branch, nn)
     if len(names) > 1:

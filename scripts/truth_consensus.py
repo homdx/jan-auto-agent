@@ -100,7 +100,7 @@ def main():
             # neither settled nor dropped from the report
             disputed[k] = (votes, rs)
 
-    L = [f"# Adjudication\n",
+    L = ["# Adjudication\n",
          f"{len(adjudicators)} adjudicators · {len(g)} findings · "
          f"{len(settled)} settled · {len(disputed)} disputed\n",
          f"Adjudicators: {', '.join(adjudicators)}\n"]

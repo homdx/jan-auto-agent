@@ -374,7 +374,7 @@ def main():
                 v = best_line(rs, f_)
                 if v and v.lower() != "none":
                     Q.append(f"- **{label}:** {v[:600]}")
-            Q.append(f"\n**Verdict:** `REAL` / `FALSE` / `FIXED` — _________\n")
+            Q.append("\n**Verdict:** `REAL` / `FALSE` / `FIXED` — _________\n")
             Q.append("---\n")
         Q.append("\n## Recording the answers\n")
         Q.append("Append each decided line to `validate<N>/truth.csv` "

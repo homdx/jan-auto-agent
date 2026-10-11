@@ -7,7 +7,7 @@
 #
 #   scripts/run_claim_check.sh report.md                   # voters from [claim_vote] llm_profiles
 #   RUNS=5 scripts/run_claim_check.sh report.md --profiles a b c
-#   scripts/run_claim_check.sh report.md --target . --ref origin/kc --truth truth.csv   # CC-6 + CC-8
+#   scripts/run_claim_check.sh report.md --target . --ref origin/<head> --truth truth.csv   # CC-6 + CC-8
 #   scripts/run_claim_check.sh report.md --target . --ref HEAD --truth t.csv --dry-run  # print, run nothing
 #
 # --target / --ref / --base / --fetch / --profiles / --models ... go to claim_vote.py as they are.

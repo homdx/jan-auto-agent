@@ -93,8 +93,8 @@ def main():
             print(f"error: every entry in {a.improvements} ({len(entries)}) is a heading "
                   f"with no Location and no Instruction — there is nothing to review.",
                   file=sys.stderr)
-            print(f"  Regenerate it with --auto ... --dry-run, or pass --allow-thin to "
-                  f"review titles only and record that the input was thin.", file=sys.stderr)
+            print("  Regenerate it with --auto ... --dry-run, or pass --allow-thin to "
+                  "review titles only and record that the input was thin.", file=sys.stderr)
             return 1
         print(f"warning: skipping {len(thin)} entry/entries with no Location and no "
               f"Instruction — they cannot be judged: {', '.join(thin[:8])}"
@@ -124,8 +124,6 @@ def main():
         return 0
 
     nxt = todo[0]
-    repeat = nxt["task_id"] == getattr(main, "_last", None)
-    main._last = nxt["task_id"]
 
     print(f"progress: {n_done}/{n_all} recorded, {len(todo)} remaining"
           + (f"  (+{len(extra)} NEW-*)" if extra else ""))

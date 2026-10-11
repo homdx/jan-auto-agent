@@ -137,7 +137,7 @@ def main():
              f"**File:** `{file_}`  ",
              f"**Symbol:** `{symbol or '—'}`  ",
              f"**Status:** confirmed by adjudication ({row.get('checked_by', '?')})  ",
-             (f"**Also reported as:** " + ", ".join(f"`{x}`" for x in alias_note) + "\n"
+             ("**Also reported as:** " + ", ".join(f"`{x}`" for x in alias_note) + "\n"
               if alias_note else "\n"),
              "## The defect\n",
              (longest(both, "consequence") or longest(both, "impact")

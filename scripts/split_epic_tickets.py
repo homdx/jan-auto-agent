@@ -193,7 +193,7 @@ def main(argv=None):
         doc = [f"# {tid} — {t['title']}\n",
                f"**Severity:** {m['severity']}  ",
                f"**File:** `{m['files'][0]}`  ",
-               f"**Symbol:** `—`  ",
+               "**Symbol:** `—`  ",
                f"**Round:** {i} of {len(order)}  ",
                f"**Size:** {m['size']}  ",
                f"**Source:** `{t['src']}` § {tid}  "]

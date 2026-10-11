@@ -135,10 +135,10 @@ def badge_agree(a):
     return f"{a:^7}"
 
 def badge_sev(s):
-    if s=="HIGH":   return c(BG_RED,WHT)   + f" HIGH " + r()
-    if s=="MEDIUM": return c(BG_YLW,BLK)   + f" MED  " + r()
-    if s=="LOW":    return c(LBLU)          + f" LOW  " + r()
-    return c(GRY)                           + f" ·    " + r()
+    if s=="HIGH":   return c(BG_RED,WHT)   + " HIGH " + r()
+    if s=="MEDIUM": return c(BG_YLW,BLK)   + " MED  " + r()
+    if s=="LOW":    return c(LBLU)          + " LOW  " + r()
+    return c(GRY)                           + " ·    " + r()
 
 # ── Per-cell verdict rendering ────────────────────────────────────────────────
 def vcell(raw, truth, width=7):
