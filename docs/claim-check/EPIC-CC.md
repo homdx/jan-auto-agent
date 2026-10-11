@@ -188,9 +188,9 @@ does not decide the claim, answer UNSURE.* The reply is JSON only:
   "quote": "<up to 200 characters copied from that chunk>"}]
 ```
 
-`verify_quotes` downgrades a `TRUE`/`FALSE` to `UNSURE` (reason `quote_not_in_pack`) when
-the chunk id is not in the claim's pack or the quote, after whitespace and line-number
-prefix normalisation, is not a substring of that chunk. A world claim needs neither.
+`verify_quotes` downgrades a `TRUE`/`FALSE` to `UNSURE` when the chunk id is not in the
+claim's pack (reason `chunk_not_in_pack`) or the quote, after whitespace and line-number
+prefix normalisation, is not a substring of that chunk (reason `quote_not_in_pack`). A world claim needs neither.
 `tally` is unchanged (UNSURE abstains, quorum 3, `unanimous` as in `CLAIM-1`) and gains
 `evidence` (chunk ids) and `quotes` per claim.
 
@@ -200,8 +200,8 @@ prefix normalisation, is not a substring of that chunk. A world claim needs neit
   `--target` it behaves as today; the old `needs_code` flag is then still computed by
   `lenz_claim_filter.is_internal` (kept as the fallback).
 * `claim_extract.py` is untouched.
-* `[claim_vote]` in `contest.ini` gains `code_batch`, `pack_chars`, `pack_chunks`
-  (CC-6) — placeholders only, no real names.
+* `[claim_vote]` in `contest.ini` gains `code_batch`, `pack_chars`, `pack_chunks`,
+  `pack_chunk_chars` (CC-6) — placeholders only, no real names.
 * `truth.csv` rows use the columns `finding,truth,checked_by,duplicate_of,how` (the minimum
   in `validate1/ANALYTICS-RUNBOOK.md` is `finding,truth,how`), `truth` being `REAL` or
   `FALSE`, so `harvest_report.py --truth` (`load_truth`) reads them unchanged (CC-8).
@@ -220,9 +220,9 @@ prefix normalisation, is not a substring of that chunk. A world claim needs neit
 | 265 | CC-3 | Source evidence: symbol bodies, keyword windows, collect facts | M | CC-1 | contest | 2 |
 | 270 | CC-4 | Git evidence: commit, diff range, ticket text, file history | M | CC-1 | contest | 2 |
 | 275 | CC-5 | The pack: rank, merge, trim, render, find a quote | M | CC-3, CC-4 | contest | 3 |
-| 280 | CC-6 | Evidence-bound voting: prompt v2, quote check, `--target` | L | CC-5, CC-2 | contest | 4 |
-| 285 | CC-7 | Before and after: the same claims at two commits | M | CC-6 | contest | 5 |
-| 290 | CC-8 | Into the pipeline: `truth.csv`, pending list, one command | M | CC-6 | contest | 5 |
+| 280 | CC-6 | Evidence-bound voting: prompt v2, quote check, `--target` | L | CC-5, CC-2, CC-1 | contest | 4 |
+| 285 | CC-7 | Before and after: the same claims at two commits | M | CC-6, CC-2, CC-5 | contest | 5 |
+| 290 | CC-8 | Into the pipeline: `truth.csv`, pending list, one command | M | CC-6, CC-5, CC-1 | contest | 5 |
 | 291 | CC-9 | A Lenz comparison hint: the commands and the cost printed after a run, never run (`/extract` free 1000 a day; `/assess` 1 credit, `/verify` 10, from 100 a month + 400) | S | CC-6, CC-8 | contest | 6 |
 | 292 | CC-10 | Claim check in Gate 1 — three voters with the code and a quote instead of one reader, behind `[gate1] claim_vote = off` | M | CC-6, CC-7, CC-8 | contest | 7 |
 | 293 | CC-11 | Accept on three committed voters, not on all of them: `--accept committed`, so five voters leave three that work (146 of 150 settled, 0 wrong, replayed offline) | S | CC-6, CC-7, CC-8 | contest | 8 |

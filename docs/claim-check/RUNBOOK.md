@@ -2,8 +2,9 @@
 
 Take a report a model wrote (a reviewer's bug list, a round summary), cut it into
 atomic claims for free, let several free models vote on each, take away a table
-of what stands and what still needs a look at the code.  Three small steps, any
-of them runnable alone; nothing here spends Lenz credits.
+of what stands and what still needs a look at the code.  Two small steps (extract,
+vote), either runnable alone, and with `--target` a third that writes `truth.csv` (CC-8);
+nothing here spends Lenz credits.
 
 ## Stage 1 — extract (free, cached)
 

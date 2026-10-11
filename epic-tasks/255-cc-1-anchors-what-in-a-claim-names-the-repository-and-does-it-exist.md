@@ -142,7 +142,7 @@ symbols.
 
 ## As built
 
-Three places where the code is more precise than the text above, found when the 80 + 30 bench
+Four places where the code is more precise than the text above, found when the 80 + 30 bench
 claims were classified:
 
 * **`mixed` is narrower than "contains a `_HINTS` word".** Taken literally, `git status`,
