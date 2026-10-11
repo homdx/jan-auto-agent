@@ -415,6 +415,14 @@ def base_of(entry: str) -> str:
     return entry.partition("@")[0].strip()
 
 
+def same_model(entry: str, name: str) -> bool:
+    """*entry* of a profile names the model *name* (variants aside): `p1/a:free` and `a:free`
+    are one model, as `_check_known` takes both — `--help` says `OLD: provider/model`, and a
+    profile written with bare names refused it ("has no 'p1/a:free'")."""
+    a, b = base_of(entry), base_of(name)
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
+
+
 def _hints(name: str, pool: list[str]) -> list[str]:
     """Up to 3 names that `name` may have meant: a missing suffix, then close ones."""
     by_lower: dict[str, str] = {}
@@ -1171,9 +1179,8 @@ def drop(repo: Path, args: argparse.Namespace) -> int:
             raise ModelError(f"unknown profile {name!r} (known: {known})")
         _check_shape(entries)
         current = split_names(profiles[name].get("models", ""))
-        gone = {base_of(e) for e in entries}
         for entry in entries:
-            if base_of(entry) not in {base_of(c) for c in current}:
+            if not any(same_model(c, entry) for c in current):
                 # a name the profile lacks gets `use`'s typo hint; a name it holds
                 # is dropped without asking Kilo — a retired model is no longer
                 # listed, and it is the one an operator most wants out
@@ -1182,7 +1189,7 @@ def drop(repo: Path, args: argparse.Namespace) -> int:
                     f"profile {name!r} has no {base_of(entry)!r} "
                     f"(its models: {', '.join(current) or 'none'})"
                 )
-        kept = [c for c in current if base_of(c) not in gone]
+        kept = [c for c in current if not any(same_model(c, e) for e in entries)]
         if not kept:
             raise ModelError(f"profile {name!r} would be empty — 1 model must stay")
         before, after = ",".join(current), ",".join(kept)
@@ -1212,14 +1219,14 @@ def replace_model(repo: Path, args: argparse.Namespace) -> int:
         _check_shape([args.old, *new])
         current = split_names(profiles[name].get("models", ""))
         old = base_of(args.old)
-        if old not in {base_of(c) for c in current}:
+        if not any(same_model(c, old) for c in current):
             raise ModelError(
                 f"profile {name!r} has no {old!r} "
                 f"(its models: {', '.join(current) or 'none'})"
             )
         resolve_names(repo, new)
         check_not_judge(repo, new)
-        after_list = [new[0] if base_of(c) == old else c for c in current]
+        after_list = [new[0] if same_model(c, old) else c for c in current]
         before, after = ",".join(current), ",".join(after_list)
         if before == after:
             print(f"profile {name!r}: models = {after} (unchanged)")
