@@ -7,15 +7,16 @@
 #   contest-bench/cc/run_cc.sh --profiles a b c        # three voters, three families
 #   RUNS=1 contest-bench/cc/run_cc.sh --profiles a b c
 #   contest-bench/cc/run_cc.sh --target --profiles a b c   # CC-6: each set judged on its tree's evidence
+#   contest-bench/cc/run_cc.sh --diff --profiles a b c     # CC-7: the fixture at base and at head, FIXED/STILL/NEW/GONE
 #
 # Everything lands in claim-check-out/cc-<UTC>/: the claim lists, the built
 # fixture, votes_<set>.json, vote_<set>.log and score.txt.
 set -uo pipefail
 # CC-6: --target (first or anywhere) is ours, not claim_vote's: each set is judged at its own
 # pinned tree (the fixture at base, this repository at real_sha), so it cannot be passed on as is
-target=0; args=()
+target=0; diff=0; args=()
 for a in "$@"; do
-    if [ "$a" = --target ]; then target=1; else args+=("$a"); fi
+    if [ "$a" = --target ]; then target=1; elif [ "$a" = --diff ]; then diff=1; else args+=("$a"); fi
 done
 set -- "${args[@]+"${args[@]}"}"
 here=$(cd "$(dirname "$0")" && pwd)
@@ -32,6 +33,19 @@ real=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['real_sha
 git clone -q --shared "$out/fixture-repo" "$out/fixture-base" && git -C "$out/fixture-base" checkout -q "$base"
 git clone -q --shared "$repo" "$out/real-tree" && git -C "$out/real-tree" checkout -q "$real" \
     || { echo "run_cc: $real is not in this repository"; exit 2; }
+
+if [ "$diff" = 1 ]; then
+    # CC-7: the fixture's claims at its base and head shas; ~650 requests with 3 voters and RUNS=3
+    head=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['head_sha'])" "$here/claims_fixture.json")
+    python3 scripts/claim_diff.py "$here/claims_fixture.json" --target "$out/fixture-repo" --base "$base" \
+        --head "$head" --runs "${RUNS:-3}" --scratch "$out/scratch" --out "$out/diff" "$@" 2> "$out/diff.log"
+    code=$?
+    tail -3 "$out/diff.log"
+    [ -s "$out/diff/delta.json" ] || { echo "run_cc: no delta for the fixture, see $out/diff.log"; exit 1; }
+    python3 "$here/score_cc.py" "$out/diff/delta.json" "$here/claims_fixture.json" | tee "$out/score_diff.txt"
+    echo "== done: $out (diff $base -> $head)"
+    exit $code
+fi
 
 status=0
 for set in fixture real; do
