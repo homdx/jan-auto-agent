@@ -493,19 +493,26 @@ def report_sha(path: "Path | None") -> "str | None":
 
 
 def prepare_target(claims: list[dict], target: Target, budget: PackBudget,
-                   base: "str | None" = None) -> tuple:
+                   base: "str | None" = None, collect: bool = True) -> tuple:
     """(items, meta) for the claims at *target*: each claim's anchors resolved and
     classified there (CC-1); a ``code`` or ``mixed`` claim gets its pack (CC-5, with
-    ``base``..the target's sha when *base* is given), a ``world`` claim ``None``."""
+    ``base``..the target's sha when *base* is given, and the collect facts of the target when
+    *collect*), a ``world`` claim ``None``."""
     view = target.view()
     items, meta = [], []
+    model = [None, False]    # built once, on the first claim that needs a pack
     for c in claims:
         text = c["claim"]
         resolved = cc_anchors.resolve_anchors(cc_anchors.extract_anchors(text), view)
         kind = cc_anchors.classify(text, resolved)
         pack = None
         if kind != "world":
-            pack = build_pack(text, resolved, view, base=base,
+            if collect and not model[1]:
+                # CC-3's collect facts (callers, contracts, risk) were never built on the voter's
+                # path: build_pack takes a model, nothing passed one. Target.collect never raises
+                # (a repository collect cannot model is a warning and an absent model).
+                model[:] = [target.collect(), True]
+            pack = build_pack(text, resolved, view, model=model[0], base=base,
                               head=target.sha if base else None, budget=budget)
         items.append((text, pack))
         meta.append({"kind": kind, "dangling": cc_anchors.is_dangling(resolved),
@@ -541,6 +548,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--report", type=Path, help="the report the claims come from: the sha it names is checked against --ref")
     ap.add_argument("--expect-sha", help="the sha the report says it is about (instead of --report)")
     ap.add_argument("--scratch", type=Path, help="where --target's worktree goes (default: <repo-root>/claim-check-out/scratch)")
+    ap.add_argument("--no-collect", action="store_true",
+                    help="packs without the target's collect facts (a collect of a large tree takes seconds to minutes)")
     args = ap.parse_args(argv)
 
     if args.add_profiles:
@@ -632,7 +641,7 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
             except TargetError as exc:
                 print(f"claim_vote: --base {args.base}: does not resolve ({exc})", file=sys.stderr)
                 return 2
-        items, meta = prepare_target(claims, target, budget, base_sha)
+        items, meta = prepare_target(claims, target, budget, base_sha, collect=not args.no_collect)
         jobs = [(m, r) for m in voters for r in range(args.runs)]
         with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
             results = list(pool.map(lambda j: ask_v2(j[0], items, j[1], args.seed, parser,
@@ -642,6 +651,7 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
         warnings = list(target.warnings)
         report = {"target": {"repo": target.repo, "ref": target.ref, "sha": target.sha,
                              "base": args.base, "base_sha": base_sha, "warnings": warnings,
+                             "collect": not args.no_collect,
                              # the budget the packs were cut to (--pack-chars may differ from the ini)
                              "budget": {"chars": budget.chars, "chunks": budget.chunks,
                                         "per_chunk": budget.per_chunk}},

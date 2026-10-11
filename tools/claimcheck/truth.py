@@ -431,8 +431,9 @@ def rebuild(votes: dict, repo, *, scratch, parser=None) -> tuple:
                 base_sha = target.view().git("rev-parse", "--verify", f"{base}^{{commit}}").strip() or None
             except Exception:   # noqa: BLE001 — a base that does not resolve leaves the packs without it
                 base_sha = None
+        # collect facts only when the vote had them: a votes.json older than the field had none
         items, _meta = claim_vote.prepare_target(claims, target, _budget_of(target_info, parser),
-                                                 base_sha)
+                                                 base_sha, collect=bool(target_info.get("collect")))
         view = target.view()
         resolved = [cc_anchors.resolve_anchors(cc_anchors.extract_anchors(c["claim"]), view)
                     for c in claims]

@@ -87,15 +87,18 @@ def load_claims(path: Path) -> list:
 
 # ------------------------------------------------------------------ the two sides
 
-def prepare_sides(claims: list, base: Target, head: Target, budget: PackBudget) -> dict:
+def prepare_sides(claims: list, base: Target, head: Target, budget: PackBudget,
+                  collect: bool = True) -> dict:
     """The items, meta and resolved anchors of both sides, the world flags and the GONE flags.
 
     A claim that is ``world`` at one side only (a commit that exists at head alone) is not a
     world claim: its world side gets a pack too — usually the empty one — so a vote there
     cannot stand without evidence (CC-6's quote check downgrades it), and the rule gives
     ``NEW`` or ``UNCLEAR`` instead of a judgement nobody could see."""
-    items_b, meta_b = cv.prepare_target(claims, base, budget)
-    items_h, meta_h = cv.prepare_target(claims, head, budget, base=base.sha)
+    items_b, meta_b = cv.prepare_target(claims, base, budget, collect=collect)
+    items_h, meta_h = cv.prepare_target(claims, head, budget, base=base.sha, collect=collect)
+    model_b = base.collect() if collect else None      # cached by the target: no second build
+    model_h = head.collect() if collect else None
     view_b, view_h = base.view(), head.view()
     res_b = [cc_compare.resolve(c["claim"], view_b) for c in claims]
     res_h = [cc_compare.resolve(c["claim"], view_h) for c in claims]
@@ -104,10 +107,10 @@ def prepare_sides(claims: list, base: Target, head: Target, budget: PackBudget) 
         kb, kh = meta_b[i]["kind"], meta_h[i]["kind"]
         world.append(kb == "world" and kh == "world")
         if kb == "world" and kh != "world":
-            items_b[i] = (c["claim"], build_pack(c["claim"], res_b[i], view_b, budget=budget))
+            items_b[i] = (c["claim"], build_pack(c["claim"], res_b[i], view_b, model=model_b, budget=budget))
             meta_b[i] = {**meta_b[i], "kind": kh}
         elif kh == "world" and kb != "world":
-            items_h[i] = (c["claim"], build_pack(c["claim"], res_h[i], view_h, base=base.sha,
+            items_h[i] = (c["claim"], build_pack(c["claim"], res_h[i], view_h, model=model_h, base=base.sha,
                                                  head=head.sha, budget=budget))
             meta_h[i] = {**meta_h[i], "kind": kb}
         gone.append(cc_compare.primary_vanished(res_b[i], res_h[i]))
@@ -120,14 +123,14 @@ def requests_of(items: list, voters: int, runs: int, batch: int, code_batch: int
 
 
 def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
-               budget: PackBudget = PackBudget()) -> dict:
+               budget: PackBudget = PackBudget(), collect: bool = True) -> dict:
     """The core of the command: both sides prepared, voted (the two sides at once, so their
     jobs share one pool) and tallied, and the deltas. *vote* is the seam: the CLI's
     `make_vote` (``ask_v2`` over voters x runs), or a test's fake voter.
 
     Returns ``{"deltas", "base": {"rows", "results", "table"}, "head": {...}}``; ``rows`` is one
     tally row per claim (``None`` at base for a world claim, which is judged at head only)."""
-    sides = prepare_sides(claims, base, head, budget)
+    sides = prepare_sides(claims, base, head, budget, collect)
     idx_b = [i for i, w in enumerate(sides["world"]) if not w]
     items_b = [sides["items_b"][i] for i in idx_b]
     with concurrent.futures.ThreadPoolExecutor(2) as two:
@@ -231,6 +234,7 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--repo-root", type=Path, default=Path.cwd(), help="where contest.ini / contest.local.ini live")
     ap.add_argument("--scratch", type=Path, help="where the two worktrees go (default: <repo-root>/claim-check-out/scratch)")
     ap.add_argument("--check", action="store_true", help="exit 1 when a claim's `expect` is not its change")
+    ap.add_argument("--no-collect", action="store_true", help="packs without the collect facts of the two trees")
     args = ap.parse_args(argv)
 
     try:
@@ -285,7 +289,7 @@ def main(argv: "list[str] | None" = None) -> int:
 
         with concurrent.futures.ThreadPoolExecutor(max(1, args.parallel)) as pool:
             vote = make_vote(voters, args.runs, pool, ask)
-            got = judge_both(claims, base, head, plan_and_vote, budget)
+            got = judge_both(claims, base, head, plan_and_vote, budget, collect=not args.no_collect)
         table = write_outputs(out, base, head, got)
 
     for line in _voter_lines(got):

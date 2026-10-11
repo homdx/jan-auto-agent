@@ -92,6 +92,10 @@ run with `rejected` (every downgrade, with the quote), and per claim `id`, `kind
 
 `[claim_vote]` sets `code_batch`, `pack_chars` (`--pack-chars`), `pack_chunks` and
 `pack_chunk_chars`. The fabrication rate is a number: `rejected` per voter and per run.
+A pack also carries the target's collect facts (`collect:callers:…`, contracts, risk), built
+once per tree — about 25 s on this repository, nothing on a small one; `--no-collect` leaves
+them out. `votes.json`'s `target` records `base_sha`, `budget` and `collect`, so the CC-8
+rebuild shows the packs the voters saw.
 
 Did a fix land? The same claims at two commits, `scripts/claim_diff.py claims.json --target . --base main --head origin/<head> --check` (CC-7): FIXED / STILL / NEW / GONE / UNCLEAR, see [BEFORE-AFTER.md](BEFORE-AFTER.md).
 
