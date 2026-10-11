@@ -138,7 +138,7 @@ voter", not "every voter that happened to answer".
   paths), so read the TRUE rows with a repo-specific look as well.
 - **A model that gives no votes is a result.**  `votes=0/N` with an error or a
   `raw_head` in `votes.json` is a model to drop from the roster, not a bug to chase.
-- **No credit is spent anywhere in this runbook.**  `/assess` and `/verify` (1
+- **No credit is spent anywhere in this runbook.**  (CC-9 prints the commands that would, never runs them.)  `/assess` and `/verify` (1
   and 10 credits) are the paid tie-break and live in `scripts/lenz_claim_filter.py`
   behind `--verify`; use them only on a `SPLIT` about a public fact.  That
   script drops repo claims too (`is_internal`), asks for the key only when a
@@ -255,11 +255,8 @@ Read it in this order:
 Cost: the two sides share one pool; a code claim is 0.5 request per voter at `code_batch = 2`.
 The command opens two read-only worktrees under `--scratch` and removes them at the end.
 
-## Planned, not landed yet
+## Planned, not landed yet (CC-10)
 
-* **CC-9 (291), Lenz comparison hint.** `lenz_claim_filter.py` would pick which world claims
-  are worth the one credit by the votes' disagreement. Until it lands, `--max` and `--dry-run`
-  are the only controls, and no credit is spent without `--verify`.
 * **CC-10 (292), claim check in Gate 1.** `[gate1] claim_vote = off` by default. The ticket's
   layer 2 is an operator step and lives here once the code has landed:
   1. `main.py --validate-plan --base REPO` on one real target; keep the Architect's candidates.
@@ -279,6 +276,49 @@ The command opens two read-only worktrees under `--scratch` and removes them at 
 | `CONFLICT` from `claimcheck_truth.py --append`, exit 3 | the same `finding` already has another `truth` | decide by hand; the file is kept as it was |
 | a `finding` with both `REAL` and `FALSE` rows | two claims about one symbol | settle by hand before `harvest_report --truth` (it reads the last row only) |
 | `target cannot be opened` (warning) | the recorded repository is gone | `--target PATH` to a clone that has the sha |
+
+## If you want Lenz's opinion: the hint, never a call (CC-9)
+
+```bash
+scripts/run_claim_check.sh report.md --target . --ref HEAD --truth truth.csv          # hint included
+scripts/run_claim_check.sh report.md --target . --ref HEAD --truth truth.csv --no-lenz-hint
+python3 scripts/claimcheck_truth.py votes.json --out truth.csv --append --lenz lenz.json   # compare
+```
+
+No run of this epic calls `/assess` or `/verify`. After `claimcheck_truth.py` (and so after
+`run_claim_check.sh --truth`), pending.md ends with a block that is printed on the console as
+well: `If you want Lenz's opinion (costs credits — nothing below was run)`. It holds:
+
+* the world claims the voters did not settle (`SPLIT`, a `TRUE`/`FALSE` with a dissenter,
+  `UNSURE`; at most `DEFAULT_MAX` = 12). A code, mixed or dangling claim is never one: Lenz
+  cannot see the repository;
+* the cost: one credit per claim, `/verify` 10 more, from 100 a month + 400 extra. This
+  month's balance is not known to the tool, so check the billing page;
+* three commands, ready to copy: the script's dry run, the send (`--max N`), and this run's
+  own command again with `--append --lenz`;
+* a compare table that names the claims by their pending entry (`claim 5`), not by text.
+  pending.md names every unsettled claim once.
+
+The claims go to `lenz-claims.md` next to pending.md, one `###` section per claim, and the
+commands hand that file to `lenz_claim_filter.py` in place of the report. Its `--dry-run` then
+lists exactly the counted claims. Sending the report itself would spend the credits on
+whatever the script picks from it. The script's own filters stay as they are, so the block
+counts only what would get through them and names the rest by number:
+
+* a claim without one of its public-fact words (`_HINTS`: pytest, POSIX, rename,
+  `git status` …) is never sent;
+* a section of 120 characters or fewer is dropped.
+
+The cost is stated as "at most": the script may still skip a claim it reads as about this
+repository, and a cached claim costs nothing.
+
+`--lenz FILE` reads what `lenz_claim_filter.py --json` wrote (`[]` when nothing was left to
+send) and adds a `lenz` column (`True/high`, `Mixed/low`) to the compare table. Rows are
+matched to our claims by text, allowing for case, spacing and a light rewording by `/extract`.
+A row that matches no claim, or two claims, is ignored and counted in a warning. A missing or
+unreadable file is a warning: the table stays as it was and the exit code does not change.
+The offline tests are `tests/test_claimcheck_lenz_hint.py`. Acceptance is the operator's: read
+the block, run command 1, and check that the billing page is unchanged after the run.
 
 ## Check that a re-run is free (no network)
 

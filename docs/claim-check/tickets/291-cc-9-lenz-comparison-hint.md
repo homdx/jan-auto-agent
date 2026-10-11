@@ -1,6 +1,6 @@
 # CC-9 — a Lenz comparison hint: print the commands, never run them
 
-**Status:** FINAL — every name it relies on was checked against the tree (`DEFAULT_MAX`, `VERIFY_CREDITS`, `--max/--json/--dry-run` of `scripts/lenz_claim_filter.py`; the kinds `code|world|mixed` and `dangling` of `claim_vote.py`; the credit prices of `docs/claim-check/REPORT.md`). Cut into `epic-tasks/` after CC-8 (290) has landed: it appends to the `pending.md` and the `--pending` option that ticket adds.
+**Status:** landed (local) — every name it relies on was checked against the tree (`DEFAULT_MAX`, `VERIFY_CREDITS`, `--max/--json/--dry-run` of `scripts/lenz_claim_filter.py`; the kinds `code|world|mixed` and `dangling` of `claim_vote.py`; the credit prices of `docs/claim-check/REPORT.md`). Cut into `epic-tasks/` after CC-8 (290) has landed: it appends to the `pending.md` and the `--pending` option that ticket adds.
 **Severity:** LOW (a convenience; nothing in the epic depends on it)
 **File:** `tools/claimcheck/lenz_hint.py`
 **Symbol:** `pick_for_lenz`, `lenz_hint_markdown`
@@ -92,3 +92,31 @@ that when nothing is left to send); a `lenz.json` row for a claim that is not in
 
 Calling Lenz from the pipeline for any reason; reading the credit balance; `/verify` automation;
 sending code claims; changing `lenz_claim_filter.py`'s own filtering.
+
+## What landed (local)
+
+`tools/claimcheck/lenz_hint.py` (`pick_for_lenz`, `lenz_hint_markdown`, `read_lenz`, `lenz_compare`,
+`lenz_compare_markdown`, `credit_figures`); `claimcheck_truth.py` takes `--report`, `--lenz FILE`,
+`--no-lenz-hint` and ends `pending.md` and the console with the block; `run_claim_check.sh` passes
+`--report` and `--no-lenz-hint` to the truth step only. `tests/test_claimcheck_lenz_hint.py` (22 tests,
+no socket, no process). One line of CC-8's tests changed: the truth command it pins now ends with `--report`.
+
+Deviations from the text above, each because the tree says otherwise:
+
+* **Step 1 of the block is not "the same claims".** `lenz_claim_filter.py --dry-run` prints the *sections*
+  that would go to the free `/extract`, not the claims; and the script picks its own public-looking
+  claims from the report, so what `--max N` sends may differ from the list the block counted. The block
+  lists the counted claims itself, says "up to N credits" and says so; the acceptance's "lists the same
+  claims" is not met, and changing the script's filtering is out of scope.
+* **"The compare table"** did not exist; `--lenz` writes one (`claim | ours | lenz`), to the console
+  and as the last section of `pending.md`. A Lenz answer is matched to a claim by its text (case and
+  whitespace aside); answers that match none are counted in a sentence, not dropped silently.
+* **A missing or unreadable `--lenz` file** is a warning on stderr; the run goes on without the table.
+* **"No network" is pinned by the module's syntax tree** (no import of `urllib`, `socket`, `requests`,
+  `http`, `subprocess`, `os`, `ssl`, `getpass`; no `environ`), not by grepping its text: the block itself
+  has to name `LENZ_API_KEY`. The two constants come from `scripts/lenz_claim_filter.py` (imported
+  inside `credit_figures`, which never calls it).
+* A `TRUE`/`FALSE` with a dissenter is not picked (the ticket names only `SPLIT` and `UNSURE`).
+
+Not verified: the picking on a live `votes.json` with world claims (the only live file, `contest-bench/290/votes_live.json`,
+holds none: on it the block says "nothing worth sending"); the three printed commands were not run.

@@ -16,6 +16,13 @@ cited chunk ids and the pending list names those.
 a ``finding`` already there with another ``truth`` is not overwritten: it is printed as a
 conflict and the exit code is 3. A refusal (unreadable votes.json) is exit 2. The CSV and
 the pending list are written atomically (a temporary file, a rename).
+
+CC-9: a Lenz hint is appended to the pending list and printed (`tools.claimcheck.lenz_hint`):
+the world claims the voters left unsettled (those `lenz_claim_filter.py` would send are written
+to ``lenz-claims.md`` next to it), the three commands that would send them and what that costs.
+Nothing is sent: this script never starts `lenz_claim_filter.py`. ``--lenz FILE`` (what that script's ``--json`` wrote) adds a ``lenz``
+column to the hint's compare table; a missing or unreadable file is a warning and no column.
+``--no-lenz-hint`` leaves the hint out.
 """
 
 from __future__ import annotations
@@ -23,6 +30,8 @@ from __future__ import annotations
 import argparse
 import configparser
 import json
+import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -30,6 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tools.claimcheck import lenz_hint  # noqa: E402
 from tools.claimcheck import truth as cc_truth  # noqa: E402
 
 
@@ -45,6 +55,59 @@ def profile_models(votes: dict, repo_root: Path) -> tuple:
     return out, parser
 
 
+def _shown(path: Path) -> str:
+    """*path* as the operator types it from here: relative when it is under the current directory."""
+    rel = os.path.relpath(path)
+    return path.as_posix() if rel.startswith("..") else rel
+
+
+def compare_command(argv: list, lenz_json: Path) -> str:
+    """Command 3 of the hint: this run's own command line with ``--append`` (a re-run must not
+    rewrite a shared truth.csv; appended, it adds nothing) and ``--lenz`` in place of any earlier one."""
+    keep, skip = [], False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == "--lenz":
+            skip = True
+        elif not (a.startswith("--lenz=") or a == "--no-lenz-hint"):
+            keep.append(a)
+    if "--append" not in keep:
+        keep.append("--append")
+    keep += ["--lenz", str(lenz_json)]
+    return " ".join(shlex.quote(a) for a in ["python3", _shown(Path(__file__).resolve()), *keep])
+
+
+def lenz_block(votes: dict, args, argv: list, pending: Path) -> tuple:
+    """(the block for pending.md and the console, the claims file's text or None): the Lenz hint,
+    or with ``--no-lenz-hint`` only the compare table of a ``--lenz`` file. Reads no key, sends nothing."""
+    claims = votes.get("claims") or []
+    lenz = None
+    if args.lenz is not None:
+        try:
+            rows = lenz_hint.read_lenz(args.lenz)
+        except (OSError, ValueError) as exc:
+            print(f"claimcheck_truth: warning: --lenz {args.lenz}: {exc}; no lenz column", file=sys.stderr)
+        else:
+            lenz, unmatched = lenz_hint.match_lenz(claims, rows)
+            if unmatched:
+                print(f"claimcheck_truth: warning: {unmatched} of {len(rows)} rows of {args.lenz} match no claim "
+                      "of the votes file (ignored)", file=sys.stderr)
+    if args.no_lenz_hint:
+        table = lenz_hint.compare_table(claims, [], lenz=lenz) if lenz else []
+        return ("\n".join(["## Lenz next to our voters", "", *table, ""]) if table else ""), None
+    candidates = sum(1 for c in claims if lenz_hint.lenz_group(c) is not None)
+    picked = lenz_hint.pick_for_lenz(claims)
+    claims_file = pending.with_name("lenz-claims.md")
+    lenz_json = args.lenz or pending.with_name("lenz.json")
+    text = lenz_hint.claims_file_text(picked)
+    block = lenz_hint.lenz_hint_markdown(
+        picked, _shown(claims_file), claims=claims, candidates=candidates, json_path=_shown(lenz_json),
+        compare_cmd=compare_command(argv, _shown(lenz_json)), lenz=lenz,
+        script=_shown(lenz_hint.FILTER_SCRIPT))
+    return block, (text or None)
+
+
 def main(argv: "list[str] | None" = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("votes", type=Path, help="claim_vote.py --out votes.json")
@@ -57,6 +120,11 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--scratch", type=Path, help="where the rebuild's worktree goes (default: claim-check-out/scratch)")
     ap.add_argument("--no-rebuild", action="store_true", help="do not open the target: keys and pending from votes.json alone")
     ap.add_argument("--repo-root", type=Path, default=Path.cwd(), help="where contest.ini / contest.local.ini live")
+    ap.add_argument("--lenz", type=Path, metavar="FILE",
+                    help="what lenz_claim_filter.py --json wrote: adds a lenz column to the hint's compare table")
+    ap.add_argument("--no-lenz-hint", action="store_true",
+                    help="leave out the Lenz hint (the commands and the cost of a comparison; nothing is ever sent)")
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = ap.parse_args(argv)
 
     try:
@@ -94,12 +162,18 @@ def main(argv: "list[str] | None" = None) -> int:
     try:
         written, conflicts = cc_truth.write_truth(args.out, rows, append=args.append)
         pending = args.pending or args.out.with_name("pending.md")
-        cc_truth.atomic_write(pending, cc_truth.pending_markdown(votes, packs, models=models))
+        block, claims_text = lenz_block(votes, args, argv, pending)
+        if claims_text:
+            cc_truth.atomic_write(pending.with_name("lenz-claims.md"), claims_text)
+        md = cc_truth.pending_markdown(votes, packs, models=models)
+        cc_truth.atomic_write(pending, md + ("\n" + block if block else ""))
     except OSError as exc:
         print(f"claimcheck_truth: cannot write: {exc}", file=sys.stderr)
         return 2
     for finding, old, new in conflicts:
         print(f"CONFLICT {finding}: {args.out} says {old}, this run says {new} (kept {old})")
+    if block:
+        print(block)
     n_pending = len(cc_truth.pending_rows(votes))
     print(f"truth: {len(written)} rows {'appended to' if args.append else 'in'} {args.out} "
           f"({len(rows)} settled, {len(rows) - len(written) - len(conflicts)} already there, "
