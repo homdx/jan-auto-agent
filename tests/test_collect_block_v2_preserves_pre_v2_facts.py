@@ -543,9 +543,12 @@ def test_live_modules_recover_the_legacy_cap_tail(live_model):
         if len(module.public_symbols) <= 20:
             continue
         legacy_symbols = _legacy_facts(_legacy_block(live_model, module.path))["symbol"]
-        assert len(legacy_symbols) == 20
+        # the legacy block's rows are a set (`_legacy_facts`), so a module that
+        # repeats a name (`def _():` many times) gives fewer rows than 20
+        assert len(legacy_symbols) == len({s.qualname for s in module.public_symbols[:20]})
         new = build_collect_context_block(live_model, module.path)
-        dropped = {s.qualname for s in module.public_symbols[20:]}
+        dropped = {s.qualname for s in module.public_symbols[20:]} - {
+            s.qualname for s in module.public_symbols[:20]}
         assert not dropped & legacy_symbols
         still_missing = [q for q in dropped if q not in new]
         assert not still_missing, (module.path, still_missing)
