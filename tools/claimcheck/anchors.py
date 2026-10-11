@@ -130,7 +130,33 @@ def _is_rename(claim: str, start: int, end: int) -> bool:
             or claim[end:end + 4].lstrip().startswith("=>"))
 
 
+#: a quoted path with a space in it: `dir with space/a b.py`, "a b.py" — the quotes are its ends (a single
+#: quote is not one: "the file's config.py's" would be a path "s config.py")
+_QUOTED_SPACED_PATH = re.compile(
+    r"(?P<q>[`\"])(?P<p>(?:[\w.\- ]+/)*[\w\-][\w.\- ]*\.(?:" + _SUFFIXES + r"))(?::\d+(?:-\d+)?)?(?P=q)")
+
+
+_SUFFIX_END = re.compile(r"\.(?:" + _SUFFIXES + r")$")
+
+
+def _spaced_path(text: str) -> bool:
+    """A quoted text that is one path with spaces, not a command that names a path: a space
+    past the first `/` (`dir with space/a b.py`), no word an option, no word but the last a
+    file. `python3 scripts/run_claim_check.sh` is a command and the path in it (CC-1's golden);
+    `a b.py` alone is either, and stays the plain rule's."""
+    words = text.split()
+    return (text == text.strip() and "/" in text and " " in text.split("/", 1)[1]
+            and not any(w.startswith("-") for w in words)
+            and not any(_SUFFIX_END.search(w) for w in words[:-1]))
+
+
 def _path_spans(claim: str):
+    # first: bare, `dir with space/a b.py` was anchored as `b.py`, which does not exist, and the
+    # voter was told so — a confident FALSE on a file that is there. Only a quoted one: unquoted,
+    # where a path with spaces starts is anyone's guess
+    for m in _QUOTED_SPACED_PATH.finditer(claim):
+        if _spaced_path(m.group("p")):
+            yield "path", m.start("p"), m.end("p")
     for m in _PATH.finditer(claim):
         if m.group("p").startswith("www.") or _is_rename(claim, m.start("p"), m.end()):
             continue   # a host name, or git's rename form
@@ -568,12 +594,26 @@ class PathRepoView:
                  and p.endswith(".md")]
         by_number = [p for p in names if re.match(r"(\d+)-", p[len("epic-tasks/"):])
                      and int(re.match(r"(\d+)-", p[len("epic-tasks/"):]).group(1)) == n]
-        if "-" in ticket_id:
-            slug = "-?".join(re.escape(part) for part in ticket_id.lower().split("-"))   # kc76 and cc-1
-            by_slug = [p for p in names if re.search(rf"(?<![a-z0-9]){slug}(?![0-9])", p.lower())]
-            if by_slug:
-                return by_slug[0]
-        return by_number[0] if by_number else None
+        if "-" not in ticket_id:
+            return by_number[0] if by_number else None
+        slug = "-?".join(re.escape(part) for part in ticket_id.lower().split("-"))   # kc76 and cc-1
+        # the epic's own ticket folders too: CC-9 is docs/claim-check/tickets/291-cc-9-….md, and
+        # looked up in epic-tasks/ alone it fell back to 09-v6-… — an unrelated ticket, shown to
+        # the voter as CC-9, whose verbatim quote then verified
+        tickets = [p for p in self.files() if re.fullmatch(r"docs/[^/]+/tickets/[^/]+\.md", p)]
+        by_slug = [p for p in names + tickets if re.search(rf"(?<![a-z0-9]){slug}(?![0-9])", p.lower())]
+        if by_slug:
+            return by_slug[0]
+        # by its number alone only when the file names the id (`07-x.md` holding `# KC-7`): for a
+        # prefixed id the number in a file name is the file's (AUTO-3 is not 03-…)
+        named = re.compile(rf"(?<![A-Za-z0-9]){slug}(?![0-9])", re.I)
+        for p in by_number:
+            try:
+                if named.search(self.read(p)):
+                    return p
+            except (OSError, UnicodeDecodeError):
+                continue
+        return None
 
     def git(self, *args: str) -> str:
         """`git <args>` in the root, read-only: a short allow-list of subcommands

@@ -87,7 +87,7 @@ def main():
 
     existed = os.path.exists(out) and os.path.getsize(out) > 0
     if existed:
-        with open(out, newline="", encoding="utf-8") as fh:
+        with open(out, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
             for prev in csv.DictReader(fh):
                 if (prev.get("finding") or "").strip() == row["finding"]:
                     print(f"skipped: {row['finding']} is already decided as "

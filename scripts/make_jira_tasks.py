@@ -34,7 +34,7 @@ def read(paths, key="finding"):
     out = defaultdict(list)
     for pat in paths or []:
         for p in glob.glob(pat):
-            with open(p, newline="", encoding="utf-8") as fh:
+            with open(p, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
                 rd = csv.DictReader(fh)
                 for r in rd:
                     k = (r.get(key) or "").strip()
@@ -67,7 +67,7 @@ def main():
     ap.add_argument("--out", default="tasks")
     a = ap.parse_args()
 
-    with open(a.truth, newline="", encoding="utf-8") as fh:
+    with open(a.truth, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
         truth_rows = list(csv.DictReader(fh))
     # The same defect often gets reported at several symbols — the constant, the
     # constructor that binds it, the attribute it lands on. Those are one bug and
@@ -78,8 +78,14 @@ def main():
     # itself has no canonical row to fold into: its aliases are one bug all the same, so
     # the first of them is the ticket and the rest fold into it. A defect is never
     # dropped for naming a bad canonical.
+    # a claim-check row of a world claim (how = "world fact", CC-8) says a fact about the world
+    # is true, not that the code has a defect: "Python was created by Guido" was filed as one
+    world = [r for r in truth_rows if (r.get("how") or "").strip() == "world fact"]
+    if world:
+        print(f"skipped {len(world)} world-fact row(s): a true fact is not a defect", file=sys.stderr)
     real_rows = {(r.get("finding") or "").strip(): r for r in truth_rows
-                 if (r.get("truth") or "").strip().upper() == "REAL"}
+                 if (r.get("truth") or "").strip().upper() == "REAL"
+                 and (r.get("how") or "").strip() != "world fact"}
     order = {key: i for i, key in enumerate(real_rows)}
 
     def end_of(key):

@@ -178,7 +178,10 @@ def _has_gutter(chunk: Chunk) -> bool:
     log, note and collect chunks are plain text."""
     # ticket_chunk prints ` 6| text` rows: with the gutter kept, a quote of two ticket lines
     # never matched ("a b" against "a 4| b") and a correct verdict on a ticket claim was UNSURE
-    return chunk.kind == "source" or (chunk.kind in ("git", "ticket") and chunk.start > 0)
+    # a deleted file's hunk is `+0,0` (start 0) and still prints `  | -line` rows: a quote of two
+    # of its lines never matched, as with tickets above
+    return (chunk.kind == "source" or (chunk.kind in ("git", "ticket") and chunk.start > 0)
+            or (chunk.kind == "git" and re.search(r"(?m)^@@ ", chunk.text) is not None))
 
 
 def _content(chunk: Chunk) -> list:
@@ -599,6 +602,18 @@ def _dangling_notes(resolved: list, sha: str, chunks: list, view) -> list:
     seen: set = set()
     for ra in resolved:
         kind = ra.anchor.kind
+        if ra.found and kind == "path" and ra.lines and ra.lines[0] > 0:
+            # `a.py:900` of a 120-line file gave no chunk and no word: an empty pack, where
+            # "the file ends at line 120" is itself what decides the claim
+            body = reader.text(ra.path)
+            n = len(_split(body)) if body is not None else None
+            if n is not None and min(ra.lines) > n:
+                cid = f"note:range:{ra.anchor.text}"
+                if cid not in seen:
+                    seen.add(cid)
+                    out.append(_note(cid, f"`{ra.path}` ends at line {n}: line {min(ra.lines)} "
+                                          "the claim cites is not in it.", ra.anchor.text))
+            continue
         if ra.found or kind not in ("path", "symbol", "test"):
             continue
         if kind == "path" and ra.candidates:

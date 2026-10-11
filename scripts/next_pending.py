@@ -36,7 +36,7 @@ def parse_pending(path):
 def decided(path):
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return set()
-    with open(path, newline="", encoding="utf-8") as fh:
+    with open(path, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM ("\ufefffinding")
         return {(r.get("finding") or "").strip() for r in csv.DictReader(fh)}
 
 

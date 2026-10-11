@@ -635,6 +635,14 @@ def main(argv: list[str] | None = None) -> int:
               "no claim can be accepted", file=sys.stderr)
 
     raw = json.loads(args.claims.read_text(encoding="utf-8"))
+    # the object form ({"claims": [...]}, claim_diff's and the benches') was iterated as a dict:
+    # its keys `set`, `base_sha`, `note`, `claims` were voted on as claims, exit 0
+    if isinstance(raw, dict) and isinstance(raw.get("claims"), list):
+        raw = raw["claims"]
+    if not isinstance(raw, list) or not all(
+            isinstance(c, str) or (isinstance(c, dict) and isinstance(c.get("claim"), str)) for c in raw):
+        ap.error(f"{args.claims}: not a claims file (a list of claims, or {{\"claims\": [...]}}, "
+                 "each a string or an object with a \"claim\")")
     claims = [c if isinstance(c, dict) else {"claim": c, "truth": None} for c in raw]
     texts = [c["claim"] for c in claims]
     if args.target:

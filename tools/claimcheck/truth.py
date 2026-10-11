@@ -345,6 +345,12 @@ def _csv_text(header, rows: list) -> str:
     return buf.getvalue()
 
 
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
 def atomic_write(path: Path, text: str) -> None:
     """*text* into *path* through a temporary file in the same directory and a rename: a failure
     on the way leaves the old file as it was, and no temporary file behind."""
@@ -352,6 +358,9 @@ def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
+        # mkstemp's file is 0600, and the rename put that over a shared 644 truth.csv: other users
+        # and CI lost the scoring key. The old file's mode, else what open() would have given
+        os.chmod(tmp, path.stat().st_mode & 0o7777 if path.exists() else 0o666 & ~_umask())
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
             fh.flush()
