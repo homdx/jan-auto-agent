@@ -358,13 +358,19 @@ runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at th
   `votes_requests` (only with the vote on). Default roster by measured wrong rate:
   step-5-preview, muse-spark-1-3-contributor, nemotron-3-ultra.
 
-  Layer 2 is an operator step and was **not run**; the flag stays `off` until it is:
-  1. `main.py --validate-plan --base REPO` on one real target; keep the Architect's candidates.
-  2. `scripts/run_claim_check.sh … --truth` for the candidates the vote can settle, the rest by
-     hand from `pending.md`. Record the known-answer set in the repository with its target sha.
-  3. Gate 1 twice on the set, vote `off` and `on`; numbers to the round's `SUMMARY.md`.
-  4. Pass only if false positives let through are not more, true bugs rejected are not more,
-     and the vote decided at least a third; otherwise the flag stays `off`.
+  **Layer 2 is one command, launch and forget** (`scripts/gate1_vote_layer2.py`; the full guide is
+  `docs/claim-check/GATE1-VOTE-LAYER2.md`):
+
+  ```bash
+  python3 scripts/gate1_vote_layer2.py --detach          # off, then 3, 5, 7, 9 voters; add --sets 3,5,7,9,11 for the weak pair
+  ```
+
+  It clones the target at the recorded sha, runs `main.py --validate-plan` (the Gate 1 path `--auto` uses) once per
+  variant, scores each against the recorded answers (`contest-bench/cc/gate1_known_answers/`) and writes
+  `contest-out/gate1-layer2/<UTC>/SUMMARY.md`. Nothing to watch: `progress.log` ends with `DONE`. **Pass** (per `on`
+  variant, against `off`): false positives let through not more, true bugs rejected not more, the vote decided at
+  least a third of the candidates; otherwise `claim_vote` stays `off`. Five or more voters run with
+  `vote_accept = committed` (CC-11), three with `all`.
 
 ## When something goes wrong
 
