@@ -34,6 +34,8 @@ each a "no decision" and a line in the log. ``[gate1] claim_vote = off`` (the de
     vote_timeout_sec    = 60                     ; one HTTP request of one voter
     vote_veto_by_reader = on                     ; a unanimous FALSE also needs the reader not
                                                  ; to say confirmed
+    vote_accept         = all | committed        ; CC-11: with five or more voters, `committed`
+                                                 ; lets an abstainer stop blocking (default all)
     vote_quorum         = 3                      ; not a knob: any other value is refused (CC-10 Q5)
 """
 
@@ -76,6 +78,7 @@ class VoteConfig:
     max_per_run: int = DEFAULT_MAX_PER_RUN
     timeout_sec: float = DEFAULT_TIMEOUT_SEC
     veto_by_reader: bool = True
+    accept: str = "all"
     why: str = "claim_vote = off"
 
     @classmethod
@@ -127,10 +130,14 @@ class VoteConfig:
         if veto not in _ON | _OFF:
             logger.warning("config [gate1] vote_veto_by_reader = %r is not on/off — using on", veto)
             veto = "on"
+        accept = get("vote_accept", "all").lower()
+        if accept not in ("all", "committed"):
+            logger.warning("config [gate1] vote_accept = %r is not all/committed — using all", accept)
+            accept = "all"
         return cls(True, profiles,
                    number("vote_max_per_run", DEFAULT_MAX_PER_RUN, int, 0),
                    number("vote_timeout_sec", DEFAULT_TIMEOUT_SEC, float, 1.0),
-                   veto in _ON or veto == "", "claim_vote = on")
+                   veto in _ON or veto == "", accept, "claim_vote = on")
 
 
 @dataclass(frozen=True)
@@ -271,7 +278,8 @@ class Gate1Vote:
         self._bump("votes_requests", len(results))
         cv = self._tally_fn_module()
         row = cv.tally([{"claim": claim}], results, quorum=QUORUM,
-                       meta=[{"kind": kind, "dangling": False, "sha": pack.sha}])[0]
+                       meta=[{"kind": kind, "dangling": False, "sha": pack.sha}],
+                       accept=self.cfg.accept)[0]
         requests = len(results)
         # truth.settled: unanimous, TRUE/FALSE, and three families behind it (CC-8)
         if cc_truth.settled(row) is None:

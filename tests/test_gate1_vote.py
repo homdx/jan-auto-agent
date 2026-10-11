@@ -364,3 +364,65 @@ def test_the_fixture_chain_with_a_dead_third_voter_decides_nothing():
         cand = CandidateTask(c["id"], c["claim"], [file], "true", CitedLocation(file=file, symbol=symbol))
         assert vote.presence_by_vote(cand, PathRepoView(root)).verdict is None
         assert vote.counters["votes_overridden"] == 0
+
+
+# ── CC-11 follow-up: [gate1] vote_accept, for five or more voters ─────────────────────────────
+
+FIVE = ("kenary/step-5-preview", "kenary/muse-spark-1-3", "kenary/nemotron-3-ultra",
+        "kenary/agnes-3-0-flash", "kenary/hy3")
+
+
+def _five(*spec):
+    """Like `_voters`, for the five voters of FIVE."""
+    plan = dict(zip(FIVE, spec))
+
+    def ask(ref, items, run, seed, timeout):
+        shape, verdict = plan[ref]
+        got = cc_judge.ask_with_packs(items, run, seed, lambda p: _reply(shape, verdict, p),
+                                      batch=1, code_batch=1)
+        return {"model": ref, "run": run, "votes": got["votes"], "accepted": got["accepted"],
+                "rejected": got["rejected"]}
+
+    return ask
+
+
+def _on_five(**extra) -> configparser.ConfigParser:
+    return _config(claim_vote="on", vote_profiles=", ".join(FIVE), **extra)
+
+
+def test_two_abstainers_block_the_vote_under_the_default_rule(tmp_path):
+    filt = _filter(_on_five(), _five(("list", "TRUE"), ("list", "TRUE"), ("list", "TRUE"),
+                                     ("unsure", "TRUE"), ("unsure", "TRUE")))
+    _run(tmp_path, filt)
+    assert filt.reader_calls == 1 and filt._vote.counters["votes_decided"] == 0
+
+
+def test_two_abstainers_do_not_block_the_vote_under_committed(tmp_path):
+    filt = _filter(_on_five(vote_accept="committed"),
+                   _five(("list", "TRUE"), ("list", "TRUE"), ("list", "TRUE"),
+                         ("unsure", "TRUE"), ("dead", "TRUE")))
+    accepted, _rejected, counters = _run(tmp_path, filt)
+    assert len(accepted) == 1 and filt.reader_calls == 0
+    assert counters["votes_decided"] == 1 and counters["votes_requests"] == 5
+
+
+def test_a_dissent_among_the_committed_still_falls_back_under_committed(tmp_path):
+    filt = _filter(_on_five(vote_accept="committed"),
+                   _five(("list", "TRUE"), ("list", "TRUE"), ("list", "TRUE"),
+                         ("list", "FALSE"), ("unsure", "TRUE")))
+    _run(tmp_path, filt)
+    assert filt.reader_calls == 1 and filt._vote.counters["votes_decided"] == 0
+
+
+def test_two_committed_are_below_the_quorum_under_committed(tmp_path):
+    filt = _filter(_on_five(vote_accept="committed"),
+                   _five(("list", "TRUE"), ("list", "TRUE"), ("unsure", "TRUE"),
+                         ("unsure", "TRUE"), ("dead", "TRUE")))
+    _run(tmp_path, filt)
+    assert filt.reader_calls == 1
+
+
+def test_vote_accept_is_read_and_a_malformed_value_is_all():
+    assert gv.VoteConfig.from_config(_on_five()).accept == "all"
+    assert gv.VoteConfig.from_config(_on_five(vote_accept="committed")).accept == "committed"
+    assert gv.VoteConfig.from_config(_on_five(vote_accept="majority")).accept == "all"
