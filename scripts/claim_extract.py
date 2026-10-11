@@ -32,7 +32,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="list the sections, no network")
     args = ap.parse_args(argv)
 
-    sections = lf.split_sections(args.report.read_text(encoding="utf-8"))
+    # min_chars=0: /extract is free, and the default cut (lenz_claim_filter's, which pays per
+    # claim) dropped a short section's claims here with nothing printed
+    sections = lf.split_sections(args.report.read_text(encoding="utf-8-sig"), min_chars=0)
+    # ...but a part that is headings only (the report's `# Title`) has no claim to extract
+    sections = [s for s in sections if any(ln.strip() and not ln.lstrip().startswith("#")
+                                           for ln in s.splitlines())]
     if args.dry_run:
         for sec in sections:
             print("-", sec.splitlines()[0][:100])

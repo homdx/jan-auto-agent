@@ -28,7 +28,7 @@ def load(paths):
     for p in paths:
         name = os.path.basename(p).rsplit(".", 1)[0].lower()
         name = name[6:] if name.startswith("truth-") else name
-        with open(p, newline="", encoding="utf-8") as fh:
+        with open(p, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM: "\ufefffinding"
             rd = csv.DictReader(fh)
             if not NEEDED.issubset(set(rd.fieldnames or [])):
                 skipped.append(os.path.basename(p)); continue

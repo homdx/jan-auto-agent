@@ -198,10 +198,31 @@ def call(method: str, path: str, key: str, body: dict | None = None,
         sys.exit(f"Lenz {method} {path}: HTTP {exc.code} {exc.read()[:300]!r}")
 
 
-def split_sections(text: str) -> list[str]:
+def _heading_parts(text: str) -> list[str]:
+    """*text* cut before every ``##``/``###`` line outside a ``` / ~~~ fence: a ``## `` inside a
+    quoted shell session or a markdown sample is not a heading (it split a section in two)."""
+    parts, cur, fence = [], [], ""
+    for line in text.splitlines(keepends=True):
+        mark = re.match(r"\s*(```|~~~)", line)
+        if mark:
+            fence = "" if fence and mark.group(1) == fence else (fence or mark.group(1))
+        elif not fence and re.match(r"#{2,3} ", line) and cur:
+            parts.append("".join(cur))
+            cur = []
+        cur.append(line)
+    parts.append("".join(cur))
+    return parts
+
+
+def split_sections(text: str, min_chars: int = 120) -> list[str]:
     """Report -> sections at ##/### headings; a section keeps its own heading,
-    so /extract gets the context ("Bug 1: ...") the bare sentences lacked."""
-    parts = [p.strip() for p in re.split(r"(?m)^(?=#{2,3} )", text) if len(p.strip()) > 120]
+    so /extract gets the context ("Bug 1: ...") the bare sentences lacked.
+
+    A section of *min_chars* or fewer is left out: this script pays for /check on what it
+    sends, and CC-9's lenz_hint counts on that cut (`SECTION_MIN`). claim_extract.py passes 0:
+    a short `## Lock` section with a real claim, or a whole 79-character report, gave no claims
+    and no word of it."""
+    parts = [p.strip() for p in _heading_parts(text) if len(p.strip()) > min_chars]
     if len(parts) >= 2:
         return parts
     # no headings (a plain-text review): pack paragraphs into ~1800-char chunks
@@ -213,7 +234,7 @@ def split_sections(text: str) -> list[str]:
             cur = ""
         cur += para + "\n\n"
     chunks.append(cur.strip())
-    return [c for c in chunks if len(c) > 120]
+    return [c for c in chunks if len(c) > min_chars]
 
 
 def extract_claims(section: str, key: str, cache: Cache) -> list[str]:

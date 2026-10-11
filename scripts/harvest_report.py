@@ -48,7 +48,7 @@ def load(paths):
     for p in paths:
         base = os.path.basename(p).rsplit(".", 1)[0].lower()
         name = base.split("-", 2)[2] if base.count("-") >= 2 else base
-        with open(p, newline="", encoding="utf-8") as fh:
+        with open(p, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
             reader = csv.DictReader(fh)
             if not REQUIRED_COLS.issubset(set(reader.fieldnames or [])):
                 skipped.append(os.path.basename(p))
@@ -67,7 +67,9 @@ def load_truth(path):
     if not path:
         return {}
     out = {}
-    with open(path, newline="", encoding="utf-8") as fh:
+    # utf-8-sig: a truth.csv saved by a spreadsheet starts with a BOM; read as utf-8 every row
+    # was keyed '' and all but the last were lost without a word
+    with open(path, newline="", encoding="utf-8-sig") as fh:
         for r in csv.DictReader(fh):
             t = (r.get("truth") or "").strip().upper()
             if t in TRUTH_VALUES:

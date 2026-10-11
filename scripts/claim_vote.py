@@ -115,7 +115,7 @@ def read_ini(root: Path) -> configparser.ConfigParser:
     parser = roster._new_parser()
     for name in ("contest.ini", roster.LOCAL_FILENAME):
         if (root / name).is_file():
-            parser.read(root / name, encoding="utf-8")
+            parser.read(root / name, encoding="utf-8-sig")   # a BOM (Notepad), as roster reads it
     if not parser.has_section(SECTION):
         parser.add_section(SECTION)
     return parser
@@ -613,8 +613,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = read_ini(args.repo_root)
     get = lambda key, cast, fallback: cast(parser.get(SECTION, key, fallback=str(fallback)))  # noqa: E731
     batch = given_or(args.batch, get("batch", int, 10))
-    PACER.__init__(given_or(args.per_provider, get("per_provider", int, 2)),
-                   given_or(args.interval, get("interval_sec", float, 4.0)))
+    per_provider = given_or(args.per_provider, get("per_provider", int, 2))
+    interval = given_or(args.interval, get("interval_sec", float, 4.0))
+    # check_counts saw the options only: `batch = 0` in the ini was range()'s ValueError on the
+    # CLAIM-1 path (the --target path clamps it), per_provider = 0 a pacer nothing passes
+    for key, value, least in (("batch", batch, 1), ("per_provider", per_provider, 1),
+                              ("interval_sec", interval, 0)):
+        if value < least:
+            ap.error(f"[{SECTION}] {key} = {value:g}: must be {least} or more")
+    PACER.__init__(per_provider, interval)
     voters = (args.profiles or []) + (args.models or []) or [
         n.strip() for n in parser.get(SECTION, "llm_profiles", fallback="").split(",") if n.strip()]
     if not args.claims or not voters:
@@ -652,6 +659,13 @@ def main(argv: list[str] | None = None) -> int:
           "| models with no votes at all:", dead or "none")
     for t in table:
         print(f"[{t['verdict']:10}]{'*' if t['unanimous'] else ' '}truth={t['truth']} {t['all_votes']} {t['claim'][:90]}")
+    if claims and results and all(r.get("error") and not r["votes"] for r in results):
+        # every voter failed (a wrong key, no network, a dead endpoint): votes.json says so, and
+        # the exit says so too — it was 0, and run_claim_check.sh went on to an all-UNSURE table.
+        # A voter that answered and said nothing usable is a result, not a failed run.
+        print(f"claim_vote: no voter returned a vote ({len(results)} runs, every one an ERROR)",
+              file=sys.stderr)
+        return 1
     return 0
 
 
@@ -718,6 +732,13 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
     for t in table:
         print(f"[{t['verdict']:10}]{'*' if t['unanimous'] else ' '}{t['kind']:5} truth={t['truth']} "
               f"{t['all_votes']} {t['claim'][:90]}")
+    if claims and results and all(r.get("error") and not r["votes"] for r in results):
+        # every voter failed (a wrong key, no network, a dead endpoint): votes.json says so, and
+        # the exit says so too — it was 0, and run_claim_check.sh went on to an all-UNSURE table.
+        # A voter that answered and said nothing usable is a result, not a failed run.
+        print(f"claim_vote: no voter returned a vote ({len(results)} runs, every one an ERROR)",
+              file=sys.stderr)
+        return 1
     return 0
 
 

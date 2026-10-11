@@ -306,7 +306,10 @@ def read_truth(path: Path) -> list:
     path = Path(path)
     if not path.exists():
         return []
-    with path.open(newline="", encoding="utf-8") as fh:
+    # utf-8-sig: Excel's "CSV UTF-8" starts the file with a BOM, and the RUNBOOK has the operator
+    # settle rows here by hand; read as utf-8 the first column was "\ufefffinding", every row's
+    # finding '' — the rows lost, --append adding them again
+    with path.open(newline="", encoding="utf-8-sig") as fh:
         return list(csv.DictReader(fh))
 
 
@@ -378,7 +381,7 @@ def write_truth(path: Path, rows: list, *, append: bool = False) -> tuple:
         return [], conflicts
     header = list(TRUTH_HEADER)
     if existing:
-        with path.open(newline="", encoding="utf-8") as fh:
+        with path.open(newline="", encoding="utf-8-sig") as fh:   # the BOM, as in read_truth
             header = next(csv.reader(fh))
         header += [k for k in TRUTH_HEADER if k not in header]
     atomic_write(path, _csv_text(header, existing + add))

@@ -1109,7 +1109,9 @@ def load_roster(path, *, overlay=None, backend=None) -> ContestConfig:
 
     parser = _new_parser()
     try:
-        read = set(parser.read([str(source) for source in sources]))
+        # utf-8-sig: Notepad writes contest.local.ini with a BOM, which configparser read as
+        # "File contains no section headers" (and without an encoding, in the locale's codec)
+        read = set(parser.read([str(source) for source in sources], encoding="utf-8-sig"))
     except configparser.Error as exc:
         raise RosterError(f"{exc}") from exc
     unread = [str(source) for source in sources if str(source) not in read]
