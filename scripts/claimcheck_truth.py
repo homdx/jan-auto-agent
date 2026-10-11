@@ -55,6 +55,28 @@ def profile_models(votes: dict, repo_root: Path) -> tuple:
     return out, parser
 
 
+def shape_error(votes) -> str:
+    """Why *votes* is not a votes.json this script can read, or ``""``: claims are objects with
+    a ``claim`` text, every result row names its ``model`` and holds a ``votes`` object."""
+    if not isinstance(votes, dict):
+        return "not an object"
+    claims, results = votes.get("claims", []), votes.get("results", [])
+    if not isinstance(claims, list) or not isinstance(results, list):
+        return "`claims` and `results` must be lists"
+    for k, c in enumerate(claims):
+        if not isinstance(c, dict) or not isinstance(c.get("claim", ""), str):
+            return f"claim {k + 1} is not a claim row"
+        if not isinstance(c.get("by_model", {}), dict):
+            return f"claim {k + 1}: `by_model` is not an object"
+    for k, r in enumerate(results):
+        if not isinstance(r, dict) or not isinstance(r.get("model"), str) \
+                or not isinstance(r.get("votes", {}), dict):
+            return f"result {k + 1} has no `model` or no `votes` object"
+    if not isinstance(votes.get("target") or {}, dict):
+        return "`target` is not an object"
+    return ""
+
+
 def _shown(path: Path) -> str:
     """*path* as the operator types it from here: relative when it is under the current directory."""
     rel = os.path.relpath(path)
@@ -132,10 +154,12 @@ def main(argv: "list[str] | None" = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"claimcheck_truth: {args.votes}: {exc}", file=sys.stderr)
         return 2
-    if isinstance(votes, list):          # an empty or bare list: no claims
+    if isinstance(votes, list):          # an empty or bare list of claim rows: no results
         votes = {"claims": votes, "results": []}
-    if not isinstance(votes, dict) or not isinstance(votes.get("claims", []), list):
-        print(f"claimcheck_truth: {args.votes}: not a claim_vote.py votes.json", file=sys.stderr)
+    why = shape_error(votes)
+    if why:
+        # the extractor's claims.json (a list of strings) passed by mistake was an AttributeError traceback
+        print(f"claimcheck_truth: {args.votes}: not a claim_vote.py votes.json ({why})", file=sys.stderr)
         return 2
     models, parser = profile_models(votes, args.repo_root)
     target = votes.get("target") or {}

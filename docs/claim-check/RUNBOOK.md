@@ -165,9 +165,11 @@ python3 scripts/claimcheck_truth.py votes.json --out validate1/truth.csv --pendi
 `--target REPO`, `--ref REF`, `--base REF` and `--fetch` go to `claim_vote.py` as they are
 (stage 2 on the evidence, above). `--truth FILE` runs `scripts/claimcheck_truth.py` at the end:
 a bare name lands in `claim-check-out/<UTC>/` next to `votes.json`, and so does `pending.md`.
-`--dry-run` prints the three commands and exits 0, with no network and nothing written. The
-script takes both out of the options before `claim_vote.py` sees them. With neither option it
-runs as it always did.
+An existing FILE is appended to (`--append`: hand-checked rows stay, a disagreeing row is a
+conflict, exit 3); `--force` replaces it. `--dry-run` prints the three commands and exits 0,
+with no network and nothing written. The script takes these out of the options before
+`claim_vote.py` sees them. A failed vote (a refused `--target`, a crash) ends the script with
+the vote's exit code and no truth step.
 
 **The acceptance rule, restated.** A claim gets a `truth.csv` row only when it is settled:
 `unanimous` is true and the verdict is `TRUE` (written `REAL`) or `FALSE`. A `verdict: TRUE`

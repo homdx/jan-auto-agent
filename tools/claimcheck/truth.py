@@ -340,7 +340,8 @@ def write_truth(path: Path, rows: list, *, append: bool = False) -> tuple:
     """Write *rows* to the truth CSV at *path*; (rows written, conflicts). Without *append* the
     file is replaced by `TRUTH_HEADER` and *rows*. With it the existing rows stay (their own
     columns kept, a missing one of ours added empty) and only `merge_rows`'s additions follow;
-    nothing is written when there is nothing to add."""
+    an existing file is not touched when there is nothing to add, a missing one is created with
+    the header (the operator then finds the file the run names, empty, not a missing path)."""
     path = Path(path)
     if not append:
         atomic_write(path, _csv_text(TRUTH_HEADER, rows))
