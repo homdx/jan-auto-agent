@@ -1,12 +1,12 @@
 # CC-10 — claim check in Gate 1: three voters with the code and a quote, instead of one reader
 
-**Status:** DRAFT 2 — completed with the live numbers of round 280 (below). What is still missing before it is cut into `epic-tasks/`: a recorded set of Architect candidates with a known answer, to measure Gate 1 itself (the acceptance section). Do not copy it into `epic-tasks/` as it stands.
+**Status:** FINAL — ready to be cut into `epic-tasks/` once CC-8 (290) has landed; the numbers below are from live runs of rounds 280 and 285 plus the sensenova run of round 290's session. The one thing the code cannot give is the recorded Architect candidates: the operator step in Acceptance records them.
 **Severity:** MEDIUM (it is the first place where the epic's tool feeds `--auto` directly)
 **File:** `tools/auto/gate1_filter.py`
 **Symbol:** `Gate1Filter._check_presence` (Stage B), a new `tools/auto/gate1_vote.py`
 **Round:** —
 **Size:** M
-**Depends on:** CC-6 (voting with quotes, landed), CC-8 (one command, `truth.csv`)
+**Depends on:** CC-6 (voting with quotes, landed), CC-7 (before/after, landed), CC-8 (290: one command, `truth.csv`, `pending.md` — the operator step records its Architect candidates through it, so CC-8 lands first)
 **Also touches:** `contest.ini` / `agents.ini` (`[gate1]`), `tests/test_gate1_vote.py`, `docs/claim-check/RUNBOOK.md`
 
 ---
@@ -48,34 +48,49 @@ Stage B asks "is the problem described in this task present in this code?" That 
 the quote; a split falls back to the single reader; a fabricated quote is downgraded and falls back; `off`
 changes nothing (the existing Gate 1 tests stay green unchanged); a voter that raises is a result, not a crash.
 
-## Acceptance (to be written after the live run)
+## Acceptance (two layers)
 
-* Offline: the fake-voter chain over the fixture's "task" claims.
-* Live, the operator: a recorded set of Architect candidates with a known answer (true bug / false positive)
-  through Gate 1 with the vote off and on: false positives let through, true bugs rejected, time per
-  candidate. Numbers go to the round's `SUMMARY.md`.
+**Layer 1 — offline, in the round (no network, no key).**
+* `tests/test_gate1_vote.py` as in Tests above, with fake voters that answer in the **real reply shapes** (a quote over
+  two lines, separate JSON objects, a dead voter) — not only a clean JSON.
+* The fake-voter chain over the fixture (`contest-bench/cc/claims_fixture.json`): with the fixture's code claims as
+  "tasks", unanimous verdicts of three fake pack-readers give 0 wrong; a dead third voter gives no decision and the
+  single reader answers (counter `votes_overridden` stays 0).
+* The existing Gate 1 tests stay green **unchanged** with `claim_vote = off`; with it on and no voters configured the
+  result is byte for byte the single reader's.
+* Numbers the round reports: `votes_asked`, `votes_decided`, `votes_overridden`, requests per candidate (3), 0 crashes.
 
-## Open questions (to settle with the live numbers)
+**Layer 2 — the operator, live (a step in `docs/claim-check/RUNBOOK.md`, not part of the round).**
+1. Run `main.py --dry-run` / `--auto` planning on one real target and keep the Architect's candidates (the
+   `--validate-plan` path writes them without executing).
+2. Settle the answer for each candidate by hand: true bug / false positive. `scripts/run_claim_check.sh --truth`
+   (CC-8) writes `truth.csv` and a `pending.md` for the ones the vote cannot settle; the operator fills those.
+   The set is then recorded in the repository with its target sha (a known-answer set, like the CC-0 fixture).
+3. Run Gate 1 twice on the set, `claim_vote = off` and `on`: false positives let through, true bugs rejected,
+   seconds per candidate, requests per candidate. Numbers go to the round's `SUMMARY.md`.
+4. Pass: with the vote on, false positives let through are not more, true bugs rejected are not more, and the
+   vote decided at least a third of the candidates; otherwise the flag stays `off`.
 
-1. Which three voters, and the rate limit they can take: Gate 1 can ask hundreds of times a run (834 live
-   Stage-B calls were counted once), each of them now three requests. Is it a shortcut for the candidates
-   where the single reader and the vote disagree, or for all?
-2. Is a unanimous `FALSE` enough to reject, or must the single reader agree (a rejected true bug costs more
-   than a let-through false one)?
-3. The pack's size for a task: the cited block alone, or with its callers and the git history?
-4. Round-trip time: three voters in parallel are as slow as the slowest; a timeout falls back, never blocks.
+## Questions, answered
 
-5. **Only one model is ever available (the question that came with the draft).** Today
-   `claim_vote.py` refuses: with fewer than `MIN_COMMITTED = 3` voters it prints "quorum is 3: no claim
-   can be accepted". A **single-voter mode** (`[gate1] vote_quorum = 1`, never the default) would accept a
-   verdict when that one model commits, its quote is verified by code, and it gives the same verdict in
-   every one of N runs (the prompt varies per run). It is a weaker guarantee than three families, and the
-   draft must say so in the output (`quorum=1`, which model). Live numbers from round 280 run A, each
-   model alone, counting only votes that passed the quote check: hy3 76 right of 76 decided (fixture),
-   21 of 21 (real); nemotron-3-ultra 70 of 70, 22 of 22; **deepseek-v4-flash 65 of 69 and 12 of 13**
-   (4 + 1 wrong). So one good model with the quote check is already strong, and one bad one is not:
-   the roster for a single-voter mode is chosen by measured wrong rate, not by availability. To be
-   re-measured with `RUNS=3` before this ticket is cut.
+1. **Which voters, and the rate limit.** By measured wrong rate over the 150 fixture claims (70 base + 80 head), two live
+   runs (table below). Default `vote_profiles`: **mimo-v2-6-flash, muse-spark-1-3-contributor, nemotron-3-ultra** (kenary,
+   three families, 129 of 150 settled, 0 wrong). Spare: agnes-3-0-flash, step-5-preview, hy3. Excluded: laguna-s-2-1 (8 wrong of
+   136) and deepseek-v4-flash (4 + 1 wrong); sensenova-6.8-flash-lite is allowed but not a default (6 wrong of 129 alone, and its
+   rate limit, below). The vote is a shortcut for **every** candidate that reaches Stage B, but it is capped: `[gate1]
+   vote_max_per_run` (default 200 candidates) and a per-provider limit through the `claim_vote` throttle, so a run of hundreds of
+   candidates is three requests each at the voters' pace, never a flood; past the cap the single reader answers as today.
+2. **Is a unanimous `FALSE` enough to reject.** Not alone in the first version: reject on unanimous `FALSE` of three families
+   **and** the single reader not saying `confirmed` (`vote_veto_by_reader = on`). A unanimous `TRUE` confirms. Relax the veto only
+   with the measured set of layer 2.
+3. **The pack for a task.** The cited block (CC-5 pack of the symbol), plus its git header chunk; no callers in the first
+   version. A bigger pack is a later measured change.
+4. **Round-trip time.** Voters run in parallel; each has a timeout (`vote_timeout_sec`, default 60); a timeout or error is a
+   missing vote, so the candidate falls back to the single reader and nothing blocks.
+5. **Only one model.** `vote_quorum = 1` is never the default and not in this ticket's acceptance. If an operator sets it, the
+   output says `quorum=1` and the model, and it accepts a verdict only with a code-verified quote and the same verdict in every
+   one of N runs. The roster for it is by measured wrong rate: hy3 0 of 128, muse-spark 0 of 130, north-mini-code 0 of 93 qualify;
+   laguna 8 of 136, sensenova-6.8 6 of 129, agnes-2-5 5 of 128 do not.
 
 ## Live numbers (round 280, free models, real runs; the voting of CC-6 on the CC-0 bench)
 
@@ -95,6 +110,28 @@ and 20 of 21; nemotron-3-ultra 68 of 68 and 21 of 21; dots-3-note 78 of 79 and 1
 weakest single voters were wrong on 5 to 7 % of theirs: **the unanimity rule, not any one model, is what
 makes the vote safe.** Cost: a code claim is 0.5 request per voter (two to a request); a Gate 1 candidate is
 one claim, so `code_batch = 1` there and a candidate costs three requests.
+
+### Best voter sets by size (rounds 280 + 285 + the sensenova run)
+
+Eleven voters, 150 claims (fixture base 70 + head 80, truth from `truth_base`/`truth_head`), one run each, settled = every
+voter committed with a quote the code verified and all agree. Searched over all sets of that size.
+
+| size | best set | settled / wrong | best set with sensenova-6.8 | settled / wrong |
+|---|---|---|---|---|
+| 3 | mimo-v2-6-flash, muse-spark-1-3, nemotron-3-ultra | 129 / 0 | mimo, muse-spark, sensenova-6.8 | 118 / 0 |
+| 5 | + agnes-3-0-flash, step-5-preview | 125 / 0 | agnes-3, mimo, muse-spark, nemotron-ultra, sensenova | 116 / 0 |
+| 7 | agnes-3, hy3, mimo, muse-spark, nemotron-super, nemotron-ultra, step-5 | 115 / 0 | agnes-3, laguna, mimo, muse-spark, nemotron-ultra, sensenova, step-5 | 111 / 0 |
+| 9 | agnes-2-5, agnes-3, laguna, mimo, muse-spark, nemotron-super, nemotron-ultra, sensenova, step-5 | 103 / 0 | (same) | 103 / 0 |
+
+More voters settle fewer (129 → 125 → 115 → 103) and are no safer: the best three are already at 0 wrong. **Three is the
+minimum that the quorum allows and the best value; five buys nothing measured; seven and nine only cost requests.** Per voter
+alone, wrong of decided: hy3 0/128, muse-spark 0/130, north-mini-code 0/93, agnes-3 2/135, mimo 2/134, nemotron-super 2/135,
+nemotron-ultra 2/138, step-5 2/135, agnes-2-5 5/128, sensenova-6.8 6/129, laguna 8/136.
+
+**Sensenova in the vote (token.sensenova.ai, free).** The run asked 219 requests (sensenova-6.8: 73, 6.7: 73, nemotron-ultra the
+rest) and met **79 HTTP 429 "rpm exhausted"** (4 of them ran out all 5 retries at 15 s). 6.8 still decided 129 of 150 claims; **6.7
+decided none** (every request ended in 429 or error) and counts as a dead voter. So sensenova works as one voter of three, slowly,
+and not as three: a Gate 1 run of hundreds of candidates would sit in its rate limit. It is the reason for the cap in answer 1.
 
 What the runs found that fake voters did not (all fixed in CC-6): a quote copied over two code lines carries
 a raw newline; a reply of separate JSON objects without a list; a dead voter counted in the unanimity.
