@@ -1,6 +1,6 @@
 # CC-8 — into the pipeline: `truth.csv`, the pending list, and one command
 
-**Status:** open
+**Status:** landed (`CC-8 (290): into the pipeline …`, judged in contest-bench/290/: black box 21/21)
 **Severity:** MEDIUM (without it the result stays a table nobody feeds forward)
 **File:** `tools/claimcheck/truth.py`
 **Symbol:** `to_truth_rows`, `finding_key`, `pending_markdown`, `write_truth`
@@ -119,7 +119,8 @@ Everything here was read from a real `votes.json` of round 280's live runs and f
   `truth`, keeps rows whose value is in `TRUTH_VALUES`, and keys the dict by `finding`. `REAL` and
   `FALSE` are the two values this ticket writes.
 * **Voters' families.** The refs in `by_model` are `provider/model[:free]`. `checked_by` names the
-  *family*: the model part after the last `/`, `:free` removed, cut at the first `-`
+  *family*: the model part after the last `/`, `:free` removed, cut at the first `-`, a trailing
+  version dropped (review of cc-epic-docs: `qwen3` = `qwen-2.5`; `hy3` → `hy`)
   (`kenary/agnes-3-0-flash:free` → `agnes`, `kenary/hy3:free` → `hy3`, `tokenharbor/deepseek-v4-flash:free`
   → `deepseek`, `kenary/nemotron-3-ultra-550b-a55b:free` → `nemotron`, `sensenova123/sensenova-6.8-flash-lite`
   → `sensenova`). A test pins the table, and `claimcheck:agnes+hy3+nemotron@d36d59e` is the form.

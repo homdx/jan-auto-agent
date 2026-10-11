@@ -111,6 +111,11 @@ defaults above when absent).
 
 ## Acceptance (the operator's bench, `contest-bench/275/acceptance_275.py`)
 
+*Not in the tree:* the round's bench was written by var1 and imported var1's internals
+(`MIN_QUOTE_CHARS`, `_quoteable`), so it could not run on another entry and was not kept
+(`GROUND-competition.md`, round 275); the chain it measured is covered by
+`contest-bench/280/acceptance_280.py`, which builds every pack through `prepare_target`.
+
 The whole chain **minus the model**, on the fixture's 50 code claims and the 30 real ones:
 the pack's `truncated` rate is reported; the **deciding lines survive the trim** in ≥ 90 % of
 the fixture claims (the same measure as CC-3, after ranking and the budget); the median

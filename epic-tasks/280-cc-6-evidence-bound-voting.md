@@ -119,7 +119,8 @@ world claims ten); `test_report_sha_mismatch_is_printed`.
    caught by the quote check on ≥ 95 % of its code verdicts.
 2. **Live (the operator, not pytest):** `run_cc.sh --target` with three voters of three
    families over the fixture and over the 30 real claims; the table is compared with
-   `BASELINE.md` and with the targets of `EPIC-CC.md` §6.2. The numbers are recorded in the
+   `BASELINE.md` and with the targets of `EPIC-CC.md` §6.2 (`run_cc.sh --target` checks them:
+   `score_cc.py --thresholds`, a MISS is exit 1). The numbers are recorded in the
    round's `SUMMARY.md`; a missed target opens a fix ticket in the 281–284 gap.
 
 ## Edge cases to handle

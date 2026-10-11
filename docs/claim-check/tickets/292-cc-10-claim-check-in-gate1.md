@@ -1,6 +1,6 @@
 # CC-10 — claim check in Gate 1: three voters with the code and a quote, instead of one reader
 
-**Status:** FINAL — ready to be cut into `epic-tasks/` once CC-8 (290) has landed; the numbers below are from live runs of rounds 280 and 285 plus the sensenova run of round 290's session. The one thing the code cannot give is the recorded Architect candidates: the operator step in Acceptance records them.
+**Status:** FINAL, open — CC-8 (290) has landed, so it can be cut into `epic-tasks/`; the numbers below are from live runs of rounds 280 and 285 plus the sensenova run of round 290's session. The one thing the code cannot give is the recorded Architect candidates: the operator step in Acceptance records them.
 **Severity:** MEDIUM (it is the first place where the epic's tool feeds `--auto` directly)
 **File:** `tools/auto/gate1_filter.py`
 **Symbol:** `Gate1Filter._check_presence` (Stage B), a new `tools/auto/gate1_vote.py`

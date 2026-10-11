@@ -1,12 +1,13 @@
 # EPIC CC — claim check with evidence: models judge claims about our code with the code in front of them
 
-**Status:** draft (not started; to be cut after `arena` is merged into `main`)
+**Status:** in progress — CC-0 … CC-9 (250 … 291) landed; CC-10 (292) written, not run; the
+review of the branch (five reports) landed as ten "CC review fixes N/10" commits, not tickets
 **Base:** `main` after the open `arena` tickets and their bugs have landed
-**Branch:** `cc`, cut from that `main`
-**Tickets:** CC-0 … CC-8, numbered **250 … 290 in steps of five** (§9). The four numbers
-after each ticket are reserved for the fixes that real rounds will turn up; 291 … 299
-are reserved for the epic's own close-out. Each ticket is written in full under
-`docs/claim-check/tickets/` and is copied into `epic-tasks/` (with `arena issue create
+**Branch:** `cc-epic-docs` (the sketch said `cc`)
+**Tickets:** CC-0 … CC-8, numbered **250 … 290 in steps of five**, then CC-9 = 291 and
+CC-10 = 292 (§9). The four numbers after each ticket are reserved for the fixes that real
+rounds will turn up; 293 … 299 are left for the epic's own close-out. Each ticket is
+written in full under `docs/claim-check/tickets/` and is copied into `epic-tasks/` (with `arena issue create
 --number NNN`) when its turn comes — not before: `run` refuses untracked files in
 `epic-tasks/`.
 **Predecessor:** commit `03a77c5` (`CLAIM-1`): `scripts/claim_extract.py`,
@@ -225,7 +226,7 @@ prefix normalisation, is not a substring of that chunk. A world claim needs neit
 | 291 | CC-9 | A Lenz comparison hint: the commands and the cost printed after a run, never run (`/extract` free 1000 a day; `/assess` 1 credit, `/verify` 10, from 100 a month + 400) | S | CC-6, CC-8 | contest | 6 |
 | 292 | CC-10 | Claim check in Gate 1 — three voters with the code and a quote instead of one reader, behind `[gate1] claim_vote = off` | M | CC-6, CC-7, CC-8 | contest | 7 |
 
-Why eight contest tickets and not five: an earlier sketch folded CC-3/CC-4 pack assembly
+Why ten contest tickets (CC-1 … CC-10) and not five: an earlier sketch folded CC-3/CC-4 pack assembly
 and the voter changes into one ticket. A round gives one agent one session; an L ticket
 that mixes a deterministic assembler with a prompt and a parser is a ticket where the
 winner is whoever guessed the interface. Splitting at the `Chunk`/`Pack` types gives each
@@ -262,9 +263,10 @@ gap numbers.
 
 ```
 CC-0 ──┬─ CC-1 ──┬─ CC-3 ──┐
-       │         └─ CC-4 ──┴─ CC-5 ── CC-6 ──┬─ CC-7
-       └─ CC-2 ──────────────────────────────┤
-                                              └─ CC-8
+       │         └─ CC-4 ──┴─ CC-5 ── CC-6 ──┬─ CC-7 ───────────┐
+       └─ CC-2 ──────────────────────────────┤                  ├─ CC-10
+                                              └─ CC-8 ──┬─ CC-9  │
+                                                        └────────┘
 ```
 
 Pairs that run at the same time, and why they cannot collide:
@@ -276,7 +278,8 @@ Pairs that run at the same time, and why they cannot collide:
 | CC-7 ∥ CC-8 | `compare.py`, `claim_diff.py`, `BEFORE-AFTER.md` / `truth.py`, `claimcheck_truth.py`, `run_claim_check.sh` | `RUNBOOK.md`: only CC-8 edits it; CC-7 writes its own page |
 
 Everything else is sequential: CC-5 needs both evidence providers, CC-6 needs the pack
-and the target, CC-7/CC-8 need the voter. Five contest waves after CC-0. If the MVP is
+and the target, CC-7/CC-8 need the voter, CC-9 the pending list, CC-10 all three. Seven
+contest waves after CC-0. If the MVP is
 enough, stop after CC-6.
 
 ## 8. Testing strategy
@@ -299,10 +302,13 @@ enough, stop after CC-6.
 
 ## 9. Numbering and the gaps
 
-* The epic owns **250–299**. Tickets sit at multiples of five: 250, 255, … 290.
+* The epic owns **250–299**. Tickets sit at multiples of five: 250, 255, … 290; CC-9 and
+  CC-10, added after the sketch, took 291 and 292.
 * A fix found by round N is numbered N+1 … N+4 (a bug found while judging round 275 is
-  276; the fourth is 279). The fifth bug at one ticket takes 291–299 or opens a new block.
-* 291 … 299: close-out tickets of the epic (docs sync, the ideal-merge, the final bench run).
+  276; the fourth is 279). The fifth bug at one ticket opens a new block (300 and up).
+* 293 … 299: close-out tickets of the epic (docs sync, the ideal-merge, the final bench run).
+* The review of the branch (five reports, ten Haiku-written tickets 300–345 that were never
+  committed) landed directly as the ten "CC review fixes N/10" commits.
 * `arena issue create --number NNN` fixes the number. Without it `next_number` returns
   max + 1, which after 290 exists is 291+: unrelated tickets created in the meantime should
   pass `--number` 300 or higher, or accept that they take a reserved number.
@@ -373,3 +379,5 @@ Result of the re-check, on `main` at `d7ff804` (arena merged), 2026-10-09:
 | 280 | `docs/claim-check/tickets/280-cc-6-evidence-bound-voting.md` |
 | 285 | `docs/claim-check/tickets/285-cc-7-before-after.md` |
 | 290 | `docs/claim-check/tickets/290-cc-8-into-the-pipeline.md` |
+| 291 | `docs/claim-check/tickets/291-cc-9-lenz-comparison-hint.md` |
+| 292 | `docs/claim-check/tickets/292-cc-10-claim-check-in-gate1.md` |
