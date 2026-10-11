@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -164,32 +165,77 @@ _FULL_HEX = re.compile(r"^[0-9a-fA-F]{7,40}$")
 # ── a lock that two processes (or threads) can share: mkdir is atomic ─────────
 
 class _Lock:
-    STALE = 600.0   # seconds: a lock older than this was left by a process that died
+    STALE = 600.0   # seconds: a lock older than this, with no live owner on record, was left by a crash
 
     def __init__(self, path: Path, wait: float = 300.0) -> None:
         self.path, self.wait = path, wait
+        self.token = f"{os.getpid()}-{uuid.uuid4().hex}"
 
     def __enter__(self):
         deadline = time.monotonic() + self.wait
         while True:
             try:
                 self.path.mkdir()
-                return self
             except FileExistsError:
-                try:
-                    if time.time() - self.path.stat().st_mtime > self.STALE:
-                        shutil.rmtree(self.path, ignore_errors=True)
-                        continue
-                except OSError:
+                if self._stale():
+                    self._break()
                     continue
                 if time.monotonic() > deadline:
                     raise TargetError(f"lock {self.path}: held for more than {int(self.wait)} s")
                 time.sleep(0.05)
+                continue
             except OSError as err:
                 raise TargetError(f"lock {self.path}: {err.strerror or err}") from err
+            try:
+                (self.path / "owner").write_text(self.token, encoding="utf-8")
+            except OSError:
+                pass
+            return self
+
+    def _stale(self) -> bool:
+        """A lock is broken only when its owner is gone: a live owner on this host keeps it
+        however long it takes (a clone past STALE was broken and its .tmp deleted under it);
+        a lock with no owner on record falls back to its age."""
+        try:
+            owner = (self.path / "owner").read_text(encoding="utf-8")
+            return not _pid_alive(int(owner.split("-", 1)[0]))
+        except (OSError, ValueError):
+            pass
+        try:
+            return time.time() - self.path.stat().st_mtime > self.STALE
+        except OSError:
+            return False
+
+    def _break(self) -> None:
+        # renamed aside first: two waiters that both see it stale do not delete each other's new lock
+        aside = self.path.with_name(f"{self.path.name}.stale-{uuid.uuid4().hex[:8]}")
+        try:
+            self.path.rename(aside)
+        except OSError:
+            return
+        shutil.rmtree(aside, ignore_errors=True)
 
     def __exit__(self, *exc) -> None:
-        shutil.rmtree(self.path, ignore_errors=True)
+        try:
+            mine = (self.path / "owner").read_text(encoding="utf-8") == self.token
+        except OSError:
+            mine = False
+        if mine:   # a lock broken and taken over by another process is not ours to remove
+            shutil.rmtree(self.path, ignore_errors=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 # ── the view ──────────────────────────────────────────────────────────────────
@@ -253,6 +299,7 @@ class Target:
         self.warnings = warnings
         self._git_dir = git_dir      # the repository the worktree hangs off
         self._created = created      # this open made the tree (a reused one is left alone)
+        self._token: Optional[Path] = None   # this open's entry in <sha>/users (see close)
         self._closed = False
         self._models: dict = {}
 
@@ -314,8 +361,17 @@ class Target:
                 tree.parent.mkdir(parents=True, exist_ok=True)
                 _git(git_dir, "worktree", "add", "--detach", "--force", str(tree), sha)
                 created = True
-        return cls(repo=repo_s, ref=ref, sha=sha, tree=tree, scratch=scratch,
-                   git_dir=git_dir, created=created, warnings=warnings)
+            # every open of this tree is on record, so a close never removes it under another
+            # user (two opens of one sha share the tree; the first close deleted it and the
+            # other's anchors resolved as not found: code claims judged as world claims)
+            users = tree.parent / "users"
+            users.mkdir(exist_ok=True)
+            token = users / f"{os.getpid()}-{uuid.uuid4().hex}"
+            token.touch()
+        target = cls(repo=repo_s, ref=ref, sha=sha, tree=tree, scratch=scratch,
+                     git_dir=git_dir, created=created, warnings=warnings)
+        target._token = token
+        return target
 
     @staticmethod
     def _ref_is_sha(ref: str) -> bool:
@@ -351,7 +407,10 @@ class Target:
             raise TargetError(f"ref `{ref}`: a sha shorter than 7 characters is ambiguous, give 7 or more")
         candidates = [ref]
         if not cls._ref_is_sha(ref):
-            candidates.append(f"origin/{ref}")   # a clone has the branches as remotes only
+            # a clone has the branches as remotes; its local `main` is the one clone made and a
+            # fetch never moves it, so a URL target asks origin/<ref> first (--ref main --fetch
+            # resolved the old commit)
+            candidates.insert(0 if is_url else 1, f"origin/{ref}")
         last = ""
         for cand in candidates:
             proc = _run_git(git_dir, "rev-parse", "--verify", f"{cand}^{{commit}}")
@@ -396,7 +455,11 @@ class Target:
     # view ------------------------------------------------------------------
 
     def view(self) -> PathRepoView:
-        """A read-only `RepoView` over the tree; `git(...)` is the allow-listed subset."""
+        """A read-only `RepoView` over the tree; `git(...)` is the allow-listed subset. A tree
+        that is gone is a `TargetError`, never a view that finds nothing (empty evidence would
+        turn every code claim into a world claim)."""
+        if not self.tree.is_dir():
+            raise TargetError(f"worktree {self.tree} is gone (removed while this target was open)")
         return _TargetView(self.tree)
 
     # collect ---------------------------------------------------------------
@@ -445,16 +508,32 @@ class Target:
     # close -----------------------------------------------------------------
 
     def close(self, remove: bool = False) -> None:
-        """Remove the worktree this target made (a reused one only with `remove=True`)."""
+        """Remove the worktree this target made (a reused one only with `remove=True`), once no
+        other open of it is still in use: then the last one to close removes it."""
         if self._closed and not remove:
             return
-        if self._created or remove:
+        self._closed = True
+        users = self.tree.parent / "users"
+        marker = self.tree.parent / ".remove-when-free"
+        with _Lock(self.tree.parent.parent / ".lock"):
+            if self._token is not None:
+                self._token.unlink(missing_ok=True)
+                self._token = None
+            others = [u for u in users.glob("*") if _pid_alive(int(u.name.split("-", 1)[0]))] \
+                if users.is_dir() else []
+            wanted = self._created or remove or marker.exists()
+            if not wanted:
+                return
+            if others:
+                marker.touch()     # the last user removes it
+                return
             self._remove_tree(self._git_dir, self.tree)
+            shutil.rmtree(users, ignore_errors=True)
+            marker.unlink(missing_ok=True)
             try:
                 self.tree.parent.rmdir()   # the <sha> folder, when nothing else is in it
             except OSError:
                 pass
-        self._closed = True
 
 
 #: seconds the collect of one tree may take before the target goes on without a model.

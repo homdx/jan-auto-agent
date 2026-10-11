@@ -339,6 +339,9 @@ def test_close_removes_what_it_made(repo, tmp_path):
     reused.close()
     assert made.tree.exists()                       # a reused tree stays
     reused.close(remove=True)
+    assert made.tree.exists()                       # not under a user that still has it open
+    assert made.view().read("a.py")
+    made.close()                                    # the last one out removes it
     assert not made.tree.exists()
     assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
