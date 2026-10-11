@@ -1,6 +1,6 @@
 # EPIC CC — claim check with evidence: models judge claims about our code with the code in front of them
 
-**Status:** in progress — CC-0 … CC-9 (250 … 291) landed; CC-10 (292) and CC-11 (293) written, not run; the
+**Status:** in progress — CC-0 … CC-9 (250 … 291) and CC-11 (293) landed; CC-10 (292) written, not run; the
 review of the branch (five reports) landed as ten "CC review fixes N/10" commits, not tickets
 **Base:** `main` after the open `arena` tickets and their bugs have landed
 **Branch:** `cc-epic-docs` (the sketch said `cc`)
@@ -75,7 +75,9 @@ acceptance (§6) is measured, not asserted.
    the report's own sha (`origin/kc @ afa53f1`) is compared with it and warned about.
 6. **Unanimity, as in `CLAIM-1`.** Accept a verdict only when every voter committed to
    it, at least three voters, at least three families (two models of one family are one
-   family). Majorities are reported, never accepted.
+   family). Majorities are reported, never accepted. CC-11 (293) adds `--accept committed`:
+   a voter that abstained on a claim (UNSURE, no vote, a rejected quote) no longer blocks it,
+   three committed voters that agree are enough; a dissent still blocks. The default stays `all`.
 7. **No credit is spent.** Nothing here calls Lenz `/assess` or `/verify`. `/extract` is
    free and cached.
 8. **Old commands keep working.** `scripts/claim_extract.py`, `claim_vote.py` and

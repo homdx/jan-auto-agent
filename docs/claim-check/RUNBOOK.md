@@ -130,7 +130,8 @@ A model's own verdict is its **strict** plurality across runs: if the runs tie
 self-contradicting model is visible rather than masked by the first run's
 insertion order.  A voter with no vote on a particular claim — silent, lost
 batch, or unreadable reply — counts against unanimity; the rule is "every
-voter", not "every voter that happened to answer".
+voter", not "every voter that happened to answer". That is `--accept all`, the default;
+`--accept committed` (CC-11, below under "Voters") lets such a voter abstain without blocking.
 
 ## Rules that keep it honest
 
@@ -190,9 +191,11 @@ The columns are `finding,truth,checked_by,duplicate_of,how`:
   path. Without a target it is the path inside the first cited chunk id, else
   `claim:<sha1[:8]>`.
 * `checked_by` is `claimcheck:<families>@<sha7>`, with `@<base7>..<head7>` when the votes had
-  `--base`.
+  `--base`. Under `--accept committed` the families are those that committed on that claim.
 * `how` is the cited chunk ids plus the first quote, at most 160 characters; it is
-  `world fact` for a world claim.
+  `world fact` for a world claim. Under `--accept committed` it starts with
+  `<n> of <m> voters committed; `, so a row that stood over abstainers says so; `pending.md`
+  names a pending claim's abstainers (`abstained:`).
 
 `votes.json` holds no pack and no resolved anchors, so the script rebuilds both at the recorded
 sha. It opens a read-only worktree of exactly that commit under `--scratch`, with no model and
@@ -226,9 +229,10 @@ check is `python3 contest-bench/290/acceptance_290.py`.
 
 By measured wrong rate over the 150 fixture claims (70 at base, 80 at head), two live runs
 (`tickets/292-cc-10-claim-check-in-gate1.md` has the table). A claim is settled only when
-every voter committed with a quote the code verified and all agree, so **more voters settle
-fewer claims and are no safer**: 129 of 150 settled with 3, 125 with 5, 115 with 7, 103 with 9,
-0 wrong in each.
+every voter committed with a quote the code verified and all agree (`--accept all`, the default),
+so **more voters settle fewer claims and are no safer**: 129 of 150 settled with 3, 125 with 5,
+115 with 7, 103 with 9, 0 wrong in each. With five voters or more run `--accept committed` (CC-11):
+at least three committed and every committed voter agrees, an abstainer does not block.
 
 * Default three (three families, all on kenary): `mimo-v2-6-flash`, `muse-spark-1-3-contributor`,
   `nemotron-3-ultra`. Spares: `agnes-3-0-flash`, `step-5-preview`, `hy3`.
@@ -263,11 +267,21 @@ fewer claims and are no safer**: 129 of 150 settled with 3, 125 with 5, 115 with
   `FIXED` 18 of 20, `STILL` 10 of 10, `NEW` 2 of 2, `GONE` 2 of 2 in `claim_diff.py`: the best
   table of all the runs. It costs 5 × 3 = 15 voter runs, about 1000 requests: two hours at kenary's
   pace, so it is the setting for a decision, not for every round.
-* More voters in a single run under the *current* rule (every voter that voted at all must commit,
+* More voters in a single run under `--accept all` (every voter that voted at all must commit,
   all to one verdict) only lose claims: five good voters settle 93 to 132 of 150, three settle 98 to
-  140. Five or seven good voters settle **146 of 150** with 0 wrong if the rule were "at least three
-  committed and every committed voter agrees" (a voter that said `UNSURE` or died does not block);
-  that is not what `claim_vote.py` does today, see "Planned" (CC-11) below.
+  140. Five or seven good voters settle **146 of 150** with 0 wrong under `--accept committed`
+  ("at least three committed and every committed voter agrees"; a voter that said `UNSURE` or died
+  does not block), replayed offline by `python3 contest-bench/cc/replay_rules.py`.
+* **Which rule (CC-11).** `--accept all|committed` on `claim_vote.py`, `claim_diff.py` (both sides,
+  one rule) and through `run_claim_check.sh`; `[claim_vote] accept` in the ini, the option wins; a
+  value other than the two is one line and exit 2. Three voters need nothing (the two rules are the
+  same when everyone commits). Five or more from the roster: `--accept committed`. Mixed with weak
+  voters it is safe at seven (0 of 6435 sets wrong) and not at five (12 of 3003 sets settled a wrong
+  claim), so a five is taken from the roster only. Under `committed` a row lists `abstained`,
+  `votes.json` (and `delta.json`) record `"accept"`, and a `truth.csv` row says how it stood:
+  `how` starts with `3 of 5 voters committed; `, `checked_by` names the families that committed on
+  that claim. Families stay required: three committed voters of one family are no row.
+  The default flips to `committed` only after CC-10's Gate 1 set shows no more wrong with it.
 * Quorum is 3. `quorum=1` is never a default; with it set the output says so.
 * Before a round, `python3 scripts/py_model_test.py MODEL…` or `arena model test` shows which
   of the roster still answers; a profile whose model is gone shows as `votes=0/N` in `vote.log`
@@ -313,15 +327,12 @@ exits **1** on a free-model run even when nothing is wrong: look at `still_as_fi
 `MISMATCH` lines, do not read the exit code alone. The same trio varies by 1–2 claims between
 runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at the 15 rpm of kenary.
 
-## Planned, not landed yet (CC-10, CC-11)
+## Planned, not landed yet (CC-10), and CC-11's operator step
 
-* **CC-11 (293, `tickets/293-cc-11-accept-on-committed-voters.md`), accept on three committed voters, not on all of them.** In `tally` the
-  `unanimous` flag needs `committed == len(voters)`; with five voters one `UNSURE` or one dead
-  model blocks the claim. The runs above say the rule "`committed >= 3` and one verdict among the
-  committed" settles 146 of 150 with five or seven good voters, 0 wrong, and keeps a dead voter
-  from costing claims. Mixed with weak voters it is safe at seven (0 of 6435 sets wrong) and not at
-  five (12 of 3003 sets had a wrong claim settled), so the roster stays the measured one. Until it
-  lands, run three voters.
+* **CC-11 (293), landed: its operator step.** `--accept committed` is described under "Voters"
+  above; the default stays `all`. Layer 2 of the ticket: `claim_diff.py … --accept committed` with
+  the five-voter roster and `--runs 3` on the fixture (about two hours at kenary's pace) must give
+  wrong settled 0, `still_as_fixed` 0, and not fewer accepted than the three-voter run.
 * **CC-10 (292), claim check in Gate 1.** `[gate1] claim_vote = off` by default. The ticket's
   layer 2 is an operator step and lives here once the code has landed:
   1. `main.py --validate-plan --base REPO` on one real target; keep the Architect's candidates.

@@ -181,7 +181,13 @@ def main(argv: "list[str] | None" = None) -> int:
                   "keys from the cited chunk ids", file=sys.stderr)
 
     by = args.checked_by or cc_truth.checked_by(votes, models=models, base_sha=base_sha)
-    rows = cc_truth.to_truth_rows(votes, checked_by=by, resolved=resolved, models=models)
+    # CC-11: under `accept = committed` a row's checked_by names the families that committed on it
+    # (an explicit --checked-by is the operator's text and stays as given)
+    row_by = None if args.checked_by else (
+        lambda row: cc_truth.checked_by(votes, models=models, base_sha=base_sha,
+                                        voters=cc_truth.committed_voters(row)))
+    rows = cc_truth.to_truth_rows(votes, checked_by=by, resolved=resolved, models=models,
+                                  row_checked_by=row_by)
     for finding in cc_truth.disagreements(rows):
         # two statements about one place (one true, one false) share the key; harvest_report.load_truth
         # keeps one row per finding (the last), so a reviewer is scored on whichever came last

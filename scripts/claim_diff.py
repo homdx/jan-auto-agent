@@ -26,6 +26,11 @@ delta.json claims_fixture.json`` reads), ``delta.txt`` (the table printed), and
 ``votes_base.json`` / ``votes_head.json`` (``claim_vote.py --out``'s shape, one per side:
 ``score_cc.py votes_head.json claims_fixture.json --side head`` scores a side on its own).
 
+CC-11: ``--accept all|committed`` (``[claim_vote] accept``, default ``all``) is the acceptance
+rule of both sides' `tally` — one rule for both, so a FIXED never compares a side accepted over
+abstainers with one that was not; both ``votes_*.json`` record it, and ``delta.json`` does when
+it is not ``all``.
+
 Exit: 0, or 1 for a ``--check`` mismatch, or 2 for a refusal (a target or ref that does not
 open, an unreadable claim file, an ``expect`` that is not one of the four words).
 """
@@ -129,13 +134,15 @@ def requests_of(items: list, voters: int, runs: int, batch: int, code_batch: int
 
 
 def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
-               budget: PackBudget = PackBudget(), collect: bool = True) -> dict:
+               budget: PackBudget = PackBudget(), collect: bool = True,
+               accept: str = cv.DEFAULT_ACCEPT) -> dict:
     """The core of the command: both sides prepared, voted (the two sides at once, so their
     jobs share one pool) and tallied, and the deltas. *vote* is the seam: the CLI's
     `make_vote` (``ask_v2`` over voters x runs), or a test's fake voter.
 
-    Returns ``{"deltas", "base": {"rows", "results", "table"}, "head": {...}}``; ``rows`` is one
-    tally row per claim (``None`` at base for a world claim, which is judged at head only)."""
+    Returns ``{"deltas", "accept", "base": {"rows", "results", "table"}, "head": {...}}``; ``rows`` is
+    one tally row per claim (``None`` at base for a world claim, which is judged at head only).
+    *accept* (CC-11) is the one acceptance rule of both sides."""
     sides = prepare_sides(claims, base, head, budget, collect)
     # a world claim is judged once, at head: its change is always n/a, so an expect on it is a
     # gate that can never be met — refused here, before a single request is made
@@ -149,13 +156,14 @@ def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
         got_b = two.submit(vote, items_b, "base")
         got_h = two.submit(vote, sides["items_h"], "head")
         results_b, results_h = got_b.result(), got_h.result()
-    table_b = cv.tally([claims[i] for i in idx_b], results_b, meta=[sides["meta_b"][i] for i in idx_b])
-    table_h = cv.tally(claims, results_h, meta=sides["meta_h"])
+    table_b = cv.tally([claims[i] for i in idx_b], results_b, meta=[sides["meta_b"][i] for i in idx_b],
+                       accept=accept)
+    table_h = cv.tally(claims, results_h, meta=sides["meta_h"], accept=accept)
     rows_b: list = [None] * len(claims)
     for i, row in zip(idx_b, table_b):
         rows_b[i] = row
     deltas = cc_compare.compare(claims, rows_b, table_h, gone=sides["gone"], world=sides["world"])
-    return {"deltas": deltas,
+    return {"deltas": deltas, "accept": accept,
             "base": {"rows": rows_b, "results": results_b, "table": table_b, "index": idx_b},
             "head": {"rows": table_h, "results": results_h, "table": table_h}}
 
@@ -190,21 +198,27 @@ def make_vote(voters: list, runs: int, pool: concurrent.futures.Executor, ask: C
 
 # ------------------------------------------------------------------ output
 
-def side_report(target: Target, side: dict, base_sha: "str | None") -> dict:
+def side_report(target: Target, side: dict, base_sha: "str | None",
+                accept: str = cv.DEFAULT_ACCEPT) -> dict:
     """``claim_vote.py --out``'s shape for one side (``score_cc.py --side`` reads it)."""
     return {"target": {"repo": target.repo, "ref": target.ref, "sha": target.sha,
                        "base": base_sha, "warnings": list(target.warnings)},
-            "results": side["results"], "claims": side["table"]}
+            "accept": accept, "results": side["results"], "claims": side["table"]}
 
 
 def write_outputs(out: Path, base: Target, head: Target, got: dict) -> str:
     out.mkdir(parents=True, exist_ok=True)
     deltas = got["deltas"]
-    (out / "delta.json").write_text(json.dumps(cc_compare.delta_json(base.sha, head.sha, deltas),
-                                               ensure_ascii=False, indent=1), encoding="utf-8")
+    accept = got.get("accept", cv.DEFAULT_ACCEPT)
+    # the rule both sides were tallied under, so a delta table read later says which one it is;
+    # `all` writes the file as before (no key: an old delta.json is read as `all`)
+    data = cc_compare.delta_json(base.sha, head.sha, deltas)
+    if accept != cv.DEFAULT_ACCEPT:
+        data["accept"] = accept
+    (out / "delta.json").write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     for name, target, side, b in (("base", base, got["base"], None),
                                   ("head", head, got["head"], base.sha)):
-        (out / f"votes_{name}.json").write_text(json.dumps(side_report(target, side, b),
+        (out / f"votes_{name}.json").write_text(json.dumps(side_report(target, side, b, accept),
                                                            ensure_ascii=False, indent=1), encoding="utf-8")
     table = cc_compare.render(base.sha, head.sha, deltas)
     (out / "delta.txt").write_text(table + "\n", encoding="utf-8")
@@ -245,6 +259,8 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--pack-chars", type=int, help="rendered characters of one claim's pack ([claim_vote] pack_chars)")
     ap.add_argument("--per-provider", type=int, help="calls in flight per host ([claim_vote] per_provider)")
     ap.add_argument("--interval", type=float, help="seconds between call starts per host ([claim_vote] interval_sec)")
+    ap.add_argument("--accept", metavar="all|committed",
+                    help="the acceptance rule of both sides ([claim_vote] accept, default all; CC-11)")
     ap.add_argument("--out", type=Path, help="where delta.json and the rest go (default: <repo-root>/claim-check-out/diff-<UTC>)")
     ap.add_argument("--repo-root", type=Path, default=Path.cwd(), help="where contest.ini / contest.local.ini live")
     ap.add_argument("--scratch", type=Path, help="where the two worktrees go (default: <repo-root>/claim-check-out/scratch)")
@@ -266,6 +282,10 @@ def main(argv: "list[str] | None" = None) -> int:
     if bad:
         ap.error(bad)
     parser = cv.read_ini(args.repo_root)
+    accept, why = cv.accept_rule(args.accept, parser)
+    if why:
+        print(f"claim_diff: {why}", file=sys.stderr)
+        return 2
     get = lambda key, cast, fallback: cast(parser.get(cv.SECTION, key, fallback=str(fallback)))  # noqa: E731
     batch = cv.given_or(args.batch, get("batch", int, 10))
     code_batch = cv.given_or(args.code_batch, get("code_batch", int, 2))
@@ -313,7 +333,8 @@ def main(argv: "list[str] | None" = None) -> int:
         with concurrent.futures.ThreadPoolExecutor(max(1, args.parallel)) as pool:
             vote = make_vote(voters, args.runs, pool, ask)
             try:
-                got = judge_both(claims, base, head, plan_and_vote, budget, collect=not args.no_collect)
+                got = judge_both(claims, base, head, plan_and_vote, budget, collect=not args.no_collect,
+                                 accept=accept)
             except ValueError as exc:
                 print(f"claim_diff: {args.claims}: {exc}", file=sys.stderr)
                 return 2
@@ -324,7 +345,7 @@ def main(argv: "list[str] | None" = None) -> int:
     print(table)
     deltas = got["deltas"]
     print(f"== {out}  changes: {dict(Counter(d.change for d in deltas))}"
-          f" | requests planned: {sum(planned.values())}")
+          f" | requests planned: {sum(planned.values())} | rule: {accept}")
     if not args.check:
         return 0
     bad = cc_compare.mismatches(deltas)

@@ -32,6 +32,11 @@ TRUE/FALSE stands only when it names a chunk of that pack and quotes it verbatim
 ``rejected``. Without ``--target`` nothing of this runs: the script is ``CLAIM-1``'s.
 
     python3 scripts/claim_vote.py claims.json --target . --ref origin/main --profiles a b c
+
+CC-11: ``--accept all|committed`` (``[claim_vote] accept``, default ``all``) is the acceptance
+rule of `tally`: ``all`` needs every voter of the run to commit; ``committed`` needs three
+committed voters that agree, and a voter that abstained on a claim does not block it (the rows
+name it in ``abstained``). Five voters or more: ``--accept committed``. ``votes.json`` records it.
 """
 from __future__ import annotations
 
@@ -380,6 +385,12 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
 
 
 MIN_COMMITTED = 3   # models that must commit (TRUE/FALSE) before a verdict stands
+#: CC-11: when a verdict is accepted (``unanimous``). ``all``: every voter of the run committed,
+#: to one verdict (the rule until CC-10's Gate 1 set says otherwise). ``committed``: at least the
+#: quorum committed and the committed agree; an abstainer (UNSURE, no vote on this claim, a quote
+#: the code rejected) does not block. A dissent among the committed blocks under both.
+ACCEPT_RULES = ("all", "committed")
+DEFAULT_ACCEPT = "all"
 
 
 def _strict_plurality(counts: Counter) -> str:
@@ -426,7 +437,7 @@ def _evidence_of(results: list[dict], i: int, verdict: "str | None" = None) -> t
 
 def tally(claims: list[dict], results: list[dict],
           symbols: "set[str] | None" = None, quorum: int = MIN_COMMITTED,
-          view=None, meta: "list[dict] | None" = None) -> list[dict]:
+          view=None, meta: "list[dict] | None" = None, accept: str = DEFAULT_ACCEPT) -> list[dict]:
     """Per claim: every vote, each model's own majority, and the cross-model one.
 
     UNSURE is an abstention, not a vote: the verdict is decided among TRUE and
@@ -441,7 +452,13 @@ def tally(claims: list[dict], results: list[dict],
     verdict then stands like a world claim's (no ``CODE-CHECK``), under the same rule, and
     each row gains ``id`` (when the claim has one), ``sha``, ``evidence``, ``quotes``,
     ``rejected`` ({reason: n}) and ``downgrades`` (their total).
+
+    CC-11: *accept* is the acceptance rule (`ACCEPT_RULES`). Under ``committed`` each row also
+    says ``abstained``: the voters of the run that did not commit on this claim. Under ``all``
+    the rows are what they were (no ``abstained``: an accepted row has none by the rule).
     """
+    if accept not in ACCEPT_RULES:
+        raise ValueError(f"accept = {accept!r}: one of {', '.join(ACCEPT_RULES)}")
     out = []
     # a result read back from a saved JSON has string keys; a live one has ints
     results = [{**r, "votes": {int(k): v for k, v in r["votes"].items()},
@@ -470,8 +487,11 @@ def tally(claims: list[dict], results: list[dict],
         # the acceptance rule of the runbook: every voter committed, all to one verdict.
         # ``voters`` is every model that produced any result; a voter with no vote
         # on this claim (silent, lost batch, unreadable reply) makes unanimous False.
+        # CC-11 `committed`: that last clause dropped — with five voters one UNSURE blocked the
+        # claim for all, so more voters settled fewer claims (132 of 150 at five, 91 at nine;
+        # 146 at both under this rule, 0 wrong). A dissent still blocks: len(decided) == 1.
         unanimous = (len(decided) == 1 and committed >= quorum
-                     and committed == len(voters))
+                     and (accept == "committed" or committed == len(voters)))
         if meta is not None:
             kind, dangling = meta[i]["kind"], meta[i]["dangling"]
         else:
@@ -485,6 +505,9 @@ def tally(claims: list[dict], results: list[dict],
                "unanimous": unanimous and not blind,
                "by_model": model_major,
                "all_votes": dict(total)}
+        if accept == "committed":
+            # who was asked and did not commit here: a row accepted over abstainers says so
+            row["abstained"] = sorted(m for m in voters if model_major.get(m, "UNSURE") == "UNSURE")
         if meta is not None:
             chunks, quotes, rejected = _evidence_of(results, i, verdict)
             if c.get("id") is not None:
@@ -557,6 +580,17 @@ def check_counts(args) -> str:
     return ""
 
 
+def accept_rule(given: "str | None", parser: configparser.ConfigParser) -> tuple:
+    """(rule, why it is refused or ``""``): ``--accept`` beats ``[claim_vote] accept``, which
+    defaults to `DEFAULT_ACCEPT` (shared with claim_diff.py)."""
+    rule = given if given is not None else parser.get(SECTION, "accept", fallback=DEFAULT_ACCEPT)
+    rule = rule.strip().lower()
+    if rule not in ACCEPT_RULES:
+        where = "--accept" if given is not None else f"[{SECTION}] accept ="
+        return rule, f"{where} {rule}: must be {' or '.join(ACCEPT_RULES)}"
+    return rule, ""
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("claims", type=Path, nargs="?")
@@ -572,6 +606,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch", type=int, help="claims per request ([claim_vote] batch)")
     ap.add_argument("--per-provider", type=int, help="calls in flight per host ([claim_vote] per_provider)")
     ap.add_argument("--interval", type=float, help="seconds between call starts per host ([claim_vote] interval_sec)")
+    ap.add_argument("--accept", metavar="all|committed",
+                    help="the acceptance rule ([claim_vote] accept, default all): all = every voter committed; "
+                         "committed = at least 3 committed and they agree, an abstainer does not block (CC-11)")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--repo-root", type=Path, default=Path.cwd(), help="where contest.ini / contest.local.ini live")
     ap.add_argument("--symbols-root", type=Path, help="the repo whose code the claims are about (default: --repo-root)")
@@ -621,6 +658,11 @@ def main(argv: list[str] | None = None) -> int:
                               ("interval_sec", interval, 0)):
         if value < least:
             ap.error(f"[{SECTION}] {key} = {value:g}: must be {least} or more")
+    # one line and exit 2, before any request: a typo here was a run under a rule nobody chose
+    args.accept, why = accept_rule(args.accept, parser)
+    if why:
+        print(f"claim_vote: {why}", file=sys.stderr)
+        return 2
     PACER.__init__(per_provider, interval)
     voters = (args.profiles or []) + (args.models or []) or [
         n.strip() for n in parser.get(SECTION, "llm_profiles", fallback="").split(",") if n.strip()]
@@ -654,8 +696,9 @@ def main(argv: list[str] | None = None) -> int:
     # CC-1: --symbols-root names the repo the claims are about, so its anchors are
     # resolved there; without it the old regex rule decides needs_code.
     view = cc_anchors.PathRepoView(args.symbols_root) if args.symbols_root else None
-    table = tally(claims, results, lf._repo_symbols(args.symbols_root or args.repo_root), view=view)
-    report = {"results": results, "claims": table}
+    table = tally(claims, results, lf._repo_symbols(args.symbols_root or args.repo_root), view=view,
+                  accept=args.accept)
+    report = {"accept": args.accept, "results": results, "claims": table}
     if args.out:
         args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     for r in results:
@@ -663,7 +706,7 @@ def main(argv: list[str] | None = None) -> int:
               + (f" ERROR {r['error']}" if r.get("error") else ""))
     dead = sorted({r["model"] for r in results if not r["votes"]})
     print("verdicts:", dict(Counter(t["verdict"] for t in table)),
-          "| unanimous (*, accept):", sum(t["unanimous"] for t in table),
+          "| unanimous (*, accept):", sum(t["unanimous"] for t in table), f"(rule {args.accept})",
           "| models with no votes at all:", dead or "none")
     for t in table:
         print(f"[{t['verdict']:10}]{'*' if t['unanimous'] else ' '}truth={t['truth']} {t['all_votes']} {t['claim'][:90]}")
@@ -715,7 +758,7 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
             results = list(pool.map(lambda j: ask_v2(j[0], items, j[1], args.seed, parser,
                                                      args.timeout, batch, code_batch,
                                                      args.fixed_prompt), jobs))
-        table = tally(claims, results, meta=meta)
+        table = tally(claims, results, meta=meta, accept=args.accept)
         warnings = list(target.warnings)
         report = {"target": {"repo": target.repo, "ref": target.ref, "sha": target.sha,
                              "base": args.base, "base_sha": base_sha, "warnings": warnings,
@@ -723,7 +766,7 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
                              # the budget the packs were cut to (--pack-chars may differ from the ini)
                              "budget": {"chars": budget.chars, "chunks": budget.chunks,
                                         "per_chunk": budget.per_chunk}},
-                  "results": results, "claims": table}
+                  "accept": args.accept, "results": results, "claims": table}
     if args.out:
         args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     for r in results:
@@ -732,7 +775,7 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
               + (f" ERROR {r['error']}" if r.get("error") else ""))
     dead = sorted({r["model"] for r in results if not r["votes"]})
     print("verdicts:", dict(Counter(t["verdict"] for t in table)),
-          "| unanimous (*, accept):", sum(t["unanimous"] for t in table),
+          "| unanimous (*, accept):", sum(t["unanimous"] for t in table), f"(rule {args.accept})",
           "| models with no votes at all:", dead or "none",
           "| rejected quotes:", sum(len(r.get("rejected", ())) for r in results),
           "| warnings:", "; ".join(warnings) or "none",

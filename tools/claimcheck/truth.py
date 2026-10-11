@@ -99,13 +99,29 @@ def dead_voters(votes: dict) -> list:
     return sorted({r["model"] for r in votes.get("results") or ()} - live)
 
 
+def accept_of(votes: dict) -> str:
+    """The acceptance rule *votes* was tallied under (CC-11): ``all`` or ``committed``; a
+    ``votes.json`` written before the field is ``all``."""
+    return "committed" if votes.get("accept") == "committed" else "all"
+
+
+def committed_voters(row: dict) -> list:
+    """The voters that committed (TRUE or FALSE) on *row*, sorted."""
+    by_model = row.get("by_model")
+    if not isinstance(by_model, dict):
+        return []
+    return sorted(ref for ref, v in by_model.items() if v in TRUTH_OF)
+
+
 def checked_by(votes: dict, *, models: Optional[dict] = None, sha: Optional[str] = None,
-               base_sha: Optional[str] = None) -> str:
+               base_sha: Optional[str] = None, voters: Optional[list] = None) -> str:
     """``claimcheck:<families, sorted, +>@<sha7>``, or ``@<base7>..<head7>`` for a before/after
     run. *sha* defaults to ``votes["target"]["sha"]``; with no sha at all there is no ``@``.
-    *models* maps a profile name to the model it names (`family_of`)."""
+    *models* maps a profile name to the model it names (`family_of`). *voters*: the refs whose
+    families are named (CC-11: a row's committed voters), default every live voter of the run."""
     models = models or {}
-    fams = sorted({family_of(ref, models.get(ref)) for ref in live_voters(votes)})
+    refs = live_voters(votes) if voters is None else voters
+    fams = sorted({family_of(ref, models.get(ref)) for ref in refs})
     sha = sha or (votes.get("target") or {}).get("sha") or ""
     text = "claimcheck:" + ("+".join(fams) or "none")
     if sha and base_sha:
@@ -185,12 +201,23 @@ def how_of(row: dict) -> str:
 
 # ------------------------------------------------------------------ to_truth_rows
 
+def committed_how(row: dict) -> str:
+    """``3 of 5 voters committed``: of the voters of the run (the committed and the ``abstained``)."""
+    did = len(committed_voters(row))
+    return f"{did} of {did + len(row.get('abstained') or ())} voters committed"
+
+
 def to_truth_rows(votes: dict, *, checked_by: str, resolved: Optional[list] = None,
-                  models: Optional[dict] = None) -> list:
+                  models: Optional[dict] = None, row_checked_by=None) -> list:
     """One `TRUTH_HEADER` dict per settled claim of *votes* (CC-6's ``votes.json``), in claim
     order. *resolved*: one list of resolved anchors per claim (`rebuild`), else the key comes
     from the cited chunk ids. Two claims with one ``finding`` and one ``truth``: the second's
-    ``duplicate_of`` is that finding."""
+    ``duplicate_of`` is that finding.
+
+    CC-11: under ``accept = committed`` a row may stand over abstainers, so it says so: ``how``
+    starts with `committed_how` and, with *row_checked_by* (claim row -> text), ``checked_by``
+    names the families that committed on that claim, not every voter of the run."""
+    committed = accept_of(votes) == "committed"
     rows, seen = [], set()
     claims = votes.get("claims") or []
     for i, c in enumerate(claims):
@@ -201,8 +228,10 @@ def to_truth_rows(votes: dict, *, checked_by: str, resolved: Optional[list] = No
         finding = finding_key(c.get("claim", ""), res, c.get("evidence") or ())
         dup = finding if (finding, truth) in seen else ""
         seen.add((finding, truth))
-        rows.append({"finding": finding, "truth": truth, "checked_by": checked_by,
-                     "duplicate_of": dup, "how": how_of(c)})
+        how = f"{committed_how(c)}; {how_of(c)}" if committed else how_of(c)
+        by = row_checked_by(c) if committed and row_checked_by is not None else checked_by
+        rows.append({"finding": finding, "truth": truth, "checked_by": by,
+                     "duplicate_of": dup, "how": how})
     return rows
 
 
@@ -275,6 +304,8 @@ def pending_markdown(votes: dict, packs: Optional[list] = None, *,
             by_model = c.get("by_model") or {}
             for v in live:
                 lines.append(f"| {_cell(v)} | {by_model.get(v, '(no vote)')} |")
+            if c.get("abstained"):     # CC-11: under `committed` the row names who did not commit
+                lines += ["", "abstained: " + ", ".join(c["abstained"])]
             lines += ["", f"rejected quotes: {sum(rejected.values()) if isinstance(rejected, dict) else 0}"
                       + (f" ({', '.join(f'{k} {n}' for k, n in sorted(rejected.items()))})"
                          if isinstance(rejected, dict) and rejected else ""), ""]

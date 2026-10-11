@@ -1,6 +1,7 @@
 # CC-11 — accept a verdict on three committed voters, not on all of them
 
-**Status:** FINAL — ready to be cut into `epic-tasks/`. Every number below is from live runs of the
+**Status:** landed (`CC-11 (293): --accept committed …`; judged in contest-bench/293/: black box 19/19,
+`tests/test_claim_vote_accept.py`; the default stays `all`). FINAL. Every number below is from live runs of the
 runbook on free models (nine runs, 2026-10-11) and from `contest-bench/cc/replay_rules.py`, which
 reproduces them offline from `contest-bench/cc/free_votes.json`.
 **Severity:** MEDIUM (it decides how many voters are worth running; today more than three only cost requests)

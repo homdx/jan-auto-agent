@@ -10,7 +10,7 @@ A claim is *accepted* under
     all        every voter of the set committed (a 0 is an abstention that blocks), one verdict   (today's rule)
     committed  at least 3 voters committed, one verdict among the committed (a 0 does not block)  (CC-11)
 
-and *wrong* when the accepted verdict is not the truth. The numbers in tickets/295-cc-11-*.md come from
+and *wrong* when the accepted verdict is not the truth. The numbers in tickets/293-cc-11-*.md come from
 here; a candidate's `tally` fed the same verdicts must give the same counts.
 """
 from __future__ import annotations

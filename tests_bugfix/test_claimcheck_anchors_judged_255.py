@@ -90,9 +90,9 @@ def _run_main(monkeypatch, tmp_path, extra):
     seen = {}
     real_tally = claim_vote.tally
 
-    def spy(claims_, results, symbols=None, view=None):
+    def spy(claims_, results, symbols=None, view=None, **kw):   # **kw: CC-11's accept
         seen["view"] = view
-        return real_tally(claims_, results, symbols, view=view)
+        return real_tally(claims_, results, symbols, view=view, **kw)
 
     monkeypatch.setattr(claim_vote, "tally", spy)
     monkeypatch.setattr(claim_vote, "ask", lambda *a, **k: {"model": a[0], "run": a[2], "votes": {}, "error": None})
