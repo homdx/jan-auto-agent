@@ -213,6 +213,73 @@ Expect `pending.md` to be the larger file. Round 280 (three free voters, one run
 to 63 of the fixture's 80 claims and 10 to 16 of 30 real ones, with 0 wrong. The offline
 check is `python3 contest-bench/290/acceptance_290.py`.
 
+## Voters: which models, how many
+
+By measured wrong rate over the 150 fixture claims (70 at base, 80 at head), two live runs
+(`tickets/292-cc-10-claim-check-in-gate1.md` has the table). A claim is settled only when
+every voter committed with a quote the code verified and all agree, so **more voters settle
+fewer claims and are no safer**: 129 of 150 settled with 3, 125 with 5, 115 with 7, 103 with 9,
+0 wrong in each.
+
+* Default three (three families, all on kenary): `mimo-v2-6-flash`, `muse-spark-1-3-contributor`,
+  `nemotron-3-ultra`. Spares: `agnes-3-0-flash`, `step-5-preview`, `hy3`.
+* Keep out of the roster: `laguna-s-2-1` (8 wrong of 136), `deepseek-v4-flash` (4 + 1 wrong).
+  `sensenova-6.8` is allowed as one voter of three, not as three: its free plan answers HTTP
+  429 "rpm exhausted" (79 of 219 requests in the live run) and `6.7` decided nothing.
+* Quorum is 3. `quorum=1` is never a default; with it set the output says so.
+* Before a round, `python3 scripts/py_model_test.py MODEL…` or `arena model test` shows which
+  of the roster still answers; a profile whose model is gone shows as `votes=0/N` in `vote.log`
+  and is dropped, not chased.
+
+## Closing a round: did the branch fix what its tickets claim (CC-7)
+
+At the end of a round, or before a merge, take the claims the tickets make (a review's claims
+after `claim_extract.py`, or hand-written `claims.json` with `"expect"` on each), and run
+base = the branch point, head = the candidate:
+
+```bash
+python3 scripts/claim_diff.py claims.json --target . --base main --head origin/kc \
+    --profiles a b c --runs 1 --out claim-check-out/diff-kc --check
+python3 contest-bench/cc/score_cc.py claim-check-out/diff-kc/delta.json claims.json   # with a key
+```
+
+Read it in this order:
+
+1. The exit code: `0` all `expect` met, `1` a mismatch (printed with both sides' evidence ids),
+   `2` a refusal (a ref that does not resolve, an unknown `expect`).
+2. `still_as_fixed` must be **0**: a claim that is still true reported as `FIXED` is the one
+   costly error. `UNCLEAR` is an honest answer, not a failure; expect many.
+3. `NEW` rows are claims that are true at head and were not at base: read them, they are what
+   the branch introduced.
+
+Cost: the two sides share one pool; a code claim is 0.5 request per voter at `code_batch = 2`.
+The command opens two read-only worktrees under `--scratch` and removes them at the end.
+
+## Planned, not landed yet
+
+* **CC-9 (291), Lenz comparison hint.** `lenz_claim_filter.py` would pick which world claims
+  are worth the one credit by the votes' disagreement. Until it lands, `--max` and `--dry-run`
+  are the only controls, and no credit is spent without `--verify`.
+* **CC-10 (292), claim check in Gate 1.** `[gate1] claim_vote = off` by default. The ticket's
+  layer 2 is an operator step and lives here once the code has landed:
+  1. `main.py --validate-plan --base REPO` on one real target; keep the Architect's candidates.
+  2. `scripts/run_claim_check.sh … --truth` for the candidates the vote can settle, the rest by
+     hand from `pending.md`. Record the known-answer set in the repository with its target sha.
+  3. Gate 1 twice on the set, vote `off` and `on`; numbers to the round's `SUMMARY.md`.
+  4. Pass only if false positives let through are not more, true bugs rejected are not more,
+     and the vote decided at least a third; otherwise the flag stays `off`.
+
+## When something goes wrong
+
+| what you see | what it is | what to do |
+|---|---|---|
+| `votes=0/N` for one profile, `raw_head` in `votes.json` | the model is dead, out of credits, or rate-limited | drop it from the roster; the others still vote |
+| HTTP 429 in `vote.log` | the provider's rpm (kenary 15 shared, sensenova "rpm exhausted") | lower `[claim_vote] per_provider` or raise `interval_sec`; retries are built in |
+| a claim stays `UNSURE` on every run | the pack did not hold the place | check `pack_chars` and that the anchor resolves (`--target`/`--ref` right) |
+| `CONFLICT` from `claimcheck_truth.py --append`, exit 3 | the same `finding` already has another `truth` | decide by hand; the file is kept as it was |
+| a `finding` with both `REAL` and `FALSE` rows | two claims about one symbol | settle by hand before `harvest_report --truth` (it reads the last row only) |
+| `target cannot be opened` (warning) | the recorded repository is gone | `--target PATH` to a clone that has the sha |
+
 ## Check that a re-run is free (no network)
 
 `tests/test_claim_check.py` stubs the network and fails if a cached section or
