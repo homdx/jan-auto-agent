@@ -87,6 +87,7 @@ def test_tally_tie_is_split():
 
 # ── CC-6 (280): --target, the packs in the prompt, the new votes.json fields ──
 
+import configparser  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
@@ -260,3 +261,17 @@ def test_a_model_with_no_votes_at_all_is_not_a_voter_for_unanimity():
     part = {"model": "c/z", "run": 0, "votes": {0: "TRUE"}}
     table = cv.tally(claims, [live("a/x"), live("b/y"), part, dead])
     assert table[0]["unanimous"] and not table[1]["unanimous"]
+
+
+def test_every_voter_request_names_itself(monkeypatch):
+    """A header-less urllib request is refused by Cloudflare in front of publicai (HTTP 403, code 1010)."""
+    seen = []
+    monkeypatch.setattr(cv, "voter_settings", lambda ref, parser: LlmSettings(
+        base_url="http://p.invalid/v1", api_key="k", model=ref, temperature=0.3, max_tokens=100))
+
+    def completion(url, headers, payload, timeout, **_k):
+        seen.append(headers)
+        return json.dumps([{"id": 1, "verdict": "TRUE"}])
+    monkeypatch.setattr(cv, "request_completion", completion)
+    cv.ask("a/x", WORLD[:1], 0, 1, configparser.ConfigParser(), 5)
+    assert seen and all(h.get("User-Agent") == cv.USER_AGENT and h["Authorization"] == "Bearer k" for h in seen)

@@ -223,9 +223,42 @@ fewer claims and are no safer**: 129 of 150 settled with 3, 125 with 5, 115 with
 
 * Default three (three families, all on kenary): `mimo-v2-6-flash`, `muse-spark-1-3-contributor`,
   `nemotron-3-ultra`. Spares: `agnes-3-0-flash`, `step-5-preview`, `hy3`.
-* Keep out of the roster: `laguna-s-2-1` (8 wrong of 136), `deepseek-v4-flash` (4 + 1 wrong).
-  `sensenova-6.8` is allowed as one voter of three, not as three: its free plan answers HTTP
-  429 "rpm exhausted" (79 of 219 requests in the live run) and `6.7` decided nothing.
+* Measured again by running this runbook on free models only (nine live runs over the same 150
+  fixture claims; "decided" = a verdict with a quote the code verified, "wrong" = against the
+  fixture's truth, alone, before any unanimity):
+
+  | voter | decided | wrong | use |
+  |---|---|---|---|
+  | nemotron-3-ultra, hy3, agnes-3-0-flash, muse-spark-1-3, step-5-preview, mimo-v2-6-flash | 139–145 | 0 | roster |
+  | nemotron-3-super | 131 | 0 | spare |
+  | vercel_8080 `inclusionai/ling-3.1-flash-free` | 130 | 0 | spare; the other ling-3.0 variants and `laguna` through the proxy gave 0 votes or 7 wrong |
+  | agnes-2-5-flash | 124 | 0 (5 wrong of 128 in an earlier run) | spare, moves between runs |
+  | north-mini-code | 98 | 2 | no |
+  | laguna-s-2-1 | 141 | 7 | no |
+  | publicai gemma-sea-lion-27b, qwen-sea-lion-32b, apertus 8b / 70b / v1.5-70b | 33–138 | 8–46 | no: what they commit to is wrong 9 to 52 % of the time, and gemma and apertus put a quote that is not in the pack in 20 to 35 % of their answers; bielik gave no vote |
+  | zai `glm-4.7-flash` | 34 | 12 | no: z.ai answers 429 "overloaded" on most requests |
+
+  `publicai` needs a `User-Agent` header (Cloudflare error 1010 otherwise); `claim_vote.py` sends one.
+  A voter outside the roster is judged the same way before it joins: run the fixture with it and read the
+  `wrong` column of its decided claims; a model that is wrong even 1 time in 50 alone is kept out.
+* **Stability** (does a model say the same thing twice?). The same fixture asked again of the same
+  model, 9 to 12 pairs of runs each, three of them with the prompt reworded and the claims reshuffled
+  (`--runs 3`): `nemotron-3-ultra`, `muse-spark-1-3`, `step-5-preview`, `agnes-3-0-flash` never
+  changed a verdict (0 flips), and the number of claims a run left undecided moved by 0 to 8 of 150.
+  **`mimo-v2-6-flash` flips**: on one claim it said the wrong thing in 3 of its 6 runs, and only the
+  other two voters not agreeing kept it out of `truth.csv`. It stays a voter, never the only one.
+  So a roster is chosen by *flips* as well as by wrong alone: the 0-flip models first.
+* Three voters, one run: 135 to 141 of 150 settled, 0 wrong, in five runs of four different trios
+  (the same default trio gave 136 and 141). Five voters with **three runs each** (a model's verdict is
+  the one two of its three runs agree on): **140 settled, 0 wrong**, with the current rule, and
+  `FIXED` 18 of 20, `STILL` 10 of 10, `NEW` 2 of 2, `GONE` 2 of 2 in `claim_diff.py`: the best
+  table of all the runs. It costs 5 × 3 = 15 voter runs, about 1000 requests: two hours at kenary's
+  pace, so it is the setting for a decision, not for every round.
+* More voters in a single run under the *current* rule (every voter that voted at all must commit,
+  all to one verdict) only lose claims: five good voters settle 93 to 132 of 150, three settle 98 to
+  140. Five or seven good voters settle **146 of 150** with 0 wrong if the rule were "at least three
+  committed and every committed voter agrees" (a voter that said `UNSURE` or died does not block);
+  that is not what `claim_vote.py` does today, see "Planned" (CC-11) below.
 * Quorum is 3. `quorum=1` is never a default; with it set the output says so.
 * Before a round, `python3 scripts/py_model_test.py MODEL…` or `arena model test` shows which
   of the roster still answers; a profile whose model is gone shows as `votes=0/N` in `vote.log`
@@ -239,9 +272,17 @@ base = the branch point, head = the candidate:
 
 ```bash
 python3 scripts/claim_diff.py claims.json --target . --base main --head origin/kc \
-    --profiles a b c --runs 1 --out claim-check-out/diff-kc --check
+    --profiles claim_vote_llm.kenary_mimo_v2_6_flash_free \
+               claim_vote_llm.kenary_muse_spark_1_3_contributor_free \
+               claim_vote_llm.kenary_nemotron_3_ultra_550b_a55b_free \
+    --runs 1 --out claim-check-out/diff-kc --check
 python3 contest-bench/cc/score_cc.py claim-check-out/diff-kc/delta.json claims.json   # with a key
 ```
+
+`--profiles` takes the **full ini section name**, prefix included
+(`claim_vote_llm.<slug>`, what `claim_vote.py --add-profiles` writes; `grep '^\[claim_vote_llm'
+contest.local.ini` lists them). A bare slug fails in 1 s with `no [slug] section` and every
+claim comes back `UNCLEAR`, which looks like dead models and is only a wrong name.
 
 Read it in this order:
 
@@ -255,8 +296,23 @@ Read it in this order:
 Cost: the two sides share one pool; a code claim is 0.5 request per voter at `code_batch = 2`.
 The command opens two read-only worktrees under `--scratch` and removes them at the end.
 
-## Planned, not landed yet (CC-10)
+What to expect from free models (five live runs of three voters on the fixture: 20 `fixed`,
+10 `still`, 2 `gone`, 2 `new` claims): `FIXED` 17–18 of 20, `STILL` 8–10 of 10, `GONE` 2 of 2,
+`NEW` 1–2 of 2, **`still_as_fixed` 0 in every run**; the rest is `UNCLEAR` (one voter said
+`UNSURE`, or a quote was not in the pack). `--check` counts `UNCLEAR` against an `expect`, so it
+exits **1** on a free-model run even when nothing is wrong: look at `still_as_fixed` and at the
+`MISMATCH` lines, do not read the exit code alone. The same trio varies by 1–2 claims between
+runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at the 15 rpm of kenary.
 
+## Planned, not landed yet (CC-10, CC-11)
+
+* **CC-11 (not cut yet), accept on three committed voters, not on all of them.** In `tally` the
+  `unanimous` flag needs `committed == len(voters)`; with five voters one `UNSURE` or one dead
+  model blocks the claim. The runs above say the rule "`committed >= 3` and one verdict among the
+  committed" settles 146 of 150 with five or seven good voters, 0 wrong, and keeps a dead voter
+  from costing claims. Mixed with weak voters it is safe at seven (0 of 6435 sets wrong) and not at
+  five (12 of 3003 sets had a wrong claim settled), so the roster stays the measured one. Until it
+  lands, run three voters.
 * **CC-10 (292), claim check in Gate 1.** `[gate1] claim_vote = off` by default. The ticket's
   layer 2 is an operator step and lives here once the code has landed:
   1. `main.py --validate-plan --base REPO` on one real target; keep the Architect's candidates.
@@ -270,6 +326,8 @@ The command opens two read-only worktrees under `--scratch` and removes them at 
 
 | what you see | what it is | what to do |
 |---|---|---|
+| `votes=0/N` for every profile in 1 second, `_pick = 'x' but the config has no [x] section` | `--profiles` was given a bare slug | the full section name: `claim_vote_llm.kenary_mimo_v2_6_flash_free` (`grep '^\[claim_vote_llm' contest.local.ini`) |
+| `HTTP 403 … error code: 1010` from a provider | Cloudflare refuses a request with no `User-Agent` (publicai) | `claim_vote.py` sends one now; an older checkout needs the header |
 | `votes=0/N` for one profile, `raw_head` in `votes.json` | the model is dead, out of credits, or rate-limited | drop it from the roster; the others still vote |
 | HTTP 429 in `vote.log` | the provider's rpm (kenary 15 shared, sensenova "rpm exhausted") | lower `[claim_vote] per_provider` or raise `interval_sec`; retries are built in |
 | a claim stays `UNSURE` on every run | the pack did not hold the place | check `pack_chars` and that the anchor resolves (`--target`/`--ref` right) |

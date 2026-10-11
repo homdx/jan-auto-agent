@@ -105,6 +105,9 @@ PACER = Pacer()
 
 
 SECTION = "claim_vote"
+# A header-less urllib request says "Python-urllib/3.x", which Cloudflare in front of some
+# free providers (publicai: HTTP 403, error code 1010) refuses before the model is reached.
+USER_AGENT = "jan-auto-agent"
 
 
 def read_ini(root: Path) -> configparser.ConfigParser:
@@ -292,6 +295,7 @@ def ask(ref: str, claims: list[str], run: int, seed: int, parser: configparser.C
             api_format=st.api_format, temperature=st.temperature,
             max_tokens=st.max_tokens, system="You are a careful technical fact checker.",
             user_msg=prompt, num_ctx=st.num_ctx, think=st.think)
+        headers.setdefault("User-Agent", USER_AGENT)
         sem = PACER.wait(host)
         try:
             text = strip_think(request_completion(url, headers, payload, timeout,
@@ -336,6 +340,7 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
             api_format=st.api_format, temperature=st.temperature,
             max_tokens=st.max_tokens, system=cc_judge.SYSTEM,
             user_msg=prompt, num_ctx=st.num_ctx, think=st.think)
+        headers.setdefault("User-Agent", USER_AGENT)
         sem = PACER.wait(host)
         started = time.monotonic()
         try:
