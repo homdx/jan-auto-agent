@@ -123,8 +123,8 @@ rule committed  accepted  <=>  one verdict among the committed
   candidate's tests reproduce it through `tally` (test `test_replay_matches_the_oracle`).
 * The existing suites stay green unchanged with the default: `python3 -m pytest .smoke_tests/
   .regression_tests/`, then `python3 -m pytest tests_bugfix -n 4 -q` (two roots, run one after the other).
-* Black box (`contest-bench/293/blackbox_293.py`, written by the judge before the round, as for 285 and
-  290): the candidate's `scripts/claim_vote.py` and `scripts/claim_diff.py` as processes against a local
+* Black box (`python3 contest-bench/293/blackbox_293.py --code DIR`, already in the repository; it fails on
+  today's code and passes on a throwaway prototype of the rule, 19 checks): the candidate's `scripts/claim_vote.py` and `scripts/claim_diff.py` as processes against a local
   fake model server with five voters, two of which answer `UNSURE` on a fixed list of claims or return
   HTTP 404; with `--accept committed` the table has the claims accepted that `--accept all` leaves
   open, none wrong, `delta.json` records the rule, and CC-7's FIXED/STILL numbers are not lower than
