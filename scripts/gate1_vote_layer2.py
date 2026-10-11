@@ -92,13 +92,16 @@ def load_truth(known: Path) -> dict:
 
 
 def build_ini(dest: Path, local: configparser.ConfigParser, base_ini: Path, mode: str,
-              voters: list, accept: str, reader: str) -> None:
+              voters: list, accept: str, reader: str, reader_timeout: int = 240) -> None:
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(base_ini)
     rd = local[P + reader]
     for key in ("base_url", "api_key", "model"):
         cfg["gate1_llm"][key] = rd[key]
     cfg["gate1"]["presence_llm_profile"] = "gate1_llm"
+    # one hung request must not hold a variant for the 40 minutes agents.ini allows a Coder (the first live
+    # run sat 35 minutes on a connection that never answered): the reader gives up and retries after this
+    cfg["loop"]["timeout_seconds"] = str(reader_timeout)
     cfg["gate1"]["claim_vote"] = mode
     cfg["gate1"]["vote_accept"] = accept
     if voters:

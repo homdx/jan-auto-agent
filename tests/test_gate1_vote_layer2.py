@@ -103,3 +103,20 @@ def test_dry_run_lists_the_variants_and_runs_nothing(capsys):
     out = capsys.readouterr().out
     assert rc == 2 and "MISSING" in out            # no claim_vote_llm.* sections in agents.ini: refused, not run
     assert "off" in out and "on-5" in out
+
+
+def test_the_generated_ini_caps_the_readers_request_time(tmp_path):
+    import configparser
+    local = configparser.ConfigParser(interpolation=None)
+    for name in ("rd", "a", "b", "c"):
+        local.add_section(l2.P + name)
+        for k, v in (("base_url", "http://x/v1"), ("api_key", "k"), ("model", name)):
+            local.set(l2.P + name, k, v)
+    dest = tmp_path / "agents.ini"
+    l2.build_ini(dest, local, ROOT / "agents.ini", "on", ["a", "b", "c"], "all", "rd")
+    got = configparser.ConfigParser(interpolation=None)
+    got.read(dest)
+    assert got["loop"]["timeout_seconds"] == "240"
+    assert got["gate1"]["presence_llm_profile"] == "gate1_llm" and got["gate1_llm"]["model"] == "rd"
+    assert got["gate1"]["vote_profiles"] == "claim_vote_llm.a, claim_vote_llm.b, claim_vote_llm.c"
+    assert oct(dest.stat().st_mode & 0o777) == "0o600"
