@@ -234,8 +234,8 @@ so **more voters settle fewer claims and are no safer**: 129 of 150 settled with
 115 with 7, 103 with 9, 0 wrong in each. With five voters or more run `--accept committed` (CC-11):
 at least three committed and every committed voter agrees, an abstainer does not block.
 
-* Default three (three families, all on kenary): `mimo-v2-6-flash`, `muse-spark-1-3-contributor`,
-  `nemotron-3-ultra`. Spares: `agnes-3-0-flash`, `step-5-preview`, `hy3`.
+* Default three (three families): `step-5-preview`, `muse-spark-1-3-contributor`,
+  `nemotron-3-ultra`. Spares: `agnes-3-0-flash`, `hy3`, `mimo-v2-6-flash` (flips, never the only one).
 * Measured again by running this runbook on free models only (nine live runs over the same 150
   fixture claims; "decided" = a verdict with a quote the code verified, "wrong" = against the
   fixture's truth, alone, before any unanimity):
@@ -295,7 +295,7 @@ base = the branch point, head = the candidate:
 
 ```bash
 python3 scripts/claim_diff.py claims.json --target . --base main --head origin/kc \
-    --profiles claim_vote_llm.kenary_mimo_v2_6_flash_free \
+    --profiles claim_vote_llm.kenary_step_5_preview_free \
                claim_vote_llm.kenary_muse_spark_1_3_contributor_free \
                claim_vote_llm.kenary_nemotron_3_ultra_550b_a55b_free \
     --runs 1 --out claim-check-out/diff-kc --check

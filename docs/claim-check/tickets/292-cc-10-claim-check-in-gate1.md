@@ -74,8 +74,8 @@ changes nothing (the existing Gate 1 tests stay green unchanged); a voter that r
 ## Questions, answered
 
 1. **Which voters, and the rate limit.** By measured wrong rate over the 150 fixture claims (70 base + 80 head), two live
-   runs (table below). Default `vote_profiles`: **mimo-v2-6-flash, muse-spark-1-3-contributor, nemotron-3-ultra** (kenary,
-   three families, 129 of 150 settled, 0 wrong). Spare: agnes-3-0-flash, step-5-preview, hy3. Excluded: laguna-s-2-1 (8 wrong of
+   runs (table below). Default `vote_profiles`: **step-5-preview, muse-spark-1-3-contributor, nemotron-3-ultra** (three families;
+   step-5 replaces mimo-v2-6-flash, which flips its verdict between runs; the 129 of 150 settled, 0 wrong were measured with mimo). Spare: agnes-3-0-flash, hy3, mimo-v2-6-flash (never alone). Excluded: laguna-s-2-1 (8 wrong of
    136) and deepseek-v4-flash (4 + 1 wrong); sensenova-6.8-flash-lite is allowed but not a default (6 wrong of 129 alone, and its
    rate limit, below). The vote is a shortcut for **every** candidate that reaches Stage B, but it is capped: `[gate1]
    vote_max_per_run` (default 200 candidates) and a per-provider limit through the `claim_vote` throttle, so a run of hundreds of
