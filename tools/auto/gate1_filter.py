@@ -84,12 +84,14 @@ from typing import Any
 from tools.agent_trace import tracer
 from tools.auto.architect import CandidateTask
 from tools.auto.llm_profile import LlmSettings, resolve_llm_profile
+from tools.auto import gate1_vote as _gate1_vote
 from tools.auto.gate1_grounding import (
     callee_context, config_fallback_note, target_file_context,
     instruction_file_context,
     collect_contract_note, existing_test_coverage_note, truncation_safety_note,
     intentional_design_note, test_helper_note,
 )
+from tools.claimcheck.anchors import PathRepoView
 from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
@@ -516,6 +518,13 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 sec, exc,
             )
             self._skip_llm_for_unindexed = True
+        # CC-10: three voters with the code and a quote shortcut the single reader when they are
+        # sure. `[gate1] claim_vote = off` (the default) builds nothing: Gate 1 is as it was.
+        try:
+            self._vote = _gate1_vote.build(config)
+        except Exception as exc:  # noqa: BLE001 — a wrong vote setting must not stop Gate 1
+            logger.warning("config [gate1] claim_vote: the vote stays off (%s)", exc)
+            self._vote = None
         try:
             self._timeout = float(config.get("loop", "timeout_seconds", fallback="300"))
         except ValueError as exc:
@@ -909,9 +918,29 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             def _presence_one(i: int, c: CandidateTask, block: str) -> tuple[bool, str]:
                 print(f"  [{i}/{n_presence}] presence check: {c.title}")
                 module_docstring = self._module_docstring_for(c, base_dir)
-                ok, reason, verdict = self._check_presence(
-                    c, block, module_docstring=module_docstring, base_dir=base_dir,
-                )
+                voted = self._vote_on(c, base_dir)
+                if voted is not None and voted.verdict == "confirmed":
+                    # CC-10: three families, three verified quotes — the reader is not asked
+                    ok, reason, verdict = True, voted.reason, "confirmed"
+                    self._vote.note_decided()
+                elif (voted is not None and voted.verdict == "rejected"
+                      and not self._vote.cfg.veto_by_reader):
+                    ok, reason, verdict = False, voted.reason, "rejected"
+                    self._vote.note_decided()
+                else:
+                    ok, reason, verdict = self._check_presence(
+                        c, block, module_docstring=module_docstring, base_dir=base_dir,
+                    )
+                    if voted is not None and voted.verdict == "rejected":
+                        if ok and verdict == "confirmed":
+                            # the veto: the reader read the code and disagrees with a unanimous FALSE
+                            self._vote.note_overridden()
+                        else:
+                            self._vote.note_decided()
+                            # a reader with no answer is not a "confirmed": the vote's reason stands alone
+                            no_answer = verdict == _PRESENCE_UNKNOWN
+                            ok, verdict = False, "rejected"
+                            reason = voted.reason + ("" if no_answer else f"; single reader: {reason}")
                 # Logged here, at completion, so that with presence_workers
                 # > 1 the verdict lines still appear as soon as each check
                 # finishes rather than after the whole batch.
@@ -1096,6 +1125,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             ))
 
         rejected = [r for r in all_results if not r.accepted]
+        if getattr(self, "_vote", None) is not None:
+            c = self._vote.counters
+            print(f"🗳 Gate 1 vote: asked {c['votes_asked']}, decided {c['votes_decided']}, "
+                  f"overridden by the reader {c['votes_overridden']}, requests {c['votes_requests']}")
         print(
             f"✅ Gate 1 done — {len(accepted)} accepted, "
             f"{len(rejected)} rejected ({len([r for r in rejected if r.stage == 'duplicate'])} duplicate(s))\n"
@@ -1119,9 +1152,21 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 )
             except Exception:  # noqa: BLE001 — never sink a run on a counter
                 pass
+            if getattr(self, "_vote", None) is not None:
+                # only with the vote on: with it off the dict is what it was
+                counters.update(self._vote.counters)
         return accepted, rejected
 
     # ── Stage A helpers ───────────────────────────────────────────────────────
+
+    def _vote_on(self, candidate: CandidateTask, base_dir: Path):
+        """CC-10: the claim vote on *candidate*, or None when there is no vote or it has no
+        decision to offer. Never raises (the vote itself does not)."""
+        vote = getattr(self, "_vote", None)
+        if vote is None:
+            return None
+        out = vote.presence_by_vote(candidate, PathRepoView(base_dir))
+        return out if out.verdict else None
 
     def _location_is_indexed(self, candidate: CandidateTask) -> bool:
         """L1 (Stage A0): does the collect model know the file this candidate
