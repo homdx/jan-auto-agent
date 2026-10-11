@@ -181,7 +181,7 @@ def main(argv: "list[str] | None" = None) -> int:
                   "keys from the cited chunk ids", file=sys.stderr)
 
     by = args.checked_by or cc_truth.checked_by(votes, models=models, base_sha=base_sha)
-    rows = cc_truth.to_truth_rows(votes, checked_by=by, resolved=resolved)
+    rows = cc_truth.to_truth_rows(votes, checked_by=by, resolved=resolved, models=models)
     for finding in cc_truth.disagreements(rows):
         # two statements about one place (one true, one false) share the key; harvest_report.load_truth
         # keeps one row per finding (the last), so a reviewer is scored on whichever came last
@@ -203,7 +203,7 @@ def main(argv: "list[str] | None" = None) -> int:
         print(f"CONFLICT {finding}: {args.out} says {old}, this run says {new} (kept {old})")
     if block:
         print(block)
-    n_pending = len(cc_truth.pending_rows(votes))
+    n_pending = len(cc_truth.pending_rows(votes, models))
     print(f"truth: {len(written)} rows {'appended to' if args.append else 'in'} {args.out} "
           f"({len(rows)} settled, {len(rows) - len(written) - len(conflicts)} already there, "
           f"{len(conflicts)} conflicts); pending: {n_pending} in {pending}; checked_by {by}")

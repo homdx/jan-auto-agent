@@ -264,12 +264,15 @@ def test_family_of_table():
         "kenary/agnes-3-0-flash:free", "kenary/hy3:free", "tokenharbor/deepseek-v4-flash:free",
         "kenary/nemotron-3-ultra-550b-a55b:free", "sensenova123/sensenova-6.8-flash-lite",
         "sensenova123/sensenova-6.7-flash-lite")} == {
-        "kenary/agnes-3-0-flash:free": "agnes", "kenary/hy3:free": "hy3",
+        "kenary/agnes-3-0-flash:free": "agnes", "kenary/hy3:free": "hy",
         "tokenharbor/deepseek-v4-flash:free": "deepseek",
         "kenary/nemotron-3-ultra-550b-a55b:free": "nemotron",
         "sensenova123/sensenova-6.8-flash-lite": "sensenova",
         "sensenova123/sensenova-6.7-flash-lite": "sensenova"}
     assert tr.family_of("claim_vote_llm.a", "kenary/agnes-3-0-flash:free") == "agnes"
+    # a trailing version is not a family (review of cc-epic-docs): qwen3 and qwen-2.5 are one
+    assert tr.family_of("qwen/qwen3-235b:free") == tr.family_of("qwen/qwen-2.5-72b:free") == "qwen"
+    assert tr.family_of("x/4o") == "4o"
 
 
 def test_checked_by_names_families_and_sha():
@@ -277,15 +280,15 @@ def test_checked_by_names_families_and_sha():
     votes = {"target": {"sha": "d36d59e" + "0" * 33},
              "results": [res("kenary/nemotron-3-ultra-550b-a55b:free"), res("kenary/agnes-3-0-flash:free"),
                          res("kenary/hy3:free"), res("kenary/agnes-3-0-flash:free")]}
-    assert tr.checked_by(votes) == "claimcheck:agnes+hy3+nemotron@d36d59e"
-    assert tr.checked_by(votes, base_sha="1234567abc") == "claimcheck:agnes+hy3+nemotron@1234567..d36d59e"
-    assert tr.checked_by({"results": votes["results"]}) == "claimcheck:agnes+hy3+nemotron"
+    assert tr.checked_by(votes) == "claimcheck:agnes+hy+nemotron@d36d59e"
+    assert tr.checked_by(votes, base_sha="1234567abc") == "claimcheck:agnes+hy+nemotron@1234567..d36d59e"
+    assert tr.checked_by({"results": votes["results"]}) == "claimcheck:agnes+hy+nemotron"
 
 
 def test_dead_voter_is_not_in_checked_by(votes):
     by = tr.checked_by(votes)
     assert "sensenova" not in by
-    assert by == f"claimcheck:agnes+deepseek+hy3+nemotron@{votes['target']['sha'][:7]}"
+    assert by == f"claimcheck:agnes+deepseek+hy+nemotron@{votes['target']['sha'][:7]}"
 
 
 def test_how_is_one_csv_safe_line(tmp_path):

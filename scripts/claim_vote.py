@@ -391,14 +391,17 @@ def claim_kind(claim: str, symbols: "set[str] | None" = None, view=None) -> tupl
     return ("code" if lf.is_internal(claim, symbols or set()) else "world"), False
 
 
-def _evidence_of(results: list[dict], i: int) -> tuple:
+def _evidence_of(results: list[dict], i: int, verdict: "str | None" = None) -> tuple:
     """(chunk ids, quotes, {reason: n}) of claim *i* over every result: what the votes
-    that stood cited, first seen first, and what the quote check rejected."""
+    that stood cited, first seen first, and what the quote check rejected. With a TRUE/FALSE
+    *verdict* only the votes for it count: a FALSE run's quote led the `how` of a REAL row."""
     chunks: list = []
     quotes: list = []
     rejected: Counter = Counter()
     for r in results:
         got = r.get("accepted", {}).get(i)
+        if got and verdict in ("TRUE", "FALSE") and got.get("verdict", verdict) != verdict:
+            got = None     # a vote for the other side (an entry without a verdict is an old file's)
         if got:
             if got.get("chunk") and got["chunk"] not in chunks:
                 chunks.append(got["chunk"])
@@ -470,7 +473,7 @@ def tally(claims: list[dict], results: list[dict],
                "by_model": model_major,
                "all_votes": dict(total)}
         if meta is not None:
-            chunks, quotes, rejected = _evidence_of(results, i)
+            chunks, quotes, rejected = _evidence_of(results, i, verdict)
             if c.get("id") is not None:
                 row = {"id": c["id"], **row}
             row.update(sha=meta[i].get("sha", ""), evidence=chunks, quotes=quotes,

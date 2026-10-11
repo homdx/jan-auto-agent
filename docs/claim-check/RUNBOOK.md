@@ -172,7 +172,9 @@ with no network and nothing written. The script takes these out of the options b
 the vote's exit code and no truth step.
 
 **The acceptance rule, restated.** A claim gets a `truth.csv` row only when it is settled:
-`unanimous` is true and the verdict is `TRUE` (written `REAL`) or `FALSE`. A `verdict: TRUE`
+`unanimous` is true, the verdict is `TRUE` (written `REAL`) or `FALSE`, and the voters behind it
+are of at least three families (three `agnes-*` models agreeing are one opinion: pending, under
+"fewer than 3 model families"; a trailing version is not a family, `qwen3` = `qwen-2.5`). A `verdict: TRUE`
 with a dissenter (`by_model` TRUE, TRUE, FALSE; `unanimous: false`) is **not** settled. It goes
 to `pending.md`, as do `SPLIT`, `UNSURE` and `CODE-CHECK`. A model with no vote at all is not a
 voter: it is left out of `checked_by` and named as `dead:` in `pending.md`'s header.

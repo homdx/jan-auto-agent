@@ -37,32 +37,55 @@ HOW_QUOTE = 160          # characters of the first accepted quote in ``how``
 PREVIEW_LINES = 3        # first lines of each chunk in pending.md
 PREVIEW_CHARS = 160      # characters of one preview line
 #: the pending list's groups, in order; a row that is none of them is a plurality with a dissent
-PENDING_ORDER = ("SPLIT", "DISSENT", "CODE-CHECK", "UNSURE")
+PENDING_ORDER = ("SPLIT", "DISSENT", "FAMILIES", "CODE-CHECK", "UNSURE")
 PENDING_TITLE = {"SPLIT": "SPLIT — the committed voters tie",
                  "DISSENT": "TRUE / FALSE with a dissenter — a plurality, not a settled answer",
+                 "FAMILIES": "TRUE / FALSE, unanimous, but from fewer than 3 model families — not independent",
                  "CODE-CHECK": "CODE-CHECK — about the code, judged without it (no evidence found)",
                  "UNSURE": "UNSURE — fewer than the quorum committed"}
 
 
 # ------------------------------------------------------------------ settled or not
 
-def settled(row: dict) -> Optional[str]:
-    """``REAL`` / ``FALSE`` for a settled row, else None. Settled is ``unanimous is True`` and a
-    verdict of TRUE or FALSE — nothing else (not ``verdict`` alone, not ``unanimous`` with any
-    other verdict)."""
+#: EPIC-CC principle 6: a verdict stands on at least three families (two models of one family are one)
+MIN_FAMILIES = 3
+
+
+def settled(row: dict, models: Optional[dict] = None) -> Optional[str]:
+    """``REAL`` / ``FALSE`` for a settled row, else None. Settled is ``unanimous is True``, a
+    verdict of TRUE or FALSE, and voters of at least `MIN_FAMILIES` families behind it — nothing
+    else (not ``verdict`` alone, not ``unanimous`` with any other verdict). *models*: profile name ->
+    model (`family_of`). A row without ``by_model`` (hand-made, not claim_vote.py's) is not counted."""
     if row.get("unanimous") is not True:
         return None
-    return TRUTH_OF.get(row.get("verdict"))
+    truth = TRUTH_OF.get(row.get("verdict"))
+    if truth is not None and families_behind(row, models) < MIN_FAMILIES:
+        # three agnes-* voters agreeing wrote a REAL row "checked_by: claimcheck:agnes": one family
+        # unanimous is one opinion asked three times (the runbook's rule counts families)
+        return None
+    return truth
+
+
+def families_behind(row: dict, models: Optional[dict] = None) -> int:
+    """How many families committed to *row*'s verdict; `MIN_FAMILIES` for a row without ``by_model``."""
+    by_model = row.get("by_model")
+    if not isinstance(by_model, dict) or not by_model:
+        return MIN_FAMILIES
+    models = models or {}
+    return len({family_of(ref, models.get(ref)) for ref, v in by_model.items() if v == row.get("verdict")})
 
 
 # ------------------------------------------------------------------ the voters: families
 
 def family_of(ref: str, model: Optional[str] = None) -> str:
     """The voter's family: the model part after the last ``/``, ``:free`` (any ``:tag``)
-    removed, cut at the first ``-``, lower case (``kenary/agnes-3-0-flash:free`` -> ``agnes``).
+    removed, cut at the first ``-``, a trailing version number dropped, lower case
+    (``kenary/agnes-3-0-flash:free`` -> ``agnes``, ``qwen3-235b`` and ``qwen-2.5-72b`` -> ``qwen``).
     *model*: the ``model`` an ini profile names, for a ref that is a section name."""
     name = (model or ref).rsplit("/", 1)[-1].split(":", 1)[0]
-    return name.split("-", 1)[0].lower() or name.lower()
+    head = name.split("-", 1)[0].lower() or name.lower()
+    # `qwen3` and `qwen-2.5` were two families, so two qwen voters passed for independent ones
+    return re.sub(r"\d+(?:\.\d+)*$", "", head) or head
 
 
 def live_voters(votes: dict) -> list:
@@ -162,7 +185,8 @@ def how_of(row: dict) -> str:
 
 # ------------------------------------------------------------------ to_truth_rows
 
-def to_truth_rows(votes: dict, *, checked_by: str, resolved: Optional[list] = None) -> list:
+def to_truth_rows(votes: dict, *, checked_by: str, resolved: Optional[list] = None,
+                  models: Optional[dict] = None) -> list:
     """One `TRUTH_HEADER` dict per settled claim of *votes* (CC-6's ``votes.json``), in claim
     order. *resolved*: one list of resolved anchors per claim (`rebuild`), else the key comes
     from the cited chunk ids. Two claims with one ``finding`` and one ``truth``: the second's
@@ -170,7 +194,7 @@ def to_truth_rows(votes: dict, *, checked_by: str, resolved: Optional[list] = No
     rows, seen = [], set()
     claims = votes.get("claims") or []
     for i, c in enumerate(claims):
-        truth = settled(c)
+        truth = settled(c, models)
         if truth is None:
             continue
         res = resolved[i] if resolved is not None and i < len(resolved) else None
@@ -182,9 +206,9 @@ def to_truth_rows(votes: dict, *, checked_by: str, resolved: Optional[list] = No
     return rows
 
 
-def pending_rows(votes: dict) -> list:
+def pending_rows(votes: dict, models: Optional[dict] = None) -> list:
     """(index, claim row) of every claim that is not settled, in claim order."""
-    return [(i, c) for i, c in enumerate(votes.get("claims") or []) if settled(c) is None]
+    return [(i, c) for i, c in enumerate(votes.get("claims") or []) if settled(c, models) is None]
 
 
 def disagreements(rows: list) -> list:
@@ -201,7 +225,9 @@ def _group(c: dict) -> str:
     v = c.get("verdict")
     if v in ("SPLIT", "CODE-CHECK", "UNSURE"):
         return v
-    return "DISSENT" if v in ("TRUE", "FALSE") else "UNSURE"
+    if v in ("TRUE", "FALSE"):
+        return "FAMILIES" if c.get("unanimous") is True else "DISSENT"
+    return "UNSURE"
 
 
 def _preview(text: str) -> list:
@@ -223,7 +249,7 @@ def pending_markdown(votes: dict, packs: Optional[list] = None, *,
     sha = target.get("sha") or ""
     live, dead = live_voters(votes), dead_voters(votes)
     models = models or {}
-    pend = pending_rows(votes)
+    pend = pending_rows(votes, models)
     total = len(votes.get("claims") or [])
     lines = ["# Claim check — pending (stage 3)", "",
              f"sha: {sha or '(no --target: the voters did not see the code)'}"

@@ -45,6 +45,8 @@ import shlex
 from pathlib import Path
 from typing import Optional
 
+from tools.claimcheck import truth as cc_truth
+
 ROOT = Path(__file__).resolve().parent.parent.parent
 FILTER_SCRIPT = ROOT / "scripts" / "lenz_claim_filter.py"
 #: the script's own values when its source cannot be read (it holds them as module literals)
@@ -113,8 +115,8 @@ def lenz_group(c: dict) -> Optional[str]:
     v = c.get("verdict")
     if v in ("SPLIT", "UNSURE"):
         return v
-    if v in ("TRUE", "FALSE") and c.get("unanimous") is not True:
-        return "DISSENT"
+    if v in ("TRUE", "FALSE") and cc_truth.settled(c) is None:
+        return "DISSENT"     # a plurality, or unanimous from too few families: not settled either way
     return None
 
 
@@ -178,7 +180,9 @@ def _ref(c: dict, numbers: dict) -> str:
 def _ours(c: dict) -> str:
     v = c.get("verdict") or "?"
     if v in ("TRUE", "FALSE"):
-        return f"{v} (unanimous)" if c.get("unanimous") is True else f"{v} (with a dissenter)"
+        if c.get("unanimous") is not True:
+            return f"{v} (with a dissenter)"
+        return f"{v} (unanimous)" if cc_truth.settled(c) else f"{v} (unanimous, too few families)"
     return v
 
 

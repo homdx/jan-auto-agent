@@ -90,7 +90,8 @@ def main() -> int:
         with Target.open(tmp / "fx", fixture["head_sha"], scratch=tmp / "s") as target:
             items, meta = cv.prepare_target(claims, target, PackBudget())
             results = []
-            for model, fn in (("a/perfect-1", perfect), ("b/perfect-2", perfect), ("c/perfect-3", perfect),
+            # three families: a truth row needs them (EPIC-CC principle 6); "perfect-1..3" were one
+            for model, fn in (("a/alpha-1", perfect), ("b/beta-2", perfect), ("c/gamma-3", perfect),
                               ("d/noisy-1", noisy)):
                 got = judge.ask_with_packs(items, 0, 1, fn, batch=10, code_batch=2)
                 results.append({"model": model, "run": 0, "votes": got["votes"],

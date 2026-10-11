@@ -303,7 +303,7 @@ def ask_with_packs(items: list, run: int, seed: int,
                    code_batch: int = 2, fixed: bool = False) -> dict:
     """One voter's run over *items* (`(claim, pack_or_None)`), its votes checked.
 
-    `{"votes": {i: verdict}, "accepted": {i: {"chunk", "quote"}}, "rejected": [...],
+    `{"votes": {i: verdict}, "accepted": {i: {"chunk", "quote", "verdict"}}, "rejected": [...],
     "errors": [...], "raw_head": str}`: *votes* are the verdicts after `verify_quotes`,
     *accepted* the evidence of each committed vote on a claim with a pack. A batch whose
     call raises is an entry in *errors* and no votes, never an exception: a dead model is a
@@ -329,7 +329,7 @@ def ask_with_packs(items: list, run: int, seed: int,
             i = group[k]
             votes[i] = vote.verdict
             if vote.verdict in COMMITTED and shown[k][1] is not None:
-                accepted[i] = {"chunk": vote.chunk, "quote": vote.quote}
+                accepted[i] = {"chunk": vote.chunk, "quote": vote.quote, "verdict": vote.verdict}
         rejected += [{**row, "claim": group[row["claim"]]} for row in bad]
     return {"votes": votes, "accepted": accepted, "rejected": rejected,
             "errors": errors, "raw_head": raw_head}
