@@ -327,14 +327,38 @@ exits **1** on a free-model run even when nothing is wrong: look at `still_as_fi
 `MISMATCH` lines, do not read the exit code alone. The same trio varies by 1–2 claims between
 runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at the 15 rpm of kenary.
 
-## Planned, not landed yet (CC-10), and CC-11's operator step
+## Claim check in Gate 1 (CC-10), and CC-11's operator step
 
 * **CC-11 (293), landed: its operator step.** `--accept committed` is described under "Voters"
   above; the default stays `all`. Layer 2 of the ticket: `claim_diff.py … --accept committed` with
   the five-voter roster and `--runs 3` on the fixture (about two hours at kenary's pace) must give
   wrong settled 0, `still_as_fixed` 0, and not fewer accepted than the three-voter run.
-* **CC-10 (292), claim check in Gate 1.** `[gate1] claim_vote = off` by default. The ticket's
-  layer 2 is an operator step and lives here once the code has landed:
+* **CC-10 (292), landed (local): `[gate1] claim_vote`, off by default.** With `claim_vote = off`
+  (or the key absent) Gate 1 is what it was: nothing is built, no counter is added. With `on`,
+  Stage B asks the voters of `vote_profiles` (a profile section of `agents.ini` / `contest.local.ini`
+  or Kilo's `provider/model`; **three, of three families**, otherwise the vote stays off and says
+  why in the log) before it asks the single reader. The claim is
+  "`<symbol>` in `<file>` has the problem: <the instruction>", its pack is built from the candidate's
+  own tree (`base_dir`), each voter is asked once for it (**three requests a candidate**, in
+  parallel, through the `claim_vote` pacer), and the verdict is `claim_vote.tally`'s with CC-8's
+  families rule:
+  * unanimous `TRUE` (three committed, three families, quotes found in the pack) -> `confirmed`
+    without the reader;
+  * unanimous `FALSE` -> `rejected` with the voters' quotes, **unless the reader says
+    `confirmed`** (`vote_veto_by_reader = on`, the default; the override is `votes_overridden`).
+    A reader that gave no answer does not save the candidate;
+  * anything else (split, UNSURE, a quote not in the pack, a dead voter, a claim with no code
+    anchor, the pack empty, past `vote_max_per_run`, any error) -> no decision, the single reader
+    answers as before. The vote never makes Gate 1 stricter than the reader.
+
+  Keys: `vote_profiles`, `vote_max_per_run` (200), `vote_timeout_sec` (60), `vote_veto_by_reader`
+  (on). `vote_quorum` is not a knob: any value but 3 turns the vote off (one voter is not this
+  ticket's). The plan phase prints `🗳 Gate 1 vote: asked …, decided …, overridden by the reader …,
+  requests …`, and `counters` gains `votes_asked`, `votes_decided`, `votes_overridden`,
+  `votes_requests` (only with the vote on). Default roster by measured wrong rate:
+  step-5-preview, muse-spark-1-3-contributor, nemotron-3-ultra.
+
+  Layer 2 is an operator step and was **not run**; the flag stays `off` until it is:
   1. `main.py --validate-plan --base REPO` on one real target; keep the Architect's candidates.
   2. `scripts/run_claim_check.sh … --truth` for the candidates the vote can settle, the rest by
      hand from `pending.md`. Record the known-answer set in the repository with its target sha.

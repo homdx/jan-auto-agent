@@ -1,6 +1,6 @@
 # EPIC CC — claim check with evidence: models judge claims about our code with the code in front of them
 
-**Status:** in progress — CC-0 … CC-9 (250 … 291) and CC-11 (293) landed; CC-10 (292) written, not run; the
+**Status:** in progress — CC-0 … CC-11 (250 … 293) landed (CC-10, 292, behind `[gate1] claim_vote = off`; its live set not run); the
 review of the branch (five reports) landed as ten "CC review fixes N/10" commits, not tickets
 **Base:** `main` after the open `arena` tickets and their bugs have landed
 **Branch:** `cc-epic-docs` (the sketch said `cc`)

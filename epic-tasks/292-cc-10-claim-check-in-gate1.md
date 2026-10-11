@@ -1,6 +1,6 @@
 # CC-10 — claim check in Gate 1: three voters with the code and a quote, instead of one reader
 
-**Status:** open — FINAL. CC-8 (290) has landed, so it can be cut into `epic-tasks/`; the numbers below are from live runs of rounds 280 and 285 plus the sensenova run of round 290's session. The one thing the code cannot give is the recorded Architect candidates: the operator step in Acceptance records them.
+**Status:** landed (local; layer 2, the live Gate 1 set, not done; the flag stays `off`). Before: FINAL, open — CC-8 (290) has landed, so it can be cut into `epic-tasks/`; the numbers below are from live runs of rounds 280 and 285 plus the sensenova run of round 290's session. The one thing the code cannot give is the recorded Architect candidates: the operator step in Acceptance records them.
 **Severity:** MEDIUM (it is the first place where the epic's tool feeds `--auto` directly)
 **File:** `tools/auto/gate1_filter.py`
 **Symbol:** `Gate1Filter._check_presence` (Stage B), a new `tools/auto/gate1_vote.py`
@@ -150,3 +150,22 @@ Gate 1 inherits the fixes, and its own test must use the **real reply shapes**, 
 ## Not in scope
 
 Changing Stage A, A0 or C; the Coder, executor or validators; the unanimity rule; Lenz.
+
+## What landed (local)
+
+* `tools/auto/gate1_vote.py` (new): `VoteConfig.from_config`, `claim_of`, `Gate1Vote.presence_by_vote`,
+  `build`. Voters run in parallel through `claim_vote.ask_v2` (`code_batch = 1`, so three requests a
+  candidate); the verdict is `claim_vote.tally` plus `truth.settled` (three families). Nothing raises.
+* `tools/auto/gate1_filter.py`: `Gate1Filter` builds the vote from `[gate1]` (None when off); in Stage B a
+  confirmed vote skips the reader, a rejecting vote needs the reader not to say `confirmed`; the counters
+  and a summary line are added only when the vote is on.
+* `agents.ini [gate1]`: `claim_vote = off` and the keys, commented. RUNBOOK: "Claim check in Gate 1".
+* `tests/test_gate1_vote.py` (26 tests): the verdicts above with voters in the live reply shapes, the
+  settings, the cap, off byte for byte, and the fixture chain (48 of 50 code claims decided, 0 wrong; a dead
+  third voter decides nothing and `votes_overridden` stays 0).
+
+Deviations: the pack is built from the working tree at `base_dir` (Gate 1 has no pinned `Target`; the
+architect's candidates were made from that tree), without the collect model (no callers, as the ticket says)
+and with no explicit "git header chunk" beyond what `build_pack` adds for the symbol. `vote_quorum` other than
+3 turns the vote off instead of being implemented. `run` of the voters past the overall bound
+(`2 * vote_timeout_sec + 5`) is a missing vote.
