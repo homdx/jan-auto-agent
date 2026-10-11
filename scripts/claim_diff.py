@@ -242,15 +242,18 @@ def main(argv: "list[str] | None" = None) -> int:
     except (OSError, ValueError) as exc:   # json.JSONDecodeError is a ValueError
         print(f"claim_diff: {args.claims}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
         return 2
+    bad = cv.check_counts(args)
+    if bad:
+        ap.error(bad)
     parser = cv.read_ini(args.repo_root)
     get = lambda key, cast, fallback: cast(parser.get(cv.SECTION, key, fallback=str(fallback)))  # noqa: E731
-    batch = args.batch or get("batch", int, 10)
-    code_batch = args.code_batch or get("code_batch", int, 2)
+    batch = cv.given_or(args.batch, get("batch", int, 10))
+    code_batch = cv.given_or(args.code_batch, get("code_batch", int, 2))
     budget = PackBudget.from_config(parser)
-    if args.pack_chars and args.pack_chars > 0:
+    if args.pack_chars:
         budget = PackBudget(chars=args.pack_chars, chunks=budget.chunks, per_chunk=budget.per_chunk)
-    cv.PACER.__init__(args.per_provider or get("per_provider", int, 2),
-                      args.interval or get("interval_sec", float, 4.0))
+    cv.PACER.__init__(cv.given_or(args.per_provider, get("per_provider", int, 2)),
+                      cv.given_or(args.interval, get("interval_sec", float, 4.0)))
     voters = (args.profiles or []) + (args.models or []) or [
         n.strip() for n in parser.get(cv.SECTION, "llm_profiles", fallback="").split(",") if n.strip()]
     if not voters:

@@ -184,7 +184,16 @@ def _kilo_settings(ref: str) -> LlmSettings:
                          "options.baseURL") from None
     if not isinstance(base, str):
         raise ValueError(f"{KILO_CONFIG}: provider {provider!r} options.baseURL is not a string")
-    key = json.loads(KILO_AUTH.read_text(encoding="utf-8"))[provider]["key"]
+    # a plain-string entry ({"openrouter": "sk-…"}) was a TypeError traceback past --add-profiles'
+    # one-line refusal; the key itself is never named
+    try:
+        auth = json.loads(KILO_AUTH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        raise ValueError(f"{KILO_AUTH}: not valid JSON (line {err.lineno}, column {err.colno})") from None
+    entry = auth.get(provider) if isinstance(auth, dict) else None
+    key = entry.get("key") if isinstance(entry, dict) else None
+    if not isinstance(key, str) or not key:
+        raise ValueError(f"{KILO_AUTH}: no key for provider {provider!r}")
     return LlmSettings(base_url=base.rstrip("/"), api_key=key, model=model,
                        temperature=0.3, max_tokens=4000)
 
@@ -208,9 +217,15 @@ def add_profiles(refs: list[str], root: Path) -> list[str]:
     never world-readable."""
     path = root / roster.LOCAL_FILENAME
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-    names, add = [], ""
+    names, add, owner = [], "", {}
     for ref in refs:
         name = "claim_vote_llm." + re.sub(r"[^a-z0-9]+", "_", ref.lower()).strip("_")
+        # the check read only the file as it was before this call: one ref twice (or gpt-4.1
+        # and gpt-4-1) wrote the section twice, and read_ini then failed every later run
+        if owner.setdefault(name, ref) != ref:
+            raise ValueError(f"{owner[name]!r} and {ref!r} both map to [{name}]; pass one of them")
+        if name in names:
+            continue
         names.append(name)
         if f"[{name}]" in existing:
             continue
@@ -520,6 +535,30 @@ def prepare_target(claims: list[dict], target: Target, budget: PackBudget,
     return items, meta
 
 
+#: claim_vote.py options that only mean something with --target
+TARGET_ONLY = ("ref", "base", "fetch", "pack_chars", "code_batch", "report", "expect_sha", "scratch",
+               "no_collect")
+
+
+def given_or(value, fallback):
+    """*value* when the option was given, else *fallback*: `args.x or default` turned an explicit
+    `--interval 0` (no pacing) into the ini's 4 s."""
+    return fallback if value is None else value
+
+
+def check_counts(args) -> str:
+    """Why a count option is out of range, or ``""``: a batch, a per-host limit or a pack size
+    is at least 1, an interval at least 0 (both shared with claim_diff.py)."""
+    for name in ("batch", "code_batch", "per_provider", "pack_chars", "parallel", "runs"):
+        value = getattr(args, name, None)
+        if value is not None and value < 1:
+            return f"--{name.replace('_', '-')} {value}: must be 1 or more"
+    interval = getattr(args, "interval", None)
+    if interval is not None and interval < 0:
+        return f"--interval {interval}: must be 0 or more"
+    return ""
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("claims", type=Path, nargs="?")
@@ -540,7 +579,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--symbols-root", type=Path, help="the repo whose code the claims are about (default: --repo-root)")
     # CC-6: judge the claims on the evidence of a repository at a pinned commit
     ap.add_argument("--target", metavar="REPO", help="a repository (path or URL): code claims are judged on its evidence")
-    ap.add_argument("--ref", default="HEAD", help="the commit of --target to judge at (default HEAD)")
+    ap.add_argument("--ref", help="the commit of --target to judge at (default HEAD)")
     ap.add_argument("--base", metavar="REF", help="also give each pack the git evidence of BASE..the --ref commit")
     ap.add_argument("--fetch", action="store_true", help="git fetch --target before resolving --ref")
     ap.add_argument("--pack-chars", type=int, help="rendered characters of one claim's pack ([claim_vote] pack_chars)")
@@ -564,11 +603,20 @@ def main(argv: list[str] | None = None) -> int:
         for name in names:
             print(f"[{name}] in {roster.LOCAL_FILENAME}")
         return 0
+    # options that only mean something with --target were accepted and ignored without it;
+    # --expect-sha is a guard, so it silently guarded nothing
+    if not args.target:
+        given = [f"--{k.replace('_', '-')}" for k in TARGET_ONLY if getattr(args, k) not in (None, False)]
+        if given:
+            ap.error(f"{', '.join(given)} need --target")
+    bad = check_counts(args)
+    if bad:
+        ap.error(bad)
     parser = read_ini(args.repo_root)
     get = lambda key, cast, fallback: cast(parser.get(SECTION, key, fallback=str(fallback)))  # noqa: E731
-    batch = args.batch or get("batch", int, 10)
-    PACER.__init__(args.per_provider or get("per_provider", int, 2),
-                   args.interval or get("interval_sec", float, 4.0))
+    batch = given_or(args.batch, get("batch", int, 10))
+    PACER.__init__(given_or(args.per_provider, get("per_provider", int, 2)),
+                   given_or(args.interval, get("interval_sec", float, 4.0)))
     voters = (args.profiles or []) + (args.models or []) or [
         n.strip() for n in parser.get(SECTION, "llm_profiles", fallback="").split(",") if n.strip()]
     if not args.claims or not voters:
@@ -613,9 +661,9 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
                 voters: list[str], batch: int) -> int:
     """CC-6: the vote on the evidence of ``--target`` at ``--ref``."""
     get = lambda key, cast, fallback: cast(parser.get(SECTION, key, fallback=str(fallback)))  # noqa: E731
-    code_batch = args.code_batch or get("code_batch", int, 2)
+    code_batch = given_or(args.code_batch, get("code_batch", int, 2))
     budget = PackBudget.from_config(parser)
-    if args.pack_chars and args.pack_chars > 0:
+    if args.pack_chars:
         budget = PackBudget(chars=args.pack_chars, chunks=budget.chunks, per_chunk=budget.per_chunk)
     try:
         expect = args.expect_sha or report_sha(args.report)
@@ -624,7 +672,7 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
         return 2
     scratch = args.scratch or args.repo_root / "claim-check-out" / "scratch"
     try:
-        target = Target.open(args.target, args.ref, scratch=scratch, fetch=args.fetch,
+        target = Target.open(args.target, args.ref or "HEAD", scratch=scratch, fetch=args.fetch,
                              expect_sha=expect)
     except TargetError as exc:
         print(f"claim_vote: --target refused: {exc}", file=sys.stderr)
