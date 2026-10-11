@@ -730,6 +730,7 @@ FLAG = pathlib.Path(__file__).with_suffix(".flag")
 
 def test_slow_on_rerun_kc57():
     if FLAG.exists():
+        FLAG.with_suffix(".started").write_text("started")     # the rerun reached the body
         time.sleep(90)
     FLAG.write_text("seen")
     assert False, "first run only"
@@ -740,19 +741,36 @@ def test_the_flake_rerun_is_bounded_by_the_same_budget(round_, tmp_path):
     """KC-57 §1: the serial rerun of a failed test spends what is left of the
     budget. Past it the rerun is ended like the root itself: `budget✗`, the
     test it hit in named — never `1✗`, which would send the agent to fix a
-    test that is not red."""
+    test that is not red.
+
+    KC-184's rule here too: the *name* is in the tail only when the rerun's pytest reached the
+    test inside what was left of the budget. Under 32 busy processes on 8 cores the root and the
+    rerun's start-up spent all 12 s in 23 runs of 24 ("flake rerun ended", no name), and in some
+    the root itself was still exiting at 12 s ("ended after the harvest budget", no rerun at all):
+    the machine's speed, not the rule. `budget✗` and the bound on the wall time hold on each
+    attempt; a 12 s attempt whose rerun never reached the test is retried once with 60 s (under
+    the 90 s the rerun sleeps), and the rerun's lines are asserted on the attempt that got there."""
     repo, base, ticket = round_
     wt = _worktree(repo, base, tmp_path)
     _accepting(wt)
     _edit(wt, "tests/test_slow_on_rerun_kc57.py", _SLOW_ON_RERUN)
     _commit(wt, "a test whose rerun outlives the budget")
+    flag = wt.path / "tests" / "test_slow_on_rerun_kc57.flag"
+    started = flag.with_suffix(".started")
 
-    start = time.monotonic()
-    summary, tail = run_tests_detail(str(wt.path), budget_sec=12.0)
-    took = time.monotonic() - start
+    for budget in (12.0, 60.0):
+        flag.unlink(missing_ok=True)                    # the first run of each attempt fails fast
+        started.unlink(missing_ok=True)
+        start = time.monotonic()
+        summary, tail = run_tests_detail(str(wt.path), budget_sec=budget)
+        took = time.monotonic() - start
 
-    assert summary.startswith("tests:budget✗"), summary
-    assert took < 30                                    # the budget, not the 90 s rerun
+        assert summary.startswith("tests:budget✗"), summary
+        assert took < budget + 18                       # the budget, not the 90 s rerun
+        if started.exists():
+            break
+    else:
+        pytest.fail(f"the rerun's pytest did not reach its slow test in {budget:g} s: {tail[:2]}")
     assert any("flake rerun ended" in line for line in tail)
     assert any("the budget hit in:" in line and "test_slow_on_rerun_kc57" in line
                for line in tail)
