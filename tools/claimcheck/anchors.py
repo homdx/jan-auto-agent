@@ -496,7 +496,8 @@ _READ_ONLY_GIT = frozenset((
     "merge-base describe name-rev show-ref for-each-ref shortlog status").split())
 _FORBIDDEN_GIT_ARGS = ("--output", "--ext-diff", "--textconv", "--open-files-in-pager", "--exec-path",
                        "--git-dir", "--work-tree", "--config-env",
-                       "--contents")   # blame --contents reads a file outside the repository
+                       "--contents",   # blame --contents reads a file outside the repository
+                       "--no-index")   # diff/grep --no-index read any path on disk, not the repository
 #: a diff driver is named by the commit's .gitattributes and defined in the operator's config;
 #: git runs its textconv / external diff by default, so the view turns both off for these.
 _NO_FILTERS_GIT = frozenset(("show", "diff", "diff-tree", "log", "blame"))   # blame runs textconv too

@@ -36,6 +36,7 @@ import difflib
 import concurrent.futures
 import json
 import sys
+import threading
 import time
 from collections import Counter
 from contextlib import ExitStack
@@ -169,13 +170,16 @@ def make_vote(voters: list, runs: int, pool: concurrent.futures.Executor, ask: C
     def vote(items: list, side: str) -> list:
         jobs = [(m, r) for m in voters for r in range(runs)]
         done = [0]
+        lock = threading.Lock()   # the pool's threads finish together: an unlocked += lost counts
 
         def one(job):
             started = time.monotonic()
             row = ask(job[0], items, job[1])
-            done[0] += 1
+            with lock:
+                done[0] += 1
+                n = done[0]
             print(f"[progress] {side} {job[0]} run{job[1]} done: votes={len(row.get('votes', {}))}"
-                  f"/{len(items)} rejected={len(row.get('rejected', ()))} job {done[0]}/{len(jobs)} "
+                  f"/{len(items)} rejected={len(row.get('rejected', ()))} job {n}/{len(jobs)} "
                   f"{time.monotonic() - started:.0f}s"
                   + (f" ERROR {row['error']}" if row.get("error") else ""),
                   file=sys.stderr, flush=True)

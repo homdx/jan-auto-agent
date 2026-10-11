@@ -246,7 +246,8 @@ _VIEW_GIT = frozenset(("show diff log cat-file rev-parse ls-tree ls-files grep b
 #: options that write a file or start a program (`-O<pager>`, `--output=`, a textconv filter).
 _VIEW_FORBIDDEN = ("--output", "--ext-diff", "--textconv", "--open-files-in-pager",
                    "--exec-path", "--git-dir", "--work-tree", "--config-env",
-                   "--contents")   # blame --contents reads a file outside the commit
+                   "--contents",   # blame --contents reads a file outside the commit
+                   "--no-index")   # diff/grep --no-index read any path on disk, not the commit
 #: a diff driver is named by the commit's .gitattributes and defined in the operator's config;
 #: git runs its textconv / external diff by default, so the view turns both off for these.
 _NO_FILTERS = frozenset(("show", "diff", "log", "blame"))   # blame runs textconv too
@@ -368,7 +369,9 @@ class Target:
             users.mkdir(exist_ok=True)
             token = users / f"{os.getpid()}-{uuid.uuid4().hex}"
             token.touch()
-        target = cls(repo=repo_s, ref=ref, sha=sha, tree=tree, scratch=scratch,
+        # a local path is recorded absolute: votes.json keeps it, and claimcheck_truth.py run from
+        # another directory read `--target .` as its own cwd ("no such directory", no rebuild)
+        target = cls(repo=repo_s if _is_url(repo_s) else os.path.abspath(repo_s), ref=ref, sha=sha, tree=tree, scratch=scratch,
                      git_dir=git_dir, created=created, warnings=warnings)
         target._token = token
         return target
