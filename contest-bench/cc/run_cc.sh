@@ -42,7 +42,10 @@ if [ "$diff" = 1 ]; then
     code=$?
     tail -3 "$out/diff.log"
     [ -s "$out/diff/delta.json" ] || { echo "run_cc: no delta for the fixture, see $out/diff.log"; exit 1; }
-    python3 "$here/score_cc.py" "$out/diff/delta.json" "$here/claims_fixture.json" | tee "$out/score_diff.txt"
+    # thresholds.json says "enforced from CC-6 on", and nothing passed it: a miss is exit 1 now
+    python3 "$here/score_cc.py" "$out/diff/delta.json" "$here/claims_fixture.json" \
+        --thresholds "$here/thresholds.json" | tee "$out/score_diff.txt"
+    [ "${PIPESTATUS[0]}" -ne 0 ] && [ "$code" -eq 0 ] && code=1
     echo "== done: $out (diff $base -> $head)"
     exit $code
 fi
@@ -60,7 +63,10 @@ for set in fixture real; do
         --symbols-root "${roots[0]}" "${on[@]+"${on[@]}"}" --out "$out/votes_$set.json" "$@" > "$out/vote_$set.log" 2>&1
     grep -E "^verdicts:|ERROR|quorum|warning" "$out/vote_$set.log" | head -5
     [ -s "$out/votes_$set.json" ] || { echo "run_cc: no votes for $set, see $out/vote_$set.log"; status=1; continue; }
-    python3 "$here/score_cc.py" "$out/votes_$set.json" "$src" | tee -a "$out/score.txt"
+    # the targets are for votes cast on the evidence (CC-6 on); the no-evidence baseline is 0 by design
+    th=(); [ "$target" = 1 ] && th=(--thresholds "$here/thresholds.json")
+    python3 "$here/score_cc.py" "$out/votes_$set.json" "$src" "${th[@]+"${th[@]}"}" | tee -a "$out/score.txt"
+    [ "${PIPESTATUS[0]}" -ne 0 ] && status=1
     echo | tee -a "$out/score.txt"
 done
 echo "== done: $out (fixture base $base, real $real, sha of this checkout $(git rev-parse --short HEAD))"

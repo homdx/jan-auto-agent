@@ -32,6 +32,7 @@ open, an unreadable claim file, an ``expect`` that is not one of the four words)
 from __future__ import annotations
 
 import argparse
+import difflib
 import concurrent.futures
 import json
 import sys
@@ -76,6 +77,10 @@ def load_claims(path: Path) -> list:
         c = dict(c) if isinstance(c, dict) else {"claim": c}
         if not isinstance(c.get("claim"), str) or not c["claim"].strip():
             raise ValueError(f"claim {k + 1}: no `claim` text")
+        # `"expected": "fixed"` was read as no expectation, and the gate passed it silently
+        typo = [key for key in c if key != "expect" and difflib.get_close_matches(key, ["expect"], 1, 0.7)]
+        if typo:
+            raise ValueError(f"claim {c.get('id') or k + 1}: key `{typo[0]}` — did you mean `expect`?")
         try:
             c["expect"] = cc_compare.normalise_expect(c.get("expect"))
         except ValueError as exc:
@@ -131,6 +136,12 @@ def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
     Returns ``{"deltas", "base": {"rows", "results", "table"}, "head": {...}}``; ``rows`` is one
     tally row per claim (``None`` at base for a world claim, which is judged at head only)."""
     sides = prepare_sides(claims, base, head, budget, collect)
+    # a world claim is judged once, at head: its change is always n/a, so an expect on it is a
+    # gate that can never be met — refused here, before a single request is made
+    odd = [str(c.get("id") or i + 1) for i, c in enumerate(claims) if c.get("expect") and sides["world"][i]]
+    if odd:
+        raise ValueError(f"expect on a world claim ({', '.join(odd)}): it is judged once, at head; "
+                         "remove the expect or name the code it is about")
     idx_b = [i for i, w in enumerate(sides["world"]) if not w]
     items_b = [sides["items_b"][i] for i in idx_b]
     with concurrent.futures.ThreadPoolExecutor(2) as two:
@@ -242,6 +253,11 @@ def main(argv: "list[str] | None" = None) -> int:
     except (OSError, ValueError) as exc:   # json.JSONDecodeError is a ValueError
         print(f"claim_diff: {args.claims}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
         return 2
+    if args.check and not any(c["expect"] for c in claims):
+        # "check: 0 of 0 claims with an expect match" and exit 0 was a gate that checked nothing
+        print(f"claim_diff: --check: no claim in {args.claims} carries an `expect`: nothing to check",
+              file=sys.stderr)
+        return 2
     bad = cv.check_counts(args)
     if bad:
         ap.error(bad)
@@ -292,7 +308,11 @@ def main(argv: "list[str] | None" = None) -> int:
 
         with concurrent.futures.ThreadPoolExecutor(max(1, args.parallel)) as pool:
             vote = make_vote(voters, args.runs, pool, ask)
-            got = judge_both(claims, base, head, plan_and_vote, budget, collect=not args.no_collect)
+            try:
+                got = judge_both(claims, base, head, plan_and_vote, budget, collect=not args.no_collect)
+            except ValueError as exc:
+                print(f"claim_diff: {args.claims}: {exc}", file=sys.stderr)
+                return 2
         table = write_outputs(out, base, head, got)
 
     for line in _voter_lines(got):

@@ -187,6 +187,8 @@ def mismatches(deltas: list) -> list:
 
 def mismatch_line(d: Delta) -> str:
     who = d.id or d.claim[:60]
+    if d.change == NA:      # claim_diff.py refuses this before voting; a direct caller gets the reason
+        return f"MISMATCH {who}: expect {d.expect}, not judged: a world claim is judged once, at head"
     return (f"MISMATCH {who}: expect {d.expect}, got {d.change} "
             f"(base {d.base['verdict']}{'*' if d.base['unanimous'] else ''} "
             f"[{', '.join(d.evidence_base) or '-'}]; "

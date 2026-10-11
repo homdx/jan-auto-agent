@@ -393,9 +393,13 @@ def test_check_exit_codes(repo, tmp_path, http, capsys):
     assert _cli(repo, tmp_path, wrong) == 0                       # without --check: a report, not a gate
 
 
-def test_claims_without_expect_never_fail_check(repo, tmp_path, http):
+def test_claims_without_expect_never_fail_check(repo, tmp_path, http, capsys):
     plain = [{k: v for k, v in c.items() if k != "expect"} for c in CLAIMS]
-    assert _cli(repo, tmp_path, plain, "--check") == 0
+    # next to one claim with an expect, the others are not checked
+    assert _cli(repo, tmp_path, [CLAIMS[0], *plain[1:]], "--check") == 0
+    # none at all is not a pass: "0 of 0 match" was a gate that checked nothing (review of cc-epic-docs)
+    assert _cli(repo, tmp_path, plain, "--check") == 2
+    assert "nothing to check" in capsys.readouterr().err
 
 
 def test_an_unknown_expect_is_a_refusal(repo, tmp_path, http, capsys):

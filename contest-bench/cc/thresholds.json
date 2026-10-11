@@ -1,5 +1,5 @@
 {
- "note": "The targets of EPIC-CC.md section 6.2. Recorded by CC-0, enforced from CC-6 on (score_cc.py --thresholds exits 1 on a miss). A target is moved only with a note saying why, never silently.",
+ "note": "The targets of EPIC-CC.md section 6.2. Recorded by CC-0, enforced from CC-6 on: run_cc.sh --target and --diff pass them to score_cc.py --thresholds, and a miss is a MISS line and exit 1 (the plain run, the no-evidence baseline, is not checked). A target is moved only with a note saying why, never silently.",
  "targets": [
   {"id": "fixture-code-coverage", "set": "fixture", "metric": "kinds.code.coverage", "op": ">=", "value": 0.60,
    "note": "code claims decided unanimously on the fixture; the no-evidence baseline (BASELINE.md) is 0 by the tool's rule and near 0 in raw votes"},
