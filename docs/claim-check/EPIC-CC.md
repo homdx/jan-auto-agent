@@ -1,11 +1,11 @@
 # EPIC CC — claim check with evidence: models judge claims about our code with the code in front of them
 
-**Status:** in progress — CC-0 … CC-9 (250 … 291) landed; CC-10 (292) written, not run; the
+**Status:** in progress — CC-0 … CC-9 (250 … 291) landed; CC-10 (292) and CC-11 (293) written, not run; the
 review of the branch (five reports) landed as ten "CC review fixes N/10" commits, not tickets
 **Base:** `main` after the open `arena` tickets and their bugs have landed
 **Branch:** `cc-epic-docs` (the sketch said `cc`)
 **Tickets:** CC-0 … CC-8, numbered **250 … 290 in steps of five**, then CC-9 = 291 and
-CC-10 = 292 (§9). The four numbers after each ticket are reserved for the fixes that real
+CC-10 = 292 and CC-11 = 293 (§9). The four numbers after each ticket are reserved for the fixes that real
 rounds will turn up; 293 … 299 are left for the epic's own close-out. Each ticket is
 written in full under `docs/claim-check/tickets/` and is copied into `epic-tasks/` (with `arena issue create
 --number NNN`) when its turn comes — not before: `run` refuses untracked files in
@@ -225,6 +225,7 @@ prefix normalisation, is not a substring of that chunk. A world claim needs neit
 | 290 | CC-8 | Into the pipeline: `truth.csv`, pending list, one command | M | CC-6 | contest | 5 |
 | 291 | CC-9 | A Lenz comparison hint: the commands and the cost printed after a run, never run (`/extract` free 1000 a day; `/assess` 1 credit, `/verify` 10, from 100 a month + 400) | S | CC-6, CC-8 | contest | 6 |
 | 292 | CC-10 | Claim check in Gate 1 — three voters with the code and a quote instead of one reader, behind `[gate1] claim_vote = off` | M | CC-6, CC-7, CC-8 | contest | 7 |
+| 293 | CC-11 | Accept on three committed voters, not on all of them: `--accept committed`, so five voters leave three that work (146 of 150 settled, 0 wrong, replayed offline) | S | CC-6, CC-7, CC-8 | contest | 8 |
 
 Why ten contest tickets (CC-1 … CC-10) and not five: an earlier sketch folded CC-3/CC-4 pack assembly
 and the voter changes into one ticket. A round gives one agent one session; an L ticket
@@ -306,7 +307,7 @@ enough, stop after CC-6.
   CC-10, added after the sketch, took 291 and 292.
 * A fix found by round N is numbered N+1 … N+4 (a bug found while judging round 275 is
   276; the fourth is 279). The fifth bug at one ticket opens a new block (300 and up).
-* 293 … 299: close-out tickets of the epic (docs sync, the ideal-merge, the final bench run).
+* 293 is CC-11 (the acceptance rule found by running the runbook on free models); 294 … 299: close-out tickets of the epic (docs sync, the ideal-merge, the final bench run).
 * The review of the branch (five reports, ten Haiku-written tickets 300–345 that were never
   committed) landed directly as the ten "CC review fixes N/10" commits.
 * `arena issue create --number NNN` fixes the number. Without it `next_number` returns
@@ -381,3 +382,4 @@ Result of the re-check, on `main` at `d7ff804` (arena merged), 2026-10-09:
 | 290 | `docs/claim-check/tickets/290-cc-8-into-the-pipeline.md` |
 | 291 | `docs/claim-check/tickets/291-cc-9-lenz-comparison-hint.md` |
 | 292 | `docs/claim-check/tickets/292-cc-10-claim-check-in-gate1.md` |
+| 293 | `docs/claim-check/tickets/293-cc-11-accept-on-committed-voters.md` |

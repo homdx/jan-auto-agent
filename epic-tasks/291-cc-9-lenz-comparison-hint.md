@@ -1,6 +1,6 @@
 # CC-9 — a Lenz comparison hint: print the commands, never run them
 
-**Status:** landed (local) — the names it relies on were checked against the tree (`DEFAULT_MAX`, `VERIFY_CREDITS`, `--max/--json/--dry-run` of `scripts/lenz_claim_filter.py`; the kinds `code|world|mixed` and `dangling` of `claim_vote.py`; the credit prices of `docs/claim-check/REPORT.md`). Cut into `epic-tasks/` after CC-8 (290) has landed: it appends to the `pending.md` and the `--pending` option that ticket adds.
+**Status:** landed (`CC-9 (291): a Lenz comparison hint …`; `tools/claimcheck/lenz_hint.py`). FINAL — every name it relies on was checked against the tree (`DEFAULT_MAX`, `VERIFY_CREDITS`, `--max/--json/--dry-run` of `scripts/lenz_claim_filter.py`; the kinds `code|world|mixed` and `dangling` of `claim_vote.py`; the credit prices of `docs/claim-check/REPORT.md`). Cut into `epic-tasks/` after CC-8 (290) has landed: it appends to the `pending.md` and the `--pending` option that ticket adds.
 **Severity:** LOW (a convenience; nothing in the epic depends on it)
 **File:** `tools/claimcheck/lenz_hint.py`
 **Symbol:** `pick_for_lenz`, `lenz_hint_markdown`

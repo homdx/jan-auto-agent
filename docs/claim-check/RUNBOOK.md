@@ -314,7 +314,7 @@ runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at th
 
 ## Planned, not landed yet (CC-10, CC-11)
 
-* **CC-11 (not cut yet), accept on three committed voters, not on all of them.** In `tally` the
+* **CC-11 (293, `tickets/293-cc-11-accept-on-committed-voters.md`), accept on three committed voters, not on all of them.** In `tally` the
   `unanimous` flag needs `committed == len(voters)`; with five voters one `UNSURE` or one dead
   model blocks the claim. The runs above say the rule "`committed >= 3` and one verdict among the
   committed" settles 146 of 150 with five or seven good voters, 0 wrong, and keeps a dead voter
