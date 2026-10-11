@@ -161,35 +161,47 @@ def _rows_to_votes(rows, order: list) -> dict:
     return votes
 
 
+#: start positions one reply is decoded from, at most: each try reads to the end of what it opens,
+#: so trying every `[` of a 5,000-deep reply took seconds, and 10,000 deep raised RecursionError
+MAX_STARTS = 400
+
+
+def decode_at(decoder: json.JSONDecoder, text: str, i: int):
+    """``(value, end)`` of the JSON value at *i*, or None: a value nested past the interpreter's
+    recursion limit is unreadable, not an exception (one hostile reply ended every voter's run)."""
+    try:
+        return decoder.raw_decode(text, i)
+    except (json.JSONDecodeError, RecursionError):
+        return None
+
+
 def _lists(text: str):
-    """Every JSON list in *text*, in order of where it starts."""
+    """Every JSON list in *text*, in order of where it starts (the first `MAX_STARTS`)."""
     # strict=False: a model copying a code line into "quote" writes the line break as a bare
     # newline, which strict JSON forbids; the whole reply was lost to it, not just the quote
     decoder = json.JSONDecoder(strict=False)
-    for i, ch in enumerate(text):
-        if ch != "[":
-            continue
-        try:
-            rows, _end = decoder.raw_decode(text, i)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(rows, list):
-            yield rows
+    i, tries = text.find("["), 0
+    while i != -1 and tries < MAX_STARTS:
+        tries += 1
+        got = decode_at(decoder, text, i)
+        if got is not None and isinstance(got[0], list):
+            yield got[0]
+        i = text.find("[", i + 1)
 
 
 def _objects(text: str) -> list:
     """Every top-level JSON object in *text*, in order (the rows of a reply that has no list)."""
     decoder = json.JSONDecoder(strict=False)
     out: list = []
-    i = text.find("{")
-    while i != -1:
-        try:
-            row, end = decoder.raw_decode(text, i)
-        except json.JSONDecodeError:
+    i, tries = text.find("{"), 0
+    while i != -1 and tries < MAX_STARTS:
+        tries += 1
+        got = decode_at(decoder, text, i)
+        if got is None:
             i = text.find("{", i + 1)
             continue
-        out.append(row)
-        i = text.find("{", end)
+        out.append(got[0])
+        i = text.find("{", got[1])
     return out
 
 
@@ -201,14 +213,23 @@ def parse_votes_v2(text: str, order: list) -> dict:
     an `id` written as a string (`"3"`, `"CLAIM-3"`). A row with an unknown verdict or an
     `id` out of range is dropped; garbage gives {} (the voter cast no votes)."""
     text = text if isinstance(text, str) else ""
-    for candidate in (text, _drop_trailing_commas(text)):
+    # the trailing-comma pass tracks strings from the top: one stray `"` in the prose before the
+    # JSON (`a 5" screen`) put it out of step, and `"TRUE",}` lost the vote; it also runs from
+    # the first `[` / `{`, past the prose
+    lst, obj = text.find("["), text.find("{")
+    tails = [text[k:] for k in (lst, obj) if k > 0]
+    for candidate in (text, _drop_trailing_commas(text), *map(_drop_trailing_commas, tails)):
         for rows in _lists(candidate):
             votes = _rows_to_votes(rows, order)
             if votes:
                 return votes
     # no list: some models answer with the rows one after another (one object a line, or one
     # object for a one-claim prompt); round 280's live smoke lost every vote of one voter to it
-    return _rows_to_votes(_objects(_drop_trailing_commas(text)), order)
+    for candidate in (_drop_trailing_commas(text), *map(_drop_trailing_commas, tails)):
+        votes = _rows_to_votes(_objects(candidate), order)
+        if votes:
+            return votes
+    return {}
 
 
 # ------------------------------------------------------------------ the quote check
@@ -321,7 +342,11 @@ def ask_with_packs(items: list, run: int, seed: int,
         except Exception as exc:   # noqa: BLE001 — a dead model is a result, not a crash
             errors.append(str(exc)[:120] or type(exc).__name__)
             continue
-        got = parse_votes_v2(text, order)
+        try:
+            got = parse_votes_v2(text, order)
+        except Exception as exc:   # noqa: BLE001 — a reply nothing reads is that voter's error, not the run's
+            errors.append(f"unreadable reply: {type(exc).__name__}")
+            got = {}
         if not got and not raw_head:
             raw_head = (text if isinstance(text, str) else "")[:200]
         checked, bad = verify_quotes(got, {k: p for k, (_c, p) in enumerate(shown)})

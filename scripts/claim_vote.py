@@ -263,13 +263,11 @@ def parse_votes(text: str, order: list[int]) -> dict[int, str]:
     """Model reply -> {original claim index: verdict}; garbage gives {}."""
     text = text or ""
     decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch != "[":
-            continue
-        try:
-            rows, _end = decoder.raw_decode(text, i)
-        except json.JSONDecodeError:
-            continue
+    i, tries = text.find("["), 0
+    while i != -1 and tries < cc_judge.MAX_STARTS:   # the CLAIM-1 path had judge.py's RecursionError too
+        tries += 1
+        got, i = cc_judge.decode_at(decoder, text, i), text.find("[", i + 1)
+        rows = got[0] if got is not None else None
         if not isinstance(rows, list):
             continue
         votes: dict[int, str] = {}
