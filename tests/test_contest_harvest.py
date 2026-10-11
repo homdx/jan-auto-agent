@@ -796,19 +796,34 @@ def test_harvest_budget_reworks_with_tests_slow(round_, tmp_path):
     wt = _worktree(repo, base, tmp_path)
     _edit(wt, "tools/auto/probe.py", "PROBE = 1\n")
     _edit(wt, "tests/test_probe.py", "def test_probe():\n    assert True\n")
-    _edit(wt, "tests/test_slow_kc57.py", _SLOW)
+    # the harvest runs the suite in a worktree of its own and drops it after, so the marker is
+    # written outside it, where this test can still see it
+    started = tmp_path / "test_slow_kc57.started"
+    _edit(wt, "tests/test_slow_kc57.py",
+          f"import pathlib\nimport time\n\n\ndef test_slow_kc57():\n"
+          f"    pathlib.Path({str(started)!r}).write_text('started')\n    time.sleep(90)\n")
     _record(wt, ticket.name, outcome="DONE", commit=_commit(wt, "a test that outlives the budget"))
 
-    h = harvest(wt, ticket, run_tests=True, budget_sec=3.0)
+    # KC-184's rule here too: the slow test's *name* is in the reason only when the nested pytest
+    # reached it inside the budget, which on a starved machine is its speed, not the rule (this
+    # test failed 1 run in 3 under -n 8 with 8 busy cores, before and after the claimcheck fixes).
+    # A 3 s budget spent in start-up is retried once with 60 s, under the 90 s the test sleeps.
+    for budget in (3.0, 60.0):
+        started.unlink(missing_ok=True)
+        h = harvest(wt, ticket, run_tests=True, budget_sec=budget)
 
-    assert h.verdict == "REWORK"
-    assert "tests_slow" in _codes(h) and "tests_failed" not in _codes(h)
-    slow = _reason(h, "tests_slow")
-    assert slow.blocking
-    assert "3s harvest budget" in slow.text
+        assert h.verdict == "REWORK"
+        assert "tests_slow" in _codes(h) and "tests_failed" not in _codes(h)
+        slow = _reason(h, "tests_slow")
+        assert slow.blocking
+        assert f"{budget:g}s harvest budget" in slow.text
+        assert len(slow.text) <= TEXT_LIMIT
+        assert h.facts["tests_run"].startswith("tests:budget✗")
+        if started.exists():
+            break
+    else:
+        pytest.fail(f"the nested pytest did not reach its slow test in {budget:g} s")
     assert "test_slow_kc57.py::test_slow_kc57" in slow.text
-    assert len(slow.text) <= TEXT_LIMIT
-    assert h.facts["tests_run"].startswith("tests:budget✗")
 
     message = rework_message(h, 1, 2)
     assert "harvest budget" in message
