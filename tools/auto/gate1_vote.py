@@ -36,11 +36,14 @@ What that does to Gate 1, both ways (measured by the first live run of layer 2,
 A voter is a profile section (of the ini Gate 1 runs with, else of ``contest.ini`` /
 ``contest.local.ini``, where ``claim_vote.py --add-profiles`` writes them) or Kilo's ``provider/model``;
 its family is read off the **model** the section names, never off the section's name. A voter that
-cannot be resolved (checked once, before the first vote) is named in the log and left out; one that misses the vote's time bound twice in
-a run is dropped for the rest of it, and the vote stops when what is left could no longer decide.
-The vote waits as long as the claim_vote pacer's queue needs (voters of one host start two at a
-time, four seconds apart), and each request has 2 x vote_timeout_sec once it has its slot; a
-voter given up on stops retrying, and its thread never holds the process at exit.
+cannot be resolved (checked once, before the first vote) is named in the log and left out; one that gives
+no reply twice in a row (nothing by the vote's bound, or its request failed after its retries) is dropped
+for the rest of the run, and the vote stops when what is left could no longer decide. The vote waits as
+long as the claim_vote pacer's queue needs (voters of one host start two at a time, four seconds apart),
+the requests of the other votes still in flight on that host included (``presence_workers`` > 1: the
+requests reach the pacer in the order their votes queued them), and each request has 2 x
+vote_timeout_sec once it has its slot; a voter given up on stops retrying, and its thread never holds
+the process at exit.
 
 Nothing here raises: a voter that raises, a pack that cannot be built, an ini that is wrong are
 each a "no decision" and a line in the log. ``[gate1] claim_vote = off`` (the default) builds no
@@ -91,7 +94,7 @@ DEFAULT_TIMEOUT_SEC = 60.0
 MAX_INSTRUCTION = 400
 #: times in one run a voter may miss the vote's time bound before it is dropped for the rest of it
 MAX_MISSES = 2
-#: the vote waits 2 x vote_timeout_sec + this for its voters (their requests stop at 2 x the timeout)
+#: the vote waits this past the end of its last request (`Gate1Vote._bound`): the request stops there itself
 VOTE_SLACK_SEC = 5.0
 #: where ``contest.ini`` / ``contest.local.ini`` live (the project root); a test points it elsewhere
 LOCAL_ROOT = Path(__file__).resolve().parents[2]
@@ -207,7 +210,9 @@ class VoteConfig:
                 value = cast(text)
             except ValueError:
                 value = None
-            if value is None or value < low:
+            # float() takes "inf" and "nan", which int() refused: inf overflowed the vote's wait on every
+            # candidate, and nan made it return at once, every voter "missing" it
+            if value is None or not math.isfinite(value) or value < low:
                 logger.warning("config [gate1] %s = %r is malformed — using %s", key, text, default)
                 return default
             return value
@@ -304,6 +309,72 @@ def _load_claim_vote():
     return claim_vote
 
 
+class _Turns:
+    """The places of this run's requests in each host's queue, in the order their votes queued them
+    (`Gate1Vote._run_voters`): a request asks the pacer for a slot only after every earlier one has its
+    slot or has given up. The pacer's semaphore served whoever asked first, and with presence_workers
+    > 1 a vote's requests could reach it after those of a vote queued later, or lose a freed slot to a
+    newcomer, and wait past the bound that had counted them in order ("no free slot before the deadline")."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._issued: Counter = Counter()
+        self._next: Counter = Counter()
+        self._gone: dict = {}              # host -> places given up before their turn: skipped when it comes
+
+    def take(self, host: str) -> int:
+        with self._cond:
+            place = self._issued[host]
+            self._issued[host] += 1
+            return place
+
+    def wait(self, host: str, place: int, deadline: Optional[float]) -> bool:
+        with self._cond:
+            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if self._cond.wait_for(lambda: self._next[host] == place, left):
+                return True
+            self._gone.setdefault(host, set()).add(place)
+            return False
+
+    def done(self, host: str, place: int) -> None:
+        """*place* has its slot, gave up, or never asked: the next place's turn."""
+        with self._cond:
+            if self._next[host] == place:
+                nxt, gone = place + 1, self._gone.get(host, set())
+                while nxt in gone:
+                    gone.discard(nxt)
+                    nxt += 1
+                self._next[host] = nxt
+                self._cond.notify_all()
+            elif self._next[host] < place:
+                self._gone.setdefault(host, set()).add(place)
+
+
+class _Turn:
+    """One request's place (`_Turns`), as the pacer `claim_vote.ask_v2` waits on (``pacer=``)."""
+
+    def __init__(self, turns: _Turns, host: str, place: int, pacer) -> None:
+        self._turns, self._host, self._place, self._pacer = turns, host, place, pacer
+        self._used = False
+
+    def wait(self, provider: str, deadline: Optional[float] = None):
+        if self._used:                     # a second request of the same voter: no place of its own
+            return self._pacer.wait(provider, deadline)
+        self._used = True
+        try:
+            if not self._turns.wait(self._host, self._place, deadline):
+                raise TimeoutError(f"no turn for {provider} before the deadline")
+            return self._pacer.wait(provider, deadline)
+        finally:
+            self._turns.done(self._host, self._place)
+
+    def close(self) -> None:
+        """The request never asked for its slot (it failed before): its place is passed on."""
+        if not self._used:
+            self._used = True
+            self._turns.done(self._host, self._place)
+
+
 class Gate1Vote:
     """The vote of one Gate 1 run. *ask_fn* ``(ref, items, run, seed, timeout) -> row`` is one
     voter's run over ``(claim, pack)`` items (the row of `claim_vote.ask_v2`); the default is
@@ -324,6 +395,8 @@ class Gate1Vote:
         self.stopped = ""                   # why the vote ended for the rest of the run
         self._resolved = False              # resolve_voters ran (once, before the first vote)
         self._hosts: dict = {}              # ref -> the host its requests queue on (the pacer's key)
+        self._inflight: Counter = Counter()  # host -> requests of this run's votes not returned yet
+        self._turns = _Turns()               # their order in each host's queue
         self._resolve_lock = threading.Lock()   # held for the whole resolution: a second presence
                                                 # worker waits for it instead of voting with all refs
         # votes_skipped: candidates that reached the vote and were not voted on (nothing in the tree
@@ -333,30 +406,42 @@ class Gate1Vote:
 
     # -- the voters ----------------------------------------------------------------------------
 
-    def _ask(self, ref: str, items: list, timeout: float, deadline: Optional[float] = None) -> dict:
+    def _ask(self, ref: str, items: list, timeout: float, deadline: Optional[float] = None,
+             turn: Optional[_Turn] = None) -> dict:
         if self._ask_fn is not None:
             return self._ask_fn(ref, items, 0, 0, timeout)
         cv = _load_claim_vote()
         parser = self._voter_parser(cv)
         # code_batch = 1: a Gate 1 candidate is one claim, so a voter costs one request. The timeout
         # is passed as it was set (1.9 was cut to 1). *deadline* bounds the wait for a pacer slot,
-        # and once the request has its slot it has 2 x timeout of its own (budget), retries included
+        # and once the request has its slot it has 2 x timeout of its own (budget), retries included;
+        # *turn* is its place in the host's queue (passed only when set: a stub of ask_v2 still fits)
         return cv.ask_v2(ref, items, 0, 0, parser, timeout, batch=1, code_batch=1, deadline=deadline,
-                         budget=timeout * 2)
+                         budget=timeout * 2, **({"pacer": turn} if turn is not None else {}))
 
-    def _bound(self, refs: list) -> float:
+    def _host(self, ref: str) -> str:
+        return self._hosts.get(ref) or f"#{ref}"
+
+    def _bound(self, refs: list, queued: Optional[Counter] = None) -> float:
         """Seconds the vote waits for *refs*: on one host the claim_vote pacer starts `width`
         requests at a time and `interval` apart, and each has 2 x timeout once it starts. A flat
         2 x timeout + 5 cut the tail of the queue — nine voters on one provider lost the last few
-        every candidate, recorded as dead (and, two in a row, dropped for the run)."""
+        every candidate, recorded as dead (and, two in a row, dropped for the run).
+
+        *queued*: host -> requests already in flight there (`_inflight`), which the pacer serves
+        first. With ``presence_workers`` > 1 several candidates are voted on at once on one
+        pacer, and a bound of the vote's own requests alone cut most of them: eight workers, three
+        voters on one host, 5 of 16 votes decided."""
         per_request = self.cfg.timeout_sec * 2
         if self._ask_fn is not None:
             width, interval = 1, 0.0                 # a test's fake: no pacer, no queue
         else:
             pacer = _load_claim_vote().PACER
             width, interval = max(1, int(getattr(pacer, "_width", 2))), float(getattr(pacer, "interval", 4.0))
-        hosts = Counter(self._hosts.get(r) or f"#{r}" for r in refs)
-        worst = max((math.ceil(k / width) * per_request + (k - 1) * interval for k in hosts.values()), default=0.0)
+        hosts = Counter(self._host(r) for r in refs)
+        queued = queued or Counter()
+        worst = max((math.ceil((k + queued[h]) / width) * per_request + (k + queued[h] - 1) * interval
+                     for h, k in hosts.items()), default=0.0)
         return worst + VOTE_SLACK_SEC
 
     def _voter_parser(self, cv):
@@ -430,18 +515,35 @@ class Gate1Vote:
         for its whole retry budget, and the interpreter waited for it at exit — a plan finished,
         and the process ran on for twenty minutes. The deadline goes into the request itself."""
         timeout = self.cfg.timeout_sec
-        bound = self._bound(refs)             # the bound on the whole vote, the pacer's queue included
+        pacer = None if self._ask_fn is not None else _load_claim_vote().PACER
+        turns: dict = {}
+        with self._lock:
+            # the bound on the whole vote, the pacer's queue included: the requests of the other votes
+            # still in flight on the same hosts are served first (`_Turns` keeps that order), and this
+            # vote's join them
+            bound = self._bound(refs, self._inflight)
+            for ref in refs:
+                host = self._host(ref)
+                self._inflight[host] += 1
+                if pacer is not None:
+                    turns[ref] = _Turn(self._turns, host, self._turns.take(host), pacer)
         deadline = time.monotonic() + bound - VOTE_SLACK_SEC
         rows: dict = {}
         lock, done = threading.Lock(), threading.Event()
         left = [len(refs)]
 
         def one(ref: str) -> None:
+            turn = turns.get(ref)
             try:
-                row = self._ask(ref, items, timeout, deadline)
+                row = self._ask(ref, items, timeout, deadline, turn)
                 got = row if isinstance(row, dict) else {}
             except Exception as exc:   # noqa: BLE001 — a dead voter is a result, not a crash
                 got = {"error": f"raised {type(exc).__name__}: {str(exc)[:100]}"}
+            finally:
+                if turn is not None:
+                    turn.close()
+                with self._lock:      # out of the queue when it returns, given up on or not
+                    self._inflight[self._host(ref)] -= 1
             with lock:
                 rows[ref] = got
                 left[0] -= 1
@@ -463,21 +565,29 @@ class Gate1Vote:
         return out
 
     def _note_voter(self, ref: str, row: Optional[dict]) -> None:
-        """The voter's error, logged once a run (it was dropped); a missed bound counted, and a
-        voter that misses it `MAX_MISSES` times in a row is not asked again this run."""
+        """The voter's error, logged once a run (it was dropped); a vote with no reply of the voter
+        counted, and a voter with `MAX_MISSES` of them in a row is not asked again this run.
+
+        No reply is no row by the bound, or a row of `claim_vote.ask_v2` that had a slot and got no
+        reply (``requests`` > 0, ``replies`` 0: a timeout, a refused connection, an HTTP error, each
+        after its retries). Its request ends at its own deadline, before the bound, so a provider
+        that never answers was "answered" every time: never dropped, and each vote waited out its
+        2 x timeout. A request that never got its slot is the queue's, not the voter's."""
         if row is not None and row.get("error") and ref not in self._warned:
             self._warned.add(ref)
             logger.warning("Gate1[vote] voter %s: %s (logged once a run)", ref, str(row["error"])[:160])
+        failed = row is not None and bool(row.get("requests")) and not row.get("replies")
         with self._lock:
-            if row is not None:
+            if row is not None and not failed:
                 self._misses[ref] = 0
                 return
             self._misses[ref] = self._misses.get(ref, 0) + 1
             dropped = self._misses[ref] >= MAX_MISSES and ref in self._voters
             if dropped:
                 self._voters.remove(ref)
-        logger.warning("Gate1[vote] voter %s did not answer within the vote's bound (%d in a row)%s",
-                       ref, self._misses[ref], " — it is not asked again this run" if dropped else "")
+        logger.warning("Gate1[vote] voter %s %s (%d in a row)%s", ref,
+                       "gave no reply" if failed else "did not answer within the vote's bound",
+                       self._misses[ref], " — it is not asked again this run" if dropped else "")
         if dropped:
             why = self._viable("a voter was dropped")
             if why:

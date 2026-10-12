@@ -382,7 +382,7 @@ def test_the_real_ask_passes_the_timeout_as_set_and_a_deadline(monkeypatch):
     cv = gv._load_claim_vote()
     seen = {}
 
-    def fake_ask_v2(ref, items, run, seed, parser, timeout, batch, code_batch, deadline=None, budget=None):
+    def fake_ask_v2(ref, items, run, seed, parser, timeout, batch, code_batch, deadline=None, budget=None, pacer=None):
         seen.update(timeout=timeout, deadline=deadline, budget=budget)
         return {"model": ref, "votes": {}}
 

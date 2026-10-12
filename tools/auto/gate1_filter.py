@@ -74,6 +74,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -540,6 +541,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 sec, "presence_deadline_sec", fallback=str(DEFAULT_PRESENCE_DEADLINE_SEC)) or 0)
             if self._presence_deadline_sec < 0:
                 raise ValueError("below 0")
+            if not math.isfinite(self._presence_deadline_sec):
+                raise ValueError("not a number of seconds (0 = no bound)")   # nan was no bound at all
         except ValueError as exc:
             logger.warning("config [%s] presence_deadline_sec is malformed (%s) — using default %.0f",
                            sec, exc, DEFAULT_PRESENCE_DEADLINE_SEC)

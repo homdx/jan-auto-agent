@@ -356,16 +356,17 @@ def ask(ref: str, claims: list[str], run: int, seed: int, parser: configparser.C
 
 def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.ConfigParser,
            timeout: float, batch: int = 10, code_batch: int = 2, fixed: bool = False,
-           deadline: "float | None" = None, budget: "float | None" = None) -> dict:
+           deadline: "float | None" = None, budget: "float | None" = None, pacer=None) -> dict:
     """CC-6's `ask`: one model, one run over ``(claim, pack_or_None)`` items, prompt v2,
     every committed vote on a claim with a pack checked against its quote.
 
     The HTTP call, the pacer and the retry budget are `ask`'s; the batching, the prompt,
     the parser and the check are ``tools.claimcheck.judge.ask_with_packs``. The row adds
-    ``accepted`` (the evidence of each vote that stood) and ``rejected`` (each downgrade,
-    with its reason) to `ask`'s. *deadline* (``time.monotonic()``, Gate 1's vote): no slot is
+    ``accepted`` (the evidence of each vote that stood), ``rejected`` (each downgrade,
+    with its reason), ``requests`` (made with a pacer slot) and ``replies`` (answered) to `ask`'s. *deadline* (``time.monotonic()``, Gate 1's vote): no slot is
     waited for and no retry is made past it (`request_completion`'s ``deadline``). *budget*:
-    seconds one request has once it holds its pacer slot (the queue is not its time)."""
+    seconds one request has once it holds its pacer slot (the queue is not its time). *pacer*: what
+    the request waits on for its slot instead of `PACER` (Gate 1 keeps its votes' requests in order)."""
     try:
         st = voter_settings(ref, parser)
         retry = retry_kwargs_from_config(parser, SECTION)
@@ -381,7 +382,7 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
             max_tokens=st.max_tokens, system=cc_judge.SYSTEM,
             user_msg=prompt, num_ctx=st.num_ctx, think=st.think)
         headers.setdefault("User-Agent", USER_AGENT)
-        sem = PACER.wait(host, deadline)
+        sem = (pacer or PACER).wait(host, deadline)
         started = time.monotonic()
         end = deadline
         if budget is not None:
@@ -389,8 +390,10 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
         # passed only when set: a stub of request_completion with the old signature still fits
         until = {"deadline": end} if end is not None else {}
         try:
-            return strip_think(request_completion(url, headers, payload, timeout,
+            text = strip_think(request_completion(url, headers, payload, timeout,
                                                   api_format=st.api_format, **retry, **until))
+            replies[0] += 1
+            return text
         finally:
             sem.release()
             calls[0] += 1
@@ -399,11 +402,13 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
             print(f"[progress] {ref} run{run} request {calls[0]} "
                   f"{time.monotonic() - started:.0f}s", file=sys.stderr, flush=True)
 
-    calls = [0]
+    calls, replies = [0], [0]
     got = cc_judge.ask_with_packs(items, run, seed, complete, batch=batch,
                                   code_batch=code_batch, fixed=fixed)
+    # requests: made with a pacer slot; replies: answered (garbage included). Gate 1's vote tells a
+    # voter that never replies from one whose request found no free slot (`Gate1Vote._note_voter`)
     out = {"model": ref, "run": run, "votes": got["votes"], "accepted": got["accepted"],
-           "rejected": got["rejected"]}
+           "rejected": got["rejected"], "requests": calls[0], "replies": replies[0]}
     if got["errors"]:
         out["error"] = got["errors"][0]
     if got["raw_head"]:
