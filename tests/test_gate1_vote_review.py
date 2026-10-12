@@ -382,14 +382,14 @@ def test_the_real_ask_passes_the_timeout_as_set_and_a_deadline(monkeypatch):
     cv = gv._load_claim_vote()
     seen = {}
 
-    def fake_ask_v2(ref, items, run, seed, parser, timeout, batch, code_batch, deadline=None):
-        seen.update(timeout=timeout, deadline=deadline)
+    def fake_ask_v2(ref, items, run, seed, parser, timeout, batch, code_batch, deadline=None, budget=None):
+        seen.update(timeout=timeout, deadline=deadline, budget=budget)
         return {"model": ref, "votes": {}}
 
     monkeypatch.setattr(cv, "ask_v2", fake_ask_v2)
     vote = gv.Gate1Vote(gv.VoteConfig(True, THREE, timeout_sec=1.9))
     vote._run_voters([THREE[0]], [])
-    assert seen["timeout"] == 1.9
+    assert seen["timeout"] == 1.9 and seen["budget"] == 3.8      # the request's own time, from its slot
     assert 0 < seen["deadline"] - time.monotonic() <= 3.8
 
 

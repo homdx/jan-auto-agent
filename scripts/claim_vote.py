@@ -356,7 +356,7 @@ def ask(ref: str, claims: list[str], run: int, seed: int, parser: configparser.C
 
 def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.ConfigParser,
            timeout: float, batch: int = 10, code_batch: int = 2, fixed: bool = False,
-           deadline: "float | None" = None) -> dict:
+           deadline: "float | None" = None, budget: "float | None" = None) -> dict:
     """CC-6's `ask`: one model, one run over ``(claim, pack_or_None)`` items, prompt v2,
     every committed vote on a claim with a pack checked against its quote.
 
@@ -364,7 +364,8 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
     the parser and the check are ``tools.claimcheck.judge.ask_with_packs``. The row adds
     ``accepted`` (the evidence of each vote that stood) and ``rejected`` (each downgrade,
     with its reason) to `ask`'s. *deadline* (``time.monotonic()``, Gate 1's vote): no slot is
-    waited for and no retry is made past it (`request_completion`'s ``deadline``)."""
+    waited for and no retry is made past it (`request_completion`'s ``deadline``). *budget*:
+    seconds one request has once it holds its pacer slot (the queue is not its time)."""
     try:
         st = voter_settings(ref, parser)
         retry = retry_kwargs_from_config(parser, SECTION)
@@ -382,8 +383,11 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
         headers.setdefault("User-Agent", USER_AGENT)
         sem = PACER.wait(host, deadline)
         started = time.monotonic()
+        end = deadline
+        if budget is not None:
+            end = started + budget if end is None else min(end, started + budget)
         # passed only when set: a stub of request_completion with the old signature still fits
-        until = {"deadline": deadline} if deadline is not None else {}
+        until = {"deadline": end} if end is not None else {}
         try:
             return strip_think(request_completion(url, headers, payload, timeout,
                                                   api_format=st.api_format, **retry, **until))

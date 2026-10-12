@@ -38,8 +38,9 @@ A voter is a profile section (of the ini Gate 1 runs with, else of ``contest.ini
 its family is read off the **model** the section names, never off the section's name. A voter that
 cannot be resolved (checked once, before the first vote) is named in the log and left out; one that misses the vote's time bound twice in
 a run is dropped for the rest of it, and the vote stops when what is left could no longer decide.
-The voters' requests carry the vote's deadline, so one that is given up on stops retrying, and its
-thread never holds the process at exit.
+The vote waits as long as the claim_vote pacer's queue needs (voters of one host start two at a
+time, four seconds apart), and each request has 2 x vote_timeout_sec once it has its slot; a
+voter given up on stops retrying, and its thread never holds the process at exit.
 
 Nothing here raises: a voter that raises, a pack that cannot be built, an ini that is wrong are
 each a "no decision" and a line in the log. ``[gate1] claim_vote = off`` (the default) builds no
@@ -53,6 +54,7 @@ each a "no decision" and a line in the log. ``[gate1] claim_vote = off`` (the de
     vote_timeout_sec    = 60                     ; one HTTP request of one voter (seconds, a fraction kept)
     vote_confirm        = on                     ; off: the vote only vetoes (a unanimous TRUE is the reader's)
     vote_skip_tests     = off                    ; on: a candidate citing a test file is not put to the voters
+                                                 ; (tools/collect/test_paths, test dirs, a test_*.py that holds a test)
     vote_veto_by_reader = on                     ; a unanimous FALSE also needs the reader not
                                                  ; to say confirmed
     vote_accept         = all | committed        ; CC-11: with five or more voters, `committed`
@@ -64,15 +66,19 @@ from __future__ import annotations
 
 import configparser
 import logging
+import math
+import re
 import sys
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 from tools.claimcheck import anchors as cc_anchors
 from tools.claimcheck import truth as cc_truth
+from tools.collect import test_paths as _test_paths
 from tools.claimcheck.pack import PackBudget, build_pack
 
 logger = logging.getLogger(__name__)
@@ -252,12 +258,40 @@ def claim_of(candidate) -> str:
     return f"{where} has the problem: {instruction}"
 
 
-def _is_test_path(path: str) -> bool:
-    """A cited file that is test code: under tests/ or tests_bugfix/ (at any depth) or named ``test_*``/``*_test.*``."""
-    parts = str(path or "").replace("\\", "/").split("/")
+#: directories whose files are test code at any depth (pytest's tests/, Java's src/test/, Jest's __tests__/)
+_TEST_DIRS = frozenset(("tests", "test", "__tests__", "tests_bugfix", "tests_slow", ".smoke_tests",
+                        ".regression_tests", "spec", "specs"))
+#: pytest's file shapes: a test only when the file holds one (see `_is_test_path`)
+_PY_TEST_NAME = re.compile(r"(?:^test_.*|_test)\.py$")
+_PY_TEST_DEF = re.compile(r"^\s*(?:async\s+)?def\s+test\w*\s*\(|^class\s+Test\w*", re.M)
+#: other languages' test files, unambiguous by name (Go requires the suffix; Jest and friends the infix)
+_OTHER_TEST_NAME = re.compile(r"_test\.go$|\.(?:test|spec)\.[cm]?[jt]sx?$")
+
+
+def _is_test_path(path: str, view=None) -> bool:
+    """A cited file that is test code. The project's own rule first (`tools/collect/test_paths`:
+    its test roots, a ``conftest.py`` anywhere), then a test directory at any depth, the other
+    languages' test names, Django's ``tests.py`` — and a pytest-shaped name (``test_*.py``,
+    ``*_test.py``) outside those only when the file holds a test (with *view*, a ``RepoView``):
+    `tools/collect/test_map.py` is shipped code and lost its vote, while `conftest.py`,
+    ``*.spec.ts`` and ``__tests__/`` were voted on."""
+    p = str(path or "").replace("\\", "/")
+    if not p:
+        return False
+    parts = p.split("/")
     name = parts[-1]
-    return (any(p in ("tests", "tests_bugfix", "test", ".smoke_tests", ".regression_tests") for p in parts[:-1])
-            or name.startswith("test_") or name.rsplit(".", 1)[0].endswith("_test"))
+    if _test_paths.is_test_path(p) or any(d in _TEST_DIRS for d in parts[:-1]):
+        return True
+    if name in ("conftest.py", "tests.py") or _OTHER_TEST_NAME.search(name):
+        return True
+    if _PY_TEST_NAME.search(name):
+        if view is None:
+            return True
+        try:
+            return bool(_PY_TEST_DEF.search(view.read(p)))
+        except Exception:   # noqa: BLE001 — unreadable: the name decides, as before
+            return True
+    return False
 
 
 def _load_claim_vote():
@@ -289,6 +323,7 @@ class Gate1Vote:
         self._warned: set = set()           # refs whose error was logged once
         self.stopped = ""                   # why the vote ended for the rest of the run
         self._resolved = False              # resolve_voters ran (once, before the first vote)
+        self._hosts: dict = {}              # ref -> the host its requests queue on (the pacer's key)
         self._resolve_lock = threading.Lock()   # held for the whole resolution: a second presence
                                                 # worker waits for it instead of voting with all refs
         # votes_skipped: candidates that reached the vote and were not voted on (nothing in the tree
@@ -304,9 +339,25 @@ class Gate1Vote:
         cv = _load_claim_vote()
         parser = self._voter_parser(cv)
         # code_batch = 1: a Gate 1 candidate is one claim, so a voter costs one request. The timeout
-        # is passed as it was set (1.9 was cut to 1), and the deadline stops the request's retries
-        # once the vote no longer waits for it
-        return cv.ask_v2(ref, items, 0, 0, parser, timeout, batch=1, code_batch=1, deadline=deadline)
+        # is passed as it was set (1.9 was cut to 1). *deadline* bounds the wait for a pacer slot,
+        # and once the request has its slot it has 2 x timeout of its own (budget), retries included
+        return cv.ask_v2(ref, items, 0, 0, parser, timeout, batch=1, code_batch=1, deadline=deadline,
+                         budget=timeout * 2)
+
+    def _bound(self, refs: list) -> float:
+        """Seconds the vote waits for *refs*: on one host the claim_vote pacer starts `width`
+        requests at a time and `interval` apart, and each has 2 x timeout once it starts. A flat
+        2 x timeout + 5 cut the tail of the queue — nine voters on one provider lost the last few
+        every candidate, recorded as dead (and, two in a row, dropped for the run)."""
+        per_request = self.cfg.timeout_sec * 2
+        if self._ask_fn is not None:
+            width, interval = 1, 0.0                 # a test's fake: no pacer, no queue
+        else:
+            pacer = _load_claim_vote().PACER
+            width, interval = max(1, int(getattr(pacer, "_width", 2))), float(getattr(pacer, "interval", 4.0))
+        hosts = Counter(self._hosts.get(r) or f"#{r}" for r in refs)
+        worst = max((math.ceil(k / width) * per_request + (k - 1) * interval for k in hosts.values()), default=0.0)
+        return worst + VOTE_SLACK_SEC
 
     def _voter_parser(self, cv):
         """*config* with a ``[claim_vote]`` section and the voters' sections (`voter_ini`):
@@ -345,6 +396,7 @@ class Gate1Vote:
                 if not (st.base_url and st.model):
                     raise ValueError("no base_url or model")
                 models[ref] = st.model
+                self._hosts[ref] = st.base_url.split("//")[-1].split("/")[0]
             except (ValueError, OSError, KeyError, configparser.Error) as exc:
                 logger.warning("Gate1[vote] voter %s cannot be used (%s) — it is left out", ref, str(exc)[:120])
                 self._voters.remove(ref)
@@ -378,8 +430,8 @@ class Gate1Vote:
         for its whole retry budget, and the interpreter waited for it at exit — a plan finished,
         and the process ran on for twenty minutes. The deadline goes into the request itself."""
         timeout = self.cfg.timeout_sec
-        bound = timeout * 2 + VOTE_SLACK_SEC  # the bound on the whole vote
-        deadline = time.monotonic() + timeout * 2
+        bound = self._bound(refs)             # the bound on the whole vote, the pacer's queue included
+        deadline = time.monotonic() + bound - VOTE_SLACK_SEC
         rows: dict = {}
         lock, done = threading.Lock(), threading.Event()
         left = [len(refs)]
@@ -465,7 +517,7 @@ class Gate1Vote:
             self.resolve_voters()
         if self.stopped:
             return self._skip()
-        if self.cfg.skip_tests and _is_test_path(candidate.cited_location.file):
+        if self.cfg.skip_tests and _is_test_path(candidate.cited_location.file, view):
             return self._skip()       # a claim about a test is "the test lacks X": true and no reason for a task
         where, instruction = claim_parts(candidate)
         if not instruction:
@@ -473,7 +525,7 @@ class Gate1Vote:
             # "`f` in `x.py` has the problem: " was three requests about nothing
             return self._skip()
         claim = claim_of(candidate)
-        resolved = cc_anchors.resolve_anchors(cc_anchors.extract_anchors(claim), view)
+        resolved = cc_anchors.resolve_claim(claim, view)
         kind = cc_anchors.classify(claim, resolved)
         # dangling is judged on the cited file and symbol only: an instruction that names the file
         # it will create ("add a test in tests/test_new.py") made every such candidate "dangling",
