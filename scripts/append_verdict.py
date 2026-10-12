@@ -101,7 +101,9 @@ def main():
         w.writerow(row)
         fh.flush()
         os.fsync(fh.fileno())
-    n = sum(1 for _ in open(out, encoding="utf-8")) - 1
+    # closed at once, and counted in CSV rows: a quoted cell over two lines is one verdict
+    with open(out, newline="", encoding="utf-8-sig") as fh:
+        n = sum(1 for _ in csv.reader(fh)) - 1
     print(f"decided #{n}: {row['truth']} {row['finding']} -> {out}")
     return 0
 

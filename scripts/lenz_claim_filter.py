@@ -101,10 +101,28 @@ def split_sentences(text: str) -> list[str]:
             if label.group(1).lower() in _NOT_CLAIMS:
                 continue
             line = line[label.end():]
-        for part in re.split(r"(?<=[.!?])\s+(?=[A-Z`])", line):
+        for part in _sentences(line):
             part = part.strip()
             if len(part) > 30:
                 out.append(part)
+    return out
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z`])")
+#: an abbreviation is no sentence end: "e.g. Python is widely used ..." went to Lenz as a claim of its own
+_ABBREV_END = re.compile(r"(?:^|[\s(])(?:e\.g|i\.e|etc|vs|cf|fig|no|approx|resp|incl|esp)\.$", re.I)
+
+
+def _sentences(line: str) -> list[str]:
+    """*line* cut at sentence ends: a full stop, ``!`` or ``?`` before a capital or a backtick, not
+    after a common abbreviation."""
+    out, start = [], 0
+    for m in _SENTENCE_END.finditer(line):
+        if _ABBREV_END.search(line[start:m.start()]):
+            continue
+        out.append(line[start:m.start()])
+        start = m.end()
+    out.append(line[start:])
     return out
 
 
@@ -184,6 +202,11 @@ def api_key() -> str:
     return getpass.getpass("Lenz API key (not saved): ").strip()
 
 
+class LenzError(Exception):
+    """One Lenz call that did not answer: HTTP, network or a reply that is no JSON. A batch fetched
+    before it is cached, so a re-run does not pay for it again."""
+
+
 def call(method: str, path: str, key: str, body: dict | None = None,
          timeout: int = 120) -> dict:
     req = urllib.request.Request(
@@ -195,7 +218,13 @@ def call(method: str, path: str, key: str, body: dict | None = None,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        sys.exit(f"Lenz {method} {path}: HTTP {exc.code} {exc.read()[:300]!r}")
+        # raised, not sys.exit: /verify's poll loop loses its paid task id to an exit
+        raise LenzError(f"Lenz {method} {path}: HTTP {exc.code} {exc.read()[:300]!r}") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        # a dropped connection, a DNS failure, a timeout: a traceback before
+        raise LenzError(f"Lenz {method} {path}: {type(exc).__name__}: {getattr(exc, 'reason', exc)}") from None
+    except ValueError as exc:
+        raise LenzError(f"Lenz {method} {path}: the reply is not JSON ({exc})") from None
 
 
 def _heading_parts(text: str) -> list[str]:
@@ -307,7 +336,11 @@ def verify(claim: str, key: str, cache: Cache, wait: int = 240) -> dict:
     deadline = time.time() + wait
     while task_id and time.time() < deadline:
         time.sleep(10)
-        st = call("GET", f"/verify/status/{task_id}", key)
+        try:
+            st = call("GET", f"/verify/status/{task_id}", key)
+        except LenzError as exc:
+            # the /verify was paid for: its task id is reported, not lost with the process
+            return {"status": "error", "task_id": task_id, "error": str(exc), "cached": False}
         if st.get("status") in ("completed", "complete", "done", "ready", "failed"):
             if st.get("status") != "failed":
                 cache.put("verify", claim, st)
@@ -373,14 +406,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:                      # the next stage never reads a stale file
             args.json.write_text("[]\n", encoding="utf-8")
         return 0
-    rows = assess(claims, need_key() if fresh else "", cache)
+    try:
+        rows = assess(claims, need_key() if fresh else "", cache)
+    except LenzError as exc:
+        print(f"lenz_claim_filter: {exc} — the rows fetched before it are cached; a re-run does not "
+              "send them again", file=sys.stderr)
+        return 1
     report = {"source": str(args.report), "sentences": len(extracted),
               "internal": len(extracted) - len(claims), "rows": rows, "verify": None}
     worst = most_doubtful(rows) if args.verify else None
     if worst is not None:
         claim = rows[worst].get("claim") or claims[worst]
         key = "" if cache.get("verify", claim) else need_key()
-        report["verify"] = {"claim_text": claim, "result": verify(claim, key, cache)}
+        try:
+            result = verify(claim, key, cache)
+        except LenzError as exc:
+            result = {"status": "error", "error": str(exc), "cached": False}
+        report["verify"] = {"claim_text": claim, "result": result}
     print(render(report))
     if args.json:
         args.json.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")

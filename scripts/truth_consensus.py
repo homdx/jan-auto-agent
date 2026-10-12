@@ -69,7 +69,16 @@ def main():
     if a.arbiter:
         a.arbiter = a.arbiter.strip().lower()
 
-    paths = [p for pat in a.csvs for p in sorted(glob.glob(pat))] or a.csvs
+    paths, unmatched = [], []
+    for pat in a.csvs:
+        hits = sorted(glob.glob(pat))
+        paths += hits
+        if not hits:
+            unmatched.append(pat)
+    if unmatched:
+        # the pattern itself was opened: a FileNotFoundError traceback
+        print(f"no file matches: {', '.join(unmatched)}", file=sys.stderr)
+        return 2
     rows = load(paths)
     if not rows:
         print("no verdict rows", file=sys.stderr)
@@ -85,13 +94,16 @@ def main():
         votes = {r["_adj"]: r["truth"] for r in rs}
         distinct = {v for v in votes.values() if v != "UNDECIDED"}
         if len(distinct) == 1:
-            settled[k] = (distinct.pop(), rs)
+            verdict = distinct.pop()
+            # only who said it: an UNDECIDED adjudicator was listed under "agreed by" and in
+            # checked_by, and its own `how` could be the one the report quoted
+            settled[k] = (verdict, [r for r in rs if r["truth"] == verdict])
         elif distinct:
             # An arbiter breaks the tie rather than the count doing it. Two
             # models agreeing is not evidence when both applied the same wrong
             # rule — which is exactly how a split usually arises.
             if a.arbiter and a.arbiter in votes and votes[a.arbiter] != "UNDECIDED":
-                settled[k] = (votes[a.arbiter], rs)
+                settled[k] = (votes[a.arbiter], [r for r in rs if r["truth"] == votes[a.arbiter]])
                 arbitrated[k] = (votes[a.arbiter], votes)
             else:
                 disputed[k] = (votes, rs)
@@ -183,7 +195,8 @@ def main():
 
     text = "\n".join(L)
     if a.report:
-        open(a.report, "w", encoding="utf-8").write(text)
+        with open(a.report, "w", encoding="utf-8") as fh:
+            fh.write(text)
         print(f"report -> {a.report}")
     else:
         print(text)
