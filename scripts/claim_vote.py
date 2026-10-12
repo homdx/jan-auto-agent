@@ -433,7 +433,7 @@ def claim_kind(claim: str, symbols: "set[str] | None" = None, view=None) -> tupl
     (CC-1, ``tools/claimcheck/anchors.py``); without one the regex rule
     ``lenz_claim_filter.is_internal`` decides, as before, and nothing dangles."""
     if view is not None:
-        resolved = cc_anchors.resolve_anchors(cc_anchors.extract_anchors(claim), view)
+        resolved = cc_anchors.resolve_claim(claim, view)
         return cc_anchors.classify(claim, resolved), cc_anchors.is_dangling(resolved)
     return ("code" if lf.is_internal(claim, symbols or set()) else "world"), False
 
@@ -562,7 +562,7 @@ def prepare_target(claims: list[dict], target: Target, budget: PackBudget,
     model = [None, False]    # built once, on the first claim that needs a pack
     for c in claims:
         text = c["claim"]
-        resolved = cc_anchors.resolve_anchors(cc_anchors.extract_anchors(text), view)
+        resolved = cc_anchors.resolve_claim(text, view)
         kind = cc_anchors.classify(text, resolved)
         pack = None
         if kind != "world":

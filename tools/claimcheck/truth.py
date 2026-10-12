@@ -376,10 +376,28 @@ def _csv_text(header, rows: list) -> str:
     return buf.getvalue()
 
 
-def _umask() -> int:
+def _read_umask_once() -> int:
     mask = os.umask(0)
     os.umask(mask)
     return mask
+
+
+#: the umask at import, for a system without /proc: set and put back once, before any thread
+_UMASK_AT_IMPORT = _read_umask_once()
+
+
+def _umask() -> int:
+    """The process umask, read without changing it: os.umask(0) and back is process-wide, and a
+    file another thread created in between got no umask at all. /proc/self/status says it on
+    Linux; elsewhere the value read at import."""
+    try:
+        with open("/proc/self/status", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    return _UMASK_AT_IMPORT
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -504,6 +522,6 @@ def rebuild(votes: dict, repo, *, scratch, parser=None) -> tuple:
         items, _meta = claim_vote.prepare_target(claims, target, _budget_of(target_info, parser),
                                                  base_sha, collect=bool(target_info.get("collect")))
         view = target.view()
-        resolved = [cc_anchors.resolve_anchors(cc_anchors.extract_anchors(c["claim"]), view)
+        resolved = [cc_anchors.resolve_claim(c["claim"], view)
                     for c in claims]
     return resolved, [pack for _text, pack in items], base_sha

@@ -130,7 +130,7 @@ def primary_vanished(base_resolved, head_resolved) -> bool:
 
 def resolve(claim: str, view) -> list:
     """CC-1's resolved anchors of *claim* in *view* (the definition index is built once per view)."""
-    return cc_anchors.resolve_anchors(cc_anchors.extract_anchors(claim), view)
+    return cc_anchors.resolve_claim(claim, view)
 
 
 # ------------------------------------------------------------------ compare

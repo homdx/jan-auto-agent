@@ -106,11 +106,11 @@
   "claim": "`lib/config.py` defines `to_int` as a lambda that strips its value.",
   "chunks": [
    {
-    "id": "src:lib/config.py:1-34",
-    "start": 1,
-    "end": 34,
-    "why": "lib/config.py",
-    "text": "  1| \"\"\"Settings read from an ini file.\"\"\"\n  2| \n  3| import configparser\n  4| import os\n  5| from typing import TYPE_CHECKING\n  6| \n  7| if TYPE_CHECKING:\n  8|     def typed_section(name: str) -> dict: ...\n  9| \n 10| DEFAULT_TIMEOUT = 30\n 11| \n 12| to_int = lambda value: int(value.strip())\n 13| \n 14| \n 15| def read_config(path: str) -> configparser.ConfigParser:\n 16|     parser = configparser.ConfigParser()\n 17|     parser.read(path, encoding=\"utf-8\")\n 18|     return parser\n 19| \n 20| \n 21| def load_timeout(parser) -> int:\n 22|     \"\"\"The step timeout, in seconds.\"\"\"\n 23|     if not parser.has_section(\"defaults\"):\n 24|         return DEFAULT_TIMEOUT\n 25|     return parser.getint(\"defaults\", \"timeout\", fallback=DEFAULT_TIMEOUT)\n 26| \n 27| \n 28| def parse_bool(text: str) -> bool:\n 29|     return text.strip().lower() in (\"1\", \"yes\", \"true\", \"on\")\n 30| \n 31| \n 32| def get_list(parser, key: str) -> list:\n 33|     raw = parser.get(\"pipeline\", key, fallback=\"\")\n 34|     return [item for item in raw.split(\",\") if item]"
+    "id": "src:lib/config.py:12-12",
+    "start": 12,
+    "end": 12,
+    "why": "to_int",
+    "text": " 12| to_int = lambda value: int(value.strip())"
    }
   ]
  },
@@ -123,6 +123,13 @@
     "end": 28,
     "why": "lib/config.py:24-25",
     "text": " 21| def load_timeout(parser) -> int:\n 22|     \"\"\"The step timeout, in seconds.\"\"\"\n 23|     if not parser.has_section(\"defaults\"):\n 24|         return DEFAULT_TIMEOUT\n 25|     return parser.getint(\"defaults\", \"timeout\", fallback=DEFAULT_TIMEOUT)\n 26| \n 27| \n 28| def parse_bool(text: str) -> bool:"
+   },
+   {
+    "id": "src:lib/config.py:10-10",
+    "start": 10,
+    "end": 10,
+    "why": "DEFAULT_TIMEOUT",
+    "text": " 10| DEFAULT_TIMEOUT = 30"
    }
   ]
  },

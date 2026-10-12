@@ -246,7 +246,10 @@ def find_all_quote(pack: Pack, quote: str) -> list:
     * the quote must lie inside **one** chunk, and inside one run of its lines: a quote that
       runs across two chunks, or across an omission marker, is not a quote of either;
     * a marker line (`# … 5 lines omitted (10-14)`) is not a quoted line;
-    * a quote shorter than `MIN_QUOTE` characters after normalising proves nothing: [].
+    * a quote shorter than `MIN_QUOTE` characters after normalising proves nothing: [];
+    * its edges are the line's token edges: a quote that starts or ends with a letter, a digit
+      or ``_`` must not continue a token of the line there — ``MAX_RETRIES = 1`` is no quote
+      of ``MAX_RETRIES = 10``, nor ``RETRIES = 10`` of it (a voter's FALSE stood on it).
 
     One line can sit in two chunks (a function's `src:` chunk and the `git:` hunk that
     changed it): both are listed, so a voter that names the lower-ranked one is still right.
@@ -260,8 +263,16 @@ def find_all_quote(pack: Pack, quote: str) -> list:
                if len(n) >= MIN_QUOTE}
     if not needles:
         return []
+    patterns = [_edged(n) for n in needles]
     return [chunk.id for chunk in pack.chunks
-            if any(needle in run for run in _segments(chunk) for needle in needles)]
+            if any(rx.search(run) for run in _segments(chunk) for rx in patterns)]
+
+
+def _edged(needle: str) -> "re.Pattern":
+    """*needle* as a pattern that matches only at token edges where it has a word character."""
+    head = r"(?<![\w])" if re.match(r"\w", needle[0]) else ""
+    tail = r"(?![\w])" if re.match(r"\w", needle[-1]) else ""
+    return re.compile(head + re.escape(needle) + tail)
 
 
 def find_quote(pack: Pack, quote: str) -> Optional[str]:

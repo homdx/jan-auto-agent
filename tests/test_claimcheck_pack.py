@@ -490,7 +490,12 @@ def test_the_render_parses_back(tmp_path):
             hit = got.find(run)                      # a whole run of the chunk's lines is a quote of it ...
             assert hit is not None and order.index(hit) <= order.index(c.id)   # ... or of an earlier chunk with it
             if len(run) >= 20:
-                assert got.find(run[5:-3]) is not None
+                # an inner part of a run is a quote too, cut at token edges: a cut inside a token
+                # (`cy._mechanical`) is no quote since a quote's edges are the line's token edges
+                i, j = run.find(" ", 5), run.rfind(" ", 0, len(run) - 3)
+                inner = run[i:j].strip() if 0 <= i < j else ""
+                if len(inner) >= pack_mod.MIN_QUOTE:
+                    assert got.find(inner) is not None
 
 
 # ------------------------------------------------------------------ find

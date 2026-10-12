@@ -262,22 +262,38 @@ class _Def:
     end: int
 
 
+def _assigned_names(node) -> list:
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    names: list = []
+    for t in targets:
+        for n in ([t] if isinstance(t, ast.Name) else getattr(t, "elts", ())):
+            if isinstance(n, ast.Name):
+                names.append(n.id)
+    return names
+
+
 def _definitions(text: str, path: str) -> list:
     """Every `def`, `async def` and `class` of one module, nested ones by dotted
-    qualname, each with the span a reader would call the definition."""
+    qualname, each with the span a reader would call the definition; and every name a module
+    or a class body assigns (`MAX_RETRIES = 3`, `timeout: int = 30`), a constant being a
+    definition too — a claim about `MAX_RETRIES` found nothing and went to the voters as a
+    world claim, with no code in front of them. A function's locals are not definitions."""
     tree = ast.parse(text)
     out: list = []
-    stack = [(tree, "")]
+    stack = [(tree, "", True)]     # node, qualname prefix, whether its assignments define names
     while stack:
-        node, prefix = stack.pop()
+        node, prefix, defining = stack.pop()
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 qualname = prefix + child.name
                 start = min([child.lineno] + [d.lineno for d in child.decorator_list])
                 out.append(_Def(path, qualname, start, child.end_lineno or child.lineno))
-                stack.append((child, qualname + "."))
+                stack.append((child, qualname + ".", isinstance(child, ast.ClassDef)))
+            elif defining and isinstance(child, (ast.Assign, ast.AnnAssign)):
+                for name in _assigned_names(child):
+                    out.append(_Def(path, prefix + name, child.lineno, child.end_lineno or child.lineno))
             else:
-                stack.append((child, prefix))
+                stack.append((child, prefix, defining))
     return out
 
 
@@ -492,6 +508,37 @@ def _resolve_ticket(anchor: Anchor, view: RepoView, index: _Index) -> ResolvedAn
         return ResolvedAnchor(anchor, True, path=path)
     ours = "-" in ticket_id or "epic-tasks" in index.top_dirs
     return ResolvedAnchor(anchor, False, path="epic-tasks" if ours else "")
+
+
+#: an identifier written without backticks: snake_case or UPPER_SNAKE (one `_` at least, not only
+#: at the ends), outside a path, a call, a dotted name and backticks — `retry_call never raises`
+_BARE_IDENT = re.compile(r"(?<![\w.`/$@\-])([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?![\w`(/\-])")
+
+
+def resolve_claim(claim: str, view: RepoView) -> list:
+    """`resolve_anchors` of *claim*'s anchors, plus every identifier written without backticks
+    that the repository defines (`retry_call`, `MAX_RETRIES`): a claim that named the repo's own
+    function that way was a `world` claim, settled by the voters with no code in front of them
+    (the legacy symbols rule had it as code). An identifier the repository does not define stays
+    a word; a single lowercase word (`backoff`) stays one by ticket 255's rule, written either way."""
+    anchors = extract_anchors(claim)
+    resolved = resolve_anchors(anchors, view)
+    taken = [(a.start, a.end) for a in anchors]
+    extra = []
+    index = None
+    for m in _BARE_IDENT.finditer(claim):
+        start, end = m.span(1)
+        name = m.group(1)
+        if any(start < e and s < end for s, e in taken) or name in _NOT_SYMBOLS or keyword.iskeyword(name):
+            continue
+        index = index or _index_of(view)
+        got = _resolve_symbol(Anchor("symbol", name, start, end), index)
+        if got.found:
+            extra.append(got)
+    if not extra:
+        return resolved
+    out = sorted(resolved + extra, key=lambda r: (r.anchor.start, r.anchor.end))
+    return _prefer_named_file(out, index)
 
 
 def resolve_anchors(anchors, view: RepoView) -> list:
