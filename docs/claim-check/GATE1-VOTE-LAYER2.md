@@ -28,6 +28,8 @@ Options worth knowing:
 |---|---|
 | `--sets 3,5,7,9` | voter sets to test (the default is `3:all,5:committed,7:committed,9:committed`); `--sets 3,5,7,9,11` adds the 11-voter set with two weak voters |
 | `--sets 5:all,5:committed` | the same size under both acceptance rules, to see what `committed` buys |
+| `--sets 3+veto,3+notests,5+veto+notests` | the variants of section 6: `+veto` = `vote_confirm = off` (a unanimous FALSE rejects, a unanimous TRUE is the reader's), `+notests` = `vote_skip_tests = on` (candidates citing a test file are not voted); a `+veto` variant is not asked to decide a third, only not to be worse |
+| `--off-runs 2` | how many times the baseline runs (default 2): the reader is a model and does not repeat itself, the second run sizes its noise and `SUMMARY.md` prints the disagreement |
 | `--dry-run` | prints the variants, their voters and the reader; runs nothing |
 | `--resume DIR` | continues a stopped run; variants that have a `result.json` are not run again |
 | `--reader NAME` | the `claim_vote_llm.NAME` section used as Gate 1's single reader (default `kenary_agnes_3_0_flash_free`) |

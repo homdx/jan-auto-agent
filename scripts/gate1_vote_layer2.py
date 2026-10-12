@@ -68,18 +68,29 @@ def log(out: Path, msg: str) -> None:
 
 
 def parse_sets(text: str) -> list:
-    """``3:all,5:committed,7`` -> [(3, 'all'), (5, 'committed'), (7, 'committed')]; ``0`` is not a set (off always runs)."""
+    """``3:all,5:committed+veto,7+notests`` -> [(3, 'all', ()), (5, 'committed', ('veto',)), (7, 'committed', ('notests',))].
+
+    ``veto`` is ``vote_confirm = off`` (a unanimous FALSE rejects, a unanimous TRUE is the reader's); ``notests`` is
+    ``vote_skip_tests = on`` (a candidate citing a test file is not put to the voters)."""
     out = []
     for part in text.split(","):
         part = part.strip()
         if not part:
             continue
-        n, _, rule = part.partition(":")
+        head, *opts = part.split("+")
+        n, _, rule = head.partition(":")
         n = int(n)
         if not 3 <= n <= len(ROSTER):
             raise SystemExit(f"set size {n}: from 3 to {len(ROSTER)}")
-        out.append((n, rule or ("all" if n == 3 else "committed")))
+        bad = set(opts) - {"veto", "notests"}
+        if bad or (rule and rule not in ("all", "committed")):
+            raise SystemExit(f"set {part!r}: options are +veto and +notests, rules all|committed")
+        out.append((n, rule or ("all" if n == 3 else "committed"), tuple(sorted(opts))))
     return out
+
+
+def variant_name(n: int, opts: tuple) -> str:
+    return "-".join([f"on-{n}"] + list(opts))
 
 
 def load_truth(known: Path) -> dict:
@@ -92,7 +103,8 @@ def load_truth(known: Path) -> dict:
 
 
 def build_ini(dest: Path, local: configparser.ConfigParser, base_ini: Path, mode: str,
-              voters: list, accept: str, reader: str, reader_timeout: int = 240) -> None:
+              voters: list, accept: str, reader: str, reader_timeout: int = 240,
+              opts: tuple = ()) -> None:
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(base_ini)
     rd = local[P + reader]
@@ -104,6 +116,8 @@ def build_ini(dest: Path, local: configparser.ConfigParser, base_ini: Path, mode
     cfg["loop"]["timeout_seconds"] = str(reader_timeout)
     cfg["gate1"]["claim_vote"] = mode
     cfg["gate1"]["vote_accept"] = accept
+    cfg["gate1"]["vote_confirm"] = "off" if "veto" in opts else "on"
+    cfg["gate1"]["vote_skip_tests"] = "on" if "notests" in opts else "off"
     if voters:
         for v in voters:
             if not cfg.has_section(P + v):
@@ -124,13 +138,13 @@ def prepare_target(work: Path, repo: Path, sha: str, plan: Path) -> None:
 
 
 def run_variant(out: Path, name: str, known: Path, repo: Path, sha: str, base_ini: Path,
-                local, voters: list, accept: str, reader: str, timeout: int) -> dict:
+                local, voters: list, accept: str, reader: str, timeout: int, opts: tuple = ()) -> dict:
     vdir = out / name
     if vdir.exists():
         shutil.rmtree(vdir)
     vdir.mkdir(parents=True)
     ini = vdir / "agents.ini"
-    build_ini(ini, local, base_ini, "off" if name == "off" else "on", voters, accept, reader)
+    build_ini(ini, local, base_ini, "off" if name.startswith("off") else "on", voters, accept, reader, opts=opts)
     prepare_target(vdir / "target", repo, sha, known / "plan.json")
     started = time.time()
     with open(vdir / "run.log", "w", encoding="utf-8") as fh:
@@ -138,7 +152,7 @@ def run_variant(out: Path, name: str, known: Path, repo: Path, sha: str, base_in
                              "--base", str(vdir / "target"), "--config", str(ini)],
                             cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT, timeout=timeout).returncode
     text = (vdir / "run.log").read_text(encoding="utf-8", errors="replace")
-    res = {"variant": name, "rc": rc, "seconds": round(time.time() - started), "voters": voters,
+    res = {"variant": name, "rc": rc, "opts": list(opts), "seconds": round(time.time() - started), "voters": voters,
            "accept": accept, "removed": {}, "inconclusive": []}
     m = CHECKED.search(text)
     if m:
@@ -179,22 +193,34 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
             continue
         sc = score(r, ids, truth)
         verdict = "baseline"
-        if r["variant"] != "off":
+        if r["variant"].startswith("off"):
+            verdict = "baseline" if r["variant"] == "off" else "baseline repeat (the reader's own noise)"
+        else:
             if not labelled:
                 verdict = "no answers recorded"
             elif sc_off is None:
                 verdict = "no baseline"
             else:
                 third = math.ceil(r.get("checked", len(ids)) / 3)
+                veto = "veto" in r.get("opts", [])      # a veto-only vote decides little by design: no third required
                 ok = (len(sc["false_positives_through"]) <= len(sc_off["false_positives_through"])
                       and len(sc["true_bugs_rejected"]) <= len(sc_off["true_bugs_rejected"])
-                      and r.get("votes_decided", 0) >= third)
-                verdict = "PASS" if ok else "FAIL (needs fp<=off, true rejected<=off, decided>=%d)" % third
+                      and (veto or r.get("votes_decided", 0) >= third))
+                verdict = ("PASS" + (" (veto only: decided not required)" if veto else "")) if ok else \
+                    "FAIL (needs fp<=off, true rejected<=off%s)" % ("" if veto else ", decided>=%d" % third)
         verdicts[r["variant"]] = verdict
         lines.append(f"| {r['variant']} | {len(r['voters'])} | {r['accept']} | yes | {r.get('removed_n', len(r['removed']))} | "
                      f"{len(sc['false_positives_through'])} | {len(sc['true_bugs_rejected'])} | {r.get('votes_asked', '-')} | "
                      f"{r.get('votes_decided', '-')} | {r.get('votes_overridden', '-')} | {r.get('votes_requests', '-')} | "
                      f"{r['seconds']} | {verdict} |")
+    offs = [r for r in results if r["variant"].startswith("off") and r["ok"]]
+    if len(offs) >= 2:
+        a, b = offs[0], offs[1]
+        flips = sorted(set(a["removed"]) ^ set(b["removed"]))
+        lines += ["", f"Noise of the baseline: `{a['variant']}` and `{b['variant']}` (same code, same candidates) disagree on "
+                      f"{len(flips)} candidate(s); false positives through {len(score(a, ids, truth)['false_positives_through'])} "
+                      f"and {len(score(b, ids, truth)['false_positives_through'])}. A difference between a vote variant and `off` "
+                      f"smaller than that is not a result."]
     lines += ["", "## Per candidate (R = removed by Gate 1, k = kept)", "",
               "| id | answer | " + " | ".join(r["variant"] for r in results) + " | title |",
               "|---|---|" + "---|" * len(results) + "---|"]
@@ -209,7 +235,8 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sets", default=DEFAULT_SETS, help=f"voter sets, size[:all|committed],…  (default {DEFAULT_SETS}; add 11 for two weak voters)")
+    ap.add_argument("--sets", default=DEFAULT_SETS, help=f"voter sets, size[:all|committed][+veto][+notests],…  (default {DEFAULT_SETS}; 11 adds two weak voters; +veto: the vote only vetoes; +notests: test-file candidates are not voted)")
+    ap.add_argument("--off-runs", type=int, default=2, help="how many times the baseline (vote off) runs; the reader is a model and does not repeat itself, so 2 sizes its noise (default 2)")
     ap.add_argument("--known", default=str(KNOWN), help="directory with plan.json, truth.csv, TARGET (default: the recorded set)")
     ap.add_argument("--repo", default=str(ROOT), help="repository to clone the target from (default: this checkout; TARGET's sha must be in it)")
     ap.add_argument("--base-ini", default=str(ROOT / "agents.ini"))
@@ -224,11 +251,12 @@ def main(argv=None) -> int:
 
     known = Path(args.known)
     sets = parse_sets(args.sets)
-    variants = [("off", [], "all")] + [(f"on-{n}", ROSTER[:n], rule) for n, rule in sets]
+    variants = [("off" if i == 0 else f"off-{i + 1}", [], "all", ()) for i in range(max(1, args.off_runs))]
+    variants += [(variant_name(n, opts), ROSTER[:n], rule, opts) for n, rule, opts in sets]
     out = Path(args.resume) if args.resume else Path(args.out) if args.out else OUT_BASE / dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     local = configparser.ConfigParser(interpolation=None)
     local.read(args.local_ini)
-    missing = sorted({P + s for s in ROSTER[:max(n for n, _ in sets)] + [args.reader]} - set(local.sections())) if sets else []
+    missing = sorted({P + s for s in ROSTER[:max(n for n, _, _ in sets)] + [args.reader]} - set(local.sections())) if sets else []
     plan = json.loads((known / "plan.json").read_text(encoding="utf-8"))
     ids = [t["id"] for t in plan["tasks"]]
     titles = {t["id"]: t["title"] for t in plan["tasks"]}
@@ -238,8 +266,8 @@ def main(argv=None) -> int:
     if args.dry_run:
         print(f"known answers: {known} ({len(ids)} candidates, {len(truth)} with an answer), target sha {sha}")
         print(f"output: {out}")
-        for name, voters, rule in variants:
-            print(f"  {name:7} accept={rule:9} voters={len(voters)} {', '.join(voters)}")
+        for name, voters, rule, opts in variants:
+            print(f"  {name:16} accept={rule:9} voters={len(voters)} {', '.join(voters)}")
         print(f"reader: {P}{args.reader}")
         if missing:
             print("MISSING sections in the local ini:", ", ".join(missing))
@@ -262,7 +290,7 @@ def main(argv=None) -> int:
     if not truth:
         log(out, "WARNING: no truth.csv rows — the run counts what Gate 1 removes but cannot say PASS/FAIL")
     results, failed_run = [], False
-    for name, voters, rule in variants:
+    for name, voters, rule, opts in variants:
         done = out / name / "result.json"
         if args.resume and done.exists():
             res = json.loads(done.read_text(encoding="utf-8"))
@@ -271,7 +299,7 @@ def main(argv=None) -> int:
             log(out, f"{name}: start ({len(voters)} voters, accept={rule})")
             try:
                 res = run_variant(out, name, known, Path(args.repo), sha, Path(args.base_ini), local,
-                                  voters, rule, args.reader, args.timeout)
+                                  voters, rule, args.reader, args.timeout, opts)
             except Exception as exc:   # noqa: BLE001 — one variant failing must not stop the others
                 res = {"variant": name, "rc": -1, "seconds": 0, "voters": voters, "accept": rule, "removed": {},
                        "ok": False, "error": f"{type(exc).__name__}: {exc}"[:200]}

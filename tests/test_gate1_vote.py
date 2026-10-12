@@ -426,3 +426,59 @@ def test_vote_accept_is_read_and_a_malformed_value_is_all():
     assert gv.VoteConfig.from_config(_on_five()).accept == "all"
     assert gv.VoteConfig.from_config(_on_five(vote_accept="committed")).accept == "committed"
     assert gv.VoteConfig.from_config(_on_five(vote_accept="majority")).accept == "all"
+
+
+# ── layer 2 follow-ups: vote_confirm (veto only) and vote_skip_tests ──────────────────────────
+
+def _test_file_repo(tmp_path: Path) -> list:
+    (tmp_path / "tests").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n", encoding="utf-8")
+    return [CandidateTask(
+        title="add a test that a is a fresh copy", instruction="the test does not assert a fresh copy",
+        target_files=["tests/test_a.py"], acceptance_check="true",
+        cited_location=CitedLocation(file="tests/test_a.py", symbol="test_a"), cluster="tests")]
+
+
+def test_veto_only_leaves_a_unanimous_true_to_the_reader(tmp_path):
+    ask = _voters(("list", "TRUE"), ("list", "TRUE"), ("list", "TRUE"))
+    filt = _filter(_on(vote_confirm="off"), ask)
+    _run(tmp_path, filt)
+    assert len(ask.calls) == 3, "the voters were asked"
+    assert filt.reader_calls == 1 and filt._vote.counters["votes_decided"] == 0
+
+
+def test_veto_only_still_rejects_on_a_unanimous_false(tmp_path):
+    filt = _filter(_on(vote_confirm="off"), _voters(("list", "FALSE"), ("list", "FALSE"), ("list", "FALSE")),
+                   reader=("rejected", "the reader does not see it"))
+    accepted, rejected, counters = _run(tmp_path, filt)
+    assert not accepted and len(rejected) == 1 and counters["votes_decided"] == 1
+
+
+def test_a_candidate_citing_a_test_file_is_not_voted_on_when_asked_not_to(tmp_path):
+    ask = _voters(("list", "TRUE"), ("list", "TRUE"), ("list", "TRUE"))
+    filt = _filter(_on(vote_skip_tests="on"), ask)
+    filt.filter(_test_file_repo(tmp_path), tmp_path, counters={})
+    assert ask.calls == [] and filt.reader_calls == 1
+
+
+def test_a_test_file_candidate_is_voted_on_by_default(tmp_path):
+    ask = _voters(("list", "TRUE"), ("list", "TRUE"), ("list", "TRUE"))
+    filt = _filter(_on(), ask)
+    filt.filter(_test_file_repo(tmp_path), tmp_path, counters={})
+    assert len(ask.calls) == 3 and filt.reader_calls == 0
+
+
+def test_confirm_and_skip_tests_defaults_and_malformed_values():
+    cfg = gv.VoteConfig.from_config(_on())
+    assert cfg.confirm is True and cfg.skip_tests is False
+    cfg = gv.VoteConfig.from_config(_on(vote_confirm="off", vote_skip_tests="on"))
+    assert cfg.confirm is False and cfg.skip_tests is True
+    cfg = gv.VoteConfig.from_config(_on(vote_confirm="maybe", vote_skip_tests="sometimes"))
+    assert cfg.confirm is True and cfg.skip_tests is False
+
+
+def test_which_paths_are_test_files():
+    for path in ("tests/test_a.py", "tests_bugfix/x.py", "tests/fixtures/a/Greeter.java", "pkg/test_x.py", "a/b_test.go"):
+        assert gv._is_test_path(path), path
+    for path in ("tools/auto/a.py", "tools/testing.py", "", None):
+        assert not gv._is_test_path(path), path

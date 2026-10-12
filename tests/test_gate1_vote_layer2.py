@@ -32,7 +32,11 @@ def test_the_report_lines_are_read():
 
 
 def test_sets_parse_with_the_default_rule_per_size():
-    assert l2.parse_sets("3,5:all,7") == [(3, "all"), (5, "all"), (7, "committed")]
+    assert l2.parse_sets("3,5:all,7") == [(3, "all", ()), (5, "all", ()), (7, "committed", ())]
+    assert l2.parse_sets("5+veto+notests") == [(5, "committed", ("notests", "veto"))]
+    assert l2.variant_name(5, ("notests", "veto")) == "on-5-notests-veto"
+    with pytest.raises(SystemExit):
+        l2.parse_sets("5+loud")
     with pytest.raises(SystemExit):
         l2.parse_sets("2")
     with pytest.raises(SystemExit):
@@ -88,6 +92,19 @@ def test_no_recorded_answers_means_no_verdict(tmp_path):
     assert v["on-3"] == "no answers recorded"
 
 
+def test_a_veto_only_variant_does_not_need_a_third_decided(tmp_path):
+    veto = _res("on-3-veto", ["AUTO-T2"], decided=1)
+    veto["opts"] = ["veto"]
+    v = _verdicts(tmp_path, _res("off", []), veto)
+    assert v["on-3-veto"].startswith("PASS")
+
+
+def test_two_baselines_give_a_noise_line(tmp_path):
+    _verdicts(tmp_path, _res("off", ["AUTO-T2"]), _res("off-2", ["AUTO-T3"]))
+    text = (tmp_path / "SUMMARY.md").read_text()
+    assert "Noise of the baseline" in text and "disagree on 2 candidate(s)" in text
+
+
 def test_the_recorded_set_is_consistent():
     known = l2.KNOWN
     plan = json.loads((known / "plan.json").read_text())
@@ -113,10 +130,11 @@ def test_the_generated_ini_caps_the_readers_request_time(tmp_path):
         for k, v in (("base_url", "http://x/v1"), ("api_key", "k"), ("model", name)):
             local.set(l2.P + name, k, v)
     dest = tmp_path / "agents.ini"
-    l2.build_ini(dest, local, ROOT / "agents.ini", "on", ["a", "b", "c"], "all", "rd")
+    l2.build_ini(dest, local, ROOT / "agents.ini", "on", ["a", "b", "c"], "all", "rd", opts=("veto", "notests"))
     got = configparser.ConfigParser(interpolation=None)
     got.read(dest)
     assert got["loop"]["timeout_seconds"] == "240"
     assert got["gate1"]["presence_llm_profile"] == "gate1_llm" and got["gate1_llm"]["model"] == "rd"
     assert got["gate1"]["vote_profiles"] == "claim_vote_llm.a, claim_vote_llm.b, claim_vote_llm.c"
+    assert got["gate1"]["vote_confirm"] == "off" and got["gate1"]["vote_skip_tests"] == "on"
     assert oct(dest.stat().st_mode & 0o777) == "0o600"

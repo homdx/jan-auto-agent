@@ -34,6 +34,8 @@ each a "no decision" and a line in the log. ``[gate1] claim_vote = off`` (the de
     vote_timeout_sec    = 60                     ; one HTTP request of one voter
     vote_veto_by_reader = on                     ; a unanimous FALSE also needs the reader not
                                                  ; to say confirmed
+    vote_confirm        = on                     ; off: the vote only vetoes (a unanimous TRUE is the reader's)
+    vote_skip_tests     = off                    ; on: a candidate citing a test file is not put to the voters
     vote_accept         = all | committed        ; CC-11: with five or more voters, `committed`
                                                  ; lets an abstainer stop blocking (default all)
     vote_quorum         = 3                      ; not a knob: any other value is refused (CC-10 Q5)
@@ -79,6 +81,8 @@ class VoteConfig:
     timeout_sec: float = DEFAULT_TIMEOUT_SEC
     veto_by_reader: bool = True
     accept: str = "all"
+    confirm: bool = True          # False: the vote only vetoes, a unanimous TRUE is the reader's to decide
+    skip_tests: bool = False      # True: a candidate that cites a test file is not put to the voters
     why: str = "claim_vote = off"
 
     @classmethod
@@ -134,10 +138,20 @@ class VoteConfig:
         if accept not in ("all", "committed"):
             logger.warning("config [gate1] vote_accept = %r is not all/committed — using all", accept)
             accept = "all"
+        def flag(key: str, default: bool) -> bool:
+            raw_flag = get(key, "on" if default else "off").lower()
+            if raw_flag in _ON:
+                return True
+            if raw_flag in _OFF:
+                return False
+            logger.warning("config [gate1] %s = %r is not on/off — using %s", key, raw_flag, "on" if default else "off")
+            return default
+
         return cls(True, profiles,
                    number("vote_max_per_run", DEFAULT_MAX_PER_RUN, int, 0),
                    number("vote_timeout_sec", DEFAULT_TIMEOUT_SEC, float, 1.0),
-                   veto in _ON or veto == "", accept, "claim_vote = on")
+                   veto in _ON or veto == "", accept,
+                   flag("vote_confirm", True), flag("vote_skip_tests", False), "claim_vote = on")
 
 
 @dataclass(frozen=True)
@@ -158,6 +172,14 @@ def claim_of(candidate) -> str:
     instruction = " ".join(str(candidate.instruction or "").split())[:MAX_INSTRUCTION]
     where = f"`{loc.symbol}` in `{loc.file}`" if loc.symbol else f"`{loc.file}`"
     return f"{where} has the problem: {instruction}"
+
+
+def _is_test_path(path: str) -> bool:
+    """A cited file that is test code: under tests/ or tests_bugfix/ (at any depth) or named ``test_*``/``*_test.*``."""
+    parts = str(path or "").replace("\\", "/").split("/")
+    name = parts[-1]
+    return (any(p in ("tests", "tests_bugfix", "test", ".smoke_tests", ".regression_tests") for p in parts[:-1])
+            or name.startswith("test_") or name.rsplit(".", 1)[0].endswith("_test"))
 
 
 def _load_claim_vote():
@@ -262,6 +284,8 @@ class Gate1Vote:
     def _presence_by_vote(self, candidate, view) -> VoteOutcome:
         if not self.cfg.enabled:
             return VoteOutcome()
+        if self.cfg.skip_tests and _is_test_path(candidate.cited_location.file):
+            return VoteOutcome()      # a claim about a test is "the test lacks X": true and no reason for a task
         claim = claim_of(candidate)
         resolved = cc_anchors.resolve_anchors(cc_anchors.extract_anchors(claim), view)
         kind = cc_anchors.classify(claim, resolved)
@@ -287,6 +311,8 @@ class Gate1Vote:
         quotes = tuple(row.get("quotes") or ())
         by = ", ".join(sorted(m for m, v in row["by_model"].items() if v == row["verdict"]))
         shown = "; ".join(f"“{q[:100]}”" for q in quotes[:2])
+        if row["verdict"] == "TRUE" and not self.cfg.confirm:
+            return VoteOutcome(requests=requests)     # veto only: the reader decides what the vote would confirm
         if row["verdict"] == "TRUE":
             return VoteOutcome("confirmed", f"claim vote: confirmed by {by} ({shown})", requests, quotes)
         return VoteOutcome("rejected", f"claim vote: rejected by {by} ({shown})", requests, quotes)
