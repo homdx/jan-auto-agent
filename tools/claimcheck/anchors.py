@@ -219,7 +219,33 @@ def extract_anchors(claim: str) -> list:
             ends.insert(i, end)
             found.append(Anchor(kind, claim[start:end], start, end))
     found.sort(key=lambda a: (a.start, a.end))
-    return found
+    return [_with_wider(claim, a) if a.kind == "path" else a for a in found]
+
+
+#: words a path's longer reading may take in front of it (`a long dir name/x.py`)
+MAX_WIDER_WORDS = 3
+_WORD_BEFORE = re.compile(r"[\w.\-/]+ $")
+
+
+def _with_wider(claim: str, a: Anchor) -> Anchor:
+    """*a* with its longer readings (`Anchor.wider`): the words before it, one space apart.
+
+    A space in a file or directory name is ambiguous in a sentence: `my file.py`, `renamed é.py`
+    and `my dir/mod.py` were anchored as `file.py`, `é.py`, `dir/mod.py`, and the voter was told the
+    file does not exist (or the claim went to `world`). Which reading is meant only the repository
+    can say, so extraction offers them and `_resolve_path` takes one that is a file. *quoted*: the
+    reading is exactly the text between a pair of backticks or double quotes."""
+    out, s = [], a.start
+    for _ in range(MAX_WIDER_WORDS):
+        m = _WORD_BEFORE.search(claim, max(0, s - 200), s)
+        if not m:
+            break
+        s = m.start()
+        quoted = s > 0 and claim[s - 1] in "`\"" and claim[a.end:a.end + 1] == claim[s - 1]
+        out.append((s, claim[s:a.end], quoted))
+    if not out:
+        return a
+    return Anchor(a.kind, a.text, a.start, a.end, wider=tuple(reversed(out)))
 
 
 # ------------------------------------------------------------------ resolution
@@ -344,7 +370,48 @@ def _nearest_dir(index: _Index, path: str) -> str:
     return "/".join(parts)
 
 
+def _wider_file(anchor: Anchor, index: _Index, quoted: bool, exact: bool = False) -> Optional[ResolvedAnchor]:
+    """The first longer reading of *anchor* (`Anchor.wider`) that is one file of the repository:
+    the path itself, or (not *exact*) the one file it is the tail or the name of."""
+    for start, text, q in anchor.wider:
+        if q != quoted:
+            continue
+        raw, lines = _split_lines(text)
+        path = raw[2:] if raw.startswith("./") else raw
+        hit = path if path in index.file_set else None
+        if hit is None and not exact:
+            tails = ([p for p in index.files if p.endswith("/" + path)] if "/" in path
+                     else list(index.basenames.get(path, ())))
+            hit = tails[0] if len(tails) == 1 else None
+        if hit:
+            return ResolvedAnchor(Anchor("path", text, start, anchor.end), True, path=hit, lines=lines)
+    return None
+
+
 def _resolve_path(anchor: Anchor, index: _Index) -> ResolvedAnchor:
+    """A path anchor; with longer readings (a space in the name), in this order: a quoted reading
+    that is a file (`my file.py` in backticks), the plain reading as a path of the repository, an
+    unquoted reading as a path of it (`my file.py defines …`), the plain reading as a file's tail or
+    name, an unquoted reading as one. So a sentence's word is never glued to a path that is there."""
+    if not anchor.wider:
+        return _resolve_plain_path(anchor, index)
+    wide = _wider_file(anchor, index, quoted=True)
+    if wide is not None:
+        return wide
+    plain = _resolve_plain_path(anchor, index)
+    raw = _split_lines(anchor.text)[0]
+    raw = raw[2:] if raw.startswith("./") else raw
+    if plain.found and (raw in index.file_set or raw in index.dirs):
+        return plain
+    wide = _wider_file(anchor, index, quoted=False, exact=True)
+    if wide is not None:
+        return wide
+    if plain.found:
+        return plain
+    return _wider_file(anchor, index, quoted=False) or plain
+
+
+def _resolve_plain_path(anchor: Anchor, index: _Index) -> ResolvedAnchor:
     raw, lines = _split_lines(anchor.text)
     path = raw[2:] if raw.startswith("./") else raw
     if path in index.file_set or path in index.dirs:
@@ -451,7 +518,10 @@ def _prefer_named_file(out: list, index: _Index) -> list:
     """`X` in `tools/y.py`: a name defined in several files means the one the claim names.
 
     The first definition by path is the answer for a bare name on its own; when the claim
-    also names a file that holds a definition of it, that file is the answer."""
+    also names a file that holds a definition of it, that file is the answer. "Of it" is by the
+    name as written: `request_completion` in `tools/llm_stream.py` is that module's function, not
+    the first by path, `tests/test_contest_cli.py`'s nested stub of the same name — the stub's
+    qualname was the only one looked for in the named file, so the decoy won."""
     files = {r.path for r in out if r.anchor.kind == "path" and r.found and r.path in index.file_set}
     if not files:
         return out
@@ -461,8 +531,12 @@ def _prefer_named_file(out: list, index: _Index) -> list:
                 or r.path in files:
             continue
         last = r.qualname.rsplit(".", 1)[-1]
-        defs = [d for d in index.by_last.get(last, ()) if d.qualname == r.qualname]
-        pick = next((d for d in defs if d.path in files), None)
+        written = r.anchor.text.split("::")[-1].replace("::", ".")
+        defs = [d for d in index.by_last.get(last, ())
+                if d.qualname == r.qualname or d.qualname == written or d.qualname.endswith("." + written)]
+        # in the named file: the definition named exactly as written first, then any of that name
+        in_file = [d for d in defs if d.path in files]
+        pick = next((d for d in in_file if d.qualname == written), in_file[0] if in_file else None)
         if pick is not None:
             fixed[i] = _found(r.anchor, pick, [d for d in defs if d is not pick])
     return fixed
@@ -539,6 +613,11 @@ _FORBIDDEN_GIT_ARGS = ("--output", "--ext-diff", "--textconv", "--open-files-in-
 _NO_FILTERS_GIT = frozenset(("show", "diff", "diff-tree", "log", "blame"))   # blame runs textconv too
 
 
+#: directories of a plain tree (not a git checkout) that are not the project's own code
+_VENDORED = frozenset((".git", ".venv", "venv", "node_modules", "__pycache__", "site-packages", ".tox",
+                       ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".eggs"))
+
+
 class PathRepoView:
     """A `RepoView` over a directory; a pinned snapshot — the file list is read once.
 
@@ -569,19 +648,64 @@ class PathRepoView:
         return gitref.read_utf8(full)
 
     def files(self) -> list:
+        """The files of the tree: a git checkout's tracked and untracked-but-not-ignored ones
+        (`git ls-files`), a plain directory's minus the vendored trees (`_VENDORED`); in both, a
+        symlink to another file of the tree is left out.
+
+        It was every file under the root but `.git`: Gate 1 runs on the live working directory, and
+        a cited `request_completion` resolved to a stub in `.regression_tests/` (a mirror of
+        `tests/`), `Settings.load_config` to `.venv/…/site-packages/` — the first chunk the voters
+        read was the decoy, and a 20,000-file `.venv` was indexed for every run."""
         if self._files is None:
-            found = []
-            for folder, dirs, names in os.walk(self.root):
-                dirs[:] = [d for d in dirs if d != ".git"]
-                rel = os.path.relpath(folder, self.root)
-                for name in names:
-                    if name == ".git":   # a worktree's or a submodule's `.git` is a file, not a directory
-                        continue
-                    path = name if rel == "." else f"{rel}/{name}".replace(os.sep, "/")
-                    if os.path.isfile(os.path.join(folder, name)):
-                        found.append(path)
-            self._files = sorted(found)
+            listed = self._git_files()
+            found = listed if listed is not None else self._walk()
+            self._files = sorted(self._without_mirrors(found))
         return list(self._files)
+
+    def _git_files(self) -> Optional[list]:
+        if not (self.root / ".git").exists():
+            return None
+        try:
+            out = gitref.git(self.root, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
+                             strip=False, timeout=120)
+        except gitref.GitRefError:
+            return None
+        names = [n for n in dict.fromkeys(out.split("\0")) if n]
+        # a committed node_modules or virtualenv is still not the project's code
+        venvs = tuple(n[:-len("pyvenv.cfg")] for n in names if n == "pyvenv.cfg" or n.endswith("/pyvenv.cfg"))
+        return [n for n in names if os.path.isfile(os.path.join(self.root, n))
+                and not _VENDORED.intersection(n.split("/")[:-1])
+                and not any(n.startswith(v) for v in venvs)]
+
+    def _walk(self) -> list:
+        found = []
+        for folder, dirs, names in os.walk(self.root):
+            dirs[:] = [d for d in dirs if d not in _VENDORED
+                       and not os.path.isfile(os.path.join(folder, d, "pyvenv.cfg"))]
+            rel = os.path.relpath(folder, self.root)
+            for name in names:
+                if name == ".git":   # a worktree's or a submodule's `.git` is a file, not a directory
+                    continue
+                path = name if rel == "." else f"{rel}/{name}".replace(os.sep, "/")
+                if os.path.isfile(os.path.join(folder, name)):
+                    found.append(path)
+        return found
+
+    def _without_mirrors(self, paths: list) -> list:
+        """*paths* minus each symlink whose target is another of *paths* (`.smoke_tests/x.py` ->
+        `tests/x.py`): the same definition twice, and the mirror's path sorted first."""
+        listed = set(paths)
+        real_root = os.path.realpath(self.root)
+        out = []
+        for p in paths:
+            full = os.path.join(self.root, p)
+            if os.path.islink(full):
+                real = os.path.realpath(full)
+                if real.startswith(real_root + os.sep) and \
+                        os.path.relpath(real, real_root).replace(os.sep, "/") in listed:
+                    continue
+            out.append(p)
+        return out
 
     def rev_parse(self, rev: str) -> Optional[str]:
         if not rev or rev.startswith("-") or not (self.root / ".git").exists():
