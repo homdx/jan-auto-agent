@@ -374,7 +374,7 @@ def test_a_voter_that_never_answers_is_dropped_after_two_misses_and_the_vote_sto
     assert all(o.verdict is None for o in outs)
     assert vote.stopped and "vote_accept = all needs every voter" in vote.stopped
     assert vote.counters["votes_asked"] == 2 and vote.counters["votes_skipped"] == 2
-    assert took < 5
+    assert took < 20          # the stuck voter waits 30 s: the vote never waited for it (a margin for load)
     assert "is not asked again this run" in caplog.text
 
 
@@ -431,7 +431,7 @@ def test_request_completion_stops_at_its_deadline_on_a_silent_provider():
         took = time.monotonic() - started
     finally:
         close()
-    assert took < 4.5, took        # 61 attempts of 1 s + 60 waits without it
+    assert took < 30, took         # 61 attempts of 1 s + 60 waits of 0.5 s (91 s) without it; a margin for load
 
 
 def test_request_completion_without_a_deadline_is_as_before(monkeypatch):
@@ -469,7 +469,7 @@ def test_ask_v2_on_a_silent_provider_returns_at_the_deadline(tmp_path):
         took = time.monotonic() - started
     finally:
         close()
-    assert row["votes"] == {} and took < 4.5, took
+    assert row["votes"] == {} and took < 30, took   # 91 s without the deadline; a margin for load
 
 
 # ── №8: one view of the target for the run ───────────────────────────────────────────────────

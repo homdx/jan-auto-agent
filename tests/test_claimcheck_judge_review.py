@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -49,11 +48,38 @@ def test_the_first_list_with_rows_still_wins():
     '[{"id": 1, "quote": "' + "a[" * 100000,
     '{"id": 1, "verdict": "TRUE", "quote": "' + "x" * 200000,
 ], ids=["nested-1.6MB", "deep-20000", "string-of-brackets", "unterminated-object"])
-def test_a_hostile_reply_is_bounded_work(text):
-    started = time.perf_counter()
+def test_a_hostile_reply_is_bounded_work(text, monkeypatch):
+    """Each pass over a reply (one decoder) makes at most 2 x MAX_STARTS tries and decodes at most
+    MAX_DECODE_WORK characters plus one try's worth — counted, not timed: a time bound failed under
+    load (32 busy processes on 8 cores), and the old code's 400 tries of 1.6 MB each are 640 M."""
+    passes = []
+
+    class Counting(json.JSONDecoder):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.tries = self.scanned = 0
+            passes.append(self)
+
+        def raw_decode(self, s, idx=0):
+            self.tries += 1
+            try:
+                value, end = super().raw_decode(s, idx)
+            except json.JSONDecodeError as err:
+                self.scanned += max(1, err.pos - idx)
+                raise
+            except RecursionError:
+                self.scanned += min(len(s) - idx, judge._RECURSION_COST)
+                raise
+            self.scanned += end - idx
+            return value, end
+
+    monkeypatch.setattr(json, "JSONDecoder", Counting)
     assert judge.parse_votes_v2(text, [0]) == {}
     assert cv.parse_votes(text, [0]) == {}
-    assert time.perf_counter() - started < 5.0
+    assert passes
+    for p in passes:
+        assert p.tries <= 2 * judge.MAX_STARTS
+        assert p.scanned <= judge.MAX_DECODE_WORK + len(text)
 
 
 def test_starts_are_all_of_them_or_the_head_and_the_tail():
