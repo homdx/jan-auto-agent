@@ -28,6 +28,7 @@ import builtins
 import keyword
 import os
 import re
+import threading
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -299,16 +300,25 @@ class _Index:
         return sorted(p for p, parts in self.module_of.items() if parts[-n:] == dotted)
 
 
+#: one index build at a time: Gate 1's presence workers share one view of the target (CC-10), and
+#: four threads that each missed the cache built the same five-second index four times
+_INDEX_LOCK = threading.Lock()
+
+
 def _index_of(view: RepoView) -> _Index:
     cached = getattr(view, _INDEX_ATTR, None)
     if isinstance(cached, _Index):
         return cached
-    index = _Index(view)
-    try:
-        setattr(view, _INDEX_ATTR, index)    # a view is a pinned snapshot: one index per view
-    except (AttributeError, TypeError):
-        pass
-    return index
+    with _INDEX_LOCK:
+        cached = getattr(view, _INDEX_ATTR, None)
+        if isinstance(cached, _Index):
+            return cached
+        index = _Index(view)
+        try:
+            setattr(view, _INDEX_ATTR, index)    # a view is a pinned snapshot: one index per view
+        except (AttributeError, TypeError):
+            pass
+        return index
 
 
 def _found(anchor: Anchor, d: _Def, others: list) -> ResolvedAnchor:

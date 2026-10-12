@@ -1227,9 +1227,18 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                        error_retry_wait_sec: float = DEFAULT_ERROR_RETRY_WAIT_SEC,
                        max_retry_after_sec: float = DEFAULT_MAX_RETRY_AFTER_SEC,
                        on_retry=None,
-                       _sleep_fn=None, on_meta=None):
+                       _sleep_fn=None, on_meta=None, deadline: "float | None" = None):
     """
     POST a chat-completions request and return the assistant message text.
+
+    *deadline* (a ``time.monotonic()`` value, None by default: no change for any
+    caller that does not pass it) bounds the WHOLE call, retries included: no
+    attempt starts past it, no attempt's socket timeout reaches beyond it, and a
+    retry whose wait would end past it is not made — the call raises
+    ``RuntimeError`` instead. ``timeout`` alone bounds one attempt, and with the
+    default retry budget a provider that accepts the connection and never answers
+    held one call for 61 × timeout + 60 × 10 s (about 4 h at 240 s; CC-10's Gate 1
+    reader and its voters, bugs R3 and G4).
 
     RUN-9: *on_meta*, if given, is called once with the ``CompletionMeta`` of
     the reply being returned (``finish_reason``, ``completion_tokens`` or
@@ -1297,7 +1306,26 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         headers=headers,
         method="POST",
     )
-    sleep = _sleep_fn or time.sleep
+    _sleep = _sleep_fn or time.sleep
+
+    def _left() -> "float | None":
+        return None if deadline is None else deadline - time.monotonic()
+
+    def sleep(wait_s: float) -> None:
+        # the deadline: a retry that would start past it is not made
+        left = _left()
+        if left is not None and left <= wait_s:
+            raise RuntimeError(f"deadline reached calling {url}: not retrying "
+                               f"(a wait of {wait_s:.1f}s with {max(0.0, left):.1f}s left)")
+        _sleep(wait_s)
+
+    def _attempt_timeout() -> float:
+        left = _left()
+        if left is None:
+            return timeout
+        if left <= 0:
+            raise RuntimeError(f"deadline reached before calling {url}")
+        return min(timeout, left) if timeout else left
     # RUN-9: CompletionMeta.elapsed counts from before the first attempt, so
     # a caller sees the whole cost of the call, retries included.
     _started = time.monotonic()
@@ -1416,7 +1444,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         attempt = 0
         while True:
             try:
-                return urllib.request.urlopen(req, timeout=timeout, context=ssl_context)
+                return urllib.request.urlopen(req, timeout=_attempt_timeout(), context=ssl_context)
             except urllib.error.HTTPError as e:
                 detail = ""
                 try:

@@ -335,28 +335,55 @@ runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at th
   wrong settled 0, `still_as_fixed` 0, and not fewer accepted than the three-voter run.
 * **CC-10 (292), landed (local): `[gate1] claim_vote`, off by default.** With `claim_vote = off`
   (or the key absent) Gate 1 is what it was: nothing is built, no counter is added. With `on`,
-  Stage B asks the voters of `vote_profiles` (a profile section of `agents.ini` / `contest.local.ini`
-  or Kilo's `provider/model`; **three, of three families**, otherwise the vote stays off and says
-  why in the log) before it asks the single reader. The claim is
+  Stage B asks the voters of `vote_profiles` (a profile section of the ini Gate 1 runs with, else of
+  `contest.ini` / `contest.local.ini` where `claim_vote.py --add-profiles` writes them, or Kilo's
+  `provider/model`; **three, of three families** — the family of the **model** a section names, never
+  of the section's name — otherwise the vote stays off and says why in the log) before it asks the
+  single reader. The claim is
   "`<symbol>` in `<file>` has the problem: <the instruction>", its pack is built from the candidate's
-  own tree (`base_dir`), each voter is asked once for it (**three requests a candidate**, in
-  parallel, through the `claim_vote` pacer), and the verdict is `claim_vote.tally`'s with CC-8's
-  families rule:
-  * unanimous `TRUE` (three committed, three families, quotes found in the pack) -> `confirmed`
-    without the reader;
+  own tree (`base_dir`, indexed once a run), each voter is asked once for it (**three requests a
+  candidate**, in parallel, through the `claim_vote` pacer), and the verdict is `claim_vote.tally`'s
+  with CC-8's families rule:
   * unanimous `FALSE` -> `rejected` with the voters' quotes, **unless the reader says
     `confirmed`** (`vote_veto_by_reader = on`, the default; the override is `votes_overridden`).
-    A reader that gave no answer does not save the candidate;
-  * anything else (split, UNSURE, a quote not in the pack, a dead voter, a claim with no code
-    anchor, the pack empty, past `vote_max_per_run`, any error) -> no decision, the single reader
-    answers as before. The vote never makes Gate 1 stricter than the reader.
+    A reader that gave no answer did not say `confirmed`, so the rejection stands (ticket question 2);
+  * unanimous `TRUE` (three committed, three families, quotes found in the pack) -> `confirmed`
+    without the reader (`vote_confirm = on`, the default); with `vote_confirm = off` the vote only
+    vetoes and the single reader decides (the first layer-2 run below found the TRUEs mostly wrong);
+  * anything else (split, UNSURE, a quote not in the pack, under `vote_accept = all` a voter with no
+    vote on the candidate, a cited file not in the tree, an empty instruction, a test file under
+    `vote_skip_tests = on`, a claim with no code anchor, the pack empty, past `vote_max_per_run`,
+    any error) -> no decision, the single reader
+    answers as before. A file the instruction says to create ("add a test in `tests/…`") does not
+    count: only the cited file and symbol must exist.
 
-  Keys: `vote_profiles`, `vote_max_per_run` (200), `vote_timeout_sec` (60), `vote_veto_by_reader`
-  (on). `vote_quorum` is not a knob: any value but 3 turns the vote off (one voter is not this
-  ticket's). The plan phase prints `🗳 Gate 1 vote: asked …, decided …, overridden by the reader …,
-  requests …`, and `counters` gains `votes_asked`, `votes_decided`, `votes_overridden`,
-  `votes_requests` (only with the vote on). Default roster by measured wrong rate:
-  step-5-preview, muse-spark-1-3-contributor, nemotron-3-ultra.
+  **What the vote does to Gate 1, both ways.** With `vote_confirm = on` it is *less* strict than the
+  reader: a TRUE it confirms skips the reader and the reader's own grounds to reject (a docstring
+  that calls the code a deliberate example, an intentional design, a test helper). It is *stricter*
+  where a unanimous FALSE meets a reader with no answer: under `presence_unknown = keep` the reader
+  alone would have kept that candidate.
+
+  **Voters that fail.** A voter that cannot be resolved (no section, no key) is named in the log
+  once, before the first vote, and left out. One that does not answer within the vote's bound
+  (2 × `vote_timeout_sec` + 5 s) twice in a row is dropped for the rest of the run; its requests carry
+  that deadline, so they stop retrying, and its threads never keep the process alive. When the voters
+  left cannot decide (under `all`: any voter gone; else fewer than three of three families) the vote
+  stops for the run and the plan line says so.
+
+  Keys: `vote_profiles`, `vote_max_per_run` (200), `vote_timeout_sec` (60, a fraction kept),
+  `vote_confirm` (on), `vote_skip_tests` (off; on: a candidate citing a test file is not voted),
+  `vote_veto_by_reader` (on), `vote_accept` (all). `vote_quorum` is not a knob:
+  any value but 3 turns the vote off (one voter is not this ticket's). The plan phase prints
+  `🗳 Gate 1 vote: asked …, decided …, overridden by the reader …, requests …, skipped …`, and
+  `counters` gains `votes_asked`, `votes_decided`, `votes_overridden`, `votes_requests`,
+  `votes_skipped` (candidates that reached the vote and were not voted on; only with the vote on).
+  Default roster by measured wrong rate: step-5-preview, muse-spark-1-3-contributor, nemotron-3-ultra.
+
+  **The single reader's bound (all of Gate 1, vote on or off).** `[gate1] presence_deadline_sec`
+  (1800 in `agents.ini`; 0 = none) bounds one presence check of one candidate, every retry and
+  re-ask of it included; `[loop] timeout_seconds` bounds one attempt only, and with the default 60
+  retries a provider that accepts the connection and never answers held one check for hours. Past
+  the bound the check is `unknown` (`presence_unknown` decides what happens to the candidate).
 
   **Layer 2 is one command, launch and forget** (`scripts/gate1_vote_layer2.py`; the full guide is
   `docs/claim-check/GATE1-VOTE-LAYER2.md`):

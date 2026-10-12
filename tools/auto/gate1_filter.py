@@ -530,6 +530,25 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [loop] timeout_seconds is malformed (%s) — using default 300.0", exc)
             self._timeout = 300.0
+        # R3 (CC-10 layer 2): [loop] timeout_seconds bounds ONE attempt of the reader's request, and
+        # with the [loop] retry budget (60 retries, 10 s apart) a provider that accepts the connection
+        # and never answers held one presence check for 61 x 240 + 600 s, about 4.2 h — the variant's
+        # 3 h limit ran out first. This bounds one presence check of one candidate, every retry and
+        # re-ask of it included (not the Gate 1 run); past it the check is `unknown`. 0 = no bound.
+        try:
+            self._presence_deadline_sec = float(config.get(
+                sec, "presence_deadline_sec", fallback=str(DEFAULT_PRESENCE_DEADLINE_SEC)) or 0)
+            if self._presence_deadline_sec < 0:
+                raise ValueError("below 0")
+        except ValueError as exc:
+            logger.warning("config [%s] presence_deadline_sec is malformed (%s) — using default %.0f",
+                           sec, exc, DEFAULT_PRESENCE_DEADLINE_SEC)
+            self._presence_deadline_sec = DEFAULT_PRESENCE_DEADLINE_SEC
+        # CC-10: one view of each target directory for the run — the anchor index is cached on the
+        # view, and a view built per candidate re-read and re-parsed every file of the tree each time
+        # (5 s a candidate on this repository, 17 minutes at the 200-candidate cap)
+        self._vote_views: dict = {}
+        self._vote_views_lock = threading.Lock()
         # AUTO-RETRY-BACKOFF-1: how many extra attempts (after the first)
         # a plain LLM-call EXCEPTION (network error, HTTP 4xx/5xx that
         # bubbled up as an exception — NOT an unparseable-but-received
@@ -1128,7 +1147,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         if getattr(self, "_vote", None) is not None:
             c = self._vote.counters
             print(f"🗳 Gate 1 vote: asked {c['votes_asked']}, decided {c['votes_decided']}, "
-                  f"overridden by the reader {c['votes_overridden']}, requests {c['votes_requests']}")
+                  f"overridden by the reader {c['votes_overridden']}, requests {c['votes_requests']}, "
+                  f"skipped {c.get('votes_skipped', 0)}"
+                  + (f" — stopped: {self._vote.stopped}" if self._vote.stopped else ""))
         print(
             f"✅ Gate 1 done — {len(accepted)} accepted, "
             f"{len(rejected)} rejected ({len([r for r in rejected if r.stage == 'duplicate'])} duplicate(s))\n"
@@ -1165,7 +1186,12 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         vote = getattr(self, "_vote", None)
         if vote is None:
             return None
-        out = vote.presence_by_vote(candidate, PathRepoView(base_dir))
+        key = str(Path(base_dir).resolve())
+        with self._vote_views_lock:
+            view = self._vote_views.get(key)
+            if view is None:
+                view = self._vote_views[key] = PathRepoView(base_dir)
+        out = vote.presence_by_vote(candidate, view)
         return out if out.verdict else None
 
     def _location_is_indexed(self, candidate: CandidateTask) -> bool:
@@ -1697,6 +1723,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         grounding_notes = self._build_grounding_notes(
             candidate, code_block, module_docstring, base_dir,
         )
+        # [gate1] presence_deadline_sec: the bound on this whole check, every call of it included
+        # (passed only when set, so a transport stub with the old signature still fits)
+        _deadline = (time.monotonic() + self._presence_deadline_sec
+                     if getattr(self, "_presence_deadline_sec", 0) else None)
+        _until = {"deadline": _deadline} if _deadline is not None else {}
 
         user_msg = _USER_PROMPT_TMPL.format(
             instruction=candidate.instruction,
@@ -1754,6 +1785,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 ssl_context=self._presence_ssl_context,
                 on_meta=_meta_box.append,
                 **self._retry_kwargs,
+                **_until,
             )
             cleaned = strip_think(text)
             meta = _meta_box[0] if _meta_box else None
@@ -1825,6 +1857,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 last_exc = exc
                 if _exc_attempt >= self._llm_call_retry_max:
                     break
+                if _deadline is not None and time.monotonic() >= _deadline:
+                    break     # [gate1] presence_deadline_sec: no retry past the bound
                 _exc_attempt += 1
                 logger.warning(
                     "Gate1._check_presence [%s]: LLM call failed (%s) — "
@@ -2368,6 +2402,8 @@ def filter_candidates(
 _PRESENCE_CONFIRMED = "confirmed"
 _PRESENCE_REJECTED = "rejected"
 _PRESENCE_UNKNOWN = "unknown"
+#: [gate1] presence_deadline_sec when the ini does not set it (R3: half an hour a candidate)
+DEFAULT_PRESENCE_DEADLINE_SEC = 1800.0
 
 # The reason a candidate is accepted with no verdict behind it. Prefix-matched
 # by `gate1_outcome()` (so an acceptance that was never a model verdict is not

@@ -95,10 +95,16 @@ class Pacer:
         self._width = width
         self._lock = threading.Lock()
 
-    def wait(self, provider: str) -> threading.Semaphore:
+    def wait(self, provider: str, deadline: "float | None" = None) -> threading.Semaphore:
+        """A slot of *provider*'s, held until the caller releases it. *deadline* (monotonic):
+        a caller that no longer waits for the answer (Gate 1's vote gave up) does not queue for
+        a slot past it — `TimeoutError` instead."""
         with self._lock:
             sem = self._slots.setdefault(provider, threading.Semaphore(self._width))
-        sem.acquire()
+        if deadline is None:
+            sem.acquire()
+        elif not sem.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise TimeoutError(f"no free slot for {provider} before the deadline")
         with self._lock:
             start = max(time.time(), self._next.get(provider, 0.0))
             self._next[provider] = start + self.interval
@@ -336,14 +342,16 @@ def ask(ref: str, claims: list[str], run: int, seed: int, parser: configparser.C
 
 
 def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.ConfigParser,
-           timeout: int, batch: int = 10, code_batch: int = 2, fixed: bool = False) -> dict:
+           timeout: float, batch: int = 10, code_batch: int = 2, fixed: bool = False,
+           deadline: "float | None" = None) -> dict:
     """CC-6's `ask`: one model, one run over ``(claim, pack_or_None)`` items, prompt v2,
     every committed vote on a claim with a pack checked against its quote.
 
     The HTTP call, the pacer and the retry budget are `ask`'s; the batching, the prompt,
     the parser and the check are ``tools.claimcheck.judge.ask_with_packs``. The row adds
     ``accepted`` (the evidence of each vote that stood) and ``rejected`` (each downgrade,
-    with its reason) to `ask`'s."""
+    with its reason) to `ask`'s. *deadline* (``time.monotonic()``, Gate 1's vote): no slot is
+    waited for and no retry is made past it (`request_completion`'s ``deadline``)."""
     try:
         st = voter_settings(ref, parser)
         retry = retry_kwargs_from_config(parser, SECTION)
@@ -359,11 +367,13 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
             max_tokens=st.max_tokens, system=cc_judge.SYSTEM,
             user_msg=prompt, num_ctx=st.num_ctx, think=st.think)
         headers.setdefault("User-Agent", USER_AGENT)
-        sem = PACER.wait(host)
+        sem = PACER.wait(host, deadline)
         started = time.monotonic()
+        # passed only when set: a stub of request_completion with the old signature still fits
+        until = {"deadline": deadline} if deadline is not None else {}
         try:
             return strip_think(request_completion(url, headers, payload, timeout,
-                                                  api_format=st.api_format, **retry))
+                                                  api_format=st.api_format, **retry, **until))
         finally:
             sem.release()
             calls[0] += 1
