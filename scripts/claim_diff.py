@@ -199,14 +199,28 @@ def make_vote(voters: list, runs: int, pool: concurrent.futures.Executor, ask: C
 # ------------------------------------------------------------------ output
 
 def side_report(target: Target, side: dict, base_sha: "str | None",
-                accept: str = cv.DEFAULT_ACCEPT) -> dict:
-    """``claim_vote.py --out``'s shape for one side (``score_cc.py --side`` reads it)."""
-    return {"target": {"repo": target.repo, "ref": target.ref, "sha": target.sha,
-                       "base": base_sha, "warnings": list(target.warnings)},
-            "accept": accept, "results": side["results"], "claims": side["table"]}
+                accept: str = cv.DEFAULT_ACCEPT, *, budget: "PackBudget | None" = None,
+                collect: "bool | None" = None, models: "dict | None" = None) -> dict:
+    """``claim_vote.py --out``'s shape for one side (``score_cc.py --side`` reads it).
+
+    The target fields are claim_vote's: ``base_sha`` next to ``base`` (without it claimcheck_truth
+    warned that ``--base <sha>`` was "a name, not a sha"), ``collect`` and ``budget`` (the truth
+    step's rebuilt packs lacked the collect chunks and used the ini's budget: not what the voters
+    saw), and the voters' ``models`` (their families wherever the truth step runs)."""
+    info = {"repo": target.repo, "ref": target.ref, "sha": target.sha,
+            "base": base_sha, "base_sha": base_sha, "warnings": list(target.warnings)}
+    if collect is not None:
+        info["collect"] = bool(collect)
+    if budget is not None:
+        info["budget"] = {"chars": budget.chars, "chunks": budget.chunks, "per_chunk": budget.per_chunk}
+    out = {"target": info, "accept": accept}
+    if models is not None:
+        out["models"] = models
+    return {**out, "results": side["results"], "claims": side["table"]}
 
 
-def write_outputs(out: Path, base: Target, head: Target, got: dict) -> str:
+def write_outputs(out: Path, base: Target, head: Target, got: dict, *, budget: "PackBudget | None" = None,
+                  collect: "bool | None" = None, models: "dict | None" = None) -> str:
     out.mkdir(parents=True, exist_ok=True)
     deltas = got["deltas"]
     accept = got.get("accept", cv.DEFAULT_ACCEPT)
@@ -218,7 +232,8 @@ def write_outputs(out: Path, base: Target, head: Target, got: dict) -> str:
     (out / "delta.json").write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     for name, target, side, b in (("base", base, got["base"], None),
                                   ("head", head, got["head"], base.sha)):
-        (out / f"votes_{name}.json").write_text(json.dumps(side_report(target, side, b, accept),
+        (out / f"votes_{name}.json").write_text(json.dumps(side_report(target, side, b, accept, budget=budget,
+                                                                       collect=collect, models=models),
                                                            ensure_ascii=False, indent=1), encoding="utf-8")
     table = cc_compare.render(base.sha, head.sha, deltas)
     (out / "delta.txt").write_text(table + "\n", encoding="utf-8")
@@ -338,7 +353,8 @@ def main(argv: "list[str] | None" = None) -> int:
             except ValueError as exc:
                 print(f"claim_diff: {args.claims}: {exc}", file=sys.stderr)
                 return 2
-        table = write_outputs(out, base, head, got)
+        table = write_outputs(out, base, head, got, budget=budget, collect=not args.no_collect,
+                              models=cv.voter_models(voters, parser))
 
     for line in _voter_lines(got):
         print(line)

@@ -221,6 +221,22 @@ def voter_settings(ref: str, parser: configparser.ConfigParser) -> LlmSettings:
                              max_tokens=4000))[0]
 
 
+def voter_models(voters, parser: configparser.ConfigParser) -> dict:
+    """``{ref: model}`` of the voters that resolve: votes.json records it (``models``), so the truth
+    step reads each voter's family off its model wherever it runs. It read ``contest.ini`` of the
+    current directory: the same votes.json gave no row from the project and a REAL row of three
+    agnes sections ("three families") from anywhere else. A ref that does not resolve is left out."""
+    out = {}
+    for ref in dict.fromkeys(voters):
+        try:
+            model = voter_settings(ref, parser).model
+        except Exception:   # noqa: BLE001 — a dead voter is reported by the vote itself
+            continue
+        if model:
+            out[ref] = model
+    return out
+
+
 def add_profiles(refs: list[str], root: Path) -> list[str]:
     """Append ``[claim_vote_llm.<slug>]`` sections for Kilo ``provider/model`` refs
     to ``contest.local.ini``; returns the section names.  Existing ones are kept.
@@ -708,7 +724,7 @@ def main(argv: list[str] | None = None) -> int:
     view = cc_anchors.PathRepoView(args.symbols_root) if args.symbols_root else None
     table = tally(claims, results, lf._repo_symbols(args.symbols_root or args.repo_root), view=view,
                   accept=args.accept)
-    report = {"accept": args.accept, "results": results, "claims": table}
+    report = {"accept": args.accept, "models": voter_models(voters, parser), "results": results, "claims": table}
     if args.out:
         args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     for r in results:
@@ -776,7 +792,8 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
                              # the budget the packs were cut to (--pack-chars may differ from the ini)
                              "budget": {"chars": budget.chars, "chunks": budget.chunks,
                                         "per_chunk": budget.per_chunk}},
-                  "accept": args.accept, "results": results, "claims": table}
+                  "accept": args.accept, "models": voter_models(voters, parser),
+                  "results": results, "claims": table}
     if args.out:
         args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     for r in results:

@@ -108,24 +108,25 @@ def lenz_constants(path: Path = FILTER_SCRIPT) -> dict:
 
 # ------------------------------------------------------------------ which claims are worth a credit
 
-def lenz_group(c: dict) -> Optional[str]:
-    """The `LENZ_ORDER` group of one votes.json claim row, or None when it is not worth a credit."""
+def lenz_group(c: dict, models: Optional[dict] = None) -> Optional[str]:
+    """The `LENZ_ORDER` group of one votes.json claim row, or None when it is not worth a credit.
+    *models*: profile -> model, as the truth step reads the families (`truth.settled`)."""
     if c.get("kind") != "world" or c.get("dangling"):
         return None
     v = c.get("verdict")
     if v in ("SPLIT", "UNSURE"):
         return v
-    if v in ("TRUE", "FALSE") and cc_truth.settled(c) is None:
+    if v in ("TRUE", "FALSE") and cc_truth.settled(c, models) is None:
         return "DISSENT"     # a plurality, or unanimous from too few families: not settled either way
     return None
 
 
-def pick_for_lenz(claims: list, *, limit: Optional[int] = None) -> list:
+def pick_for_lenz(claims: list, *, limit: Optional[int] = None, models: Optional[dict] = None) -> list:
     """The claim rows worth a credit (`lenz_group`), SPLIT first, then DISSENT, then UNSURE, each
     group in claim order; at most *limit* (default: the script's own cap, ``DEFAULT_MAX``)."""
     limit = lenz_constants()["DEFAULT_MAX"] if limit is None else limit
     ranked = sorted((LENZ_ORDER.index(g), i) for i, c in enumerate(claims or [])
-                    if (g := lenz_group(c)) is not None)
+                    if (g := lenz_group(c, models)) is not None)
     return [claims[i] for _, i in ranked[:max(0, limit)]]
 
 
@@ -135,9 +136,14 @@ def _one_line(text: str) -> str:
 
 def section_of(claim: str) -> str:
     """One claim as a section of the claims file: the claim as the heading (what the script's
-    ``--dry-run`` prints) and again as the body (what ``/extract`` reads)."""
+    ``--dry-run`` prints) and again as the body (what ``/extract`` reads).
+
+    The body never starts with ``#``, a backtick or ``~``: a claim that began with a code fence
+    opened a fence the script's splitter never saw closed (three claims read as one section), and
+    one that began with ``## `` was a heading of its own (three read as four)."""
     line = _one_line(claim)
-    return f"### {line}\n\n{line}\n"
+    body = re.sub(r"^[#`~\s]+", "", line) or line.replace("#", "").replace("`", "").replace("~", "")
+    return f"### {line}\n\n{body}\n"
 
 
 def sendable(claim: str) -> bool:
@@ -177,12 +183,12 @@ def _ref(c: dict, numbers: dict) -> str:
     return f"claim {n}{who}" if n is not None else f"claim{who or ' ?'}"
 
 
-def _ours(c: dict) -> str:
+def _ours(c: dict, models: Optional[dict] = None) -> str:
     v = c.get("verdict") or "?"
     if v in ("TRUE", "FALSE"):
         if c.get("unanimous") is not True:
             return f"{v} (with a dissenter)"
-        return f"{v} (unanimous)" if cc_truth.settled(c) else f"{v} (unanimous, too few families)"
+        return f"{v} (unanimous)" if cc_truth.settled(c, models) else f"{v} (unanimous, too few families)"
     return v
 
 
@@ -194,7 +200,8 @@ def _votes_cell(c: dict) -> str:
     return ", ".join(f"{v} {n}" for v, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))) or "-"
 
 
-def compare_table(claims: list, picked: list, *, lenz: Optional[dict] = None) -> list:
+def compare_table(claims: list, picked: list, *, lenz: Optional[dict] = None,
+                  models: Optional[dict] = None) -> list:
     """The compare table's lines: every picked claim (and, with *lenz*, every claim a Lenz row
     matched) with our verdict and the voters' split; a ``lenz`` column only when *lenz* is given
     (``{claim index: "True/high"}``)."""
@@ -209,7 +216,7 @@ def compare_table(claims: list, picked: list, *, lenz: Optional[dict] = None) ->
     lines = [head, "|---|---|---|" + ("---|" if lenz is not None else "")]
     index = {id(c): i for i, c in enumerate(claims)}
     for c in rows:
-        line = f"| {_ref(c, numbers)} | {_ours(c)} | {_votes_cell(c)} |"
+        line = f"| {_ref(c, numbers)} | {_ours(c, models)} | {_votes_cell(c)} |"
         if lenz is not None:
             line += f" {lenz.get(index.get(id(c)), '-')} |"
         lines.append(line)
@@ -219,7 +226,7 @@ def compare_table(claims: list, picked: list, *, lenz: Optional[dict] = None) ->
 def lenz_hint_markdown(picked: list, report_path, *, claims: Optional[list] = None,
                        candidates: Optional[int] = None, json_path="lenz.json",
                        compare_cmd: Optional[str] = None, lenz: Optional[dict] = None,
-                       script: str = "scripts/lenz_claim_filter.py") -> str:
+                       script: str = "scripts/lenz_claim_filter.py", models: Optional[dict] = None) -> str:
     """The block appended to pending.md and printed on the console, text only.
 
     *report_path* is the file the commands hand to `lenz_claim_filter.py` (the claims file
@@ -236,7 +243,7 @@ def lenz_hint_markdown(picked: list, report_path, *, claims: Optional[list] = No
     if not picked:
         lines += ["Nothing worth sending to Lenz: no claim about the world was left unsettled by the voters "
                   "(Lenz cannot see this repository, so code claims are never worth a credit).", ""]
-        table = compare_table(claims, [], lenz=lenz) if lenz else []
+        table = compare_table(claims, [], lenz=lenz, models=models) if lenz else []
         return "\n".join(lines + ([*table, ""] if table else []))
     n = len(send)
     capped = (f" ({len(picked)} of {candidates}; the cap is DEFAULT_MAX = {consts['DEFAULT_MAX']})"
@@ -272,7 +279,7 @@ def lenz_hint_markdown(picked: list, report_path, *, claims: Optional[list] = No
                   "  3. Compare with our verdicts:",
                   "       " + (compare_cmd or f"python3 scripts/claimcheck_truth.py <votes.json> --lenz {q(str(json_path))}"),
                   ""]
-    table = compare_table(claims, picked, lenz=lenz)
+    table = compare_table(claims, picked, lenz=lenz, models=models)
     if table:
         lines += ["The claims (their texts are in the pending entries above and in the claims file):", "", *table, ""]
     return "\n".join(lines)

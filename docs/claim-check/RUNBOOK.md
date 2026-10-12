@@ -128,9 +128,11 @@ of 40 claims across 6 identical-prompt runs).
 A model's own verdict is its **strict** plurality across runs: if the runs tie
 (even number, or three different answers) the model abstains (`UNSURE`), so a
 self-contradicting model is visible rather than masked by the first run's
-insertion order.  A voter with no vote on a particular claim — silent, lost
+insertion order.  A voter with no vote on a particular claim in any run — silent, lost
 batch, or unreadable reply — counts against unanimity; the rule is "every
-voter", not "every voter that happened to answer". That is `--accept all`, the default;
+voter", not "every voter that happened to answer". A voter that voted on the claim in one run
+and lost it in another is judged by the votes it cast (CC-11's ticket: "its own majority
+decides, as today"): `--runs 3` with one vote and two lost batches is that one vote. That is `--accept all`, the default;
 `--accept committed` (CC-11, below under "Voters") lets such a voter abstain without blocking.
 
 ## Rules that keep it honest
@@ -163,14 +165,16 @@ line of `vote.log` is the verdict counts and the models that returned no votes.
 ## With the code in front of the voters: into `truth.csv` and the stage-3 queue (CC-8)
 
 ```bash
-scripts/run_claim_check.sh report.md --target . --ref origin/<head> --truth truth.csv
-scripts/run_claim_check.sh report.md --target . --ref origin/<head> --base main --truth truth.csv --dry-run
+scripts/run_claim_check.sh report.md --target . --ref origin/<head> --truth validate1/truth.csv
+scripts/run_claim_check.sh report.md --target . --ref origin/<head> --base main --truth validate1/truth.csv --dry-run
 python3 scripts/claimcheck_truth.py votes.json --out validate1/truth.csv --pending pending.md --append
 ```
 
 `--target REPO`, `--ref REF`, `--base REF` and `--fetch` go to `claim_vote.py` as they are
 (stage 2 on the evidence, above). `--truth FILE` runs `scripts/claimcheck_truth.py` at the end:
-a bare name lands in `claim-check-out/<UTC>/` next to `votes.json`, and so does `pending.md`.
+a bare name lands in `claim-check-out/<UTC>/` next to `votes.json`, and so does `pending.md` —
+**a new directory every run**, so `--truth truth.csv` writes a new file each time and never
+appends to the shared key; give the shared file's path (`validate1/truth.csv`, as above) for that.
 An existing FILE is appended to (`--append`: hand-checked rows stay, a disagreeing row is a
 conflict, exit 3); `--force` replaces it. `--dry-run` prints the three commands and exits 0,
 with no network and nothing written. The script takes these out of the options before
@@ -420,9 +424,9 @@ runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at th
 ## If you want Lenz's opinion: the hint, never a call (CC-9)
 
 ```bash
-scripts/run_claim_check.sh report.md --target . --ref HEAD --truth truth.csv          # hint included
-scripts/run_claim_check.sh report.md --target . --ref HEAD --truth truth.csv --no-lenz-hint
-python3 scripts/claimcheck_truth.py votes.json --out truth.csv --append --lenz lenz.json   # compare
+scripts/run_claim_check.sh report.md --target . --ref HEAD --truth validate1/truth.csv          # hint included
+scripts/run_claim_check.sh report.md --target . --ref HEAD --truth validate1/truth.csv --no-lenz-hint
+python3 scripts/claimcheck_truth.py votes.json --out validate1/truth.csv --append --lenz lenz.json   # compare
 ```
 
 No run of this epic calls `/assess` or `/verify`. After `claimcheck_truth.py` (and so after

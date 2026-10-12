@@ -45,14 +45,27 @@ from tools.claimcheck import truth as cc_truth  # noqa: E402
 
 
 def profile_models(votes: dict, repo_root: Path) -> tuple:
-    """({ref: model}, the ini parser): every voter ref that is an ini section naming a ``model``
-    (``--profiles vote_agnes``), so `family_of` reads the model, not the section name."""
+    """({ref: model}, the ini parser): the model of every voter ref, so `family_of` reads the model,
+    not the section name — first what votes.json recorded (``models``, written by claim_vote.py),
+    then a ``[ref]`` section of *repo_root*'s contest.ini / contest.local.ini (read with a BOM, as
+    claim_vote reads them: utf-8 was a MissingSectionHeaderError traceback). A section-named voter
+    with neither is named on stderr: its family is then a guess from its name."""
     parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
-    parser.read([repo_root / "contest.ini", repo_root / "contest.local.ini"], encoding="utf-8")
-    out = {}
+    parser.read([repo_root / "contest.ini", repo_root / "contest.local.ini"], encoding="utf-8-sig")
+    recorded = votes.get("models") if isinstance(votes.get("models"), dict) else {}
+    out, unknown = {}, []
     for ref in cc_truth.live_voters(votes) + cc_truth.dead_voters(votes):
-        if parser.has_section(ref) and parser.get(ref, "model", fallback=""):
-            out[ref] = parser.get(ref, "model")
+        model = recorded.get(ref)
+        if not (isinstance(model, str) and model.strip()):
+            model = parser.get(ref, "model", fallback="") if parser.has_section(ref) else ""
+        if model:
+            out[ref] = model.strip()
+        elif "/" not in ref:
+            unknown.append(ref)
+    if unknown:
+        print(f"claimcheck_truth: warning: no model known for {', '.join(unknown)} (votes.json has no "
+              f"`models` for it and {repo_root} has no such section in contest.ini / contest.local.ini; "
+              "--repo-root names where they are): its family is read off the name", file=sys.stderr)
     return out, parser
 
 
@@ -75,6 +88,26 @@ def shape_error(votes) -> str:
             return f"result {k + 1} has no `model` or no `votes` object"
     if not isinstance(votes.get("target") or {}, dict):
         return "`target` is not an object"
+    # what the rows below read: a hand-edited file passed the check above and was a traceback
+    # ('int' object has no attribute 'strip', 'int' object is not subscriptable)
+    for k, c in enumerate(claims):
+        for key in ("evidence", "quotes", "abstained"):
+            value = c.get(key)
+            if value is not None and not (isinstance(value, list) and all(isinstance(x, str) for x in value)):
+                return f"claim {k + 1}: `{key}` is not a list of strings"
+        for key in ("verdict", "kind", "sha"):
+            if c.get(key) is not None and not isinstance(c.get(key), str):
+                return f"claim {k + 1}: `{key}` is not a string"
+        if c.get("id") is not None and (isinstance(c.get("id"), bool) or not isinstance(c.get("id"), (str, int))):
+            return f"claim {k + 1}: `id` is not a string or a number"
+        if not all(isinstance(v, str) for v in (c.get("by_model") or {}).values()):
+            return f"claim {k + 1}: a `by_model` verdict is not a string"
+    target = votes.get("target") or {}
+    for key in ("repo", "ref", "sha", "base", "base_sha"):
+        if target.get(key) is not None and not isinstance(target.get(key), str):
+            return f"`target.{key}` is not a string"
+    if votes.get("models") is not None and not isinstance(votes.get("models"), dict):
+        return "`models` is not an object"
     return ""
 
 
@@ -101,7 +134,7 @@ def compare_command(argv: list, lenz_json: Path) -> str:
     return " ".join(shlex.quote(a) for a in ["python3", _shown(Path(__file__).resolve()), *keep])
 
 
-def lenz_block(votes: dict, args, argv: list, pending: Path) -> tuple:
+def lenz_block(votes: dict, args, argv: list, pending: Path, models: "dict | None" = None) -> tuple:
     """(the block for pending.md and the console, the claims file's text or None): the Lenz hint,
     or with ``--no-lenz-hint`` only the compare table of a ``--lenz`` file. Reads no key, sends nothing."""
     claims = votes.get("claims") or []
@@ -117,17 +150,19 @@ def lenz_block(votes: dict, args, argv: list, pending: Path) -> tuple:
                 print(f"claimcheck_truth: warning: {unmatched} of {len(rows)} rows of {args.lenz} match no claim "
                       "of the votes file (ignored)", file=sys.stderr)
     if args.no_lenz_hint:
-        table = lenz_hint.compare_table(claims, [], lenz=lenz) if lenz else []
+        table = lenz_hint.compare_table(claims, [], lenz=lenz, models=models) if lenz else []
         return ("\n".join(["## Lenz next to our voters", "", *table, ""]) if table else ""), None
-    candidates = sum(1 for c in claims if lenz_hint.lenz_group(c) is not None)
-    picked = lenz_hint.pick_for_lenz(claims)
+    # the families of the models, as pending.md counts them: three agnes sections were "unanimous"
+    # here and left out of the Lenz candidates while pending.md listed the claim as unsettled
+    candidates = sum(1 for c in claims if lenz_hint.lenz_group(c, models) is not None)
+    picked = lenz_hint.pick_for_lenz(claims, models=models)
     claims_file = pending.with_name("lenz-claims.md")
     lenz_json = args.lenz or pending.with_name("lenz.json")
     text = lenz_hint.claims_file_text(picked)
     block = lenz_hint.lenz_hint_markdown(
         picked, _shown(claims_file), claims=claims, candidates=candidates, json_path=_shown(lenz_json),
         compare_cmd=compare_command(argv, _shown(lenz_json)), lenz=lenz,
-        script=_shown(lenz_hint.FILTER_SCRIPT))
+        script=_shown(lenz_hint.FILTER_SCRIPT), models=models)
     return block, (text or None)
 
 
@@ -142,7 +177,8 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--target", metavar="REPO", help="the repository to rebuild at the recorded sha (default: votes.json's target.repo)")
     ap.add_argument("--scratch", type=Path, help="where the rebuild's worktree goes (default: claim-check-out/scratch)")
     ap.add_argument("--no-rebuild", action="store_true", help="do not open the target: keys and pending from votes.json alone")
-    ap.add_argument("--repo-root", type=Path, default=Path.cwd(), help="where contest.ini / contest.local.ini live")
+    ap.add_argument("--repo-root", type=Path, default=ROOT,
+                    help="where contest.ini / contest.local.ini live (default: this project, not the current directory)")
     ap.add_argument("--lenz", type=Path, metavar="FILE",
                     help="what lenz_claim_filter.py --json wrote: adds a lenz column to the hint's compare table")
     ap.add_argument("--no-lenz-hint", action="store_true",
@@ -197,9 +233,14 @@ def main(argv: "list[str] | None" = None) -> int:
     try:
         written, conflicts = cc_truth.write_truth(args.out, rows, append=args.append)
         pending = args.pending or args.out.with_name("pending.md")
-        block, claims_text = lenz_block(votes, args, argv, pending)
+        block, claims_text = lenz_block(votes, args, argv, pending, models)
+        claims_file = pending.with_name("lenz-claims.md")
         if claims_text:
-            cc_truth.atomic_write(pending.with_name("lenz-claims.md"), claims_text)
+            cc_truth.atomic_write(claims_file, claims_text)
+        elif not args.no_lenz_hint and claims_file.is_file():
+            # this run picked nothing for Lenz: a claims file of an earlier run next to a pending.md
+            # that says "nothing worth sending" was sent as if it were this run's
+            claims_file.unlink()
         md = cc_truth.pending_markdown(votes, packs, models=models)
         cc_truth.atomic_write(pending, md + ("\n" + block if block else ""))
     except OSError as exc:

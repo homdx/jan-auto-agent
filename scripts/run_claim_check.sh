@@ -7,12 +7,12 @@
 #
 #   scripts/run_claim_check.sh report.md                   # voters from [claim_vote] llm_profiles
 #   RUNS=5 scripts/run_claim_check.sh report.md --profiles a b c
-#   scripts/run_claim_check.sh report.md --target . --ref origin/<head> --truth truth.csv   # CC-6 + CC-8
-#   scripts/run_claim_check.sh report.md --target . --ref HEAD --truth t.csv --dry-run  # print, run nothing
+#   scripts/run_claim_check.sh report.md --target . --ref origin/<head> --truth validate1/truth.csv   # CC-6 + CC-8
+#   scripts/run_claim_check.sh report.md --target . --ref HEAD --truth validate1/truth.csv --dry-run  # print, run nothing
 #
 # --target / --ref / --base / --fetch / --profiles / --models ... go to claim_vote.py as they are.
-# --truth FILE (CC-8): claimcheck_truth.py at the end; a bare name lands in the output directory,
-# pending.md always does.  An existing FILE is appended to (its rows are an operator's work: a run
+# --truth FILE (CC-8): claimcheck_truth.py at the end; a bare name lands in the output directory
+# (a new one every run: a new file each time, never the shared key), pending.md always does.  An existing FILE is appended to (its rows are an operator's work: a run
 # that replaced validate1/truth.csv lost the hand-checked rows); --force replaces it, --append is the default.
 # --dry-run: print the commands and exit 0 — no network, nothing written.
 # --no-lenz-hint (CC-9): no Lenz block in pending.md and on the console (with --truth only; the

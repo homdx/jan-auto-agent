@@ -50,7 +50,7 @@ with the agents. A round of seven free agents takes one to two hours.
 The operator makes the Opus, Sonnet and Haiku patches by hand and leaves them in `/tmp` (`Sonet5-0073-….patch`, a series:
 `0072` was the already-landed docs commit, `0073` the work). Apply each to a worktree at the round's base commit
 (`git worktree add --detach /tmp/j/Sonet5 <base>`; `git apply <patch>`). They are judged in the same round with the same box.
-Authors in their patches are not the project's: the ideal commit is made again by `renat <renat@hp.local2>` with the model's
+Authors in their patches are not the project's: the ideal commit is made again by the operator's own git identity (`git config user.name/user.email`) with the model's
 `Co-Authored-By` trailer.
 
 ## 5. Judging
@@ -71,7 +71,7 @@ Authors in their patches are not the project's: the ideal commit is made again b
 Take the best entry as it is when it passes everything (here Sonnet 5.5). `git apply` its patch on the epic's branch (leave
 out files the branch already has, such as the `epic-tasks` copy of the ticket, and take the entry's version of that one file),
 check that the files equal the judged ones (`cmp`), commit **by explicit paths** in groups (code and tests; then ticket, runbook,
-epic table), author `renat <renat@hp.local2>`, the model's trailer kept. The operator pushes; nobody else does.
+epic table), author the operator's own git identity (`git config user.name/user.email`), the model's trailer kept. The operator pushes; nobody else does.
 
 ## 7. After the round: the live measurement
 
