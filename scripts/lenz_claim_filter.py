@@ -394,9 +394,15 @@ def main(argv: list[str] | None = None) -> int:
         return keys[0]
 
     extracted: list[str] = []
-    for sec in sections:
-        key = need_key() if cache.get("extract", sec) is None else ""
-        extracted += extract_claims(sec, key, cache)
+    try:
+        for sec in sections:
+            key = need_key() if cache.get("extract", sec) is None else ""
+            extracted += extract_claims(sec, key, cache)
+    except LenzError as exc:
+        # the free /extract fails as /assess does: one line, not a traceback
+        print(f"lenz_claim_filter: {exc} — the sections read before it are cached; a re-run does not "
+              "send them again", file=sys.stderr)
+        return 1
     claims = pick_extracted(extracted, args.max, _repo_symbols(args.repo_root))
     fresh = sum(1 for c in claims if not cache.get("assess", c))
     print(f"{len(sections)} sections -> {len(extracted)} claims (free) -> "

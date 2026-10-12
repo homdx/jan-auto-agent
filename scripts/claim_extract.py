@@ -49,11 +49,17 @@ def main(argv: list[str] | None = None) -> int:
     key = lf.api_key() if todo else ""
     seen: set[str] = set()
     claims: list[dict] = []
-    for sec in sections:
-        for c in lf.extract_claims(sec, key, cache):
-            if lf.normalize(c) not in seen:
-                seen.add(lf.normalize(c))
-                claims.append({"claim": c, "section": sec.splitlines()[0][:80]})
+    try:
+        for sec in sections:
+            for c in lf.extract_claims(sec, key, cache):
+                if lf.normalize(c) not in seen:
+                    seen.add(lf.normalize(c))
+                    claims.append({"claim": c, "section": sec.splitlines()[0][:80]})
+    except lf.LenzError as exc:
+        # one line, as before the LenzError: an HTTP 429 or a bad key was a traceback in extract.log
+        print(f"claim_extract: {exc} — the sections read before it are cached; a re-run does not "
+              "send them again", file=sys.stderr)
+        return 1
     args.out.write_text(json.dumps(claims, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"{len(sections)} sections -> {len(claims)} claims -> {args.out}")
     return 0

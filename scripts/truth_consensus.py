@@ -71,7 +71,9 @@ def main():
 
     paths, unmatched = [], []
     for pat in a.csvs:
-        hits = sorted(glob.glob(pat))
+        # a file of that name is that file: `truth[1].csv` is no pattern of itself (it opened before the
+        # unmatched-pattern check, and was refused by it)
+        hits = [pat] if os.path.isfile(pat) else sorted(glob.glob(pat))
         paths += hits
         if not hits:
             unmatched.append(pat)

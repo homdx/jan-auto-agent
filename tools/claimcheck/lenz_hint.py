@@ -138,11 +138,18 @@ def section_of(claim: str) -> str:
     """One claim as a section of the claims file: the claim as the heading (what the script's
     ``--dry-run`` prints) and again as the body (what ``/extract`` reads).
 
-    The body never starts with ``#``, a backtick or ``~``: a claim that began with a code fence
-    opened a fence the script's splitter never saw closed (three claims read as one section), and
-    one that began with ``## `` was a heading of its own (three read as four)."""
+    The body never starts with a fence (three backticks or tildes) or ``#``: a claim that began with
+    a code fence opened a fence the script's splitter never saw closed (three claims read as one
+    section), and one that began with ``## `` was a heading of its own (three read as four). A single
+    backtick stays: `sorted()` keeps … went to Lenz as "sorted()` keeps …"."""
     line = _one_line(claim)
-    body = re.sub(r"^[#`~\s]+", "", line) or line.replace("#", "").replace("`", "").replace("~", "")
+    body = line
+    while True:
+        cut = re.sub(r"^\s*(?:`{3,}|~{3,}|#+)\s*", "", body)
+        if cut == body:
+            break
+        body = cut
+    body = body or line.replace("#", "").replace("`", "").replace("~", "")
     return f"### {line}\n\n{body}\n"
 
 

@@ -261,7 +261,6 @@ def score(res: dict, ids: list, truth: dict, skip=()) -> dict:
 
 
 def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> tuple:
-    off = next((r for r in results if r["variant"] == "off" and r["ok"]), None)
     # every baseline run that ran: a variant is compared with each, so the verdict does not depend on
     # which of the two noisy `off` runs came first (PASS against 14, FAIL against 10)
     bases = [r for r in results if r["variant"].startswith("off") and r["ok"]]
