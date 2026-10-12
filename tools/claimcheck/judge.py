@@ -161,9 +161,16 @@ def _rows_to_votes(rows, order: list) -> dict:
     return votes
 
 
-#: start positions one reply is decoded from, at most: each try reads to the end of what it opens,
-#: so trying every `[` of a 5,000-deep reply took seconds, and 10,000 deep raised RecursionError
+#: start positions one reply is decoded from, at most this many from its head and as many from its
+#: tail: each try reads to the end of what it opens, so trying every `[` of a 5,000-deep reply took
+#: seconds, and 10,000 deep raised RecursionError. Only the head was tried, and a valid answer after
+#: ~8k characters of code-heavy reasoning (600 `[`, 400 `{`) was a lost vote: an answer comes last
 MAX_STARTS = 400
+#: characters decoded over all the tries of one reply: one long unterminated nesting made every try
+#: read to the end (1.6 MB in 19 s); a cheap failure (`a[i]` in prose) costs what it read
+MAX_DECODE_WORK = 4_000_000
+#: what a try that hit the interpreter's recursion limit is counted as
+_RECURSION_COST = 4_000
 
 
 def decode_at(decoder: json.JSONDecoder, text: str, i: int):
@@ -175,34 +182,49 @@ def decode_at(decoder: json.JSONDecoder, text: str, i: int):
         return None
 
 
+def _starts(text: str, ch: str) -> list:
+    """The positions of *ch* in *text* that are tried: all of them, or the first and the last
+    `MAX_STARTS`."""
+    pos = [m.start() for m in re.finditer(re.escape(ch), text)]
+    return pos if len(pos) <= 2 * MAX_STARTS else pos[:MAX_STARTS] + pos[-MAX_STARTS:]
+
+
+def json_values(text: str, ch: str, *, strict: bool = False, past: bool = False):
+    """Each JSON value that starts at a *ch* of *text* (`_starts`), in order, within
+    `MAX_DECODE_WORK`. *past*: the next try starts after the value just read (rows written one
+    after another); else at the next *ch* (a list inside a list is tried too)."""
+    decoder = json.JSONDecoder(strict=strict)
+    work, after = 0, -1
+    for i in _starts(text, ch):
+        if work >= MAX_DECODE_WORK:
+            return
+        if past and i < after:
+            continue
+        try:
+            value, end = decoder.raw_decode(text, i)
+        except json.JSONDecodeError as err:
+            work += max(1, err.pos - i)
+            continue
+        except RecursionError:
+            work += min(len(text) - i, _RECURSION_COST)
+            continue
+        work += end - i
+        after = end
+        yield value
+
+
 def _lists(text: str):
-    """Every JSON list in *text*, in order of where it starts (the first `MAX_STARTS`)."""
+    """Every JSON list in *text*, in order of where it starts (`json_values`)."""
     # strict=False: a model copying a code line into "quote" writes the line break as a bare
     # newline, which strict JSON forbids; the whole reply was lost to it, not just the quote
-    decoder = json.JSONDecoder(strict=False)
-    i, tries = text.find("["), 0
-    while i != -1 and tries < MAX_STARTS:
-        tries += 1
-        got = decode_at(decoder, text, i)
-        if got is not None and isinstance(got[0], list):
-            yield got[0]
-        i = text.find("[", i + 1)
+    for value in json_values(text, "["):
+        if isinstance(value, list):
+            yield value
 
 
 def _objects(text: str) -> list:
     """Every top-level JSON object in *text*, in order (the rows of a reply that has no list)."""
-    decoder = json.JSONDecoder(strict=False)
-    out: list = []
-    i, tries = text.find("{"), 0
-    while i != -1 and tries < MAX_STARTS:
-        tries += 1
-        got = decode_at(decoder, text, i)
-        if got is None:
-            i = text.find("{", i + 1)
-            continue
-        out.append(got[0])
-        i = text.find("{", got[1])
-    return out
+    return [v for v in json_values(text, "{", past=True) if isinstance(v, dict)]
 
 
 def parse_votes_v2(text: str, order: list) -> dict:

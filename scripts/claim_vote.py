@@ -289,12 +289,9 @@ def build_prompt(claims: list[str], run: int, seed: int,
 def parse_votes(text: str, order: list[int]) -> dict[int, str]:
     """Model reply -> {original claim index: verdict}; garbage gives {}."""
     text = text or ""
-    decoder = json.JSONDecoder()
-    i, tries = text.find("["), 0
-    while i != -1 and tries < cc_judge.MAX_STARTS:   # the CLAIM-1 path had judge.py's RecursionError too
-        tries += 1
-        got, i = cc_judge.decode_at(decoder, text, i), text.find("[", i + 1)
-        rows = got[0] if got is not None else None
+    # judge's bounded tries (the head and the tail of the reply, a work budget): the CLAIM-1 path
+    # had judge.py's RecursionError too, and lost an answer past its first 400 `[`
+    for rows in cc_judge.json_values(text, "[", strict=True):
         if not isinstance(rows, list):
             continue
         votes: dict[int, str] = {}
