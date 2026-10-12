@@ -217,7 +217,7 @@ def main(argv=None) -> int:
     ap.add_argument("--reader", default=READER, help="claim_vote_llm.* section used as Gate 1's single reader")
     ap.add_argument("--out", help="output directory (default contest-out/gate1-layer2/<UTC>)")
     ap.add_argument("--resume", metavar="DIR", help="continue DIR: variants with a result.json are not run again")
-    ap.add_argument("--timeout", type=int, default=7200, help="seconds one variant may take (default 7200)")
+    ap.add_argument("--timeout", type=int, default=10800, help="seconds one variant may take (default 10800; 9 voters took 6200 s, 11 timed out at 7200)")
     ap.add_argument("--detach", action="store_true", help="start in the background, print where the progress is, return")
     ap.add_argument("--dry-run", action="store_true", help="print the variants and what they would use, run nothing")
     args = ap.parse_args(argv)

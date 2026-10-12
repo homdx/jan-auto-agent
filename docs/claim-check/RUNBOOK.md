@@ -372,6 +372,11 @@ runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at th
   least a third of the candidates; otherwise `claim_vote` stays `off`. Five or more voters run with
   `vote_accept = committed` (CC-11), three with `all`.
 
+  **First run (2026-10-12, free models, 56 candidates): no set of 3, 5, 7 or 9 voters passes, `claim_vote` stays `off`.**
+  The vote's unanimous FALSE was right 8 of 8 times; its unanimous TRUE was wrong 8 of 10 (three voters) to 18 of 20
+  (nine): "add a test that …" candidates and a pack without callers. More voters decide more and are not safer. Details,
+  and the three changes to try, in `docs/claim-check/GATE1-VOTE-LAYER2.md` section 6.
+
 ## When something goes wrong
 
 | what you see | what it is | what to do |
