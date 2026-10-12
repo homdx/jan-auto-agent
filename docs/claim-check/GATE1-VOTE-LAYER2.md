@@ -29,9 +29,9 @@ Options worth knowing:
 | `--sets 3,5,7,9` | voter sets to test (the default is `3:all,5:committed,7:committed,9:committed`); `--sets 3,5,7,9,11` adds the 11-voter set with two weak voters |
 | `--sets 5:all,5:committed` | the same size under both acceptance rules, to see what `committed` buys |
 | `--sets 3+veto,3+notests,5+veto+notests` | the variants of section 6: `+veto` = `vote_confirm = off` (a unanimous FALSE rejects, a unanimous TRUE is the reader's), `+notests` = `vote_skip_tests = on` (candidates citing a test file are not voted); a `+veto` variant is not asked to decide a third, only not to be worse |
-| `--off-runs 2` | how many times the baseline runs (default 2): the reader is a model and does not repeat itself, the second run sizes its noise and `SUMMARY.md` prints the disagreement |
+| `--off-runs 2` | how many times the baseline runs (default: `[gate1_layer2] off_runs` of `contest.ini`, which ships 2): the reader is a model and does not repeat itself, the second run sizes its noise and `SUMMARY.md` prints the disagreement |
 | `--dry-run` | prints the variants, their voters and the reader; runs nothing |
-| `--resume DIR` | continues a stopped run; variants that have a `result.json` are not run again |
+| `--resume DIR` | continues a stopped run; a variant whose `result.json` says it ran is not run again, one that failed (an error, a timeout) is |
 | `--reader NAME` | the `claim_vote_llm.NAME` section used as Gate 1's single reader (default `kenary_agnes_3_0_flash_free`) |
 | `--known DIR` | another known-answer set (`plan.json`, `truth.csv`, `TARGET`) |
 
@@ -81,18 +81,26 @@ and `plan.json` as real defects are settled; the script reads whatever is there.
 
 The table has one row per variant:
 
+* `unresolved` — candidates Gate 1 could not judge in this run: the reader never answered (plan_validator's "could not be
+  checked" list, or a `presence_unknown = keep` line in `run.log`). They are left out of the next two columns **on both
+  sides** of a comparison (a provider's outage is not the vote's false positive), and the verdict says on how many
+  candidates it was made;
 * `false positives through` — kept by Gate 1 although the answer is `FALSE` (lower is better);
 * `true bugs rejected` — removed by Gate 1 although the answer is `REAL` (lower is better);
-* `asked / decided / overridden / requests` — the vote's own counters: candidates put to the voters, candidates the voters
-  settled (the reader not asked, or its veto not used), unanimous `FALSE` verdicts the reader overruled with `confirmed`,
-  and HTTP requests made;
+* `asked / decided / overridden / requests / skipped` — the vote's own counters: candidates put to the voters, candidates
+  the voters settled (the reader not asked, or its veto not used), unanimous `FALSE` verdicts the reader overruled with
+  `confirmed`, HTTP requests made, and candidates that reached the vote and were not voted on (nothing in the tree to
+  quote, a test file under `+notests`, the cap, the vote stopped);
 * `verdict` — `PASS` when, against `off`, false positives are not more, true bugs rejected are not more, and `decided` is at
   least a third of the candidates. Otherwise `FAIL (...)` says which.
 
-Below it is a per-candidate matrix (`R` removed, `k` kept) next to the recorded answer. A column that disagrees with `off`
-on a candidate with an answer is where to look: `<variant>/run.log` has the vote line and the reader's reason.
+Below it is a per-candidate matrix (`R` removed, `k` kept, `?` not judged) next to the recorded answer. A column that
+disagrees with `off` on a candidate with an answer is where to look: `<variant>/run.log` has the vote line and the
+reader's reason.
 
-Exit code: `0` all `on` variants passed, `1` one failed the rule, `2` a variant could not run.
+Exit code: `0` all `on` variants passed, `1` one failed the rule, `2` a variant could not run (`--resume DIR` runs it
+again), `3` an `on` variant has no verdict (no recorded answers, or no baseline). The last line of `progress.log` before
+`DONE` names every variant's verdict in full.
 
 ## 4. What to do with the answer
 
