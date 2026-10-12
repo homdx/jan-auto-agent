@@ -108,8 +108,8 @@ def parse_sets(text: str) -> list:
             raise SystemExit(f"set {part!r}: options are +veto and +notests, rules all|committed")
         item = (n, rule or ("all" if n == 3 else "committed"), tuple(sorted(opts)))
         # two sets of one name shared one directory and one result.json, and --resume took the second as done
-        if any(variant_name(o[0], o[2]) == variant_name(item[0], item[2]) for o in out):
-            raise SystemExit(f"set {part!r}: {variant_name(item[0], item[2])} is named twice")
+        if any(variant_name(o[0], o[2], o[1]) == variant_name(item[0], item[2], item[1]) for o in out):
+            raise SystemExit(f"set {part!r}: {variant_name(item[0], item[2], item[1])} is named twice")
         out.append(item)
     return out
 
@@ -125,8 +125,11 @@ def ini_off_runs(path: Path) -> int:
     return value if value >= 1 else DEFAULT_OFF_RUNS
 
 
-def variant_name(n: int, opts: tuple) -> str:
-    return "-".join([f"on-{n}"] + list(opts))
+def variant_name(n: int, opts: tuple, rule: "str | None" = None) -> str:
+    """``on-5``, ``on-5-veto``; the rule is in the name when it is not the size's default (``on-5-all``,
+    ``on-3-committed``), so ``--sets 5:all,5:committed`` — what committed buys at one size — is two variants."""
+    default = "all" if n == 3 else "committed"
+    return "-".join([f"on-{n}"] + ([rule] if rule and rule != default else []) + list(opts))
 
 
 def load_truth(known: Path) -> dict:
@@ -259,6 +262,10 @@ def score(res: dict, ids: list, truth: dict, skip=()) -> dict:
 
 def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> tuple:
     off = next((r for r in results if r["variant"] == "off" and r["ok"]), None)
+    # every baseline run that ran: a variant is compared with each, so the verdict does not depend on
+    # which of the two noisy `off` runs came first (PASS against 14, FAIL against 10)
+    bases = [r for r in results if r["variant"].startswith("off") and r["ok"]]
+    base_unresolved = set().union(*[set(b.get("inconclusive") or ()) for b in bases]) if bases else set()
     labelled = len(truth)
     lines = [f"# CC-10 layer 2 — Gate 1 on a known-answer set\n",
              f"{len(ids)} candidates, {labelled} with a recorded answer "
@@ -274,25 +281,34 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
             verdicts[r["variant"]] = "ERROR"
             continue
         # both sides on the same candidates: what either could not judge is out of both counts
-        sc = score(r, ids, truth, skip=(off.get("inconclusive") or ()) if off and r is not off else ())
-        unresolved = sorted(set(r.get("inconclusive") or ()) | (set(off.get("inconclusive") or ()) if off else set()))
+        own = set(r.get("inconclusive") or ())
+        is_base = r["variant"].startswith("off")
+        sc = score(r, ids, truth, skip=() if is_base else base_unresolved)
+        unresolved = sorted(own | (set() if is_base else base_unresolved))
         verdict = "baseline"
         if r["variant"].startswith("off"):
             verdict = "baseline" if r["variant"] == "off" else "baseline repeat (the reader's own noise)"
         else:
             if not labelled:
                 verdict = "no answers recorded"
-            elif off is None:
+            elif not bases:
                 verdict = "no baseline"
             else:
-                sc_off = score(off, ids, truth, skip=r.get("inconclusive") or ())
+                skip = own | base_unresolved
+                scs = [score(b, ids, truth, skip=skip) for b in bases]
+                best_fp = min(len(x["false_positives_through"]) for x in scs)
+                best_tr = min(len(x["true_bugs_rejected"]) for x in scs)
                 third = math.ceil(r.get("checked", len(ids)) / 3)
-                veto = "veto" in r.get("opts", [])      # a veto-only vote decides little by design: no third required
-                ok = (len(sc["false_positives_through"]) <= len(sc_off["false_positives_through"])
-                      and len(sc["true_bugs_rejected"]) <= len(sc_off["true_bugs_rejected"])
-                      and (veto or r.get("votes_decided", 0) >= third))
-                verdict = ("PASS" + (" (veto only: decided not required)" if veto else "")) if ok else \
-                    "FAIL (needs fp<=off, true rejected<=off%s)" % ("" if veto else ", decided>=%d" % third)
+                veto = "veto" in r.get("opts", [])
+                # a veto-only vote decides little by design, so no third is asked of it — but one that never
+                # vetoed did nothing, and "not worse than off" was a PASS for an inert switch
+                decided = r.get("votes_decided", 0)
+                enough = decided >= 1 if veto else decided >= third
+                ok = (len(sc["false_positives_through"]) <= best_fp and len(sc["true_bugs_rejected"]) <= best_tr
+                      and enough)
+                n_off = f"each of {len(bases)} off runs" if len(bases) > 1 else "off"
+                verdict = ("PASS" + (" (veto only: at least one veto, no third required)" if veto else "")) if ok else \
+                    "FAIL (needs fp<=%s, true rejected<=%s, decided>=%d)" % (n_off, n_off, 1 if veto else third)
                 if unresolved:
                     verdict += f" — on {len(ids) - len(unresolved)} of {len(ids)} candidates, {len(unresolved)} unresolved"
         verdicts[r["variant"]] = verdict
@@ -343,7 +359,7 @@ def main(argv=None) -> int:
     sets = parse_sets(args.sets)
     off_runs = args.off_runs if args.off_runs is not None else ini_off_runs(ROOT / "contest.ini")
     variants = [("off" if i == 0 else f"off-{i + 1}", [], "all", ()) for i in range(max(1, off_runs))]
-    variants += [(variant_name(n, opts), ROSTER[:n], rule, opts) for n, rule, opts in sets]
+    variants += [(variant_name(n, opts, rule), ROSTER[:n], rule, opts) for n, rule, opts in sets]
     out = Path(args.resume) if args.resume else Path(args.out) if args.out else OUT_BASE / dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     local = configparser.ConfigParser(interpolation=None)
     local.read(args.local_ini, encoding="utf-8-sig")       # a BOM (Notepad) or a locale's codec was a traceback
@@ -374,7 +390,10 @@ def main(argv=None) -> int:
         if "--out" not in cmd and "--resume" not in cmd:
             cmd += ["--out", str(out)]
         with open(out / "nohup.out", "a") as fh:
-            subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True, cwd=ROOT)
+            # the child runs where this one was started: its relative --local-ini / --known / --out were
+            # checked and printed against this directory, and cwd=ROOT read them from another one
+            subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
+                             cwd=os.getcwd())
         print(f"started in the background.\n  progress: {out}/progress.log\n  answer:   {out}/SUMMARY.md (when progress.log says DONE)")
         return 0
 
