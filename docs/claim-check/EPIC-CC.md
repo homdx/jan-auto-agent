@@ -5,7 +5,7 @@ review of the branch (five reports) landed as ten "CC review fixes N/10" commits
 **Base:** `main` after the open `arena` tickets and their bugs have landed
 **Branch:** `cc-epic-docs` (the sketch said `cc`)
 **Tickets:** CC-0 … CC-8, numbered **250 … 290 in steps of five**, then CC-9 = 291 and
-CC-10 = 292 and CC-11 = 293 (§9). The four numbers after each ticket are reserved for the fixes that real
+CC-10 = 292, CC-11 = 293 and CC-12 = 294 (§9). The four numbers after each ticket are reserved for the fixes that real
 rounds will turn up; 293 … 299 are left for the epic's own close-out. Each ticket is
 written in full under `docs/claim-check/tickets/` and is copied into `epic-tasks/` (with `arena issue create
 --number NNN`) when its turn comes — not before: `run` refuses untracked files in
@@ -228,6 +228,7 @@ prefix normalisation, is not a substring of that chunk (reason `quote_not_in_pac
 | 291 | CC-9 | A Lenz comparison hint: the commands and the cost printed after a run, never run (`/extract` free 1000 a day; `/assess` 1 credit, `/verify` 10, from 100 a month + 400) | S | CC-6, CC-8 | contest | 6 |
 | 292 | CC-10 | Claim check in Gate 1 — three voters with the code and a quote instead of one reader, behind `[gate1] claim_vote = off` | M | CC-6, CC-7, CC-8 | contest | 7 |
 | 293 | CC-11 | Accept on three committed voters, not on all of them: `--accept committed`, so five voters leave three that work (146 of 150 settled, 0 wrong, replayed offline) | S | CC-6, CC-7, CC-8 | contest | 8 |
+| 294 | CC-12 | Callers in the evidence pack, so the Gate 1 vote can confirm a candidate and not only veto it (first live run: unanimous FALSE right 8 of 8, unanimous TRUE wrong 8 of 10); `[gate1] vote_callers`, off by default | M | CC-5, CC-10 | contest | 9 |
 
 Why ten contest tickets (CC-1 … CC-10) and not five: an earlier sketch folded CC-3/CC-4 pack assembly
 and the voter changes into one ticket. A round gives one agent one session; an L ticket
