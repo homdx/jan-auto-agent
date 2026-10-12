@@ -177,8 +177,9 @@ class _Lock:
             try:
                 self.path.mkdir()
             except FileExistsError:
-                if self._stale():
-                    self._break()
+                stale, seen = self._stale()
+                if stale:
+                    self._break(seen)
                     continue
                 if time.monotonic() > deadline:
                     raise TargetError(f"lock {self.path}: held for more than {int(self.wait)} s")
@@ -192,27 +193,44 @@ class _Lock:
                 pass
             return self
 
-    def _stale(self) -> bool:
-        """A lock is broken only when its owner is gone: a live owner on this host keeps it
-        however long it takes (a clone past STALE was broken and its .tmp deleted under it);
-        a lock with no owner on record falls back to its age."""
+    def _stale(self) -> tuple:
+        """(stale, the owner token it was judged by, or None). A lock is broken only when its
+        owner is gone: a live owner on this host keeps it however long it takes (a clone past
+        STALE was broken and its .tmp deleted under it); a lock with no owner on record falls
+        back to its age."""
         try:
             owner = (self.path / "owner").read_text(encoding="utf-8")
-            return not _pid_alive(int(owner.split("-", 1)[0]))
-        except (OSError, ValueError):
-            pass
-        try:
-            return time.time() - self.path.stat().st_mtime > self.STALE
         except OSError:
-            return False
+            owner = None
+        if owner is not None:
+            pid = _token_pid(owner)
+            if pid is not None:
+                return not _pid_alive(pid), owner
+        try:
+            return time.time() - self.path.stat().st_mtime > self.STALE, owner
+        except OSError:
+            return False, owner
 
-    def _break(self) -> None:
-        # renamed aside first: two waiters that both see it stale do not delete each other's new lock
+    def _break(self, seen: "str | None" = None) -> None:
+        """Move the stale lock *seen* aside and delete it. Two waiters that both judged the dead
+        lock stale: the first breaks it and takes a new one, and the second's rename used to move
+        that NEW, live lock aside and delete it — both then held "the" lock. What was moved is
+        checked against what was judged, and a lock that is not the one judged is put back."""
         aside = self.path.with_name(f"{self.path.name}.stale-{uuid.uuid4().hex[:8]}")
         try:
             self.path.rename(aside)
         except OSError:
             return
+        try:
+            moved = (aside / "owner").read_text(encoding="utf-8")
+        except OSError:
+            moved = None
+        if moved != seen:
+            try:
+                aside.rename(self.path)     # a live lock taken in between: its owner keeps it
+                return
+            except OSError:
+                pass                        # a third lock is there already: this one cannot go back
         shutil.rmtree(aside, ignore_errors=True)
 
     def __exit__(self, *exc) -> None:
@@ -222,6 +240,12 @@ class _Lock:
             mine = False
         if mine:   # a lock broken and taken over by another process is not ours to remove
             shutil.rmtree(self.path, ignore_errors=True)
+
+
+def _token_pid(token: str) -> "int | None":
+    """The pid of a ``<pid>-<uuid>`` token (a users/ entry, a lock's owner), or None for any other name."""
+    head = str(token).split("-", 1)[0].strip()
+    return int(head) if head.isdigit() else None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -522,7 +546,9 @@ class Target:
             if self._token is not None:
                 self._token.unlink(missing_ok=True)
                 self._token = None
-            others = [u for u in users.glob("*") if _pid_alive(int(u.name.split("-", 1)[0]))] \
+            # a name that is no token of ours (.DS_Store, an editor's backup) is nobody's: int() of it
+            # was a ValueError that left the worktree behind
+            others = [u for u in users.glob("*") if (pid := _token_pid(u.name)) is not None and _pid_alive(pid)] \
                 if users.is_dir() else []
             wanted = self._created or remove or marker.exists()
             if not wanted:

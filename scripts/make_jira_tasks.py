@@ -26,6 +26,15 @@ from collections import defaultdict
 SEV = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 4, "": 5}
 
 
+def is_world_fact(how) -> bool:
+    """A claim-check row of a world claim: its ``how`` is ``world fact``, alone (CC-8) or as the
+    last part after CC-11's ``3 of 5 voters committed; `` — the exact match missed that form, and
+    under ``--accept committed`` a true world fact became a defect ticket. A quote in ``how`` has
+    its ``;`` escaped (``\\;``), so only a bare one separates the parts."""
+    parts = re.split(r"(?<!\\);", str(how or ""))
+    return parts[-1].strip() == "world fact"
+
+
 def slug(s):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:48]
 
@@ -80,12 +89,12 @@ def main():
     # dropped for naming a bad canonical.
     # a claim-check row of a world claim (how = "world fact", CC-8) says a fact about the world
     # is true, not that the code has a defect: "Python was created by Guido" was filed as one
-    world = [r for r in truth_rows if (r.get("how") or "").strip() == "world fact"]
+    world = [r for r in truth_rows if is_world_fact(r.get("how"))]
     if world:
         print(f"skipped {len(world)} world-fact row(s): a true fact is not a defect", file=sys.stderr)
     real_rows = {(r.get("finding") or "").strip(): r for r in truth_rows
                  if (r.get("truth") or "").strip().upper() == "REAL"
-                 and (r.get("how") or "").strip() != "world fact"}
+                 and not is_world_fact(r.get("how"))}
     order = {key: i for i, key in enumerate(real_rows)}
 
     def end_of(key):

@@ -384,8 +384,12 @@ def _umask() -> int:
 
 def atomic_write(path: Path, text: str) -> None:
     """*text* into *path* through a temporary file in the same directory and a rename: a failure
-    on the way leaves the old file as it was, and no temporary file behind."""
+    on the way leaves the old file as it was, and no temporary file behind. A symlink is written
+    through: the rename replaced the link with a regular file, and the shared truth.csv it named
+    never got the new rows."""
     path = Path(path)
+    if path.is_symlink():
+        path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
@@ -419,12 +423,34 @@ def write_truth(path: Path, rows: list, *, append: bool = False) -> tuple:
     add, conflicts = merge_rows(existing, rows)
     if not add and path.exists():
         return [], conflicts
-    header = list(TRUTH_HEADER)
-    if existing:
-        with path.open(newline="", encoding="utf-8-sig") as fh:   # the BOM, as in read_truth
-            header = next(csv.reader(fh))
-        header += [k for k in TRUTH_HEADER if k not in header]
-    atomic_write(path, _csv_text(header, existing + add))
+    # bytes, not read_text: a spreadsheet's CRLF stays as the operator saved it. A BOM is dropped
+    # (CC review fixes 13: the file is written without one, every reader takes it either way)
+    old = path.read_bytes().decode("utf-8") if path.exists() else ""
+    old = old[1:] if old.startswith("\ufeff") else old
+    raw = list(csv.reader(io.StringIO(old, newline="")))
+    header = raw[0] if raw else []
+    if header and all(k in header for k in TRUTH_HEADER):
+        # nothing of the file is rewritten: the rows are added after it. Rewritten from DictReader
+        # rows, a hand-edited row's cells past the header ("see issue #4", "and the PR") were lost
+        eol = "\r\n" if "\r\n" in old else "\n"
+        body = _csv_text(header, add).split("\n", 1)[1].replace("\n", eol)
+        atomic_write(path, old + ("" if old.endswith("\n") else eol) + body)
+        return add, conflicts
+    # our columns are missing (an older file) or there is no header yet (an empty file): the header
+    # gains them at its end and every row keeps its own cells, the ones past its header too
+    grown = header + [k for k in TRUTH_HEADER if k not in header]
+    gap = len(grown) - len(header)
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow(grown)
+    for cells in raw[1:]:
+        if not cells:
+            continue
+        own, past = cells[:len(header)], cells[len(header):]
+        w.writerow(own + [""] * (len(header) - len(own)) + [""] * gap + past)
+    for r in add:
+        w.writerow([r.get(k, "") for k in grown])
+    atomic_write(path, buf.getvalue())
     return add, conflicts
 
 
