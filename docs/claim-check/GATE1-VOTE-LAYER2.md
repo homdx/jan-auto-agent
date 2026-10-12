@@ -190,3 +190,46 @@ above are the instrument):
   switch). All eight unanimous FALSEs of this run were right.
 
 The last is one small code change and the cheapest to try; the second addresses the cause. Neither is part of this run.
+
+### The second run: the changes tried, and the noise (same run directory, 2026-10-12)
+
+Added to the same run: the baseline a second time (`off-2`), `+veto` (`vote_confirm = off`), `+notests` (`vote_skip_tests = on`).
+
+| variant | false positives through | true bugs rejected | asked / decided | vote's own confirmations (wrong) | vote's own rejections (wrong) | verdict |
+|---|---|---|---|---|---|---|
+| off | 26 | 1 | — | — | — | baseline |
+| off-2 | 26 | 1 | — | — | — | baseline repeat |
+| on-3-veto | 28 | 1 | 53 / 0 | none by design | 0 | FAIL |
+| on-3-notests | 26 | 1 | 24 / 6 | 6 (4) | 0 | FAIL (decided < 19) |
+| on-3-notests-veto | 27 | 2 | 24 / 0 | none by design | 0 | FAIL |
+| on-5-notests | 29 | 1 | 24 / 9 | 9 (7) | 0 | FAIL (decided < 19) |
+
+What the second run says:
+
+1. **The baseline is noisy and the rule did not allow for it.** `off` and `off-2` have the same count (26 false positives
+   through, 1 true bug rejected) but disagree on **14 of 56 candidates**. A single variant lands at 26 to 28 with no vote
+   involved: `on-3-veto` decided nothing (0 of 53) and still reads 28; `on-3-notests-veto` decided nothing and removed a
+   *real* bug (`AUTO-R2`) the baselines kept, which is the reader alone. A difference of 1 to 3 against one baseline run is
+   not a result, in either direction. The pass rule ("not more than `off`") needs the better of two baselines and a margin, or
+   more candidates; the layer-2 patch 20 of the review fixes (candidates the reader could not judge) removes one source of
+   this noise and not the reader's own.
+2. **Dropping the test-file candidates helped the vote's own accuracy and did not fix it.** Wrong confirmations: 8 of 10
+   became 4 of 6 (three voters), 14 of 16 became 7 of 9 (five). What is left are the debatable answers (`T8`, `T53`, a public
+   mutable field), `T14` (the field is already copied at the sha) and `T13`: the claim ("has the problem: *<the fix>*") is
+   true in the literal sense and the answer recorded for it is FALSE. This is the claim-wording question of CC-12.
+3. **A veto with three voters is a no-op on this set.** Unanimous FALSE needs the three to agree on "absent"; with three it never
+   happened in these runs (0 rejections). With five to nine it happened 4, 3 and 1 times in the first run, all right.
+   So the veto is only useful with more voters, and the more voters, the more the abstainers matter (`vote_accept`).
+4. **No variant passes; `claim_vote` stays `off`.** The two things most likely to change that are CC-12 (callers in the
+   pack, and a claim that asks for the defect rather than the fix) and a calmer instrument: more real bugs in the set (four
+   is too few to say the vote never rejects one) and a repeat count for the baseline.
+
+**Read this result with one caveat.** The whole run used the code **before** the review fixes of 2026-10-12 (fix 15 reads the
+model a profile names for the three-families rule; before it the rule read the *section names*, so two agnes sections counted
+as two families, and 61 retries held one check for hours; fix 20 takes the candidates the reader could not judge out of the
+comparison). The numbers for 5, 7 and 9 voters are the most affected (agnes-3 and agnes-2-5 are one family). Measure again on
+the fixed code before drawing the line between "the vote is a poor confirmation" and "the vote was run wrong":
+
+```bash
+python3 scripts/gate1_vote_layer2.py --detach --sets 3,5,7,9,5+notests
+```
