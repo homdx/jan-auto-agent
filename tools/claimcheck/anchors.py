@@ -237,6 +237,10 @@ def _with_wider(claim: str, a: Anchor) -> Anchor:
     reading is exactly the text between a pair of backticks or double quotes."""
     out, s = [], a.start
     for _ in range(MAX_WIDER_WORDS):
+        # a longer reading is a word and one space before: no space, nothing to search (the window
+        # search for each of 32,000 `a.py:` took twice what extracting them did)
+        if s < 2 or claim[s - 1] != " ":
+            break
         m = _WORD_BEFORE.search(claim, max(0, s - 200), s)
         if not m:
             break
@@ -510,9 +514,11 @@ def _resolve_ticket(anchor: Anchor, view: RepoView, index: _Index) -> ResolvedAn
     return ResolvedAnchor(anchor, False, path="epic-tasks" if ours else "")
 
 
-#: an identifier written without backticks: snake_case or UPPER_SNAKE (one `_` at least, not only
-#: at the ends), outside a path, a call, a dotted name and backticks — `retry_call never raises`
-_BARE_IDENT = re.compile(r"(?<![\w.`/$@\-])([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)(?![\w`(/\-])")
+#: an identifier written without backticks: snake_case or UPPER_SNAKE (a `_` between two parts), or a
+#: private name (`_flush`, `_check_presence`: no English word starts with `_`), outside a path, a call, a
+#: dotted name and backticks — `retry_call never raises`. A dunder (`__init__`) names no one definition
+_BARE_IDENT = re.compile(r"(?<![\w.`/$@\-])(_+[A-Za-z][A-Za-z0-9_]*|[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)"
+                         r"(?![\w`(/\-])")
 
 
 def resolve_claim(claim: str, view: RepoView) -> list:
@@ -529,7 +535,8 @@ def resolve_claim(claim: str, view: RepoView) -> list:
     for m in _BARE_IDENT.finditer(claim):
         start, end = m.span(1)
         name = m.group(1)
-        if any(start < e and s < end for s, e in taken) or name in _NOT_SYMBOLS or keyword.iskeyword(name):
+        if any(start < e and s < end for s, e in taken) or name in _NOT_SYMBOLS or keyword.iskeyword(name) \
+                or (name.startswith("__") and name.endswith("__")):
             continue
         index = index or _index_of(view)
         got = _resolve_symbol(Anchor("symbol", name, start, end), index)
@@ -718,8 +725,10 @@ class PathRepoView:
         except gitref.GitRefError:
             return None
         names = [n for n in dict.fromkeys(out.split("\0")) if n]
-        # a committed node_modules or virtualenv is still not the project's code
-        venvs = tuple(n[:-len("pyvenv.cfg")] for n in names if n == "pyvenv.cfg" or n.endswith("/pyvenv.cfg"))
+        # a committed node_modules or virtualenv is still not the project's code. A venv made in the root
+        # itself (`python -m venv .`) is not one to leave out: its prefix "" left out every file of the
+        # project (an empty index, every claim a world claim); its packages are under site-packages
+        venvs = tuple(n[:-len("pyvenv.cfg")] for n in names if n.endswith("/pyvenv.cfg"))
         return [n for n in names if os.path.isfile(os.path.join(self.root, n))
                 and not _VENDORED.intersection(n.split("/")[:-1])
                 and not any(n.startswith(v) for v in venvs)]
