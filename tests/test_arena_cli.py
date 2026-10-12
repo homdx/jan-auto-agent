@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import json
 import os
 import stat
@@ -66,8 +68,10 @@ def test_ar8_verbs_parse_their_own_arguments(monkeypatch):
 
     entry = cli.Object("entry", dict(cli.OBJECTS["entry"].verbs))
     issue = cli.Object("issue", dict(cli.OBJECTS["issue"].verbs))
-    entry.verbs["merge"].handler = capture
-    issue.verbs["land"].handler = capture
+    # new Verb objects: the dict copies share them with cli.OBJECTS, and `.handler = capture` on a shared
+    # one outlived monkeypatch — every later `issue land` of the worker returned 0 and committed nothing
+    entry.verbs["merge"] = dataclasses.replace(entry.verbs["merge"], handler=capture)
+    issue.verbs["land"] = dataclasses.replace(issue.verbs["land"], handler=capture)
     monkeypatch.setitem(cli.OBJECTS, "entry", entry)
     monkeypatch.setitem(cli.OBJECTS, "issue", issue)
 

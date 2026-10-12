@@ -423,6 +423,24 @@ def same_model(entry: str, name: str) -> bool:
     return a == b or a.endswith("/" + b) or b.endswith("/" + a)
 
 
+def _spread(current: list[str], names: list[str]) -> str:
+    """The note for a NAME with no provider that matches the entries of two or more providers, or "".
+
+    Several providers of one model in a profile are a supported setup (three sensenova providers, one
+    model each), and a bare NAME acts on all of them, as before. But it did so without a word, and with
+    `-y` without a question: the caller asks then whatever `-y` says (review of 2026-10-12)."""
+    notes = []
+    for name in names:
+        if "/" in base_of(name):
+            continue
+        hits = list(dict.fromkeys(base_of(c) for c in current if same_model(c, name)))
+        providers = {c.split("/", 1)[0] for c in hits if "/" in c}
+        if len(providers) > 1:
+            notes.append(f"{base_of(name)!r} is the model of {len(providers)} providers here ({', '.join(hits)}): "
+                         "every one of them changes")
+    return "; ".join(notes)
+
+
 def _hints(name: str, pool: list[str]) -> list[str]:
     """Up to 3 names that `name` may have meant: a missing suffix, then close ones."""
     by_lower: dict[str, str] = {}
@@ -1193,7 +1211,10 @@ def drop(repo: Path, args: argparse.Namespace) -> int:
         if not kept:
             raise ModelError(f"profile {name!r} would be empty — 1 model must stay")
         before, after = ",".join(current), ",".join(kept)
-        if not _confirm(name, before, after, args.yes):
+        spread = _spread(current, entries)
+        if spread:
+            print(f"note: {spread} — asked even with -y")
+        if not _confirm(name, before, after, args.yes and not spread):
             raise ModelError(f"not applied — {roster.LOCAL_FILENAME} unchanged")
         write_models(repo, name, after)
     except (ModelError, profile.ProfileError) as err:
@@ -1233,7 +1254,10 @@ def replace_model(repo: Path, args: argparse.Namespace) -> int:
             return EXIT_OK
         resolve_names(repo, new)
         check_not_judge(repo, new)
-        if not _confirm(name, before, after, args.yes):
+        spread = _spread(current, [old])
+        if spread:
+            print(f"note: {spread} — asked even with -y")
+        if not _confirm(name, before, after, args.yes and not spread):
             raise ModelError(f"not applied — {roster.LOCAL_FILENAME} unchanged")
         write_models(repo, name, after)
     except (ModelError, profile.ProfileError) as err:
