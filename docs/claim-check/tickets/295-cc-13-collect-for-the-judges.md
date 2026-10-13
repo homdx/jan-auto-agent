@@ -1,6 +1,6 @@
 # CC-13 — the collect model for the judges: used when it is there and fresh, on the voters' side too, with a line that says so
 
-**Status:** FINAL, open — written from what the CC-10 layer-2 runs showed (2026-10-12/13) and from reading the code paths; not yet measured.
+**Status:** landed (round 295: sensenova-6.8 var3 as is + a one-line follow-up; black box 295 passes, `tests/test_gate1_vote_collect.py` 49 tests, the vote stays off). Before: FINAL, open — written from what the CC-10 layer-2 runs showed (2026-10-12/13) and from reading the code paths; not yet measured.
 Cut it into `epic-tasks/` with the first word `open` when the round starts. It does not depend on CC-12 (callers in the pack, 294): the two touch the same
 pack and can be done in either order, but the layer-2 numbers should be taken for each separately.
 **Severity:** MEDIUM (it decides whether the judges are measured, and later run, with the evidence the pipeline has for them)
@@ -45,7 +45,7 @@ Two findings from making one:
 * **`[gate1] vote_collect = off | auto`** (default `off`: every pack is what it is). With `auto`, the vote loads the collect model of the run's base directory once
   (`CollectModel`, read-only) and passes it as `model=` to `build_pack`, **only if it is fresh**: the same freshness test as `main.py --collect --check` (the manifest's
   hashes match the tracked files; `[collect] staleness` is honoured: `ignore` never uses a model, `warn` uses a stale one and flags it, `refresh` is not done by the
-  vote — it never writes). An absent or stale model is no model: the pack is today's, and the log says so once.
+  vote — it never writes). An absent model is no model. A stale one follows `[collect] staleness`: `ignore` — not used, `warn` — used and flagged. Either way the pack of an unused model is today's, and the log says so once (`stale`, not `absent`, when the artifact is there).
 * **One line at the start of Gate 1** (all variants, also with the vote off): `collect: fresh | stale (N modules changed) | absent — reader: used/not used, vote pack: used/not used`.
   Counters `collect_chunks` (chunks of kind `collect` in the packs of the run) and `collect_state` next to the vote's own, so a result says what it had.
 * **`scripts/gate1_vote_layer2.py --collect-from DIR`**: DIR is a `.collect/` built for the known-answer target (`TARGET`'s sha; a checker refuses one whose manifest does not match

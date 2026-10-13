@@ -1,6 +1,6 @@
 # CC-13 — the collect model for the judges: used when it is there and fresh, on the voters' side too, with a line that says so
 
-**Status:** open — FINAL, written from what the CC-10 layer-2 runs showed (2026-10-12/13) and from reading the code paths; not yet measured.
+**Status:** landed (round 295, see docs/claim-check/tickets/295-…). Before: open — FINAL, written from what the CC-10 layer-2 runs showed (2026-10-12/13) and from reading the code paths; not yet measured.
 Cut it into `epic-tasks/` with the first word `open` when the round starts. It does not depend on CC-12 (callers in the pack, 294): the two touch the same
 pack and can be done in either order, but the layer-2 numbers should be taken for each separately.
 **Severity:** MEDIUM (it decides whether the judges are measured, and later run, with the evidence the pipeline has for them)

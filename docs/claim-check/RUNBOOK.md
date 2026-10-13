@@ -416,6 +416,11 @@ runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at th
   its unanimous TRUE wrong 75 to 88 %, and the two baseline runs of the same code differ by six false positives (31 and 25). Not yet measured on fixed code: a veto-only
   vote of five or more voters (`--sets 5+veto,7+veto`). Details in `docs/claim-check/GATE1-VOTE-LAYER2.md` section 6.
 
+  **CC-13 (295), landed: the collect model for the judges.** `[gate1] vote_collect = off|auto` (default `off`): with `auto` the voters' packs carry the `.collect/` facts about the cited module
+  (chunks `collect:contracts|callers|calls|risk|fail_open:<path>`) when the artifact of the run's tree is fresh (or stale and `[collect] staleness = warn`); never written by the vote. `[collect] skip_dirs`
+  adds directories the collector must not walk (`contest-out`, `rounds`). Every Gate 1 run now prints one line that says whether collect was there and who used it: `📦 collect: fresh | stale (N modules changed) | absent — reader: used/not used, vote pack: used/not used`.
+  Layer 2 with and without it: `scripts/gate1_vote_layer2.py --collect-from <.collect built for the target sha> --sets 3,3+collect,5,5+collect` (how to build it: `contest-bench/cc/gate1_known_answers/README.txt`).
+
 ## When something goes wrong
 
 | what you see | what it is | what to do |
