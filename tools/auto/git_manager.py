@@ -392,13 +392,15 @@ class GitManager:
         if not sha:
             return []
         try:
+            # -z: the names as they are. Without it git C-quotes a non-ASCII name ('"caf\\303\\251.py"'),
+            # and the collect facts of that file were never marked stale
             out = self._run(
-                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+                ["git", "diff-tree", "-z", "--no-commit-id", "--name-only", "-r", sha],
                 "git diff-tree failed",
             )
         except GitError:
             return []
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        return [name for name in out.split("\0") if name.strip()]
 
     def paths_changed_between(self, base: str, tip: str) -> list[str]:
         """Repo-relative paths changed in the ``base..tip`` range.
@@ -413,12 +415,12 @@ class GitManager:
             return []
         try:
             out = self._run(
-                ["git", "diff", "--name-only", f"{base}..{tip}"],
+                ["git", "diff", "-z", "--name-only", f"{base}..{tip}"],
                 "git diff base..tip failed",
             )
         except GitError:
             return []
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        return [name for name in out.split("\0") if name.strip()]       # -z: see paths_changed_in
 
     # ── Private ──────────────────────────────────────────────────────────────
 

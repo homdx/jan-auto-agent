@@ -6469,6 +6469,9 @@ def test_a_background_suite_holds_its_slot_until_its_process_exits(tmp_path, mon
     its pytest process runs in the worktree and releases it when the process
     exits. No `release` is called — the poll is what finds the process gone.
     """
+    # Names no run_agent of another test uses: a round test's agent thread that ends late releases its
+    # slot by name in its `finally` (`_SUITE_SLOTS` is module state), and under load an `agent-b` of an
+    # earlier test popped this test's waiter ("status None", a flake of the full suite on 8 cores).
     clock = _FakeClock()
     monkeypatch.setattr(_runner_module, "time", clock)
     monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
@@ -6477,16 +6480,16 @@ def test_a_background_suite_holds_its_slot_until_its_process_exits(tmp_path, mon
     slots = _runner_module._SUITE_SLOTS
     try:
         assert _runner_module._suite_pids(ws.path) == {sleeper.pid}, "the scan must see it"
-        assert slots.acquire("agent-a", ws.path) == 0.0
+        assert slots.acquire("kc58-holder", ws.path) == 0.0
         entered = {}
 
         def hold():
-            entered["waited"] = slots.acquire("agent-b", ws.path)
+            entered["waited"] = slots.acquire("kc58-waiter", ws.path)
 
         thread = threading.Thread(target=hold, daemon=True)
         thread.start()
-        assert _wait_for(lambda: slots.status("agent-b") is not None)
-        assert slots.status("agent-b")[0] == "queued"
+        assert _wait_for(lambda: slots.status("kc58-waiter") is not None)
+        assert slots.status("kc58-waiter")[0] == "queued"
         clock.advance(30.0)            # the background suite takes thirty seconds
         assert thread.is_alive(), "the process is still up, so the slot must still be held"
         sleeper.kill()                 # ... until the process exits
@@ -6494,15 +6497,15 @@ def test_a_background_suite_holds_its_slot_until_its_process_exits(tmp_path, mon
         thread.join(60)
         assert entered["waited"] == pytest.approx(30.0, abs=1.0)
         # the hold is gone but the entry is not: only an explicit release drops it
-        assert slots.status("agent-a") == ("done", 30.0, 0)
+        assert slots.status("kc58-holder") == ("done", 30.0, 0)
         # agent-b holds the slot now; whether the poll has already noticed that
         # no pytest is left is a timing question, not something this test owns
-        second = slots.status("agent-b")
+        second = slots.status("kc58-waiter")
         assert second[0] in ("running", "done") and second[2] == 0, second
     finally:
         sleeper.kill()
-        slots.release("agent-a")
-        slots.release("agent-b")
+        slots.release("kc58-holder")
+        slots.release("kc58-waiter")
 
 
 def test_a_holder_past_its_ceiling_stops_blocking_without_a_kill(tmp_path, monkeypatch):
@@ -6510,6 +6513,9 @@ def test_a_holder_past_its_ceiling_stops_blocking_without_a_kill(tmp_path, monke
     the next waiter goes in beside it — and the holder's process is not
     signalled. The ceiling is a queue rule, not a kill.
     """
+    # Names no run_agent of another test uses: a round test's agent thread that ends late releases its
+    # slot by name in its `finally` (`_SUITE_SLOTS` is module state), and under load an `agent-b` of an
+    # earlier test popped this test's waiter ("status None", a flake of the full suite on 8 cores).
     clock = _FakeClock()
     monkeypatch.setattr(_runner_module, "time", clock)
     monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
@@ -6517,32 +6523,32 @@ def test_a_holder_past_its_ceiling_stops_blocking_without_a_kill(tmp_path, monke
     sleeper = _SuiteSleeper(ws.path)
     slots = _runner_module._SUITE_SLOTS
     try:
-        assert slots.acquire("agent-a", ws.path, ceiling=100.0) == 0.0
+        assert slots.acquire("kc58-holder", ws.path, ceiling=100.0) == 0.0
         entered = {}
 
         def wait():
-            entered["waited"] = slots.acquire("agent-b", ws.path, ceiling=100.0)
+            entered["waited"] = slots.acquire("kc58-waiter", ws.path, ceiling=100.0)
 
         thread = threading.Thread(target=wait, daemon=True)
         thread.start()
-        assert _wait_for(lambda: slots.status("agent-b") is not None)
-        assert slots.status("agent-b")[0] == "queued"
+        assert _wait_for(lambda: slots.status("kc58-waiter") is not None)
+        assert slots.status("kc58-waiter")[0] == "queued"
         clock.advance(90.0)
         # one short of the ceiling: the queue still blocks
-        assert not _wait_for(lambda: slots.status("agent-b")[0] != "queued", 0.3)
-        assert slots.status("agent-a") == ("running", 90.0, 0)
+        assert not _wait_for(lambda: slots.status("kc58-waiter")[0] != "queued", 0.3)
+        assert slots.status("kc58-holder") == ("running", 90.0, 0)
         # past it: the waiter goes in beside the holder, which keeps running
         clock.advance(20.0)
         assert _wait_for(lambda: not thread.is_alive(), 60)
         thread.join(60)
         assert entered["waited"] == pytest.approx(110.0, abs=1.0)
-        assert slots.status("agent-a")[0] == "over"
-        assert slots.status("agent-a")[1] == pytest.approx(110.0, abs=1.0)
+        assert slots.status("kc58-holder")[0] == "over"
+        assert slots.status("kc58-holder")[1] == pytest.approx(110.0, abs=1.0)
         assert sleeper.alive, "the ceiling must not signal the holder's pytest"
     finally:
         sleeper.kill()
-        slots.release("agent-a")
-        slots.release("agent-b")
+        slots.release("kc58-holder")
+        slots.release("kc58-waiter")
 
 
 class _RecordingSuiteSlots:

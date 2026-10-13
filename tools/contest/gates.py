@@ -82,7 +82,9 @@ def git(cwd, *args, check=False):
     git cannot answer after the ladder — that is their contract, and
     `judge_worktree` is written on it.
     """
-    r = run_git(["git", *args], cwd=cwd, errors="replace")
+    # core.quotepath=false: a non-ASCII path is written as it is, not C-quoted ('"tests/caf\\303\\251.py"'
+    # matched no test root, and `git show HEAD:<that>` failed)
+    r = run_git(["git", "-c", "core.quotepath=false", *args], cwd=cwd, errors="replace")
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} in {cwd}: {r.stderr.strip()}")
     return r.stdout.strip()

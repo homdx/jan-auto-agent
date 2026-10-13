@@ -502,9 +502,16 @@ def validate_plan(
 # ```, ~~~ closes ~~~), which is why the run is captured and back-referenced
 # instead of being written as a literal — a "~~~" line inside a ``` block is
 # body text, not a terminator.
+#
+# Review batch m: the next entry starts at a heading of a task, "### <id>: " with an id the way ids are
+# (`AUTO-T3`, `T-2`, `T.1`: a digit, a dash or a dot in it) — not at any "### " after a rule, which cut an
+# entry at its own "---" + "### Notes inside it" and left that tail behind. A fenced block does not run
+# past such a heading either: an unclosed fence in the removed entry paired with the NEXT entry's opening
+# fence, and that whole entry went with it (gone from IMPROVEMENTS.md, still in plan.json).
+_NEXT_ENTRY = r"(?:### (?=[\w.\-]*[\d.\-])[\w.\-]+: |## Manual Suggestions)"
 _FENCE_BLOCK = (
     r"(?m:^ {0,3})(?P<fence>`{3,}|~{3,})[^\n]*\n"   # opening fence line
-    r"[\s\S]*?"                                     # block body, verbatim
+    r"(?:(?!\n-{3,}\n+" + _NEXT_ENTRY + r")[\s\S])*?"  # block body, verbatim, within its entry
     r"(?m:^ {0,3})(?P=fence)[^\n]*"                  # closing fence line
 )
 
@@ -513,10 +520,23 @@ def _task_section_pattern(task_id: str) -> re.Pattern:
     return re.compile(
         r"### " + re.escape(task_id) + r":"
         r"(?:" + _FENCE_BLOCK + r"|.)*?"
-        r"(?:\n-{3,}\n+(?=### |## Manual Suggestions|\Z)"
+        r"(?:\n-{3,}\n+(?=" + _NEXT_ENTRY + r"|\Z)"
         r"|(?=\n## Manual Suggestions|\Z))",
         re.DOTALL,
     )
+
+
+def _without_section(text: str, task_id: str) -> str:
+    """*text* without *task_id*'s entry; the blank lines where it was cut are made two at most. The whole
+    file's runs of blank lines were collapsed, and every other entry's code sample lost its two blank lines
+    (PEP 8's, before a def)."""
+    m = _task_section_pattern(task_id).search(text)
+    if m is None:
+        return text
+    head, tail = text[:m.start()], text[m.end():]
+    if head.endswith("\n\n") and tail.startswith("\n"):
+        tail = tail.lstrip("\n")
+    return head + tail
 
 
 _AUTO_SECTION_EMPTY_NOTE = (
@@ -553,13 +573,10 @@ def _remove_from_improvements_md(base_dir: Path, removed_ids: "list[str]") -> No
     original = md_path.read_text(encoding="utf-8")
     text = original
     for task_id in removed_ids:
-        text = _task_section_pattern(task_id).sub("", text)
+        text = _without_section(text, task_id)
 
     if text == original:
         return  # none of removed_ids had a section here — nothing to write
-
-    # Collapse any run of 3+ blank lines left behind by a removed section.
-    text = re.sub(r"\n{3,}", "\n\n", text)
 
     # If every "### " entry under "## Autonomous Tasks" is now gone, leave a
     # note instead of a heading with nothing under it.

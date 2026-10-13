@@ -85,7 +85,7 @@ from typing import Optional
 
 from tools.block_extractor import extract_block as _block_extractor_extract_block
 # SearchAgent is imported lazily inside Coder._fetch_needed
-from tools.auto.utils import _cfg_mode, atomic_write_text
+from tools.auto.utils import _cfg_mode, atomic_write_text, in_style_of
 from tools.auto.context_assembler import ContextAssembler
 
 from tools.agent_trace import tracer
@@ -2170,6 +2170,7 @@ class Coder(_llm_stream.LLMClientBase):
             writes succeed — and also when the only thing that happened was a
             ``target_files`` skip (see *skipped_out*).
         """
+        import shutil       # .coder.bak copies (a module-level import moved every pinned line)
         written: list[str] = []
         first_error = ""
 
@@ -2225,10 +2226,9 @@ class Coder(_llm_stream.LLMClientBase):
                 try:
                     if dest.exists():
                         backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                        backup.write_text(
-                            dest.read_text(encoding="utf-8", errors="replace"),
-                            encoding="utf-8",
-                        )
+                        # bytes and mode: read as utf-8 with errors=replace, a latin-1 \xe9 came back
+                        # as U+FFFD, and a BOM + CRLF file as BOM + LF — no backup of the original
+                        shutil.copy2(dest, backup)
                         dest.unlink()
                         logger.info(
                             "coder._write_files [%s]: DELETED %s (backup: %s)",
@@ -2306,10 +2306,8 @@ class Coder(_llm_stream.LLMClientBase):
                     except OSError:
                         existing_mode = None
                     backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                    backup.write_text(
-                        dest.read_text(encoding="utf-8", errors="replace"),
-                        encoding="utf-8",
-                    )
+                    shutil.copy2(dest, backup)        # bytes and mode (see the delete branch)
+                    content = in_style_of(dest, content)
                     logger.debug(
                         "coder._write_files [%s]: backed up %s → %s",
                         task_id, dest, backup,
@@ -2333,7 +2331,7 @@ class Coder(_llm_stream.LLMClientBase):
                 # reset its permission bits on every single edit — restore
                 # them explicitly so this fix doesn't trade a corruption bug
                 # for a permissions bug.
-                atomic_write_text(dest, content)
+                atomic_write_text(dest, content, newline="")
                 if existing_mode is not None:
                     try:
                         os.chmod(dest, existing_mode)

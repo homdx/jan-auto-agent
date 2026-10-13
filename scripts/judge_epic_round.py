@@ -183,7 +183,8 @@ def _git(cwd, *args):
     a cell that says so — not an exception into the run.
     """
     try:
-        p = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+        # core.quotepath=false: a non-ASCII test path came back C-quoted and was no test of a root
+        p = subprocess.run(["git", "-c", "core.quotepath=false", *args], cwd=cwd, capture_output=True,
                            text=True, timeout=300)
     except (OSError, subprocess.SubprocessError):
         return 1, ""

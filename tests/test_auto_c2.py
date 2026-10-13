@@ -446,10 +446,10 @@ class TestFileWriting:
         # instead of Path.write_text, which is no longer on the write path.
         original_atomic_write_text = coder_mod.atomic_write_text
 
-        def patched_atomic_write_text(path, content):
+        def patched_atomic_write_text(path, content, **kw):
             if Path(path).name == "a.py":
                 raise OSError("disk full")
-            return original_atomic_write_text(path, content)
+            return original_atomic_write_text(path, content, **kw)
 
         with (
             patch("tools.llm_stream.request_completion", return_value=response),

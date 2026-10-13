@@ -1744,7 +1744,8 @@ def _churn(ws: Workspace) -> tuple[int, int]:
     """
     def out(*args: str) -> str:
         try:
-            r = run_git(["git", "--no-optional-locks", *args], cwd=ws.path,
+            # core.quotepath=false: an untracked non-ASCII file was a quoted name, and its lines counted 0
+            r = run_git(["git", "--no-optional-locks", "-c", "core.quotepath=false", *args], cwd=ws.path,
                         timeout=_TICK_GIT_TIMEOUT_S, retries=_TICK_GIT_RETRIES)
         except Exception:  # noqa: BLE001 — a sample must never raise
             return ""

@@ -434,8 +434,20 @@ class BacklogPrioritiser:
             return False
 
         # Require a whole-word match so "parse" doesn't match "parse_config".
-        pattern = re.compile(rf"\b{re.escape(symbol_a)}\b")
-        return bool(pattern.search(task_b.instruction))
+        name = re.escape(symbol_a)
+        if _looks_like_code(symbol_a):
+            return bool(re.search(rf"\b{name}\b", task_b.instruction))
+        # A name that is also an English word (`run`, `parse`, `Store`) counts only where B writes it as
+        # code: "the loop will run only when enabled" made B depend on A, and the controller holds a task
+        # whose dependency is not done — one failed task blocked an unrelated one
+        return bool(re.search(rf"`[^`\n]*\b{name}\b[^`\n]*`|\b{name}\s*\(|\.{name}\b|\b{name}\.\w",
+                              task_b.instruction))
+
+
+def _looks_like_code(name: str) -> bool:
+    """A name no prose word is: an underscore, a dot, a digit, or a capital past its first letter
+    (`load_rows`, `Store.compact`, `parse2`, `LoadRows`)."""
+    return any(ch in "_." or ch.isdigit() for ch in name) or any(ch.isupper() for ch in name[1:])
 
 
 def _depends_on(

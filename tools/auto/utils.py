@@ -161,7 +161,31 @@ def fsync_directory(directory: "str | Path") -> None:
         )
 
 
-def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = False) -> None:
+def _read_umask_once() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+#: the umask at import, for a system without /proc: set and put back once, before any thread
+_UMASK_AT_IMPORT = _read_umask_once()
+
+
+def _umask() -> int:
+    """The process umask, read without changing it (os.umask is process-wide: a file another thread made
+    in between got none); /proc/self/status on Linux, else the value read at import."""
+    try:
+        with open("/proc/self/status", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    return _UMASK_AT_IMPORT
+
+
+def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = False,
+                      newline: "str | None" = None) -> None:
     """Write *content* to *path* atomically (temp file + ``os.replace``).
 
     ``os.replace`` is a single filesystem rename, which POSIX and Windows both
@@ -179,6 +203,11 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
     racing writers exactly one wins and the other gets ``FileExistsError``
     instead of silently replacing the winner's file. A filesystem without
     hard links falls back to the plain replace.
+
+    The file keeps the mode it had, and a new one gets what ``open()`` would
+    give it (0666 less the umask): mkstemp's temporary file is 0600, and the
+    rename made a 0644 IMPROVEMENTS.md and a 0755 script 0600. *newline* is
+    ``open()``'s: ``""`` writes *content*'s line ends as they are.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,7 +215,11 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
         dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        try:
+            os.chmod(tmp_name, (path.stat().st_mode & 0o7777) if path.exists() else 0o666 & ~_umask())
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
@@ -208,6 +241,21 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
         except OSError:
             pass
         raise
+
+
+def in_style_of(dest: Path, content: str) -> str:
+    """*content* with *dest*'s line ends (CRLF when most of its lines end so) and its BOM. The model writes
+    LF and no BOM, and a one-line edit of a CRLF file was a diff of every line (12 changed of 6)."""
+    try:
+        raw = dest.read_bytes()
+    except OSError:
+        return content
+    text = content.replace("\r\n", "\n")
+    if raw.count(b"\r\n") * 2 > raw.count(b"\n"):
+        text = text.replace("\n", "\r\n")
+    if raw.startswith(b"\xef\xbb\xbf") and not text.startswith("\ufeff"):
+        text = "\ufeff" + text
+    return text
 
 
 def _cfg_mode(
