@@ -718,6 +718,13 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"{args.claims}: not a claims file (a list of claims, or {{\"claims\": [...]}}, "
                  "each a string or an object with a \"claim\")")
     claims = [c if isinstance(c, dict) else {"claim": c, "truth": None} for c in raw]
+    # nothing to vote on is no vote: `[]` ran both runs and exited 0 ("verdicts: {}"), and a blank claim
+    # was sent to every voter as a real request, paid and UNSURE
+    if not claims:
+        ap.error(f"{args.claims}: no claims in it")
+    blank = [i for i, c in enumerate(claims, 1) if not c["claim"].strip()]
+    if blank:
+        ap.error(f"{args.claims}: claim {blank[0]} is empty" + (f" (and {len(blank) - 1} more)" if len(blank) > 1 else ""))
     texts = [c["claim"] for c in claims]
     if args.target:
         return main_target(args, parser, claims, voters, batch)

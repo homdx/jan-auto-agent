@@ -21,11 +21,13 @@ Without a target (a run without ``--target``, or a target that cannot be opened)
 
 from __future__ import annotations
 
+import builtins
 import csv
 import hashlib
 import io
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -158,14 +160,31 @@ def claim_hash(claim: str) -> str:
     return "claim:" + hashlib.sha1(norm.encode("utf-8")).hexdigest()[:8]
 
 
+#: heads of names no repository defines: the standard library's modules and the builtins
+_OUTSIDE = frozenset(sys.stdlib_module_names) | frozenset(dir(builtins))
+
+
 def finding_key(claim: str, resolved=None, evidence=()) -> str:
     """The grouping key `harvest_report.py` and `merge_validations.py` use: ``<path>::<qualname>``
-    of the claim's first found symbol anchor, else ``<path>`` of its first found path anchor,
-    else the path inside the first cited chunk id (*evidence*), else `claim_hash`."""
+    of the claim's first found symbol anchor, else ``<path>::<name>`` of a symbol the claim places in
+    a file that does not define it, else ``<path>`` of its first found path anchor, else the path
+    inside the first cited chunk id (*evidence*), else `claim_hash`."""
     resolved = list(resolved or ())
     for r in resolved:
         if r.anchor.kind == "symbol" and r.found and r.path and r.qualname:
             return f"{r.path}::{r.qualname}"
+    files = [r.path for r in resolved if r.anchor.kind == "path" and r.found and r.path]
+    for r in resolved:
+        # a symbol the file does not define (`missing_fn` in `pkg/rows.py`): its row was keyed by the file
+        # alone, so a reviewer's `pkg/rows.py::missing_fn` finding never matched it, and the file's real
+        # claims shared its key (REAL and FALSE of one key, "0 conflicts")
+        if r.anchor.kind == "symbol" and not r.found:
+            name = r.anchor.text.split("::")[-1].strip("`")
+            if name.split(".")[0] in _OUTSIDE:
+                continue          # `os.path.join`, `json.loads`: the world's, not a missing one of the file
+            where = files[0] if files else r.path if r.path and "." in r.path.rsplit("/", 1)[-1] else ""
+            if where and name:
+                return f"{where}::{name}"
     for r in resolved:
         if r.anchor.kind == "path" and r.found and r.path:
             return r.path

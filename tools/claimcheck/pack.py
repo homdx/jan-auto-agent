@@ -184,12 +184,19 @@ def _has_gutter(chunk: Chunk) -> bool:
             or (chunk.kind == "git" and re.search(r"(?m)^@@ ", chunk.text) is not None))
 
 
-def _content(chunk: Chunk) -> list:
+def _content(chunk: Chunk, quotable: bool = False) -> list:
     """The chunk's lines without gutters; a marker line is None (it is not a quoted line).
-    A diff's own `+`/`-`/` ` stay: `+    check=False` is verbatim from the chunk."""
+    A diff's own `+`/`-`/` ` stay: `+    check=False` is verbatim from the chunk.
+
+    *quotable* (what a quote may stand on): the base..head diff of a head pack (``diff:`` chunks, CC-7)
+    loses its removed lines (the blank gutter): they are not in the code the pack is evidence for, and a
+    vote that quoted one stood — a claim about a deleted line read TRUE at head, a fixed one STILL. The
+    lines around a removed one are next to each other at head, and stay one run. The rank still reads
+    them (a claim about removed code finds its diff by them)."""
     gutter = _has_gutter(chunk)
     # a ticket has no removed-line blank gutter: only a number is one (`| a | b |` is a table row)
     rx = _QUOTE_NUMBER if chunk.kind == "ticket" else _CHUNK_GUTTER
+    at_head = quotable and chunk.id.startswith("diff:")
     out: list = []
     for line in chunk.text.split("\n"):
         if _MARKER_LINE.match(line):
@@ -198,6 +205,8 @@ def _content(chunk: Chunk) -> list:
         if gutter:
             m = rx.match(line)
             if m:
+                if at_head and not any(ch.isdigit() for ch in m.group(0)):
+                    continue
                 line = line[m.end():]
         out.append(line)
     return out
@@ -212,7 +221,7 @@ def _segments(chunk: Chunk) -> list:
     the lines on either side of an omission are not next to each other in the file."""
     runs: list = []
     current: list = []
-    for line in _content(chunk):
+    for line in _content(chunk, quotable=True):
         if line is None:
             if current:
                 runs.append(current)
@@ -269,9 +278,22 @@ def find_all_quote(pack: Pack, quote: str) -> list:
 
 
 def _edged(needle: str) -> "re.Pattern":
-    """*needle* as a pattern that matches only at token edges where it has a word character."""
-    head = r"(?<![\w])" if re.match(r"\w", needle[0]) else ""
-    tail = r"(?![\w])" if re.match(r"\w", needle[-1]) else ""
+    """*needle* as a pattern that matches only at token edges where it has a word character.
+
+    A number goes on past a dot and a digit (``TIMEOUT = 30`` is no quote of ``TIMEOUT = 30.5``, nor
+    ``VERSION = 1.2`` of ``1.2.3``, nor ``5 seconds`` of ``1.5 seconds``), and a quoted path past a slash
+    (``path = src/a`` is no quote of ``path = src/a/b``): the dot and the slash were token edges, and a
+    voter's prefix of the real value stood as its verbatim quote."""
+    path = "/" in needle
+    head = tail = ""
+    if re.match(r"\w", needle[0]):
+        head = r"(?<![\w])" + (r"(?<!\d\.)" if needle[0].isdigit() else "") + (r"(?<!\w/)" if path else "")
+    elif re.match(r"\.\d", needle):
+        head = r"(?<!\d)"
+    if re.search(r"\w$", needle):
+        tail = r"(?![\w])" + (r"(?!\.\d)" if needle[-1].isdigit() else "") + (r"(?!/\w)" if path else "")
+    elif re.search(r"\d\.$", needle):
+        tail = r"(?!\d)"
     return re.compile(head + re.escape(needle) + tail)
 
 
@@ -624,6 +646,16 @@ def _dangling_notes(resolved: list, sha: str, chunks: list, view) -> list:
                     seen.add(cid)
                     out.append(_note(cid, f"`{ra.path}` ends at line {n}: line {min(ra.lines)} "
                                           "the claim cites is not in it.", ra.anchor.text))
+            continue
+        if not ra.found and kind == "ticket" and ra.path:
+            # a ticket of ours (`CC-77`) with no file: the pack was empty, and no vote could stand on
+            # "there is no such ticket" — the one thing the evidence says
+            cid = f"note:dangling:{ra.anchor.text}"
+            if cid not in seen:
+                seen.add(cid)
+                out.append(_note(cid, f"no ticket {ra.anchor.text.split()[-1]} in the repository: no file "
+                                      "for it in `epic-tasks/` nor in a `docs/<epic>/tickets/` folder.",
+                                 ra.anchor.text))
             continue
         if ra.found or kind not in ("path", "symbol", "test"):
             continue

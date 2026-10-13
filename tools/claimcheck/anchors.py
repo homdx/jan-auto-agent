@@ -36,6 +36,7 @@ from typing import Optional
 
 from tools.arena import gitref
 from tools.claimcheck.model import Anchor, RepoView, ResolvedAnchor
+from tools.collect.test_paths import is_test_path
 
 # ------------------------------------------------------------------ extraction
 
@@ -521,12 +522,32 @@ _BARE_IDENT = re.compile(r"(?<![\w.`/$@\-])(_+[A-Za-z][A-Za-z0-9_]*|[A-Za-z][A-Z
                          r"(?![\w`(/\-])")
 
 
+#: directories of examples a project runs, not of its own code: a bare word found only there is a word
+_BENCH_DIRS = frozenset(("contest-bench", "fixtures", "fixture", "testdata", "test_data", "test-data"))
+
+
+#: a word before a one-part private name that makes it a noun of the sentence: "The _state is set", "every
+#: _cache entry" — prose about a state or a cache, the underscore or not; "_flush drops the last line" names code
+_DETERMINER = re.compile(r"(?:^|\s)(?:the|a|an|this|that|these|those|its|their|our|his|her|my|your|every|each|"
+                         r"any|no|some|all|both|either|neither)\s+$", re.I)
+
+
+def _own_source(path: str) -> bool:
+    """A file of the project's own code: no test (`tools.collect.test_paths`), no bench or fixture."""
+    return not is_test_path(path) and not any(part in _BENCH_DIRS for part in path.split("/")[:-1])
+
+
 def resolve_claim(claim: str, view: RepoView) -> list:
     """`resolve_anchors` of *claim*'s anchors, plus every identifier written without backticks
     that the repository defines (`retry_call`, `MAX_RETRIES`): a claim that named the repo's own
     function that way was a `world` claim, settled by the voters with no code in front of them
     (the legacy symbols rule had it as code). An identifier the repository does not define stays
-    a word; a single lowercase word (`backoff`) stays one by ticket 255's rule, written either way."""
+    a word; a single lowercase word (`backoff`) stays one by ticket 255's rule, written either way.
+
+    Only the project's own code counts for such a word (`_own_source`), and a private one must name one
+    definition there: "The _state is set to ready when the queue drains" resolved to a bench's test helper,
+    a world claim judged on code that is not about it. A one-part private name after an article or the like
+    (`_DETERMINER`: "the _lock", "every _cache entry") is a noun of the sentence, a word."""
     anchors = extract_anchors(claim)
     resolved = resolve_anchors(anchors, view)
     taken = [(a.start, a.end) for a in anchors]
@@ -539,9 +560,12 @@ def resolve_claim(claim: str, view: RepoView) -> list:
                 or (name.startswith("__") and name.endswith("__")):
             continue
         index = index or _index_of(view)
-        got = _resolve_symbol(Anchor("symbol", name, start, end), index)
-        if got.found:
-            extra.append(got)
+        if name.startswith("_") and "_" not in name.lstrip("_") and _DETERMINER.search(claim[:start]):
+            continue
+        defs = [d for d in index.by_last.get(name, ()) if _own_source(d.path)]
+        if not defs or (name.startswith("_") and len(defs) > 1):
+            continue
+        extra.append(_found(Anchor("symbol", name, start, end), defs[0], defs[1:]))
     if not extra:
         return resolved
     out = sorted(resolved + extra, key=lambda r: (r.anchor.start, r.anchor.end))
@@ -667,9 +691,14 @@ _FORBIDDEN_GIT_ARGS = ("--output", "--ext-diff", "--textconv", "--open-files-in-
 _NO_FILTERS_GIT = frozenset(("show", "diff", "diff-tree", "log", "blame"))   # blame runs textconv too
 
 
-#: directories of a plain tree (not a git checkout) that are not the project's own code
-_VENDORED = frozenset((".git", ".venv", "venv", "node_modules", "__pycache__", "site-packages", ".tox",
+#: directories of a plain tree (not a git checkout) that are not the project's own code. A virtualenv is
+#: known by what it holds (`_VENV_MARKERS`), not by its name: `venv`/`.venv` in this list left out a real
+#: package of that name (CPython's `Lib/venv`, a project's `tool/venv/builder.py`)
+_VENDORED = frozenset((".git", "node_modules", "__pycache__", "site-packages", ".tox",
                        ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".eggs"))
+#: a file only a virtualenv has, relative to its root: `python -m venv` and virtualenv 20+ write pyvenv.cfg,
+#: an older virtualenv only its activate script
+_VENV_MARKERS = ("pyvenv.cfg", "bin/activate", "Scripts/activate")
 
 
 class PathRepoView:
@@ -728,7 +757,7 @@ class PathRepoView:
         # a committed node_modules or virtualenv is still not the project's code. A venv made in the root
         # itself (`python -m venv .`) is not one to leave out: its prefix "" left out every file of the
         # project (an empty index, every claim a world claim); its packages are under site-packages
-        venvs = tuple(n[:-len("pyvenv.cfg")] for n in names if n.endswith("/pyvenv.cfg"))
+        venvs = tuple(n[:-len(m)] for n in names for m in _VENV_MARKERS if n.endswith("/" + m))
         return [n for n in names if os.path.isfile(os.path.join(self.root, n))
                 and not _VENDORED.intersection(n.split("/")[:-1])
                 and not any(n.startswith(v) for v in venvs)]
@@ -737,7 +766,7 @@ class PathRepoView:
         found = []
         for folder, dirs, names in os.walk(self.root):
             dirs[:] = [d for d in dirs if d not in _VENDORED
-                       and not os.path.isfile(os.path.join(folder, d, "pyvenv.cfg"))]
+                       and not any(os.path.isfile(os.path.join(folder, d, m)) for m in _VENV_MARKERS)]
             rel = os.path.relpath(folder, self.root)
             for name in names:
                 if name == ".git":   # a worktree's or a submodule's `.git` is a file, not a directory

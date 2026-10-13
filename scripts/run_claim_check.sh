@@ -60,6 +60,12 @@ mkdir -p "$out"
 echo "== claim check of $report -> $out"
 python3 scripts/claim_extract.py "$report" --out "$out/claims.json" 2>&1 | tee "$out/extract.log"
 [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "extract failed, see $out/extract.log"; exit 1; }
+# a report with no claim is no failed vote: claim_vote.py refuses an empty claims file (it ran both runs
+# for nothing and said exit 0), so the run ends here and says so
+if [ "$(tr -d ' \t\r\n' < "$out/claims.json")" = "[]" ]; then      # no python3 of its own: the pipeline runs three
+    echo "== no claims in $report — nothing to vote on"
+    exit 0
+fi
 python3 scripts/claim_vote.py "$out/claims.json" --runs "${RUNS:-3}" --out "$out/votes.json" ${pass[@]+"${pass[@]}"} 2>&1 | tee "$out/vote.log"
 vote_rc="${PIPESTATUS[0]}"
 # the vote's own exit code: a refused --target or a crash used to end in "== done" and exit 0

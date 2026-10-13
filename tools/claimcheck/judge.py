@@ -148,10 +148,15 @@ def _text(value) -> str:
 
 def _rows_to_votes(rows, order: list) -> dict:
     votes: dict = {}
+    rows = [row for row in rows if isinstance(row, dict)]
+    # a reply that numbers the claims from 0 (an id 0, none equal to the claim count): read 0-based. Read
+    # 1-based, the id 0 was dropped and every other vote went to the claim before its own — unanimous
+    # world verdicts inverted, with no quote to catch it
+    ids = {_row_id(row.get("id")) for row in rows}
+    shift = 1 if 0 in ids and len(order) not in ids else 0
     for row in rows:
-        if not isinstance(row, dict):
-            continue
         n = _row_id(row.get("id"))
+        n = None if n is None else n + shift
         verdict = row.get("verdict")
         verdict = verdict.strip().upper() if isinstance(verdict, str) else ""
         if n is None or not 1 <= n <= len(order) or verdict not in VERDICTS:

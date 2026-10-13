@@ -49,11 +49,18 @@ def test_a_quoted_path_with_a_space_is_one_anchor_and_resolves(tmp_path):
 
 
 def test_two_lines_of_a_deleted_files_hunk_are_a_quote():
+    """A commit's hunk (`git:`, history): the deletion's lines are what the commit took out. In the base..head
+    diff of a head pack (`diff:`, review batch m №72) they are not in the code the pack stands for: there the
+    deletion header is the evidence."""
     text = ("diff --git a/d.py b/d.py\ndeleted file mode 100644\n--- a/d.py\n+++ /dev/null\n"
             "@@ -1,2 +0,0 @@\n  | -def gone_function():\n  | -    return 'the old value'")
-    chunk = Chunk("diff:a..b:d.py:0-0", "git", "d.py", 0, 0, text, ())
+    chunk = Chunk("git:b:d.py:0-0", "git", "d.py", 0, 0, text, ())
     pack = Pack("c", "s", (chunk,), False, 0, 0)
     assert cc_pack.find_quote(pack, "-def gone_function():\n-    return 'the old value'") == chunk.id
+    head = Chunk("diff:a..b:d.py:0-0", "git", "d.py", 0, 0, text, ())
+    pack = Pack("c", "s", (head,), False, 0, 0)
+    assert cc_pack.find_quote(pack, "-def gone_function():\n-    return 'the old value'") is None
+    assert cc_pack.find_quote(pack, "deleted file mode 100644\n--- a/d.py\n+++ /dev/null") == head.id
 
 
 def _truth(tmp_path, rows):

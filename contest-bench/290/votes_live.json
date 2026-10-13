@@ -1,6 +1,6 @@
 {
  "target": {
-  "repo": "/tmp/claude-1000/-home-renat-Project-opensource-github-agent-offline-qwen25/b654f466-bb0a-4392-81ca-7af377606247/scratchpad/r285j/live3/fx",
+  "repo": "fx (built by contest-bench/cc/make_fixture.py --build; blackbox_290.py puts its own path here)",
   "ref": "d36d59e",
   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
   "base": null,

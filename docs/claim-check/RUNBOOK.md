@@ -141,9 +141,10 @@ decides, as today"): `--runs 3` with one vote and two lost batches is that one v
   `--target` they see it, and the quote check is what keeps them honest.)  A model that cannot see
   `gates.py` still says TRUE to "`_SUMMARY_LINE` does not parse node IDs with
   spaces" because it sounds right.  `needs_code` marks these; the check is a
-  heuristic (paths, tickets, `identifiers`, a bare `snake_case` name the repo
-  defines; ordinary slash words such as `read/write` or `TCP/IP` are not
-  paths), so read the TRUE rows with a repo-specific look as well.
+  heuristic (paths, tickets, `identifiers`, a bare `snake_case` name the repo's own
+  code defines — not a test, a bench or a fixture; a bare `_private` one only when that code
+  defines it once and no article makes it a noun, "the _lock"; ordinary slash words such as
+  `read/write` or `TCP/IP` are not paths), so read the TRUE rows with a repo-specific look as well.
 - **A model that gives no votes is a result.**  `votes=0/N` with an error or a
   `raw_head` in `votes.json` is a model to drop from the roster, not a bug to chase.
 - **No credit is spent anywhere in this runbook.**  (CC-9 prints the commands that would, never runs them.)  `/assess` and `/verify` (1

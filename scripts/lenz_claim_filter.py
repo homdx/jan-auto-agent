@@ -109,8 +109,10 @@ def split_sentences(text: str) -> list[str]:
 
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z`])")
-#: an abbreviation is no sentence end: "e.g. Python is widely used ..." went to Lenz as a claim of its own
-_ABBREV_END = re.compile(r"(?:^|[\s(])(?:e\.g|i\.e|etc|vs|cf|fig|no|approx|resp|incl|esp)\.$", re.I)
+#: an abbreviation is no sentence end: "e.g. Python is widely used ..." went to Lenz as a claim of its own.
+#: Not `no`, `etc`, `fig`: each ends sentences ("Is it thread-safe? No. The cache leaks ...", "JSON, YAML, etc.
+#: The loader ..."), and "no. 5" or "Fig. 3" is never cut anyway (a cut needs a capital or a backtick after it)
+_ABBREV_END = re.compile(r"(?:^|[\s(])(?:e\.g|i\.e|vs|cf|approx|resp|incl|esp)\.$", re.I)
 
 
 def _sentences(line: str) -> list[str]:
@@ -232,9 +234,13 @@ def _heading_parts(text: str) -> list[str]:
     quoted shell session or a markdown sample is not a heading (it split a section in two)."""
     parts, cur, fence = [], [], ""
     for line in text.splitlines(keepends=True):
-        mark = re.match(r"\s*(```|~~~)", line)
-        if mark:
-            fence = "" if fence and mark.group(1) == fence else (fence or mark.group(1))
+        mark = re.match(r"\s*(`{3,}|~{3,})(.*)", line)
+        if mark and not fence:
+            fence = mark.group(1)
+        elif mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence) and not mark.group(2).strip():
+            # CommonMark: a fence closes only with as many of its own character or more, and nothing after
+            # them: a ```` fence quoting a ``` sample was closed by the sample, and a `## ` inside cut there
+            fence = ""
         elif not fence and re.match(r"#{2,3} ", line) and cur:
             parts.append("".join(cur))
             cur = []
