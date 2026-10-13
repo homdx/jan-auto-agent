@@ -645,11 +645,16 @@ def _l2_results(collect_line):
     base = {"rc": 0, "ok": True, "seconds": 1, "checked": 4, "voters": [], "accept": "all", "opts": [], "removed": {}}
     off = dict(base, variant="off", removed={"AUTO-T2": "x", "AUTO-T3": "x"})
     off2 = dict(base, variant="off-2", removed={"AUTO-T2": "x", "AUTO-T3": "x"})
+    # a +collect variant is judged against the baselines that had the model (review of CC-13: against `off`
+    # it counted the reader's change with the model as the vote's)
+    had = {"collect": "fresh", "collect_reader": "used", "collect_pack": "not used"}
+    offc = dict(base, variant="off+collect", opts=["collect"], removed={"AUTO-T2": "x", "AUTO-T3": "x"}, **had)
+    offc2 = dict(base, variant="off-2+collect", opts=["collect"], removed={"AUTO-T2": "x", "AUTO-T3": "x"}, **had)
     on = dict(base, variant="on-3+collect", voters=list("abc"), opts=["collect"],
               removed={"AUTO-T2": "x", "AUTO-T3": "x", "AUTO-T4": "x"},
               votes_asked=4, votes_decided=4, votes_overridden=0, votes_requests=12, votes_skipped=0)
     on.update(collect_line)
-    return ids, truth, [off, off2, on]
+    return ids, truth, [off, off2, offc, offc2, on]
 
 
 def test_a_collect_variant_that_never_had_the_model_is_not_credited(tmp_path):

@@ -12,6 +12,11 @@ The collect model of the target (CC-13, for `scripts/gate1_vote_layer2.py --coll
     python3 main.py --collect --base /tmp/target-4ff7d14 --config <that config>
     python3 scripts/gate1_vote_layer2.py --detach --collect-from /tmp/target-4ff7d14/.collect --sets 3,3+collect,5,5+collect --off-runs 3
 
+The script carries the artifact's own skip_dirs (the names its manifest recorded beyond the defaults) into every +collect variant's ini,
+so the list above is the one the judges read it with, and it refuses to start when the artifact, installed in a clone of the target and
+read the way the judges read it, is not fresh (another collector version, a tree that moved). The baselines run with the model and
+without (off..., off...+collect); with --resume into a directory whose off runs are done, only the +collect ones run.
+
 About an hour with a free model for the 395-943 modules (Pass B is one request per module, ~10 s each when the provider is quiet).
 Rebuild only when TARGET changes. `--no-llm` builds the static part in seconds (contracts, callers, risk, fail-open): enough to measure whether the
 static facts alone change the judges, and the vote packs carry only those chunks (the summaries are not in a pack).

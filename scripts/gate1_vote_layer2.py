@@ -79,8 +79,11 @@ INI_SECTION = "gate1_layer2"
 DEFAULT_OFF_RUNS = 2
 #: CC-13: the line Gate 1 prints at the start of a run — whether the collect model was there and
 #: whether the reader and the vote pack used it, so a variant says what its judges had
-COLLECT_LINE = re.compile(r"collect: (fresh|stale(?: \(\d+ modules? changed\))?|present|absent)"
+#: a stale line names why in parentheses — files moved, another collector version, another skip_dirs list
+COLLECT_LINE = re.compile(r"collect: (fresh|stale(?: \([^)]*\))?|present|absent)"
                           r" — reader: (used|not used), vote pack: (used|not used)")
+#: the vote line's tail with vote_collect = auto: how many collect chunks the packs put to the voters carried
+COLLECT_CHUNKS = re.compile(r"Gate 1 vote: .*?, collect chunks (\d+)")
 
 
 def log(out: Path, msg: str) -> None:
@@ -155,7 +158,7 @@ def load_truth(known: Path) -> dict:
 
 def build_ini(dest: Path, local: configparser.ConfigParser, base_ini: Path, mode: str,
               voters: list, accept: str, reader: str, reader_timeout: int = 240,
-              opts: tuple = ()) -> None:
+              opts: tuple = (), collect_skip: "str | None" = None) -> None:
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(base_ini, encoding="utf-8-sig")
     rd = local[P + reader]
@@ -176,6 +179,11 @@ def build_ini(dest: Path, local: configparser.ConfigParser, base_ini: Path, mode
     # variant measures the pipeline as --auto runs it, not a leaner one.
     cfg["gate1"]["vote_collect"] = "auto" if "collect" in opts else "off"
     cfg["collect"]["use_in_auto"] = "true" if "collect" in opts else "false"
+    if "collect" in opts and collect_skip is not None:
+        # the artifact's own [collect] skip_dirs (what its manifest recorded beyond the defaults): with the base
+        # ini's list instead, the judges' freshness test compares two lists, calls the artifact stale, and the
+        # reader goes without it (the README builds it with contest-out, rounds, claim-check-out)
+        cfg["collect"]["skip_dirs"] = collect_skip
     if voters:
         for v in voters:
             if not cfg.has_section(P + v):
@@ -197,17 +205,44 @@ def prepare_target(work: Path, repo: Path, sha: str, plan: Path) -> None:
     shutil.copy(plan, work / ".agent" / "plan.json")
 
 
-def check_collect(artifact_dir: Path, work: Path) -> str:
+def collect_skip_dirs(artifact_dir: Path) -> tuple:
+    """``(extra, problem)``: the ``[collect] skip_dirs`` value that reproduces the list the artifact's manifest
+    recorded (the names beyond the defaults, comma separated, ``""`` for none), or a problem when there is no
+    such value — an unreadable manifest, or a recorded list without one of the defaults, which no setting gives
+    back since the setting only adds."""
+    from tools.collect import manifest as mf
+
+    try:
+        man = mf.read_manifest(artifact_dir / "collect_manifest.json")
+    except (OSError, ValueError) as exc:
+        return "", f"{artifact_dir / 'collect_manifest.json'} is unreadable ({exc})"
+    recorded = set(man.skip_dirs) if man.skip_dirs else set(mf.DEFAULT_SKIP_DIRS)
+    lacking = sorted(set(mf.DEFAULT_SKIP_DIRS) - recorded)
+    if lacking:
+        return "", f"its manifest's skip_dirs lacks the default(s) {lacking}: no [collect] skip_dirs reproduces it"
+    if any("," in name for name in recorded):
+        return "", f"its manifest's skip_dirs has a name with a comma: no [collect] skip_dirs reproduces it"
+    return ", ".join(sorted(recorded - set(mf.DEFAULT_SKIP_DIRS))), ""
+
+
+def check_collect(artifact_dir: Path, work: Path, config: "configparser.ConfigParser | None" = None) -> str:
     """``""`` when the artifact at *artifact_dir* was built for the tree at *work*, else the first
     path that differs — a path the manifest has that the clone does not, whose bytes moved, or a
-    path the clone has that the manifest does not.
+    path the clone has that the manifest does not — or the collector version that built it, when it
+    is not this one.
 
     CC-13: ``--collect-from`` is the whole point of the ``+collect`` variants, so a wrong artifact
     is a wrong table, not a slow one. The check is the manifest's own hashes against the clone's
-    tree, walked with the same ``skip_dirs`` the artifact recorded (an artifact with no key was
-    built with the defaults), so a manifest of another tree, another ``collector_version``, or a
-    tree that drifted since never slips through as ``fresh``. Read-only: it copies nothing."""
+    tree, walked the way the collector walks it (``scan_repo``, the walk the manifest's file list came
+    from: ``discover_files`` knew neither the scanner's own skip list nor its size limit) with the
+    ``skip_dirs`` the artifact recorded (an artifact with no key was built with the defaults), and
+    the manifest's ``collector_version`` against this one, so a manifest of another tree, another
+    collector, or a tree that drifted since never slips through. *config* is the variant's own ini
+    (its ``[architect]``/``[search]`` skip lists and its languages); without one the recorded list
+    alone is used. Read-only: it copies nothing."""
+    import configparser as _cp
     from tools.collect import manifest as mf
+    from tools.collect.scanner import scan_repo
 
     if not artifact_dir.is_dir():
         return f"{artifact_dir} is not a directory"
@@ -220,13 +255,27 @@ def check_collect(artifact_dir: Path, work: Path) -> str:
         man = mf.read_manifest(manifest_path)
     except (OSError, ValueError) as exc:
         return f"{manifest_path} is unreadable ({exc})"
-    recorded = frozenset(man.skip_dirs) if man.skip_dirs else mf.DEFAULT_SKIP_DIRS
+    if man.collector_version != mf.COLLECTOR_VERSION:
+        # every judge would read it as stale: the vote would use it (staleness = warn), the reader would not
+        return (f"it was built by collector_version {man.collector_version!r}, this code is "
+                f"{mf.COLLECTOR_VERSION!r} — rebuild it")
+    extra, problem = collect_skip_dirs(artifact_dir)
+    if problem:
+        return problem
+    walk = _cp.ConfigParser(interpolation=None)
+    if config is not None:
+        # raw: the walk needs the skip lists and the languages, not the keys, and a key with a `%` in it
+        # would stop the check with an interpolation error the run itself never meets
+        walk.read_dict({name: dict(config.items(name, raw=True)) for name in config.sections()})
+    if not walk.has_section("collect"):
+        walk.add_section("collect")
+    walk["collect"]["skip_dirs"] = extra
     try:
-        # the manifest's own paths plus whatever the walk finds now: `discover_files` walks `.py`
-        # by default, so a manifest built with `[collect] languages = python,java` would show every
-        # .java file as "the manifest has it and the clone does not" without the union. `hash_tree`
-        # drops the paths that are gone, which is how a deletion reaches the diff as `removed`.
-        paths = sorted(man.file_hashes.keys() | set(mf.discover_files(work, skip_dirs=recorded)))
+        # the manifest's own paths plus whatever the walk finds now: a manifest built with `[collect]
+        # languages = python,java` lists files a python-only walk does not, so without the union every
+        # .java file is "the manifest has it and the clone does not". `hash_tree` drops the paths that are
+        # gone, which is how a deletion reaches the diff as `removed`.
+        paths = sorted(man.file_hashes.keys() | {m.path for m in scan_repo(work, config=walk)})
         current = mf.hash_tree(work, paths)
     except OSError as exc:
         return f"the clone at {work} could not be walked ({exc})"
@@ -268,18 +317,37 @@ def install_collect(artifact_dir: Path, work: Path, config_path: "Path | None" =
     return collect_dir
 
 
-def check_and_install(artifact_dir: Path, repo: Path, sha: str, scratch: Path) -> str:
+def check_and_install(artifact_dir: Path, repo: Path, sha: str, scratch: Path,
+                      ini: "Path | None" = None) -> str:
     """The one preflight of ``--collect-from``: prepare a throwaway clone at *sha*, check the
     artifact against its tree, and refuse with the first differing path before any variant ran.
+    With *ini* (an ini the way a ``+collect`` variant gets it) the artifact is then installed into the
+    clone and read the way the judges read it: anything but ``fresh`` is refused with what the read
+    said, since a stale artifact is one the reader goes without while the vote uses it.
     Returns ``""`` when the artifact is for this tree."""
+    import configparser as _cp
+
     scratch.mkdir(parents=True, exist_ok=True)
     work = scratch / "target"
     if work.exists():
         shutil.rmtree(work)
+    cfg = None
+    if ini is not None:
+        cfg = _cp.ConfigParser(inline_comment_prefixes=(";", "#"))
+        cfg.read(ini, encoding="utf-8-sig")
     try:
         subprocess.run(["git", "clone", "-q", str(repo), str(work)], check=True)
         subprocess.run(["git", "-C", str(work), "checkout", "-q", sha], check=True)
-        return check_collect(artifact_dir, work)
+        problem = check_collect(artifact_dir, work, cfg)
+        if problem or ini is None:
+            return problem
+        from tools.collect import loader as cl
+        install_collect(artifact_dir, work, ini)
+        read = cl.load_readonly(work, config=cfg)
+        if read.status != "fresh":
+            return (f"installed in a clone of the target and read the way the judges read it, it is "
+                    f"{read.status}: {read.reason or ', '.join(read.causes) or 'no reason given'}")
+        return ""
     finally:
         if work.exists():
             shutil.rmtree(work, ignore_errors=True)
@@ -324,19 +392,29 @@ def read_report(text: str, titles: dict) -> dict:
             res["votes_skipped"] = int(k.group(1))
     c = COLLECT_LINE.search(text)
     if c:
-        res["collect"], res["collect_reader"], res["collect_pack"] = c.groups()
+        # the state word alone (`stale`), and why in its own field: "stale (2 modules changed)" in `collect`
+        # was never `stale` to the summary, which then called a run that had the model NO COLLECT
+        head, _, detail = c.group(1).partition(" (")
+        res["collect"], res["collect_reader"], res["collect_pack"] = head, c.group(2), c.group(3)
+        if detail:
+            res["collect_detail"] = detail.rstrip(")")
+    k = COLLECT_CHUNKS.search(text)
+    if k:
+        res["collect_chunks"] = int(k.group(1))
     return res
 
 
 def run_variant(out: Path, name: str, known: Path, repo: Path, sha: str, base_ini: Path,
                 local, voters: list, accept: str, reader: str, timeout: int, opts: tuple = (),
-                titles: "dict | None" = None, collect_from: "Path | None" = None) -> dict:
+                titles: "dict | None" = None, collect_from: "Path | None" = None,
+                collect_skip: "str | None" = None) -> dict:
     vdir = out / name
     if vdir.exists():
         shutil.rmtree(vdir)
     vdir.mkdir(parents=True)
     ini = vdir / "agents.ini"
-    build_ini(ini, local, base_ini, "off" if name.startswith("off") else "on", voters, accept, reader, opts=opts)
+    build_ini(ini, local, base_ini, "off" if name.startswith("off") else "on", voters, accept, reader, opts=opts,
+              collect_skip=collect_skip)
     prepare_target(vdir / "target", repo, sha, known / "plan.json")
     if collect_from is not None and "collect" in opts:
         # CC-13: the artifact was checked against this sha before any variant ran (--collect-from),
@@ -372,11 +450,39 @@ def score(res: dict, ids: list, truth: dict, skip=()) -> dict:
             "true_bugs_rejected": sorted(i for i in res["removed"] if truth.get(i) == "REAL" and i not in out_)}
 
 
+def _is_collect(r: dict) -> bool:
+    """A ``+collect`` variant or baseline: the judges were to read the collect model."""
+    return "collect" in (r.get("opts") or [])
+
+
+def _had_collect(r: dict) -> bool:
+    """CC-13: the run had what its name says — a fresh artifact the reader used, and the vote pack too when
+    there was a vote. A stale one is not: the reader goes without it (its bridge needs fresh) while the vote
+    uses it, and that is a third measurement, neither with nor without."""
+    is_base = r["variant"].startswith("off")
+    return (r.get("collect") == "fresh" and r.get("collect_reader") == "used"
+            and (is_base or r.get("collect_pack") == "used"))
+
+
+def _collect_cell(r: dict) -> str:
+    if "collect" not in r:
+        return "no line" if _is_collect(r) else "-"
+    detail = f" ({r['collect_detail']})" if r.get("collect_detail") else ""
+    chunks = f", {r['collect_chunks']} chunks" if r.get("collect_chunks") is not None else ""
+    return f"{r['collect']}{detail} ({r.get('collect_reader', '?')} / {r.get('collect_pack', '?')}{chunks})"
+
+
 def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> tuple:
-    # every baseline run that ran: a variant is compared with each, so the verdict does not depend on
-    # which of the two noisy `off` runs came first (PASS against 14, FAIL against 10)
-    bases = [r for r in results if r["variant"].startswith("off") and r["ok"]]
-    base_unresolved = set().union(*[set(b.get("inconclusive") or ()) for b in bases]) if bases else set()
+    # every baseline run that ran, of the variant's own kind: a variant is compared with each, so the verdict
+    # does not depend on which of the noisy `off` runs came first (PASS against 14, FAIL against 10). CC-13: a
+    # `+collect` variant against the baselines that had the model (the reader with it, the vote off), the others
+    # against the ones without — against a reader without the model, the reader's own change was counted as the
+    # vote's. A `+collect` baseline that never had the model is no baseline of either kind.
+    def bases_of(kind: bool) -> list:
+        return [r for r in results if r["variant"].startswith("off") and r["ok"] and _is_collect(r) == kind
+                and (not kind or _had_collect(r))]
+
+    unresolved_of = {k: set().union(*[set(b.get("inconclusive") or ()) for b in bases_of(k)]) for k in (False, True)}
     labelled = len(truth)
     lines = ["# CC-10 layer 2 — Gate 1 on a known-answer set\n",
              f"{len(ids)} candidates, {labelled} with a recorded answer "
@@ -394,16 +500,22 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
         # both sides on the same candidates: what either could not judge is out of both counts
         own = set(r.get("inconclusive") or ())
         is_base = r["variant"].startswith("off")
+        kind = _is_collect(r)
+        bases, base_unresolved = bases_of(kind), unresolved_of[kind]
         sc = score(r, ids, truth, skip=() if is_base else base_unresolved)
         unresolved = sorted(own | (set() if is_base else base_unresolved))
         verdict = "baseline"
-        if r["variant"].startswith("off"):
-            verdict = "baseline" if r["variant"] == "off" else "baseline repeat (the reader's own noise)"
+        if is_base:
+            first = next((b["variant"] for b in results if b["variant"].startswith("off") and _is_collect(b) == kind),
+                         None)
+            verdict = "baseline" if r["variant"] == first else "baseline repeat (the reader's own noise)"
+            if kind:
+                verdict += " with the collect model"
         else:
             if not labelled:
                 verdict = "no answers recorded"
             elif not bases:
-                verdict = "no baseline"
+                verdict = "no baseline" + (" with the collect model (an `off+collect` run that had it)" if kind else "")
             else:
                 skip = own | base_unresolved
                 scs = [score(b, ids, truth, skip=skip) for b in bases]
@@ -417,39 +529,56 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
                 enough = decided >= 1 if veto else decided >= third
                 ok = (len(sc["false_positives_through"]) <= best_fp and len(sc["true_bugs_rejected"]) <= best_tr
                       and enough)
-                n_off = f"each of {len(bases)} off runs" if len(bases) > 1 else "off"
+                n_off = (f"each of {len(bases)} off{'+collect' if kind else ''} runs" if len(bases) > 1
+                         else bases[0]["variant"])
                 verdict = ("PASS" + (" (veto only: at least one veto, no third required)" if veto else "")) if ok else \
                     "FAIL (needs fp<=%s, true rejected<=%s, decided>=%d)" % (n_off, n_off, 1 if veto else third)
                 if unresolved:
                     verdict += f" — on {len(ids) - len(unresolved)} of {len(ids)} candidates, {len(unresolved)} unresolved"
         # CC-13: a `+collect` variant is a measurement of the judges WITH the collect model; one whose run did not
-        # have it (the line says absent, or the vote pack did not use it) is a different measurement and must
+        # have it (absent, stale, the reader or the vote pack without it) is a different measurement and must
         # not be credited with a PASS or blamed with a FAIL
-        has_collect = "collect" in r.get("opts", [])
-        col = f"{r.get('collect', 'no line')} ({r.get('collect_reader', '?')} / {r.get('collect_pack', '?')})" if "collect" in r else \
-            ("no line" if has_collect else "-")
-        if has_collect and not (r.get("collect") in ("fresh", "stale") and r.get("collect_pack") == "used"):
-            verdict = (f"NO COLLECT (the run says collect: {r.get('collect') or 'no line'}, vote pack: "
-                       f"{r.get('collect_pack') or '?'} — not the measurement the name says)")
+        col = _collect_cell(r)
+        if kind and not _had_collect(r):
+            verdict = (f"NO COLLECT (the run says collect: {r.get('collect') or 'no line'}"
+                       + (f" ({r['collect_detail']})" if r.get("collect_detail") else "")
+                       + f", reader: {r.get('collect_reader') or '?'}, vote pack: {r.get('collect_pack') or '?'}"
+                       " — not the measurement the name says)")
         verdicts[r["variant"]] = verdict
         lines.append(f"| {r['variant']} | {len(r['voters'])} | {r['accept']} | yes | {r.get('removed_n', len(r['removed']))} | "
                      f"{len(r.get('inconclusive') or ())} | "
                      f"{len(sc['false_positives_through'])} | {len(sc['true_bugs_rejected'])} | {r.get('votes_asked', '-')} | "
                      f"{r.get('votes_decided', '-')} | {r.get('votes_overridden', '-')} | {r.get('votes_requests', '-')} | "
                      f"{r.get('votes_skipped', '-')} | {r['seconds']} | {col} | {verdict} |")
-    offs = [r for r in results if r["variant"].startswith("off") and r["ok"]]
-    if len(offs) >= 2:
+    for kind in (False, True):
+        offs = bases_of(kind)
+        if len(offs) < 2:
+            continue
         a, b = offs[0], offs[1]
         # on the candidates both judged, as the verdicts count them: one the reader could not judge in either
         # run was a false positive of the other run here (kept and FALSE), and a flip
         both_out = set(a.get("inconclusive") or ()) | set(b.get("inconclusive") or ())
         flips = sorted((set(a["removed"]) ^ set(b["removed"])) - both_out)
-        lines += ["", f"Noise of the baseline: `{a['variant']}` and `{b['variant']}` (same code, same candidates) disagree on "
+        lines += ["", f"Noise of the baseline{' with the collect model' if kind else ''}: `{a['variant']}` and "
+                      f"`{b['variant']}` (same code, same candidates) disagree on "
                       f"{len(flips)} candidate(s); false positives through "
                       f"{len(score(a, ids, truth, skip=both_out)['false_positives_through'])} "
                       f"and {len(score(b, ids, truth, skip=both_out)['false_positives_through'])}"
                       + (f" (on the {len(ids) - len(both_out)} both judged)" if both_out else "")
-                      + ". A difference between a vote variant and `off` smaller than that is not a result."]
+                      + f". A difference between a vote variant and `{a['variant']}` smaller than that is not a result."]
+    without, with_ = bases_of(False), bases_of(True)
+    if without and with_:
+        # CC-13's first half of the pass rule, the reader alone: Gate 1 with the vote off, with the model and without,
+        # counted on the candidates every one of those runs judged
+        skip = unresolved_of[False] | unresolved_of[True]
+        fp = lambda rs: sorted(len(score(x, ids, truth, skip=skip)["false_positives_through"]) for x in rs)  # noqa: E731
+        tr = lambda rs: sorted(len(score(x, ids, truth, skip=skip)["true_bugs_rejected"]) for x in rs)  # noqa: E731
+        span = lambda v: f"{v[0]}" if v[0] == v[-1] else f"{v[0]} to {v[-1]}"  # noqa: E731
+        lines += ["", f"The collect model for the reader alone (the vote off): false positives through "
+                      f"{span(fp(with_))} with it ({len(with_)} `off+collect` run(s)) against {span(fp(without))} without "
+                      f"({len(without)} `off` run(s)); true bugs rejected {span(tr(with_))} against {span(tr(without))}"
+                      + (f", on the {len(ids) - len(skip)} candidates all of them judged" if skip else "")
+                      + ". The option's rule asks not more with the model than without, for the reader and the vote alike."]
     lines += ["", "## Per candidate (R = removed by Gate 1, k = kept, ? = not judged: the run failed or the reader "
               "never answered)", "",
               "| id | answer | " + " | ".join(r["variant"] for r in results) + " | title |",
@@ -468,7 +597,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sets", default=DEFAULT_SETS, help=f"voter sets, size[:all|committed][+veto][+notests][+collect],…  (default {DEFAULT_SETS}; 11 adds two weak voters; +veto: the vote only vetoes; +notests: test-file candidates are not voted; +collect: the judges read the collect model of --collect-from)")
     ap.add_argument("--off-runs", type=int, default=None, help="how many times the baseline (vote off) runs; the reader is a model and does not repeat itself, so 2 sizes its noise (default: [gate1_layer2] off_runs of contest.ini, else 2)")
-    ap.add_argument("--collect-from", metavar="DIR", help="a .collect/ built for TARGET's sha: copied into every +collect clone, and the baselines get the +collect suffix too so the table puts each variant with and without side by side. Refused, naming the first differing path, when the manifest does not match the clone's tree")
+    ap.add_argument("--collect-from", metavar="DIR", help="a .collect/ built for TARGET's sha: copied into every +collect clone with its own [collect] skip_dirs; the baselines then run with the model (off+collect) and without (off), each variant judged against its own kind. Refused, naming why, when the manifest does not match the clone's tree, another collector version built it, or the clone reads it as anything but fresh")
     ap.add_argument("--known", default=str(KNOWN), help="directory with plan.json, truth.csv, TARGET (default: the recorded set)")
     ap.add_argument("--repo", default=str(ROOT), help="repository to clone the target from (default: this checkout; TARGET's sha must be in it)")
     ap.add_argument("--base-ini", default=str(ROOT / "agents.ini"))
@@ -484,11 +613,13 @@ def main(argv=None) -> int:
     known = Path(args.known)
     sets = parse_sets(args.sets)
     off_runs = args.off_runs if args.off_runs is not None else ini_off_runs(ROOT / "contest.ini")
-    # CC-13: the baselines get the +collect suffix whenever any variant opts in, so the table has
-    # each variant with and without the artifact — the comparison is the point of the option.
+    # CC-13: whenever a variant opts in, the baselines run twice over — `off…` without the model and `off…+collect`
+    # with it (the reader reads it, the vote is off) — and each variant is judged against its own kind. The
+    # baselines used to be renamed `off+collect` with nothing in them: a `+collect` variant (its reader with the
+    # model) was judged against a reader without it, and the reader's own change was counted as the vote's.
     any_collect = any("collect" in opts for _, _, opts in sets)
-    suffix = "+collect" if any_collect else ""
-    variants = [(("off" if i == 0 else f"off-{i + 1}") + suffix, [], "all", ()) for i in range(max(1, off_runs))]
+    plain = [("off" if i == 0 else f"off-{i + 1}", [], "all", ()) for i in range(max(1, off_runs))]
+    variants = plain + ([(name + "+collect", [], "all", ("collect",)) for name, *_ in plain] if any_collect else [])
     variants += [(variant_name(n, opts, rule), ROSTER[:n], rule, opts) for n, rule, opts in sets]
     out = Path(args.resume) if args.resume else Path(args.out) if args.out else OUT_BASE / dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     local = configparser.ConfigParser(interpolation=None)
@@ -517,6 +648,10 @@ def main(argv=None) -> int:
         print(f"reader: {P}{args.reader}")
         if any_collect:
             print(f"collect: {args.collect_from or 'NOT GIVEN — +collect variants cannot run'}")
+        if args.collect_from:
+            extra, problem = collect_skip_dirs(Path(args.collect_from))
+            print(f"collect: [collect] skip_dirs of the +collect variants = {extra!r}" if not problem
+                  else f"collect: {problem}")
         if missing:
             print("MISSING sections in the local ini:", ", ".join(missing))
         return 2 if missing else 0
@@ -526,10 +661,22 @@ def main(argv=None) -> int:
     if any_collect and not args.collect_from:
         print("cannot run, a set names +collect but --collect-from was not given", file=sys.stderr)
         return 2
+    collect_skip = None
     if args.collect_from:
         # the artifact is what every +collect variant reads; a wrong one is a wrong table, so it is
-        # checked against a throwaway clone of the target before a single variant starts.
-        problem = check_and_install(Path(args.collect_from), Path(args.repo), sha, out / ".collect-check")
+        # checked against a throwaway clone of the target before a single variant starts — and read there
+        # with the ini a +collect variant gets, the way the judges read it
+        collect_skip, problem = collect_skip_dirs(Path(args.collect_from))
+        if not problem:
+            scratch = out / ".collect-check"
+            scratch.mkdir(parents=True, exist_ok=True)
+            pre_ini = scratch / "agents.ini"
+            build_ini(pre_ini, local, Path(args.base_ini), "off", [], "all", args.reader, opts=("collect",),
+                      collect_skip=collect_skip)
+            try:
+                problem = check_and_install(Path(args.collect_from), Path(args.repo), sha, scratch, pre_ini)
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)     # the ini carries the reader's key
         if problem:
             print(f"cannot run, --collect-from does not match the target at {sha[:8]}: {problem}",
                   file=sys.stderr)
@@ -565,7 +712,8 @@ def main(argv=None) -> int:
             log(out, f"{name}: start ({len(voters)} voters, accept={rule})")
             try:
                 # the option is a keyword, not a positional: without --collect-from the call is the old one
-                extra = {"collect_from": Path(args.collect_from)} if args.collect_from else {}
+                extra = ({"collect_from": Path(args.collect_from), "collect_skip": collect_skip}
+                         if args.collect_from else {})
                 res = run_variant(out, name, known, Path(args.repo), sha, Path(args.base_ini), local,
                                   voters, rule, args.reader, args.timeout, opts, titles, **extra)
             except Exception as exc:   # noqa: BLE001 — one variant failing must not stop the others
