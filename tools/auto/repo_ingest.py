@@ -199,6 +199,7 @@ class RepoIngestor:
         base_dir: str | Path,
         config: configparser.ConfigParser | None = None,
         task_mode: str = "code",
+        extra_skip_dirs: "frozenset[str] | set[str] | None" = None,
     ) -> None:
         self.base_dir  = Path(base_dir).resolve()
         self._config   = config or configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
@@ -206,7 +207,11 @@ class RepoIngestor:
 
         # Walk limits — prefer [architect] overrides, fall back to [search].
         # AUTO-CR-3: max_file_kb_creative overrides max_file_kb in creative mode.
-        self._skip_dirs  = self._read_skip_dirs()
+        # CC-13: `extra_skip_dirs` is added by the caller (`[collect] skip_dirs`) rather
+        # than read here, so the collect-specific setting never has to be special-cased
+        # by the architect/search fallback chain above; `None` (every pre-CC-13 caller)
+        # changes nothing.
+        self._skip_dirs  = self._read_skip_dirs() | (set(extra_skip_dirs) if extra_skip_dirs else set())
         self._max_depth  = self._read_int("max_depth",  2)
         self._max_file_kb = self._read_int_mode("max_file_kb", 500)
 

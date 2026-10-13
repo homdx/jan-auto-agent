@@ -29,6 +29,8 @@ Options worth knowing:
 | `--sets 3,5,7,9` | voter sets to test (the default is `3:all,5:committed,7:committed,9:committed`); `--sets 3,5,7,9,11` adds the 11-voter set with two weak voters |
 | `--sets 5:all,5:committed` | the same size under both acceptance rules, to see what `committed` buys (the rule that is not the size's default is in the name: `on-5-all`) |
 | `--sets 3+veto,3+notests,5+veto+notests` | the variants of section 6: `+veto` = `vote_confirm = off` (a unanimous FALSE rejects, a unanimous TRUE is the reader's), `+notests` = `vote_skip_tests = on` (candidates citing a test file are not voted); a `+veto` variant is not asked to decide a third, only not to be worse |
+| `--sets 5+collect` | CC-13: the variant is handed the collect model of the target as well (`[gate1] vote_collect = auto`, `[collect] use_in_auto = true`), `--collect-from DIR` required. The name gets a `+collect` suffix and **so do the baselines** (`off+collect`), so the table puts each variant with and without the model side by side; `5+collect,5` are two variants, not one |
+| `--collect-from DIR` | `DIR` is a `.collect/` built for the target's sha (how: `contest-bench/cc/gate1_known_answers/README.txt`). Before the first variant the script clones the target to a scratch dir and refuses to start, naming the first differing path, when the artifact's manifest does not match that clone's tree — a wrong artifact would be a wrong table, and only `SUMMARY.md` would say it |
 | `--off-runs 2` | how many times the baseline runs (default: `[gate1_layer2] off_runs` of `contest.ini`, which ships 2): the reader is a model and does not repeat itself, the second run sizes its noise and `SUMMARY.md` prints the disagreement |
 | `--dry-run` | prints the variants, their voters and the reader; runs nothing |
 | `--resume DIR` | continues a stopped run; a variant whose `result.json` says it ran is not run again, one that failed (an error, a timeout) is |
@@ -58,6 +60,49 @@ candidates (CC-11 measured 129, 125, 115, 103 of 150 claims for 3, 5, 7, 9 voter
 the voters that committed and the three-families rule; a dissent still sends the candidate to the single reader.
 
 The single reader is the same in every variant, so a difference between two variants is the vote's.
+
+### With or without the collect model (CC-13)
+
+Every variant so far ran on a fresh `git clone` of the target, and `.collect/` is not in git: the reader judged with
+less evidence than `--auto` gives it, and the voters never could have had the collect facts at all. `--collect-from`
+changes that. The artifact is **copied** into every clone (read-only data, not linked, so that `--validate-plan`,
+which edits and commits `plan.json`, cannot touch anything shared) and two switches are turned on for the variant:
+
+* `[collect] use_in_auto = true` — the single reader's collect bridge (the contract note for the cited symbol, the
+  "does the model know this file" check). That is already how `--auto` runs; without it a variant measures a reader
+  leaner than the one in production.
+* `[gate1] vote_collect = auto` — the voters' packs carry the artifact's facts about the cited module as chunks of
+  kind `collect` (`collect:contracts|callers|calls|risk|fail_open:<path>`), read by the same freshness test as
+  `main.py --collect --check` and never written by the vote. Off (default, and the non-`+collect` variants) = the packs
+  exactly as before, which is the comparison the table needs.
+
+One line at the start of every variant's `run.log` says whether the model was there and who got it, the `+collect`
+variants and the baselines alike:
+
+```
+📦 collect: fresh — reader: used, vote pack: used
+```
+
+`fresh | stale (N modules changed) | absent` is the artifact's own state for the clone (the layer-2 clones are all at
+one sha, so a checked-in artifact is `fresh` for all of them), and the two halves say whether the reader and the vote
+pack actually used it. The run's counters carry it on too: `collect_state` (`off` | `absent` | `stale` | `fresh`) and
+`collect_chunks` (chunks of kind `collect` across the run's packs), next to the vote's own `votes_*`.
+
+Staleness is honoured read-only: `[collect] staleness = ignore` gives no model, `warn` (default) gives a stale one and
+says so, `refresh` does nothing here — the vote is not the collector and will not rebuild an artifact in the middle of
+a run. An absent, unreadable or mismatching artifact is `absent`, the packs are today's, and the run never dies on it.
+
+**Pass for the option, not for the vote.** With `+collect` the reader's false positives through are not more than
+without, and the vote's wrong unanimous TRUEs are fewer (the rate at the third run was 75 to 88 %); no real bug
+rejected that was not rejected without it. Anything less leaves `vote_collect = off`, and this section records what
+the model changed — the answer to "do the judges pull from collect" is a number, not a yes.
+
+The artifact is built **once**, not per run: `collect` of this tree takes about an hour with a free model (395 modules
+re-summarized at ~10 s each on an incremental run, 943 on a full one) and is rate limited, so `README.txt` of the
+known-answer set says how to build it in a `git worktree` at the target's sha and that it is rebuilt only when the sha
+changes. Build it with a config whose `[collect] dir` is not inside the tree you hand here. `[collect] skip_dirs` is
+worth setting in that config: a checkout that keeps round output would otherwise be scanned whole (`contest-out/` held
+32,539 `.py` files at one point — five minutes at 96 % CPU, no output, and a module list 33,000 long).
 
 ### The known-answer set
 

@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import FrozenSet, List, Optional
 
 from tools.auto.repo_ingest import RepoIngestor
+from tools.collect.manifest import skip_dirs_from_config as _collect_skip_dirs
 from tools.collect.ast_facts import (
     extract_config_reads,
     extract_except_sites,
@@ -223,7 +224,15 @@ def scan_repo(
     happens to be installed.
     """
     root = Path(root)
-    ingestor = RepoIngestor(root, config)
+    # CC-13: `[collect] skip_dirs` prunes the walk itself, not just the
+    # manifest built from it — the artifact's module list is this walk's
+    # output, so a directory that is skipped only when the manifest is written
+    # would still be re-summarised (Pass B, one LLM call per module) on every
+    # build and would sit in the module list as a phantom dependency. The walk
+    # and the manifest both use `manifest.skip_dirs_from_config`, so they
+    # cannot disagree about the list; a config without the key gives the
+    # defaults and the walk is exactly what it was.
+    ingestor = RepoIngestor(root, config, extra_skip_dirs=_collect_skip_dirs(config))
     enabled = enabled_languages(config)
     java_exts = java_extensions_from_config(config)
 

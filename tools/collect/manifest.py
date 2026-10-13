@@ -50,6 +50,52 @@ DEFAULT_SKIP_DIRS = frozenset(
 )
 
 
+def skip_dirs_from_config(
+    config: Optional["configparser.ConfigParser"] = None,
+) -> frozenset:
+    """`[collect] skip_dirs` of *config* added to `DEFAULT_SKIP_DIRS`.
+
+    CC-13: before this there was no setting — a checkout that keeps round output
+    (`contest-out/` with thousands of `.py` files, or a `rounds/` sandbox) was
+    scanned whole. The value is a comma-separated list of *extra* directory
+    names, added to the default list rather than replacing it, so
+    `skip_dirs = contest-out` never re-enables `node_modules`. Empty (the
+    default, and an absent key) is exactly today's list. A malformed value,
+    a parser that is not one, or a key that is not a string degrades to the
+    defaults — the manifest is built, never aborted, on a wrong setting.
+    """
+    out = set(DEFAULT_SKIP_DIRS)
+    if config is None:
+        return frozenset(out)
+    try:
+        raw = config.get("collect", "skip_dirs", fallback="")
+    except (AttributeError, TypeError, ValueError):
+        return frozenset(out)
+    if not isinstance(raw, str):
+        return frozenset(out)
+    for name in raw.split(","):
+        name = name.strip()
+        if name:
+            out.add(name)
+    return frozenset(out)
+
+
+def effective_skip_dirs(
+    config: Optional["configparser.ConfigParser"] = None,
+    extra: Optional[Iterable[str]] = None,
+) -> frozenset:
+    """`DEFAULT_SKIP_DIRS` plus `[collect] skip_dirs` of *config* plus *extra*:
+    the one place the effective list is computed, so the walk, the manifest and
+    the freshness check cannot disagree about it."""
+    out = set(skip_dirs_from_config(config))
+    if extra is not None:
+        for name in extra:
+            name = str(name).strip()
+            if name:
+                out.add(name)
+    return frozenset(out)
+
+
 def _utc_iso_now() -> str:
     """Current UTC time as an ISO-8601 string with a trailing 'Z'."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -68,16 +114,22 @@ def discover_files(
     root: Path,
     *,
     suffixes: Iterable[str] = (".py",),
-    skip_dirs: Iterable[str] = DEFAULT_SKIP_DIRS,
+    skip_dirs: Optional[Iterable[str]] = None,
+    config: Optional["configparser.ConfigParser"] = None,
 ) -> List[str]:
     """Walk `root`, returning sorted POSIX-relative paths of matching files.
 
     Self-contained on purpose: COLLECT-2 must not depend on the AST scanner
     (COLLECT-4, EPIC B) which doesn't exist yet. The scanner is free to hand
     `build_manifest` its own file list instead of relying on this walk.
+
+    `skip_dirs` is the effective list in force: `DEFAULT_SKIP_DIRS` plus
+    `[collect] skip_dirs` of *config* (`effective_skip_dirs` is the one place
+    it is computed). Passing `None` means "the defaults plus whatever *config*
+    says", which is the same as today for a config that does not set the key.
     """
     root = Path(root)
-    skip = set(skip_dirs)
+    skip = effective_skip_dirs(config, None if skip_dirs is None else skip_dirs)
     suffix_set = tuple(suffixes)
     out: List[str] = []
     for dirpath, dirnames, filenames in _walk(root, skip):
@@ -267,6 +319,15 @@ class Manifest:
     git_sha: Optional[str]
     dirty: bool
     file_hashes: Dict[str, str] = field(default_factory=dict)
+    # CC-13: the effective `skip_dirs` in force when this manifest was built
+    # (`effective_skip_dirs`, i.e. DEFAULT_SKIP_DIRS plus `[collect] skip_dirs`).
+    # A manifest built with a different list hashes a different file set, so
+    # `is_fresh` reports the tree as stale the moment the setting changes —
+    # the change is visible in the manifest rather than buried in a
+    # thousand-file diff. An absent key is an older manifest, whose list was
+    # the default, so `from_dict` reads it back as exactly that: nothing
+    # about an existing artifact has to change for this.
+    skip_dirs: Tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         return {
@@ -275,6 +336,7 @@ class Manifest:
             "git_sha": self.git_sha,
             "dirty": self.dirty,
             "file_hashes": dict(self.file_hashes),
+            "skip_dirs": sorted(self.skip_dirs),
         }
 
     def to_json(self, *, indent: int = 2) -> str:
@@ -312,6 +374,13 @@ class Manifest:
             git_sha=d.get("git_sha"),
             dirty=bool(d.get("dirty", False)),
             file_hashes=dict(d.get("file_hashes", {})),
+            # An older manifest has no key: its list was the default. Anything
+            # present but not a list of strings is left as the default too —
+            # a half-written manifest is stale, never an unreadable one.
+            skip_dirs=tuple(sorted(d["skip_dirs"]))
+            if isinstance(d.get("skip_dirs"), (list, tuple))
+            and all(isinstance(x, str) for x in d["skip_dirs"])
+            else tuple(sorted(DEFAULT_SKIP_DIRS)),
         )
 
     @classmethod
@@ -326,6 +395,8 @@ def build_manifest(
     collector_version: str = COLLECTOR_VERSION,
     provenance: Optional[Tuple[Optional[str], bool]] = None,
     file_hashes: Optional[Dict[str, str]] = None,
+    config: Optional["configparser.ConfigParser"] = None,
+    skip_dirs: Optional[Iterable[str]] = None,
 ) -> Manifest:
     """Build a `Manifest` for `root`. If `files` isn't given, discovers
     `*.py` files under `root` via `discover_files`.
@@ -347,9 +418,16 @@ def build_manifest(
     this a single `--collect` on a stale tree hashed the same files twice
     (once to decide what changed, once here, after `_write_artifact` had
     already touched disk).
+
+    CC-13: `config` / `skip_dirs` set the effective `skip_dirs` the walk above
+    uses, and that list is recorded on the manifest itself (see `Manifest.skip_dirs`)
+    so a change of the setting is a change of the artifact, visible to
+    `is_fresh` — without it, a manifest built with one list compared against a
+    tree walked with another would drift silently.
     """
     root = Path(root)
-    file_list = list(files) if files is not None else discover_files(root)
+    effective = effective_skip_dirs(config, skip_dirs)
+    file_list = list(files) if files is not None else discover_files(root, skip_dirs=effective)
     if provenance is not None:
         git_sha, dirty = provenance
     else:
@@ -360,6 +438,7 @@ def build_manifest(
         git_sha=git_sha,
         dirty=dirty,
         file_hashes=file_hashes if file_hashes is not None else hash_tree(root, file_list),
+        skip_dirs=tuple(sorted(effective)),
     )
 
 
@@ -379,6 +458,7 @@ def is_fresh(
     *,
     files: Optional[Iterable[str]] = None,
     hashes: Optional[Dict[str, str]] = None,
+    skip_dirs: Optional[Iterable[str]] = None,
 ) -> bool:
     """True iff `manifest` was built by the CURRENT collector_version AND
     `root`'s current content hashes exactly match `manifest`'s.
@@ -416,6 +496,15 @@ def is_fresh(
     rather than needing four separate fixes (action_refresh already got its
     own version check separately, since it doesn't call is_fresh at all).
 
+    CC-13: `skip_dirs`, when given, is the *effective* list in force now
+    (`effective_skip_dirs` of the caller's config) and is compared against the
+    list the manifest recorded. The file hashes already catch most of it — a
+    changed list hashes a different file set — but the explicit comparison is
+    what makes "the setting changed and nothing else did" report stale rather
+    than fresh, and it holds on the `hashes=` path too, where the caller's own
+    hash map may already have been built with the new list. Omitting it (the
+    older call sites) keeps today's behaviour exactly.
+
     Pass `files` explicitly to freshness-check against a specific file set
     instead of a fresh directory walk (e.g. when the caller already has the
     scanner's own file list from EPIC B). Pass `hashes` to skip the hash
@@ -425,6 +514,8 @@ def is_fresh(
     the three full tree hashes one stale `--collect` used to cost.
     """
     if manifest.collector_version != COLLECTOR_VERSION:
+        return False
+    if skip_dirs is not None and tuple(sorted(skip_dirs)) != tuple(manifest.skip_dirs):
         return False
     if hashes is not None:
         return hashes == manifest.file_hashes

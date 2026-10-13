@@ -838,6 +838,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             Every candidate that was dropped, with the stage and reason logged.
         """
         base_dir = Path(base_dir)
+        # CC-13: one line per run, every variant (the vote off included), that says whether the
+        # collect model was there and who got it — the judges are the single reader and the CC-10
+        # voters, and without it a run's log cannot say what either had.
+        print(self._collect_line(base_dir), flush=True)
         all_results: list[FilterResult] = []
 
         # ── Stage A: existence checks ─────────────────────────────────────────
@@ -1182,6 +1186,57 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         return accepted, rejected
 
     # ── Stage A helpers ───────────────────────────────────────────────────────
+
+    def _collect_line(self, base_dir: Path) -> str:
+        """CC-13: the one line at the start of Gate 1 that says what the judges had.
+
+        ``collect: fresh | stale (N modules changed) | absent — reader: used/not used,
+        vote pack: used/not used``. The reader's side is its collect bridge (GATE1-CTX-1/-2,
+        Stage A0) and the vote's side is the CC-10 vote's own read of the same artifact
+        (`[gate1] vote_collect`), so one line settles "did the judges pull from collect"
+        for both of them. Printed by every variant, the vote off included, and built before
+        Stage A so the run's log says it at the start rather than never. Nothing here raises:
+        a missing artifact, a malformed ``[collect]`` key or a broken read is an ``absent``
+        line, never a run that stops.
+        """
+        state = ""
+        changed = 0
+        reader_used = False
+        try:
+            bridge = getattr(self, "_collect_bridge", None)
+            reader_used = bool(getattr(bridge, "usable", False))
+            state = str(getattr(bridge, "status", "") or "")
+        except Exception:   # noqa: BLE001 — the bridge's own state is a line, not a traceback
+            state, reader_used = "", False
+        vote_used = False
+        try:
+            vote = getattr(self, "_vote", None)
+            read = vote.collect_read(base_dir) if vote is not None else None
+            if read is not None:
+                vote_used = bool(getattr(read, "used", False))
+                if getattr(read, "status", ""):
+                    state = str(read.status)
+                changed = int(getattr(read, "changed", 0) or 0)
+        except Exception:   # noqa: BLE001 — a read that fails is "not used"
+            vote_used = False
+        if not state:
+            # neither judge asked for the model: say whether there was one at all, so an artifact
+            # that exists and is simply unused is not reported as absent (the read is cached, so the
+            # vote's later read of the same tree is free)
+            try:
+                probe = _gate1_vote.read_collect_model(base_dir, config=self._config)
+                if probe is not None:
+                    state = str(getattr(probe, "status", "") or "absent")
+                    changed = int(getattr(probe, "changed", 0) or 0)
+            except Exception:   # noqa: BLE001
+                pass
+        state = state or "absent"
+        if state == "stale":
+            head = f"stale ({changed} module{'s' if changed != 1 else ''} changed)"
+        else:
+            head = state
+        return (f"📦 collect: {head} — reader: {'used' if reader_used else 'not used'}, "
+                f"vote pack: {'used' if vote_used else 'not used'}")
 
     def _vote_on(self, candidate: CandidateTask, base_dir: Path):
         """CC-10: the claim vote on *candidate*, or None when there is no vote or it has no

@@ -485,7 +485,10 @@ def load(
         return _absent(collect_dir, "manifest is unreadable — treated as absent")
 
     current_paths = [m.path for m in scan_repo(root, config=config)]
-    fresh = manifest_mod.is_fresh(existing_manifest, root, files=current_paths)
+    # CC-13: the effective `[collect] skip_dirs` list, so a change of the
+    # setting alone reports stale rather than drifting on the hashes alone.
+    fresh = manifest_mod.is_fresh(existing_manifest, root, files=current_paths,
+                                 skip_dirs=manifest_mod.skip_dirs_from_config(config))
     if fresh:
         return _load_from_dir(collect_dir, status=STATUS_FRESH)
 
@@ -497,3 +500,99 @@ def load(
         return _load_from_dir(collect_dir, status=STATUS_FRESH)
     # policy == "warn" (default / fallback)
     return _load_from_dir(collect_dir, status=STATUS_STALE, reason="artifact is stale (a tracked file changed)")
+
+
+@dataclass(frozen=True)
+class CollectRead:
+    """What one read of the artifact produced for a consumer that may not write.
+
+    `status` is what the artifact said (`fresh` / `stale` / `absent`); `model`
+    is what the caller may actually hand to its evidence builder — `None`
+    means "no model, the pack is today's". The two can differ, and that is the
+    point: `staleness = refresh` on a stale artifact is reported `stale` with
+    `model=None`, because this reader does not rebuild anything. `changed` is
+    how many files differ from the manifest (0 when fresh or absent), so the
+    caller can say *how* stale it is rather than just *that* it is.
+    """
+
+    status: str = STATUS_ABSENT
+    model: Optional[CollectModel] = None
+    changed: int = 0
+    reason: str = ""
+
+    @property
+    def used(self) -> bool:
+        """True when this read gives a usable model: a fresh artifact, or a
+        stale one `[collect] staleness = warn` allows."""
+        return self.model is not None and self.model.available
+
+
+def load_readonly(
+    root: Path,
+    *,
+    config: Optional[configparser.ConfigParser] = None,
+) -> CollectRead:
+    """The collect model of `root` by `load`'s own freshness test, without ever
+    writing anything to disk.
+
+    CC-13: the Gate 1 vote asks for this. It must use exactly the freshness
+    test `main.py --collect --check` reports (the manifest's hashes against the
+    tracked files, the current `collector_version`) and it must never rebuild —
+    a run cannot pay an hour of Pass B in the middle of Stage B, and a vote is
+    not the collector. `[collect] staleness` is still honoured, with one
+    difference:
+
+      * `ignore`  — never a model (exactly as in `load`).
+      * `warn`    — the stale model is used and flagged, `changed` says how many
+                     files moved.
+      * `refresh` — **not** honoured here: the artifact is left on disk and no
+                     model is returned, `status` stays `stale`.
+
+    Nothing here raises: an absent, unreadable, truncated or malformed artifact
+    is `absent`, and the caller's pack is exactly what it is today.
+    """
+    try:
+        root = Path(root)
+        collect_dir = cli_mod.resolve_collect_dir(root, config)
+        manifest_path = collect_dir / cli_mod.MANIFEST_FILENAME
+        artifact_path = collect_dir / cli_mod.ARTIFACT_FILENAME
+        if not manifest_path.is_file() or not artifact_path.is_file():
+            return CollectRead(reason="no collect artifact — collect has never run")
+        try:
+            man = manifest_mod.read_manifest(manifest_path)
+        except (OSError, ValueError):
+            return CollectRead(reason="manifest is unreadable — treated as absent")
+
+        skip = manifest_mod.skip_dirs_from_config(config)
+        paths = [m.path for m in scan_repo(root, config=config)]
+        hashes = manifest_mod.hash_tree(root, paths)
+        diff = manifest_mod.diff_files(man.file_hashes, hashes)
+        changed = len(diff.added | diff.modified | diff.removed)
+
+        if manifest_mod.is_fresh(man, root, files=paths, hashes=hashes, skip_dirs=skip):
+            model = _load_from_dir(collect_dir, status=STATUS_FRESH)
+            if not model.available:
+                return CollectRead(reason=model.reason or "artifact is unreadable — treated as absent")
+            return CollectRead(status=STATUS_FRESH, model=model)
+
+        reason = "artifact is stale (a tracked file changed)"
+        if man.collector_version != manifest_mod.COLLECTOR_VERSION:
+            reason = (f"manifest was built by collector_version={man.collector_version!r}, "
+                      f"current is {manifest_mod.COLLECTOR_VERSION!r}")
+
+        policy = _staleness_policy(config)
+        if policy == "ignore":
+            return CollectRead(status=STATUS_ABSENT, changed=changed,
+                               reason="stale artifact, staleness=ignore — treated as absent")
+        if policy == "refresh":
+            return CollectRead(status=STATUS_STALE, changed=changed,
+                               reason=f"stale artifact, staleness=refresh: this reader does not "
+                                      f"write, so the artifact was left alone")
+        # policy == "warn" (default / fallback): the stale model is used and flagged
+        model = _load_from_dir(collect_dir, status=STATUS_STALE, reason=reason)
+        if not model.available:
+            return CollectRead(status=STATUS_ABSENT, changed=changed,
+                               reason=model.reason or "artifact is unreadable — treated as absent")
+        return CollectRead(status=STATUS_STALE, model=model, changed=changed, reason=model.reason)
+    except Exception:   # noqa: BLE001 — a consumer of collect never dies on collect
+        return CollectRead(reason="collect could not be read — treated as absent")

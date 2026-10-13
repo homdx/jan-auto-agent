@@ -61,8 +61,11 @@ each a "no decision" and a line in the log. ``[gate1] claim_vote = off`` (the de
     vote_veto_by_reader = on                     ; a unanimous FALSE also needs the reader not
                                                  ; to say confirmed
     vote_accept         = all | committed        ; CC-11: with five or more voters, `committed`
-                                                 ; lets an abstainer stop blocking (default all)
+                                                  ; lets an abstainer stop blocking (default all)
     vote_quorum         = 3                      ; not a knob: any other value is refused (CC-10 Q5)
+    vote_collect        = off                    ; CC-13: auto = the vote's pack carries the collect
+                                                  ; model's facts when the artifact of the run's base
+                                                  ; directory is fresh (or stale and staleness = warn)
 """
 
 from __future__ import annotations
@@ -102,6 +105,17 @@ LOCAL_FILES = ("contest.ini", "contest.local.ini")
 
 #: [gate1] vote_confirm when the ini does not set it (on, as CC-10 landed; off = the vote only vetoes)
 DEFAULT_CONFIRM = True
+#: CC-13: `[gate1] vote_collect` — `off` (the default, every pack is what it is) or `auto`
+#: (the pack carries the collect model's facts when the artifact of the run's base directory is
+#: fresh, or stale and `[collect] staleness = warn` allows a stale one)
+DEFAULT_VOTE_COLLECT = "off"
+VOTE_COLLECT_MODES = ("off", "auto")
+
+#: The vote's own counters of the collect model (CC-13): `collect_chunks` is how many
+#: chunks of kind `collect` the run's packs carried, `collect_state` is what the artifact
+#: said (`off`, `absent`, `stale`, `fresh`) — a result then says what it had.
+COUNTER_COLLECT_CHUNKS = "collect_chunks"
+COUNTER_COLLECT_STATE = "collect_state"
 
 _ON = {"on", "true", "yes", "1"}
 _OFF = {"off", "false", "no", "0", ""}
@@ -158,6 +172,7 @@ class VoteConfig:
     accept: str = "all"
     confirm: bool = DEFAULT_CONFIRM   # False: the vote only vetoes, a unanimous TRUE is the reader's to decide
     skip_tests: bool = False          # True: a candidate that cites a test file is not put to the voters
+    vote_collect: str = DEFAULT_VOTE_COLLECT   # CC-13: auto = the pack may carry collect chunks
     why: str = "claim_vote = off"
     models: tuple = ()
 
@@ -229,12 +244,18 @@ class VoteConfig:
         if accept not in ("all", "committed"):
             logger.warning("config [gate1] vote_accept = %r is not all/committed — using all", accept)
             accept = "all"
+        # CC-13: a malformed value is `off`, never an error — a wrong key must degrade to
+        # today's pack rather than keep the vote from running
+        vote_collect = get("vote_collect", DEFAULT_VOTE_COLLECT).lower() or DEFAULT_VOTE_COLLECT
+        if vote_collect not in VOTE_COLLECT_MODES:
+            logger.warning("config [gate1] vote_collect = %r is not off/auto — using off", vote_collect)
+            vote_collect = DEFAULT_VOTE_COLLECT
         return cls(True, profiles,
                    number("vote_max_per_run", DEFAULT_MAX_PER_RUN, int, 0),
                    number("vote_timeout_sec", DEFAULT_TIMEOUT_SEC, float, 1.0),
                    switch("vote_veto_by_reader", "on"), accept,
                    switch("vote_confirm", "on" if DEFAULT_CONFIRM else "off"), switch("vote_skip_tests", "off"),
-                   "claim_vote = on", models)
+                   vote_collect, "claim_vote = on", models)
 
 
 @dataclass(frozen=True)
@@ -307,6 +328,83 @@ def _load_claim_vote():
         sys.path.insert(0, scripts)
     import claim_vote
     return claim_vote
+
+
+#: CC-13: the collect model read once per tree, shared by the vote and by Gate 1's own line
+#: about it. The read is a full scan and hash of the tree, so it is cached here rather than
+#: re-done per candidate or per consumer; `main.py` is one process per run, so nothing of one
+#: run leaks into the next.
+_COLLECT_READS: dict = {}
+_COLLECT_READS_LOCK = threading.Lock()
+
+
+def _tree_key(base_dir) -> Optional[str]:
+    """*base_dir* as the key of a tree, or None when it names nothing to read."""
+    try:
+        root = Path(base_dir)
+        if not root.exists():
+            return None
+        return str(root.resolve())
+    except Exception:   # noqa: BLE001 — a weird base_dir is "no collect data"
+        return None
+
+
+def _tree_root_of(view) -> Optional[str]:
+    """The tree a *view* reads from (`PathRepoView.root`, a git view's `base_dir`), or None:
+    the collect model must be the one for the tree the claim is judged against."""
+    try:
+        for name in ("root", "base_dir", "worktree", "directory", "dir"):
+            value = getattr(view, name, None)
+            if isinstance(value, (str, Path)) and str(value):
+                return str(value)
+    except Exception:   # noqa: BLE001 — a weird view is "no collect data"
+        return None
+    return None
+
+
+def _collect_loader():
+    """`tools.collect.loader`, imported lazily: a collect package that cannot be imported is
+    "no collect data", never a run that dies before Stage B."""
+    try:
+        from tools.collect import loader as cl
+        return cl
+    except Exception:   # noqa: BLE001 — the vote runs without collect
+        return None
+
+
+def read_collect_model(base_dir, config=None):
+    """CC-13: the read of the collect artifact of *base_dir*, or None when there is none.
+
+    The same freshness test `main.py --collect --check` reports (the manifest's hashes against
+    the tracked files, the current `collector_version`) and the same `[collect] staleness`
+    policy, except that it never writes: `ignore` gives no model, `warn` gives the stale model
+    and says how many files moved, `refresh` is not honoured here (the vote is not the
+    collector and will not pay an hour of Pass B in the middle of Stage B). An absent,
+    unreadable or malformed artifact is "no collect data" — the pack is today's — and nothing
+    here raises. Read once per tree: the second call is a dict lookup."""
+    key = _tree_key(base_dir)
+    if key is None:
+        return None
+    with _COLLECT_READS_LOCK:
+        if key in _COLLECT_READS:
+            return _COLLECT_READS[key]
+        read = None
+        try:
+            cl = _collect_loader()
+            if cl is not None:
+                read = cl.load_readonly(base_dir, config=config)
+        except Exception as exc:   # noqa: BLE001 — a broken artifact is no artifact
+            logger.warning("Gate1[vote] the collect artifact could not be read (%s: %s) — "
+                           "no collect data", type(exc).__name__, str(exc)[:100])
+            read = None
+        _COLLECT_READS[key] = read
+        return read
+
+
+def clear_collect_reads() -> None:
+    """Drop the cached reads of `read_collect_model` (a test of one tree then another)."""
+    with _COLLECT_READS_LOCK:
+        _COLLECT_READS.clear()
 
 
 class _Turns:
@@ -400,9 +498,48 @@ class Gate1Vote:
         self._resolve_lock = threading.Lock()   # held for the whole resolution: a second presence
                                                 # worker waits for it instead of voting with all refs
         # votes_skipped: candidates that reached the vote and were not voted on (nothing in the tree
-        # to quote, the cap, the vote stopped) — votes_asked alone hid them
+        # to quote, the cap, the vote stopped) — votes_asked alone hid them. CC-13 adds the collect
+        # side: collect_chunks counts the chunks of kind `collect` the run's packs carried, and
+        # collect_state says what the artifact was (off = the switch, absent/stale/fresh = the read),
+        # so a result says what its judges had.
         self.counters = {"votes_asked": 0, "votes_decided": 0, "votes_overridden": 0,
-                         "votes_requests": 0, "votes_skipped": 0}
+                         "votes_requests": 0, "votes_skipped": 0,
+                         COUNTER_COLLECT_CHUNKS: 0, COUNTER_COLLECT_STATE: DEFAULT_VOTE_COLLECT}
+
+    # -- the collect model (CC-13) -------------------------------------------------------------
+
+    def collect_read(self, base_dir):
+        """The read of *base_dir*'s collect artifact for this vote, or None.
+
+        ``[gate1] vote_collect = off`` (the default) reads nothing and leaves the counter at
+        ``off``: every pack is exactly what it is today. ``auto`` reads the artifact of the run's
+        base directory once — the same freshness test `main.py --collect --check` uses, and never
+        a write — and records what it said in `collect_state`. Nothing raises: an absent tree, a
+        malformed ``[collect]`` key or a broken artifact is no model, and the pack is today's."""
+        if self.cfg.vote_collect != "auto":
+            return None
+        read = read_collect_model(base_dir, config=self._config)
+        self._set_state(getattr(read, "status", None) or "absent")
+        return read
+
+    def collect_model(self, view):
+        """The collect model for one vote's pack, or None (the pack is today's). Only a read that
+        has a model to give one is passed on: `staleness = ignore` and the ``refresh`` case the
+        vote does not honour both read as no model."""
+        try:
+            read = self.collect_read(_tree_root_of(view))
+            return read.model if read is not None and getattr(read, "used", False) else None
+        except Exception:   # noqa: BLE001 — the pack is built without collect, never a crash
+            return None
+
+    def _set_state(self, state: str) -> None:
+        with self._lock:
+            self.counters[COUNTER_COLLECT_STATE] = str(state or "absent")
+
+    def collect_state(self) -> str:
+        """``off`` (the switch is off), or what the artifact said: ``absent``, ``stale``, ``fresh``."""
+        with self._lock:
+            return self.counters.get(COUNTER_COLLECT_STATE, DEFAULT_VOTE_COLLECT)
 
     # -- the voters ----------------------------------------------------------------------------
 
@@ -650,9 +787,14 @@ class Gate1Vote:
         cited = [r for r in resolved if r.anchor.start < len(where)]
         if kind == "world" or cc_anchors.is_dangling(cited):
             return self._skip()       # nothing to quote: the single reader as today
-        pack = build_pack(claim, resolved, view, budget=self._budget)
+        # CC-13: `vote_collect = auto` and a fresh (or `staleness = warn` stale) artifact add the
+        # collect facts about the cited module to the pack the voters read; `off` and every failure
+        # give None and the pack is byte for byte what it was
+        pack = build_pack(claim, resolved, view, model=self.collect_model(view), budget=self._budget)
         if not pack.chunks:
             return self._skip()
+        # the pack's own record of what the vote had: a collect chunk of zero is "no collect data"
+        self._bump(COUNTER_COLLECT_CHUNKS, sum(1 for c in pack.chunks if c.kind == "collect"))
         if not self._admit():
             return self._skip()       # past [gate1] vote_max_per_run: the single reader answers
         with self._lock:

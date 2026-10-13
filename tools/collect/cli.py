@@ -589,6 +589,7 @@ def _write_manifest(
     *,
     provenance: Optional[Tuple[Optional[str], bool]] = None,
     file_hashes: Optional[Dict[str, str]] = None,
+    config: Optional[configparser.ConfigParser] = None,
 ) -> None:
     """`provenance`, if given, must be a `(git_sha, dirty)` pair captured
     via `manifest_mod.capture_provenance(root)` *before* `_write_artifact`
@@ -599,7 +600,7 @@ def _write_manifest(
     tree here (see `manifest.build_manifest`)."""
     files = sorted(m.path for m in modules)
     manifest = manifest_mod.build_manifest(
-        root, files, provenance=provenance, file_hashes=file_hashes,
+        root, files, provenance=provenance, file_hashes=file_hashes, config=config,
     )
     manifest_mod.write_manifest(manifest, collect_dir / MANIFEST_FILENAME)
 
@@ -678,7 +679,8 @@ def _freshness(
 
     modules = scan_repo(root, config=config)
     hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
-    fresh = manifest_mod.is_fresh(existing, root, files=[m.path for m in modules], hashes=hashes)
+    fresh = manifest_mod.is_fresh(existing, root, files=[m.path for m in modules],
+                                 hashes=hashes, skip_dirs=manifest_mod.skip_dirs_from_config(config))
     if fresh:
         reason = "up to date"
     elif existing.collector_version != manifest_mod.COLLECTOR_VERSION:
@@ -764,7 +766,8 @@ def _full_build(
         summaries_carried=carried, summaries_stale=stale, summaries_dropped=dropped,
     )
     written = _write_artifact(collect_dir, ctx)
-    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance, file_hashes=hashes)
+    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance, file_hashes=hashes,
+                    config=config)
     written = sorted(set(written) | {MANIFEST_FILENAME})
     return collect_dir, written, ctx
 
@@ -1097,7 +1100,8 @@ def action_refresh(
     # tracks exactly this same set of paths, so a second tree-wide hash
     # pass here (after `_write_artifact` has written to disk) was pure
     # duplication of the one done at the top of this function.
-    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance, file_hashes=current_hashes)
+    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance,
+                    file_hashes=current_hashes, config=config)
     written = sorted(set(written) | {MANIFEST_FILENAME})
 
     if changes.is_empty():
@@ -1463,6 +1467,10 @@ def action_module(
         git_sha=git_sha,
         dirty=dirty,
         file_hashes=hashes,
+        # CC-13: `is_fresh` compares the effective `[collect] skip_dirs` list against
+        # the one the manifest recorded, so a patched manifest that omits it reads as
+        # stale right after a successful `--module` (the walk and the record disagree).
+        skip_dirs=tuple(sorted(manifest_mod.skip_dirs_from_config(config))),
     )
     manifest_mod.write_manifest(patched_manifest, manifest_path)
     written = sorted(set(written) | {MANIFEST_FILENAME})
