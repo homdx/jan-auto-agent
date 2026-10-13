@@ -63,7 +63,7 @@ MATCH_RATIO = 0.85       # a Lenz claim reworded by /extract still matches ours 
 
 def _source(path: Path):
     try:
-        return ast.parse(Path(path).read_text(encoding="utf-8"))
+        return ast.parse(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, SyntaxError, ValueError):
         return None
 

@@ -384,7 +384,7 @@ def build_call_edges(root: Path, modules: Iterable[ModuleRecord]) -> Graph:
             # broken/unavailable file can't take down the scan" contract
             # COLLECT-25 established for `scan_java_module`.
             try:
-                source = (root / m.path).read_text(encoding="utf-8")
+                source = (root / m.path).read_text(encoding="utf-8-sig")
             except (OSError, UnicodeDecodeError):
                 # BUGFIX: this used to catch only OSError — a `.java` file
                 # that simply isn't valid UTF-8 raised a bare
@@ -415,7 +415,7 @@ def build_call_edges(root: Path, modules: Iterable[ModuleRecord]) -> Graph:
             continue
 
         try:
-            source = (root / m.path).read_text(encoding="utf-8")
+            source = (root / m.path).read_text(encoding="utf-8-sig")
             tree = ast.parse(source, filename=m.path)
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue

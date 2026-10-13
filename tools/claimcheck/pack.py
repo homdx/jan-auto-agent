@@ -561,7 +561,7 @@ def _index_names(chunks: list, path: str) -> Optional[tuple]:
 def _definitions(text: str) -> Optional[tuple]:
     """(top-level names in file order, the parsed tree) of a Python module, None when it does not parse."""
     try:
-        tree = ast.parse(text)
+        tree = ast.parse(text[1:] if text.startswith("\ufeff") else text)     # a BOM is no code
     except Exception:   # noqa: BLE001 — SyntaxError, ValueError, RecursionError, MemoryError
         return None
     names = [s.name for s in tree.body

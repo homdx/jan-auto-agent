@@ -282,8 +282,9 @@ def _definitions(text: str, path: str) -> list:
     qualname, each with the span a reader would call the definition; and every name a module
     or a class body assigns (`MAX_RETRIES = 3`, `timeout: int = 30`), a constant being a
     definition too — a claim about `MAX_RETRIES` found nothing and went to the voters as a
-    world claim, with no code in front of them. A function's locals are not definitions."""
-    tree = ast.parse(text)
+    world claim, with no code in front of them. A function's locals are not definitions. A BOM is no
+    code: with it the module did not parse, and its definitions were "not found"."""
+    tree = ast.parse(text[1:] if text.startswith("\ufeff") else text)
     out: list = []
     stack = [(tree, "", True)]     # node, qualname prefix, whether its assignments define names
     while stack:

@@ -259,7 +259,7 @@ def _load(view, path: str, cache: dict) -> Optional[_File]:
                 f = _File(path, [_clean(line) for line in _split(text)])
                 if path.endswith(".py"):
                     try:
-                        f.tree = ast.parse(text)
+                        f.tree = ast.parse(text[1:] if text.startswith("\ufeff") else text)   # a BOM is no code
                     except (SyntaxError, ValueError, RecursionError, MemoryError):
                         f.tree = None
                     if f.tree is not None:

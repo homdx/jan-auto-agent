@@ -362,7 +362,7 @@ def _sources_for(root: Path, modules: List[ModuleRecord]) -> Dict[str, str]:
         if m.parse_error is not None:
             continue
         try:
-            sources[m.path] = (Path(root) / m.path).read_text(encoding="utf-8")
+            sources[m.path] = (Path(root) / m.path).read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             # BUGFIX: same class of bug as scanner.scan_repo/graph.
             # build_call_edges/risk._loc — only OSError was caught here,
@@ -1015,7 +1015,7 @@ def action_refresh(
             if m.parse_error is not None:
                 continue
             try:
-                sources_for_summary[m.path] = (root / m.path).read_text(encoding="utf-8")
+                sources_for_summary[m.path] = (root / m.path).read_text(encoding="utf-8-sig")
             except (OSError, UnicodeDecodeError):
                 # BUGFIX: this was an unguarded dict-comprehension read —
                 # a file that changed on disk (deleted, permissions,
@@ -1323,7 +1323,7 @@ def action_module(
     if not abs_module.is_file():
         raise CollectCliError(f"--module path does not exist under {root}: {module_path}")
     try:
-        source = abs_module.read_text(encoding="utf-8")
+        source = abs_module.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         # BUGFIX: this used to be a bare `read_text()` call — a permission
         # error or a file that isn't valid UTF-8 raised straight out of

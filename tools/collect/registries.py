@@ -192,7 +192,7 @@ def build_fail_open_registry(
         tree: Optional[ast.Module] = None
         if root is not None and not m.parse_error:
             try:
-                source = (Path(root) / m.path).read_text(encoding="utf-8")
+                source = (Path(root) / m.path).read_text(encoding="utf-8-sig")
                 tree = ast.parse(source, filename=m.path)
                 comments = _line_comments(source)
             except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
@@ -567,7 +567,7 @@ class AlreadySafeIndex:
             if not src_path.is_file():
                 continue
             try:
-                source = src_path.read_text(encoding="utf-8", errors="replace")
+                source = src_path.read_text(encoding="utf-8-sig", errors="replace")
             except OSError:
                 continue
             rng = _method_line_range(source, short, method)

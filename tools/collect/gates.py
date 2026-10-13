@@ -282,7 +282,7 @@ def _repo_defined_names(modules: Iterable[ModuleRecord], root: Path) -> Set[str]
         if m.parse_error:
             continue
         try:
-            source = (Path(root) / m.path).read_text(encoding="utf-8")
+            source = (Path(root) / m.path).read_text(encoding="utf-8-sig")
             tree = ast.parse(source, filename=m.path)
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue

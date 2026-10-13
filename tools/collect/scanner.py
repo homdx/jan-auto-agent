@@ -238,7 +238,9 @@ def scan_repo(
     modules: List[ModuleRecord] = []
     for rel in scannable:
         try:
-            source = (root / rel).read_text(encoding="utf-8")
+            # utf-8-sig: a module saved with a BOM (Notepad, some IDEs) imports fine, and read as utf-8 it was
+            # a parse error here — no symbols, imports or except sites (the other source reads of collect too)
+            source = (root / rel).read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError) as exc:
             # BUGFIX: an unreadable file (permission error, a broken
             # symlink, a file deleted in a race between the walk above and

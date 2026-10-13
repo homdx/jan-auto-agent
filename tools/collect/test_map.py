@@ -167,7 +167,7 @@ def build_test_map(
             continue
         seen.add(real_path)
         try:
-            source = (root / real_path).read_text(encoding="utf-8")
+            source = (root / real_path).read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             # BUGFIX: same class of bug as scanner.scan_repo/graph.
             # build_call_edges/risk._loc/cli._sources_for — only OSError

@@ -137,11 +137,13 @@ def _signature(node: ast.AST) -> str:
 
 def _split_params(rendered: str) -> List[str]:
     """Split an `ast.unparse(arguments)` string on top-level commas — the
-    commas inside a default value (`x=(1, 2)`, `y={'a': 1}`, `z='a, b'`)
-    or an annotation (`Dict[str, int]`) do not separate parameters."""
+    commas inside a default value (`x=(1, 2)`, `y={'a': 1}`, `z='a, b'`),
+    an annotation (`Dict[str, int]`) or a lambda's parameters (`f=lambda x, y:
+    x`) do not separate parameters."""
     parts: List[str] = []
     depth = 0
     quote: Optional[str] = None
+    lambdas: List[int] = []         # the depth of each lambda whose ":" is still ahead
     start = 0
     i = 0
     while i < len(rendered):
@@ -157,7 +159,14 @@ def _split_params(rendered: str) -> List[str]:
             depth += 1
         elif ch in ")]}":
             depth -= 1
-        elif ch == "," and depth == 0:
+        elif ch == "l" and rendered.startswith("lambda", i) and (i == 0 or not (rendered[i - 1].isalnum()
+                or rendered[i - 1] == "_")) and not (rendered[i + 6:i + 7].isalnum() or rendered[i + 6:i + 7] == "_"):
+            lambdas.append(depth)
+            i += 6
+            continue
+        elif ch == ":" and lambdas and lambdas[-1] == depth:
+            lambdas.pop()
+        elif ch == "," and depth == 0 and not lambdas:
             parts.append(rendered[start:i].strip())
             start = i + 1
         i += 1

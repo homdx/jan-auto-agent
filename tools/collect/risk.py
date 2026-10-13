@@ -90,7 +90,7 @@ def _loc(root: Optional[Path], module: ModuleRecord) -> int:
     if root is None or module.parse_error:
         return 0
     try:
-        source = (Path(root) / module.path).read_text(encoding="utf-8")
+        source = (Path(root) / module.path).read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError):
         # BUGFIX: same class of bug as scanner.scan_repo/graph.build_call_edges
         # — a file that isn't valid UTF-8 (e.g. it changed on disk between

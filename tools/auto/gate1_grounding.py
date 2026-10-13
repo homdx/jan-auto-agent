@@ -116,7 +116,7 @@ def target_file_context(
         if not path.is_file():
             continue
         try:
-            source = path.read_text(encoding="utf-8", errors="replace")
+            source = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
         # FIX-2 #13: an extensionless file is not a Python file. The old
@@ -250,7 +250,7 @@ def instruction_file_context(
         if not path.is_file():
             continue
         try:
-            source = path.read_text(encoding="utf-8", errors="replace")
+            source = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
 

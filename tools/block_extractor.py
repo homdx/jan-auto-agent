@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import io
 import keyword
 import re
 from dataclasses import dataclass
@@ -22,7 +23,16 @@ def _normalize_ext(file_ext: str) -> str:
 
 
 def _split_lines_keepends(source: str) -> list[str]:
-    return source.splitlines(keepends=True)
+    # the lines `ast` counts: \n, \r and \r\n only. str.splitlines also cuts at a form feed, \x1c-\x1e,
+    # \x85, U+2028 and U+2029, and a form feed between two functions put every later block one line early
+    # (the signature without its body)
+    return io.StringIO(source, newline="").readlines()
+
+
+def _no_bom(source: str) -> str:
+    """*source* without a leading BOM: a file saved with one imports fine, and its blocks, imports and
+    docstring were not found (the module did not parse, or the first line did not match)."""
+    return source[1:] if isinstance(source, str) and source.startswith("\ufeff") else source
 
 
 def _line_start_index(source: str, char_index: int) -> int:
@@ -230,7 +240,72 @@ def _extract_python_block_fallback(source: str, target_name: str) -> str:
 # Brace-based strategy
 # ----------------------------
 
-def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", close_ch: str = "}") -> int:
+_LANG_OF_EXT = {
+    ".rs": "rust",
+    **{e: "c" for e in (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx")},
+    **{e: "js" for e in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")},
+}
+#: a Rust char literal: `'a'`, `'\n'`, `'\x41'`, `'\u{1F600}'`; any other `'` is a lifetime or a label
+_RUST_CHAR = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]{1,6}\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
+#: words after which a JS `/` starts a regex literal, not a division
+_JS_REGEX_AFTER_WORD = frozenset(("return", "typeof", "case", "do", "else", "in", "of", "new", "delete", "void",
+                                  "throw", "yield", "await", "instanceof"))
+
+
+def _lang_skip(source: str, i: int, lang: str) -> Optional[int]:
+    """Where the code scan goes on when *source[i]* starts something of *lang* the generic scan misreads,
+    else None: a Rust lifetime (`'a`, `'static`) is no string — read as one, a body with `&'static str` ran
+    on to the next apostrophe, a later function's `// don't` — nor is a C preprocessor line (`#error don't
+    compile`), and a JS regex literal (`/}/.test(s)`) holds braces that are no block's."""
+    ch = source[i]
+    if lang == "rust" and ch == "'":
+        m = _RUST_CHAR.match(source, i)
+        return m.end() if m else i + 1
+    if lang == "c" and ch == "#" and not source[_line_start_index(source, i):i].strip():
+        nl = source.find("\n", i)
+        return len(source) if nl < 0 else nl
+    if lang == "js" and ch == "/" and source[i + 1:i + 2] not in ("/", "*") and _js_regex_can_start(source, i):
+        return _js_regex_end(source, i)
+    return None
+
+
+def _js_regex_can_start(source: str, i: int) -> bool:
+    j = i - 1
+    while j >= 0 and source[j] in " \t\r\n":
+        j -= 1
+    if j < 0 or source[j] in "(,=:[!&|?{};+-*%<>~^":
+        return True
+    k = j
+    while k >= 0 and (source[k].isalnum() or source[k] in "_$"):
+        k -= 1
+    return source[k + 1:j + 1] in _JS_REGEX_AFTER_WORD
+
+
+def _js_regex_end(source: str, i: int) -> Optional[int]:
+    """The index past the regex literal that starts at *i* (its flags too), None when the line ends first."""
+    j, klass, n = i + 1, False, len(source)
+    while j < n:
+        ch = source[j]
+        if ch == "\n":
+            return None
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == "[":
+            klass = True
+        elif ch == "]":
+            klass = False
+        elif ch == "/" and not klass:
+            j += 1
+            while j < n and (source[j].isalnum() or source[j] == "_"):
+                j += 1
+            return j
+        j += 1
+    return None
+
+
+def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", close_ch: str = "}",
+                    lang: str = "") -> int:
     """
     Scan from the opening bracket character (open_ch, default "{") and return
     the index just after its matching close_ch (default "}"). Brackets
@@ -282,6 +357,11 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
             continue
 
         # code
+        if lang:
+            skip = _lang_skip(source, i, lang)
+            if skip is not None:
+                i = skip
+                continue
         if ch == "/" and nxt == "/":
             state = "line_comment"
             i += 2
@@ -323,7 +403,7 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
 _DEFINITION_SCAN_BOUND = 400
 
 
-def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool) -> Optional[int]:
+def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool, lang: str = "") -> Optional[int]:
     """
     Starting at `scan_from` (the position right after a regex match for a
     candidate definition signature), determine whether this location is a
@@ -367,7 +447,7 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool)
         # pattern that matches a call-like signature ends in "\("): skip to
         # ITS matching ")" first, so a default value or nested call inside
         # the arg list can't be mistaken for the end of the signature.
-        close_paren = _brace_scan_end(source, i - 1, "(", ")")
+        close_paren = _brace_scan_end(source, i - 1, "(", ")", lang)
         if close_paren >= n:
             return None
         i = close_paren
@@ -407,6 +487,11 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool)
             i += 1
             continue
 
+        if lang:
+            skip = _lang_skip(source, i, lang)
+            if skip is not None:
+                i = skip
+                continue
         if ch == "/" and nxt == "/":
             state = "line_comment"
             i += 2
@@ -440,18 +525,26 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool)
 
 def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     name = re.escape(target_name)
+    # type parameters between the name and its "(": `identity<T>(`, `longest<'a>(`, Go's `Map[T, U any](`.
+    # Without them 25 of 55 common signatures were "not found" (TS/Rust/Go/Java generics, typed arrows,
+    # `char *dupstr`, `Foo::bar`, `unsigned long get`, `function*`, `exports.h = function`, `type X struct`)
+    # and Gate 1 removed real tasks of a non-Python target as hallucinated; a call site still never counts
+    # (`_find_definition_open_brace`), so the patterns can be loose
+    tp = r"(?:\s*<[^(){};]*>|\s*\[[^(){};]*\])?"
+    word = r"[A-Za-z_$][\w$.]*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?(?:\[\s*\])*"
     return [
-        # function foo(...) {
-        re.compile(rf"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+{name}\s*\("),
-        # func foo(...) { / func (r T) foo(...) {
-        re.compile(rf"(?m)^\s*func\s+(?:\([^)]+\)\s*)?{name}\s*\("),
-        # const foo = (...) => { / let foo = async (...) => {
-        re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>"),
+        # function foo(...) {   function* gen() {   function identity<T>(a: T): T {
+        re.compile(rf"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*{name}{tp}\s*\("),
+        # func foo(...) { / func (r T) foo(...) { / func Map[T, U any](...) {
+        re.compile(rf"(?m)^\s*func\s+(?:\([^)]+\)\s*)?{name}{tp}\s*\("),
+        # const foo = (...) => { / let foo = async (...) => { / const f = <T>(x: T): T => {
+        re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*(?::[^=;]+?)?=\s*(?:async\s*)?"
+                   rf"(?:<[^(){{}};]*>\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}]+?)?\s*=>"),
         # class method / constructor / free function-style defs in C-like syntax:
         #   foo(...) {
         #   async foo(...) {
-        #   static foo(...) {
-        re.compile(rf"(?m)^\s*(?:public|private|protected|static|async|final|export|default|\s)*{name}\s*\("),
+        #   static foo(...) {   *gen() {
+        re.compile(rf"(?m)^\s*(?:public|private|protected|static|async|final|export|default|\s)*\*?\s*{name}{tp}\s*\("),
         # C-like method/function WITH a return type (Java/C/C++/Kotlin/etc.):
         #   public String foo(    static int foo(    void foo(    List<X> foo(    int[] foo(
         # Allows optional annotations + modifiers, then a return-type token
@@ -473,17 +566,30 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
         # itself contain another `<...>` pair — e.g.
         # Optional<Map<K, List<V>>>) covers the realistic depth ceiling
         # for a method signature without needing a recursive regex engine.
+        #
+        # A Java method's own type parameters come first (`public <T> T first(`); the return type may be
+        # several words (`unsigned long get(`) or end in a pointer or a reference (`char *dupstr(`); the
+        # name may be qualified (`int Foo::bar(`); Rust's `fn` reads as the "type" before `longest<'a>(`.
         re.compile(
             rf"(?m)^\s*"
             rf"(?:@[\w.]+(?:\([^)]*\))?\s*)*"
             rf"(?:(?:public|private|protected|static|final|abstract|synchronized|"
             rf"native|default|transient|volatile|strictfp|export|async|inline|"
             rf"virtual|const|extern|unsafe|suspend|open|override|fun|fn|pub)\s+)*"
-            rf"[A-Za-z_$][\w$.]*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?(?:\[\s*\])*\s+"
-            rf"{name}\s*\("
+            rf"(?:<[^(){{}};]*>\s+)?"
+            # the words of the type on the line (at most four, apart by blanks: `\s` took a newline too, and
+            # the words ran on through the file, 30 s on a long one), then before the name a newline as well
+            # (GNU style: `static int` on a line of its own, the name at the start of the next)
+            rf"(?:{word}(?:[ \t]*[*&]+[ \t]*|[ \t]+)){{0,3}}{word}(?:\s*[*&]+\s*|\s+)"
+            rf"(?:[\w$]+::)*{name}{tp}\s*\("
         ),
         # class X { foo(...) { ... } }
-        re.compile(rf"(?m)^\s*{name}\s*\("),
+        re.compile(rf"(?m)^\s*{name}{tp}\s*\("),
+        # exports.h = function (...) {   h: function(...) {   Foo.prototype.h = async function* (...) {
+        re.compile(rf"(?m)^\s*(?:(?:module\.)?exports\.|[\w$]+\.prototype\.|this\.)?{name}\s*[:=]\s*"
+                   rf"(?:async\s+)?function\s*\*?\s*[\w$]*\s*\("),
+        # Go: type Server struct {   type Set[T comparable] interface {
+        re.compile(rf"(?m)^\s*type\s+{name}{tp}\s+(?:struct|interface)\b"),
         # type declarations in C-like / JVM / Rust syntax:
         #   public class App {   interface Foo {   struct Bar {   enum E {   record R(   trait T {
         re.compile(
@@ -493,7 +599,7 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     ]
 
 
-def _find_earliest_genuine_definition(source: str, target_name: str) -> Optional[tuple]:
+def _find_earliest_genuine_definition(source: str, target_name: str, lang: str = "") -> Optional[tuple]:
     """
     Search every brace-language candidate pattern for `target_name` and
     return (match_start, open_brace_index, close_brace_end_index) for the
@@ -523,7 +629,7 @@ def _find_earliest_genuine_definition(source: str, target_name: str) -> Optional
     for pat in patterns:
         for match in pat.finditer(source):
             has_arg_list = match.group(0).rstrip().endswith("(")
-            open_idx = _find_definition_open_brace(source, match.end(), has_arg_list)
+            open_idx = _find_definition_open_brace(source, match.end(), has_arg_list, lang)
             if open_idx is None:
                 continue
 
@@ -537,12 +643,12 @@ def _find_earliest_genuine_definition(source: str, target_name: str) -> Optional
     if best_start is None:
         return None
 
-    end = _brace_scan_end(source, best_open_brace)
+    end = _brace_scan_end(source, best_open_brace, lang=lang)
     return (best_match_start, best_open_brace, end)
 
 
-def _extract_brace_block(source: str, target_name: str) -> str:
-    found = _find_earliest_genuine_definition(source, target_name)
+def _extract_brace_block(source: str, target_name: str, lang: str = "") -> str:
+    found = _find_earliest_genuine_definition(source, target_name, lang)
     if found is None:
         return ""
 
@@ -681,13 +787,14 @@ def extract_block(source: str, target_name: str, file_ext: str) -> str:
     Returns:
         The full code block, or "" if the target is not found.
     """
+    source = _no_bom(source)
     ext = _normalize_ext(file_ext)
 
     if ext == ".py":
         return _extract_python_block(source, target_name)
 
     # Default to brace-based strategy for JS/TS/Go/Java/C/C++/Rust/etc.
-    return _extract_brace_block(source, target_name)
+    return _extract_brace_block(source, target_name, _LANG_OF_EXT.get(ext, ""))
 
 
 def extract_module_docstring(source: str, file_ext: str, max_chars: int = 500) -> str:
@@ -714,6 +821,7 @@ def extract_module_docstring(source: str, file_ext: str, max_chars: int = 500) -
     coverage for a failure mode nobody has hit yet isn't worth the parser
     complexity for non-Python languages.
     """
+    source = _no_bom(source)
     ext = _normalize_ext(file_ext)
     if ext != ".py":
         return ""
@@ -737,10 +845,13 @@ def _split_braced_names(inner: str, alias_sep: str) -> list[str]:
 
     *alias_sep* is ``" as "`` for JS/TS ``import``/``require`` aliasing, or
     ``":"`` for destructured-require renaming (``const {a: b} = require(...)``).
+    A TS ``type`` mark (``{ type Props }``) is no part of the name.
     """
     names: list[str] = []
     for part in inner.split(","):
-        part = part.strip()
+        part = " ".join(part.split())
+        if part.startswith("type "):
+            part = part[5:].strip()
         if not part:
             continue
         if alias_sep in part:
@@ -766,6 +877,7 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
     Java/Rust/C-like:
         best-effort import/use extraction
     """
+    source = _no_bom(source)
     ext = _normalize_ext(file_ext)
 
     if ext == ".py":
@@ -789,8 +901,12 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
     if ext in {".js", ".jsx", ".ts", ".tsx"}:
         items: list[str] = []
 
-        # import defaultName, { a as b, c } from 'x'
-        for m in re.finditer(r"(?m)^\s*import\s+([^;]+?)\s+from\s+['\"`][^'\"`]+['\"`]", source):
+        # import defaultName, { a as b, c } from 'x'   import type { Props } from './p'
+        # One statement a match: the clause runs on past a newline only inside its braces. `[^;]+?` ran
+        # across lines, so a side-effect `import './polyfills'` with no semicolon swallowed the next import
+        # ("'./polyfills'\nimport React" for a name, React lost)
+        for m in re.finditer(r"(?m)^[ \t]*import\s+(?:type\s+)?((?:\{[^}]*\}|[^;'\"`{}\n])+?)\s+from\s+['\"`]"
+                             r"[^'\"`\n]+['\"`]", source):
             clause = m.group(1).strip()
             if clause.startswith("* as "):
                 items.append(clause[5:].strip())
@@ -827,15 +943,19 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
             else:
                 items.append(path.rstrip("/").split("/")[-1])
 
-        for block in re.finditer(r"(?ms)^\s*import\s*\((.*?)\)", source):
+        # a group ends at a ")" that starts its line: the first ")" anywhere (one in a comment) cut it there,
+        # and the imports after it were lost
+        for block in re.finditer(r"(?ms)^\s*import\s*\((.*?)^[ \t]*\)", source):
             inner = block.group(1)
             for line in inner.splitlines():
                 line = line.strip()
                 if not line or line.startswith("//"):
                     continue
-                m = re.match(r'(?:(?:([A-Za-z_][\w]*)|\.|_)\s+)?["`]([^"`]+)["`]', line)
+                m = re.match(r'(?:([A-Za-z_][\w]*|\.)\s+)?["`]([^"`]+)["`]', line)
                 if m:
                     alias, path = m.group(1), m.group(2)
+                    if alias in ("_", "."):
+                        continue         # a blank or a dot import binds no name of its own
                     if alias:
                         items.append(alias)
                     else:
@@ -850,12 +970,12 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
             path = m.group(1)
             items.append(path.split(".")[-1])
 
-        # Rust use statements.
-        for m in re.finditer(r"(?m)^\s*use\s+([^;]+);", source):
-            inner = m.group(1).strip()
-            # Very best-effort: pull identifiers after :: or inside braces.
+        # Rust use statements: the path's identifiers, and for `x as y` the name it binds (`as` was listed
+        # as an import, and so was the name it renames)
+        for m in re.finditer(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);", source):
+            inner = re.sub(r"\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)", r"\2", m.group(1).strip())
             parts = re.findall(r"[A-Za-z_][\w]*", inner)
-            items.extend(parts)
+            items.extend(p for p in parts if p != "_")
 
         return _unique_preserve_order(items)
 
@@ -957,6 +1077,7 @@ def get_context_lines(source: str, target_name: str, before: int = 10, file_ext:
 
     If the target is not found, returns "".
     """
+    source = _no_bom(source)
     ext = _normalize_ext(file_ext)
     if ext == ".py":
         try:
@@ -1016,7 +1137,7 @@ def _find_block_start_line_fallback(source: str, target_name: str, file_ext: str
     # definition), silently feeding an LLM misleading "what comes before
     # this function" context. Reuse the same verified search
     # _extract_brace_block uses so both agree on where the definition is.
-    found = _find_earliest_genuine_definition(source, target_name)
+    found = _find_earliest_genuine_definition(source, target_name, _LANG_OF_EXT.get(ext, ""))
     if found is None:
         return None
     match_start, _open_idx, _end = found
