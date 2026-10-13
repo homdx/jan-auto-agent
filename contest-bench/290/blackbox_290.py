@@ -107,7 +107,14 @@ def main() -> int:
         try:
             import harvest_report
             truth = harvest_report.load_truth(str(out))
-            check(len(truth) == len({r["finding"] for r in rows}), f"harvest_report.load_truth reads {len(truth)} findings")
+            # a finding with one truth is read; one that two claims about one place settled REAL and FALSE is
+            # left unscored (review batch m: the last row was its truth, the order of the rows decided)
+            said = {}
+            for r in rows:
+                said.setdefault(r["finding"], set()).add(r["truth"])
+            one = {f for f, ts in said.items() if len(ts) == 1}
+            check(set(truth) == one, f"harvest_report.load_truth reads {len(truth)} findings "
+                                     f"({len(said) - len(one)} with two truths unscored)")
         except Exception as exc:  # noqa: BLE001
             check(False, f"harvest_report.load_truth raised {exc!r}")
         # --append: idempotent, conflict

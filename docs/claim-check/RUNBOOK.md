@@ -211,8 +211,9 @@ target that cannot be opened is a warning, not a stop.
 present with another `truth` is printed as `CONFLICT` and kept as it was, with exit 3.
 
 **Two claims about one place.** Two statements about one function can settle `REAL` and `FALSE`
-in one run. Both rows are written, and the script prints a note. `harvest_report.load_truth`,
-however, keeps only the last row of a `finding`: settle such a finding by hand before scoring.
+in one run. Both rows are written, and the script prints a note. `harvest_report.load_truth`
+leaves such a finding unscored and names it on stderr, and `truth_consensus.py` counts this file as
+UNDECIDED on it (its report lists it under "Contradicting themselves"): settle it by hand.
 
 Where the two files go:
 

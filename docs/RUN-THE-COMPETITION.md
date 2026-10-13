@@ -196,7 +196,10 @@ python3 scripts/truth_consensus.py 'validate1/truth-*.csv' \
 ```
 
 Glob `truth-*.csv`, never `truth*.csv` — the latter re-ingests the output as an
-adjudicator named `truth`. Exit code 4 means something is still split.
+adjudicator named `truth`. Exit code 4 means something is still split. Exit code 2: a row's
+truth is no verdict (the file and line are named), or `truth.csv` has rows no adjudicator
+settles this time (a machine row of `claimcheck_truth.py --append`, a finding now disputed) —
+put them in an adjudicator's file, or pass `--replace` to drop them.
 
 **Take away:** `validate<N>/truth.csv` — `finding,truth,checked_by,duplicate_of,how`.
 This is the only artefact of the whole round that is worth keeping long term.

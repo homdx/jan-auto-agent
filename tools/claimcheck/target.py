@@ -393,6 +393,10 @@ class Target:
             users.mkdir(exist_ok=True)
             token = users / f"{os.getpid()}-{uuid.uuid4().hex}"
             token.touch()
+            if created:
+                # who made it: a maker killed before its close (kill -9, the OOM killer) left the tree
+                # for good — every later open reused it and, not its maker, left it there
+                (tree.parent / "creator").write_text(token.name, encoding="utf-8")
         # a local path is recorded absolute: votes.json keeps it, and claimcheck_truth.py run from
         # another directory read `--target .` as its own cwd ("no such directory", no rebuild)
         target = cls(repo=repo_s if _is_url(repo_s) else os.path.abspath(repo_s), ref=ref, sha=sha, tree=tree, scratch=scratch,
@@ -496,9 +500,12 @@ class Target:
 
         A failure of collect (not a Python repository, a parse error, 300 s) does not fail
         the target: the result is the loader's absent model and `warnings` says why."""
+        # by the config object itself: an id() alone outlives its object, and a new config made where a
+        # collected one was (the same id) got the other's model. The config is held, so its id is not reused
         key = id(config)
-        if key in self._models:
-            return self._models[key]
+        hit = self._models.get(key)
+        if hit is not None and hit[0] is config:
+            return hit[1]
         model = None
         try:
             model = collect_loader.load(self.tree, config=config)
@@ -506,7 +513,7 @@ class Target:
             model = None
         if model is None or model.status != collect_loader.STATUS_FRESH:
             model = self._build_collect(config)
-        self._models[key] = model
+        self._models[key] = (config, model)
         return model
 
     def _build_collect(self, config):
@@ -535,8 +542,9 @@ class Target:
     # close -----------------------------------------------------------------
 
     def close(self, remove: bool = False) -> None:
-        """Remove the worktree this target made (a reused one only with `remove=True`), once no
-        other open of it is still in use: then the last one to close removes it."""
+        """Remove the worktree this target made (a reused one only with `remove=True`, or when the
+        process that made it is gone without removing it), once no other open of it is still in use:
+        then the last one to close removes it."""
         if self._closed and not remove:
             return
         self._closed = True
@@ -550,7 +558,13 @@ class Target:
             # was a ValueError that left the worktree behind
             others = [u for u in users.glob("*") if (pid := _token_pid(u.name)) is not None and _pid_alive(pid)] \
                 if users.is_dir() else []
-            wanted = self._created or remove or marker.exists()
+            creator = self.tree.parent / "creator"
+            try:
+                maker = _token_pid(creator.read_text(encoding="utf-8").strip())
+            except OSError:
+                maker = None              # no record (a tree of an older run): left alone, as before
+            orphan = maker is not None and maker != os.getpid() and not _pid_alive(maker)
+            wanted = self._created or remove or marker.exists() or orphan
             if not wanted:
                 return
             if others:
@@ -559,6 +573,7 @@ class Target:
             self._remove_tree(self._git_dir, self.tree)
             shutil.rmtree(users, ignore_errors=True)
             marker.unlink(missing_ok=True)
+            creator.unlink(missing_ok=True)
             try:
                 self.tree.parent.rmdir()   # the <sha> folder, when nothing else is in it
             except OSError:

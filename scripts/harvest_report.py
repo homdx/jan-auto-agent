@@ -63,17 +63,39 @@ def load(paths):
     return rows
 
 
+class _Truth(dict):
+    """{finding: truth}; ``get`` of ``tools/x.py::`` (the key `group` gives a finding with no symbol) also
+    finds ``tools/x.py`` (claimcheck_truth's key for a claim about a file): such a finding was never scored."""
+
+    def get(self, key, default=None):
+        got = dict.get(self, key)
+        if got is None and isinstance(key, str) and key.endswith("::"):
+            got = dict.get(self, key[:-2])
+        return default if got is None else got
+
+
 def load_truth(path):
+    """{finding: truth} of *path* (`_Truth`: a file-only key is found for a finding with no symbol). A finding with two truths (REAL and FALSE, claimcheck_truth's two claims about one
+    place) is left unscored, and said on stderr: the last row was the truth, and the order decided."""
     if not path:
         return {}
-    out = {}
+    said = defaultdict(set)
     # utf-8-sig: a truth.csv saved by a spreadsheet starts with a BOM; read as utf-8 every row
     # was keyed '' and all but the last were lost without a word
     with open(path, newline="", encoding="utf-8-sig") as fh:
         for r in csv.DictReader(fh):
             t = (r.get("truth") or "").strip().upper()
             if t in TRUTH_VALUES:
-                out[(r.get("finding") or "").strip()] = t
+                said[(r.get("finding") or "").strip()].add(t)
+    out = _Truth()
+    torn = sorted(k for k, ts in said.items() if len(ts) > 1)
+    for k, ts in said.items():
+        if len(ts) == 1:
+            out[k] = next(iter(ts))
+    if torn:
+        print(f"{path}: {len(torn)} finding(s) with more than one truth, not scored — settle them by hand: "
+              + ", ".join(f"{k} ({'/'.join(sorted(said[k]))})" for k in torn[:5]) + (" …" if len(torn) > 5 else ""),
+              file=sys.stderr)
     return out
 
 

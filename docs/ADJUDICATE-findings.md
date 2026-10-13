@@ -96,7 +96,8 @@ time, exactly like stage 2.
 ## After the adjudicators finish
 
 ```bash
-# merge into one ground truth; exit 4 if anything is still disputed
+# merge into one ground truth; exit 4 if anything is still disputed, 2 if a truth is no verdict
+# or truth.csv holds rows no adjudicator settles now (--replace drops them)
 python3 scripts/truth_consensus.py validate<N>/truth-*.csv \
     --truth validate<N>/truth.csv --report validate<N>/adjudication.md
 

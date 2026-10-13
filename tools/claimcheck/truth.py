@@ -22,6 +22,7 @@ Without a target (a run without ``--target``, or a target that cannot be opened)
 from __future__ import annotations
 
 import builtins
+import contextlib
 import csv
 import hashlib
 import io
@@ -446,13 +447,60 @@ def atomic_write(path: Path, text: str) -> None:
         raise
 
 
+@contextlib.contextmanager
+def locked(path: Path):
+    """An exclusive lock for a read-merge-write of *path*. Two claim checks that appended at about the same
+    time each read the file, merged and renamed: the later rename dropped the other's rows (4 processes of
+    40 rows each left 44 of 160). The lock is on *path*'s directory (POSIX ``flock``; the file itself is
+    replaced by each write, so a lock on it would be on the old file, and a lock file beside it would be
+    left in the operator's directory); on Windows on a sidecar ``.<name>.lock``. A symlink is followed."""
+    path = Path(path)
+    real = Path(os.path.realpath(path)) if path.is_symlink() else path
+    real.parent.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        import msvcrt
+        with open(real.parent / f".{real.name}.lock", "a+b") as fh:
+            while True:
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)    # tries for 10 s, then raises
+                    break
+                except OSError:
+                    continue
+            try:
+                yield
+            finally:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+    try:
+        fd = os.open(real.parent, os.O_RDONLY)
+    except OSError:
+        fd = None
+    try:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:
+                pass    # a filesystem with no lock on a directory (some network, WSL mounts): unlocked, as before
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)                # closing it lets the lock go
+
+
 def write_truth(path: Path, rows: list, *, append: bool = False) -> tuple:
     """Write *rows* to the truth CSV at *path*; (rows written, conflicts). Without *append* the
     file is replaced by `TRUTH_HEADER` and *rows*. With it the existing rows stay (their own
     columns kept, a missing one of ours added empty) and only `merge_rows`'s additions follow;
     an existing file is not touched when there is nothing to add, a missing one is created with
-    the header (the operator then finds the file the run names, empty, not a missing path)."""
-    path = Path(path)
+    the header (the operator then finds the file the run names, empty, not a missing path).
+    The read, the merge and the write are one step under `locked`."""
+    with locked(path):
+        return _write_truth(Path(path), rows, append)
+
+
+def _write_truth(path: Path, rows: list, append: bool) -> tuple:
     if not append:
         atomic_write(path, _csv_text(TRUTH_HEADER, rows))
         return rows, []

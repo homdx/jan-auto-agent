@@ -14,6 +14,7 @@ the bar is higher: an opinion is not admissible, only something you can point at
         --severity LOW --fix "bind list(_DEFAULT_SKIP_DIRS)"
 """
 import argparse
+import contextlib
 import csv
 import os
 import sys
@@ -22,6 +23,45 @@ COLUMNS = ["finding", "truth", "checked_by", "confidence", "how", "evidence",
            "consequence", "severity", "fix", "notes"]
 TRUTH = {"REAL", "FALSE", "FIXED", "UNDECIDED"}
 SEV = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE", ""}
+
+
+@contextlib.contextmanager
+def _locked(path):
+    """An exclusive lock on *path*'s directory (POSIX ``flock``; on Windows a sidecar ``.<name>.lock``): the
+    "is the file there" check, the "already decided" check and the append are one step. Eight first writers
+    at once wrote the header twice (the second header then read as a verdict "TRUTH" and settled), and two
+    writers of one finding both passed."""
+    d, name = os.path.split(os.path.abspath(path))
+    if os.name == "nt":
+        import msvcrt
+        with open(os.path.join(d, f".{name}.lock"), "a+b") as fh:
+            while True:
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    continue
+            try:
+                yield
+            finally:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        fd = None
+    try:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError:
+                pass    # a filesystem with no lock on a directory (some network, WSL mounts): unlocked, as before
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)                # closing it lets the lock go
 
 
 def main():
@@ -85,25 +125,26 @@ def main():
                   file=sys.stderr)
             return 1
 
-    existed = os.path.exists(out) and os.path.getsize(out) > 0
-    if existed:
-        with open(out, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
-            for prev in csv.DictReader(fh):
-                if (prev.get("finding") or "").strip() == row["finding"]:
-                    print(f"skipped: {row['finding']} is already decided as "
-                          f"{prev.get('truth')} — move on.", file=sys.stderr)
-                    return 2
+    with _locked(out):
+        existed = os.path.exists(out) and os.path.getsize(out) > 0
+        if existed:
+            with open(out, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
+                for prev in csv.DictReader(fh):
+                    if (prev.get("finding") or "").strip() == row["finding"]:
+                        print(f"skipped: {row['finding']} is already decided as "
+                              f"{prev.get('truth')} — move on.", file=sys.stderr)
+                        return 2
 
-    with open(out, "a", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=COLUMNS)
-        if not existed:
-            w.writeheader()
-        w.writerow(row)
-        fh.flush()
-        os.fsync(fh.fileno())
-    # closed at once, and counted in CSV rows: a quoted cell over two lines is one verdict
-    with open(out, newline="", encoding="utf-8-sig") as fh:
-        n = sum(1 for _ in csv.reader(fh)) - 1
+        with open(out, "a", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=COLUMNS)
+            if not existed:
+                w.writeheader()
+            w.writerow(row)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # closed at once, and counted in CSV rows: a quoted cell over two lines is one verdict
+        with open(out, newline="", encoding="utf-8-sig") as fh:
+            n = sum(1 for _ in csv.reader(fh)) - 1
     print(f"decided #{n}: {row['truth']} {row['finding']} -> {out}")
     return 0
 
