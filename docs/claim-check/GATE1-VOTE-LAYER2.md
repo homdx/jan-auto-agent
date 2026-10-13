@@ -83,9 +83,9 @@ variants and the baselines alike:
 📦 collect: fresh — reader: used, vote pack: used
 ```
 
-`fresh | stale (N modules changed) | absent` is the artifact's own state for the clone (the layer-2 clones are all at
+`fresh | stale (N modules changed) | stale | present | absent` is the artifact's own state for the clone (the layer-2 clones are all at
 one sha, so a checked-in artifact is `fresh` for all of them), and the two halves say whether the reader and the vote
-pack actually used it. The run's counters carry it on too: `collect_state` (`off` | `absent` | `stale` | `fresh`) and
+pack actually used it (`present` = an artifact is on disk but neither judge was asked to read it, so the line does not scan the tree to say more; `stale` with no count = the reader's bridge said stale and nobody counted). A `+collect` variant whose run does not report `fresh` or `stale` and `vote pack: used` is not the measurement its name says: `SUMMARY.md` calls it `NO COLLECT` (exit code 3), not PASS or FAIL. The run's counters carry it on too: `collect_state` (`off` | `absent` | `stale` | `fresh`) and
 `collect_chunks` (chunks of kind `collect` across the run's packs), next to the vote's own `votes_*`.
 
 Staleness is honoured read-only: `[collect] staleness = ignore` gives no model, `warn` (default) gives a stale one and

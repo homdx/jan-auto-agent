@@ -4,6 +4,7 @@ from __future__ import annotations
 import configparser
 import hashlib
 import logging
+import errno
 import os
 import re
 import shlex
@@ -202,7 +203,7 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
     hard-linked into place (``os.link`` fails if *path* exists), so of two
     racing writers exactly one wins and the other gets ``FileExistsError``
     instead of silently replacing the winner's file. A filesystem without
-    hard links falls back to the plain replace.
+    hard links falls back to the plain replace, after a plain check that *path* does not exist.
 
     The file keeps the mode it had, and a new one gets what ``open()`` would
     give it (0666 less the umask): mkstemp's temporary file is 0600, and the
@@ -229,6 +230,10 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
             except FileExistsError:
                 raise
             except OSError:
+                # no hard links on this filesystem: create-only is best effort here (a plain replace has no
+                # atomic "fail if it exists"), but an existing file is still refused, not silently replaced
+                if path.exists():
+                    raise FileExistsError(errno.EEXIST, "exists (hard links unavailable here)", str(path))
                 os.replace(tmp_name, path)
             else:
                 os.unlink(tmp_name)

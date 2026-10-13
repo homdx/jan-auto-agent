@@ -79,7 +79,7 @@ INI_SECTION = "gate1_layer2"
 DEFAULT_OFF_RUNS = 2
 #: CC-13: the line Gate 1 prints at the start of a run — whether the collect model was there and
 #: whether the reader and the vote pack used it, so a variant says what its judges had
-COLLECT_LINE = re.compile(r"collect: (fresh|stale \(\d+ modules? changed\)|absent)"
+COLLECT_LINE = re.compile(r"collect: (fresh|stale(?: \(\d+ modules? changed\))?|present|absent)"
                           r" — reader: (used|not used), vote pack: (used|not used)")
 
 
@@ -246,16 +246,26 @@ def check_collect(artifact_dir: Path, work: Path) -> str:
     return f"{first} ({why}; {len(changed)} file(s) differ in all)"
 
 
-def install_collect(artifact_dir: Path, work: Path) -> None:
-    """Copy the artifact into the clone's own ``[collect] dir``. Read-only data, copied not
-    linked: the clones are separate trees so that ``--validate-plan`` cannot touch anything
-    shared, and the artifact goes with them."""
+def install_collect(artifact_dir: Path, work: Path, config_path: "Path | None" = None) -> Path:
+    """Copy the artifact into the clone's own ``[collect] dir`` and return that directory. Read-only
+    data, copied not linked: the clones are separate trees so that ``--validate-plan`` cannot touch
+    anything shared, and the artifact goes with them.
+
+    The directory is resolved with the variant's own ini (*config_path*), the very call the vote makes
+    when it reads: with a custom ``[collect] dir`` the default ``.collect`` would be written where
+    nobody reads and the ``+collect`` variant would run without the model."""
+    import configparser
     from tools.collect import cli as cli_mod
 
-    collect_dir = cli_mod.resolve_collect_dir(work, None)
+    cfg = None
+    if config_path is not None:
+        cfg = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+        cfg.read(config_path, encoding="utf-8-sig")
+    collect_dir = cli_mod.resolve_collect_dir(work, cfg)
     collect_dir.mkdir(parents=True, exist_ok=True)
     for name in ("artifact.json", "collect_manifest.json"):
         shutil.copy(artifact_dir / name, collect_dir / name)
+    return collect_dir
 
 
 def check_and_install(artifact_dir: Path, repo: Path, sha: str, scratch: Path) -> str:
@@ -331,7 +341,7 @@ def run_variant(out: Path, name: str, known: Path, repo: Path, sha: str, base_in
     if collect_from is not None and "collect" in opts:
         # CC-13: the artifact was checked against this sha before any variant ran (--collect-from),
         # and the clone is the same tree, so the copy is what the judges read.
-        install_collect(collect_from, vdir / "target")
+        install_collect(collect_from, vdir / "target", ini)
     started = time.time()
     timed_out = False
     with open(vdir / "run.log", "w", encoding="utf-8") as fh:
@@ -372,13 +382,13 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
              f"{len(ids)} candidates, {labelled} with a recorded answer "
              f"({sum(v == 'REAL' for v in truth.values())} real, {sum(v == 'FALSE' for v in truth.values())} false positives). "
              f"Run {out.name}.\n",
-             "| variant | voters | accept | ok | removed | unresolved | false positives through | true bugs rejected | asked | decided | overridden | requests | skipped | seconds | verdict |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| variant | voters | accept | ok | removed | unresolved | false positives through | true bugs rejected | asked | decided | overridden | requests | skipped | seconds | collect (reader / vote pack) | verdict |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     verdicts = {}
     for r in results:
         if not r["ok"]:
             why = r.get("error") or f"rc={r['rc']}"
-            lines.append(f"| {r['variant']} | {len(r['voters'])} | {r['accept']} | **FAILED {why}** | | | | | | | | | | {r['seconds']} | cannot run |")
+            lines.append(f"| {r['variant']} | {len(r['voters'])} | {r['accept']} | **FAILED {why}** | | | | | | | | | | {r['seconds']} | | cannot run |")
             verdicts[r["variant"]] = "ERROR"
             continue
         # both sides on the same candidates: what either could not judge is out of both counts
@@ -412,12 +422,21 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
                     "FAIL (needs fp<=%s, true rejected<=%s, decided>=%d)" % (n_off, n_off, 1 if veto else third)
                 if unresolved:
                     verdict += f" — on {len(ids) - len(unresolved)} of {len(ids)} candidates, {len(unresolved)} unresolved"
+        # CC-13: a `+collect` variant is a measurement of the judges WITH the collect model; one whose run did not
+        # have it (the line says absent, or the vote pack did not use it) is a different measurement and must
+        # not be credited with a PASS or blamed with a FAIL
+        has_collect = "collect" in r.get("opts", [])
+        col = f"{r.get('collect', 'no line')} ({r.get('collect_reader', '?')} / {r.get('collect_pack', '?')})" if "collect" in r else \
+            ("no line" if has_collect else "-")
+        if has_collect and not (r.get("collect") in ("fresh", "stale") and r.get("collect_pack") == "used"):
+            verdict = (f"NO COLLECT (the run says collect: {r.get('collect') or 'no line'}, vote pack: "
+                       f"{r.get('collect_pack') or '?'} — not the measurement the name says)")
         verdicts[r["variant"]] = verdict
         lines.append(f"| {r['variant']} | {len(r['voters'])} | {r['accept']} | yes | {r.get('removed_n', len(r['removed']))} | "
                      f"{len(r.get('inconclusive') or ())} | "
                      f"{len(sc['false_positives_through'])} | {len(sc['true_bugs_rejected'])} | {r.get('votes_asked', '-')} | "
                      f"{r.get('votes_decided', '-')} | {r.get('votes_overridden', '-')} | {r.get('votes_requests', '-')} | "
-                     f"{r.get('votes_skipped', '-')} | {r['seconds']} | {verdict} |")
+                     f"{r.get('votes_skipped', '-')} | {r['seconds']} | {col} | {verdict} |")
     offs = [r for r in results if r["variant"].startswith("off") and r["ok"]]
     if len(offs) >= 2:
         a, b = offs[0], offs[1]

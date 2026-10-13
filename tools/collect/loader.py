@@ -527,6 +527,18 @@ class CollectRead:
         return self.model is not None and self.model.available
 
 
+def artifact_present(root: Path, *, config: Optional[configparser.ConfigParser] = None) -> bool:
+    """True when `root` has a collect manifest and artifact on disk. CC-13: a label for the
+    one line Gate 1 prints when neither judge uses the model — two `is_file` calls, no
+    scan and no hashing (`load_readonly` costs a full `scan_repo`, 14 s on this tree)."""
+    try:
+        collect_dir = cli_mod.resolve_collect_dir(Path(root), config)
+        return (collect_dir / cli_mod.MANIFEST_FILENAME).is_file() and \
+            (collect_dir / cli_mod.ARTIFACT_FILENAME).is_file()
+    except Exception:   # noqa: BLE001 — a label never stops a run
+        return False
+
+
 def load_readonly(
     root: Path,
     *,

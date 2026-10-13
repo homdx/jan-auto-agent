@@ -841,6 +841,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # CC-13: one line per run, every variant (the vote off included), that says whether the
         # collect model was there and who got it — the judges are the single reader and the CC-10
         # voters, and without it a run's log cannot say what either had.
+        # one read of the artifact per Gate 1 run, not per process: the auto loop refreshes the artifact
+        # between tasks, and a read cached from an earlier run said `absent` for a tree that had one since
+        _gate1_vote.clear_collect_reads()
         print(self._collect_line(base_dir), flush=True)
         all_results: list[FilterResult] = []
 
@@ -1190,7 +1193,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
     def _collect_line(self, base_dir: Path) -> str:
         """CC-13: the one line at the start of Gate 1 that says what the judges had.
 
-        ``collect: fresh | stale (N modules changed) | absent — reader: used/not used,
+        ``collect: fresh | stale (N modules changed) | stale | present | absent — reader: used/not used,
         vote pack: used/not used``. The reader's side is its collect bridge (GATE1-CTX-1/-2,
         Stage A0) and the vote's side is the CC-10 vote's own read of the same artifact
         (`[gate1] vote_collect`), so one line settles "did the judges pull from collect"
@@ -1200,7 +1203,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         line, never a run that stops.
         """
         state = ""
-        changed = 0
+        changed: "int | None" = None      # unknown until a read says how many files moved
         reader_used = False
         try:
             bridge = getattr(self, "_collect_bridge", None)
@@ -1220,18 +1223,16 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except Exception:   # noqa: BLE001 — a read that fails is "not used"
             vote_used = False
         if not state:
-            # neither judge asked for the model: say whether there was one at all, so an artifact
-            # that exists and is simply unused is not reported as absent (the read is cached, so the
-            # vote's later read of the same tree is free)
+            # neither judge asked for the model: say whether an artifact is on disk, without reading
+            # it (a read is a full scan and hash of the tree, ~14 s here, for a label nobody uses):
+            # `present` = there, not checked; `absent` = never built
             try:
-                probe = _gate1_vote.read_collect_model(base_dir, config=self._config)
-                if probe is not None:
-                    state = str(getattr(probe, "status", "") or "absent")
-                    changed = int(getattr(probe, "changed", 0) or 0)
+                cl = _gate1_vote._collect_loader()
+                state = "present" if cl is not None and cl.artifact_present(base_dir, config=self._config) else "absent"
             except Exception:   # noqa: BLE001
-                pass
+                state = "absent"
         state = state or "absent"
-        if state == "stale":
+        if state == "stale" and changed is not None:
             head = f"stale ({changed} module{'s' if changed != 1 else ''} changed)"
         else:
             head = state

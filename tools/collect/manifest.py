@@ -28,6 +28,7 @@ tree — even rebuilt at a different timestamp — compares equal.
 
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 import logging
@@ -68,8 +69,10 @@ def skip_dirs_from_config(
     if config is None:
         return frozenset(out)
     try:
-        raw = config.get("collect", "skip_dirs", fallback="")
-    except (AttributeError, TypeError, ValueError):
+        # raw: a directory name may hold a `%`, which interpolation would refuse
+        # (`InterpolationSyntaxError` is a configparser.Error, not a ValueError)
+        raw = config.get("collect", "skip_dirs", raw=True, fallback="")
+    except (AttributeError, TypeError, ValueError, configparser.Error):
         return frozenset(out)
     if not isinstance(raw, str):
         return frozenset(out)

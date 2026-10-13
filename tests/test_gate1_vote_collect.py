@@ -343,7 +343,8 @@ def test_vote_collect_off_reads_the_artifact_neither_the_reader_nor_the_voters(t
     assert counters[gv.COUNTER_COLLECT_CHUNKS] == 0
     assert counters[gv.COUNTER_COLLECT_STATE] == "off" == counters["collect_state"]
     assert not [c for c in packs[0].chunks if c.kind == "collect"]
-    assert _collect_line(out) == "📦 collect: fresh — reader: not used, vote pack: not used"
+    # neither judge reads the model, so the line does not read it either (no scan): on disk, not checked
+    assert _collect_line(out) == "📦 collect: present — reader: not used, vote pack: not used"
 
 
 def test_vote_collect_auto_puts_the_collect_facts_in_the_voters_packs(tmp_path, capsys):
@@ -430,7 +431,8 @@ def test_the_run_prints_one_line_that_says_what_the_judges_had(tmp_path, capsys,
     if artifact:
         _artifact(tree, cfg)
     counters, out = _run(tree, _filter(cfg, _voters([], [])), capsys)
-    state = "fresh" if artifact else "absent"
+    # vote off + an artifact: neither judge reads it, so the line says it is there ("present"), not that it is fresh
+    state = ("present" if vote == "off" else "fresh") if artifact else "absent"
 
     line = _collect_line(out)
     assert line == f"📦 collect: {state} — reader: not used, vote pack: {pack}"
@@ -464,7 +466,7 @@ def test_the_line_does_not_need_a_vote(tmp_path, capsys):
     filt._check_presence = fake_reader
     filt.filter([_cand()], tree)
     assert _collect_line(capsys.readouterr().out) == \
-        "📦 collect: fresh — reader: not used, vote pack: not used"
+        "📦 collect: present — reader: not used, vote pack: not used"
 
 
 def test_the_line_says_absent_when_the_artifact_is_broken(tmp_path, capsys):
@@ -568,3 +570,130 @@ def test_check_collect_refuses_without_raising(tmp_path, what, in_dir):
     else:
         (artifact / cli_mod.MANIFEST_FILENAME).unlink()
     assert "has no" in l2.check_collect(artifact, tree)
+
+
+# ── review findings on CC-13: %, a stale count that was never counted, a scan for a label ────────
+
+def test_a_percent_in_skip_dirs_is_a_directory_name_not_a_crash():
+    from tools.collect import manifest as manifest_mod
+    for raw, extra in (("x%y", {"x%y"}), ("100%", {"100%"}), ("a, b", {"a", "b"})):
+        cfg = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+        cfg.read_string("[collect]\nskip_dirs = %s\n" % raw)
+        assert manifest_mod.skip_dirs_from_config(cfg) == manifest_mod.DEFAULT_SKIP_DIRS | extra
+
+
+def test_a_stale_reader_with_no_count_says_stale_and_no_count(tmp_path, capsys):
+    tree = _tree(tmp_path)
+    cfg = _cfg()
+    filt = Gate1Filter(config=cfg, base_url="http://localhost:1337/v1", api_key="test",
+                       model="test-model", api_format="openai", verify_ssl=False)
+
+    class Bridge:                       # what the real bridge reports for a stale artifact
+        usable = False
+        status = "stale"
+
+    filt._collect_bridge = Bridge()
+    filt._check_presence = lambda candidate, block, **kw: (True, "the reader says so", "confirmed")
+    filt.filter([_cand()], tree)
+    line = _collect_line(capsys.readouterr().out)
+    assert line == "📦 collect: stale — reader: not used, vote pack: not used"
+    assert "modules changed" not in line
+
+
+def test_the_line_does_not_scan_the_tree_for_a_label(tmp_path, capsys, monkeypatch):
+    tree = _tree(tmp_path)
+    cfg = _cfg()
+    _artifact(tree, cfg)
+
+    def boom(*a, **k):
+        raise AssertionError("a full scan for a label nobody uses")
+
+    monkeypatch.setattr(cl, "load_readonly", boom)
+    monkeypatch.setattr(gv, "read_collect_model", boom)
+    filt = Gate1Filter(config=cfg, base_url="http://localhost:1337/v1", api_key="test",
+                       model="test-model", api_format="openai", verify_ssl=False)
+    filt._check_presence = lambda candidate, block, **kw: (True, "the reader says so", "confirmed")
+    filt.filter([_cand()], tree)
+    assert _collect_line(capsys.readouterr().out) == "📦 collect: present — reader: not used, vote pack: not used"
+
+
+def test_artifact_present_is_two_file_checks(tmp_path):
+    tree = _tree(tmp_path)
+    cfg = _cfg()
+    assert cl.artifact_present(tree, config=cfg) is False
+    collect_dir = _artifact(tree, cfg)
+    assert cl.artifact_present(tree, config=cfg) is True
+    (collect_dir / cli_mod.MANIFEST_FILENAME).unlink()
+    assert cl.artifact_present(tree, config=cfg) is False
+
+
+def test_the_layer_2_script_reads_the_bare_stale_and_the_present_line():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gate1_vote_layer2_cc13", PROJECT_ROOT / "scripts" / "gate1_vote_layer2.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    for head in ("fresh", "stale", "stale (3 modules changed)", "present", "absent"):
+        m = mod.COLLECT_LINE.search(f"📦 collect: {head} — reader: used, vote pack: not used")
+        assert m and m.group(1) == head and m.group(2) == "used" and m.group(3) == "not used"
+
+
+# ── review findings v3: a +collect variant without the model, the install directory, the read cache ──
+
+def _l2_results(collect_line):
+    ids = ["AUTO-T1", "AUTO-T2", "AUTO-T3", "AUTO-T4"]
+    truth = {"AUTO-T1": "REAL", "AUTO-T2": "FALSE", "AUTO-T3": "FALSE", "AUTO-T4": "FALSE"}
+    base = {"rc": 0, "ok": True, "seconds": 1, "checked": 4, "voters": [], "accept": "all", "opts": [], "removed": {}}
+    off = dict(base, variant="off", removed={"AUTO-T2": "x", "AUTO-T3": "x"})
+    off2 = dict(base, variant="off-2", removed={"AUTO-T2": "x", "AUTO-T3": "x"})
+    on = dict(base, variant="on-3+collect", voters=list("abc"), opts=["collect"],
+              removed={"AUTO-T2": "x", "AUTO-T3": "x", "AUTO-T4": "x"},
+              votes_asked=4, votes_decided=4, votes_overridden=0, votes_requests=12, votes_skipped=0)
+    on.update(collect_line)
+    return ids, truth, [off, off2, on]
+
+
+def test_a_collect_variant_that_never_had_the_model_is_not_credited(tmp_path):
+    ids, truth, results = _l2_results({"collect": "absent", "collect_reader": "not used", "collect_pack": "not used"})
+    verdicts = l2.summary(tmp_path, results, ids, truth, {})
+    assert verdicts["on-3+collect"].startswith("NO COLLECT") and "absent" in verdicts["on-3+collect"]
+    text = (tmp_path / "SUMMARY.md").read_text(encoding="utf-8")
+    assert "collect (reader / vote pack)" in text and "absent (not used / not used)" in text
+
+
+def test_a_collect_variant_that_had_the_model_is_judged_as_any_other(tmp_path):
+    ids, truth, results = _l2_results({"collect": "fresh", "collect_reader": "used", "collect_pack": "used"})
+    verdicts = l2.summary(tmp_path, results, ids, truth, {})
+    assert verdicts["on-3+collect"].startswith("PASS")
+    assert "fresh (used / used)" in (tmp_path / "SUMMARY.md").read_text(encoding="utf-8")
+
+
+def test_a_collect_variant_without_the_line_is_not_credited_either(tmp_path):
+    ids, truth, results = _l2_results({})
+    assert l2.summary(tmp_path, results, ids, truth, {})["on-3+collect"].startswith("NO COLLECT")
+
+
+def test_the_artifact_is_installed_where_the_variants_own_ini_says(tmp_path):
+    src = tmp_path / "artifact"
+    src.mkdir()
+    (src / "artifact.json").write_text("{}", encoding="utf-8")
+    (src / "collect_manifest.json").write_text("{}", encoding="utf-8")
+    work = tmp_path / "work"
+    work.mkdir()
+    ini = tmp_path / "v.ini"
+    ini.write_text("[collect]\ndir = build/collect-artifacts\n", encoding="utf-8")
+    where = l2.install_collect(src, work, ini)
+    assert where == work / "build" / "collect-artifacts" and (where / "artifact.json").is_file()
+    assert not (work / ".collect").exists()
+    default = l2.install_collect(src, work)                 # no ini: the default directory, as before
+    assert default == work / ".collect"
+
+
+def test_the_collect_read_is_fresh_for_each_gate_1_run(tmp_path, capsys):
+    tree = _tree(tmp_path)
+    cfg = _on(vote_collect="auto")
+    filt = _filter(cfg, _voters([], []))
+    filt.filter([_cand()], tree)
+    assert _collect_line(capsys.readouterr().out).startswith("📦 collect: absent")
+    _artifact(tree, cfg)                                    # built after the first run, same process
+    filt.filter([_cand()], tree)
+    assert _collect_line(capsys.readouterr().out).startswith("📦 collect: fresh")
