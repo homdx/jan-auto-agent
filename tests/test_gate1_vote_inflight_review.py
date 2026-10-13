@@ -199,11 +199,17 @@ def test_what_counts_as_no_reply():
     vote._note_voter("b", {"votes": {}, "error": "no free slot for h before the deadline", "requests": 0,
                            "replies": 0})                     # the queue's, not the voter's
     vote._note_voter("c", {"votes": {}, "requests": 1, "replies": 1})      # a reply nothing could read
-    vote._note_voter("d", {"votes": {}, "error": "boom"})                  # a row with no counts (a fake)
+    vote._note_voter("d", {"votes": {}, "error": "raised KeyError: 'k'"})   # it raised, or its settings failed
     vote._note_voter("e", None)                                            # nothing by the bound
-    assert vote._misses == {"a": 1, "b": 0, "c": 0, "d": 0, "e": 1}
+    assert {r: vote._misses.get(r, 0) for r in "abcde"} == {"a": 1, "b": 0, "c": 0, "d": 1, "e": 1}
     vote._note_voter("a", {"votes": {0: "TRUE"}, "requests": 1, "replies": 1})
     assert vote._misses["a"] == 0
+    # the queue's timeout says nothing of the voter: a miss before it is still counted after it
+    vote._note_voter("e", {"votes": {}, "error": "no free slot for h before the deadline", "requests": 0,
+                           "replies": 0})
+    assert vote._misses["e"] == 1
+    vote._note_voter("d", {"votes": {}, "error": "boom"})                  # the second: dropped
+    assert "d" not in vote._voters and vote._misses["d"] == 2
 
 
 # ── №57: a number that is no number ──────────────────────────────────────────────────────────

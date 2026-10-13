@@ -372,7 +372,7 @@ runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at th
   needs: on one host two requests at a time, four seconds apart, each with 2 × `vote_timeout_sec` once
   it has its slot, behind the requests of the other votes still in flight there (`presence_workers` > 1),
   plus 5 s. A voter that gives no reply twice in a row (nothing by that bound, or its request failed
-  after its retries: a timeout, a refused connection, an HTTP error) is dropped for the rest of the run;
+  after its retries: a timeout, a refused connection, an HTTP error; or the voter raised) is dropped for the rest of the run;
   its requests carry the deadline, so they stop retrying, and its threads never keep the process alive. When the voters
   left cannot decide (under `all`: any voter gone; else fewer than three of three families) the vote
   stops for the run and the plan line says so.

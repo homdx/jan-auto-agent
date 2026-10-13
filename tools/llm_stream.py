@@ -1319,6 +1319,40 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                                f"(a wait of {wait_s:.1f}s with {max(0.0, left):.1f}s left)")
         _sleep(wait_s)
 
+    def retry_after(msg: str, wait_s: float) -> None:
+        # the deadline before the log line: "waiting 100.0s and retrying" was logged (and sent to
+        # on_retry), then the retry was refused at once
+        left = _left()
+        if left is not None and left <= wait_s:
+            sleep(wait_s)                       # raises: the deadline line is the one logged
+        logger.warning("request_completion: %s", msg)
+        if on_retry:
+            on_retry(msg)
+        sleep(wait_s)
+
+    def _check_deadline(what: str) -> None:
+        # the deadline bounds the reply too: the socket timeout is only the gap between two reads, and a
+        # provider that keeps a stream open with keep-alive comments, or trickles the body, held the
+        # call (and the caller's worker and pacer slot) far past it
+        left = _left()
+        if left is not None and left <= 0:
+            raise RuntimeError(f"deadline reached reading {what} from {url}: stopped after "
+                               f"{time.monotonic() - _started:.1f}s, the reply still coming")
+
+    def _read_body(response) -> bytes:
+        if deadline is None:
+            return response.read()
+        read1 = getattr(response, "read1", None)
+        if read1 is None:                       # a stand-in response with no read1: read it whole
+            return response.read()
+        chunks = []
+        while True:
+            chunk = read1(65536)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            _check_deadline("the response body")
+
     def _attempt_timeout() -> float:
         left = _left()
         if left is None:
@@ -1704,10 +1738,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     f"waiting {wait_s:.1f}s and retrying "
                     f"(attempt {attempt + 1}/{error_retries})"
                 )
-                logger.warning("request_completion: %s", msg)
-                if on_retry:
-                    on_retry(msg)
-                sleep(wait_s)
+                retry_after(msg, wait_s)
                 attempt += 1
             except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
                 # AUTO-FIX (medium-priority audit): these previously had no
@@ -1730,10 +1761,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     f"{error_retry_wait_sec:.1f}s and retrying "
                     f"(attempt {attempt + 1}/{error_retries})"
                 )
-                logger.warning("request_completion: %s", msg)
-                if on_retry:
-                    on_retry(msg)
-                sleep(error_retry_wait_sec)
+                retry_after(msg, error_retry_wait_sec)
                 attempt += 1
 
     if not stream:
@@ -1750,7 +1778,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     # json.loads fail on "not a valid JSON text" even though
                     # the payload itself is fine. utf-8-sig is identical for
                     # BOM-free bodies.
-                    raw = json.loads(response.read().decode("utf-8-sig"))
+                    raw = json.loads(_read_body(response).decode("utf-8-sig"))
             except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError,
                     ValueError) as e:
                 # ValueError covers json.JSONDecodeError (a subclass): a
@@ -1767,10 +1795,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     f"waiting {error_retry_wait_sec:.1f}s and retrying "
                     f"(attempt {_read_attempt + 1}/{error_retries})"
                 )
-                logger.warning("request_completion: %s", msg)
-                if on_retry:
-                    on_retry(msg)
-                sleep(error_retry_wait_sec)
+                retry_after(msg, error_retry_wait_sec)
                 _read_attempt += 1
             else:
                 # Only the read+parse is retried. A ValueError from
@@ -1807,6 +1832,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         try:
             with _open() as response:
                 for raw_line in response:
+                    _check_deadline("the stream")
                     # utf-8-sig: a BOM on the first line of the stream would
                     # otherwise drop that chunk via the JSONDecodeError
                     # `continue` below.
@@ -1895,10 +1921,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 f"{error_retry_wait_sec:.1f}s and retrying "
                 f"(attempt {_stream_attempt + 1}/{error_retries})"
             )
-            logger.warning("request_completion: %s", msg)
-            if on_retry:
-                on_retry(msg)
-            sleep(error_retry_wait_sec)
+            retry_after(msg, error_retry_wait_sec)
             _stream_attempt += 1
 
     meta.elapsed = time.monotonic() - _started

@@ -37,7 +37,7 @@ A voter is a profile section (of the ini Gate 1 runs with, else of ``contest.ini
 ``contest.local.ini``, where ``claim_vote.py --add-profiles`` writes them) or Kilo's ``provider/model``;
 its family is read off the **model** the section names, never off the section's name. A voter that
 cannot be resolved (checked once, before the first vote) is named in the log and left out; one that gives
-no reply twice in a row (nothing by the vote's bound, or its request failed after its retries) is dropped
+no reply twice in a row (nothing by the vote's bound, its request failed after its retries, or it raised) is dropped
 for the rest of the run, and the vote stops when what is left could no longer decide. The vote waits as
 long as the claim_vote pacer's queue needs (voters of one host start two at a time, four seconds apart),
 the requests of the other votes still in flight on that host included (``presence_workers`` > 1: the
@@ -572,14 +572,21 @@ class Gate1Vote:
         reply (``requests`` > 0, ``replies`` 0: a timeout, a refused connection, an HTTP error, each
         after its retries). Its request ends at its own deadline, before the bound, so a provider
         that never answers was "answered" every time: never dropped, and each vote waited out its
-        2 x timeout. A request that never got its slot is the queue's, not the voter's."""
+        2 x timeout. An error row with no ``requests`` at all (the voter raised, or its settings
+        failed) is no reply either: it reset the count, and a voter that raised on every vote was
+        asked on every one, the vote never deciding under ``vote_accept = all``. A request that never
+        got its slot (``requests`` 0) is the queue's, not the voter's: neither counted nor a reply."""
         if row is not None and row.get("error") and ref not in self._warned:
             self._warned.add(ref)
             logger.warning("Gate1[vote] voter %s: %s (logged once a run)", ref, str(row["error"])[:160])
-        failed = row is not None and bool(row.get("requests")) and not row.get("replies")
+        voted = row is not None and bool(row.get("votes"))
+        made = row.get("requests") if row is not None else None
+        failed = row is not None and not voted and (
+            (bool(made) and not row.get("replies")) or (made is None and bool(row.get("error"))))
         with self._lock:
             if row is not None and not failed:
-                self._misses[ref] = 0
+                if voted or made is None or made:
+                    self._misses[ref] = 0
                 return
             self._misses[ref] = self._misses.get(ref, 0) + 1
             dropped = self._misses[ref] >= MAX_MISSES and ref in self._voters

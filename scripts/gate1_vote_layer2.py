@@ -44,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -266,7 +267,7 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
     bases = [r for r in results if r["variant"].startswith("off") and r["ok"]]
     base_unresolved = set().union(*[set(b.get("inconclusive") or ()) for b in bases]) if bases else set()
     labelled = len(truth)
-    lines = [f"# CC-10 layer 2 — Gate 1 on a known-answer set\n",
+    lines = ["# CC-10 layer 2 — Gate 1 on a known-answer set\n",
              f"{len(ids)} candidates, {labelled} with a recorded answer "
              f"({sum(v == 'REAL' for v in truth.values())} real, {sum(v == 'FALSE' for v in truth.values())} false positives). "
              f"Run {out.name}.\n",
@@ -319,11 +320,16 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
     offs = [r for r in results if r["variant"].startswith("off") and r["ok"]]
     if len(offs) >= 2:
         a, b = offs[0], offs[1]
-        flips = sorted(set(a["removed"]) ^ set(b["removed"]))
+        # on the candidates both judged, as the verdicts count them: one the reader could not judge in either
+        # run was a false positive of the other run here (kept and FALSE), and a flip
+        both_out = set(a.get("inconclusive") or ()) | set(b.get("inconclusive") or ())
+        flips = sorted((set(a["removed"]) ^ set(b["removed"])) - both_out)
         lines += ["", f"Noise of the baseline: `{a['variant']}` and `{b['variant']}` (same code, same candidates) disagree on "
-                      f"{len(flips)} candidate(s); false positives through {len(score(a, ids, truth)['false_positives_through'])} "
-                      f"and {len(score(b, ids, truth)['false_positives_through'])}. A difference between a vote variant and `off` "
-                      f"smaller than that is not a result."]
+                      f"{len(flips)} candidate(s); false positives through "
+                      f"{len(score(a, ids, truth, skip=both_out)['false_positives_through'])} "
+                      f"and {len(score(b, ids, truth, skip=both_out)['false_positives_through'])}"
+                      + (f" (on the {len(ids) - len(both_out)} both judged)" if both_out else "")
+                      + ". A difference between a vote variant and `off` smaller than that is not a result."]
     lines += ["", "## Per candidate (R = removed by Gate 1, k = kept, ? = not judged: the run failed or the reader "
               "never answered)", "",
               "| id | answer | " + " | ".join(r["variant"] for r in results) + " | title |",
@@ -368,6 +374,13 @@ def main(argv=None) -> int:
     plan = json.loads((known / "plan.json").read_text(encoding="utf-8"))
     ids = [t["id"] for t in plan["tasks"]]
     titles = {t["id"]: t["title"] for t in plan["tasks"]}
+    # Gate 1's "kept, presence unknown" line names a candidate by its title: two of one title could not be told
+    # apart, and a run marked both unresolved when one was
+    twins = sorted(t for t, n in Counter(titles.values()).items() if n > 1)
+    if twins:
+        print(f"{known / 'plan.json'}: candidates share a title ({twins[0]!r}): the run's log names a candidate "
+              "by its title, so the set needs one title a candidate", file=sys.stderr)
+        return 2
     sha = (known / "TARGET").read_text(encoding="utf-8").split()[0]
     truth = load_truth(known)
 
