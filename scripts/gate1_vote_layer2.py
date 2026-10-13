@@ -48,6 +48,9 @@ from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# run as `python3 scripts/gate1_vote_layer2.py` only scripts/ is on sys.path: check_collect imports tools.collect
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 KNOWN = ROOT / "contest-bench" / "cc" / "gate1_known_answers"
 OUT_BASE = ROOT / "contest-out" / "gate1-layer2"
 
