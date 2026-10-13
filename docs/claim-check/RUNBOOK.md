@@ -413,8 +413,8 @@ runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at th
   (nine): "add a test that …" candidates and a pack without callers. More voters decide more and are not safer. Second run (veto only, no test-file candidates, the baseline twice): still no pass; the baseline itself moves by
   up to three candidates and disagrees with its own repeat on 14 of 56. Both runs were made on the code before the review
   fixes 15–21, so repeat them on the fixed code. Third run, on the code with every review fix (up to 28, no voter dropped, no candidate unresolved): still no pass. The vote's unanimous FALSE was right 11 of 11,
-  its unanimous TRUE wrong 75 to 88 %, and the two baseline runs of the same code differ by six false positives (31 and 25). Not yet measured on fixed code: a veto-only
-  vote of five or more voters (`--sets 5+veto,7+veto`). Details in `docs/claim-check/GATE1-VOTE-LAYER2.md` section 6.
+  its unanimous TRUE wrong 75 to 88 %, and the two baseline runs of the same code differ by six false positives (31 and 25). Veto-only vote of five and seven voters (fourth run): its 3 rejections were all right (14 of 14 unanimous FALSEs over the runs), it spoke on 2 and 1 candidates of 56,
+  and its false-positive count (28, 31) sits in the reader's own noise (baselines 24, 27, 27): safe, nearly inert. Next: with the collect model (`--sets 5+veto+collect` after CC-13 landed). Details in `docs/claim-check/GATE1-VOTE-LAYER2.md` section 6.
 
   **CC-13 (295), landed: the collect model for the judges.** `[gate1] vote_collect = off|auto` (default `off`): with `auto` the voters' packs carry the `.collect/` facts about the cited module
   (chunks `collect:contracts|callers|calls|risk|fail_open:<path>`) when the artifact of the run's tree is fresh (or stale and `[collect] staleness = warn`); never written by the vote. `[collect] skip_dirs`

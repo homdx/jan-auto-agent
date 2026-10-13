@@ -323,3 +323,30 @@ on-9 32/1/21 → 31/0/22, on-5-notests 29/1/9 → 32/0/14. Verdict of every vari
   times and judge a variant against their range, not against each run.
 * **What does not help.** More voters (decided 10, 21, 20, 22), dropping the test-file candidates (the wrong TRUEs stay on literal-premise and debatable answers),
   or a veto with three voters. The next real change is CC-12 (the pack with callers, a claim that asks about the defect and not the fix).
+
+### Fourth run: veto only with five and seven voters (run `20261013T021139Z`, 2026-10-13)
+
+The one variant the third run had not measured on fixed code: `vote_confirm = off` (a unanimous TRUE is handed to the reader, only a unanimous FALSE can reject, and only if
+the reader does not confirm), five and seven voters, `vote_accept = committed`, the baseline three times. Code: fixes 15 to 28 (the run began before fixes 29 to 33; they
+do not touch the reader's path). No voter was dropped, no candidate unresolved.
+
+| variant | false positives through | true bugs rejected | vote rejections (wrong) | overridden by the reader | verdict |
+|---|---|---|---|---|---|
+| off | 24 | 1 | — | — | baseline |
+| off-2 | 27 | 1 | — | — | baseline |
+| off-3 | 27 | 1 | — | — | baseline |
+| on-5-veto | 28 | 0 | 2 (0) | 1 | FAIL (28 against a baseline range of 24 to 27) |
+| on-7-veto | 31 | 1 | 1 (0) | 2 | FAIL (31 against 24 to 27) |
+
+* **The veto was right every time it spoke**: 3 rejections over the two variants, all of false positives (`AUTO-T6`, `AUTO-T38`); no real bug rejected by the vote. With the third run's
+  11 of 11 that is **14 unanimous FALSEs, 14 right**. The reader had removed `AUTO-T6` in all three baselines anyway; `AUTO-T38` it kept in one of the three, so the vote did remove one
+  false positive the reader missed once.
+* **It speaks rarely**: 2 and 1 candidates of 56, because three to seven voters of three families seldom all say "absent" (the same abstention the committed rule absorbs on the TRUE side).
+  The veto is safe and nearly inert on this set.
+* **The count against the baselines is the reader's noise**, not the vote's: `on-5-veto` 28 and `on-7-veto` 31 false positives are the reader's own run-to-run spread plus one or two
+  vetoes; the baselines alone range from 24 to 27 and the reader changes its mind on 7 of 56 candidates between two identical runs. The tool's rule (not more than *each* of three
+  baselines) fails any variant that lands above the luckiest baseline; the fair reading is that **a veto-only vote does not worsen the reader and does not help it measurably on this set**.
+* **What would help it speak**: a pack with evidence the reader's side already has (CC-13: the collect model) and callers (CC-12). Both are the next measurements; a veto-only vote with the
+  collect facts is the variant to try first (`--sets 5+veto+collect,7+veto+collect` with `--collect-from`, after the artifact for the target sha is built).
+
+Across the four runs the verdict is unchanged: `claim_vote` stays `off`; the veto half is correct and the confirm half is not.
