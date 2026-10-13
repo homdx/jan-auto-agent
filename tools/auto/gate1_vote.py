@@ -793,10 +793,11 @@ class Gate1Vote:
         pack = build_pack(claim, resolved, view, model=self.collect_model(view), budget=self._budget)
         if not pack.chunks:
             return self._skip()
-        # the pack's own record of what the vote had: a collect chunk of zero is "no collect data"
-        self._bump(COUNTER_COLLECT_CHUNKS, sum(1 for c in pack.chunks if c.kind == "collect"))
         if not self._admit():
             return self._skip()       # past [gate1] vote_max_per_run: the single reader answers
+        # the pack's own record of what the voters read: counted once it is put to them, so a pack past the
+        # cap (never sent) does not count, and a collect chunk of zero is "no collect data"
+        self._bump(COUNTER_COLLECT_CHUNKS, sum(1 for c in pack.chunks if c.kind == "collect"))
         with self._lock:
             refs = list(self._voters)
         self._bump("votes_asked")

@@ -513,12 +513,19 @@ class CollectRead:
     `model=None`, because this reader does not rebuild anything. `changed` is
     how many files differ from the manifest (0 when fresh or absent), so the
     caller can say *how* stale it is rather than just *that* it is.
+
+    `causes` is what makes a stale artifact stale besides the files: `collector
+    version` (built by another collector) and `skip_dirs changed` (the manifest
+    recorded another list than the config's). Both are stale with `changed = 0`,
+    and a line that said "0 modules changed" sent the operator looking at files
+    that had not moved; empty when fresh or absent.
     """
 
     status: str = STATUS_ABSENT
     model: Optional[CollectModel] = None
     changed: int = 0
     reason: str = ""
+    causes: Tuple[str, ...] = ()
 
     @property
     def used(self) -> bool:
@@ -578,8 +585,6 @@ def load_readonly(
         skip = manifest_mod.skip_dirs_from_config(config)
         paths = [m.path for m in scan_repo(root, config=config)]
         hashes = manifest_mod.hash_tree(root, paths)
-        diff = manifest_mod.diff_files(man.file_hashes, hashes)
-        changed = len(diff.added | diff.modified | diff.removed)
 
         if manifest_mod.is_fresh(man, root, files=paths, hashes=hashes, skip_dirs=skip):
             model = _load_from_dir(collect_dir, status=STATUS_FRESH)
@@ -587,26 +592,39 @@ def load_readonly(
                 return CollectRead(reason=model.reason or "artifact is unreadable — treated as absent")
             return CollectRead(status=STATUS_FRESH, model=model)
 
-        reason = "artifact is stale (a tracked file changed)"
+        diff = manifest_mod.diff_files(man.file_hashes, hashes)
+        changed = len(diff.added | diff.modified | diff.removed)
+        # what else is_fresh refused: the reason named "a tracked file changed" for a manifest whose
+        # files had not moved at all (another skip_dirs list), and a count of 0 said nothing either
+        causes = []
         if man.collector_version != manifest_mod.COLLECTOR_VERSION:
-            reason = (f"manifest was built by collector_version={man.collector_version!r}, "
-                      f"current is {manifest_mod.COLLECTOR_VERSION!r}")
+            causes.append("collector version")
+        if tuple(sorted(skip)) != tuple(man.skip_dirs):
+            causes.append("skip_dirs changed")
+        causes = tuple(causes)
+        reasons = ([f"{changed} tracked file(s) changed"] if changed else []) + [
+            f"manifest was built by collector_version={man.collector_version!r}, "
+            f"current is {manifest_mod.COLLECTOR_VERSION!r}" if c == "collector version" else
+            f"manifest recorded skip_dirs {list(man.skip_dirs)}, the config says {sorted(skip)}"
+            for c in causes]
+        reason = "artifact is stale (" + "; ".join(reasons or ["a tracked file changed"]) + ")"
 
         policy = _staleness_policy(config)
         if policy == "ignore":
             # the artifact is there and stale: say so (a log that says "absent" would send the
             # operator looking for a build that exists), and give no model, as `load` does
-            return CollectRead(status=STATUS_STALE, changed=changed,
-                               reason="stale artifact, staleness=ignore — not used")
+            return CollectRead(status=STATUS_STALE, changed=changed, causes=causes,
+                               reason=f"{reason}, staleness=ignore — not used")
         if policy == "refresh":
-            return CollectRead(status=STATUS_STALE, changed=changed,
-                               reason=f"stale artifact, staleness=refresh: this reader does not "
+            return CollectRead(status=STATUS_STALE, changed=changed, causes=causes,
+                               reason=f"{reason}, staleness=refresh: this reader does not "
                                       f"write, so the artifact was left alone")
         # policy == "warn" (default / fallback): the stale model is used and flagged
         model = _load_from_dir(collect_dir, status=STATUS_STALE, reason=reason)
         if not model.available:
             return CollectRead(status=STATUS_ABSENT, changed=changed,
                                reason=model.reason or "artifact is unreadable — treated as absent")
-        return CollectRead(status=STATUS_STALE, model=model, changed=changed, reason=model.reason)
+        return CollectRead(status=STATUS_STALE, model=model, changed=changed, causes=causes,
+                           reason=model.reason)
     except Exception:   # noqa: BLE001 — a consumer of collect never dies on collect
         return CollectRead(reason="collect could not be read — treated as absent")

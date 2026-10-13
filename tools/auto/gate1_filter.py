@@ -1159,6 +1159,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             print(f"🗳 Gate 1 vote: asked {c['votes_asked']}, decided {c['votes_decided']}, "
                   f"overridden by the reader {c['votes_overridden']}, requests {c['votes_requests']}, "
                   f"skipped {c.get('votes_skipped', 0)}"
+                  # CC-13: "vote pack: used" at the start says the model was handed over; this says how many
+                  # of its facts the voters were actually shown (chunks of kind `collect` in the packs voted on)
+                  + (f", collect chunks {c.get(_gate1_vote.COUNTER_COLLECT_CHUNKS, 0)}"
+                     if getattr(self._vote.cfg, "vote_collect", "off") == "auto" else "")
                   + (f" — stopped: {self._vote.stopped}" if self._vote.stopped else ""))
         print(
             f"✅ Gate 1 done — {len(accepted)} accepted, "
@@ -1193,8 +1197,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
     def _collect_line(self, base_dir: Path) -> str:
         """CC-13: the one line at the start of Gate 1 that says what the judges had.
 
-        ``collect: fresh | stale (N modules changed) | stale | present | absent — reader: used/not used,
-        vote pack: used/not used``. The reader's side is its collect bridge (GATE1-CTX-1/-2,
+        ``collect: fresh | stale (N modules changed, collector version, skip_dirs changed) | stale | present |
+        absent — reader: used/not used, vote pack: used/not used`` (a stale line names what of the three the read
+        found; a bare ``stale`` is the reader's bridge, which counts nothing). The reader's side is its collect bridge (GATE1-CTX-1/-2,
         Stage A0) and the vote's side is the CC-10 vote's own read of the same artifact
         (`[gate1] vote_collect`), so one line settles "did the judges pull from collect"
         for both of them. Printed by every variant, the vote off included, and built before
@@ -1204,6 +1209,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         """
         state = ""
         changed: "int | None" = None      # unknown until a read says how many files moved
+        causes: tuple = ()                # what else made it stale: "collector version", "skip_dirs changed"
         reader_used = False
         try:
             bridge = getattr(self, "_collect_bridge", None)
@@ -1220,6 +1226,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 if getattr(read, "status", ""):
                     state = str(read.status)
                 changed = int(getattr(read, "changed", 0) or 0)
+                causes = tuple(str(c) for c in (getattr(read, "causes", ()) or ()))
         except Exception:   # noqa: BLE001 — a read that fails is "not used"
             vote_used = False
         if not state:
@@ -1232,10 +1239,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             except Exception:   # noqa: BLE001
                 state = "absent"
         state = state or "absent"
-        if state == "stale" and changed is not None:
-            head = f"stale ({changed} module{'s' if changed != 1 else ''} changed)"
-        else:
-            head = state
+        # a version or a skip_dirs list that differs is stale with no file moved: "0 modules changed" named
+        # the one thing that had not happened
+        parts = ([f"{changed} module{'s' if changed != 1 else ''} changed"] if changed else []) + list(causes)
+        head = f"stale ({', '.join(parts)})" if state == "stale" and parts else state
         return (f"📦 collect: {head} — reader: {'used' if reader_used else 'not used'}, "
                 f"vote pack: {'used' if vote_used else 'not used'}")
 
