@@ -262,7 +262,7 @@ def test_load_readonly_says_how_many_files_moved(tmp_path):
 
 
 @pytest.mark.parametrize("staleness, status, used", [
-    ("ignore", "absent", False),
+    ("ignore", "stale", False),
     ("refresh", "stale", False),
 ])
 def test_the_staleness_policy_of_a_read_only_reader(tmp_path, staleness, status, used):
@@ -377,7 +377,7 @@ def test_vote_collect_auto_without_an_artifact_is_the_same_request_as_off(tmp_pa
 
 
 @pytest.mark.parametrize("staleness, state, chunks", [
-    ("ignore", "absent", 0),
+    ("ignore", "stale", 0),
     ("refresh", "stale", 0),
     ("warn", "stale", 1),
 ])

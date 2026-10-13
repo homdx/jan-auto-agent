@@ -582,8 +582,10 @@ def load_readonly(
 
         policy = _staleness_policy(config)
         if policy == "ignore":
-            return CollectRead(status=STATUS_ABSENT, changed=changed,
-                               reason="stale artifact, staleness=ignore — treated as absent")
+            # the artifact is there and stale: say so (a log that says "absent" would send the
+            # operator looking for a build that exists), and give no model, as `load` does
+            return CollectRead(status=STATUS_STALE, changed=changed,
+                               reason="stale artifact, staleness=ignore — not used")
         if policy == "refresh":
             return CollectRead(status=STATUS_STALE, changed=changed,
                                reason=f"stale artifact, staleness=refresh: this reader does not "
