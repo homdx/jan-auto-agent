@@ -410,7 +410,9 @@ runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at th
   The vote's unanimous FALSE was right 8 of 8 times; its unanimous TRUE was wrong 8 of 10 (three voters) to 18 of 20
   (nine): "add a test that …" candidates and a pack without callers. More voters decide more and are not safer. Second run (veto only, no test-file candidates, the baseline twice): still no pass; the baseline itself moves by
   up to three candidates and disagrees with its own repeat on 14 of 56. Both runs were made on the code before the review
-  fixes 15–21, so repeat them on the fixed code. Details in `docs/claim-check/GATE1-VOTE-LAYER2.md` section 6.
+  fixes 15–21, so repeat them on the fixed code. Third run, on the code with every review fix (up to 28, no voter dropped, no candidate unresolved): still no pass. The vote's unanimous FALSE was right 11 of 11,
+  its unanimous TRUE wrong 75 to 88 %, and the two baseline runs of the same code differ by six false positives (31 and 25). Not yet measured on fixed code: a veto-only
+  vote of five or more voters (`--sets 5+veto,7+veto`). Details in `docs/claim-check/GATE1-VOTE-LAYER2.md` section 6.
 
 ## When something goes wrong
 

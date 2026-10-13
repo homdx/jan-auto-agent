@@ -241,3 +241,40 @@ the fixed code before drawing the line between "the vote is a poor confirmation"
 ```bash
 python3 scripts/gate1_vote_layer2.py --detach --sets 3,5,7,9,5+notests
 ```
+
+### Third run: the fixed code (run `20261012T102718Z`, 2026-10-12/13)
+
+All voting variants on the code with every review fix up to 28 (families read off the models, the pacer queue and the votes' deadlines of fixes 23 and 26,
+the evidence rules of fixes 22 and 27). No voter was dropped in any variant, no candidate was unresolved. Baselines are the two runs of the same directory,
+made on the code of fixes 15 to 21 (the reader's path did not change since). A first attempt at 5, 7 and 9 voters on the code of fix 15 to 25 was thrown
+away: its votes were cut off by a bug that fix 26 repairs (the `decided` counts of the first two runs above are therefore a little low).
+
+| variant | false positives through | true bugs rejected | decided (of asked) | vote confirmed (wrong) | vote rejected (wrong) | confirmed what the reader had removed in both baselines |
+|---|---|---|---|---|---|---|
+| off | 31 | 1 | — | — | — | — |
+| off-2 | 25 | 1 | — | — | — | — |
+| on-3 | 30 | 0 | 10 of 56 | 9 (7) | 1 (0) | 1 |
+| on-5 | 30 | 1 | 21 of 56 | 18 (15) | 3 (0) | 2 |
+| on-7 | 32 | 1 | 20 of 56 | 17 (15) | 3 (0) | 3 |
+| on-9 | 31 | 0 | 22 of 56 | 19 (16) | 3 (0) | 2 |
+| on-5-notests | 32 | 0 | 14 of 26 | 12 (9) | 1 (0) | 1 |
+
+Against the first run, same variants (false positives / true rejected / decided): on-3 27/1/10 → 30/0/10, on-5 30/1/20 → 30/1/21, on-7 31/1/18 → 32/1/20,
+on-9 32/1/21 → 31/0/22, on-5-notests 29/1/9 → 32/0/14. Verdict of every variant: FAIL, `claim_vote` stays `off`.
+
+* **The conclusion did not move.** The fixes were needed (the first run's votes were cut off and its families were section names) and changed the counts
+  a little (`decided` of the five and seven voters up by 1 and 2, of the five without tests up by 5), but the vote's own decisions are as they were:
+  a unanimous FALSE was right **11 of 11** times in this run (1, 3, 3, 3, 1; 8 of 8 before), a unanimous TRUE was wrong **9 of 12 to 16 of 19**
+  (75 to 88 %; before 80 to 90 %). Without the test-file candidates it is 9 wrong of 12, not better enough to matter.
+* **The baseline noise is bigger than any effect.** `off` and `off-2` (the same code on the same candidates) disagree on 12 of 56 candidates, and let 31 and 25
+  false positives through, six apart. Every voting variant (30 to 32) sits inside or just above that band. The rule of the tool (not more than *each* baseline
+  run) is therefore decided by which baseline was lucky: it fails the five voters (30 against a baseline of 25) and would have passed them against 31; against the first baseline alone, `on-5` (30, 1, decided 21) and `on-9` (31, 0, decided 22) would both read PASS. A verdict that flips with the baseline is no verdict.
+  The number to trust is the vote's own accuracy, not the count against one baseline. Both baselines removed the same real bug (`AUTO-T1`, the reader's one wrong rejection); `on-3` and `on-9` did not, which is again the reader's noise, not the vote's.
+* **Where the vote hurts.** In each variant it confirmed one to three false positives that the reader had removed in both baselines (1, 2, 3, 2, 1): that is the
+  vote doing damage that is not noise. Elsewhere it agrees with the reader on what the reader let through anyway.
+* **What it could still be good for.** Its rejections (11 in five variants, all right) are the useful half. A veto-only vote with five or more voters
+  (`--sets 5+veto,7+veto`, the first run only tried it with three voters, where unanimous FALSE almost never happens) is the one variant not yet measured on
+  fixed code; it can only remove false positives the reader lets through, by a quoted unanimous absence. It needs the baseline noise first: run `off` three
+  times and judge a variant against their range, not against each run.
+* **What does not help.** More voters (decided 10, 21, 20, 22), dropping the test-file candidates (the wrong TRUEs stay on literal-premise and debatable answers),
+  or a veto with three voters. The next real change is CC-12 (the pack with callers, a claim that asks about the defect and not the fix).
