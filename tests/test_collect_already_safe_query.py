@@ -70,7 +70,10 @@ def real_repo_index():
 
 
 def test_guarded_prompt_store_access_is_safe(real_repo_index):
-    answer = real_repo_index.query("tools/prompt_store.py:78")
+    # Located from the source, not hardcoded: this line moved 78 → 90 when HARDEN-1 A3
+    # put `_version_label` above the class.
+    guarded_line = _line_of("tools/prompt_store.py", 'return stack[-1]["prompt"]')
+    answer = real_repo_index.query(f"tools/prompt_store.py:{guarded_line}")
 
     assert isinstance(answer, SafetyAnswer)
     assert answer.safe is True

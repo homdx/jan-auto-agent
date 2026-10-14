@@ -22,6 +22,18 @@ def _get_hardcoded(agent_name: str) -> str:
     raise ValueError(f"PromptStore: no hardcoded constant registered for agent '{agent_name}'")
 
 
+# A stack record with no ``version`` (a hand-edited or older-format prompts.json) is
+# shown as this, so one such record cannot take the whole /prompts table down (HARDEN-1 A3).
+_NO_VERSION_LABEL = "v?"
+
+
+def _version_label(item) -> str:
+    """The display label of one stack *item*: ``v<n>``, or ``v?`` when the
+    record carries no version at all (HARDEN-1 A3)."""
+    version = item.get("version") if isinstance(item, dict) else None
+    return f"v{version}" if version is not None else _NO_VERSION_LABEL
+
+
 class PromptStore:
     """
     Versioned, rollback-capable store for agent system prompts.
@@ -84,6 +96,14 @@ class PromptStore:
 
             validator_agent    v2  (score 0.87)  rollback: v1, hardcoded
             improvement_agent  hardcoded          rollback: —
+
+        A record with no ``version`` (a hand-edited or older-format
+        ``prompts.json``) is shown as ``v?`` rather than raising
+        (HARDEN-1 A3): the REPL's ``/prompts`` has no handler, so one such
+        record used to end the shell with a ``KeyError``. A missing or
+        ``null`` ``score`` was already shown as ``(no score)`` (fix 36);
+        ``version`` now gets the same treatment, and the other records are
+        still listed.
         """
         data = self._load()
         rows = []
@@ -93,13 +113,14 @@ class PromptStore:
 
             # Current version label + score
             if stack:
-                current_version = entry.get("current_version", stack[-1]["version"])
+                current_version = entry.get("current_version", stack[-1].get("version"))
                 current = next(
-                    (item for item in reversed(stack) if item["version"] == current_version),
+                    (item for item in reversed(stack)
+                     if isinstance(item, dict) and item.get("version") == current_version),
                     stack[-1],
                 )
-                label = f"v{current['version']}"
-                score = current.get("score")
+                label = _version_label(current)
+                score = current.get("score") if isinstance(current, dict) else None
                 score_str = f"(score {score:.2f})" if isinstance(score, (int, float)) else "(no score)"
             else:
                 label = "hardcoded"
@@ -107,7 +128,7 @@ class PromptStore:
 
             # Rollback chain: everything below the top, then "hardcoded"
             below = stack[:-1] if stack else []
-            rollback_parts = [f"v{item['version']}" for item in reversed(below)]
+            rollback_parts = [_version_label(item) for item in reversed(below)]
             rollback_parts.append("hardcoded")
             rollback_str = "rollback: " + ", ".join(rollback_parts)
 

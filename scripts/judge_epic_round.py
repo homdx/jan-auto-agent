@@ -144,7 +144,10 @@ _API_ERR = re.compile(
 _STATS = re.compile(r"(\d+) (passed|failed|errors?|skipped)")
 
 #: The stats line ends in ====; the duration is searched for, never anchored.
-_HAS_DURATION = re.compile(r"\d+(?:\.\d+)?\s*[smh]")
+#: (?<!\d) starts the digit run at its first digit, so one line of thousands of digits
+#: cannot make every start position backtrack through the whole run (14.1 s at 20 000
+#: digits — HARDEN-1 A6); matches on ordinary text are unchanged.
+_HAS_DURATION = re.compile(r"(?<!\d)\d+(?:\.\d+)?\s*[smh]")
 
 
 def _slug(name):

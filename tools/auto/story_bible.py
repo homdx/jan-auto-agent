@@ -119,7 +119,11 @@ _GENDER_MALE_RE = re.compile(
     r"мужчин|мужского|парень|male|\bон\b", re.IGNORECASE
 )
 
-_AGE_RE = re.compile(r"(\d+)\s*(?:лет|год)", re.IGNORECASE)
+# (?<!\d) anchors the digit run at its first digit: without it, a line of thousands of
+# digits made every start position backtrack through the whole run (13.9 s at 20 000
+# digits — HARDEN-1 A6), and a match on ordinary text is unchanged, since the run is
+# read from its first digit either way.
+_AGE_RE = re.compile(r"(?<!\d)(\d+)\s*(?:лет|год)", re.IGNORECASE)
 # Duration phrases ("married for 5 years") are excluded from age detection, so they are not read as an age (BUGFIX).
 _AGE_DURATION_CONTEXT_RE = re.compile(
     r"(?:в\s+браке|женат\w*|замужем|прошло|знаком\w*|живёт|живет|работает|"

@@ -706,6 +706,14 @@ def extract_prose_section(
 
 # Public API
 
+def _extract_block_named(source: str, target_name: str, ext: str) -> str:
+    """The language-specific extraction for one exact *target_name*."""
+    if ext == ".py":
+        return _extract_python_block(source, target_name)
+    # Default to brace-based strategy for JS/TS/Go/Java/C/C++/Rust/etc.
+    return _extract_brace_block(source, target_name, _LANG_OF_EXT.get(ext, ""))
+
+
 def extract_block(source: str, target_name: str, file_ext: str) -> str:
     """
     Extract a named code block from source text for any supported language.
@@ -716,11 +724,20 @@ def extract_block(source: str, target_name: str, file_ext: str) -> str:
     source = _no_bom(source)
     ext = _normalize_ext(file_ext)
 
-    if ext == ".py":
-        return _extract_python_block(source, target_name)
+    block = _extract_block_named(source, target_name, ext)
+    if block or not target_name or "." not in target_name:
+        return block
 
-    # Default to brace-based strategy for JS/TS/Go/Java/C/C++/Rust/etc.
-    return _extract_brace_block(source, target_name, _LANG_OF_EXT.get(ext, ""))
+    # HARDEN-1 A4: a reference the caller hands us is very often dotted —
+    # `module.func` from `find_references` on an imported module, `a.b.c` from
+    # a chained call — while the definition it names is the *bare* symbol.
+    # Looking the whole name up found nothing (that is the only way we get
+    # here), so the last segment is tried: `module.func` → `func`,
+    # `Class.method` → the method, which the Python finder already resolves
+    # through its qualname when the class is visible. The whole name still
+    # wins whenever it *is* a real definition (a `Class.method` qualname, a
+    # JS `exports.h = function ...`), because it is tried first.
+    return _extract_block_named(source, target_name.rsplit(".", 1)[-1].strip(), ext)
 
 
 def extract_module_docstring(source: str, file_ext: str, max_chars: int = 500) -> str:

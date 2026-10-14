@@ -187,17 +187,66 @@ def stream_options_is_supported(url: str, model=None) -> bool:
 
 
 # Matches an api_key line, commented or not, so a pasted secret is masked before the LLM sees it (MASK-KEY-1).
+# The key name is its own group, so `mask_api_key` can tell a pass-through
+# assignment (`self.api_key = api_key`) from a literal value (HARDEN-1 A8).
 _API_KEY_LINE_RE = re.compile(
-    r'(?im)^([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?[\w.-]*api[_-]?key[ \t]*=[ \t]*)(\S+)([ \t]*\r?)$'
+    r'(?im)^([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?)([\w.-]*api[_-]?key)([ \t]*=[ \t]*)(\S+)([ \t]*\r?)$'
 )
 # the same key in JSON: "api_key": "<value>", "openai_api_key": "<value>"
 _API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]*(")')
+# A bare Python/JS identifier: a NAME, i.e. a reference to something, never a literal secret.
+_BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Characters that make a value an expression rather than a literal token: a call, an
+# index, an attribute, a container or punctuation (`os.environ["X"]`, `config.api_key`).
+_EXPRESSION_CHARS = "([{)]},;'\"."
+
+
+def _value_is_secret_literal(value: str, key_name: str) -> bool:
+    """Whether the *value* of an ``api_key = …`` assignment is a literal that
+    must be masked, as opposed to code that must be sent as it is.
+
+    HARDEN-1 A8: the mask used to replace *whatever* followed the ``=``, so a
+    request carrying a file the model is asked to rewrite (``/edit``, the
+    Coder, which reads and writes whole files through this same request path)
+    had its code rewritten for it — ``self.api_key = api_key`` went out as
+    ``self.api_key = here_your_key``, and a faithful edit wrote the
+    placeholder back, turning working code into a ``NameError`` nothing
+    catches. Across this repo's own sources the old pattern matched hundreds
+    of lines.
+
+    The intent is to keep a real secret out of the request without touching
+    code, so only a *literal* is masked:
+
+    * a quoted string (``api_key = "k1"``, ``"api_key": "k1"``) — always a literal;
+    * a bare token with no whitespace and no call, index, attribute or
+      punctuation character (``api_key = sk-abc123``) — a key-shaped literal;
+    * anything else is an expression (``os.environ["OPENAI_API_KEY"]``,
+      ``config.api_key``, ``get_key()``) and is sent verbatim;
+    * a bare identifier that IS the key's own name (``self.api_key = api_key``,
+      ``self.api_key = _API_KEY``) is a pass-through of a parameter, not a
+      secret, and is sent verbatim too.
+    """
+    value = (value or "").strip()
+    if not value:
+        return False
+    # A quoted string is a literal, whatever is inside it.
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return True
+    if any(ch.isspace() for ch in value) or any(ch in value for ch in _EXPRESSION_CHARS):
+        return False
+    # A name that merely refers to the key it is being assigned to (`self.api_key =
+    # api_key`): the assigned name's last segment, so `self.api_key` is compared
+    # with `api_key` and not with the dotted name itself.
+    if _BARE_IDENTIFIER_RE.match(value):
+        return value.strip("_").lower() != key_name.rsplit(".", 1)[-1].strip("_").lower()
+    # Not an identifier: an opaque bare token (sk-abc123, a long hex string) — a key.
+    return True
 
 
 def mask_api_key(text: "str | None") -> "str | None":
-    """Replace every ``api_key = <value>`` line in *text* with
-    ``api_key = here_your_key``, regardless of what the value actually is
-    (a placeholder like "test", a real key, anything non-blank).
+    """Replace every ``api_key = <literal>`` line in *text* with
+    ``api_key = here_your_key``, leaving an expression on the right-hand side
+    alone (HARDEN-1 A8, see ``_value_is_secret_literal``).
 
     This is a plain string transform with no knowledge of *which* key is
     "real" — it masks unconditionally so a secret embedded in file content
@@ -207,7 +256,14 @@ def mask_api_key(text: "str | None") -> "str | None":
     """
     if not text:
         return text
-    text = _API_KEY_LINE_RE.sub(r"\1here_your_key\3", text)
+
+    def _mask_line(m: "re.Match") -> str:
+        prefix, key_name, assign, value, suffix = m.groups()
+        if not _value_is_secret_literal(value, key_name):
+            return m.group(0)
+        return f"{prefix}{key_name}{assign}here_your_key{suffix}"
+
+    text = _API_KEY_LINE_RE.sub(_mask_line, text)
     return _API_KEY_JSON_RE.sub(r"\1here_your_key\2", text)
 
 
@@ -579,9 +635,68 @@ _FENCE_LABEL_RE = re.compile(
 )
 
 
+def _is_json(text: str, strict: bool = True) -> bool:
+    """Whether *text* parses as a JSON value.
+
+    ``strict=False`` accepts the literal newlines and tabs a model emits
+    *inside* a JSON string (``{"notes": "use:\n```python\n…\n```"}``), which
+    strict JSON forbids but which every caller would hand straight to
+    ``json.loads`` anyway. That is only a probe: a candidate that needs it is
+    escaped on the way out (see ``_escape_raw_controls``), so the returned
+    body is still strict-JSON.
+    """
+    try:
+        json.loads(text, strict=strict)
+        return True
+    except ValueError:
+        return False
+
+
+_RAW_CONTROL_ESCAPES = {"\n": "\\n", "\r": "\\r", "\t": "\\t", "\b": "\\b", "\f": "\\f"}
+
+
+def _escape_raw_controls(text: str) -> str:
+    """*text* with the control characters JSON forbids inside a string written
+    as their escapes, so a body a model emitted with literal newlines inside a
+    string still passes every caller's plain ``json.loads`` (HARDEN-1 A7).
+
+    Only characters *inside* a string are touched: a literal newline between
+    tokens is legal JSON whitespace, and escaping it would produce a stray
+    backslash outside any string.
+    """
+    out = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            elif ch < " ":
+                out.append(_RAW_CONTROL_ESCAPES.get(ch, f"\\u{ord(ch):04x}"))
+                continue
+        elif ch == '"':
+            in_string = True
+        out.append(ch)
+    return "".join(out)
+
+
 def _before_closing_fence(rest: str) -> str:
     """The body up to its closing fence: the first ``` before which the body parses as JSON (a ``` inside a JSON
-    string — a model echoing a code block — cut the body short), else the first ``` as before."""
+    string — a model echoing a code block — cut the body short), else the first ``` as before.
+
+    A body with literal newlines inside one of its strings parses too
+    (HARDEN-1 A7): ``strict=False`` accepts them and ``_escape_raw_controls``
+    writes them as escapes, so the returned body is strict JSON either way.
+    """
+    # A fence that was opened and never closed (truncation, or the model just omitted it): the body is the
+    # whole rest, and it is complete JSON even though a string of it quotes a code fence.
+    whole = rest.strip()
+    if _is_json(whole, strict=False):
+        return whole if _is_json(whole) else _escape_raw_controls(whole)
     first, start = None, 0
     while True:
         pos = rest.find("```", start)
@@ -590,16 +705,30 @@ def _before_closing_fence(rest: str) -> str:
         candidate = rest[:pos].strip()
         if first is None:
             first = candidate
-        try:
-            json.loads(candidate)
-            return candidate
-        except ValueError:
-            start = pos + 3
+        if _is_json(candidate, strict=False):
+            return candidate if _is_json(candidate) else _escape_raw_controls(candidate)
+        start = pos + 3
     return first if first is not None else rest.strip()
 
 
 def strip_json_fence(text: str) -> str:
     """Strip a ```json ... ``` or ``` ... ``` fence wrapping a JSON blob, if present."""
+    # HARDEN-1 A7: the whole reply is tried as JSON FIRST, before any fence is
+    # cut. A bare reply that is already valid JSON is exactly that, even when
+    # one of its strings quotes a code fence — the commonest such reply is a
+    # verdict whose hint or a summary whose notes quotes a code sample:
+    # {"purpose": "...", "notes": "Typical use:\n```python\nretry(fetch, 3)\n```"}.
+    # Cutting at that inner fence returned 'python\nretry(fetch, 3)\n', so every
+    # caller's json.loads failed: a Pass B summary became the "module left
+    # without a summary" case, and a Gate 2 APPROVED verdict became "validator
+    # unavailable", which re-runs Gate 2 `validator_unavailable_retries` times
+    # and then discards a passing candidate. Only a reply that is not valid
+    # JSON falls through to fence stripping below.
+    if text:
+        stripped = text.strip()
+        if _is_json(stripped, strict=False):
+            # Escaped only when the body needs it, so a plain reply is returned byte-for-byte.
+            return stripped if _is_json(stripped) else _escape_raw_controls(stripped)
     # The JSON fence is matched case-insensitively, and only the matched span is cut (BUGFIX).
     m = _JSON_FENCE_OPEN_RE.search(text)
     if m:
@@ -1450,6 +1579,9 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         # Ollama chunks may carry a null message; the null is treated as empty (BUGFIX).
                         try:
                             chunk = json.loads(line)
+                            # A chunk that is not an object at all carries no token either (HARDEN-1 A2, as on the SSE branch).
+                            if not isinstance(chunk, dict):
+                                continue
                             token = (chunk.get("message") or {}).get("content", "")
                             done  = chunk.get("done", False)
                         except json.JSONDecodeError:
@@ -1464,10 +1596,20 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             break
                         try:
                             chunk = json.loads(data)
+                            # A chunk that is not an object at all carries no token (HARDEN-1 A2).
+                            if not isinstance(chunk, dict):
+                                continue
                             # An empty choices list is skipped, not an IndexError that loses the reply (BUGFIX).
                             choices = chunk.get("choices") or []
+                            # A null (or otherwise non-object) first choice is skipped too, exactly
+                            # as `_meta_from_chunk` skips it (HARDEN-1 A2): `{"choices": [null]}` is
+                            # a real gateway shape, and `None.get("delta")` raised AttributeError
+                            # here — neither a JSONDecodeError nor a KeyError, so it escaped the
+                            # guard below and killed a call that had already read every token,
+                            # which the caller then retried and re-billed.
+                            first = choices[0] if choices else None
                             # A null delta is treated as empty, so it does not raise AttributeError (BUGFIX).
-                            token = (choices[0].get("delta") or {}).get("content", "") if choices else ""
+                            token = (first.get("delta") or {}).get("content", "") if isinstance(first, dict) else ""
                             done  = False
                         except (json.JSONDecodeError, KeyError):
                             continue

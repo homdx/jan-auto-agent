@@ -54,6 +54,7 @@ from tools.auto.gate_registry import (  # GATES-1 / GATES-2
 )
 from tools.agent_trace import tracer   # AUTO-CR-27: per-stage decision tracing
 from tools.auto.utils import is_pytest_command   # RUN-3
+from tools.llm_stream import strip_json_fence     # HARDEN-1 A7: Gate 2's fence handling
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -725,10 +726,15 @@ class LLMGate2Validator:
                 return False, f"Reason: {critique}"
 
             # ── Code / docs mode: strict JSON path (unchanged) ───────────────
-            if "```json" in raw:
-                raw = raw.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw:
-                raw = raw.split("```")[1].split("```")[0].strip()
+            # HARDEN-1 A7: Gate 2 used to strip the fences with its own
+            # `raw.split("```json")[1].split("```")[0]`, which cut a verdict at
+            # the first fence *inside* one of its strings — a rejection whose
+            # hint quotes a code sample lost the hint, and an approval became
+            # "validator unavailable", so InnerLoop re-ran Gate 2 and then
+            # discarded the passing candidate. `strip_json_fence` parses the
+            # whole reply first and only then falls back to fence stripping,
+            # getting fix 36's `_before_closing_fence` for the wrapped case too.
+            raw = strip_json_fence(raw)
 
             # A reply that is only code fences is reported as empty, not as a JSON error.
             if not raw or not raw.strip():
@@ -820,6 +826,11 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     Order is load-bearing: negated-positive RU rules (нет противоречий, не против,
     не противоречит) and the «не соглас» rule are tested **before** the bare
     negative patterns (против, противоречи…, соглас) to avoid mis-classification.
+
+    The English verdict tokens match as whole words only (HARDEN-1 A1, see
+    ``_verdict_token_at_start``): ``NOT BAD`` / ``NOTE:`` / ``Normally`` /
+    ``NOPE`` are prose, not a bare ``NO`` rejection, and fall through to the
+    fail-open rules exactly as any other prose does.
     """
     import re as _re
 
@@ -837,6 +848,27 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             if after:
                 return after
         return norm if norm else "validator rejected (no reason given)"
+
+    def _verdict_token_at_start(candidate: str, token: str) -> bool:
+        """Whether *candidate* begins with the verdict word *token*, as a whole word.
+
+        HARDEN-1 A1: ``str.startswith`` alone made every word that merely begins
+        with a verdict token a verdict — ``NOT BAD``, ``Nothing to add``,
+        ``NOTE:``, ``Normally``, ``NOPE`` were all read as a bare ``NO``
+        rejection whose "reason" was the word's own tail (``'T BAD'``,
+        ``'thing to add, looks good'``), and that garbage was handed to the
+        Coder as the thing to fix: a whole round burned on an approval.
+        ``REVISED`` / ``REJECTION`` were read the same way.
+
+        A verdict token ends at a non-alphanumeric character (``NO: x``,
+        ``NO, x``, ``No - x``, ``REVISE: x``) or at the end of the line
+        (``NO``). Both loops below go through this one helper, so they cannot
+        drift apart again.
+        """
+        if not candidate.startswith(token):
+            return False
+        rest = candidate[len(token):]
+        return not rest or not rest[0].isalnum()
 
     # ── APPROVED patterns (Russian) — must be checked BEFORE bare negatives ──
     _RU_APPROVED = [
@@ -968,7 +1000,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
 
         # ── English REVISE / REJECT / NO ─────────────────────────────────
         for token in ("REVISE", "REJECT", "NO"):
-            if upper.startswith(token):
+            if _verdict_token_at_start(upper, token):
                 rest = raw.strip()[len(token):].lstrip(": ").strip()
                 reason = rest if rest else "validator rejected (no reason given)"
                 return False, reason, False
@@ -987,7 +1019,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             if _EN_DISCOURSE_OK.match(_lu) or _EN_NOTHING_NEEDED.match(_lu):
                 return True, "", False
             for token in ("REVISE", "REJECT", "NO"):
-                if _lu.startswith(token):
+                if _verdict_token_at_start(_lu, token):
                     rest = _line.strip()[len(token):].lstrip(": ").strip()
                     reason = rest if rest else "validator rejected (no reason given)"
                     return False, reason, False

@@ -1,10 +1,10 @@
 # HARDEN-1 — eight defects in what a model's reply can contain and what the request masks: the verdict parser, the stream chunk, the prompt store, a dotted reference, quadratic claim extraction, two digit regexes, a code fence inside a JSON string, and the secret mask over-reaching
 
-**Status:** queued
+**Status:** landed (round 298: step-5-preview as the base — all eight defects, and the only entry that reads a JSON string with raw newlines in it; plus one case no entry covered: an unclosed fence whose string quotes a fence). Before: queued
 **Severity:** MEDIUM (wrong answers on inputs nobody tested; none loses data on a normal run)
 **File:** `tools/auto/inner_loop.py`, `tools/llm_stream.py`, `tools/collect/summarizer.py`, `tools/collect/verifier.py`, `tools/auto/story_bible.py`, `scripts/judge_epic_round.py`, `tools/prompt_store.py`, `tools/block_extractor.py`, `tools/search_agent.py`
 **Symbol:** `_parse_verdict_soft`, `request_completion` (the OpenAI SSE branch), `PromptStore.get_store_summary`, `extract_block` / `find_references`, `extract_claims` / `_iter_access_citations`, `_AGE_RE`, `_HAS_DURATION`, `_API_KEY_LINE_RE` / `mask_api_key`, Gate 2's fence split in `inner_loop.py`, `strip_json_fence`, `_parse_llm_summary`
-**Round:** —
+**Round:** 298
 **Size:** M
 **Depends on:** CC review fixes 34–36 (landed, `c2ef95b`): this ticket starts from their code
 **Also touches:** `tests/test_auto_verdict_boundary.py` and one pinned test per defect in `tests_bugfix/`

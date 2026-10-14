@@ -125,6 +125,10 @@ class DroppedClaim:
 # ── claim extraction from Pass B prose ─────────────────────────────────────────
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+# HARDEN-1 A5: the longest "sentence" `extract_claims` will parse at all. A claim
+# over about 2 000 characters is not a claim, and Pass B's prose has no length
+# cap of its own, so this is the second line of defence behind `_pair_brackets`.
+_MAX_CLAIM_SENTENCE_CHARS = 2000
 _LOCATION_RE = re.compile(r"(?<![\w./\\-])([\w./\\-]+\.py):(\d+)")   # (?<!…): starts where its run starts
 # A `path.py:identifier` citation — the same "file:thing" shape as
 # `_LOCATION_RE`, but naming a symbol instead of a line number (identifier
@@ -191,6 +195,36 @@ def _normalize_access(access: str) -> str:
     return access.replace('"', "'")
 
 
+def _pair_brackets(sentence: str) -> dict:
+    """Every ``[`` in *sentence* paired with the ``]`` that closes it, as a
+    ``{open_index: close_index}`` dict — one left-to-right pass with a stack.
+
+    HARDEN-1 A5: `_iter_access_citations` used to find every ``name[`` start
+    and then walk *forward from that start* to the bracket that brought its
+    depth back to zero. When the brackets never balance — ``"a[" * n``, a
+    looping or long Pass B answer — every start walked to the end of the
+    sentence, so the walk was O(n) per start and O(n²) overall: 38 s for
+    24 000 characters of unmatched brackets, at 100 % CPU, with no error and
+    no timeout, holding ``--collect`` for minutes.
+
+    Pairing once here makes the whole sentence O(n): each ``]`` closes the
+    most recent still-open ``[``, which is exactly the bracket the per-start
+    walk used to find, so the two agree on every string (checked against the
+    old function on 20 000 random bracket strings). An unmatched ``[`` (no
+    ``]`` left for it) and an unmatched ``]`` (nothing open to close) simply
+    have no entry, which is the old code's "unbalanced — not a real
+    subscript citation" outcome.
+    """
+    pairs: Dict[int, int] = {}
+    stack: List[int] = []
+    for i, ch in enumerate(sentence):
+        if ch == "[":
+            stack.append(i)
+        elif ch == "]" and stack:
+            pairs[stack.pop()] = i
+    return pairs
+
+
 def _iter_access_citations(sentence: str) -> List[str]:
     """Every `name[...]`-shaped access citation in `sentence`, with full,
     correctly-balanced bracket content — including one level (or more) of
@@ -208,35 +242,22 @@ def _iter_access_citations(sentence: str) -> List[str]:
        so a true, correctly-cited claim about the *outer* access was
        dropped by `citation_check` as an uncatalogued fabrication — even
        though it was neither uncatalogued nor fabricated, just mismatched
-       on a truncated string. Walking the brackets with an explicit depth
-       counter instead of a regex character class captures the whole
-       balanced span regardless of nesting depth.
+       on a truncated string. Pairing the brackets with an explicit stack
+       (see `_pair_brackets`) captures the whole balanced span regardless
+       of nesting depth, in one linear pass instead of one walk per start.
     2. The old pattern had no way to tell a real access apart from a type
        annotation using the same subscript syntax (`dict[str, int]`) —
        see `_TYPING_BASE_NAMES`'s docstring above.
     """
+    pairs = _pair_brackets(sentence)
     citations: List[str] = []
     for m in _ACCESS_START_RE.finditer(sentence):
         base = m.group(0)
         if base.rsplit(".", 1)[-1] in _TYPING_BASE_NAMES:
             continue
-        start = m.end()  # index of the opening '['
-        depth = 0
-        end = None
-        i = start
-        while i < len(sentence):
-            ch = sentence[i]
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-            i += 1
-        if end is None:
-            continue  # unbalanced — not a real subscript citation
-        citations.append(sentence[m.start():end + 1])
+        end = pairs.get(m.end())   # the `]` that closes this start's `[`, if it has one
+        if end is not None:
+            citations.append(sentence[m.start():end + 1])
     return citations
 
 
@@ -377,6 +398,18 @@ def extract_claims(
     for raw_sentence in _SENTENCE_SPLIT_RE.split(text.strip()):
         sentence = raw_sentence.strip()
         if not sentence:
+            continue
+        # HARDEN-1 A5 (second line of defence): `summary.purpose` and
+        # `summary.notes` come straight from the model with no length cap, and
+        # `_SENTENCE_SPLIT_RE` only splits on sentence punctuation and
+        # newlines — so one "sentence" can be the model's whole reply. A
+        # 2 000+ character run of prose is not a claim about anything, and the
+        # per-sentence work below (bracket pairing, location/symbol regexes,
+        # crash-word probes) is unbounded in what it is asked to look at, so
+        # such a sentence yields nothing rather than being parsed. The bracket
+        # walk itself is linear now (`_pair_brackets`), so this cap bounds
+        # prompt-sized prose, it is not the fix for the quadratic walk.
+        if len(sentence) > _MAX_CLAIM_SENTENCE_CHARS:
             continue
 
         # Every location, symbol and access citation in a sentence is extracted, not only the first (BUGFIX).

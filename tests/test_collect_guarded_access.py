@@ -73,7 +73,10 @@ def test_real_prompt_store_get_current_is_guarded_via_alias():
     accesses = _accesses(source, "tools/prompt_store.py")
     by_access = {(a.location, a.access): a for a in accesses}
     # Line number follows tools/prompt_store.py::get_current; update it if that method moves.
-    site = by_access[("tools/prompt_store.py:78", "stack[-1]")]
+    # (78 → 90: HARDEN-1 A3 put `_version_label` above the class.)
+    guarded_line = next(i for i, ln in enumerate(source.splitlines(), start=1)
+                        if 'return stack[-1]["prompt"]' in ln)
+    site = by_access[(f"tools/prompt_store.py:{guarded_line}", "stack[-1]")]
     assert site.status == "GUARDED"
     assert site.guard
 
