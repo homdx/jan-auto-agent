@@ -1,11 +1,11 @@
-# HARDEN-1 — four defects in what a model's reply can contain: the verdict parser, the stream chunk, the prompt store, a dotted reference
+# HARDEN-1 — six defects in what a model's reply can contain: the verdict parser, the stream chunk, the prompt store, a dotted reference, quadratic claim extraction and two digit regexes
 
 **Status:** open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** MEDIUM (wrong answers on inputs nobody tested; none loses data on a normal run)
-**File:** `tools/auto/inner_loop.py`, `tools/llm_stream.py`, `tools/prompt_store.py`, `tools/block_extractor.py`, `tools/search_agent.py`
-**Symbol:** `_parse_verdict_soft`, `request_completion` (the OpenAI SSE branch), `PromptStore.get_store_summary`, `extract_block` / `find_references`
+**File:** `tools/auto/inner_loop.py`, `tools/llm_stream.py`, `tools/collect/verifier.py`, `tools/auto/story_bible.py`, `scripts/judge_epic_round.py`, `tools/prompt_store.py`, `tools/block_extractor.py`, `tools/search_agent.py`
+**Symbol:** `_parse_verdict_soft`, `request_completion` (the OpenAI SSE branch), `PromptStore.get_store_summary`, `extract_block` / `find_references`, `extract_claims` / `_iter_access_citations`, `_AGE_RE`, `_HAS_DURATION`
 **Round:** —
-**Size:** S
+**Size:** M
 **Depends on:** CC review fixes 34–36 (landed, `c2ef95b`): this ticket starts from their code
 **Also touches:** `tests/test_auto_verdict_boundary.py` and one pinned test per defect in `tests_bugfix/`
 
@@ -67,9 +67,57 @@ prefix for some languages, make the extractor and the emitter agree rather than 
 
 ---
 
+### A5. Claim extraction is quadratic on a model's long text — `run`
+
+**Where:** `tools/collect/verifier.py`, `extract_claims` → `_iter_access_citations`, `_LOCATION_RE`, `_SYMBOL_CITATION_RE`; called by `verify_repo` on every module's
+`summary.purpose` and `summary.notes`, straight from the model, with no cap on the length.
+**Evidence (current code, after fixes 34–36; seconds for 6 000 / 12 000 / 24 000 characters):**
+
+| text | seconds |
+|---|---|
+| `"a[" * n/2` (brackets that never close) | 8.4 / 13.9 / 38.6 |
+| `"word[ " …` | 2.3 / 10.8 / 34.4 |
+| `"x[ " …` | 1.0 / 3.8 / 40.6 |
+| `"a/" * n/2` (path characters that never reach `.py:`) | 0.01 / 0.02 / 0.05 (fixed by fix 36) |
+
+Fix 36 made the path regexes linear but not the bracket walk: `_iter_access_citations` finds every `name[` start and walks forward to the matching `]`; when the brackets never
+balance every start walks to the end of the sentence, O(n²) in a pure-Python loop. A long or looping Pass B answer holds `--collect` at 100 % CPU for minutes, with no error,
+no log line and no timeout.
+**Fix:** pair the brackets once with a stack, then read the starts (the reviewer's replacement, tested against the old function on 20 000 random bracket strings with 0
+differences: 24 000 characters in 0.004 s):
+
+```python
+def _iter_access_citations(sentence):
+    match, stack = {}, []
+    for i, ch in enumerate(sentence):
+        if ch == "[":
+            stack.append(i)
+        elif ch == "]" and stack:
+            match[stack.pop()] = i
+    out = []
+    for m in _ACCESS_START_RE.finditer(sentence):
+        if m.group(0).rsplit(".", 1)[-1] in _TYPING_BASE_NAMES:
+            continue
+        end = match.get(m.end())
+        if end is not None:
+            out.append(sentence[m.start():end + 1])
+    return out
+```
+
+Check the result against the old function on the existing tests **and** on nested and interleaved brackets (`a[b[c]]`, `a[b]c]`) before accepting: the stack pairs differently from "the first `]` at depth 0" when brackets cross. A cap on the length of a sentence handed to `extract_claims` (a "claim" over about 2 000 characters is not a claim) is the second line of defence.
+**Test:** `extract_claims("a[" * 12000, "m.py")`, `"word[ " * 4000` and `"x[ " * 8000` each finish in under a second; results equal the old function's on 20 000 random bracket strings.
+
+### A6. Two regexes on a run of digits are quadratic — `run` (low reach)
+
+**Where:** `tools/auto/story_bible.py` (`_AGE_RE = (\d+)\s*(?:лет|год)`), `scripts/judge_epic_round.py` (`_HAS_DURATION = \d+(?:\.\d+)?\s*[smh]`).
+**Evidence:** a single line of `"1" * n`: `_AGE_RE` 3.7 s at 10 000 digits and 13.9 s at 20 000; `_HAS_DURATION` 4.3 s and 14.1 s. A run of thousands of digits in one line is very
+unlikely, which is why this is low.
+**Fix:** anchor the start with `(?<!\d)` or cap the line length.
+**Test:** 20 000 digits on one line: under a second, and the matches on ordinary text are unchanged.
+
 ## Contest
 
-One commit. Score by the shared tests in `contest-bench/298/` (each defect's reproduction as a script that exits non-zero on the bug), not by the entries' own tests; cross-test every entry's tests against every other's code. A1 is the one that costs rounds: an approval that begins with `NO…` goes to the Coder as a defect. Judge A1 by hand; A2–A4 by the pinned tests. Free models are enough for A2–A4; A1 wants a strong one.
+One commit. Score by the shared tests in `contest-bench/298/` (each defect's reproduction as a script that exits non-zero on the bug), not by the entries' own tests; cross-test every entry's tests against every other's code. A1 and A5 are the ones that cost: A1 sends an approval to the Coder as a defect, A5 freezes `--collect`: an approval that begins with `NO…` goes to the Coder as a defect. Judge A1 by hand; A2–A4 by the pinned tests. Free models are enough for A2–A4 and A6; A1 and A5 want a strong one (A5 must match the old function on crossing brackets).
 
 ## Refused (shared by HARDEN-1 … HARDEN-4, so they are not opened again)
 
