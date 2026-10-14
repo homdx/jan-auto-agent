@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO
-from tools.auto.git_manager import make_git_manager, GitError
+from tools.auto.git_manager import make_git_manager, DirtyTreeError, GitError, GitManager
 from tools.auto.utils import highest_completed_round
 # make_outer_loop is imported inside _run_task_loop, so tests can patch it at its source module.
 
@@ -468,7 +468,12 @@ class AutoController:
         # ──────────────────────────────────────────────────────────────────
 
         # AUTO-A3: ensure the target folder is a git repo with agent identity.
-        self._setup_git()
+        try:
+            self._setup_git()
+        except DirtyTreeError as exc:
+            print(f"⛔ --auto refused: {exc}", flush=True)
+            self.state.log(f"refused: {exc}")
+            return 2
 
         # Blocked tasks from a prior session go back to TODO so their dependencies are re-checked this session.
         self._reset_resettable_blocked_tasks(cfg)
@@ -1069,7 +1074,15 @@ class AutoController:
         """
         try:
             cfg = self._cfg()
+            probe = GitManager(self.base_dir, cfg) if (self.base_dir / ".git").exists() else None
+            had_commit = probe is not None and probe.get_current_hash() is not None
+            if had_commit:
+                changed = probe.user_changes()
+                if changed:
+                    raise DirtyTreeError(changed)
             self.git = make_git_manager(self.base_dir, cfg)
+            if not had_commit:
+                self.git.commit_existing_files()
             self.workspace_dir.mkdir(parents=True, exist_ok=True)
             self.state.log(
                 f"git ready (user={self.git.git_user} <{self.git.git_email}>)"

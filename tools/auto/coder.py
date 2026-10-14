@@ -1833,9 +1833,11 @@ class Coder(_llm_stream.LLMClientBase):
         except (OSError, ValueError) as exc:
             return None, f"path resolution error for {rel!r}: {exc}"
         try:
-            dest.relative_to(base_resolved)
+            inside = dest.relative_to(base_resolved)
         except ValueError:
             return None, f"path escapes base_dir: {rel!r} → {dest}"
+        if ".git" in inside.parts:
+            return None, f"rejected a path inside .git: {rel!r}"
         return dest, ""
 
     def _write_files(
@@ -1921,7 +1923,9 @@ class Coder(_llm_stream.LLMClientBase):
                 try:
                     if dest.exists():
                         backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                        # Backups keep the original bytes and mode, so no encoding or BOM is changed.
+                        # bytes and mode: read as utf-8 with errors=replace, a latin-1 \xe9 came back
+                        # as U+FFFD, and a BOM + CRLF file as BOM + LF — no backup of the original
+                        backup.unlink(missing_ok=True)    # copy2 keeps a read-only mode: it could not overwrite
                         shutil.copy2(dest, backup)
                         dest.unlink()
                         logger.info(
@@ -1992,6 +1996,7 @@ class Coder(_llm_stream.LLMClientBase):
                     except OSError:
                         existing_mode = None
                     backup = dest.with_suffix(dest.suffix + ".coder.bak")
+                    backup.unlink(missing_ok=True)
                     shutil.copy2(dest, backup)        # bytes and mode (see the delete branch)
                     content = in_style_of(dest, content)
                     logger.debug(

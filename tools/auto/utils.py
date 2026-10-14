@@ -4,7 +4,6 @@ from __future__ import annotations
 import configparser
 import hashlib
 import logging
-import errno
 import os
 import re
 import shlex
@@ -162,7 +161,7 @@ def _umask() -> int:
 
 
 def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = False,
-                      newline: "str | None" = None) -> None:
+                      newline: "str | None" = None, encoding: str = "utf-8") -> None:
     """Write *content* to *path* atomically (temp file + ``os.replace``).
 
     ``os.replace`` is a single filesystem rename, which POSIX and Windows both
@@ -179,7 +178,8 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
     hard-linked into place (``os.link`` fails if *path* exists), so of two
     racing writers exactly one wins and the other gets ``FileExistsError``
     instead of silently replacing the winner's file. A filesystem without
-    hard links falls back to the plain replace, after a plain check that *path* does not exist.
+    hard links creates *path* with ``O_EXCL`` and copies the content into it (create-only still holds;
+    a reader may see the file before it is complete).
 
     The file keeps the mode it had, and a new one gets what ``open()`` would
     give it (0666 less the umask): mkstemp's temporary file is 0600, and the
@@ -196,7 +196,7 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
             os.chmod(tmp_name, (path.stat().st_mode & 0o7777) if path.exists() else 0o666 & ~_umask())
         except OSError:
             pass
-        with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as f:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
@@ -206,12 +206,15 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
             except FileExistsError:
                 raise
             except OSError:
-                # Without hard links, create-only is best effort: an existing file is refused, not replaced.
-                if path.exists():
-                    raise FileExistsError(errno.EEXIST, "exists (hard links unavailable here)", str(path))
-                os.replace(tmp_name, path)
-            else:
-                os.unlink(tmp_name)
+                # no hard links here: O_EXCL is the atomic "fail if it exists" (a check, then a replace, let two
+                # writers both win)
+                import shutil
+                out = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, os.stat(tmp_name).st_mode & 0o7777)
+                with os.fdopen(out, "wb") as dst, open(tmp_name, "rb") as src:
+                    shutil.copyfileobj(src, dst)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+            os.unlink(tmp_name)
         else:
             os.replace(tmp_name, path)
         fsync_directory(path.parent)

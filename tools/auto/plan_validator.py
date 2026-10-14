@@ -73,7 +73,7 @@ from tools.auto.gate1_filter import filter_candidates, _is_technical_failure
 from tools.auto.git_manager import GitError, make_git_manager
 from tools.auto.plan_emitter import IMPROVEMENTS_FILENAME
 from tools.auto.state import STATUS_IN_PROGRESS, STATUS_TODO, StateStore
-from tools.auto.utils import _ts, atomic_write_text, normalize_task_mode
+from tools.auto.utils import _ts, atomic_write_text, in_style_of, normalize_task_mode
 from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
@@ -452,7 +452,7 @@ def _remove_from_improvements_md(base_dir: Path, removed_ids: "list[str]") -> No
             1,
         )
 
-    atomic_write_text(md_path, text)
+    atomic_write_text(md_path, in_style_of(md_path, text), newline="")
     logger.info(
         "_remove_from_improvements_md: stripped %d section(s) from %s",
         len(removed_ids), md_path,
@@ -518,7 +518,7 @@ def _append_false_positives(base_dir: Path, removed: "list[RemovedTask]") -> Non
         logger.debug("_append_false_positives: all task ids already recorded — no write")
         return
 
-    atomic_write_text(md_path, existing.rstrip() + "\n\n" + "".join(new_entries))
+    atomic_write_text(md_path, in_style_of(md_path, existing.rstrip() + "\n\n" + "".join(new_entries)), newline="")
     logger.info(
         "_append_false_positives: recorded %d new entr%s in %s",
         len(new_entries), "y" if len(new_entries) == 1 else "ies", md_path,

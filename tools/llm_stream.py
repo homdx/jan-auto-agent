@@ -188,8 +188,10 @@ def stream_options_is_supported(url: str, model=None) -> bool:
 
 # Matches an api_key line, commented or not, so a pasted secret is masked before the LLM sees it (MASK-KEY-1).
 _API_KEY_LINE_RE = re.compile(
-    r'(?im)^([ \t]*(?:[#;]+[ \t]*)?api_key[ \t]*=[ \t]*)(\S+)([ \t]*)$'
+    r'(?im)^([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?[\w.-]*api[_-]?key[ \t]*=[ \t]*)(\S+)([ \t]*\r?)$'
 )
+# the same key in JSON: "api_key": "<value>", "openai_api_key": "<value>"
+_API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]*(")')
 
 
 def mask_api_key(text: "str | None") -> "str | None":
@@ -205,7 +207,8 @@ def mask_api_key(text: "str | None") -> "str | None":
     """
     if not text:
         return text
-    return _API_KEY_LINE_RE.sub(r"\1here_your_key\3", text)
+    text = _API_KEY_LINE_RE.sub(r"\1here_your_key\3", text)
+    return _API_KEY_JSON_RE.sub(r"\1here_your_key\2", text)
 
 
 def strip_think(text: "str | None") -> "str | None":

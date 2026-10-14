@@ -882,7 +882,5 @@ def write_verification_report(report: Dict[str, Any], path: Path) -> None:
     """Write `report` as canonical (sorted-key, indented) JSON."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    from tools.auto.utils import atomic_write_text
+    atomic_write_text(path, json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n")

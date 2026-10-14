@@ -40,11 +40,14 @@ def _resolve_within_base(base_dir: str, file_path: str) -> "str | None":
     arbitrary files on the host. Returns the resolved absolute path if it
     stays within base_dir, else None.
     """
-    base_abs = os.path.abspath(base_dir)
-    target_abs = os.path.abspath(os.path.join(base_dir, file_path))
-    if target_abs == base_abs or target_abs.startswith(base_abs + os.sep):
-        return target_abs
-    return None
+    # realpath: a symlink inside base_dir that points outside it passed the string test
+    base_real = os.path.realpath(base_dir)
+    target_real = os.path.realpath(os.path.join(base_dir, file_path))
+    try:
+        inside = os.path.commonpath([base_real, target_real]) == base_real
+    except ValueError:
+        return None
+    return target_real if inside else None
 
 
 class _SearchChunkFailed(Exception):
@@ -1003,13 +1006,18 @@ class OrchestratorActions:
             _bak_n += 1
             backup = f"{target}.bak.{time.strftime('%H%M%S')}.{_bak_n}"
         try:
-            with open(backup, "w", encoding="utf-8") as b:
-                b.write(original)
-            # Atomic write, as in state.py, so a killed process leaves no truncated target.
-            _tmp = target + ".tmp-edit"
-            with open(_tmp, "w", encoding="utf-8") as f:
-                f.write(revised)
-            os.replace(_tmp, target)
+            import shutil
+            from pathlib import Path
+            from tools.auto.utils import atomic_write_text, in_style_of
+            shutil.copy2(target, backup)        # the original's bytes and mode
+            with open(target, "rb") as fh:
+                raw = fh.read()
+            try:
+                raw.decode("utf-8")
+                encoding = "utf-8"
+            except UnicodeDecodeError:
+                encoding = "latin-1"            # read_file's fallback: write back what it read
+            atomic_write_text(target, in_style_of(Path(target), revised), newline="", encoding=encoding)
         except Exception as e:
             print(f"[{_ts()}] ❌ Failed to write {target}: {e}")
             return

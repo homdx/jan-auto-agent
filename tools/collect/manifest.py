@@ -416,7 +416,8 @@ def build_manifest(
 def write_manifest(manifest: Manifest, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(manifest.to_json() + "\n", encoding="utf-8")
+    from tools.auto.utils import atomic_write_text
+    atomic_write_text(path, manifest.to_json() + "\n")
 
 
 def read_manifest(path: Path) -> Manifest:

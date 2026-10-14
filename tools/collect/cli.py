@@ -522,7 +522,8 @@ def _write_artifact(collect_dir: Path, ctx: CollectContext) -> List[str]:
 
     def _write(path: Path, content: str) -> None:
         try:
-            path.write_text(content, encoding="utf-8")
+            from tools.auto.utils import atomic_write_text
+            atomic_write_text(path, content)
         except OSError as exc:
             raise OSError(f"could not write {path}: {exc}") from exc
 

@@ -478,13 +478,14 @@ def write_merged_record(repo: Path, nn: int, agent: str, sha: str, subject: str)
     Written atomically through a sibling temp file, so a torn write cannot leave the
     other rounds' records unreadable.
     """
-    records = read_merged_record(repo)
-    records[str(nn)] = {"agent": agent, "sha": sha, "subject": subject}
+    from tools.auto.utils import atomic_write_text
+    from tools.claimcheck.truth import locked
     target = repo / MERGED_RECORD
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"{target.name}.tmp")
-    tmp.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, target)
+    # two merges at once each read, added and replaced: one round's record was lost
+    with locked(target):
+        records = read_merged_record(repo)
+        records[str(nn)] = {"agent": agent, "sha": sha, "subject": subject}
+        atomic_write_text(target, json.dumps(records, indent=2, sort_keys=True) + "\n")
 
 
 # ── entry merge: the winner, as it is ─────────────────────────────────────────

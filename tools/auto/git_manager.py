@@ -53,6 +53,16 @@ _DEFAULT_GIT_USER  = "auto-agent"
 _DEFAULT_GIT_EMAIL = "auto-agent@localhost"
 
 
+class DirtyTreeError(RuntimeError):
+    """The target has uncommitted changes that are not the agent's: a failed task's reset would take them."""
+
+    def __init__(self, paths: "list[str]") -> None:
+        self.paths = list(paths)
+        shown = ", ".join(self.paths[:5]) + (f" and {len(self.paths) - 5} more" if len(self.paths) > 5 else "")
+        super().__init__(f"uncommitted changes in the target: {shown} — commit or stash them first "
+                         "(a task that fails resets the tree to HEAD)")
+
+
 class GitError(RuntimeError):
     """Raised when a git command exits non-zero unexpectedly."""
 
@@ -150,7 +160,7 @@ class GitManager:
         try:
             self._run(["git", "add", ".gitignore"], "git add .gitignore failed")
             self._run(
-                ["git", "commit", "-m", "chore: add auto-agent safety .gitignore"],
+                ["git", "commit", "-m", "chore: add auto-agent safety .gitignore", "--", ".gitignore"],
                 "git commit .gitignore failed",
             )
             logger.info(
@@ -159,6 +169,54 @@ class GitManager:
         except GitError as exc:
             # Non-fatal: the file is written and the entries are present for git to honour.
             logger.warning("ensure_gitignore_committed: commit failed: %s", exc)
+
+    #: what the agent itself leaves in the target outside .agent/: not the user's changes
+    _OWN_OUTPUTS: tuple[str, ...] = (".agent/", "IMPROVEMENTS.md", "IMPROVEMENTS-FALSE.md")
+
+    def _collect_dir(self) -> Optional[str]:
+        """``[collect] dir`` relative to the repository (``.collect/``), or None when it lies outside it."""
+        try:
+            from tools.collect.cli import resolve_collect_dir
+            rel = resolve_collect_dir(self.repo_dir, self._config).resolve().relative_to(self.repo_dir)
+        except Exception:   # noqa: BLE001 — no collect dir to keep
+            return None
+        return rel.as_posix().rstrip("/") + "/" if rel.parts else None
+
+    def user_changes(self) -> list[str]:
+        """The paths ``git status`` reports that are not the agent's own outputs (the collect artifact included)."""
+        collect = self._collect_dir()
+        out = self._run(["git", "-c", "core.quotepath=false", "--no-optional-locks", "status",
+                         "--porcelain", "-z", "--untracked-files=all"], "git status failed")
+        paths, entries = [], out.split("\0")
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            if entry[0] in "RC":
+                i += 1          # -z: a rename's source is the next entry
+            path = entry[3:]
+            if path.startswith(".agent/") or path in self._OWN_OUTPUTS or path.endswith(".coder.bak") or \
+                    (collect is not None and path.startswith(collect)):
+                continue
+            paths.append(path)
+        return paths
+
+    def commit_existing_files(self) -> Optional[str]:
+        """Commit the files a repository without a commit already holds, .agent/ aside, so a reset to HEAD
+        has them to go back to; ``None`` when there is nothing to commit."""
+        # an ignored path named in an exclude pathspec is an error of `git add`: exclude only what is not ignored
+        keep_out = [] if self._agent_state_is_ignored() else [":(exclude).agent"]
+        collect = self._collect_dir()
+        if collect is not None and (self.repo_dir / collect).exists() and not self._is_ignored(collect):
+            keep_out.append(f":(exclude){collect}")
+        self._run(["git", "add", "-A", *(["--", ".", *keep_out] if keep_out else [])], "git add failed")
+        if not self.has_staged_changes():
+            return None
+        self._run(["git", "commit", "-m", "chore: the files as they were before the auto-agent"],
+                  "git commit of the existing files failed")
+        return self.get_current_hash()
 
     def configure_identity(self) -> None:
         """Set ``user.name`` and ``user.email`` locally in the repo.
@@ -219,7 +277,17 @@ class GitManager:
                 "writable."
             )
             return
-        self._run(["git", "clean", "-fd"], "git clean failed")
+        collect = self._collect_dir()
+        # an untracked collect artifact is an hour of Pass B, not a task's residue
+        keep = ["-e", f"/{collect}"] if collect is not None else []
+        self._run(["git", "clean", "-fd", *keep], "git clean failed")
+
+    def _is_ignored(self, rel: str) -> bool:
+        try:
+            return run_git(["git", "check-ignore", "-q", rel], cwd=self.repo_dir, timeout=30, encoding="utf-8",
+                           errors="replace", retries=1).returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
 
     def _agent_state_is_ignored(self) -> bool:
         """Return True only if git will actually ignore ``.agent/``.
