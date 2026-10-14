@@ -1,6 +1,6 @@
 # CC-14 — the round's claims at the judge: did each entry do what its ticket says (`judge_epic_round.py --claims`)
 
-**Status:** open — FINAL, written 2026-10-13 from reading the code paths (the judge, `claim_diff.py`, the contest's hand-over); not yet measured.
+**Status:** queued
 Cut it into `epic-tasks/` with the first word `open` when the round starts.
 **Severity:** MEDIUM (it is the one question of a round the judge still answers by reading, and the instrument for it exists)
 **File:** `scripts/judge_epic_round.py`, `scripts/claim_diff.py`, `tools/contest/export.py`, `tools/contest/draft.py`
