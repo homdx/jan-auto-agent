@@ -305,7 +305,7 @@ def summarize_repo(
     sleep_fn: Callable[[float], None] = time.sleep,
     on_error: Optional[Callable[[str, Exception, int], None]] = None,
     checkpoint_path: Optional[Path] = None,
-    progress_fn: Optional[Callable[[int, int, str], None]] = None,
+    progress_fn: Optional[Callable[[int, int, str, bool], None]] = None,
     hashes: Optional[Dict[str, str]] = None,
     on_resume: Optional[Callable[[int, int], None]] = None,
 ) -> List[ModuleRecord]:
@@ -338,10 +338,12 @@ def summarize_repo(
     `sleep_fn` defaults to `time.sleep` but is injectable so tests can run
     the retry path without actually waiting.
 
-    `progress_fn(done_count, total_count, module_path)` — if given, called
-    once after each module that actually needs an LLM call finishes (cached
-    or parse-error modules don't count toward the total, since nothing is
-    sent for them). Pass a no-op lambda to silence progress reporting.
+    `progress_fn(done_count, total_count, module_path, succeeded)` — if given,
+    called once after each module that actually needs an LLM call finishes
+    (cached or parse-error modules don't count toward the total, since nothing is
+    sent for them). `succeeded` is True when the module ended up with a summary,
+    False when the summarizer gave up. Pass a no-op lambda to silence progress
+    reporting.
     """
     from tools.backoff import retry_with_backoff, clear_state, save_state
 
@@ -379,6 +381,7 @@ def summarize_repo(
 
         source = sources.get(module.path, "")
         result = module
+        last_error = ""
         try:
             result = retry_with_backoff(
                 lambda: summarize_module(
@@ -401,11 +404,12 @@ def summarize_repo(
                 module.path, max_retries + 1, exc,
             )
             result = module
+            last_error = f"{type(exc).__name__}: {exc}"
 
         out.append(result)
         sent += 1
         if progress_fn is not None:
-            progress_fn(sent, total, module.path)
+            progress_fn(sent, total, module.path, result.summary is not None, last_error)
         if checkpoint_path is not None and result.summary is not None:
             entry = {
                 "purpose": result.summary.purpose,

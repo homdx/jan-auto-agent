@@ -494,7 +494,7 @@ def test_summarize_repo_resume_reuses_matching_sha_and_re_summarises_a_changed_o
     out = summarize_repo(
         _two_modules(), _two_sources(), stub_llm, sleep_fn=lambda s: None,
         checkpoint_path=checkpoint, hashes=hashes,
-        progress_fn=lambda done, total, path: totals.append((done, total, path)),
+        progress_fn=lambda done, total, path, succeeded, error="": totals.append((done, total, path, succeeded)),
     )
 
     assert out[0].summary.purpose == "cached"
@@ -502,7 +502,7 @@ def test_summarize_repo_resume_reuses_matching_sha_and_re_summarises_a_changed_o
     # Exactly the one module whose sha moved was sent to the LLM.
     assert calls["n"] == 1
     # The progress total is what is still owed, not the whole batch.
-    assert totals == [(1, 1, "pkg/other.py")]
+    assert totals == [(1, 1, "pkg/other.py", True)]
     assert not checkpoint.exists()  # batch completed → cleared
 
 

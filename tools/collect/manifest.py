@@ -320,6 +320,10 @@ class Manifest:
     file_hashes: Dict[str, str] = field(default_factory=dict)
     # Effective skip_dirs when built; a changed list reads as stale, and old manifests read as default.
     skip_dirs: Tuple[str, ...] = field(default_factory=tuple)
+    # CC-15: modules whose Pass B produced no summary (gave up or reply never parsed).
+    # A --no-llm build records () — no summary is expected there. Older manifests
+    # without the key read as () and are unaffected.
+    unsummarized: Tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         return {
@@ -329,6 +333,7 @@ class Manifest:
             "dirty": self.dirty,
             "file_hashes": dict(self.file_hashes),
             "skip_dirs": sorted(self.skip_dirs),
+            "unsummarized": sorted(self.unsummarized),
         }
 
     def to_json(self, *, indent: int = 2) -> str:
@@ -357,6 +362,11 @@ class Manifest:
             if isinstance(d.get("skip_dirs"), (list, tuple))
             and all(isinstance(x, str) for x in d["skip_dirs"])
             else tuple(sorted(DEFAULT_SKIP_DIRS)),
+            # A missing or malformed unsummarized key falls back to [] (older manifests); the manifest is not unreadable.
+            unsummarized=tuple(sorted(d.get("unsummarized", [])))
+            if isinstance(d.get("unsummarized"), (list, tuple))
+            and all(isinstance(x, str) for x in d["unsummarized"])
+            else tuple(),
         )
 
     @classmethod
@@ -373,6 +383,7 @@ def build_manifest(
     file_hashes: Optional[Dict[str, str]] = None,
     config: Optional["configparser.ConfigParser"] = None,
     skip_dirs: Optional[Iterable[str]] = None,
+    unsummarized: Optional[Iterable[str]] = None,
 ) -> Manifest:
     """Build a `Manifest` for `root`. If `files` isn't given, discovers
     `*.py` files under `root` via `discover_files`.
@@ -400,6 +411,9 @@ def build_manifest(
     so a change of the setting is a change of the artifact, visible to
     `is_fresh` — without it, a manifest built with one list compared against a
     tree walked with another would drift silently.
+    CC-15: `unsummarized` records the paths of modules whose Pass B produced no
+    summary; a --no-llm build passes () so the manifest is fresh, and an older
+    manifest without the key is read as () (below).
     """
     root = Path(root)
     effective = effective_skip_dirs(config, skip_dirs)
@@ -415,6 +429,7 @@ def build_manifest(
         dirty=dirty,
         file_hashes=file_hashes if file_hashes is not None else hash_tree(root, file_list),
         skip_dirs=tuple(sorted(effective)),
+        unsummarized=tuple(sorted(unsummarized)) if unsummarized is not None else tuple(),
     )
 
 
@@ -493,6 +508,10 @@ def is_fresh(
     if manifest.collector_version != COLLECTOR_VERSION:
         return False
     if skip_dirs is not None and tuple(sorted(skip_dirs)) != tuple(manifest.skip_dirs):
+        return False
+    # CC-15: a manifest with unsummarized modules is stale — they will be retried
+    # at the next --collect / --refresh instead of being reported up to date.
+    if manifest.unsummarized:
         return False
     if hashes is not None:
         return hashes == manifest.file_hashes

@@ -1,13 +1,13 @@
 # CC-15 — a module Pass B left without a summary is "up to date" and is never summarized again
 
-**Status:** FINAL, open — found 2026-10-14 while building the collect model of the layer-2 target for CC-13 (295) on sensenova; reproduced with a fake model
+**Status:** landed (round 297: agnes-2-5-flash as the base, made to say what the ticket says; black box 297, 25 checks). Before: FINAL, open — found 2026-10-14 while building the collect model of the layer-2 target for CC-13 (295) on sensenova; reproduced with a fake model
 (below). Cut it into `epic-tasks/` with the first word `open` when the round starts.
 **Severity:** MEDIUM (a summary the provider failed to give once is gone for good: the judges' packs, the reader's contract notes and the docs read an
 artifact that silently lacks it, and every check says the artifact is fine)
 **File:** `tools/collect/cli.py`, `tools/collect/manifest.py`, `tools/collect/summarizer.py`
 **Symbol:** `action_refresh` (the incremental batch), `_freshness` / `--check`, `build_manifest` / `Manifest` / `is_fresh`, the `[i/n] summarized` progress line of
 `summarize_repo`
-**Round:** —
+**Round:** 297
 **Size:** S
 **Depends on:** RUN-11 (39, the Pass B checkpoint, landed), CC-13 (295, landed)
 **Also touches:** `tools/collect/loader.py` (`load_readonly`: the count it reports), `tests/test_collect_cli.py`, `tests/test_collect_summarizer.py`, a new

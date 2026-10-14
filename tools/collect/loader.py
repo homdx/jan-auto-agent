@@ -577,11 +577,15 @@ def load_readonly(
             causes.append("collector version")
         if tuple(sorted(skip)) != tuple(man.skip_dirs):
             causes.append("skip_dirs changed")
+        if man.unsummarized:
+            n = len(man.unsummarized)
+            causes.append(f"{n} module{'' if n == 1 else 's'} without a summary")
         causes = tuple(causes)
         reasons = ([f"{changed} tracked file(s) changed"] if changed else []) + [
             f"manifest was built by collector_version={man.collector_version!r}, "
             f"current is {manifest_mod.COLLECTOR_VERSION!r}" if c == "collector version" else
             f"manifest recorded skip_dirs {list(man.skip_dirs)}, the config says {sorted(skip)}"
+            if c == "skip_dirs changed" else c
             for c in causes]
         reason = "artifact is stale (" + "; ".join(reasons or ["a tracked file changed"]) + ")"
 

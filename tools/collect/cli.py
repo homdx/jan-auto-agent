@@ -81,10 +81,21 @@ from tools.collect.scanner import language_for, scan_file, scan_repo
 from tools.collect.summarizer import LlmCall, collect_max_retries, summarize_repo
 
 
-def _print_summarize_progress(done: int, total: int, module_path: str) -> None:
+def _modules(n: int) -> str:
+    """`1 module` / `N modules`."""
+    return f"{n} module" + ("" if n == 1 else "s")
+
+
+def _print_summarize_progress(done: int, total: int, module_path: str, succeeded: bool = True,
+                              last_error: str = "") -> None:
     """Simple `[done/total]` progress line printed to stdout after each
-    module's LLM call finishes (COLLECT Pass B)."""
-    print(f"[{done}/{total}] summarized {module_path}", flush=True)
+    module's LLM call finishes (COLLECT Pass B). When `succeeded` is
+    False the module ran out of retries and got no summary — say so
+    rather than mislabeling it `summarized`."""
+    if succeeded:
+        print(f"[{done}/{total}] summarized {module_path}", flush=True)
+    else:
+        print(f"[{done}/{total}] no summary {module_path}" + (f" ({last_error})" if last_error else ""), flush=True)
 
 
 def _print_summarize_error(module_path: str, exc: Exception, error_count: int) -> None:
@@ -575,6 +586,7 @@ def _write_manifest(
     provenance: Optional[Tuple[Optional[str], bool]] = None,
     file_hashes: Optional[Dict[str, str]] = None,
     config: Optional[configparser.ConfigParser] = None,
+    unsummarized: Optional[Tuple[str, ...]] = None,
 ) -> None:
     """`provenance`, if given, must be a `(git_sha, dirty)` pair captured
     via `manifest_mod.capture_provenance(root)` *before* `_write_artifact`
@@ -582,10 +594,14 @@ def _write_manifest(
 
     `file_hashes`, if given, is the `{path: sha256}` map the caller already
     computed for this same set of modules, reused instead of re-hashing the
-    tree here (see `manifest.build_manifest`)."""
+    tree here (see `manifest.build_manifest`).
+    `unsummarized`, if given, is the sorted list of module paths whose Pass B
+    produced no summary — the manifest records them so the next refresh can
+    retry just those instead of treating the whole artifact as fresh."""
     files = sorted(m.path for m in modules)
     manifest = manifest_mod.build_manifest(
         root, files, provenance=provenance, file_hashes=file_hashes, config=config,
+        unsummarized=unsummarized,
     )
     manifest_mod.write_manifest(manifest, collect_dir / MANIFEST_FILENAME)
 
@@ -668,6 +684,9 @@ def _freshness(
                                  hashes=hashes, skip_dirs=manifest_mod.skip_dirs_from_config(config))
     if fresh:
         reason = "up to date"
+    elif existing.unsummarized:
+        n = len(existing.unsummarized)
+        reason = f"stale — {_modules(n)} without a summary"
     elif existing.collector_version != manifest_mod.COLLECTOR_VERSION:
         # No file changed, so the reason is the schema; the old message said the opposite.
         reason = (
@@ -730,20 +749,27 @@ def _full_build(
         summaries_carried=carried, summaries_stale=stale, summaries_dropped=dropped,
     )
     written = _write_artifact(collect_dir, ctx)
+    # Compute the set of modules Pass B left without a summary so the manifest
+    # can list them and the next refresh retries just those (CC-15).
+    # A --no-llm build never attempted Pass B, so unsummarized stays empty.
+    unsummarized = tuple(sorted(
+        m.path for m in ctx.modules
+        if m.summary is None and m.parse_error is None and pass_b_ran
+    ))
     _write_manifest(root, collect_dir, ctx.modules, provenance=provenance, file_hashes=hashes,
-                    config=config)
+                    config=config, unsummarized=unsummarized)
     written = sorted(set(written) | {MANIFEST_FILENAME})
-    return collect_dir, written, ctx
+    return collect_dir, written, ctx, unsummarized
 
 
-def _full_build_message(why: str, ctx: CollectContext, written: List[str], collect_dir: Path) -> str:
+def _full_build_message(why: str, ctx: CollectContext, written: List[str], collect_dir: Path, unsummarized: Tuple[str, ...] = ()) -> str:
     """The one line every full build reports, whichever path reached it
     (`--rebuild`, a first-ever run, a `collector_version` mismatch). It
     leads with `why` so the reader sees which path ran, and it counts what
     Pass B actually did, in both directions:
 
     - `--no-llm` / `[collect] llm_summaries = false` / a summarizer that
-      could not be built never run Pass B (`build_context` leaves
+      could not be built never ran Pass B (`build_context` leaves
       `verification_report` None), and then the honest verb is
       "re-scanned (Pass B skipped)", not "re-summarized";
     - a module with a parse error is never summarized, and a summarizer
@@ -751,9 +777,14 @@ def _full_build_message(why: str, ctx: CollectContext, written: List[str], colle
       module(s) re-summarized" for a tree where only some were was a
       literal overclaim on the one number V7 made this line report. A
       partial batch names both halves; a batch that ran and produced
-      nothing says so rather than claiming Pass B was skipped."""
+      nothing says so rather than claiming Pass B was skipped.
+    - CC-15: when some modules ran out of retries and are listed in
+      `unsummarized`, they are named so the operator knows which ones
+      will be retried at the next --collect instead of staying silently
+      without a summary."""
     total = len(ctx.modules)
     summarized = sum(1 for m in ctx.modules if m.summary is not None)
+    n_unsummarized = len(unsummarized)
     pass_b_ran = ctx.pass_b_ran
     if not pass_b_ran:
         what = f"{total} module(s) re-scanned (Pass B skipped{_pass_b_suffix(ctx)})"
@@ -763,6 +794,8 @@ def _full_build_message(why: str, ctx: CollectContext, written: List[str], colle
         what = f"{total} module(s) re-scanned, {summarized} re-summarized"
     else:
         what = f"{total} module(s) re-scanned, none re-summarized (Pass B produced no summary)"
+    if n_unsummarized:
+        what += f", {n_unsummarized} without a summary (tried again at the next --collect)"
     return f"{why}{what}; wrote {len(written)} file(s) in {collect_dir}"
 
 
@@ -794,12 +827,12 @@ def action_rebuild(
     `drop_summaries` asks for the structural-only artifact explicitly.
     """
     root = Path(root)
-    collect_dir, written, ctx = _full_build(
+    collect_dir, written, ctx, unsummarized = _full_build(
         root, config=config, config_path=config_path, llm_call=llm_call, drop_summaries=drop_summaries,
     )
     return CollectResult(
         action="rebuild", wrote=True, fresh=True,
-        message=_full_build_message("", ctx, written, collect_dir),
+        message=_full_build_message("", ctx, written, collect_dir, unsummarized=unsummarized),
         collect_dir=collect_dir, written_files=tuple(written),
     )
 
@@ -905,13 +938,13 @@ def action_refresh(
     )
 
     if previous_manifest is None:
-        collect_dir, written, ctx = _full_build(
+        collect_dir, written, ctx, unsummarized = _full_build(
             root, config=config, config_path=config_path, llm_call=llm_call,
             modules=current_modules, hashes=current_hashes, drop_summaries=drop_summaries,
         )
         return CollectResult(
             action="refresh", wrote=True, fresh=True,
-            message=_full_build_message(why, ctx, written, collect_dir),
+            message=_full_build_message(why, ctx, written, collect_dir, unsummarized=unsummarized),
             collect_dir=collect_dir, written_files=tuple(written),
         )
 
@@ -928,11 +961,20 @@ def action_refresh(
         and prev.summary.provenance == Provenance.LLM_STALE
     }
     to_summarize += [m for m in current_modules if m.path in stale_paths]
+    # CC-15: modules that were left without a summary last time are retried too,
+    # alongside the changed ones; unchanged modules that are already summarized
+    # are not touched.
+    previous_unsummarized = set(previous_manifest.unsummarized)
+    to_summarize += [m for m in current_modules if m.path in previous_unsummarized]
 
     settings = read_collect_settings(config)
     # "Skipped" is reported only when there was something to summarise, not for a deletion-only refresh.
     pass_b_skipped = bool(to_summarize) and (llm_call is None or not settings.llm_summaries)
     summarized_by_path: Dict[str, ModuleRecord] = {}
+    # Tracks every module path that was actually handed to summarize_repo this run;
+    # unchanged / carried-forward modules are excluded, as are modules skipped by
+    # pass_b_skipped (they never reached the LLM at all).
+    summarized_paths: set = set()
     if to_summarize and not pass_b_skipped:
         sources_for_summary: Dict[str, str] = {}
         for m in to_summarize:
@@ -957,6 +999,7 @@ def action_refresh(
                 on_resume=_print_summarize_resume,
             )
         }
+        summarized_paths = {m.path for m in batch}
 
     # With Pass B skipped, a changed module keeps its old summary, tagged stale, unless --drop-summaries removes it (V8).
     carried = stale = dropped = 0
@@ -995,8 +1038,16 @@ def action_refresh(
 
     written = _write_artifact(collect_dir, ctx)
     # The hashes computed for the diff are reused for the manifest, so the tree is not hashed twice.
+    # CC-15: record which modules Pass B left without a summary so the next refresh retries them.
+    # Only modules actually sent to Pass B this run count — unchanged modules carried forward
+    # from a previous build keep whatever summary state they already had, and skipped batches
+    # (no llm_call, llm_summaries=false) never attempted anything.
+    unsummarized = tuple(sorted(
+        m.path for m in ctx.modules
+        if m.summary is None and m.parse_error is None and m.path in summarized_paths
+    ))
     _write_manifest(root, collect_dir, ctx.modules, provenance=provenance,
-                    file_hashes=current_hashes, config=config)
+                    file_hashes=current_hashes, config=config, unsummarized=unsummarized)
     written = sorted(set(written) | {MANIFEST_FILENAME})
 
     if changes.is_empty():
@@ -1013,6 +1064,13 @@ def action_refresh(
             suffix = " (Pass B produced no summary)"
         else:
             suffix = ""
+        # CC-15: name modules that still lack a summary after the batch.
+        n_unsummarized = sum(
+            1 for m in ctx.modules
+            if m.summary is None and m.parse_error is None and m.path in summarized_paths
+        )
+        if n_unsummarized:
+            suffix += f", {n_unsummarized} without a summary (tried again at the next --collect)"
         message = f"incrementally refreshed {scope} module(s){suffix}; wrote {len(written)} file(s) in {collect_dir}"
 
     return CollectResult(
