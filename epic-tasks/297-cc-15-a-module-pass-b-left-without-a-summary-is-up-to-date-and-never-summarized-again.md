@@ -1,6 +1,6 @@
 # CC-15 — a module Pass B left without a summary is "up to date" and is never summarized again
 
-**Status:** open — FINAL, found 2026-10-14 while building the collect model of the layer-2 target for CC-13 (295) on sensenova; reproduced with a fake model
+**Status:** queued
 (below). Cut it into `epic-tasks/` with the first word `open` when the round starts.
 **Severity:** MEDIUM (a summary the provider failed to give once is gone for good: the judges' packs, the reader's contract notes and the docs read an
 artifact that silently lacks it, and every check says the artifact is fine)
