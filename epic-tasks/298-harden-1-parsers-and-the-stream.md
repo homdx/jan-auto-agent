@@ -1,9 +1,9 @@
-# HARDEN-1 — seven defects in what a model's reply can contain: the verdict parser, the stream chunk, the prompt store, a dotted reference, quadratic claim extraction, two digit regexes, and a code fence inside a JSON string
+# HARDEN-1 — eight defects in what a model's reply can contain and what the request masks: the verdict parser, the stream chunk, the prompt store, a dotted reference, quadratic claim extraction, two digit regexes, a code fence inside a JSON string, and the secret mask over-reaching
 
 **Status:** open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** MEDIUM (wrong answers on inputs nobody tested; none loses data on a normal run)
 **File:** `tools/auto/inner_loop.py`, `tools/llm_stream.py`, `tools/collect/summarizer.py`, `tools/collect/verifier.py`, `tools/auto/story_bible.py`, `scripts/judge_epic_round.py`, `tools/prompt_store.py`, `tools/block_extractor.py`, `tools/search_agent.py`
-**Symbol:** `_parse_verdict_soft`, `request_completion` (the OpenAI SSE branch), `PromptStore.get_store_summary`, `extract_block` / `find_references`, `extract_claims` / `_iter_access_citations`, `_AGE_RE`, `_HAS_DURATION`, Gate 2's fence split in `inner_loop.py`, `strip_json_fence`, `_parse_llm_summary`
+**Symbol:** `_parse_verdict_soft`, `request_completion` (the OpenAI SSE branch), `PromptStore.get_store_summary`, `extract_block` / `find_references`, `extract_claims` / `_iter_access_citations`, `_AGE_RE`, `_HAS_DURATION`, `_API_KEY_LINE_RE` / `mask_api_key`, Gate 2's fence split in `inner_loop.py`, `strip_json_fence`, `_parse_llm_summary`
 **Round:** —
 **Size:** M
 **Depends on:** CC review fixes 34–36 (landed, `c2ef95b`): this ticket starts from their code
@@ -140,9 +140,36 @@ no-fence replies: all six parse, where the current code fails the bare-with-fenc
 **Test:** the table's four rows return the object; the six reply shapes above all parse; Gate 2 with a stubbed model returns `approved=True` for a bare and a wrapped approval whose
 text quotes a fence, and a rejection's hint reaches the Coder intact; no-fence replies are unchanged.
 
+### A8. The secret mask rewrites code that is not a secret, and the model writes the placeholder back to disk — `run` (regression of fix 34)
+
+**Where:** `tools/llm_stream.py`: `_API_KEY_LINE_RE`, `_API_KEY_JSON_RE`, `mask_api_key`, applied to every request by `_mask_payload_secrets`.
+**Evidence (current code, `_mask_payload_secrets` on one user message):**
+
+| text in the file | what the model is sent |
+|---|---|
+| `self.api_key = api_key` | `self.api_key = here_your_key` |
+| `OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]` | `OPENAI_API_KEY = here_your_key` |
+| `"api_key": "k1"` | `"api_key": "here_your_key"` |
+| `api_key = sk-abc123` | `api_key = here_your_key` (the intended case) |
+| `x = 1` | unchanged |
+
+Fix 34 widened the mask: before it, only a bare `api_key = x` line was hit; now any assignment whose name contains `api_key` is. The text is the file the model is asked to rewrite **in
+full** (`/edit`, and the Coder, which reads and writes whole files through the same request path). The model gives the placeholder back, the file is written, and working code becomes a
+`NameError` (`here_your_key` is undefined) that nothing catches. The reviewer reproduced it end to end with `/edit` against a fake model that edits faithfully, asked to change one line
+(`timeout = 30` → `60`): 3 lines changed on disk instead of 1 (`1a5f18a`: 1). Across this repository's own `.py` files the mask matches hundreds of lines (445 lines in 210 files by the
+reviewer's count; I counted 43 assignment lines in `tools/`, `scripts/` and `main.py` alone with a looser pattern, so the numbers are not comparable — measure it in the test).
+**Fix (the intent is to keep a real secret out of the request without touching code):**
+1. Mask only a **literal** value: a quoted string, or a bare token that looks like a key (long, no `.`, `(`, `[`, spaces; not an identifier that is itself an expression). `self.api_key = api_key`
+   and `OPENAI_API_KEY = os.environ[...]` are expressions, not secrets.
+2. And/or restore on the way back: remember each masked line's original and put it back where the reply returns the placeholder, so a faithful rewrite round-trips (a model that changes the
+   line is its own business).
+Pick one and say which; the test below must pass under either.
+**Test:** the five rows: only the 3rd (a literal) and 4th are masked, the first two are sent as they are; a faithful `/edit` round-trip over a file holding `self.api_key = api_key` changes
+exactly the one line asked for; a real key in the same file is still not in the outgoing request.
+
 ## Contest
 
-One commit. The judge's own checks are not published and are written after the round, from the entries, so nothing here can be written to pass them: the entries' own tests are cross-tested against every other entry's code, and the judge reads every diff. A1, A5 and A7 are the ones that cost: A1 sends an approval to the Coder as a defect, A5 freezes `--collect`, A7 throws away an approved candidate: an approval that begins with `NO…` goes to the Coder as a defect. Judge A1 by hand; A2–A4 by the pinned tests. Free models are enough for A2–A4 and A6; A1, A5 and A7 want a strong one (A5 must match the old function on crossing brackets).
+One commit. The judge's own checks are not published and are written after the round, from the entries, so nothing here can be written to pass them: the entries' own tests are cross-tested against every other entry's code, and the judge reads every diff. A1, A5 and A7 are the ones that cost: A1 sends an approval to the Coder as a defect, A5 freezes `--collect`, A7 throws away an approved candidate, A8 writes `here_your_key` into working code: an approval that begins with `NO…` goes to the Coder as a defect. Judge A1 by hand; A2–A4 by the pinned tests. Free models are enough for A2–A4 and A6; A1, A5, A7 and A8 want a strong one (A5 must match the old function on crossing brackets).
 
 ## Refused (shared by HARDEN-1 … HARDEN-4, so they are not opened again)
 
