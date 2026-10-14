@@ -121,6 +121,15 @@ HEADER_FIELDS = ("Status", "Severity", "File", "Symbol", "Round", "Size", "Also 
 #: Every section a ticket carries.
 SECTIONS = ("Why", "What to build", "Acceptance", "Rules")
 
+#: Sections a ticket may carry but the lint does not ask for: `Claims` holds the claims
+#: `judge_epic_round.py --claims` judges at the base and at every entry, after `## Acceptance`.
+OPTIONAL_SECTIONS = ("Claims",)
+
+#: The four words a `## Claims` bullet names — the expects `claim_diff` understands: `new` is the
+#: behaviour the ticket adds, `fixed` the defect it states (true at the base, false after the fix),
+#: `still` what must not change, `gone` what must not be there.
+CLAIM_WORDS = ("new", "fixed", "still", "gone")
+
 #: The `**Status:**` the lint wants on a ticket that has just been written.
 OPEN = "open"
 
@@ -465,9 +474,21 @@ def ticket_format_spec() -> str:
     for section in SECTIONS:
         lines.append(f"## {section}")
         lines.append("")
+    for section in OPTIONAL_SECTIONS:
+        lines += [f"## {section}", "",
+                  "```",
+                  "- [new] `this_function` returns None when the config key is off.",
+                  "- [fixed] `this_function` returns 0 for an artifact from an older run.",
+                  "- [still] `this_function` never writes to the collect directory.",
+                  "- [gone] `old_helper` is imported from nowhere.",
+                  "```", ""]
     lines.append(
         "Every header field above must be present; `## Acceptance` must hold a "
-        "fenced code block with the command that proves the work."
+        "fenced code block with the command that proves the work. `## Claims` is optional, after "
+        "`## Acceptance`: one bullet per claim, the word in brackets one of "
+        f"{', '.join(CLAIM_WORDS)} — the claim its bracket asks for, and the code span that names "
+        "the code it is about. `judge_epic_round.py --claims` judges it at the base and at every "
+        "entry; a ticket that omits it is judged as before."
     )
     return "\n".join(lines)
 

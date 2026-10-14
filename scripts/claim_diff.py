@@ -31,8 +31,16 @@ rule of both sides' `tally` — one rule for both, so a FIXED never compares a s
 abstainers with one that was not; both ``votes_*.json`` record it, and ``delta.json`` does when
 it is not ``all``.
 
+CC-14: ``--base-votes FILE`` reuses the base side an earlier run wrote to
+``votes_base.json``, so a round of entries that all start from the same commit pays for the base
+side once instead of once per entry. The reuse is conditional: the record's identity (the claims
+voted, the base sha, the voters, the runs, the acceptance rule) must be this run's own, and any
+difference is a refusal (exit 2, naming the field) rather than a stale base judged as this round's.
+``judge_both`` is the same seam, with a ``base_side`` recorded by ``base_side_record``.
+
 Exit: 0, or 1 for a ``--check`` mismatch, or 2 for a refusal (a target or ref that does not
-open, an unreadable claim file, an ``expect`` that is not one of the four words).
+open, an unreadable claim file, an ``expect`` that is not one of the four words, a recorded base
+side whose identity is not this run's).
 """
 from __future__ import annotations
 
@@ -133,17 +141,105 @@ def requests_of(items: list, voters: int, runs: int, batch: int, code_batch: int
     return voters * runs * len(cc_judge.batches(items, batch, code_batch))
 
 
+#: The five things that make a recorded base side this run's own, in the order the refusal names them.
+BASE_FIELDS = ("claims", "base", "voters", "runs", "accept")
+
+
+def base_side_record(claims: list, base: Target, voters: list, runs: int, got: dict) -> dict:
+    """The ``base`` part of *got* with the identity of the run that produced it.
+
+    A round judges the same claims at the same base once and reuses that side for every
+    entry, so the record has to say who judged it: the claims voted, the base sha, the
+    voters, the runs and the acceptance rule. ``base_side_differs`` compares all five
+    before a second entry reuses it."""
+    side = got["base"]
+    index = side.get("index") or []
+    return {**side, "identity": {
+        "claims": [[claims[i].get("id"), claims[i].get("claim")] for i in index],
+        "base": base.sha,
+        "voters": sorted(str(v) for v in (voters or [])),
+        "runs": int(runs or 0),
+        "accept": got.get("accept", cv.DEFAULT_ACCEPT),
+    }}
+
+
+def base_side_from_votes(path) -> dict:
+    """A ``votes_base.json`` as a recorded base side: the file's own identity, read from it.
+
+    ``--base-votes`` is the same reuse from the command line, so the identity comes out of the
+    file rather than being believed: the base sha is its ``target.sha``, the voters and runs
+    its ``results``, the claims the tally rows it was tallied over. An unreadable or broken
+    file is ``{}`` — the caller refuses that as an empty record, it never raises here."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    results = data.get("results") or []
+    table = data.get("claims") or []
+    runs = 0
+    for r in results:
+        if isinstance(r, dict):
+            runs = max(runs, int(r.get("run") or 0) + 1)
+    return {"rows": None, "results": results, "table": table,
+            "index": list(range(len(table))),
+            "identity": {
+                "claims": [[row.get("id"), row.get("claim")] for row in table if isinstance(row, dict)],
+                "base": str((data.get("target") or {}).get("sha") or ""),
+                "voters": sorted({str(r.get("model")) for r in results if isinstance(r, dict)}),
+                "runs": runs,
+                "accept": str(data.get("accept") or cv.DEFAULT_ACCEPT),
+            }}
+
+
+def base_side_differs(record: dict, *, claims: list, base_sha: str, voters, runs,
+                      accept: str, index: list) -> str:
+    """The one field of *record*'s identity that is not this run's, or ``""`` when it is this run's base.
+
+    The base side is reused only when all five agree (``BASE_FIELDS``); a record that differs in
+    one of them is another round's base, so it is refused rather than judged as this round's
+    evidence."""
+    if not isinstance(record, dict) or not record.get("results"):
+        return "the record carries no base votes: nothing to reuse"
+    ident = record.get("identity") or {}
+    want = [[claims[i].get("id"), claims[i].get("claim")] for i in index]
+    if ident.get("claims") != want:
+        got = ident.get("claims") or []
+        return (f"the claims are not the record's ({len(got)} recorded, "
+                f"{len(want)} in this run, first difference "
+                f"{next((k for k, (a, b) in enumerate(zip(got, want)) if a != b), min(len(got), len(want))) + 1})")
+    if ident.get("base") != base_sha:
+        return f"base sha {ident.get('base') or '(not recorded)'}, not {base_sha}"
+    if voters is not None and sorted(str(v) for v in voters) != ident.get("voters"):
+        return f"voters {ident.get('voters') or []}, not {sorted(str(v) for v in voters)}"
+    if runs is not None and int(ident.get("runs") or 0) != int(runs):
+        return f"runs {ident.get('runs')}, not {runs}"
+    if ident.get("accept") != accept:
+        return f"accept rule {ident.get('accept')!r}, not {accept!r}"
+    return ""
+
+
 def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
                budget: PackBudget = PackBudget(), collect: bool = True,
-               accept: str = cv.DEFAULT_ACCEPT) -> dict:
+               accept: str = cv.DEFAULT_ACCEPT, base_side: "dict | None" = None,
+               voters=None, runs: "int | None" = None,
+               sides: "dict | None" = None) -> dict:
     """The core of the command: both sides prepared, voted (the two sides at once, so their
     jobs share one pool) and tallied, and the deltas. *vote* is the seam: the CLI's
     `make_vote` (``ask_v2`` over voters x runs), or a test's fake voter.
 
     Returns ``{"deltas", "accept", "base": {"rows", "results", "table"}, "head": {...}}``; ``rows`` is
     one tally row per claim (``None`` at base for a world claim, which is judged at head only).
-    *accept* (CC-11) is the one acceptance rule of both sides."""
-    sides = prepare_sides(claims, base, head, budget, collect)
+    *accept* (CC-11) is the one acceptance rule of both sides.
+
+    *base_side* (CC-14) is the ``base_side_record`` of an earlier call of this function: the base
+    side is not voted again, its recorded ``results`` stand in for the request. It is reused only
+    when every field of its identity is this run's (``base_side_differs``); any difference raises
+    ValueError naming the field, never a silent re-use. *voters* and *runs* are the run's own, so
+    a record judged by other voters is seen to differ; *sides* spares the caller a second
+    ``prepare_sides``."""
+    sides = prepare_sides(claims, base, head, budget, collect) if sides is None else sides
     # A world claim is judged once, at head, so its change is always n/a; an expect on it can never be met, so it is refused before any request is made.
     odd = [str(c.get("id") or i + 1) for i, c in enumerate(claims) if c.get("expect") and sides["world"][i]]
     if odd:
@@ -151,9 +247,19 @@ def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
                          "remove the expect or name the code it is about")
     idx_b = [i for i, w in enumerate(sides["world"]) if not w]
     items_b = [sides["items_b"][i] for i in idx_b]
+    voter = vote
+    if base_side is not None:
+        diff = base_side_differs(base_side, claims=claims, base_sha=base.sha, voters=voters,
+                                 runs=runs, accept=accept, index=idx_b)
+        if diff:
+            raise ValueError(f"recorded base side not re-used: {diff}")
+        recorded = base_side["results"]
+
+        def voter(items, side):
+            return recorded if side == "base" else vote(items, side)
     with concurrent.futures.ThreadPoolExecutor(2) as two:
-        got_b = two.submit(vote, items_b, "base")
-        got_h = two.submit(vote, sides["items_h"], "head")
+        got_b = two.submit(voter, items_b, "base")
+        got_h = two.submit(voter, sides["items_h"], "head")
         results_b, results_h = got_b.result(), got_h.result()
     table_b = cv.tally([claims[i] for i in idx_b], results_b, meta=[sides["meta_b"][i] for i in idx_b],
                        accept=accept)
@@ -279,6 +385,10 @@ def main(argv: "list[str] | None" = None) -> int:
     ap.add_argument("--scratch", type=Path, help="where the two worktrees go (default: <repo-root>/claim-check-out/scratch)")
     ap.add_argument("--check", action="store_true", help="exit 1 when a claim's `expect` is not its change")
     ap.add_argument("--no-collect", action="store_true", help="packs without the collect facts of the two trees")
+    ap.add_argument("--base-votes", type=Path, metavar="FILE",
+                    help="reuse the base side an earlier run recorded as votes_base.json "
+                         "(the base is voted once, not per claim set): refused when its claims, "
+                         "base sha, voters, runs or rule differ")
     args = ap.parse_args(argv)
 
     try:
@@ -316,6 +426,13 @@ def main(argv: "list[str] | None" = None) -> int:
               "no claim can be decided, every change is UNCLEAR", file=sys.stderr)
     scratch = args.scratch or args.repo_root / "claim-check-out" / "scratch"
     out = args.out or args.repo_root / "claim-check-out" / f"diff-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    base_record = None
+    if args.base_votes:
+        base_record = base_side_from_votes(args.base_votes)
+        if not base_record:
+            print(f"claim_diff: --base-votes {args.base_votes}: no base votes to reuse "
+                  "(an unreadable file, or not a votes_base.json)", file=sys.stderr)
+            return 2
 
     with ExitStack() as stack:
         try:
@@ -338,6 +455,13 @@ def main(argv: "list[str] | None" = None) -> int:
         planned = {}
 
         def plan_and_vote(items, side):
+            if base_record is not None and side == "base":
+                # The base side is this run's own record: its requests were paid by the run that wrote it,
+                # so the plan names zero here rather than billing them twice.
+                planned[side] = 0
+                print(f"[plan] {side}: re-used from --base-votes, 0 requests "
+                      f"({len(items)} claims not voted again)", file=sys.stderr, flush=True)
+                return vote(items, side)
             planned[side] = requests_of(items, len(voters), args.runs, batch, code_batch)
             print(f"[plan] {side}: {len(items)} claims, {planned[side]} requests "
                   f"({len(voters)} voters x {args.runs} runs)", file=sys.stderr, flush=True)
@@ -347,7 +471,7 @@ def main(argv: "list[str] | None" = None) -> int:
             vote = make_vote(voters, args.runs, pool, ask)
             try:
                 got = judge_both(claims, base, head, plan_and_vote, budget, collect=not args.no_collect,
-                                 accept=accept)
+                                 accept=accept, base_side=base_record, voters=voters, runs=args.runs)
             except ValueError as exc:
                 print(f"claim_diff: {args.claims}: {exc}", file=sys.stderr)
                 return 2

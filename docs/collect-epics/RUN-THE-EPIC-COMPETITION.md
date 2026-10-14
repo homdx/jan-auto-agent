@@ -202,6 +202,14 @@ The rest are columns, not verdicts. `off_ticket` is the one to look at
 second — a diff that touched four files the ticket never named usually did
 something else as well.
 
+A ticket that carries a `## Claims` section gets a third phase on the same
+command: `--claims` judges those claims at `--base` and at every worktree that
+passed the hard gates, and prints one row per entry — `FIXED STILL NEW GONE
+UNCLEAR n/a`, and how many of the claims' expected changes came true. The branch
+point is voted once for the round, not once per entry, and a mismatch is a lead,
+not a gate: it never changes the exit code, so read the evidence and reproduce
+it by hand before you believe the model.
+
 ---
 
 ## Stage 4 — the judgement the script cannot make

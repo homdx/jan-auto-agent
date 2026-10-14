@@ -1,11 +1,11 @@
 # CC-14 — the round's claims at the judge: did each entry do what its ticket says (`judge_epic_round.py --claims`)
 
-**Status:** queued
+**Status:** landed (round 296: sensenova-6-8-flash-lite-var1 as the base, plus two fixes found by a process-level black box — the phase had no parser from `main`, and a voter with no ini section was not refused before the first request). Before: queued
 Cut it into `epic-tasks/` with the first word `open` when the round starts.
 **Severity:** MEDIUM (it is the one question of a round the judge still answers by reading, and the instrument for it exists)
 **File:** `scripts/judge_epic_round.py`, `scripts/claim_diff.py`, `tools/contest/export.py`, `tools/contest/draft.py`
 **Symbol:** `main` of `judge_epic_round.py` (a third phase, `--claims`), `judge_both` (a base side judged once and reused), `write_summary` (the judge line), `SECTIONS` / the draft check (an optional `## Claims`)
-**Round:** —
+**Round:** 296
 **Size:** M
 **Depends on:** CC-7 (285, `claim_diff.py`, landed), CC-11 (293, `--accept committed`, landed)
 **Also touches:** `docs/kilo-contest/RUN-THE-KILO-CONTEST.md` (hand-over, judging), `docs/claim-check/RUNBOOK.md` ("Closing a round"), `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md` (the scorecard), `tests/test_judge_epic_round_claims.py`

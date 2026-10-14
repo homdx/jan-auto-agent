@@ -333,6 +333,14 @@ exits **1** on a free-model run even when nothing is wrong: look at `still_as_fi
 `MISMATCH` lines, do not read the exit code alone. The same trio varies by 1–2 claims between
 runs (136, 141 settled of 150). A run takes about 20 minutes: 213 requests at the 15 rpm of kenary.
 
+For a contest round you do not type this: the judge has it as its third phase.
+`judge_epic_round.py --claims` reads the round's ticket `## Claims` — or `--claims FILE`,
+anything this command reads — and judges it at `--base` and at every worktree that passed the
+hard gates, through the same `judge_both`. The branch point is voted **once for the round**:
+the first entry pays for it, the others for their head only, and `claim_diff.py --base-votes
+FILE` is the same reuse from the command line, refused when the record's claims, base sha,
+voters, runs or rule are not this run's.
+
 ## Claim check in Gate 1 (CC-10), and CC-11's operator step
 
 * **CC-11 (293), landed: its operator step.** `--accept committed` is described under "Voters"

@@ -601,6 +601,10 @@ python3 contest-bench/harness/setup_worktrees.py <out>/entrants.json --wt <out>/
 python3 scripts/judge_epic_round.py --round 47 --base <sha> --worktree laguna=<path> --worktree mistral=<path> --worktree hy3=<path>
 ```
 
+The judge line carries `--claims` when the round's ticket has a `## Claims`
+section, so the command `SUMMARY.md` prints is the one that runs the third
+phase as well.
+
 `contest_reset.sh` is deliberately not among them: it prepares a round's
 checkouts and cleans nothing up — the cleanup is `python3 -m
 tools.contest.workspace remove --round NN`, stage 5's. From there the epic
@@ -610,7 +614,7 @@ scoring side of the record is `contest-bench/README.md`: the same input
 data fed to every entry, ranked by what came out, against a fake provider,
 never a live one.
 
-### Judging a finished round: the score table, then the cross phase
+### Judging a finished round: the score table, the cross phase, the claims
 
 Round 158. When every agent is in a terminal state and the models have written
 their tests, the judge is one command with two stages, in this order.
@@ -678,6 +682,26 @@ on its own code, and a `behaviour` cell is the only place another entry's test
 found something the bench did not. Round 151's two real bugs (a cache that
 outlived the drop, a linked worktree left with Kilo's own `.gitignore`) came out
 of exactly such cells.
+
+3. **The claims phase**, with `--claims` — and `SUMMARY.md` prints the judge
+   line with it already when the round's ticket carries a `## Claims` section, so
+   the command at the bottom of the summary is the one to run. The claims come
+   from the ticket, one bullet per claim, `[new]` / `[fixed]` / `[still]` /
+   `[gone]` naming the expected change, or from `--claims FILE` (anything
+   `claim_diff.py` reads). Every worktree that passed the hard gates is judged
+   against `--base`; one that failed `commits` or `pushed` is listed as skipped
+   and costs no request. One line before the first request says the cost, and
+   the branch point is voted **once for the round**: the first entry pays for it,
+   the rest for their head only, and a record whose claims, base sha, voters,
+   runs or rule are not this run's is refused by name rather than reused. The
+   table is one row per entry — `FIXED STILL NEW GONE UNCLEAR n/a`, and how many
+   of the claims' expected changes came true — then every claim whose change is
+   not its `expect`, with both sides' verdicts and their evidence ids.
+   `claims.md` and each entry's `delta.json`, `votes_base.json`,
+   `votes_head.json` go to `--cross-out DIR/claims/<entry>/`, next to `cross.md`
+   (with `--cross` the default is `contest-out/NN/`; `--claims` without `--cross`
+   prints the table and writes nothing). A mismatch never changes the exit code:
+   like `behaviour` it is a lead — read the evidence and reproduce it by hand.
 
 ---
 

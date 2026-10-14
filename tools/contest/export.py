@@ -63,6 +63,37 @@ _GATE_LAYERS = ("gate", "gate-failed")
 _SETUP_WORKTREES = "python3 contest-bench/harness/setup_worktrees.py"
 _JUDGE = "python3 scripts/judge_epic_round.py"
 
+#: The folder the round's ticket comes from, relative to the repo root.
+TASKS_DIR = "epic-tasks"
+
+#: `## Claims` — the optional section that carries the ticket's claims; a heading that adds a
+#: parenthetical is still the section, so the match stops at the word.
+_CLAIMS_HEADING = re.compile(r"^##\s+Claims(?:\s+.*)?$", re.I)
+
+
+def ticket_has_claims(out_dir, ticket, repo=None):
+    """Whether the round's ticket carries a `## Claims` section — `False` when it has none.
+
+    `write_summary` adds `--claims` to the printed judge line only when the answer is true, so the
+    command the round ends with is the one that runs the claims phase. The ticket is looked up as
+    *out_dir* + `epic-tasks/` + its name, then beside *out_dir*, then in *out_dir* itself, because
+    a round's out folder sits anywhere relative to the ticket folder. Fail-open: a ticket that is
+    missing, unreadable or empty is no claims section, and a summary never fails over a claims line.
+    """
+    if not isinstance(ticket, str) or not ticket.strip():
+        return False
+    root = _repo_root(out_dir, repo)
+    out = Path(out_dir)
+    for path in (root / TASKS_DIR / ticket, out.parent / TASKS_DIR / ticket,
+                 out / ticket, out.parent / ticket):
+        try:
+            for line in path.read_text(encoding="utf-8").split("\n"):
+                if _CLAIMS_HEADING.match(line):
+                    return True
+        except OSError:
+            continue
+    return False
+
 
 # The paths
 
@@ -578,6 +609,10 @@ def write_summary(out_dir, state, base_sha, paths, *, repo=None, gate="") -> Pat
     judge_parts = [f"{_JUDGE} --round {round_no}", f"--base {base_sha or '-'}"]
     for name, path in worktrees:
         judge_parts.append(f"--worktree {name}={path}")
+    # The claims phase is the question the round ends with, so it is named only when the ticket
+    # carries the section: a ticket without it would print a flag the phase would judge nothing.
+    if ticket_has_claims(out, ticket, repo):
+        judge_parts.append("--claims")
     next_part = ["## Next", "", "```bash"]
     if paths:
         next_part.append(f"{_SETUP_WORKTREES} {entrants} --wt {_display_of(out, root)}/wt")
