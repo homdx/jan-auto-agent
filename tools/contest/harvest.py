@@ -72,26 +72,16 @@ REASON_CODES = (
     "uncommitted_files",
 )
 
-#: Outcomes that mean "the ticket is done". `append_task.py` upper-cases
-#: `--outcome` and rewrites `DONE` onto `FIXED` (the epic-round prompt says
-#: `--outcome DONE`; it means FIXED), so a row it wrote says `FIXED`. Both mean
-#: done; everything else — `SKIPPED`, `ALREADY-OK`, a typo — does not.
+#: Outcomes that count as done; append_task.py rewrites DONE to FIXED, so both are accepted.
 _DONE_OUTCOMES = frozenset({"DONE", "FIXED"})
 
-#: A reason's `text` is one sentence for the agent. Two reasons carry a payload
-#: on top of theirs and may run past it: `tests_failed` the pytest tail, because
-#: the failure cause is at the tail, and `uncommitted_files` the `git status`
-#: lines, because the paths are the whole point.
+#: Max length of a reason's text; tests_failed and uncommitted_files may run longer (their payload).
 TEXT_LIMIT = 200
 
 #: How many `git status` lines `uncommitted_files` names; the rest is counted.
 UNCOMMITTED_MAX = 10
 
-#: A claim is a commit only when it is written as a hex sha. `HEAD`, `@`, a
-#: branch and a tag all resolve in git, so `merge-base --is-ancestor` cannot
-#: tell them from a sha — a symbolic name pins nothing, it resolves to
-#: something else on every branch it is read from. 7 chars is the shortest
-#: length git resolves unambiguously, 40 is a commit object in full.
+#: A commit claim must be a hex sha; HEAD, branch and tag names resolve to different commits.
 _SHA_RE = re.compile(r"[0-9a-f]{7,40}", re.IGNORECASE)
 
 
@@ -132,8 +122,7 @@ class Harvest:
     commit: str | None
     facts: dict
     elapsed: float
-    #: KC-57: seconds spent waiting for the round's pytest lock before the
-    #: roots ran. Always 0 unless the runner serialized this harvest.
+    #: Seconds waited for the round's pytest lock before the roots ran (KC-57); 0 unless serialised.
     waited: float = 0.0
     #: KC-57: agents ahead in the pytest queue when this harvest waited.
     ahead: int = 0
@@ -155,8 +144,7 @@ def _progress_rows(progress_csv: Path) -> list[dict]:
             text = fh.read()
     except (OSError, UnicodeDecodeError):
         return []
-    # Python 3.10's `csv` raises on a NUL, 3.11+ reads it as a character:
-    # checked here so the verdict does not depend on the interpreter.
+    # A NUL is checked here, so the verdict does not depend on the Python version's csv behaviour.
     if "\0" in text:
         return []
     try:
@@ -432,10 +420,7 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     for row in _progress_rows(ws.progress_csv):
         if (row.get("ticket") or "").strip() == ticket:
             claim = row
-    # `csv.DictReader` fills the fields a short row did not carry with `None`
-    # (its `restval`), and a writer that died mid-row or a hand echo leaves
-    # exactly that: `or ""` degrades the missing claim to empty — the row
-    # scores `no_commit` — instead of a `None.strip()` into the run.
+    # A short or missing row field reads as empty, so the row scores no_commit, not a crash.
     claimed_commit = ((claim or {}).get("commit") or "").strip()
     outcome = ((claim or {}).get("outcome") or "").strip().upper()
 
@@ -463,11 +448,7 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
                 "commit once, then append_task.py --commit <sha>",
             ))
         elif not _SHA_RE.fullmatch(claimed_commit):
-            # `HEAD`, `@`, a branch and a tag all resolve in git, so they would
-            # pass `merge-base --is-ancestor` too — but a claim must name a
-            # commit, not a name that stands for a different one on every
-            # branch. Quoted as written (cut to a sha's length), so the agent
-            # sees what it put in the row.
+            # A claim must name a commit, not a name that means a different commit per branch.
             reasons.append(Reason(
                 "commit_not_on_branch",
                 f"commit {claimed_commit[:40]} is not a sha — commit once, then "
@@ -477,9 +458,7 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
             sha = _resolve_claim(ws.path, claimed_commit)
             claimed_base = sha is not None and _at_or_under_base(ws, sha)
             if claimed_base and _is_ancestor(ws.path, sha):
-                # Round 83: the base itself is on the branch too, and a row that
-                # claimed it had the roots run on the base — the agent's change
-                # was never tested, and its GAVE_UP named the base as its commit
+                # Round 83: the base is never the agent's commit, so a claim of it is refused.
                 reasons.append(Reason(
                     "commit_not_on_branch",
                     f"commit {sha[:12]} is the round's base or under it, not your "
@@ -489,11 +468,7 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
             elif sha is not None and _is_ancestor(ws.path, sha):
                 resolved = sha
             else:
-                # Round 119: the agent amended after writing its row, so the row
-                # named a commit the amend had dropped. "rebase it" sent it to
-                # check out the orphan and rebase for two legs; the row was the
-                # stale part. HEAD above the base is most likely the same work,
-                # so the first step named is the row, the cherry-pick second.
+                # Round 119: after an amend the row is stale, so the first step is the row (round 119).
                 head = git(str(ws.path), "rev-parse", "--short", "HEAD")
                 head_is_change = bool(head) and not _at_or_under_base(ws, head)
                 if head_is_change:
@@ -510,16 +485,13 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     # ── the facts: the mechanical scorecard row ───────────────────────────
     facts = judge_worktree(ws.agent, str(ws.path), ws.base_sha, list(declared),
                            want_tests=False)
-    # KC-41: a fact, not a reason — whether the one commit is the runner's
-    # deadline commit rather than the agent's. A READY reached that way is a
-    # different signal for SUMMARY and the judge than one the model claimed.
+    # Whether the one commit is the runner's deadline commit, a fact for SUMMARY and the judge (KC-41).
     facts["deadline_commit"] = (
         facts.get("commits") == 1
         and git(str(ws.path), "log", "-1", "--format=%ce", "HEAD") == DEADLINE_COMMIT_EMAIL)
 
     if "commits" not in facts:
-        # A path that is not a git worktree has nothing to score; there is no
-        # commit, so this collapses into the commit-count gate with the path named.
+        # A path that is not a git worktree has no commit to score, so it fails the commit-count gate.
         reasons.append(Reason(
             "commits_ne_1",
             f"{ws.path} is not a git worktree — nothing to score",
@@ -543,9 +515,7 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
                 f"{ticket} shipped no test file — add one under tests/ that fails "
                 "without the change",
             ))
-        # `?` = the base has no bridge at all — an external `--target` repo
-        # (KC-76). There is nothing to keep byte-identical, so only a bridge
-        # the base had and the commit changed or dropped is a reason.
+        # A base with no bridge at all (external --target repo) has nothing to keep byte-identical (KC-76).
         if facts["shrink"] in ("CHANGED", "GONE"):
             reasons.append(Reason(
                 "shrink_changed",
@@ -560,43 +530,28 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
                 blocking=False,
             ))
 
-    # KC-30: the commit the verdict points at. The claim's sha wins when the
-    # claim resolves; with no row at all the branch's one commit is named
-    # instead, so an agent that commits and stalls before `append_task.py` does
-    # not end with `commit: null` and no patch. A branch with two commits, or
-    # none, names nothing either way — there is no single sha to point at, and
-    # the fallback only reads a branch the scorecard counted one commit on.
+    # The verdict's commit is the claim's sha, else the branch's one commit, else nothing (KC-30).
     commit = resolved if facts.get("commits") == 1 else None
     if commit is None and (claim is None or claimed_base):
-        # round 83: a claim of the base names no commit of the change either —
-        # the branch's one commit is named, as with no row at all
+        # A claim of the base is not a commit of the change, so the branch's one commit is named (round 83).
         commit = _branch_commit(ws.path, facts)
 
-    # The roots run only for a verdict they can decide. When at least one
-    # blocking reason is already on the list, the verdict is already REWORK and
-    # the roots cannot change it — so they are not run and no time is wasted.
+    # Roots run only for a verdict they can decide; a verdict already REWORK skips them.
     if run_tests:
         blocking_reasons = [r for r in reasons if r.blocking]
         if blocking_reasons:
             facts["tests_run"] = f"skipped: {blocking_reasons[0].code}"
         else:
-            # KC-60: the roots run on the commit this harvest scores, not on
-            # this tree. An untracked file must not make a red commit score
-            # `READY`, and an uncommitted fix must not make a green one score
-            # `REWORK`. This tree is only read, and is left byte for byte as
-            # it was — no stash, no clean, no checkout.
+            # The roots run on the scored commit, not on this tree; the tree is only read (KC-60).
             outside = _status_lines(ws)
             if "commits" in facts:
-                # With no resolvable claim there is no scored commit; `HEAD`
-                # is the best commit git has, and a blocking claim reason is
-                # already on the list.
+                # No resolvable claim means HEAD is scored, with the blocking reason already listed.
                 target, parent, error = _commit_worktree(ws, resolved or "HEAD")
             else:
                 target, parent, error = (None, None,
                                          f"{ws.path} is not a git worktree")
             if target is None:
-                # Not run is not passed: the verdict cannot be READY on roots
-                # that never ran, and the reason says why they did not.
+                # Roots that did not run are not a pass, and the reason says why they did not.
                 facts["tests_run"] = "checkout✗"
                 reasons.append(Reason(
                     "tests_failed",

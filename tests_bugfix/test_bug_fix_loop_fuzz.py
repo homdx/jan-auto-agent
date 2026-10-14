@@ -86,9 +86,7 @@ def _one_run(seed, d):
             if st.get_task("BUG-FIX-AUTO-T1"):
                 st.set_task_status("BUG-FIX-AUTO-T1", "todo"); events.append("task revived")
         elif act < 0.30:
-            # Controller._reset_resettable_blocked_tasks, replayed verbatim.
-            # Runs at EVERY startup; undoing parking here is what reopened
-            # the main-queue bypass on resume.
+            # Replays Controller._reset_resettable_blocked_tasks; runs at every startup.
             from tools.auto.utils import highest_completed_round
             for _t in st.all_tasks():
                 if _t["status"] != STATUS_BLOCKED:
@@ -129,16 +127,7 @@ def _one_run(seed, d):
         return ("I4 non-terminal end state", events, t["status"], calls["n"], st, tk)
     return None
 
-# Seeds are fixed, so a failure here is reproducible: rerun this file
-# directly with a larger N to search further.
-#
-#   $ python3 tests/test_bug_fix_loop_fuzz.py 5000
-#
-# Every bug in section 6 of test_bug_fix_id_cascade.py was found this way,
-# after five hand-review passes had already signed the code off.  The
-# hand-written tests cover the paths someone thought to check; this covers
-# the interleavings nobody did — crash mid-fix, operator reset, ticket
-# deleted under a running fix.
+# Seeded fuzzer: rerun with a larger N to search further (python3 tests_bugfix/test_bug_fix_loop_fuzz.py 5000).
 
 import pytest
 

@@ -1,19 +1,7 @@
 #!/usr/bin/env bash
-# CC-0: the claim-check bench, live. Runs today's scripts/claim_vote.py over the
-# fixture's 80 claims and the 30 real ones and prints the score_cc.py table.
-# The only network is the voters' own calls; nothing spends Lenz credits.
-#
-#   contest-bench/cc/run_cc.sh                         # voters: [claim_vote] llm_profiles
-#   contest-bench/cc/run_cc.sh --profiles a b c        # three voters, three families
-#   RUNS=1 contest-bench/cc/run_cc.sh --profiles a b c
-#   contest-bench/cc/run_cc.sh --target --profiles a b c   # CC-6: each set judged on its tree's evidence
-#   contest-bench/cc/run_cc.sh --diff --profiles a b c     # CC-7: the fixture at base and at head, FIXED/STILL/NEW/GONE
-#
-# Everything lands in claim-check-out/cc-<UTC>/: the claim lists, the built
-# fixture, votes_<set>.json, vote_<set>.log and score.txt.
+# CC-0: claim-check bench, live, over the fixture and the real claims.
 set -uo pipefail
-# CC-6: --target (first or anywhere) is ours, not claim_vote's: each set is judged at its own
-# pinned tree (the fixture at base, this repository at real_sha), so it cannot be passed on as is
+# CC-6: --target is handled here, not by claim_vote: each set is judged at its own pinned tree (fixture at base, this repo at real_sha).
 target=0; diff=0; args=()
 for a in "$@"; do
     if [ "$a" = --target ]; then target=1; elif [ "$a" = --diff ]; then diff=1; else args+=("$a"); fi

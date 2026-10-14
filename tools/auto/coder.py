@@ -95,31 +95,20 @@ from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
-# _MAX_FILE_CHARS is now read from [coder] max_file_chars in agents.ini.
-# This default is used only when the key is absent.
+# [coder] max_file_chars is read from agents.ini; this default applies only when the key is absent.
 _DEFAULT_MAX_FILE_CHARS = 8_000
 
-# RUN-4: the truncation ladder. A reply that stops mid-JSON was cut by the
-# output budget, so the next attempt of the SAME task doubles it; the
-# configured cap is where it stops. Prose and malformed JSON never climb —
-# more tokens do not fix either (GATE1-LEARN-2 applied the same reasoning to
-# empty replies).
+# Output-budget ladder: a reply cut off mid-JSON doubles the budget on the next attempt, up to the configured cap (RUN-4).
 _TRUNCATION_HEAD = "LLM response was cut off before the JSON was complete"
-# The creative-mode counterpart (see _parse_response_prose): a chapter that
-# stops mid-sentence at the budget is the same cut-off, so it climbs the same
-# ladder — its message is appended to rather than swapped (from Hy3 / SN-67).
+# The creative counterpart: a chapter cut off at the budget climbs the same ladder.
 _TRUNCATION_HEAD_PROSE = "creative coder: response hit the token budget mid-sentence"
 _TRUNCATION_HEADS = (_TRUNCATION_HEAD, _TRUNCATION_HEAD_PROSE)
-# The advice a cut-off reply gets once the budget actually climbed: the file
-# must be COMPLETE, so "shorten it" would send the model the wrong way.
-# {budget} is the number the NEXT attempt (the one reading this line) goes
-# out at — the feedback always addresses the following attempt.
+# Advice for a cut-off reply once the budget has risen: the file must be complete, so do not say shorten; {budget} is the next attempt's budget.
 _TRUNCATION_RAISED_ADVICE = (
     "Emit the COMPLETE file content — the output budget was raised to "
     "{budget} tokens for this attempt, so do NOT shorten the file. "
 )
-# ...and the advice at the cap, where there is no more room and shortening is
-# the only lever left.
+# Truncation advice at the cap, where shortening is the only lever left.
 _TRUNCATION_ADVICE = (
     "Emit the COMPLETE file content and keep the response minimal (only the "
     "required files), or raise [coder] max_tokens. "
@@ -195,10 +184,7 @@ _SYSTEM_PROMPT = (
 # Backward-compat alias — "code" is the default persona.
 _SYSTEM_PROMPT_CODE = _SYSTEM_PROMPT
 
-# Docs/creative reuse the IDENTICAL JSON contract + rules above; only the writing
-# persona and the "code improvement" framing change. This mirrors the architect
-# (_SYSTEM_PROMPTS) and Gate-2 validator (_GATE2_SYSTEMS), which already switch
-# persona by task_mode — the coder was previously the only stage that did not.
+# Docs and creative reuse the JSON contract and rules; only the persona and framing differ (as the architect and validator do).
 _SYSTEM_PROMPT_DOCS = _SYSTEM_PROMPT_CODE.replace(
     "You are a senior software engineer implementing a targeted code improvement. ",
     "You are a senior technical writer implementing a targeted documentation "
@@ -250,9 +236,7 @@ CURRENT FILE CONTENTS:
 """
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Result dataclass
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class CoderResult:
@@ -319,9 +303,7 @@ class CoderResult:
         return f"[{self.task_id}] CODER FAIL — {self.error or 'no files written'}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Coder
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _is_truthy_delete(value) -> bool:
@@ -350,9 +332,7 @@ def _is_truthy_delete(value) -> bool:
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Guard-2 skip messages (RUN-1)
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _guard2_skip_message(rel: str) -> str:
@@ -416,27 +396,10 @@ class Coder(_llm_stream.LLMClientBase):
         super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
 
         self._task_mode = task_mode
-        # AUTO-FIX-9: the raw --auto GOAL string, verbatim from the CLI/user —
-        # never touched by an LLM. Used as the MOST reliable language-detection
-        # sample for a chapter-1 cold start (see _build_prompt), because the
-        # architect-authored task["instruction"] is LLM output and, per the
-        # whole CR-9/16 language-lock history, small models tend to write such
-        # fields in English (the system prompt's own language) even when the
-        # story itself is in Russian — task["instruction"] is NOT a safe proxy
-        # for "the story's language" the way the user's own goal text is.
+        # The raw goal string is the most reliable language sample for a chapter-1 cold start (AUTO-FIX-9).
         self._run_goal = str(run_goal or "")
         sec = "coder"
-        # BUGFIX (verified-bugs follow-up report): every read in this block
-        # was a raw config.get(...)+float()/int() or config.getboolean()/
-        # getint() call with no try/except — the file this class is named
-        # after (coder.py:300) was one of the explicitly-named affected
-        # locations, and this class had NO guards at all, the same as
-        # ClusterReviewer (architect.py). Wrapped per-call (not via a
-        # shared helper) so extract_config_reads (tools/collect/
-        # ast_facts.py) still sees each literal call — a shared helper's
-        # call shape is invisible to that AST scanner (confirmed directly:
-        # 0 reads recognized through a helper vs. 1 for an identical
-        # literal call). Matches gate1_filter.py's established style.
+        # Config reads are guarded per call (BUGFIX): a malformed value falls back instead of crashing construction.
         try:
             self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
         except ValueError as exc:
@@ -448,14 +411,7 @@ class Coder(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] max_tokens is malformed (%s) — using 16384", sec, exc)
             self._max_tokens = 16384
-        # RUN-4: ceiling for the truncation ladder. A reply cut off by the
-        # output budget is re-asked with max_tokens × 2, up to this cap.
-        # Default = 4 × max_tokens, so a 3 000 config climbs 3 000 → 6 000 →
-        # 12 000 and stops. The cap is the operator's guard against a runaway
-        # provider bill; raise it only when the model's context window can
-        # actually hold the bigger reply.
-        # Resolved per mode like max_tokens itself (max_tokens_cap_creative
-        # over max_tokens_cap), so a creative budget gets a creative ceiling.
+        # RUN-4 ceiling for the truncation ladder: the budget doubles up to this cap (default 4x max_tokens).
         _default_cap = int(self._max_tokens) * _DEFAULT_BUDGET_CAP_MULT
         try:
             self._max_tokens_cap = int(_cfg_mode(
@@ -464,9 +420,7 @@ class Coder(_llm_stream.LLMClientBase):
             logger.warning("config [%s] max_tokens_cap is malformed (%s) — using %d",
                            sec, exc, _default_cap)
             self._max_tokens_cap = _default_cap
-        # A cap below the base budget would cap the FIRST attempt down. The
-        # ladder exists to grow, never to shrink, so clamp it up (loudly)
-        # instead of silently lowering every call.
+        # A cap below the base budget would shrink the first attempt; clamp it up, with a warning.
         if self._max_tokens_cap < int(self._max_tokens):
             logger.warning(
                 "config [%s] max_tokens_cap=%d is below max_tokens=%d — "
@@ -474,14 +428,11 @@ class Coder(_llm_stream.LLMClientBase):
                 sec, self._max_tokens_cap, self._max_tokens, self._max_tokens,
             )
             self._max_tokens_cap = int(self._max_tokens)
-        # RUN-4 ladder state, in memory only — a new run starts cold, the
-        # same way Gate 1's learned budget is kept per process and never
-        # written to disk.
+        # The ladder's learned budget is kept in memory only, as Gate 1's is (RUN-4).
         self._learned_max_tokens: Optional[int] = None  # last budget that parsed
         self._task_id: str = ""                          # same-task cursor
         self._task_max_tokens: int = int(self._max_tokens)  # same-task budget
-        # Select system prompt by task_mode (mirrors architect / validator).
-        # Priority: mode-specific ini key > legacy "system" key > built-in constant.
+        # System prompt by task_mode (as architect and validator do): mode key, legacy key, then constant.
         _mode_key = f"system_{self._task_mode}" if self._task_mode != "code" else None
         if _mode_key and config.has_option(sec, _mode_key):
             self._system  = config.get(sec, _mode_key).strip()
@@ -499,18 +450,14 @@ class Coder(_llm_stream.LLMClientBase):
             logger.warning("config [%s] max_file_chars is malformed (%s) — using %d",
                             sec, exc, _DEFAULT_MAX_FILE_CHARS)
             self._max_file_chars = _DEFAULT_MAX_FILE_CHARS
-        # pullrun-sim: optional deterministic gate rejecting non-ASCII
-        # identifiers in generated .py files (code mode only).
+        # Optional deterministic gate for non-ASCII identifiers in generated .py files (code mode only).
         try:
             self._ascii_identifiers_only = config.getboolean(
                 sec, "ascii_identifiers_only", fallback=False)
         except ValueError as exc:
             logger.warning("config [%s] ascii_identifiers_only is malformed (%s) — using False", sec, exc)
             self._ascii_identifiers_only = False
-        # selfhost pilot: allow editing files that already contain a flagged
-        # pattern (see _check_content_safety grandfathering). Default on —
-        # it strictly reduces false positives; introducing a pattern into a
-        # clean file is still blocked either way.
+        # Allow editing files that already contain a flagged pattern (grandfathering); introducing one is still blocked.
         try:
             self._allow_preexisting_patterns = config.getboolean(
                 sec, "allow_preexisting_patterns", fallback=True)
@@ -518,8 +465,7 @@ class Coder(_llm_stream.LLMClientBase):
             logger.warning("config [%s] allow_preexisting_patterns is malformed (%s) — using True", sec, exc)
             self._allow_preexisting_patterns = True
         active_profile = config.get("api", "active", fallback="local")
-        # num_ctx controls the total context window on Ollama; 0 means "use server default".
-        # AUTO-CR-3: prefer [coder] num_ctx_{task_mode} then [api_{active}] num_ctx.
+        # num_ctx is the Ollama context size; 0 means the server default (AUTO-CR-3).
         _num_ctx_str = _cfg_mode(config, sec, "num_ctx", task_mode, fallback=None)
         if _num_ctx_str is None:
             _num_ctx_str = config.get(f"api_{active_profile}", "num_ctx", fallback="0")
@@ -528,9 +474,7 @@ class Coder(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config num_ctx is malformed (%r: %s) — using 0", _num_ctx_str, exc)
             self._num_ctx = 0
-        # AUTO-FIX (fable follow-up): same thinking-model truncation risk as
-        # gate1/architect — a big coder JSON response (files array) plus a
-        # <think> block is even more likely to blow the budget mid-reasoning.
+        # Thinking-model risk: the coder's JSON plus a think block may overflow the budget, so the context read is guarded (AUTO-FIX).
         try:
             self._think = config.getboolean(sec, "think", fallback=False)
         except ValueError as exc:
@@ -591,9 +535,7 @@ class Coder(_llm_stream.LLMClientBase):
         task_id = (task.get("id") or "").strip()
         base_dir = Path(base_dir).resolve()
 
-        # RUN-4: the budget this attempt goes out at. A retry of the SAME task
-        # keeps whatever the previous attempt set — that is the ladder; a new
-        # task starts at max(config, learned).
+        # RUN-4: the budget for this attempt; a retry of the same task keeps the ladder's value, a new task starts at max(config, learned).
         budget = self._budget_for_task(task_id)
 
         # ── Build and send the prompt ─────────────────────────────────────────
@@ -613,11 +555,7 @@ class Coder(_llm_stream.LLMClientBase):
                     "task_id": task_id},
         )
 
-        # BUGFIX (audit): this print() ran before the try/except below,
-        # unlike the context-probe's equivalent print (which IS inside its
-        # own try) — an asymmetry that let a stdout failure (e.g.
-        # BrokenPipeError) here escape uncaught, violating generate()'s
-        # own "never raises" contract.
+        # The print is guarded like the probe's, so a closed stdout cannot break generate()'s no-raise contract (BUGFIX).
         try:
             print(f"\n💻 [LIVE CODER STREAMING — task: {task_id}]:")
         except OSError as exc:
@@ -644,8 +582,7 @@ class Coder(_llm_stream.LLMClientBase):
             raw_text = raw_text or "".join(_coder_tokens)
             print("\n" + "═" * 80 + "\n")
         except Exception as exc:
-            # RUN-8: the call itself failed — nothing was produced, so the
-            # attempt is a transport failure, not a rejected answer.
+            # The call itself failed, so this is a transport failure, not a rejected answer (RUN-8).
             msg = f"LLM call failed: {exc}"
             logger.warning("coder.generate [%s]: %s", task_id, msg)
             tracer.event(
@@ -657,10 +594,7 @@ class Coder(_llm_stream.LLMClientBase):
 
         # ── Strip think blocks; check for missing-context signal ─────────────
         cleaned = strip_think(raw_text)
-        # Pull-model: capture any names the coder asked for (context_request).
-        # AUTO-CR-19-2: creative output is prose, so the JSON extractor always
-        # returns [] — use the prose CONTEXT_REQUEST extractor instead, so the
-        # names reach CoderResult.missing_context and inner_loop's broker pull.
+        # Pull-model: context requests are captured; creative output is prose, so the prose extractor is used (AUTO-CR-19-2).
         if self._task_mode == "creative":
             missing_ctx = self._extract_context_request_prose(cleaned)
         else:
@@ -668,9 +602,7 @@ class Coder(_llm_stream.LLMClientBase):
 
         # ── Context probe: if the LLM reported missing_context, fetch once ───
         _missing = self._extract_missing_context(cleaned)
-        # Creative requests are surfaced via missing_ctx → inner_loop pulls them
-        # on the next attempt (the SearchAgent in-call probe is code/symbol
-        # oriented and does not apply to chapter files).
+        # Creative requests are pulled on the next attempt; the in-call search probe is for code symbols only.
         context_satisfied = not bool(_missing) and not (
             self._task_mode == "creative" and bool(missing_ctx)
         )
@@ -708,14 +640,7 @@ class Coder(_llm_stream.LLMClientBase):
                     raw_text = raw_text or "".join(_probe_tokens)
                     print("\n" + "═" * 80 + "\n")
                     _probe_cleaned = strip_think(raw_text)
-                    # BUGFIX (audit): this used to overwrite `cleaned`
-                    # unconditionally — if the probe call SUCCEEDED but
-                    # returned empty (no exception, just nothing), the good
-                    # first response was silently discarded and replaced
-                    # with "". The except clause below only preserves the
-                    # first response on an actual exception, not on this
-                    # empty-but-successful case. Only adopt the probe's
-                    # result when it actually has content.
+                    # A probe that succeeds but returns nothing must not discard the good first response (BUGFIX).
                     if _probe_cleaned.strip():
                         cleaned = _probe_cleaned
                     else:
@@ -723,15 +648,7 @@ class Coder(_llm_stream.LLMClientBase):
                             "coder.generate [%s]: context-probe second call "
                             "returned empty — using first response", task_id,
                         )
-                    # Re-extract context_request symbols from the new response
-                    # so the CoderResult reflects any new symbols the second
-                    # call asked for.  context_satisfied intentionally keeps
-                    # the first response's value: False signals "probe was
-                    # needed" and is used by outer_loop to skip TaskRewriter.
-                    #
-                    # Branch the same way the first call does (defensive —
-                    # currently dormant since this path is gated on the
-                    # JSON extractor, which never fires in creative mode).
+                    # Re-extract context requests from the probe's reply; context_satisfied keeps the first value so the rewriter is skipped.
                     if self._task_mode == "creative":
                         missing_ctx = self._extract_context_request_prose(cleaned)
                     else:
@@ -752,10 +669,7 @@ class Coder(_llm_stream.LLMClientBase):
             cleaned, task_id, task.get("target_files") or []
         )
         if parse_error:
-            # RUN-4: only a reply cut off by the budget climbs it — NO-JSON
-            # and malformed-JSON replies get the same budget again. When it
-            # did climb, the feedback must not tell the model to shorten a
-            # file that has to be complete: the budget just grew.
+            # Only a reply cut off by the budget climbs it; when it climbed, the feedback does not say shorten (RUN-4).
             _raised = self._raise_budget_after_truncation(task_id, budget, parse_error)
             if _raised and parse_error.startswith(_TRUNCATION_HEAD_PROSE):
                 parse_error += (
@@ -775,8 +689,7 @@ class Coder(_llm_stream.LLMClientBase):
                 error_kind="parse",
             )
 
-        # RUN-4: this budget produced a parseable reply — the next task on
-        # this instance starts no lower than it.
+        # A parseable reply records its budget, so the next task starts no lower (RUN-4).
         self._record_parseable_budget(budget)
 
         # ── AUTO-CR-18: reject chapter duplication BEFORE writing to disk ────
@@ -801,13 +714,7 @@ class Coder(_llm_stream.LLMClientBase):
             parsed_files, base_dir, task_id, allowed_paths=allowed,
             skipped_out=files_skipped,
         )
-        # RUN-1: nothing landed and no write error was recorded — every path
-        # the LLM returned sat outside target_files, so Guard 2 protected all
-        # of them. Nothing was touched on disk, but there is no code for the
-        # executor to validate either, so this is still a failure; keep the
-        # original [SAFETY] wording (naming every dropped path) as the reason
-        # the model can act on. A real error (path escape, blocked content,
-        # I/O) wins as-is.
+        # RUN-1: every returned path was outside target_files, so Guard 2 blocked all of them; nothing was written.
         if not written and not write_error and files_skipped:
             write_error = _guard2_all_skipped_error(files_skipped)
         if write_error and not written:
@@ -828,20 +735,13 @@ class Coder(_llm_stream.LLMClientBase):
             context_satisfied=context_satisfied,
             files_skipped=files_skipped,
             max_tokens=budget,
-            # A partial write that still records an error is a reply that
-            # could not be fully landed — "parse", never "transport".
+            # A partial write with an error is a parse failure, never a transport one.
             error_kind="parse" if write_error else "",
         )
         logger.info("coder.generate: %s", result.summary())
         return result
 
-    # ── RUN-4: the truncation ladder ─────────────────────────────────────────
-    # A whole-file rewrite that stops mid-JSON was cut by the output budget.
-    # Sending it back with the same budget just reproduces the same cut five
-    # times, so the next attempt of the SAME task doubles the budget instead —
-    # up to [coder] max_tokens_cap. This is Gate 1's re-ask ladder
-    # (GATE1-LEARN-1/2) ported to the coder; the state is kept on the instance
-    # and never written to disk.
+    # RUN-4: a cut-off whole-file rewrite is retried with a doubled budget, up to max_tokens_cap (Gate 1's ladder ported); state is in memory.
 
     def _budget_for_task(self, task_id: str) -> int:
         """The token budget the current ``generate()`` call goes out at.
@@ -948,30 +848,10 @@ class Coder(_llm_stream.LLMClientBase):
         # ── File listing ──────────────────────────────────────────────────────
         target_files_listing = "\n".join(f"  - {f}" for f in target_files) or "  (none)"
 
-        # ── File contents ─────────────────────────────────────────────────────
-        # AUTO-CR-4: in creative mode, replace the generic "current file
-        # contents" fill with the budget-fitted synopsis + previous-chapter
-        # context (ContextAssembler). The target chapter is usually new/empty,
-        # so its own (nonexistent) content isn't useful — what the model
-        # needs is continuity with what came before.
+        # Creative mode: continuity context (synopsis and previous chapter) replaces the generic file fill (AUTO-CR-4).
         if self._task_mode == "creative":
             file_contents = self._build_creative_file_contents(target_files, base_dir)
-            # AUTO-CR-9/16: lock output language to the STORY text. Detect from
-            # the raw target/predecessor prose only — never from the English
-            # structural labels/placeholders in file_contents (e.g. the cold-start
-            # "(new chapter — no prior content to continue from)" marker), which
-            # would make detect_language() return "English" and make this ACTIVELY
-            # instruct the model to write chapter 1 in English — worse than no
-            # lock at all. AUTO-FIX-5/9: when there is no prior prose (chapter 1,
-            # nothing written yet), fall back to self._run_goal — the raw --auto
-            # GOAL string, verbatim from the user, never touched by an LLM — before
-            # task["instruction"], which is architect-authored and, per the whole
-            # CR-9/16 language-lock history, prone to drifting into English (the
-            # system prompt's own language) regardless of the story's language.
-            # task["instruction"]/task["goal"] are kept as a last-resort fallback
-            # only for callers that don't wire run_goal through (tests, older call
-            # sites); if everything is empty, omit the lock entirely rather than
-            # ever sampling file_contents.
+            # The language lock uses the story text: the run goal first, then the task, never structural labels (AUTO-CR-9/16, AUTO-FIX-5/9).
             from tools.auto.utils import resolve_creative_language, language_instruction
             _sample = (
                 self._creative_language_sample(target_files, base_dir)
@@ -1017,10 +897,7 @@ class Coder(_llm_stream.LLMClientBase):
             file_contents         = file_contents,
             feedback_section      = feedback_section,
             closing_instruction   = (
-                # AUTO-CR-13/16: the closing line is the LAST, most concrete
-                # instruction the model sees. In creative mode it must ask for
-                # prose; if the target already has content it is an EDIT, so we
-                # tell the model to revise in place and preserve the original.
+                # The closing instruction asks for prose; an existing target is revised in place (AUTO-CR-13/16).
                 (
                     "Now output the COMPLETE revised text of the file(s) above, "
                     "applying ONLY the change the instruction requires and "
@@ -1097,13 +974,7 @@ class Coder(_llm_stream.LLMClientBase):
             if isinstance(missing, list):
                 return [str(s).strip() for s in missing if s][:8]
         except (json.JSONDecodeError, AttributeError, TypeError) as exc:
-            # BUGFIX: was a bare `except Exception: pass`, which swallowed
-            # malformed-JSON, non-dict, and non-list payloads identically —
-            # the caller then silently treats context as "satisfied" (no
-            # missing_context) with no signal that the LLM's response
-            # couldn't be parsed at all versus genuinely having nothing
-            # missing. Narrowed to the exceptions this parse can actually
-            # raise and logged at debug so the real cause is visible.
+            # Narrowed to the parse's real exceptions and logged at debug, so an unparseable reply is visible (BUGFIX).
             logger.debug(
                 "_extract_missing_context: could not parse missing_context "
                 "from LLM response: %s", exc,
@@ -1130,13 +1001,7 @@ class Coder(_llm_stream.LLMClientBase):
         """
         try:
             from tools.search_agent import make_search_agent  # lazy import
-            # AUTO-BUG: this used to construct SearchAgent directly, reading
-            # only model/base_url/api_key/api_format/timeout — silently
-            # ignoring [search] skip_dirs/max_depth/max_file_kb and
-            # [api] verify_ssl, the exact config keys make_search_agent
-            # exists to read consistently with main.py's own SearchAgent
-            # (see its docstring). A self-signed-cert HTTPS profile or a
-            # customised skip_dirs list was silently not honoured here.
+            # Build the search agent through make_search_agent, so [search] and [api] settings such as verify_ssl apply (AUTO-BUG).
             agent = make_search_agent(self._config, str(base_dir))
         except Exception as exc:
             logger.warning("coder._fetch_needed: could not create SearchAgent: %s", exc)
@@ -1297,8 +1162,7 @@ class Coder(_llm_stream.LLMClientBase):
         def _norm(s: str) -> str:
             return " ".join((s or "").split()).lower()
 
-        # All chapters in play: existing siblings on disk, overlaid with the
-        # newly produced content for the target files.
+        # All chapters in play: the siblings on disk, overlaid with the new content for the targets.
         chapters: dict[str, str] = {}
         try:
             tgt0 = Path(target_files[0]) if target_files else Path(".")
@@ -1310,12 +1174,7 @@ class Coder(_llm_stream.LLMClientBase):
                     except OSError:
                         continue
         except OSError as exc:
-            # BUGFIX: was a bare `except Exception: pass` — narrowed to
-            # OSError (the only kind this glob/path-construction code can
-            # raise) and logged. Silently swallowing it meant a permission
-            # error or a vanishing candidate directory quietly reduced the
-            # set of sibling chapters checked for near-duplication, with no
-            # signal that detection quality had degraded.
+            # Narrowed to OSError and logged: a failed directory listing is visible, not a silent skip (BUGFIX).
             logger.debug(
                 "_creative_duplication_error: could not list candidate "
                 "chapters under %s: %s", base_dir, exc,
@@ -1338,19 +1197,7 @@ class Coder(_llm_stream.LLMClientBase):
                 n2 = _norm(ocontent)
                 if len(n2) < 50:
                     continue
-                # AUTO-CR-18-2: autojunk=False. SequenceMatcher's default
-                # autojunk=True treats characters that recur heavily in a
-                # sequence over 200 chars long as "popular" and excludes
-                # them from matching blocks — for ordinary prose that is
-                # spaces and common short words, so a REAL, near-duplicate
-                # paraphrase (same structure, ~10-20% of words swapped for
-                # synonyms) can score as low as ~0.08 instead of ~0.94.
-                # Verbatim copies (ratio 1.0 either way) never exposed
-                # this; a synonym-swapped rewrite — the actual failure
-                # mode this guard exists to catch — did, completely
-                # silently. Confirmed against real duplicated changelog
-                # entries from a live run: autojunk=True scored 0.085,
-                # autojunk=False scored 0.938, thresh is 0.92.
+                # autojunk=False: a synonym-swapped near-duplicate scores high instead of near zero (AUTO-CR-18-2).
                 ratio = difflib.SequenceMatcher(None, n1, n2, autojunk=False).ratio()
                 if ratio >= thresh:
                     return (
@@ -1361,10 +1208,7 @@ class Coder(_llm_stream.LLMClientBase):
                         f"own events and its own chapter heading."
                     )
 
-        # AUTO-CR-18-2: WITHIN-file check — near-duplicate `### `-headed
-        # entries in the SAME produced file (a changelog rewritten each
-        # round with one more synonym-swapped entry appended, never
-        # rejected because the check above compares files, not sections).
+        # Within-file check: near-duplicate "###" entries in one produced file are caught too (AUTO-CR-18-2).
         for pname, pcontent in produced.items():
             entries = _split_creative_entries(pcontent)
             if len(entries) < 2:
@@ -1379,8 +1223,7 @@ class Coder(_llm_stream.LLMClientBase):
                     n2 = _norm(body_b)
                     if len(n2) < 50:
                         continue
-                    # AUTO-CR-18-2: autojunk=False — see the cross-file
-                    # comparison above for why.
+                    # autojunk=False, as in the cross-file comparison above (AUTO-CR-18-2).
                     ratio = difflib.SequenceMatcher(None, n1, n2, autojunk=False).ratio()
                     if ratio >= thresh:
                         return (
@@ -1417,29 +1260,7 @@ class Coder(_llm_stream.LLMClientBase):
             for pat in ("chapter_*.md", "chapter_*.txt", "chapter*.md", "chapter*.txt"):
                 cands.extend(cdir.glob(pat))
 
-            # BUGFIX: `sorted(cands, reverse=True)` sorted by full PATH STRING
-            # — lexicographic, not numeric. For any project with 10+
-            # unpadded chapter numbers, this picks the wrong "latest"
-            # predecessor: "chapter_9.md" sorts AFTER "chapter_10.md" in
-            # reverse lexicographic order (comparing the character '9'
-            # against '1'), so a new chapter_11 looked at chapter_9 for its
-            # language sample instead of the true latest, chapter_10.
-            # Reproduced directly:
-            #
-            #   chapter_9.md  = "ENGLISH: chapter nine content"
-            #   chapter_10.md = "глава десять — русский текст"  (true latest)
-            #   target: chapter_11.md
-            #   sample picked: chapter_9.md's ENGLISH text        <- WRONG
-            #
-            # architect.py's _latest_chapter_file already solves this exact
-            # problem correctly (regex out the number, sort numerically) —
-            # this mirrors that approach rather than importing across
-            # modules, since the two aren't otherwise coupled. Note for a
-            # future pass: chapter-number extraction is now independently
-            # reimplemented in at least architect.py, context_broker.py,
-            # continuity_validator.py and here — the same
-            # near-duplicate-logic risk flagged elsewhere in this codebase's
-            # own fix history, worth consolidating into one shared utility.
+            # Pick the latest chapter numerically, not by path string: chapter_10 is newer than chapter_9 (BUGFIX).
             def _chapter_num(path: Path) -> "int | None":
                 m = re.search(r"chapter[_\-\s]?(\d+)", path.name, re.IGNORECASE)
                 return int(m.group(1)) if m else None
@@ -1456,14 +1277,7 @@ class Coder(_llm_stream.LLMClientBase):
                     if txt.strip():
                         return txt
         except OSError as exc:
-            # BUGFIX: was a bare `except Exception: pass`, which swallowed a
-            # real I/O error (permission-denied, disk failure, a candidate
-            # path disappearing mid-scan) exactly the same as "no preceding
-            # chapter found" — the caller then generates prose with no
-            # language-sample grounding and no hint anything went wrong.
-            # Narrowed to OSError (the only exception this glob/read-text
-            # code can actually raise) and logged so the real cause is
-            # visible instead of silently downgrading to "no content".
+            # Narrowed to OSError and logged, so a failed read is visible instead of silently meaning no prior chapter (BUGFIX).
             logger.warning(
                 "_creative_language_sample: could not read a candidate "
                 "chapter under %s: %s", cdir, exc,
@@ -1540,8 +1354,7 @@ class Coder(_llm_stream.LLMClientBase):
             )
             context = ""
 
-        # Only add the continuity block if it carries real prior content (skip
-        # the "first chapter" placeholder when we already have edit content).
+        # The continuity block is added only when it has real prior content.
         if context and "no prior chapters" not in context:
             parts.append("STORY SO FAR (for continuity):\n" + context)
 
@@ -1591,17 +1404,7 @@ class Coder(_llm_stream.LLMClientBase):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            # codeapp-sim fix: three DIFFERENT failure modes need three
-            # DIFFERENT prescriptions, or the retry feedback misleads a weak
-            # model:
-            #   (a) the reply contains no JSON at all — typically the model
-            #       asked a clarifying question or chatted instead of
-            #       emitting files. The old heuristic classified this as
-            #       "truncated" (json's 'Expecting value' matched) and told
-            #       the model its FILE WAS TOO LONG — the exact wrong advice
-            #       for a model that produced no file at all.
-            #   (b) JSON started but was cut off by the output token budget.
-            #   (c) JSON present but malformed.
+            # Three failure modes get three prescriptions: no JSON at all, JSON cut off by the budget, or malformed JSON (codeapp-sim fix).
             if "{" not in stripped:
                 msg = (
                     "LLM response contained NO JSON at all — it looks like "
@@ -1618,10 +1421,7 @@ class Coder(_llm_stream.LLMClientBase):
                     or "Expecting" in str(exc)
                 ) and not stripped.rstrip().endswith("}")
                 if truncated:
-                    # RUN-4: the head is the stable marker
-                    # _raise_budget_after_truncation keys on; generate() swaps
-                    # the advice clause out when the budget actually climbed
-                    # for the next attempt of this task.
+                    # The truncation head is the stable marker that the budget-climb advice keys on (RUN-4).
                     msg = (_TRUNCATION_HEAD
                            + " — the revised file was too long for the output "
                              "token budget. "
@@ -1659,12 +1459,7 @@ class Coder(_llm_stream.LLMClientBase):
                     task_id, i,
                 )
                 continue
-            # pullrun-sim fix: {"path": ..., "delete": true} marks a file for
-            # deletion (refactors that merge a module away). No content needed.
-            # BUGFIX A5: models emit the flag in non-canonical forms
-            # ("true" string, 1, "yes") — use _is_truthy_delete to accept
-            # the canonical truthy variants without falsely triggering
-            # on "false"/None/prose.
+            # A delete flag marks a file for removal; truthy variants such as "true" or 1 are accepted, "false" is not (BUGFIX A5).
             if _is_truthy_delete(item.get("delete")):
                 parsed.append({"path": path, "delete": True})
                 continue
@@ -1718,11 +1513,7 @@ class Coder(_llm_stream.LLMClientBase):
         # ── Strip outer fences (```markdown, ```md, ``` …) ─────────────────
         body = _strip_outer_fence(text)
 
-        # ── AUTO-CR-13: salvage prose from a JSON wrapper ───────────────────
-        # Despite the prose-only instruction, a small instruct model sometimes
-        # wraps the chapter in JSON ({"files":[{"content": "..."}]} etc.), and
-        # without this the entire JSON string was written into the chapter
-        # file. Extract the inner prose when that happens.
+        # Salvage prose from a JSON wrapper: a small model sometimes wraps the chapter in JSON (AUTO-CR-13).
         _salvaged = _extract_prose_from_json(body)
         if _salvaged is not None:
             logger.info(
@@ -1731,14 +1522,7 @@ class Coder(_llm_stream.LLMClientBase):
             )
             body = _salvaged
 
-        # ── Extract trailing CONTEXT_REQUEST line ───────────────────────────
-        # BUGFIX (audit): this only scanned (and stripped) the LAST 3 lines,
-        # but _extract_context_request_prose — which the module docstring
-        # says reads "the same line" this strips — scans the ENTIRE text.
-        # A CONTEXT_REQUEST line emitted earlier than the last 3 lines was
-        # extracted into missing_ctx by that function but left verbatim in
-        # the body actually written to disk. Strip every matching line,
-        # not just one found within the tail.
+        # Strip every CONTEXT_REQUEST line, not just those in the last three lines (BUGFIX).
         lines = body.splitlines()
         kept_lines = [
             ln for ln in lines if not ln.strip().upper().startswith("CONTEXT_REQUEST:")
@@ -1754,28 +1538,16 @@ class Coder(_llm_stream.LLMClientBase):
             logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
             return [], msg
 
-        # ── AUTO-CR-12: refusal / meta-response guard ───────────────────────
-        # Without this, the fail-open parser writes a model refusal ("I cannot
-        # fulfill your request…", "{}", "please provide more context") straight
-        # into the chapter file. Conservative — only trips on an empty JSON stub
-        # or a short body with an explicit refusal marker, so genuine prose is
-        # never rejected; a trip fails the attempt and the loop retries.
+        # Refusal guard: a model refusal or empty stub fails the attempt for a retry; genuine prose is never rejected (AUTO-CR-12).
         if _looks_like_refusal(body):
             msg = ("creative coder: response looks like a refusal / meta-reply, "
                    "not chapter prose — retrying")
             logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
             return [], msg
 
-        # ── Truncation guard ────────────────────────────────────────────────
-        # Use language-aware chars/token (~2.2 for Cyrillic vs ~4 for Latin)
-        # so this actually fires on Russian text, the dominant creative-mode
-        # language, instead of a hardcoded Latin-only ratio letting a
-        # truncated chapter through silently.
+        # Truncation guard in the language's own chars per token, so it also fires on Russian text.
         from tools.auto.utils import chars_per_token
-        # RUN-4: measure against the budget this attempt actually got — after
-        # a truncation climb this is bigger than [coder] max_tokens, and
-        # judging a complete chapter by the old number would report a cut-off
-        # that did not happen.
+        # Measured against the budget this attempt actually got, which grows after a truncation climb (RUN-4).
         char_budget = self._task_max_tokens * chars_per_token(body)
         last_char = body[-1] if body else ""
         ends_mid_sentence = last_char not in {".", "!", "?", '"', "'", "\n", "…"}
@@ -1793,11 +1565,7 @@ class Coder(_llm_stream.LLMClientBase):
         _FILE_CLOSE = re.compile(r"^<<<END>>>$", re.MULTILINE)
 
         open_matches = list(_FILE_OPEN.finditer(body))
-        # FIX: previously `len(target_files) > 1` caused the marker-stripping
-        # path to be skipped for single-target tasks, so <<<FILE:>>> / <<<END>>>
-        # delimiters were written verbatim into the chapter file.  Now we run
-        # the same extraction whenever markers are present, regardless of how
-        # many target files the task declares.
+        # Marker extraction runs whenever markers are present, for single- and multi-file tasks (FIX).
         if open_matches:
             parsed: list[dict] = []
             for i, m_open in enumerate(open_matches):
@@ -1805,10 +1573,7 @@ class Coder(_llm_stream.LLMClientBase):
                 content_start = m_open.end()
                 next_open = open_matches[i + 1] if i + 1 < len(open_matches) else None
                 boundary = next_open.start() if next_open else len(body)
-                # BUGFIX: the <<<END>>> search was unbounded, so a missing
-                # closer here matched a *later* file's marker, folding every
-                # file in between into this one's content. Only accept a
-                # closer before the next <<<FILE:>>>.
+                # A missing closer must not match a later file's marker; the closer is searched only before the next opener (BUGFIX).
                 close_match = _FILE_CLOSE.search(body, content_start, boundary)
                 content_end = close_match.start() if close_match else boundary
                 chunk = body[content_start:content_end].strip()
@@ -1839,23 +1604,15 @@ class Coder(_llm_stream.LLMClientBase):
 
     # ── Content safety ────────────────────────────────────────────────────────
 
-    # Patterns that should never appear in LLM-generated file content, keyed by
-    # a short label (used in the rejection message) → substring/regex. This is
-    # defence-in-depth, not a complete sandbox — it catches the most dangerous
-    # accidental or injected payloads before they reach disk.
+    # Patterns that must never appear in generated file content, keyed by a label (defence in depth).
 
-    # Patterns always checked regardless of task_mode: catastrophic payloads
-    # with no legitimate false-positive risk in any document or creative context.
+    # Catastrophic payload patterns, checked in every task mode, since no document needs them.
     _BLOCKED_ALWAYS: tuple[tuple[str, str], ...] = (
         ("fork bomb shell",     ":|:&"),
         ("fork bomb py",        "os.fork()"),
     )
 
-    # Patterns checked only in code mode.  These have high false-positive rates
-    # in documentation or creative writing:
-    #   - A tutorial might teach "sudo apt install nginx"
-    #   - A story character might "curl the data"
-    #   - A poem about wounds could contain 'open("'
+    # Patterns checked only in code mode; they false-positive in docs and creative prose.
     _BLOCKED_CODE_ONLY: tuple[tuple[str, str], ...] = (
         # Destructive filesystem operations
         ("shutil.rmtree",       "shutil.rmtree"),
@@ -1873,30 +1630,20 @@ class Coder(_llm_stream.LLMClientBase):
         ("open root write",     'open("/'),
     )
 
-    # System directory prefixes that must never be written to by generated
-    # code.  /tmp, /var/tmp, /home, and /Users are intentionally excluded:
-    # they are legitimate destinations for temp files, exports, and local data.
-    # Both single-quote and double-quote forms are checked in
-    # _check_content_safety to close the single-quote bypass.
+    # System directories that generated code must never write to (temp dirs are allowed); both quote forms are checked.
     _DANGEROUS_WRITE_PREFIXES: tuple[str, ...] = (
         "/etc/", "/usr/", "/bin/", "/sbin/", "/boot/",
         "/proc/", "/sys/", "/root/", "/lib/",
     )
 
-    # Patterns checked with whole-word regex (\b) instead of plain substring
-    # containment — same (label, pattern) structure as _BLOCKED_CODE_ONLY so
-    # tests can introspect membership identically. Python \b treats '_' as a
-    # word character, so underscore-joined identifiers (test_reboot_gracefully,
-    # etc.) do NOT fire; applied in code mode only, same scope as
-    # _BLOCKED_CODE_ONLY.
+    # Whole-word patterns (sudo, shutdown, reboot), code mode only: identifiers such as test_reboot_x do not match.
     _BLOCKED_CODE_WORD_BOUNDARY: tuple[tuple[str, str], ...] = (
         ("sudo invocation",     "sudo"),
         ("shutdown cmd",        "shutdown"),
         ("reboot cmd",          "reboot"),
     )
 
-    # subprocess is legitimate in many generated files; only flag it when
-    # combined with a shell-deletion token so we avoid false positives.
+    # subprocess is legitimate in generated files, so it is flagged only with a shell-deletion token.
     _SUBPROCESS_DANGER_TOKENS: tuple[str, ...] = (
         "rm ", "rm\t", '"rm"', "'rm'",  # rm with space, tab, or as a quoted list arg
         "rmdir", "rm -rf", "shutil.rmtree",
@@ -1934,15 +1681,7 @@ class Coder(_llm_stream.LLMClientBase):
             # docs / creative: only block truly catastrophic payloads
             active_patterns = cls._BLOCKED_ALWAYS
 
-        # selfhost pilot: pre-existing-pattern grandfathering. When the file
-        # being edited ALREADY legitimately contains a flagged pattern on
-        # disk (the agent's own utils.py holds os.unlink inside
-        # atomic_write_text's cleanup, executor holds subprocess, ...),
-        # editing that file must not be blocked — otherwise the agent can
-        # never modify its own infrastructure code. INTRODUCING a pattern
-        # into a file that did not have it remains blocked as before, so the
-        # scanner still stops a model from smuggling deletions into clean
-        # files. New files (existing_content is None) get no grandfathering.
+        # Grandfathering: a file that already contains a flagged pattern may be edited, but introducing one is still blocked (selfhost pilot).
         _existing_lower = (existing_content or "").lower()
         _existing_lines = _existing_lower.splitlines()
 
@@ -2014,34 +1753,12 @@ class Coder(_llm_stream.LLMClientBase):
         for label, pattern in active_patterns:
             pat_lower = pattern.lower()
 
-            # Special case: subprocess alone is fine; only block when paired
-            # with a shell-deletion token in the same file.
+            # subprocess alone is allowed; it is blocked only with a shell-deletion token in the file.
             if pat_lower == "subprocess":
                 if "subprocess" in lower:
                     for danger in cls._SUBPROCESS_DANGER_TOKENS:
                         if danger.lower() in lower:
-                            # BUGFIX: this used to be `_preexisting(danger)` —
-                            # checking only whether the danger TOKEN string
-                            # appeared anywhere in the old file, with no
-                            # requirement that it co-occurred with
-                            # "subprocess". A file with an entirely unrelated
-                            # mention of the token text (e.g. a comment
-                            # "# warning: never run rm -rf here", or a test
-                            # asserting a shutdown handler works) permanently
-                            # exempted that file from this guard for every
-                            # future edit — a genuinely NEW subprocess+rm-rf
-                            # (or +sudo, +shutdown, ...) combination introduced
-                            # later would be silently grandfathered in.
-                            # Reproduced: an existing file containing only the
-                            # plain-English warning "never run rm -rf on this
-                            # folder" let a brand-new
-                            # `subprocess.call("rm -rf /", shell=True)` through
-                            # as if it were a harmless pre-existing pattern.
-                            # The compound pattern only genuinely pre-exists
-                            # if BOTH halves were already present together —
-                            # checked here by same-line co-occurrence, not
-                            # just each token independently appearing
-                            # somewhere in the file (see _preexisting_combo).
+                            # A pattern is grandfathered only if its compound parts co-occur on one line in the old file (BUGFIX).
                             if _preexisting_combo("subprocess", danger):
                                 logger.info(
                                     "coder._check_content_safety: subprocess+%r "
@@ -2056,9 +1773,7 @@ class Coder(_llm_stream.LLMClientBase):
                             )
                 continue
 
-            # Special case: open() root-write — check both quote styles and
-            # restrict to genuinely dangerous system paths so that legitimate
-            # patterns like open("/tmp/out.txt", "w") are not blocked.
+            # open() root writes are checked for both quote styles, limited to dangerous system paths.
             if label == "open root write":
                 for prefix in cls._DANGEROUS_WRITE_PREFIXES:
                     for q in ('"', "'"):
@@ -2080,11 +1795,7 @@ class Coder(_llm_stream.LLMClientBase):
                     continue
                 return False, f"blocked content pattern {pattern!r} ({label})"
 
-        # Word-boundary patterns (code mode only: sudo/shutdown/reboot), checked
-        # separately so identifier names embedding the keyword
-        # (test_reboot_gracefully, handle_shutdown_signal, test_sudo_not_needed)
-        # do NOT fire. Python \b treats '_' as a word character, so
-        # underscore-joined names have no boundary at the underscore.
+        # Whole-word patterns apply in code mode; identifiers containing the keyword are not matched.
         if task_mode == "code":
             import re as _re
             for label, pattern in cls._BLOCKED_CODE_WORD_BOUNDARY:
@@ -2188,10 +1899,7 @@ class Coder(_llm_stream.LLMClientBase):
 
             # ── Guard 2: path must be in the task's approved target_files ──
             if allowed_paths is not None:
-                # Strip a literal "./" prefix only (not str.lstrip("./"),
-                # which eats any leading dot/slash character and let a
-                # disallowed dotfile like .notes.md collide with an
-                # allowed notes.md after normalisation).
+                # Only a literal leading ./ is stripped, so a dotfile such as .notes.md is never confused with notes.md.
                 def _norm_target(p: str) -> str:
                     p = p.replace("\\", "/")
                     while p.startswith("./"):
@@ -2203,31 +1911,17 @@ class Coder(_llm_stream.LLMClientBase):
                 if norm not in allowed_norm:
                     msg = _guard2_skip_message(rel)
                     logger.warning("coder._write_files [%s]: %s", task_id, msg)
-                    # RUN-1: a Guard-2 skip is protection, not a verdict. The
-                    # path outside target_files is never written (or deleted),
-                    # so nothing was harmed and an attempt whose target files
-                    # all landed must not be failed for it — record the skip
-                    # instead of poisoning first_error. (Observed live:
-                    # AUTO-T29 burned ~40 attempts because a test file the
-                    # model shipped alongside its code kept failing the whole
-                    # attempt.) generate() still fails the attempt when
-                    # NOTHING landed — see _guard2_all_skipped_error.
+                    # A Guard-2 skip is protection, not a failure: nothing was written, so it is recorded instead of failing the attempt (RUN-1).
                     if skipped_out is not None:
                         skipped_out.append(rel)
                     continue
 
-            # ── Delete branch (pullrun-sim): {"path": ..., "delete": true} ──
-            # Same path/target guards as writes; original backed up to
-            # .coder.bak so the deletion is reversible without git. Deleting
-            # an already-absent file is a no-op success (idempotent retries).
-            # BUGFIX A5: accept truthy string/int variants ("true", 1,
-            # "yes") the same way _parse_response does.
+            # Delete flag: same guards as writes; the original is backed up to .coder.bak; deleting an absent file is a no-op (pullrun-sim).
             if _is_truthy_delete(item.get("delete")):
                 try:
                     if dest.exists():
                         backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                        # bytes and mode: read as utf-8 with errors=replace, a latin-1 \xe9 came back
-                        # as U+FFFD, and a BOM + CRLF file as BOM + LF — no backup of the original
+                        # Backups keep the original bytes and mode, so no encoding or BOM is changed.
                         shutil.copy2(dest, backup)
                         dest.unlink()
                         logger.info(
@@ -2249,13 +1943,7 @@ class Coder(_llm_stream.LLMClientBase):
 
             content = item["content"]
 
-            # ── Guard 2.5 (pullrun-sim): identifier language ────────────────
-            # PEP 3131 makes fully-Russian identifiers VALID Python; with a
-            # compatibility alias (run = запустить) such code even passes the
-            # acceptance check (exit 0) — nothing else in code mode would
-            # ever reject it. Optional deterministic gate: tokenize and
-            # reject non-ASCII identifiers with a precise, named list, so the
-            # retry feedback tells the model exactly what to rename.
+            # Guard 2.5: tokenise and reject non-ASCII identifiers in code mode, so the retry names what to rename (pullrun-sim).
             if (
                 self._ascii_identifiers_only
                 and self._task_mode == "code"
@@ -2294,9 +1982,7 @@ class Coder(_llm_stream.LLMClientBase):
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
 
-                # Preserve the existing file's permission bits (e.g. the
-                # executable bit on a shell script or CLI entry point) —
-                # see the BUGFIX note below for why this matters.
+                # Keep the existing file's permission bits when rewriting it.
                 existing_mode: "int | None" = None
 
                 # Back up existing file before overwriting (reversible).
@@ -2313,24 +1999,7 @@ class Coder(_llm_stream.LLMClientBase):
                         task_id, dest, backup,
                     )
 
-                # BUGFIX: was `dest.write_text(content, encoding="utf-8")` —
-                # a plain, non-atomic write. If the process is killed mid-
-                # write (SIGKILL, OOM-kill, power loss) while writing the
-                # user's actual code file, the file is left truncated with
-                # no detection anywhere — unlike the JSON state files this
-                # codebase already protects, there's no parse step to even
-                # notice a corrupted source file. Same failure class already
-                # found and fixed for synopsis.md and story_bible.md
-                # elsewhere in this branch; this write is the single
-                # highest-stakes one in the whole pipeline (the user's real,
-                # possibly hand-written, source file) and was the one place
-                # still using the unsafe plain write.
-                # atomic_write_text's temp-file-plus-os.replace() approach
-                # creates the temp file via tempfile.mkstemp (mode 0600), so
-                # replacing over an existing file would otherwise silently
-                # reset its permission bits on every single edit — restore
-                # them explicitly so this fix doesn't trade a corruption bug
-                # for a permissions bug.
+                # Write atomically and keep the file's permission bits: a kill mid-write must not truncate the user's source file (BUGFIX).
                 atomic_write_text(dest, content, newline="")
                 if existing_mode is not None:
                     try:
@@ -2353,14 +2022,9 @@ class Coder(_llm_stream.LLMClientBase):
         return written, first_error
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-CR-18-2: entry splitting for the within-file duplication check
-# ─────────────────────────────────────────────────────────────────────────────
+# Entry splitting for the within-file duplication check (AUTO-CR-18-2)
 
-#: Matches the same "### Heading" entry marker scripts/check_runbook.py's
-#: own ``_ENTRY_RE`` uses to count changelog entries — kept in sync
-#: deliberately: both are reading the same document convention, and a
-#: format change (e.g. to "## ") would need to move in both places at once.
+#: The "### Heading" marker, kept in sync with check_runbook's entry regex.
 _CREATIVE_ENTRY_RE = re.compile(r"^###\s+(.+)$", re.MULTILINE)
 
 
@@ -2384,9 +2048,7 @@ def _split_creative_entries(text: str) -> list[tuple[str, str]]:
     return entries
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Symbol-aware file chunking (SCTX Task 1)
-# ─────────────────────────────────────────────────────────────────────────────
+# Symbol-aware chunking (SCTX Task 1)
 
 def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
     """Split *source* into symbol-aware chunks for prompt assembly.
@@ -2411,10 +2073,7 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
     if ext and not ext.startswith("."):
         ext = "." + ext
 
-    # ── Extract import / preamble block ────────────────────────────────────────
-    # Collects leading import/include/pragma lines (plus interleaved blanks)
-    # across Python/JS/TS/Go/Rust/C/C++/Java/Kotlin/Ruby/PHP/shell. Unsupported
-    # languages just get an empty block — safe, no import chunk is emitted.
+    # Leading import and preamble lines across the supported languages; unsupported languages get an empty block.
     _import_re = re.compile(
         r"^\s*("
         r"import\s"                             # Python, JS, TS, Java, Go bare
@@ -2470,9 +2129,7 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 symbols.append((node.name, node.lineno))
     else:
-        # Best-effort regex scan for top-level symbols across brace- and
-        # indent-based languages (JS/TS, Go, Rust, Java/C#, C/C++, Ruby, PHP,
-        # Swift, Kotlin) — functions, classes, structs, etc.
+        # Best-effort top-level symbol scan for brace- and indent-based languages.
         _sym_re = re.compile(
             r"(?m)^[ \t]*"
             # optional visibility / modifier keywords (greedy, non-capturing)
@@ -2488,9 +2145,7 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
             # the symbol name — captured
             r"([A-Za-z_][A-Za-z0-9_]*)"
         )
-        # Also capture JS/TS arrow-function assignments at statement level:
-        #   const myFunc = (...) => {
-        #   let   myFunc = async (...) => {
+        # JS/TS arrow-function assignments at statement level count as symbols.
         _arrow_re = re.compile(
             r"(?m)^[ \t]*(?:export\s+)?(?:const|let|var)\s+"
             r"([A-Za-z_][A-Za-z0-9_]*)\s*="
@@ -2593,9 +2248,7 @@ def select_relevant_chunks(
     return "\n\n".join(result_parts)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 _REFUSAL_MARKERS: tuple[str, ...] = (
     "i cannot fulfill", "i can't fulfill", "i cannot assist", "i can't assist",
@@ -2710,10 +2363,7 @@ def _strip_outer_fence(text: str) -> str:
     """
     t = text.strip()
     if t.startswith("```"):
-        # Drop the opening fence line (e.g. "```json").
-        # If there is no newline the input is just a bare fence marker with no
-        # content — return the original text so json.loads can fail gracefully
-        # rather than getting an empty string.
+        # Drop the opening fence line; a bare fence with no content is returned as-is so json.loads fails cleanly.
         if "\n" not in t:
             return t
         t = t.split("\n", 1)[1]
@@ -2745,9 +2395,7 @@ def _strip_code_fence(text: str) -> str:
     return t.rstrip("\n") + "\n"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience factory — mirrors make_executor / review_clusters pattern
-# ─────────────────────────────────────────────────────────────────────────────
+# Convenience factory
 
 def make_coder(config: configparser.ConfigParser, task_mode: str = "code",
                run_goal: str = "") -> Coder:

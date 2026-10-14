@@ -86,8 +86,7 @@ def emitter(tmp_path: Path, monkeypatch) -> tuple[PlanEmitter, StateStore]:
     git.commit.return_value = "abcdef1234567890"
 
     em = PlanEmitter(base, state, git)
-    # to_improvements_md is exercised by its own tests; keep this one focused
-    # on the upsert loop.
+    # to_improvements_md has its own tests; this one covers the upsert loop.
     monkeypatch.setattr(
         "tools.auto.plan_emitter.to_improvements_md", lambda backlog: "# plan\n"
     )

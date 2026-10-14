@@ -31,8 +31,7 @@ from tools.auto.summary_memory import SummaryFidelityVerifier
 _SOURCE = "Anna is thirty years old and lives in Prague."
 _SUMMARY = "- Anna is 25 years old.\n- Anna lives in Prague."
 _CORRECTION = "- Anna is 30 years old.\n- Anna lives in Prague."
-#: _clean_bullet_list normalises every marker to "•", so the applied
-#: correction comes back re-bulleted rather than byte-identical.
+#: _clean_bullet_list re-bullets the corrections, so the result is not byte-identical.
 _CORRECTED = "• Anna is 30 years old.\n• Anna lives in Prague."
 
 

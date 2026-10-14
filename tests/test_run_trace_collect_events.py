@@ -61,9 +61,7 @@ from tools.collect.model import FunctionRecord, ModuleRecord
 from analyze_logs import analyze, render_run_summary
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures and helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 class RecordingTracer:
     """Stands in for `tools.agent_trace.tracer`: records, writes nothing.
@@ -117,8 +115,7 @@ def _minimal_config() -> configparser.ConfigParser:
             "model": "test-model",
             "api_format": "openai",
         },
-        # 2 re-asks, not 6: enough to prove a verdict reached from the ladder,
-        # and this suite is not the place to pay for the whole ladder.
+        # Two re-asks are enough to prove a ladder verdict; the whole ladder is not paid for here.
         "gate1": {"temperature": "0.0", "max_tokens": "64", "skip_llm": "false",
                   "unparseable_max_retries": "2"},
         "loop":  {"timeout_seconds": "10"},
@@ -170,17 +167,14 @@ def _capture(fn, *args, **kwargs) -> str:
     return buf.getvalue()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# collect_block / collect_shrink / collect_miss / collect_summary
-# ─────────────────────────────────────────────────────────────────────────────
+# collect_block, collect_shrink, collect_miss and collect_summary
 
 def test_context_for_emits_block_and_shrink_and_summary(monkeypatch):
     """A build, a memo hit, and one LLM shrink — all four events."""
     rec = RecordingTracer()
     monkeypatch.setattr("tools.agent_trace.tracer", rec)
 
-    # A parse_error that alone exceeds the budget is the case where the
-    # assembler's row cut cannot help and _shrink still fires.
+    # A parse_error alone over the budget is the case where _shrink still fires.
     module = ModuleRecord(
         path="pkg/a.py",
         public_symbols=tuple(
@@ -350,9 +344,7 @@ def test_no_bridge_no_events_and_zeroed_split(monkeypatch):
     rec = RecordingTracer()
     monkeypatch.setattr("tools.agent_trace.tracer", rec)
 
-    # Every emit site is inside the bridge, so with none wired in there is
-    # nothing that could fire. format_gate1_split on an empty counter dict —
-    # what a stubbed filter_candidates leaves behind — prints all zeros.
+    # With no emit site wired, an empty counter dict prints all zeros.
     assert format_gate1_split({}) == (
         "existence=0 presence_confirmed=0 presence_rejected=0 "
         "presence_fail_closed=0 presence_unknown=0 presence_reask=0 "
@@ -398,9 +390,7 @@ def test_build_collect_context_block_stats_keeps_the_string_wrapper():
     assert empty_stats["chars"] == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Gate-1 stage split
-# ─────────────────────────────────────────────────────────────────────────────
+# Gate 1 stage split
 
 def _code_block_from(user_msg: str) -> str:
     m = re.search(r"Code at that location:\n```\n(.*?)\n```", user_msg, re.S)
@@ -433,9 +423,7 @@ def _m4_repo(tmp_path: Path) -> list[CandidateTask]:
             encoding="utf-8",
         )
     (tmp_path / "docs" / "notes.md").write_text(
-        # First line >= 8 chars: a shorter quote fails the evidence check and
-        # the candidate is rejected as unsupported, which is not what this
-        # fixture is for — it exists to be counted in `non_py`.
+        # The first line is long enough for the evidence check; this fixture exists to be counted in non_py.
         "# a notes file with some prose in it\n\nMore prose below the heading.\n",
         encoding="utf-8",
     )
@@ -487,9 +475,7 @@ def test_gate1_split_line(monkeypatch):
     assert "existence=0" in line
     assert "presence_confirmed=3" in line        # c1, c4 (on the re-ask), c5
     assert "presence_rejected=1" in line          # c2
-    # RUN-5: c3 is not a rejection — the ladder never got a verdict, so the
-    # default keep policy passes it through and fail_closed stays empty.
-    # `presence_unknown` is where c3 shows up.
+    # c3 is not a rejection: the ladder gave no verdict, so the keep policy passes it and presence_unknown counts it.
     assert "presence_fail_closed=0" in line
     assert "presence_unknown=1" in line           # c3, "" after the ladder
     assert "presence_reask=1" in line             # c4 only
@@ -504,14 +490,12 @@ def test_gate1_split_line(monkeypatch):
         "presence_nothink_ignored=0 "
         "duplicate=0 non_py=1"
     )
-    # The buckets add up to the candidates they describe. c3 is accepted
-    # without a verdict, so it is not counted as a confirmation.
+    # The buckets add up to the candidates; c3 is accepted without a verdict, so it is not counted.
     assert len(accepted) == 4
     assert len(rejected) == 1
     assert counts["presence_confirmed"] == 3
     assert counts["presence_rejected"] + counts["presence_fail_closed"] == len(rejected)
-    # And the counter the log line used to hide: without it, c3 and c2 look
-    # the same.
+    # The counter the log line used to hide: without it, c3 and c2 look the same.
     assert filt.presence_reask == 1
     assert filt.presence_unknown == 1
     assert filt.non_py_requests == 1
@@ -546,8 +530,7 @@ def test_gate1_split_all_fields_zero_for_existence_only_mode(monkeypatch):
         "presence_nothink_ignored=0 "
         "duplicate=0 non_py=0"
     )
-    # An existence-only acceptance is not a model verdict, so it is not counted
-    # as one: counting it would make the presence number exceed the calls made.
+    # An existence-only acceptance is not a model verdict, so it is not counted.
     assert counts["presence_confirmed"] == 0
     assert counts["presence_unknown"] == 0
 
@@ -566,8 +549,7 @@ def test_gate1_split_counts_existence_and_duplicate(monkeypatch):
 
         candidates = [
             _candidate("missing file", "tools/nope.py", symbol="nope"),
-            # Same title: the dedup fingerprint is file + anchor + title, so
-            # two candidates that only differ in wording are not duplicates.
+            # Candidates that differ only in wording are not duplicates (the fingerprint is file, anchor and title).
             _candidate("same claim", "tools/a.py", symbol="parse_config"),
             _candidate("same claim", "tools/a.py", symbol="parse_config"),
         ]
@@ -600,8 +582,7 @@ def test_gate1_outcome_buckets():
         == "presence_confirmed"
     assert gate1_outcome("presence", "existence check passed (LLM skipped)", True) == ""
     assert gate1_outcome("presence", "new file — existence check sufficient", True) == ""
-    # V12's stage does not exist here: flagged as a gap, never a zero column
-    # invented, and never forced into a presence bucket.
+    # V12's stage does not exist here, so it is a gap, never a zero column.
     assert gate1_outcome("already_safe", "guarded by the contract", True) == _UNKNOWN_STAGE
 
 
@@ -652,9 +633,7 @@ def test_filter_returns_the_same_tuple_without_counters(monkeypatch):
     assert len(accepted) == 1 and rejected == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Readers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _event(kind, params=None, run_id="run1", ts="2026-01-01T00:00:00+00:00",
            source="collect_bridge", target="auto_run", content="") -> dict:
@@ -666,9 +645,7 @@ def _event(kind, params=None, run_id="run1", ts="2026-01-01T00:00:00+00:00",
 
 
 def test_run_trace_log_gate1_split(monkeypatch):
-    # run_trace.py imports the singleton by name at module import time, so the
-    # patch has to land where it imported it from — unlike collect_bridge,
-    # which imports it lazily inside _event and therefore sees the module.
+    # run_trace imports the singleton by name, so the patch must land where it was imported from.
     rec = RecordingTracer()
     monkeypatch.setattr("tools.auto.run_trace.tracer", rec)
     run_trace = RunTrace(SimpleNamespace(log=lambda *args: None), "run123", None)
@@ -690,10 +667,7 @@ def test_run_trace_log_gate1_split(monkeypatch):
 
 
 def test_run_trace_log_gate1_rejected_carries_the_stage(monkeypatch):
-    # The split says how many; the per-rejection event says which one. The
-    # `stage` field is optional so the pre-M4 two-argument call is unchanged
-    # (no key at all, not an empty one) and a reader can key on it instead of
-    # on the reason-text vocabulary.
+    # stage is optional (no key at all for pre-M4 calls), so readers can key on it.
     rec = RecordingTracer()
     monkeypatch.setattr("tools.auto.run_trace.tracer", rec)
     run_trace = RunTrace(SimpleNamespace(log=lambda *args: None), "run123", None)

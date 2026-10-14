@@ -272,8 +272,7 @@ _VIEW_FORBIDDEN = ("--output", "--ext-diff", "--textconv", "--open-files-in-page
                    "--exec-path", "--git-dir", "--work-tree", "--config-env",
                    "--contents",   # blame --contents reads a file outside the commit
                    "--no-index")   # diff/grep --no-index read any path on disk, not the commit
-#: a diff driver is named by the commit's .gitattributes and defined in the operator's config;
-#: git runs its textconv / external diff by default, so the view turns both off for these.
+#: Diff drivers are turned off for these git commands, so the view is plain text.
 _NO_FILTERS = frozenset(("show", "diff", "log", "blame"))   # blame runs textconv too
 
 
@@ -285,8 +284,7 @@ class _TargetView(PathRepoView):
         norm = os.path.normpath(path.strip("/")) if path else ""
         return norm == ".collect" or norm.startswith(".collect" + os.sep)
 
-    # `.collect/` is what Target.collect() wrote, not what the commit holds: files(), exists()
-    # and read() all say so, or a claim naming `.collect/MODULE_MAP.md` would resolve as found.
+    # .collect/ comes from the collect run, not from the commit, so files() and read() say so.
     def files(self) -> list:
         return [p for p in super().files() if not self._is_collect(p)]
 
@@ -386,19 +384,15 @@ class Target:
                 tree.parent.mkdir(parents=True, exist_ok=True)
                 _git(git_dir, "worktree", "add", "--detach", "--force", str(tree), sha)
                 created = True
-            # every open of this tree is on record, so a close never removes it under another
-            # user (two opens of one sha share the tree; the first close deleted it and the
-            # other's anchors resolved as not found: code claims judged as world claims)
+            # Each open is on record under users/, so one close never removes a tree another open still uses.
             users = tree.parent / "users"
             users.mkdir(exist_ok=True)
             token = users / f"{os.getpid()}-{uuid.uuid4().hex}"
             token.touch()
             if created:
-                # who made it: a maker killed before its close (kill -9, the OOM killer) left the tree
-                # for good — every later open reused it and, not its maker, left it there
+                # A maker killed mid-open leaves its tree behind, so the tree is taken over by its owner only.
                 (tree.parent / "creator").write_text(token.name, encoding="utf-8")
-        # a local path is recorded absolute: votes.json keeps it, and claimcheck_truth.py run from
-        # another directory read `--target .` as its own cwd ("no such directory", no rebuild)
+        # A local path is recorded absolute, so votes.json works from any directory.
         target = cls(repo=repo_s if _is_url(repo_s) else os.path.abspath(repo_s), ref=ref, sha=sha, tree=tree, scratch=scratch,
                      git_dir=git_dir, created=created, warnings=warnings)
         target._token = token
@@ -438,9 +432,7 @@ class Target:
             raise TargetError(f"ref `{ref}`: a sha shorter than 7 characters is ambiguous, give 7 or more")
         candidates = [ref]
         if not cls._ref_is_sha(ref):
-            # a clone has the branches as remotes; its local `main` is the one clone made and a
-            # fetch never moves it, so a URL target asks origin/<ref> first (--ref main --fetch
-            # resolved the old commit)
+            # A clone's local branch does not move on fetch; a URL target looks at origin/<ref> first.
             candidates.insert(0 if is_url else 1, f"origin/{ref}")
         last = ""
         for cand in candidates:
@@ -500,8 +492,7 @@ class Target:
 
         A failure of collect (not a Python repository, a parse error, 300 s) does not fail
         the target: the result is the loader's absent model and `warnings` says why."""
-        # by the config object itself: an id() alone outlives its object, and a new config made where a
-        # collected one was (the same id) got the other's model. The config is held, so its id is not reused
+        # The config is held by the cache entry, so a reused id() cannot return another config's model.
         key = id(config)
         hit = self._models.get(key)
         if hit is not None and hit[0] is config:
@@ -554,8 +545,7 @@ class Target:
             if self._token is not None:
                 self._token.unlink(missing_ok=True)
                 self._token = None
-            # a name that is no token of ours (.DS_Store, an editor's backup) is nobody's: int() of it
-            # was a ValueError that left the worktree behind
+            # A name that is not one of our tokens is skipped, instead of raising and leaving the worktree.
             others = [u for u in users.glob("*") if (pid := _token_pid(u.name)) is not None and _pid_alive(pid)] \
                 if users.is_dir() else []
             creator = self.tree.parent / "creator"

@@ -105,22 +105,17 @@ BACKENDS = ("kilo", "openrouter")
 #: The subprocess entry point ``OpenRouterBackend.spawn_agent`` runs: this file.
 AGENT_LOOP_MODULE = "tools.contest.backend"
 
-#: The stdin/stdout record that ends a turn. The agent loop writes it once the
-#: model returns a message with no tool calls left to run.
+#: The stdin/stdout record that ends a turn, written when the model has no tool calls left.
 IDLE_SENTINEL = "idle"
 
-#: One bash command the agent loop may run, before it gives up and returns
-#: ``timeout``. Longer than ``turn_timeout_sec`` is pointless: the runner
-#: aborts the session first.
+#: Bash timeout for one agent command; longer than turn_timeout_sec would be pointless.
 _AGENT_BASH_TIMEOUT = 300.0
 
 #: ``CONTEST_AGENT_BASH_TIMEOUT`` in the agent's environment overrides the above.
 _AGENT_BASH_TIMEOUT_ENV = "CONTEST_AGENT_BASH_TIMEOUT"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the protocol
-# ─────────────────────────────────────────────────────────────────────────────
+# Protocol
 
 class ContestBackendError(Exception):
     """A backend failure that cannot be retried (mirrors KiloHttpError's role).
@@ -363,35 +358,21 @@ class ContestBackend(Protocol):
         ...
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Kilo
-# ─────────────────────────────────────────────────────────────────────────────
 
-#: Round 148: the project config a `PATCH /config` writes into the workspace.
-#: Kilo keeps the patch there, so the file outlives the turn that wrote it.
+#: Round 148: the project config a PATCH /config writes; it outlives the turn that wrote it.
 KILO_PROJECT_FILE = ".kilo/kilo.jsonc"
 
-#: Round 151: the two names that config may sit under. They are the only paths
-#: a `PATCH /config` rewrites, and therefore the only ones the guards below
-#: refuse over: a tracked ``.kilo/rules/x.md`` is the agent's own file and
-#: never blocks the push — `.kilo/.gitignore` keeps the untracked file out of
-#: the diff, and only a tracked one can land in it.
+#: Project config files a PATCH /config rewrites; only tracked copies block the push (round 151).
 KILO_PROJECT_FILE_NAMES = (".kilo/kilo.jsonc", ".kilo/kilo.json")
 
-#: Round 151: the ignore file that keeps `KILO_PROJECT_FILE_NAMES` out of the
-#: agent's tree, inside the workspace — never in git's own exclude (see
-#: `_exclude_kilo_dir` for why there is no exclude ours alone to write to).
+#: Ignore file, kept in the workspace, that hides the project config files (round 151).
 _KILO_IGNORE_PATH = (".kilo", ".gitignore")
 
-#: Its whole content: the two names a `PATCH /config` writes, and its own name,
-#: so the file hides itself too and `git add -A` stages none of ours. A rule
-#: file the agent adds in `.kilo/` is not among those names and stays committable.
+#: Contents of the ignore file: the project config names and its own name (round 151).
 _KILO_IGNORE_LINES = ("kilo.jsonc", "kilo.json", ".gitignore")
 
-#: Round 151: how long the guards wait for `git`. The check runs once per
-#: remembered size per agent, so a short bound is enough — and a `git` that
-#: cannot read its own index will not answer in any time at all, which is
-#: exactly why the caller has to refuse rather than wait longer.
+#: Seconds the guards wait for git; a git that cannot read its index must refuse (round 151).
 _KILO_GIT_TIMEOUT = 10.0
 
 
@@ -626,12 +607,7 @@ def _exclude_kilo_dir(directory: str) -> None:
     the missing names are appended to it; one that is tracked, or does not hide
     itself, is still the agent's and is still only warned about.
     """
-    # round 155: no per-directory memory of a file already in place — the
-    # agent's `git clean -fdx` or `rm -rf .kilo`, or the drop at the end of a
-    # leg, removes it behind any cache, and Kilo's reload then writes its own
-    # without the project names. One read per push (once per size) is nothing.
-    # round 148's contract: a directory that is not a git checkout has no diff
-    # to keep anything out of, and nothing is written there
+    # Checked on every push, since the agent or a leg can remove the file behind any cache (round 155, round 148).
     ok, inside = _git(directory, "rev-parse", "--is-inside-work-tree",
                       timeout=_KILO_GIT_TIMEOUT)
     if not ok or inside != "true":
@@ -695,10 +671,7 @@ def _drop_kilo_ignore(directory) -> None:
         pass
 
 
-#: Round 160: the least time `_reconnect_tap` gives the old tap to exit after
-#: its stop — the stop shuts the socket, so the reader is gone well inside it.
-#: Not cut by the reconnect's deadline: a join of zero is what left two taps
-#: on one log.
+#: Least time the old tap gets to exit after its stop; a zero join left two taps on one log (round 160).
 _OLD_TAP_JOIN_SEC = 2.0
 
 
@@ -726,21 +699,14 @@ class KiloBackend:
             if not events_log:
                 raise ContestBackendError("KiloBackend needs an events_log path for its tap")
             tap = EventTap(base, directory, events_log).start()
-            # round 145/151: what a reconnect after `set_model_limit` needs to
-            # rebuild this backend's own tap. Only set when the backend built
-            # the tap: an injected `tap=` is the caller's, and `_tap_args is
-            # None` is the marker that leaves it alone instead of rebuilding
-            # over it — which also keeps `server.base_url` unread for one that
-            # has none to read.
+            # Arguments to rebuild this backend's tap after a reconnect; set only when it built the tap (round 145, round 151).
             tap_args = (base, directory, events_log)
         self._client = client
         self._tap = tap
         self._directory = directory
         self._tap_args = tap_args
         self._interrupted = False
-        # round 151: held by `_reconnect_tap` and `interrupt` alike, so a Ctrl-C
-        # between "stop the old tap" and "publish the new one" cannot leave two
-        # live readers on one stream and a wait that no one will wake
+        # Held by the tap reconnect and by interrupt, so two readers never share a stream (round 151).
         self._tap_lock = threading.Lock()
 
     # ── the protocol ────────────────────────────────────────────────────────
@@ -815,10 +781,7 @@ class KiloBackend:
             self._client.set_model_limit(provider_id, model_id, limit)
         except KiloHttpError as exc:
             raise ContestBackendError(str(exc)) from exc
-        # the patch landed, so Kilo now holds the window: only this round's
-        # stream of it is left to fix, and it comes back as
-        # `KiloTapReconnectError` — never as the plain error a caller would
-        # read as "the window was not handed over"
+        # After the patch lands, a tap failure is reported as KiloTapReconnectError (round 151).
         with self._tap_lock:
             before = self._tap
         try:
@@ -945,15 +908,11 @@ class KiloBackend:
             return
         deadline = time.monotonic() + max(0.0, float(settle))
         base, directory, log = self._tap_args
-        # round 159: the lock covers reading and publishing `self._tap` only.
-        # The waits and the start below run without it, so an `interrupt()`
-        # (Ctrl-C) never waits on a reload — 151 held it across all of them,
-        # up to *settle* seconds and the whole of a start that hangs.
+        # The lock covers only reading and publishing the tap, so an interrupt never waits on a reload (round 159).
         with self._tap_lock:
             old = self._tap
             if self._interrupted:
-                # a Ctrl-C before the reconnect: no new stream is opened for a
-                # backend that is being given up
+                # A Ctrl-C before the reconnect opens no new stream for a backend being given up.
                 old.stop()
                 return
         left = max(0.0, deadline - time.monotonic())
@@ -973,9 +932,7 @@ class KiloBackend:
         try:
             new_tap = self._start_tap(base, directory, log)
         except KiloTapReconnectError:
-            # the wait above consumed the old tap's one `tap.closed`: the
-            # next caller's wait on it must still wake at once, not sit out
-            # its silence clock. Memory only — its log is closed by now.
+            # Re-record the closed tap so the next wait on it still wakes at once (round 151).
             old._close_with("the event stream could not be reopened after "
                             "the config reload")
             raise
@@ -983,9 +940,7 @@ class KiloBackend:
             self._tap = new_tap
             interrupted = self._interrupted
             if interrupted:
-                # an interrupt that came while the new tap was being started
-                # stopped the old one; this one is stopped here, under the lock
-                # it would have taken
+                # An interrupt during the start stopped the old tap, so the new one is stopped here too.
                 new_tap.stop()
         if interrupted:
             # stopped above: when this returns, no tap thread of ours runs on
@@ -999,9 +954,7 @@ class KiloBackend:
         except Exception:  # noqa: BLE001 — the stream is open; the event is a courtesy
             seen = None
         if seen is not None and seen.get("type") == "tap.closed":
-            # an interrupt (or the stream's end) landed during this wait, which
-            # consumed its `tap.closed`: record it again, so the caller's next
-            # wait on this tap still wakes at once
+            # An interrupt during this wait consumed the close signal, so record it again.
             new_tap._close_with((seen.get("properties") or {}).get("error") or "stopped")
             return
         connected = seen is not None
@@ -1016,8 +969,7 @@ class KiloBackend:
             _LOG.warning("abort(%r) failed: %s", getattr(session, "id", session), exc)
 
     def interrupt(self, session: SessionRef | None = None) -> None:
-        # round 151: the same lock `_reconnect_tap` holds, so the tap being
-        # stopped is always the one that is or is about to be published
+        # The same lock as _reconnect_tap, so the tap being stopped is the one that is or will be published (round 151).
         with self._tap_lock:
             self._interrupted = True
             self._tap.stop()
@@ -1035,22 +987,19 @@ class KiloBackend:
                   quota_re: "re.Pattern | None" = None,
                   max_retry_attempts: int | None = None,
                   quiet_after: float | None = None) -> IdleResult:
-        # KC-36: the callback goes over only when it is armed — `None` keeps
-        # this call byte for byte what it was, for a client that predates it.
+        # The callback is sent only when armed, so an older client gets the same call (KC-36).
         client_kwargs = {"idle_event_timeout": idle_event_timeout,
                          "on_permission": on_permission, "on_question": on_question}
         if on_deadline is not None:
             client_kwargs["on_deadline"] = on_deadline
         if since is not None:
             client_kwargs["since"] = since
-        # KC-61: same — the retry bound and the quota phrases go over only when
-        # they are armed, so a client that predates them gets today's call.
+        # The retry bound and quota phrases are sent only when armed, for older clients (KC-61).
         if max_retry_wait is not None:
             client_kwargs["max_retry_wait"] = max_retry_wait
         if quota_re is not None:
             client_kwargs["quota_re"] = quota_re
-        # KC-64: the same way — a limit of 0 is off and goes over as no limit
-        # at all, so a client that predates it gets today's call.
+        # A limit of 0 is off and is not sent, so an older client gets the same call (KC-64).
         if max_retry_attempts:
             client_kwargs["max_retry_attempts"] = max_retry_attempts
         # KC-73: the same — armed only after an overflow, never on a turn
@@ -1073,16 +1022,7 @@ class KiloBackend:
             self._tap.join(2.0)
 
 
-#: How long `_wait_for_stream` waits for a tap's reader to open its stream.
-#:
-#: FL-1 (round 84) family C4: an event published before the stream is open is
-#: *lost*, and the first one is the session's own. A round that prompts and
-#: then emits into a tap nobody is reading gets a silence clock that has seen
-#: nothing at all — which is indistinguishable from a session that went quiet.
-#:
-#: 5 s was a wall-clock bet on how fast a thread opens an HTTP connection, and
-#: the operator's 32-worker stress run walks through bets that size. The
-#: equivalent handshake in the contest tests is 30 s for that reason.
+#: Seconds to wait for a tap's reader to open its stream; an early event would be lost (FL-1).
 STREAM_CONNECT_TIMEOUT_S = 30.0
 
 
@@ -1115,12 +1055,9 @@ def _wait_for_stream(tap: EventTap, timeout: float = STREAM_CONNECT_TIMEOUT_S) -
     return connected
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OpenRouter — a subprocess agent loop
-# ─────────────────────────────────────────────────────────────────────────────
+# OpenRouter agent loop (a subprocess)
 
-#: The queue item that means "the agent's stdout ended". Not ``None``: that is
-#: what ``_next_line`` already uses for "nothing in time".
+#: Queue item for the end of the agent's stdout; None is reserved for "nothing in time".
 _EOF = object()
 
 
@@ -1142,9 +1079,7 @@ class _AgentRecord:
         self.messages: list = []
         self.input_tokens = 0
         self.output_tokens = 0
-        # One line per turn of the agent's stdout, `None` when the process is
-        # gone. A queue and a reader thread, not a blocking `readline()`:
-        # `wait_idle` must be able to time out while a line is still coming.
+        # One line per agent stdout line, or None at exit; a queue, so wait_idle can time out.
         self.lines: "queue.Queue" = queue.Queue()
         self.reader: "threading.Thread | None" = None
 
@@ -1196,9 +1131,7 @@ class OpenRouterBackend:
         self._timeout = float(timeout)
         self._max_steps = int(max_steps)
         self._spawn_agent = spawn_agent
-        #: KC-65: the round's env, applied after `dict(os.environ)` so the
-        #: agents' pytest reads the round's worker count too — without it the
-        #: rule is a Kilo-only rule, and this backend is the other half of it.
+        # Round environment, applied after os.environ so pytest sees the worker count (KC-65).
         self._extra_env = dict(extra_env) if extra_env else None
         self._records: dict = {}
         self._interrupted = False
@@ -1212,9 +1145,7 @@ class OpenRouterBackend:
                        rules: list, title: str,
                        agent: str | None = None,
                        variant: str | None = None) -> SessionRef:
-        # the subprocess agent loop has no reasoning-variant knob: the variant
-        # is kept on the ref, so the round's record says what was asked, and
-        # nothing else changes
+        # The reasoning variant is kept on the ref only, so the round record shows what was asked.
         sid = f"openrouter-{model_id or title or 'agent'}"
         record = self._spawn_one(sid, provider_id, model_id, agent)
         self._records[sid] = record
@@ -1230,16 +1161,11 @@ class OpenRouterBackend:
                                 "parts": [{"type": "text", "text": text}]})
 
     def compact(self, session: SessionRef) -> None:
-        # The subprocess agent holds its own transcript and there is no session on a
-        # server to compact: it keeps every message it has ever had, so the runner's
-        # context fill (KC-67) never sees a size for it and never compacts it.
-        # Nothing changes, by design — the runner reads no fill out of a session
-        # that reports no tokens, which is "no collect data", not a failure.
+        # No compaction: the subprocess agent keeps its whole transcript and reports no token fill (KC-67).
         return None
 
     def mark(self) -> int | None:
-        # KC-63: each session reads its own subprocess stdout, so no other
-        # turn's events can reach a wait; there is nothing to mark
+        # Each session reads its own stdout, so no other turn's events reach a wait (KC-63).
         return None
 
     def abort(self, session: SessionRef) -> None:
@@ -1313,13 +1239,11 @@ class OpenRouterBackend:
             else:
                 left = overall_left
             if left <= 0:
-                # KC-36: the turn deadline asks first; the silence clock never
-                # does — the same race as on a Kilo session.
+                # The turn deadline asks first; the silence clock never does (KC-36).
                 quiet = silence is not None and (silence - (now - last_seen)) <= 0
                 if not quiet and overall_left <= 0 and on_deadline is not None:
                     grant = _deadline_grant(on_deadline, time.monotonic() - started)
-                    # a grant that leaves the deadline in the past would just
-                    # ask again in a hot loop of churn reads — abort instead
+                    # A grant that leaves the deadline in the past aborts, rather than re-asking in a hot loop.
                     if grant is not None and deadline + grant > time.monotonic():
                         deadline += grant
                         continue
@@ -1352,8 +1276,7 @@ class OpenRouterBackend:
                     reply, message = "reject", f"policy failed: {type(exc).__name__}"
                     granted = 0.0
                 if granted > 0:
-                    # KC-66: the gate's own waits are the agent's time back;
-                    # KC-58: so is a suite's wait for its round-wide slot
+                    # The gate's waits and the round-wide suite waits are given back to the turn (KC-66, KC-58).
                     deadline += granted
                 # KC-58: never silent while the runner held the permission
                 last_seen = time.monotonic()
@@ -1521,9 +1444,7 @@ class OpenRouterBackend:
                 pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the agent loop — the subprocess OpenRouterBackend spawns
-# ─────────────────────────────────────────────────────────────────────────────
+# The agent loop run by the OpenRouter subprocess
 
 _AGENT_SYSTEM = """\
 You implement one ticket in this directory. It is the whole of your working

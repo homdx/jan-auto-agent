@@ -50,6 +50,5 @@ def test_iteration_count_shown_when_enabled():
 
 
 def test_iteration_count_hidden_when_disabled():
-    # The exact key 'show_iteration_count' must be honoured; a mismatched key
-    # would default to True and this assertion would fail.
+    # The key 'show_iteration_count' must be honoured; a mismatch would default to True.
     assert "iter:" not in _render(False)

@@ -130,8 +130,7 @@ def find_kilo(explicit: str | None) -> str:
     sys.exit("kilo not found: pass --kilo /path/to/kilo")
 
 
-#: KC-62: the parallelism this check is capped to next to a live round. Twelve
-#: `kilo run`s against the store a round is writing is what emptied round 107.
+#: Parallel kilo runs next to a live round are capped at 4, since more empties the round's store (KC-62).
 JOBS_NEXT_TO_A_ROUND = 4
 
 #: The box the process scan runs on. A test points it at a fake `/proc`.
@@ -266,9 +265,7 @@ def run(cmd: list, cwd: str, timeout: int, env: dict | None = None) -> tuple[str
         return out, err, None
 
 
-# `kilo run --format json` prints one event per line: the answer is the
-# "text" parts, the spend is on every "step_finish" part (tokens, and kilo's
-# own cost, which is 0 for a model kilo has no price for).
+# kilo run --format json: the answer is in the text parts; the spend is in each step_finish part.
 RETRY_RE = re.compile(r"\b429\b|too many requests|rate.?limit|forbidden|\b403\b|"
                       r"temporarily unavailable|overloaded", re.I)
 CTX_RE = re.compile(r"maximum context length is (\d+).*?at least (\d+) input", re.I | re.S)
@@ -444,8 +441,7 @@ def free_from_openrouter() -> list:
     return rows
 
 
-# Models that are definitively free but not returned by the provider's /models endpoint.
-# Keyed by a substring of the provider's base_url.
+# Models that are free but missing from the provider's /models endpoint, keyed by a base_url substring.
 KNOWN_FREE_MODELS: dict[str, list[tuple[str, str, int, str]]] = {
     "api.z.ai": [
         ("glm-4.7-flash",  FREE, 131072, "known free (docs)"),
@@ -476,28 +472,20 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
         models = data
     elif isinstance(data, dict):
         models = data.get("text") or data.get("data") or data.get("models")
-        # Bug 208: a 200 whose body is an error object is not an empty list — it is
-        # the one-line failure the callers report, never a silent zero models.
+        # A 200 whose body is an error object is reported as a failure, never as zero models (bug 208).
         if models is None and data.get("error") is not None:
             raise ValueError(f"/models reply is an error: {str(data.get('error'))[:80]!r}")
     else:
         models = None
-    # Bug 188: a reply of another shape (`null`, `"ok"`, `{"text": "Unauthorized"}`)
-    # is no model list — a ValueError the callers report, not an AttributeError
-    # traceback, nor a string iterated into one-letter "models".
+    # A reply of another shape (null, a string, an object) is reported as a ValueError, not an AttributeError.
     if not isinstance(models, list):
         raise ValueError(f"/models reply is not a model list: {str(data)[:80]!r}")
-    # Accept any recognised tool-capability token; skip only when capabilities are
-    # present but none of these tokens appears.
+    # Any recognised tool-capability token counts; skip only when capabilities exist and none match.
     TOOL_CAPS = {"tool-use", "tools", "tool_calling", "function_calling",
                  "function-calling", "toolcall"}
     rows = []
     for m in models:
-        # Bug 208: the shape of an entry is never promised by a provider. A `pricing`
-        # that is a string, a `capabilities` list of objects, a numeric `min_plan` or
-        # an object `id` each used to raise out of the loop. A field of the wrong type
-        # is that entry skipped, never a traceback: a bad entry costs one row, not the
-        # provider's whole list.
+        # A malformed entry field costs that entry, not the whole model list (bug 208).
         try:
             if isinstance(m, str):
                 m = {"id": m}
@@ -529,8 +517,7 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
                 plan = ""
             elif not isinstance(plan, str):
                 continue  # a number or a list is not a plan name
-            # Some providers price in non-USD "pollen" or similar currencies; treat
-            # those as free-tier (no real cost to the user via the API key).
+            # Non-USD currencies are treated as free-tier, since there is no real cost to the user.
             currency = pricing.get("currency")
             currency = currency.lower() if isinstance(currency, str) else ""
             if currency and currency not in ("usd", ""):
@@ -775,8 +762,7 @@ def main() -> int:
             ap.error("--find-free requires provider names or --provider NAME URL KEY")
         # need kilo only if any non-direct providers
         kilo = find_kilo(args.kilo) if any(u is None for _, u, _ in provider_specs) else ""
-        # KC-62: find-free sends nothing to a model, but it is the step right
-        # before the parallel second pass: name the store before it is crowded.
+        # The store is named before the parallel second pass crowds it (KC-62).
         note = store_note(_PROC_ROOT)
         if note:
             print(note, file=sys.stderr)
@@ -853,8 +839,7 @@ def main() -> int:
                     break
                 ctx = CTX_RE.search(err)
                 if ctx:
-                    # the model's window can't hold kilo's default output budget:
-                    # ask again with what is left after the prompt
+                    # The window cannot hold the default output budget, so the request is asked again with what is left.
                     context, used = int(ctx.group(1)), int(ctx.group(2))
                     env["KILO_CONFIG_CONTENT"] = with_output_limit(
                         model, context, max(1024, context - used - CTX_MARGIN))

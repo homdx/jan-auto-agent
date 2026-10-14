@@ -342,8 +342,7 @@ def test_path_with_spaces_and_unicode(tmp_path):
     shas = build(tmp_path, [{"message": "base", "files": {"a b/é.py": "E = 1\n"}},
                             {"message": "two", "files": {"a b/é.py": "E = 2\n"}}])
     view = PathRepoView(tmp_path)
-    # CC-1 cuts a path at a space (`a b/é.py` is read as `b/é.py`: the text alone cannot tell
-    # it from `python3 x.py`), so the path anchor is given resolved, as a view would find it
+    # Resolved path anchor, as a view would find it.
     path = ResolvedAnchor(Anchor("path", "a b/é.py", 0, 8), True, path="a b/é.py")
     commit = resolve_anchors([Anchor("commit", shas[1][:7], 0, 7)], view)
     got = git_chunks([*commit, path], view, claim="sets E")

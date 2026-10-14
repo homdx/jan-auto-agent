@@ -71,9 +71,7 @@ class TestRetryWithBackoffSuccess:
         assert sleeps == [1, 2]
 
     def test_falsy_return_value_is_still_a_success(self):
-        # None is a legitimate return (run_search's _ask_over_text contract):
-        # retry_with_backoff must return it immediately, not treat it as a
-        # failure — only EXCEPTIONS are retry-worthy.
+        # None is a legitimate return (run_search's contract): return it at once; only exceptions are retried.
         calls = []
 
         def returns_none():
@@ -126,9 +124,7 @@ class TestRetryWithBackoffFailure:
         assert sleeps == []
 
     def test_zero_attempts_means_one_try(self):
-        # A falsy/zero attempts must degrade to a single call, never to
-        # zero calls (a silent no-op success) — same defensive spirit as
-        # backoff_seconds' clamping.
+        # Zero or falsy attempts mean one call, never zero, which would be a silent no-op success.
         calls = []
 
         def always_fails():
@@ -171,8 +167,7 @@ class TestRetryWithBackoffFailure:
             )
         except RuntimeError:
             pass
-        # 1-indexed error counts, ALL failures reported (summarize_repo's
-        # public on_error contract: 1 initial + max_retries retries)
+        # 1-indexed error counts; all failures are reported (1 initial + max_retries retries).
         assert errors == [1, 2, 3]
         # on_retry only between attempts, with the matching wait
         assert retries == [(1, 1), (2, 2)]
@@ -201,21 +196,13 @@ class TestApiErrorPause:
         assert slept == [1, 2, 4, 8]
 
     def test_no_milestone_table_when_first_error_is_not_first(self, capsys, monkeypatch):
-        # A loop resuming from a checkpoint whose count starts above 1 must
-        # not re-print the schedule.
+        # A resumed loop starting above 1 must not reprint the schedule.
         monkeypatch.setattr(backoff.time, "sleep", lambda s: None)
         backoff.api_error_pause(2, {"loop": "run_edit"})
         assert "Backoff schedule" not in capsys.readouterr().out
 
 
-# ── run_search integration: the refactored retry loop keeps its contract ──────
-#
-# run_search signals "the /search LLM call itself failed" via None from
-# _ask_over_text, and retries that failure a bounded number of times
-# before giving up on the file/chunk. The refactor routes this through
-# retry_with_backoff, which retries on EXCEPTIONS — so the None sentinel
-# must be translated (_SearchChunkFailed) and the pre-refactor counts
-# preserved exactly.
+# run_search integration: the refactored loop keeps its retry counts; None is translated to _SearchChunkFailed.
 
 class _FakeOrchestrator:
     def __init__(self):
@@ -313,7 +300,6 @@ class TestRunSearchChunkRetry:
         ) as mock_llm:
             orch.run_search("what is this in doc.md", str(tmp_path))
 
-        # 1 chunk (30000 chars packs into one ~10000-char chunk + overlap
-        # head-room) × 3 attempts, no validator call (never got an answer)
+        # One chunk x 3 attempts, no validator call (no answer was received).
         assert mock_llm.call_count == 3
 

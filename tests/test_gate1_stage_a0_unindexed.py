@@ -49,8 +49,7 @@ def _base_cfg(**gate1: str) -> configparser.ConfigParser:
         "base_url": "http://localhost:1337/v1", "api_key": "k",
         "model": "m", "api_format": "openai",
     }
-    # skip_llm is OFF: Stage B must be reachable, and the tests below prove
-    # a rejected candidate never reaches it by counting presence calls.
+    # skip_llm is off so Stage B is reachable; presence counts prove rejected candidates never reach it.
     cfg["gate1"] = {"skip_llm": "false", **gate1}
     cfg["loop"] = {"timeout_seconds": "60"}
     return cfg
@@ -143,8 +142,7 @@ def test_stage_a0_counts_in_the_existence_bucket(code_repo):
     # One Stage-A0 removal (unindexed) + one genuine Stage-A failure.
     assert counters["existence"] == 2
     reasons = {r.candidate.cited_location.file: r.reason for r in rejected}
-    # The two stay separable: only the A0 removal's reason carries the
-    # stage's own prefix, so a log grep can tell them apart.
+    # Only the A0 removal's reason has the stage prefix, so logs can tell the two apart.
     assert reasons["agents.ini"].startswith("location is not an indexed source file")
     assert reasons["pkg/missing.py"].startswith("cited file not found")
 
@@ -296,8 +294,7 @@ def test_new_file_candidate_is_exempt(code_repo):
     c = _candidate("pkg/new_module.py", new_file=True)
     accepted, rejected = filt.filter([c], code_repo)
 
-    # Stage B exempts new_file too, so no presence call is expected — but
-    # the candidate must be ACCEPTED, not rejected at A0.
+    # Stage B exempts new_file: no presence call, and the candidate is accepted, not rejected at A0.
     assert len(accepted) == 1 and rejected == []
     assert calls == []
 

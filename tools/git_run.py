@@ -43,16 +43,12 @@ __all__ = [
     "run_git",
 ]
 
-#: The one signature that is a transient — git's own "another git has the index"
-#: message, on stderr with exit 128. A stale lock left by a crashed git matches it
-#: too, which is exactly why the ladder below is bounded and short: it ends by
-#: raising that error rather than waiting forever.
+#: Git's "another git has the index" message (stderr, exit 128). A stale lock matches it too, so the ladder is bounded and then raises.
 LOCK_CONTENTION_RE = re.compile(
     r"Unable to create '.*\.lock': File exists", re.IGNORECASE,
 )
 
-#: 8 attempts 0.25 s apart. A held lock that a neighbour releases in half a second
-#: is inside the ladder; a stale one costs about two seconds and then raises.
+#: 8 attempts, 0.25 s apart: a lock released within about 2 s is waited out; a stale one raises.
 LOCK_RETRIES = 8
 LOCK_BACKOFF_S = 0.25
 

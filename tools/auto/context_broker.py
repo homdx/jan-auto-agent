@@ -63,13 +63,10 @@ _SEARCHABLE_EXTS = frozenset({".py", ".js", ".ts", ".tsx", ".jsx", ".go",
                                ".java", ".rs", ".c", ".cpp", ".h", ".hpp",
                                ".md", ".txt"})
 
-# Subset of _SEARCHABLE_EXTS that is prose rather than code — these are
-# routed to extract_prose_section instead of extract_block (AUTO-CR-6).
+# Prose extensions go to extract_prose_section, not extract_block (AUTO-CR-6).
 _PROSE_EXTS = frozenset({".md", ".txt"})
 
-# Matches "chapter_07", "chapter_7", "Chapter_07.md", etc. — mirrors the
-# pattern context_assembler.py uses, so "earlier chapters first" means the
-# same thing throughout the creative pipeline.
+# Chapter pattern, the same as context_assembler, so earlier-first means the same everywhere.
 _CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
 
 
@@ -95,18 +92,9 @@ class ContextBroker:
     ) -> None:
         self._max_block_chars = max_block_chars
         self._max_symbols = max_symbols
-        # COLLECT-24: optional tools.auto.collect_bridge.CollectBridge.
-        # When set, a symbol still unresolved after the code-search passes
-        # below is tried against the collect structural model as a third,
-        # additive pass — so the SAME pull-model channel (context_request /
-        # missing_context) that already resolves code now also resolves
-        # collect facts, rather than needing a second, separate mechanism.
+        # Optional collect bridge: a symbol unresolved by code search is tried against the structural model as a third pass (COLLECT-24).
         self._collect_bridge = collect_bridge
-        # Only PROJECT-SCAN (Pass-2) hits are cached — they live in files the
-        # current task doesn't edit (dependencies), so they stay valid across
-        # attempts, and the rglob scan that finds them is the expensive part.
-        # Target-file (Pass-1) hits are never cached, since the coder rewrites
-        # those files every attempt.
+        # Only project-scan hits are cached: they live in dependency files, not the task's own targets, which the coder rewrites.
         self._resolved_cache: dict[str, str] = {}
 
     def reset_cache(self) -> None:
@@ -148,22 +136,7 @@ class ContextBroker:
         resolved = {s: self._resolved_cache[s] for s in ordered if s in self._resolved_cache}
         remaining = [s for s in ordered if s not in self._resolved_cache][: self._max_symbols]
 
-        # ── Pass 0: whole-file / chapter requests (AUTO-CR-19-2) ──────────────
-        # A creative CONTEXT_REQUEST names a chapter FILE (e.g. "chapter_2"),
-        # not a symbol or a phrase that appears in the prose — so the
-        # section/entity extractors below would never match it. Resolve such a
-        # request to the requested file's full (capped) content directly.
-        #
-        # AUTO-FIX: _resolve_whole_file()'s bare-stem fallback matches ANY
-        # symbol against ANY prose file's stem, so in a code task a "config"
-        # symbol resolved to docs/config.md's entire text and preempted the
-        # real code search — contradicting this pass's own claim that a code
-        # symbol never accidentally resolves to a file here.
-        #
-        # Gate off only for a non-empty, all-code target_files. Empty is
-        # deliberately NOT gated: resolve() is called with no target_files
-        # (chapter helpers, this module's tests) to exercise Pass 0 alone,
-        # and any() over an empty sequence is False.
+        # Pass 0: whole-file and chapter requests (AUTO-CR-19-2).
         is_code_only_task = bool(target_files) and not any(
             Path(t).suffix.lower() in _PROSE_EXTS for t in target_files
         )
@@ -187,17 +160,7 @@ class ContextBroker:
                 continue
             found_now: list[str] = []
             for sym in remaining:
-                # AUTO-FIX (medium-priority audit, NVIDIA-plan finding): this
-                # call used to be completely unguarded — extract_block/
-                # extract_prose_section raising on ONE file (an unusual
-                # encoding artifact, a pathological source shape) aborted
-                # resolve() for every remaining symbol across every
-                # remaining file, not just the one that triggered it. This
-                # sits on the hottest path in the whole pipeline: every
-                # Gate 1/Gate 2/coder context-injection call goes through
-                # here. Skip just the offending symbol/file pair and keep
-                # going — same fail-open posture as the rest of this method
-                # (a missing symbol is not treated as an error either).
+                # A failing read skips only that symbol and file; one bad file must not abort resolve() for everything (AUTO-FIX).
                 try:
                     block = _extract(source, sym, ext)
                 except Exception as exc:
@@ -222,10 +185,7 @@ class ContextBroker:
                     continue
                 found_now = []
                 for sym in remaining:
-                    # AUTO-FIX (medium-priority audit, NVIDIA-plan finding):
-                    # same reasoning as the Pass 1 guard above — a raise here
-                    # would abort the fallback project-wide scan for every
-                    # remaining symbol over every remaining file.
+                    # Same guard for the fallback project-wide scan (AUTO-FIX).
                     try:
                         block = _extract(source, sym, ext)
                     except Exception as exc:
@@ -249,13 +209,7 @@ class ContextBroker:
                 for sym in found_now:
                     remaining.remove(sym)
 
-        # ── Pass 3: collect structural model (COLLECT-24) ─────────────────────
-        # Tried last, after real source has had its chance — code is ground
-        # truth; collect facts are a fallback for symbols that live outside
-        # target_files/base_dir's own scan (e.g. summarized-only modules) or
-        # simply as a cheaper structural answer (signature + contracts,
-        # skips reading/parsing whole files). No-op whenever no bridge was
-        # wired in, or the bridge's model isn't fresh (see CollectBridge.usable).
+        # Pass 3: collect structural facts, tried last; code is ground truth, and this runs only with a fresh bridge (COLLECT-24).
         if remaining and self._collect_bridge is not None:
             for sym in list(remaining):
                 block = self._collect_bridge.pull_symbol(sym)
@@ -323,17 +277,7 @@ class ContextBroker:
         low = token.lower()
         if low.endswith((".md", ".txt", ".markdown")):
             p = base_dir / token
-            # BUGFIX (audit): no containment check — a token like
-            # "../secret.md" escaped base_dir, and _is_target() (which only
-            # checks membership in target_files, not location) returned
-            # False for any out-of-base path, so the escaped file was read
-            # and injected straight into the model prompt. Mirrors the
-            # same relative_to() containment check gate1_filter.py's
-            # new_file branch already uses. Checked on a resolved copy so
-            # it isn't fooled by a "../" that stays textually inside
-            # base_dir; p itself is left unresolved so _is_target()'s own
-            # (already-working) relative_to(base_dir) comparison below is
-            # unaffected.
+            # A token that escapes base_dir (e.g. ../secret.md) is refused before it is read (BUGFIX).
             try:
                 p.resolve().relative_to(base_dir.resolve())
                 _escapes_base = False

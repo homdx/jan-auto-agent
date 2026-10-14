@@ -88,8 +88,7 @@ def shape_error(votes) -> str:
             return f"result {k + 1} has no `model` or no `votes` object"
     if not isinstance(votes.get("target") or {}, dict):
         return "`target` is not an object"
-    # what the rows below read: a hand-edited file passed the check above and was a traceback
-    # ('int' object has no attribute 'strip', 'int' object is not subscriptable)
+    # Rows the code below reads must be objects; a hand-edited file used to crash with a traceback here.
     for k, c in enumerate(claims):
         for key in ("evidence", "quotes", "abstained"):
             value = c.get(key)
@@ -152,8 +151,7 @@ def lenz_block(votes: dict, args, argv: list, pending: Path, models: "dict | Non
     if args.no_lenz_hint:
         table = lenz_hint.compare_table(claims, [], lenz=lenz, models=models) if lenz else []
         return ("\n".join(["## Lenz next to our voters", "", *table, ""]) if table else ""), None
-    # the families of the models, as pending.md counts them: three agnes sections were "unanimous"
-    # here and left out of the Lenz candidates while pending.md listed the claim as unsettled
+    # Lenz candidates count families as pending.md does, so unanimous sections are not dropped.
     candidates = sum(1 for c in claims if lenz_hint.lenz_group(c, models) is not None)
     picked = lenz_hint.pick_for_lenz(claims, models=models)
     claims_file = pending.with_name("lenz-claims.md")
@@ -217,16 +215,14 @@ def main(argv: "list[str] | None" = None) -> int:
                   "keys from the cited chunk ids", file=sys.stderr)
 
     by = args.checked_by or cc_truth.checked_by(votes, models=models, base_sha=base_sha)
-    # CC-11: under `accept = committed` a row's checked_by names the families that committed on it
-    # (an explicit --checked-by is the operator's text and stays as given)
+    # Under accept=committed, checked_by names the families that committed; an explicit --checked-by stays as given.
     row_by = None if args.checked_by else (
         lambda row: cc_truth.checked_by(votes, models=models, base_sha=base_sha,
                                         voters=cc_truth.committed_voters(row)))
     rows = cc_truth.to_truth_rows(votes, checked_by=by, resolved=resolved, models=models,
                                   row_checked_by=row_by)
     for finding in cc_truth.disagreements(rows):
-        # two statements about one place (one true, one false) share the key; harvest_report.load_truth
-        # keeps one row per finding (the last), so a reviewer is scored on whichever came last
+        # Two conflicting claims on one place share a key; load_truth keeps the last row, so that reviewer is scored.
         print(f"claimcheck_truth: note: claims about {finding} settled both REAL and FALSE; both rows "
               "kept, harvest_report --truth reads only the last: settle that finding by hand",
               file=sys.stderr)
@@ -238,8 +234,7 @@ def main(argv: "list[str] | None" = None) -> int:
         if claims_text:
             cc_truth.atomic_write(claims_file, claims_text)
         elif not args.no_lenz_hint and claims_file.is_file():
-            # this run picked nothing for Lenz: a claims file of an earlier run next to a pending.md
-            # that says "nothing worth sending" was sent as if it were this run's
+            # No Lenz candidates this run: remove an earlier claims file so it is not sent as this run's.
             claims_file.unlink()
         md = cc_truth.pending_markdown(votes, packs, models=models)
         cc_truth.atomic_write(pending, md + ("\n" + block if block else ""))

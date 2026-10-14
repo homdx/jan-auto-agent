@@ -22,16 +22,7 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     """
     cleaned_raw = raw.strip()
     
-    # 1. Extract File Path
-    # Matches common relative/absolute path architectures ending with an extension.
-    #
-    # BUGFIX: a dotted symbol reference like "MyClass.foo" also matches this
-    # pattern (word.word looks identical to word.ext), so a prompt such as
-    # "explain MyClass.foo in app.py" used to grab "MyClass.foo" as the file
-    # path — the first match won, even though the user explicitly marked the
-    # real file with "in ". Collect every candidate match and prefer the ones
-    # that are explicitly introduced by "in "; only fall back to the bare
-    # first-match behavior when no explicit "in <path>" marker exists at all.
+    # 1. File path. A dotted symbol (MyClass.foo) can look like a file; prefer candidates marked with "in ".
     file_matches = list(re.finditer(r'(?:^|\s)(in\s+)?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)\b', cleaned_raw))
     if not file_matches:
         return None
@@ -61,26 +52,12 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
         from_match = re.search(r'\b(show|improve|explain|find|view|display)\s+([A-Za-z_][\w]*)\s+from\b', cleaned_raw, re.IGNORECASE)
         if from_match:
             target_name = from_match.group(2)
-            # BUGFIX (same class as the already-fixed Strategy A collision,
-            # see test_fix10_prompt_parser_keyword_collision.py): unlike
-            # Strategy A, this branch never stripped the captured
-            # target_name out of `remainder` before the intent keyword
-            # search below. If target_name happens to itself be a
-            # DIFFERENT category's keyword — e.g. "explain optimize from
-            # utils.py" captures target_name="optimize", which is also a
-            # has_improve keyword — it stayed sitting in `remainder` and
-            # silently flipped the detected intent, even though the actual
-            # intent verb ("explain") was the only thing the user typed.
-            # Strip only the target_name token — group(1), the real intent
-            # verb, must stay in `remainder` for the keyword search to see it.
+            # Strip only the target name from the remainder; the intent verb must stay so the keyword search sees it.
             remainder = re.sub(
                 r'\b' + re.escape(target_name) + r'\b', ' ', remainder, count=1
             ).strip()
         else:
-            # Strategy C: Fallback to the remaining single standalone identifier word.
-            # Only accept it if the symbol actually exists somewhere in the source file
-            # (def/class declaration or bare reference) to avoid grabbing prose words like
-            # "bug" from "fix the bug in app.py".
+            # Strategy C: the single standalone identifier word, accepted only if it exists in the source.
             clean_rem = re.sub(r'\b(show|improve|explain|find|view|display|me|the|in|from|optimize|fix|refactor|correct|get|read|describe|understand|doc)\b', ' ', remainder, flags=re.IGNORECASE).strip()
             words = clean_rem.split()
             valid_identifiers = [w for w in words if re.match(r'^[A-Za-z_][\w]*$', w)]
@@ -98,20 +75,7 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
 
     normalized_remainder = remainder.lower()
 
-    # Use word-boundary regex so a keyword like 'read' does not spuriously match
-    # inside a file name such as 'README.md' or 'thread.py'.
-    #
-    # Only ever search `remainder` (the raw prompt with the matched file-path
-    # segment and any def/class declaration already stripped out) — never the
-    # original raw string. `remainder` already retains every real verb the
-    # user typed; the *only* extra text a raw-string search would add back in
-    # is the file path / target name itself, and `\b` only guards against
-    # keywords glued to *contiguous* letters (e.g. "thread.py", "README.md").
-    # It does not help when the keyword is its own hyphen/dot-delimited token,
-    # which is a completely ordinary way to name a file or a function — e.g.
-    # "show def helper in small-fix.py" or "improve def show in ui.py" would
-    # otherwise pick up a spurious has_improve/has_show from the filename or
-    # symbol name and misclassify the intent.
+    # Keyword search runs on the remainder only, with word boundaries: the raw prompt would match names in file or symbol names.
     def _has_kw(words: list[str]) -> bool:
         pattern = re.compile(r'\b(?:' + '|'.join(re.escape(w) for w in words) + r')\b')
         return bool(pattern.search(normalized_remainder))

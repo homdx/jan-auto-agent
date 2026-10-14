@@ -7,17 +7,7 @@ from typing import Any, Dict, List, TYPE_CHECKING
 if TYPE_CHECKING:
     from tools.prompt_parser import ParsedPrompt
 
-# BUGFIX: was `str(x).lstrip("-* ")` at both call sites below. str.lstrip(chars)
-# removes ANY of the given characters from the left, repeatedly — it has no
-# concept of "a bullet marker" versus "the text's own leading punctuation".
-# An LLM-reported issue/change that legitimately starts with a minus sign
-# (e.g. "-1 is returned instead of raising an IndexError") had that sign
-# silently eaten, becoming "1 is returned instead of raising an IndexError"
-# and flipping the reported meaning in the console output the user reads.
-# Same bug class already found and fixed in canon_validator.py's claim
-# extraction; reuse the same "marker + required trailing whitespace" shape
-# so a real "- " or "* " bullet prefix is stripped but a bare leading "-"
-# or "*" attached to actual content is left alone.
+# Strip only bullet markers ("- ", "* "), not a leading minus or star that is part of the text (e.g. "-1 is returned").
 _BULLET_MARKER_RE = re.compile(r"^\s*[-*]\s+")
 
 
@@ -103,11 +93,7 @@ class OutputFormatter:
             for ref_name, ref_data in found_refs.items():
                 if isinstance(ref_data, dict):
                     source_file = ref_data.get("file", "unknown_source")
-                    # BUGFIX (audit): .get("code", "") only applies the ""
-                    # default when the key is ABSENT, not when it's present
-                    # with an explicit None value — (None).strip() crashed.
-                    # Other fields in this codebase use the `or ""` idiom
-                    # for exactly this reason; this one didn't.
+                    # `or ""` covers an explicit None, which .get("code", "") does not.
                     ref_code = (ref_data.get("code") or "").strip()
                     if ref_code:
                         print(f"# REFERENCED FROM {source_file}")
@@ -117,10 +103,7 @@ class OutputFormatter:
         # 5. Evaluate Intent Matrices Filtering Threshold Rules
         intent = parsed.intent
 
-        # Section: EXPLANATION (Skipped for intent='show'/'show_imports')
-        # Bugfix: "show_imports" is a distinct intent (prompt_parser.py)
-        # that should behave like "show", but this gate only matched the
-        # literal "show" and printed a spurious EXPLANATION under the list.
+        # Skip EXPLANATION for intent show and show_imports.
         if intent not in ("show", "show_imports"):
             explanation_text = (improvement.get("explanation") or "").strip()
             if explanation_text:
@@ -128,9 +111,7 @@ class OutputFormatter:
                 print(explanation_text)
                 print()
 
-        # Sections: ISSUES, IMPROVED CODE, CHANGES
-        # (Skipped for intent='show'/'show_imports'/'explain' — same bug as
-        # the EXPLANATION gate above: show_imports was missing here too.)
+        # Skip ISSUES, IMPROVED CODE and CHANGES for show, show_imports and explain.
         if intent not in ("show", "show_imports", "explain"):
             # Sub-Section: ISSUES
             print("# ISSUES")

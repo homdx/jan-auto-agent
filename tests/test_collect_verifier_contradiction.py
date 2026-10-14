@@ -97,8 +97,7 @@ def test_extract_claims_recognizes_access_crash_pattern():
 
 
 def test_unguarded_access_claim_is_not_suppressed_by_contradiction_check():
-    # A genuinely UNGUARDED access must NOT be caught by this mechanism —
-    # contradiction-suppression only fires when Pass A disagrees.
+    # A genuinely UNGUARDED access is not suppressed by the contradiction check.
     module = ModuleRecord(
         path="pkg/real_bug.py",
         guarded_accesses=(
@@ -114,12 +113,7 @@ def test_unguarded_access_claim_is_not_suppressed_by_contradiction_check():
     assert contradiction_check(claim, module, frozenset()) is None
 
 
-# ── access_safe vs UNGUARDED (mirror of access_crash vs GUARDED) ───────────────
-# Found via stub-test/run_hallucination_selfplay_v2.py's NEGATION-FLIP pattern:
-# before this check existed, a claim asserting an access is SAFE ("is fully
-# guarded", "cannot raise") about a genuinely UNGUARDED (crashing) access had
-# no checkable `kind` at all (_CRASH_WORDS_RE doesn't match affirmative-safety
-# language) and reached the artifact completely unverified.
+# access_safe vs UNGUARDED: mirror of access_crash vs GUARDED (found by the NEGATION-FLIP pattern).
 
 
 def test_false_safety_claim_on_ungarded_access_is_dropped_as_contradicts_crash():
@@ -222,17 +216,7 @@ def test_silent_except_claim_not_in_registry_is_not_suppressed():
     assert contradiction_check(claim, module, frozenset()) is None
 
 
-# ── BUGFIX regression: silent_except vs an except_site Pass A proved is ────
-# ── NOT silent (logs/re-raises/continues) — the genuine mirror of the ─────
-# ── access_crash-vs-GUARDED check, previously missing entirely ────────────
-#
-# The pre-fix `contradiction_check` only checked `fail_open_locs` for
-# `silent_except` claims — which, by construction, can only ever *agree*
-# with a claim that happens to be true (the location really is fail-open).
-# There was no check at all for the more dangerous case: a fabricated
-# "site X silently swallows the exception" about a location Pass A's own
-# `except_sites` already classified as logged/re-raised/`continue`d (i.e.
-# proven NOT silent) sailed through untouched.
+# Regression: silent_except vs an except_site Pass A proved is not silent.
 
 
 def test_silent_except_claim_dropped_when_site_proven_not_silent():

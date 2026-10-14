@@ -12,9 +12,7 @@ import textwrap
 from tools.auto.coder import Coder, _SYSTEM_PROMPT_CREATIVE
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_coder(task_mode: str = "creative") -> Coder:
     """Build a minimal Coder for unit-testing parse helpers."""
@@ -54,9 +52,7 @@ PLAIN_PROSE = textwrap.dedent("""\
 """)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# test_single_target_plain_prose_written
-# ─────────────────────────────────────────────────────────────────────────────
+# Single target: plain prose is written
 
 def test_single_target_plain_prose_written():
     """Plain prose (no JSON, no fences) written to the single target file."""
@@ -72,9 +68,7 @@ def test_single_target_plain_prose_written():
     assert "fog clung" in files[0]["content"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# test_fenced_prose_unwrapped
-# ─────────────────────────────────────────────────────────────────────────────
+# Fenced prose is unwrapped
 
 def test_fenced_prose_unwrapped():
     """Prose wrapped in ```markdown fences is correctly unwrapped."""
@@ -87,9 +81,7 @@ def test_fenced_prose_unwrapped():
     assert "```" not in files[0]["content"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# test_multi_file_markers_split
-# ─────────────────────────────────────────────────────────────────────────────
+# Multi-file markers are split
 
 def test_multi_file_markers_split():
     """<<<FILE: path>>> … <<<END>>> markers correctly split multi-file output."""
@@ -114,9 +106,7 @@ def test_multi_file_markers_split():
     assert "chapter three" in content_by_path["chapter_03.md"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# test_trailing_context_request_extracted_and_stripped
-# ─────────────────────────────────────────────────────────────────────────────
+# A trailing context request is extracted and stripped
 
 def test_trailing_context_request_extracted_and_stripped():
     """CONTEXT_REQUEST line is stripped from content and NOT written to the file."""
@@ -130,9 +120,7 @@ def test_trailing_context_request_extracted_and_stripped():
     assert "Elena" in written_content
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# test_empty_body_is_only_failure
-# ─────────────────────────────────────────────────────────────────────────────
+# An empty body is the only failure
 
 def test_empty_body_is_only_failure():
     """An empty / whitespace-only body is the single legitimate failure."""
@@ -155,9 +143,7 @@ def test_empty_body_is_only_failure():
     assert len(files3) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# test_code_mode_json_path_unchanged  (regression)
-# ─────────────────────────────────────────────────────────────────────────────
+# Code-mode JSON path is unchanged (regression)
 
 def test_code_mode_json_path_unchanged():
     """Code mode still uses the strict JSON path; prose is rejected."""
@@ -176,9 +162,7 @@ def test_code_mode_json_path_unchanged():
     assert err2 != ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# test_truncation_guard_actionable_error
-# ─────────────────────────────────────────────────────────────────────────────
+# A truncation guard gives an actionable error
 
 def test_truncation_guard_actionable_error():
     """A body that ends mid-sentence at ≥95 % of the token budget yields an
@@ -193,9 +177,7 @@ def test_truncation_guard_actionable_error():
     assert "token budget" in err.lower() or "max_tokens" in err.lower()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# test_creative_system_prompt_no_json
-# ─────────────────────────────────────────────────────────────────────────────
+# The creative system prompt asks for no JSON
 
 def test_creative_system_prompt_no_json():
     """The creative system prompt must NOT require JSON output.
@@ -210,9 +192,7 @@ def test_creative_system_prompt_no_json():
     assert "CONTEXT_REQUEST" in _SYSTEM_PROMPT_CREATIVE
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# test_multi_file_no_markers_falls_back_to_single
-# ─────────────────────────────────────────────────────────────────────────────
+# Multi-file with no markers falls back to single-file
 
 def test_multi_file_no_markers_falls_back_to_single():
     """When multiple targets are declared but no FILE markers exist and body is

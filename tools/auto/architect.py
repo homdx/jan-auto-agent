@@ -53,8 +53,7 @@ from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
-# ── Architect system prompts ──────────────────────────────────────────────────
-# Injected as the system role.  Can be overridden via agents.ini [architect] system.
+# Architect system prompts, injected as the system role; overridable with [architect] system.
 
 _SYSTEM_PROMPT_CODE = (
     "You are a senior software architect performing a targeted code review. "
@@ -105,8 +104,7 @@ _SYSTEM_PROMPT_CREATIVE = (
 # Backward-compat alias — existing code that references _SYSTEM_PROMPT still works.
 _SYSTEM_PROMPT = _SYSTEM_PROMPT_CODE
 
-# ── AUTO-CR-20-3: Plan-validator prompt ───────────────────────────────────────
-# Narrow: contradictions and missing required facts only — never style/ordering.
+# Plan-validator prompt (AUTO-CR-20-3): contradictions and missing facts only, never style.
 
 _ARCH_PLAN_SYSTEM = (
     "You are a plan reviewer. Given a GOAL and a list of proposed TASKS, reply "
@@ -122,11 +120,7 @@ _SYSTEM_PROMPTS: dict[str, str] = {
     "creative": _SYSTEM_PROMPT_CREATIVE,
 }
 
-# ── Per-cluster user prompt template ─────────────────────────────────────────
-# {goal}        — the user's overall improvement goal
-# {cluster}     — cluster name
-# {file_listing}— newline-separated list of relative paths in this cluster
-# {file_contents}—concatenated, annotated file contents
+# Per-cluster user prompt template: goal, cluster name, file listing and file contents.
 
 _USER_PROMPT_TMPL = """\
 Goal: {goal}
@@ -203,11 +197,7 @@ Now produce ONLY the JSON array of up to {max_tasks} concrete tasks that IMPLEME
 goal "{goal}" against the files above (no prose, no markdown fences):
 """
 
-# AUTO-CR-34: creative tasks are prose, not code — the shared code template
-# demands a "symbol" and shell-test acceptance_check, which contradicts the
-# creative prompt and makes the model emit meaningless shell commands. This
-# variant drops that guidance and asks for prose-appropriate tasks while
-# keeping the exact-path rules.
+# Creative tasks are prose: a variant prompt without the code rules (AUTO-CR-34).
 _USER_PROMPT_CREATIVE = """\
 Goal: {goal}
 
@@ -262,16 +252,12 @@ Now produce ONLY the JSON array of up to {max_tasks} concrete writing/editing ta
 that achieve the goal "{goal}" against the files above (no prose, no markdown fences):
 """
 
-# _MAX_FILE_CHARS and _MAX_FILES_PER_REVIEW are now read from [architect] in
-# agents.ini (max_file_chars / max_files_per_review).
-# The fallback values below apply only when the keys are absent from the config.
+# Fallbacks for max_file_chars and max_files_per_review, used only when [architect] lacks the keys.
 _DEFAULT_MAX_FILE_CHARS    = 4000
 _DEFAULT_MAX_FILES_PER_REVIEW = 6
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Data model
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class CitedLocation:
@@ -372,9 +358,7 @@ class CandidateTask:
     raw: dict = field(default_factory=dict, compare=False, repr=False)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # ClusterReviewer
-# ─────────────────────────────────────────────────────────────────────────────
 
 class ConfigValueError(ValueError):
     """A config value the operator explicitly set that this code refuses.
@@ -408,34 +392,12 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         Whether to verify the server's TLS certificate.
     """
 
-    # AUTO-H5-ESCALATE-1: mirrors gate1_filter.py's Gate1Filter
-    # _UNPARSEABLE_* escalation — an "unsalvageable" (empty/degenerate/
-    # non-JSON) response on a reasoning-heavy model is often the SAME
-    # root cause Gate 1 already handles: the model's thinking channel
-    # (see AUTO-ZAITHINK-1 / AUTO-THINKDEPTH-2 in tools/llm_stream.py)
-    # consumed the entire max_tokens budget before any JSON was written,
-    # not a one-off decoding hiccup a same-settings plain retry can fix.
-    # Each retry (bounded by [architect] empty_response_retry_max, same
-    # config key as before — just now escalating instead of static)
-    # widens the token budget; temperature cycles a fixed, absolute
-    # schedule at each token tier (AUTO-RETRY-TEMP-1 — see
-    # _UNSALVAGEABLE_TEMPERATURES below), exactly like Gate 1's
-    # presence-check retry. Floor/ceiling/step deliberately match
-    # Gate1Filter's constants — same failure mode, same fix.
+    # Escalation for unsalvageable replies, mirroring Gate 1: more tokens each retry, from the same floor and step (AUTO-H5-ESCALATE-1).
     _UNSALVAGEABLE_TOKENS_FLOOR = 4096
     _UNSALVAGEABLE_TOKENS_STEP_MULT = 2.0
     _UNSALVAGEABLE_TOKENS_DEFAULT_CEILING = 32768
     _UNSALVAGEABLE_TOKENS_CTX_FRACTION = 0.5
-    # AUTO-RETRY-TEMP-1: fixed, ABSOLUTE temperatures tried at EACH token
-    # tier before escalating to the next tier — deliberately NOT relative
-    # to the configured base [architect] temperature. Subtracting a step
-    # from base repeatedly hits the 0.0 floor after 1-2 attempts and
-    # stays there for every remaining retry — at temp=0.0 the model is
-    # deterministic, so a repeated escaping/formatting mistake reproduces
-    # byte-for-byte on every further attempt regardless of token budget
-    # (confirmed live via Gate1Filter's identical bug). Retry-recovery
-    # mode uses its own low, fixed schedule instead. See Gate1Filter's
-    # own _UNPARSEABLE_TEMPERATURES for the full tier/temperature table.
+    # Fixed absolute temperatures per token tier, not relative to the base: at 0.0 a repeated mistake reproduces byte for byte (AUTO-RETRY-TEMP-1).
     _UNSALVAGEABLE_TEMPERATURES = (0.0, 0.1)
 
     def __init__(
@@ -452,25 +414,13 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         self._task_mode  = task_mode
 
         arch = "architect"
-        # BUGFIX (verified-bugs follow-up report): every read in this
-        # block was a raw config.get(...)+int()/float() or
-        # config.getboolean()/getint() call with no try/except — unlike
-        # Gate1Filter's equivalent reads (already guarded), this class had
-        # NO guards at all. A single malformed key (confirmed live:
-        # [architect] max_files_per_review = five) crashed ClusterReviewer
-        # construction outright. Wrapped per-call (not via a shared
-        # helper) so extract_config_reads (tools/collect/ast_facts.py)
-        # still sees each literal call — a shared helper's call shape is
-        # invisible to that AST scanner (confirmed directly: 0 reads
-        # recognized through a helper vs. 1 for an identical literal
-        # call). Matches gate1_filter.py's established style.
+        # Each config read is guarded and wrapped per call, so one malformed key cannot crash construction (BUGFIX).
         try:
             self._temperature = float(config.get(arch, "temperature", fallback="0.2"))
         except ValueError as exc:
             logger.warning("config [%s] temperature is malformed (%s) — using 0.2", arch, exc)
             self._temperature = 0.2
-        # AUTO-CR-11: mode-aware token cap — creative tasks (Cyrillic, longer
-        # instructions) need more room or the JSON array truncates mid-object.
+        # Creative tasks get a larger token cap, or the JSON array truncates mid-object (AUTO-CR-11).
         from tools.auto.utils import _cfg_mode
         try:
             self._max_tokens = int(_cfg_mode(config, arch, "max_tokens", task_mode, fallback="2048"))
@@ -496,15 +446,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             logger.warning("config [%s] max_files_per_review is malformed (%s) — using %d",
                             arch, exc, _DEFAULT_MAX_FILES_PER_REVIEW)
             self._max_files_per_review = _DEFAULT_MAX_FILES_PER_REVIEW
-        # A numeric but non-positive step slips past the guard above (int()
-        # accepts it) and reaches the batch split in review_clusters:
-        # range(0, len(files), 0) raises ValueError: range() arg 3 must not
-        # be zero for every non-empty cluster. That failure is deferred all
-        # the way into the review phase, so the operator sees a traceback
-        # deep in the architect instead of a config error. Validate at read
-        # time and name the key; deliberately not wrapped in try/except —
-        # this is a config error, and swallowing it would run the review with
-        # an arbitrary batch size nobody configured.
+        # A zero or negative batch size would fail deep in review_clusters; reject it here, naming the key.
         if self._max_files_per_review <= 0:
             raise ConfigValueError(
                 "config [architect] max_files_per_review must be >= 1, "
@@ -519,37 +461,14 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [api_%s] num_ctx is malformed (%s) — using 0", active_profile, exc)
             self._num_ctx = 0
-        # AUTO-FIX (fable follow-up): mirrors the gate1_filter.py fix — a
-        # thinking model (e.g. qwen3) wraps its JSON task array in
-        # a "think" reasoning block by default. If that reasoning consumes the
-        # whole max_tokens budget, strip_think() discards everything and
-        # architect produces 0 candidates (observed live: architect call
-        # returned a totally empty response after ~5 minutes on qwen3:8b).
-        # Default to disabling thinking for this call; [architect] think =
-        # true re-enables it for a model/setup that needs it.
+        # A thinking model's reasoning would eat the whole budget; thinking is off unless [architect] think is true (AUTO-FIX).
         try:
             self._think = config.getboolean(arch, "think", fallback=False)
         except ValueError as exc:
             logger.warning("config [%s] think is malformed (%s) — using False", arch, exc)
             self._think = False
 
-        # ── AUTO-P2: architect context probe ─────────────────────────────────
-        # Absent key ⇒ False ⇒ extract_probe_request is never called and every
-        # prompt/response path is byte-identical to pre-AUTO-P. AUTO-P3 adds
-        # the documented key to agents.ini; the other six agents_*.ini window
-        # profiles need no edit precisely because of this fallback.
-        # FIX-2 C2: every probe read below was a bare
-        # getboolean/getint/getfloat with no try/except. fallback= only
-        # covers a *missing* key — a key that is present but unparseable
-        # ([architect] probe_max_rounds = five) raises ValueError straight
-        # out of the call. Nothing on the path catches it: review_clusters
-        # builds this reviewer directly and pipeline._run_plan_phase calls
-        # it with no guard (unlike _build_plan_validator, which is the
-        # plan-*validation* path), so one malformed probe key aborted the
-        # whole --auto run at the plan phase. Each read now degrades to its
-        # documented default, matching the guarded block above. Wrapped
-        # per-call rather than via a shared helper for the same reason as
-        # that block — extract_config_reads must still see each literal call.
+        # The probe is off by default and its config reads are guarded, so a malformed key cannot abort the plan phase (FIX-2).
         try:
             self._probe_enabled          = config.getboolean(arch, "probe_enabled", fallback=False)
         except ValueError as exc:
@@ -570,10 +489,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] probe_max_total_chars is malformed (%s) — using 6000", arch, exc)
             self._probe_max_total_chars = 6000
-        # AUTO-P8: escalated re-asks allowed when the digest cap cuts a round
-        # short. 0 restores the pre-AUTO-P8 behaviour (force immediately).
-        # AUTO-P9: learn the working digest cap instead of rediscovering it
-        # once per batch. See ArchProbe.seeded_cap.
+        # Escalations allowed when the digest cap cuts a round short, and the learned cap (AUTO-P8, P9).
         try:
             self._probe_budget_warmup    = config.getint(arch, "probe_budget_warmup", fallback=3)
         except ValueError as exc:
@@ -597,22 +513,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] probe_budget_escalations is malformed (%s) — using 2", arch, exc)
             self._probe_budget_escalations = 2
-        # AUTO-P13: the AUTO-P8/AUTO-P9 ladders (2x/2x/4x, or 1.5x/2.5x/4x
-        # once a cap is learned) are fixed module-level constants — the same
-        # rungs fire whether the active profile's real window is 4K or 1M
-        # tokens. AUTO-H5-ESCALATE-1's own comment already flags this class
-        # of bug for max_tokens escalation ("a stale, too-small num_ctx
-        # silently caps escalation far below what the CURRENT model can
-        # actually take, even though nothing errors or warns about it") —
-        # this is the same problem for the probe's digest-cap ladder. A
-        # profile whose active [api_{active}] num_ctx is huge relative to
-        # probe_max_total_chars (e.g. a 1M-token remote model behind a
-        # "128k" profile) still climbs one small rung at a time, spending
-        # one architect round-trip per rung to reach room the window had
-        # from the start. Default 1.0 leaves every existing profile's ladder
-        # byte-identical; a profile can opt into faster growth by setting
-        # this above 1.0. _clamp_to_window (AUTO-P11) still bounds the
-        # result, so a large scale cannot exceed what the window can hold.
+        # The ladder scales with the profile's real window; a probe scale above 1.0 grows faster (AUTO-P13).
         try:
             self._probe_budget_ladder_scale = max(
                 0.1, config.getfloat(arch, "probe_budget_ladder_scale", fallback=1.0)
@@ -623,8 +524,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 arch, exc,
             )
             self._probe_budget_ladder_scale = 1.0
-        # AUTO-F1: bound on the run-level miss memo — see ArchProbe's own
-        # docstring for why reset() must not clear it.
+        # The run-level miss memo is bounded; reset() must not clear it (AUTO-F1).
         try:
             self._probe_memo_max_entries = max(
                 1, config.getint(arch, "probe_memo_max_entries", fallback=200)
@@ -633,26 +533,15 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             logger.warning("config [%s] probe_memo_max_entries is malformed (%s) — using 200", arch, exc)
             self._probe_memo_max_entries = 200
         _ops_raw                     = config.get(arch, "probe_allowed_ops", fallback="facts")
-        # NOT defaulted back to DEFAULT_ALLOWED_OPS when the key is present but
-        # empty: `probe_allowed_ops =` is an operator saying "allow nothing",
-        # and silently restoring "facts" would re-enable a probe they just
-        # switched off. An empty tuple makes extract_probe_request fail closed
-        # (see its allowed_ops guard) — probing becomes a no-op, which is
-        # exactly what was asked for.
+        # An empty probe_allowed_ops means allow nothing; it is not replaced by the default.
         self._probe_allowed_ops      = tuple(
             o.strip().lower() for o in _ops_raw.split(",") if o.strip()
         )
-        # Built lazily, once per reviewer instance, on first use — the collect
-        # model needs base_dir, which only arrives with review_clusters(). The
-        # sentinel distinguishes "not built yet" from a legitimately-cached
-        # None (collect off/unavailable), so a missing artifact is not
-        # re-probed once per cluster. See make_collect_bridge's contract:
-        # build once per run, never per task.
+        # Built once, on first use, since the collect model needs base_dir; None (no collect) is cached too.
         self._probe: "_arch_probe.ArchProbe | None" = None
         self._probe_built            = False
 
-        # ── DM-2: select system prompt based on task_mode + ini overrides ─────
-        # Priority: mode-specific ini key > legacy "system" key > built-in constant.
+        # System prompt: the mode-specific ini key, then the legacy key, then the built-in constant (DM-2).
         mode_ini_key = f"system_{task_mode}" if task_mode != "code" else None
         if mode_ini_key and config.has_option(arch, mode_ini_key):
             self._system = config.get(arch, mode_ini_key).strip()
@@ -660,9 +549,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             built_in = _SYSTEM_PROMPTS.get(task_mode, _SYSTEM_PROMPT_CODE)
             self._system = config.get(arch, "system", fallback=built_in).strip()
 
-        # ── AUTO-CR-20-3: LLM callable for validate_plan ─────────────────────
-        # Built lazily on first call if construction fails so __init__ never
-        # raises just because summary_memory is unavailable.
+        # Built on first use if construction failed, so __init__ never raises for a missing summary_memory.
         self._llm_call = self._build_llm_call()
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -784,8 +671,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 _fire_callback(on_cluster_done)
                 continue
 
-            # Split large clusters into batches so each LLM prompt stays within
-            # a local model's context window (overflow => hallucinated paths).
+            # Large clusters are split into batches, so each prompt fits a local model's context.
             files = cluster.files
             batches = [
                 files[i:i + self._max_files_per_review]
@@ -802,22 +688,13 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     patterns=cluster.patterns,
                     files=batch_files,
                 )
-                # Content-aware key: a fingerprint of the batch files is appended so
-                # the checkpoint is invalidated when the reviewed content changes
-                # (file edits, or a different file set after a max_depth / cluster
-                # change). Without this a stale result would be replayed forever.
+                # The checkpoint key includes a fingerprint of the batch files, so edited content invalidates it.
                 batch_key = f"{sub.name}||{goal}||{_batch_fingerprint(base_dir, sub.files)}"
 
                 # ── Checkpoint hit: skip LLM call, reuse saved candidates ────
                 if checkpoint_path is not None and batch_key in checkpoint:
                     saved = checkpoint[batch_key]
-                    # BUGFIX (audit): _deserialise_candidates() ran outside
-                    # any try/except here — a structurally-wrong checkpoint
-                    # entry (schema drift, hand-edited file) raised
-                    # uncaught, defeating this whole mechanism's own
-                    # "start fresh on bad checkpoint" contract (already
-                    # honoured by the load-time try/except above, which
-                    # only guards json.loads/read_text, not this).
+                    # A malformed checkpoint entry falls back to a fresh review instead of crashing (BUGFIX).
                     try:
                         restored = _deserialise_candidates(saved)
                     except Exception as exc:  # noqa: BLE001 — fall back to a live call
@@ -835,31 +712,16 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 # ── Live LLM call ─────────────────────────────────────────────
                 _all_files = files if (len(batches) > 1 and self._task_mode == "creative") else None
                 batch_results = self._review_one_cluster(sub, base_dir, goal, all_files=_all_files)
-                # None means the LLM call failed outright (all retries exhausted).
-                # Do NOT checkpoint a failure — the batch must be retried on next run.
+                # A failed batch is not checkpointed, so it is retried on the next run.
                 if batch_results is None:
                     continue
                 cluster_candidates.extend(batch_results)
 
-                # ── Checkpoint save: persist immediately after each batch ─────
-                # Only persist NON-EMPTY results. An empty list means the LLM
-                # found nothing — caching that would prevent a retry after the
-                # inputs are fixed (e.g. raising max_depth to expose source).
+                # Only non-empty results are checkpointed, so a retry after fixing the inputs is not skipped.
                 if checkpoint_path is not None and batch_results:
                     checkpoint[batch_key] = _serialise_candidates(batch_results)
                     try:
-                        # Bugfix: this used to be a plain checkpoint_path.write_text(),
-                        # which truncates-then-writes — a process killed mid-write
-                        # (the exact "LLM crash or HTTP 500 storm" scenario this
-                        # checkpoint exists to survive) could leave invalid JSON
-                        # behind. The loader below then silently resets to an
-                        # empty checkpoint on ANY parse failure, discarding every
-                        # previously-cached batch result and forcing a full,
-                        # expensive re-review. atomic_write_text (temp file +
-                        # os.replace) guarantees the file on disk is always either
-                        # the old complete content or the new complete content —
-                        # see state.py's StateStore._atomic_write, which fixed the
-                        # identical bug for plan.json/progress.json.
+                        # Atomic write (temp file, then replace): a kill mid-write cannot leave invalid checkpoint JSON (bugfix).
                         atomic_write_text(
                             checkpoint_path,
                             json.dumps(checkpoint, indent=2, ensure_ascii=False),
@@ -874,40 +736,13 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                             checkpoint_path, exc,
                         )
 
-            # AUTO-BUG fix: batches use a sub-cluster named
-            # "<cluster.name> (batch N/M)" (see `sub = ... RepoCluster(name=...)`
-            # above) so each batch can be checkpointed independently. That
-            # suffixed name must never leak onto CandidateTask.cluster: it is
-            # stored there verbatim by _parse_candidates (called from
-            # _review_one_cluster with `sub.name`/`cluster.name` as seen from
-            # inside that helper), and tools/auto/pipeline.py's cluster_files
-            # lookup — used by Gate 1 to catch hallucinated file citations —
-            # is keyed by the plain, un-suffixed cluster name straight from
-            # repo_ingest. `cluster_files.get(candidate.cluster, set())` then
-            # silently returns an empty set for every candidate from a
-            # batched review, and gate1_filter.py's `if known and loc.file
-            # not in known:` guard — an empty set is falsy — never runs, so
-            # the "catch hallucinated paths before filesystem I/O" safety net
-            # is disabled for every cluster large enough to need more than
-            # one review batch, which in practice is the common case. Apply
-            # this once, after the batch loop, so it repairs candidates from
-            # BOTH the live-LLM branch above (`cluster_candidates.extend(
-            # batch_results)`) AND any restored from an on-disk checkpoint
-            # written before this fix existed (`cluster_candidates.extend(
-            # restored)` on a checkpoint hit) — not just one of the two.
+            # Batch sub-clusters are named "<cluster> (batch N/M)"; restore the plain name so Gate 1's file check still finds the cluster.
             for _c in cluster_candidates:
                 _c.cluster = cluster.name
 
             print(f"   → {len(cluster_candidates)} grounded candidate(s)")
 
-            # AUTO-BUG-3 fix: when a cluster is large enough to be split into
-            # multiple batches, each batch is reviewed independently and can
-            # (and in practice does, e.g. in creative mode with a single
-            # target file) propose the *identical* task. Gate-1 has its own
-            # fingerprint-based dedup, but de-duplicating right here — before
-            # candidates from different batches of the same cluster are even
-            # merged — is a cheap, local belt-and-braces fix that does not
-            # depend on downstream Gate-1 behaving as expected.
+            # Batches of one cluster can propose the same task; drop exact duplicates before merging (AUTO-BUG-3).
             if len(batches) > 1 and len(cluster_candidates) > 1:
                 from tools.auto.gate1_filter import _fingerprint, _target_fingerprint  # noqa: PLC0415
                 _seen: set[str] = set()
@@ -967,11 +802,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             self._trace_probe_config(usable=False, reason="bridge_error", detail=str(exc))
             return None
         if bridge is None or not getattr(bridge, "usable", False):
-            # Both are degraded-to-no-data for the run (see
-            # collect_bridge's module docstring), but the operator remedy
-            # differs: stale is one `--collect --refresh` away, absent is
-            # not. `getattr(..., "absent")` so a bridge that reports no
-            # status at all falls back to the original wording.
+            # "stale" and "absent" need different remedies, so the message names which one applies.
             _stale = (
                 bridge is not None
                 and getattr(bridge, "status", "absent") == "stale"
@@ -995,16 +826,12 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             bridge,
             max_chars=self._probe_max_chars,
             max_total_chars=self._probe_max_total_chars,
-            # AUTO-P7: `read` needs a root to contain paths against. Without
-            # it the op disables itself rather than reading anywhere.
+            # read needs a root to contain paths against; without one the op disables itself (AUTO-P7).
             base_dir=base_dir,
             # AUTO-F1: run-level miss memo cap.
             memo_max_entries=self._probe_memo_max_entries,
         )
-        # AUTO-P11: an absolute ceiling the learned and escalated caps must
-        # respect. Estimated the same way test_probe_budget_fits_the_window
-        # estimates it, so the runtime guard and the config-time guard agree:
-        # window minus the file contents, the prompt template and the reply.
+        # The learned and escalated digest caps never exceed the window (AUTO-P11).
         if self._num_ctx > 0:
             _prompt_tok = (
                 self._max_files_per_review * self._max_file_chars + 4000
@@ -1017,12 +844,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             headroom=self._probe_budget_headroom,
             ceiling=self._probe_budget_max_chars,
         )
-        # AUTO-DEBUG-1: the two warning branches above are the only prior
-        # console signal for this method; a *successful* build was silent,
-        # so "did probing even become available this run" could only be
-        # inferred by grepping prompts for PROBE_INSTRUCTIONS (which the
-        # [trace] max_field_chars head-truncation can hide — see
-        # controller.py AUTO-DEBUG-1 banner for the rest of this fix).
+        # Logs when probing is enabled, so the run shows whether the probe is available (AUTO-DEBUG-1).
         logger.info(
             "architect: probe available this run (collect artifact fresh) — "
             "offering ARCH_PROBE on every batch."
@@ -1179,28 +1001,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
         _base_max_tasks = 1 if self._task_mode == "creative" else 5
 
-        # AUTO-H4: shrink-retry on truncation. A "confirmed" candidate array
-        # cut off mid-object (see _parse_candidates_ex's truncated flag) means
-        # the model tried to fit more tasks into this response than its
-        # output-token budget allowed — the fix that actually addresses the
-        # cause is asking for FEWER tasks (a smaller JSON array is less likely
-        # to overflow the same max_tokens cap), not just re-sending the same
-        # over-ambitious request and hoping for a shorter roll. Each shrink
-        # halves the requested task count (floor 1) and is a fresh, independent
-        # LLM call — not a merge with the previous partial result, since a
-        # re-ask under a smaller budget is meant to complete cleanly on its
-        # own, and mixing salvaged fragments from two different requests risks
-        # duplicate/inconsistent candidates.
-        #
-        # Configurable via [architect]:
-        #   truncation_retry_max    — how many shrink attempts after the
-        #                             first try (default 2; 0 disables this
-        #                             and preserves the old "keep whatever
-        #                             was salvaged from the first response"
-        #                             behaviour).
-        #   truncation_shrink_factor — multiplier applied to max_tasks on each
-        #                              shrink (default 0.5; clamped to (0, 1)
-        #                              and to never fail to shrink at all).
+        # Truncated candidate arrays shrink the requested task count and retry as a fresh call (AUTO-H4); see truncation_retry_max and truncation_shrink_factor.
         try:
             _retry_max = self._config.getint("architect", "truncation_retry_max", fallback=2)
         except ValueError as exc:
@@ -1224,38 +1025,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 reduced = n - 1
             return max(1, reduced)
 
-        # AUTO-H5 / AUTO-H5-ESCALATE-1: retry on an unsalvageable
-        # (empty/garbage/degenerate) response — a distinct failure mode
-        # from AUTO-H4's truncation. There's no partial content here to
-        # blame on a tight max_tasks budget, so shrinking wouldn't help.
-        # Originally a same-settings plain retry (typical "one-off
-        # decoding hiccup" cause: a model repeating "title": "title": ...
-        # until it hits its cap, or a flaky upstream/proxy returning an
-        # empty body) — now ALSO escalates max_tokens/temperature each
-        # attempt (see the class docstring's AUTO-H5-ESCALATE-1 note),
-        # since a genuinely empty response is just as often a
-        # reasoning-heavy model (GLM-5.2 and similar) burning the entire
-        # budget on <think>/thinking-channel output before writing any
-        # JSON — a plain identical retry never recovers from that, an
-        # escalating one usually does.
-        #
-        # Configurable via [architect]:
-        #   empty_response_retry_max — how many escalating retries after
-        #                              the first try when a response is
-        #                              unsalvageable (default 6; 0
-        #                              disables this and preserves the
-        #                              old "0 candidates from this batch,
-        #                              move on" behaviour for that
-        #                              failure mode). Previously 2, then
-        #                              5 — 6 is deliberately an even
-        #                              multiple of len(
-        #                              _UNSALVAGEABLE_TEMPERATURES) (2),
-        #                              so every token tier the ladder
-        #                              reaches — including the LAST one —
-        #                              gets both temperatures tried
-        #                              before escalating further; an odd
-        #                              max leaves the final tier's
-        #                              second temperature untried.
+        # Unsalvageable replies retry with escalating tokens and temperature (AUTO-H5); see empty_response_retry_max.
         try:
             _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=6)
         except ValueError as exc:
@@ -1263,23 +1033,12 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             _empty_retry_max = 6
         _empty_retry_max = max(0, _empty_retry_max)
 
-        # ── AUTO-P1: probe state, read by the _call_and_parse closure ───────
-        # Reassigned by the probe loop at the bottom of this method; the
-        # closure reads them at call time, so each attempt sees the current
-        # digest and the current forced/not-forced stance.
+        # Probe state used by the call closure; reassigned by the probe loop below (AUTO-P1).
         _probe = self._get_probe(base_dir)
         if _probe is not None:
-            # AUTO-P7: tell the probe which files this batch actually saw, so
-            # results from anywhere else can be marked. Set here rather than
-            # in _get_probe because the probe instance is memoized per RUN
-            # while the batch changes every call.
+            # Tell the probe which files this batch saw, so results from elsewhere are marked (AUTO-P7).
             _probe.set_batch_files(cluster.files)
-            # AUTO-P4a: the ArchProbe instance is memoized for the whole run
-            # (one CollectBridge, per make_collect_bridge's contract), but its
-            # digest budget is per BATCH — the digest is appended to this
-            # batch's prompt and nobody else's. Without this reset,
-            # probe_max_total_chars accumulated across every batch and quietly
-            # switched the probe off partway through a long run.
+            # The probe's digest budget is per batch (AUTO-P4a); reset it so one run does not switch it off.
             _probe.reset()
         _probe_digest = ""
         _probe_forced = False
@@ -1320,17 +1079,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 max_tasks=max_tasks,
             )
 
-            # ── AUTO-P1: additive probe sections ────────────────────────────
-            # _USER_PROMPT_TMPL / _USER_PROMPT_CREATIVE are deliberately NOT
-            # edited: with probing off (or unavailable) nothing is appended and
-            # every byte sent is identical to pre-AUTO-P, which is what keeps
-            # the default path provably unchanged and the prompt-sensitive
-            # tests in test_architect_domain.py green.
+            # Probe sections are appended only when probing is on, so the default prompts stay byte-identical (AUTO-P1).
             if _probe_forced:
-                # Driven by the stance, not by _probe: a model that probed
-                # although probing was never offered still has to be told to
-                # stop, or the forced call is a byte-identical re-ask that
-                # reproduces the same probe.
+                # A forced call appends the stop suffix even if probing was not offered, so the model cannot re-probe.
                 user_msg += "\n" + _arch_probe.FORCED_SUFFIX
             elif _probe is not None and _probe.usable:
                 user_msg += "\n" + _arch_probe.PROBE_INSTRUCTIONS
@@ -1346,11 +1097,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 num_ctx=self._num_ctx, think=self._think,
             )
 
-            # AUTO-H5-ESCALATE-1: the effective temperature actually sent
-            # this call — computed directly rather than read back out of
-            # `payload`, since the ollama branch nests it under
-            # payload["options"]["temperature"] (no top-level key there),
-            # which would have silently traced the wrong value.
+            # The temperature actually sent, read from the request rather than the payload (ollama nests it).
             _effective_temperature = self._temperature if temperature is None else temperature
 
             # Trace the outgoing call.
@@ -1363,10 +1110,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         "cluster": cluster.name, "max_tasks": max_tasks},
             )
 
-            # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
-            # [5, 15, 30] (~50s total) regardless of deployment — for a local
-            # Ollama instance still loading a model into memory, that's ~50s of
-            # silent retrying inside this call before the cluster fails open.
+            # Retry delays are configurable instead of fixed (AUTO-BUG-8).
             _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
             try:
                 _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]
@@ -1410,8 +1154,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         ssl_context=self._ssl_context,
                         **self._retry_kwargs,
                     )
-                    # request_completion returns the full accumulated response; prefer it
-                    # and fall back to the streamed tokens if the return is empty.
+                    # The full response is preferred, falling back to the streamed tokens when it is empty.
                     raw_text = returned or "".join(tokens_list)
                     print("\n" + "═" * 80 + "\n")
                     last_exc = None
@@ -1420,11 +1163,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 except Exception as exc:
                     last_exc = exc
                     exc_str = str(exc)
-                    # Only retry on transient server-side errors (5xx) or connection
-                    # failures, not deterministic 4xx client errors. Prefer the real
-                    # status from exc.code (urllib's HTTPError); only fall back to a
-                    # word-boundary scan of the message for non-HTTP errors, to avoid
-                    # false positives from substrings like a model name "gpt-4-5000".
+                    # Retry only transient server errors (5xx) and connection failures; not deterministic 4xx.
                     _http_status: int = 0
                     _code = getattr(exc, "code", None)
                     if isinstance(_code, int):
@@ -1452,9 +1191,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     source="llm", target="architect", kind="llm_response", model=self._model,
                     content=f"[ERROR] {last_exc}", params={"cluster": cluster.name},
                 )
-                # None (not []) so callers can distinguish "call failed" from
-                # "call succeeded but LLM produced no valid candidates".  The
-                # checkpoint must NOT record a failed batch; None signals that.
+                # None means the call failed, distinct from an empty result; a failed batch is not checkpointed.
                 return None, False, False, []
 
             # Strip reasoning tokens before JSON parsing.
@@ -1472,23 +1209,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 cleaned, cluster.name, cluster.files
             )
 
-            # ── AUTO-P2: probe detection, ahead of the ladder verdict ────────
-            # An "ARCH_PROBE: ..." reply is non-JSON prose, so
-            # _parse_candidates_ex above classifies it *unsalvageable*. Left
-            # alone, that hands it to the AUTO-H5 ladder, which re-asks the
-            # identical question up to empty_response_retry_max times at
-            # rising max_tokens/temperature — burning the whole budget while
-            # ignoring the request the model actually made, and reading in the
-            # logs as a flaky model rather than as a feature that never fires.
-            # Detecting it *here*, before the verdict leaves this closure, is
-            # what makes the invariant unconditional: a probe can never
-            # consume an H4 shrink or an H5 escalation.
-            #
-            # Both flags are cleared, not just `unsalvageable`. A single-line
-            # probe should never trip the truncation heuristic (which needs a
-            # partial `{...}` object), but forcing both keeps the guarantee a
-            # property of this branch rather than of _parse_candidates_ex's
-            # internals.
+            # An ARCH_PROBE reply is classified here, before the retry ladders, so a probe never uses up H4 or H5 retries (AUTO-P2).
             _probe_request: list = []
             if self._probe_enabled:
                 try:
@@ -1506,14 +1227,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             if _probe_request:
                 _truncated = False
                 _unsalvageable = False
-                # AUTO-DEBUG-1: plain logger.info, unconditional — the
-                # tracer.event below is the source of truth for the trace
-                # file, but it only reaches stdout when [trace] console_echo
-                # is on, and even then competes with a lot of other console
-                # noise. This one line is the deliberately-boring,
-                # grep-for-it ("probe FIRED") signal: if it never appears in
-                # a run's log, the probe genuinely never fired — not just
-                # "wasn't printed".
+                # A plain info line when a probe fires, so a run log shows it without the trace (AUTO-DEBUG-1).
                 logger.info(
                     "architect [%s]: probe FIRED — %s",
                     cluster.name, ", ".join(str(op) for op in _probe_request),
@@ -1526,11 +1240,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         params={"cluster": cluster.name, "ops": len(_probe_request)},
                     )
                 except Exception as exc:  # noqa: BLE001 — AUTO-P4a
-                    # AUTO-P1 shipped this call bare while every other step in
-                    # the probe path was fail-open. A tracer that cannot write
-                    # (full disk, bad path, a serialisation edge) would abort
-                    # the batch through the one line whose only job is to
-                    # observe it.
+                    # A failing trace write must not abort the batch; it is logged at debug level (AUTO-P4a).
                     logger.debug("probe_request trace failed: %s", exc)
 
             return _cands, _truncated, _unsalvageable, _probe_request
@@ -1550,22 +1260,14 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             Returns ``(candidates_or_None, probe_request)``.
             """
             max_tasks = _base_max_tasks
-            # AUTO-P8: an escalated re-ask pins temperature so the model
-            # re-issues the SAME request and the widened budget serves the ops
-            # that were dropped, rather than re-rolling into a different one.
+            # An escalated re-ask pins temperature, so the same request is re-issued with the larger budget (AUTO-P8).
             candidates, truncated, unsalvageable, probe_request = _call_and_parse(
                 max_tasks, temperature=temperature
             )
 
             _shrink_attempts = 0
             _empty_attempts = 0
-            # Single adaptive loop: on each iteration, react to whichever
-            # failure mode THIS attempt actually hit — a batch can legitimately
-            # flip between them (e.g. truncated on attempt 1, unsalvageable on
-            # a shrunk attempt 2) — rather than committing to one strategy for
-            # the whole retry budget upfront. Each failure mode has its own
-            # independent attempt budget so one doesn't steal retries from the
-            # other.
+            # One adaptive loop: each attempt reacts to the failure it actually hit, since a batch can flip between failure modes.
             while candidates is not None and (truncated or unsalvageable):
                 _call_kwargs: dict = {}
                 if truncated:
@@ -1582,18 +1284,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     if _empty_attempts >= _empty_retry_max:
                         break
                     _empty_attempts += 1
-                    # AUTO-H5-ESCALATE-1 / AUTO-RETRY-TEMP-1: mirrors
-                    # gate1_filter.py's Gate1Filter unparseable-retry
-                    # escalation exactly — an unsalvageable (empty/
-                    # degenerate/non-JSON) response is very often the SAME
-                    # thinking-budget-exhaustion failure Gate 1 already
-                    # handles (see the class docstring above), not a one-off
-                    # decoding hiccup a same-settings plain retry fixes.
-                    # Every temperature in _UNSALVAGEABLE_TEMPERATURES is
-                    # tried at the CURRENT token tier before the tier
-                    # doubles — see that constant's docstring for why this
-                    # is a fixed absolute schedule, not a step down from the
-                    # configured base temperature.
+                    # Unsalvageable replies escalate tokens; each temperature is tried at a tier before the tier doubles (AUTO-H5-ESCALATE-1).
                     _ctx_ceiling = (
                         int(self._num_ctx * self._UNSALVAGEABLE_TOKENS_CTX_FRACTION)
                         if self._num_ctx
@@ -1608,9 +1299,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     )
                     _attempt_tokens = min(_uncapped_tokens, _ctx_ceiling)
                     if _attempt_tokens < _uncapped_tokens:
-                        # AUTO-CTX-CAP-WARN-1: see gate1_filter.py's sibling
-                        # warning — a stale/small num_ctx silently capping
-                        # escalation has bitten in the field more than once.
+                        # Warn when escalation is capped by a small num_ctx, since that silently limits retries (AUTO-CTX-CAP-WARN-1).
                         logger.warning(
                             "review_one_cluster [%s]: escalation wants "
                             "max_tokens=%d but is capped at %d by "
@@ -1636,58 +1325,27 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 )
 
             if candidates is not None and truncated:
-                # Shrink-retries exhausted (or disabled via
-                # truncation_retry_max=0) and the LAST attempt was still
-                # truncated — keep whatever got salvaged rather than
-                # discarding it outright; this matches the pre-AUTO-H4
-                # fail-open behaviour for the final attempt.
+                # Shrink retries are exhausted and the last attempt was still truncated: keep the salvaged candidates (pre-AUTO-H4 behaviour).
                 logger.warning(
                     "review_one_cluster [%s]: still truncated after %d shrink-retry "
                     "attempt(s) (max_tasks=%d) — keeping %d salvaged candidate(s).",
                     cluster.name, _shrink_attempts, max_tasks, len(candidates),
                 )
             if candidates is not None and unsalvageable:
-                # Plain retries exhausted (or disabled via
-                # empty_response_retry_max=0) and the response is still
-                # unsalvageable — nothing to keep this time; fail open with 0
-                # candidates for this batch, same as the pre-AUTO-H5 behaviour,
-                # but only after actually trying instead of giving up on the
-                # first empty/garbage reply.
+                # Plain retries are exhausted and the reply is still unsalvageable: fail open with no candidates for this batch.
                 logger.warning(
                     "review_one_cluster [%s]: still unsalvageable after %d plain "
                     "retry attempt(s) — giving up on this batch with 0 candidates.",
                     cluster.name, _empty_attempts,
                 )
 
-            # AUTO-P2: a recognised probe request cleared both ladder flags in
-            # _call_and_parse, so the while-loop above exits (or never runs) and
-            # control lands here with the probe intact. Handing it back to the
-            # probe loop below is what keeps a probe from ever consuming an H4
-            # shrink or an H5 escalation.
+            # A probe request is handed back to the probe loop, so it never consumes an H4 shrink or H5 escalation (AUTO-P2).
             return candidates, probe_request
 
-        # ── AUTO-P1: probe → digest → re-ask loop ────────────────────────────
-        # Bounded three ways, any of which ends the loop:
-        #   * probe_max_rounds        — iteration cap
-        #   * probe_max_total_chars   — digest cap, enforced inside ArchProbe
-        #   * an empty digest         — nothing could be resolved, so re-asking
-        #                               would reproduce the identical response
-        #                               and the identical probe, forever
-        # Whichever fires, the model gets ONE forced final call telling it to
-        # plan with what it has. That call is not optional: without it, hitting
-        # a cap would mean zero candidates from the batch, which is a
-        # regression against the pre-AUTO-P behaviour.
+        # Probe loop: bounded by probe_max_rounds, the digest cap and an empty digest; then one forced call plans with what it has (AUTO-P1).
         candidates, probe_request = _attempt_plan()
         _probe_rounds = 0
-        # AUTO-P4b: every op-set already asked in THIS batch. The all-miss fix
-        # in ArchProbe.execute covers the common spin (ask → (not found) →
-        # ask the same thing again), but it cannot cover a model that re-asks
-        # after a round that DID resolve something — a real run showed one
-        # batch alternating between `facts _llm_stream, facts strip_think` and
-        # `facts tools.llm_stream, facts tools.llm_stream.strip_think` for
-        # four rounds. Whatever the digest said, repeating a request that was
-        # already answered cannot produce a different answer, so the second
-        # occurrence ends the loop instead of spending another call.
+        # Op-sets already asked in this batch; a repeat is declined so the loop cannot spin (AUTO-P4b).
         _asked_before: set = set()
         # AUTO-P8: escalated re-asks spent on this batch.
         _budget_escalations = 0
@@ -1781,28 +1439,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         "reason":  reason,
                         "ops":     len(ops),
                         "round":   _probe_rounds,
-                        # AUTO-P6: per-op tallies on the DECLINE side too.
-                        # AUTO-P5 recorded by_op only on probe_result, but an
-                        # all-miss round returns an empty digest and emits no
-                        # probe_result at all (AUTO-P4b) — it lands here. So
-                        # every fully-missed lookup was invisible to the
-                        # breakdown, which reported "facts=23/0" on a run whose
-                        # true figure was 23 hits and 17 misses. With one op
-                        # that is merely wrong; with two it systematically
-                        # flatters whichever op tends to miss ENTIRELY, which
-                        # is exactly the comparison the next scope decision
-                        # (refs? read?) rests on.
+                        # Per-op tallies on the decline side too: an all-miss round emits no probe_result, so its misses must still be counted (AUTO-P6).
                         "by_op":   _decline_by_op(reason, ops),
-                        # AUTO-F4a: closes the exact same gap for the
-                        # informed/blind split that AUTO-P6 (above) closed
-                        # for by_op. Without this, a `facts` ask that misses
-                        # inside an all-miss round is counted in `by_op`
-                        # (via _decline_by_op) but silently invisible to
-                        # analyze_logs's "facts sequencing" line — a real
-                        # gap found reviewing AUTO-F4 against a live run
-                        # (trace_e8d5b9fcd4b2: 2 blind misses in a declined
-                        # "support (batch 11/50)" round were missing from
-                        # the reported blind total).
+                        # The informed/blind split is also recorded on declines, since an all-miss round would otherwise hide it (AUTO-F4a).
                         "informed_facts": _informed_seq,
                         "blind_facts":    _blind_seq,
                     },
@@ -1812,9 +1451,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
         while probe_request and candidates is not None and not candidates:
             if _probe is None or not _probe.usable:
-                # The model probed although probing was never offered to it
-                # (instructions are only appended when a usable probe exists).
-                # Nothing to resolve — go straight to the forced call.
+                # The model probed although probing was not offered: there is nothing to resolve, so go straight to the forced call.
                 logger.info(
                     "review_one_cluster [%s]: architect probed but no collect "
                     "artifact is available — forcing a final plan call.",
@@ -1823,25 +1460,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 _decline("no_executor", probe_request)
                 break
             if _probe.budget_exhausted:
-                # ── AUTO-P8: escalate before giving up ──────────────────────
-                # The digest cap became the dominant constraint once `module`
-                # and `read` landed: 15 of 23 declines in the last measured
-                # run were this branch, and the ops it dropped were dropped
-                # silently. Forcing a final plan call here throws away a
-                # request the model made in good faith and could have been
-                # answered with more room.
-                #
-                # Bounded by probe_budget_escalations, and each step is one
-                # extra architect call — the same cost shape as AUTO-H5's
-                # escalation ladder, which this mirrors.
+                # Escalate the digest cap before giving up on a probe round, bounded by probe_budget_escalations (AUTO-P8).
                 if _budget_escalations < self._probe_budget_escalations:
-                    # AUTO-P9: once the run has learned a working cap, the
-                    # temperature rung is skipped. That rung exists to break a
-                    # deterministic loop when we have no idea how much room a
-                    # round needs; with a measured median we DO know, so the
-                    # honest remedy is more room, and re-rolling the request at
-                    # a higher temperature would only ask something different
-                    # from what the wider budget was bought for.
+                    # Once a cap is learned the temperature rung is skipped: more room is the remedy, not a re-roll (AUTO-P9).
                     _ladder = (
                         _arch_probe._BUDGET_ONLY_LADDER
                         if _probe.has_seeded_cap
@@ -1850,33 +1471,14 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     _factor, _temp = _ladder[
                         min(_budget_escalations, len(_ladder) - 1)
                     ]
-                    # AUTO-P13: widen the rung itself for a profile that
-                    # opted into faster growth (see the attribute's own
-                    # comment in __init__). 1.0 is a no-op multiply, so a
-                    # profile that never sets probe_budget_ladder_scale gets
-                    # the exact 2x/2x/4x (or 1.5x/2.5x/4x) rungs AUTO-P8/
-                    # AUTO-P9 shipped — this only stretches them when asked.
+                    # The rung is scaled by probe_budget_ladder_scale; at the default 1.0 the ladder is unchanged (AUTO-P13).
                     _factor *= self._probe_budget_ladder_scale
-                    # AUTO-P9-followup: capture the cap BEFORE raise_budget()
-                    # mutates it. raise_budget() and current_cap share the
-                    # same underlying state, so reading current_cap AFTER the
-                    # call — as the line below used to — silently prints the
-                    # NEW cap in the slot meant to show what was just
-                    # exceeded. That is the exact failure this log line's own
-                    # AUTO-P11 comment warns about, just reintroduced from the
-                    # other direction: a live run showed "(12775/17716)" for
-                    # a batch that actually started at 11811 and had only
-                    # just been raised TO 17716 — reading as "had room to
-                    # spare and still ran out" when the batch never had that
-                    # room in the first place.
+                    # Capture the old cap before raising it, so the log shows the cap that was exceeded (AUTO-P9-followup).
                     _old_cap = _probe.current_cap
                     _new_cap = _probe.raise_budget(_factor)
                     _budget_escalations += 1
                     logger.info(
-                        # AUTO-P11: the denominator is the cap ACTUALLY in
-                        # force, not the configured one. It used to print
-                        # "17237/10000" on a batch whose cap was 15 000, which
-                        # made a working escalation look like a broken one.
+                        # The denominator is the cap in force, not the configured one (AUTO-P11).
                         "review_one_cluster [%s]: probe digest budget spent "
                         "(%d/%d chars) — escalation %d/%d: cap raised to %d, "
                         "temperature %.1f.",
@@ -1893,17 +1495,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                             "step":        _budget_escalations,
                             "new_cap":     _new_cap,
                             "temperature": _temp,
-                            # AUTO-P9: which ladder was in force, so a run can
-                            # be read as "still learning" vs "learned".
+                            # Records which probe ladder was in force, so a run can be read as learning or learned (AUTO-P9).
                             "seeded":      str(_probe.has_seeded_cap),
                         },
                     )
-                    # The escalation exists precisely to get this same request
-                    # re-issued with more room, so it must not then be killed
-                    # as a duplicate. Drop its fingerprint: the repeat detector
-                    # guards against a model looping on an ANSWERED request,
-                    # and this one was never fully answered — the budget ran
-                    # out mid-way through it.
+                    # The escalated re-ask must not be dropped as a duplicate: its earlier attempt was cut off, not answered.
                     _asked_before.discard(frozenset(str(op) for op in probe_request))
                     candidates, probe_request = _attempt_plan(temperature=_temp)
                     continue
@@ -1917,18 +1513,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 _decline("digest_budget", probe_request)
                 break
             if _probe_rounds >= self._probe_max_rounds:
-                # AUTO-P12: the round cap ends the back-and-forth, but the
-                # request that triggered it is still a legitimate,
-                # never-answered ask — the model was cut off mid-question,
-                # not told its question was wrong. Every other branch above
-                # discards the pending request outright once its budget is
-                # spent; this is the one case where that is avoidable at no
-                # extra cost, because the forced final call below is already
-                # about to happen regardless. So: answer this last request
-                # once, with the digest cap lifted (there is no further round
-                # left for an oversized answer to blow), and fold it into
-                # that same forced call rather than spending another
-                # architect round-trip asking again.
+                # On the last round, answer the pending request once with no digest cap, and fold it into the forced call (AUTO-P12).
                 _last_digest = _probe.execute(probe_request, unbounded=True)
                 if _last_digest:
                     logger.info(
@@ -2007,34 +1592,16 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         "cluster":        cluster.name,
                         "round":          _probe_rounds,
                         "ops":            len(probe_request),
-                        # AUTO-P4a: per-batch (gates the loop) and per-run
-                        # (reported only) — see ArchProbe.reset.
-                        # AUTO-P4b: hits/misses are the honest measure. Before
-                        # this, analyze_logs counted probe_result events and
-                        # called them "resolved", which reported a 60/60 miss
-                        # rate across two real runs as "22 resolved".
+                        # Per-batch counters gate the loop; per-run ones are reported only. Hits and misses are the honest measure (AUTO-P4a, P4b).
                         "hits":           _probe.last_hits,
                         "misses":         _probe.last_misses,
-                        # AUTO-F1: of those misses, how many cost nothing —
-                        # answered from the run-level memo with no bridge
-                        # lookup. Folded into "misses" already (AC-F1-5); this
-                        # is the breakout that makes the saving visible rather
-                        # than merely asserted.
+                        # Memo hits are misses that cost nothing: the saving is visible here, not only asserted (AUTO-F1).
                         "memo_hits":      _probe.last_memo_hits,
-                        # AUTO-P5: "facts=3/1 module=1/0" — which op resolved
-                        # what. Aggregate hits cannot tell you whether a newly
-                        # added op is earning its round-trip.
+                        # Per-op breakdown of the last execute(), e.g. "facts=3/1 module=1/0" (AUTO-P5).
                         "by_op":          _probe.last_by_op_str(),
                         "chars_used":     _probe.chars_used,
                         "run_chars_used": _probe.run_chars_used,
-                        # AUTO-F4: is the model asking `facts` for names it
-                        # already saw via `module`, or guessing blind?
-                        # `PROBE_INSTRUCTIONS` now says to check `module`
-                        # first — this measures whether that instruction is
-                        # actually followed instead of assuming it is.
-                        # Cumulative for the batch so far, not just this
-                        # round, hence read fresh each time rather than
-                        # cached — see ArchProbe.informed_facts/blind_facts.
+                        # Informed and blind facts asks, cumulative for the batch: did the model check module before guessing names (AUTO-F4).
                         "informed_facts": "%d/%d" % _probe.informed_facts,
                         "blind_facts":    "%d/%d" % _probe.blind_facts,
                     },
@@ -2049,20 +1616,12 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             )
             candidates, probe_request = _attempt_plan()
 
-        # Forced final call — only when the model is still asking AND has not
-        # already produced a usable plan. A probe reply that also carried
-        # grounded tasks is a complete answer; spending another call on it
-        # would buy nothing.
+        # A forced final call only when the model still asks and has no usable plan; a reply with grounded tasks is already complete.
         if probe_request and candidates is not None and not candidates:
             _probe_forced = True
             candidates, probe_request = _attempt_plan()
             if probe_request:
-                # Probe detection stays enabled on the forced call on purpose.
-                # A model that probes again after being told the budget is
-                # spent has ignored an instruction — that is not the decoding
-                # hiccup AUTO-H5 exists to retry, and six escalating re-asks
-                # will not change its mind. Recognising it keeps the flags
-                # cleared and ends the batch at 2 calls instead of 8.
+                # Probing stays detected on the forced call: a probe after the budget is spent is ignored, not retried (AUTO-H5).
                 logger.warning(
                     "review_one_cluster [%s]: architect probed again after the "
                     "forced final call (%s) — giving up on this batch with 0 "
@@ -2137,11 +1696,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            # AUTO-CR-11: a small model (e.g. llama3.1:8b) frequently runs out
-            # of output tokens mid-array, truncating the final object's string
-            # and making the WHOLE array unparseable. Rather than discarding
-            # every candidate, salvage the complete top-level objects that DID
-            # finish and drop only the truncated tail.
+            # Salvage the complete objects from a truncated array instead of discarding every candidate (AUTO-CR-11).
             salvaged = _salvage_json_objects(stripped)
             if salvaged:
                 truncated = True
@@ -2152,14 +1707,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 )
                 data = salvaged
             else:
-                # AUTO-H5: nothing salvageable at all — an empty response
-                # (`text == ""`), a degenerate repetitive ramble that never
-                # produces one complete `{...}` object, or garbage that
-                # isn't JSON in the first place. Distinct from `truncated`
-                # above precisely because there is no partial content to
-                # build on; flagged so the caller can retry the SAME
-                # request rather than shrinking a budget that isn't the
-                # actual problem here.
+                # Nothing salvageable (empty, degenerate or not JSON): flagged so the same request is retried, not a smaller one (AUTO-H5).
                 logger.warning(
                     "_parse_candidates [%s]: JSON decode failed: %s\nRaw text: %.400s",
                     cluster_name, exc, text,
@@ -2167,9 +1715,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 return [], False, True
 
         if not isinstance(data, list):
-            # Valid JSON, but not the array shape we asked for (e.g. a bare
-            # object or string) — equally unsalvageable: there is no
-            # per-item content to extract from a non-list top level.
+            # Valid JSON that is not an array: unsalvageable, since there is no per-item content to extract.
             logger.warning(
                 "_parse_candidates [%s]: expected JSON array, got %s",
                 cluster_name, type(data).__name__,
@@ -2205,11 +1751,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 )
                 continue
 
-            # AUTO-CR-28: never let a task target a control/memory file
-            # (story_bible.md, synopsis.md, IMPROVEMENTS.md, plan.json) —
-            # editing these corrupts the bible/synopsis and sends the
-            # redundancy gate into an endless rewrite loop. Bounce the
-            # candidate here, before Gate 1, so no attempt is ever spent.
+            # Control and memory files (bible, synopsis, IMPROVEMENTS.md, plan.json) are never task targets; bounced before Gate 1 (AUTO-CR-28).
             if any(
                 str(tf).strip().lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
                 in RESERVED_META_FILES
@@ -2225,11 +1767,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             # --- Validate and build cited_location (grounding gate) ---
             loc_raw = item.get("cited_location")
 
-            # AUTO-CR-10: in creative mode the grounding is "the story so far,"
-            # but a small model often omits cited_location or cites the new
-            # (nonexistent) target chapter, blocking the whole run. Repair by
-            # grounding on an existing cluster file (the latest chapter)
-            # instead of rejecting.
+            # Creative grounding repair: a missing or nonexistent cited file is replaced by an existing cluster file (AUTO-CR-10).
             if self._task_mode == "creative":
                 existing = list(cluster_files or [])
                 anchor_file = _latest_chapter_file(existing)
@@ -2277,9 +1815,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 )
                 continue
 
-            # AUTO-CR-3: creative_acceptance_default (config-driven) decides whether
-            # an empty acceptance_check is permitted and defaults to "true".
-            # Replaces the previous hard-coded task_mode == "creative" check (DM-2).
+            # An empty acceptance_check is allowed and defaults to true, as creative_acceptance_default says (AUTO-CR-3).
             if not acceptance:
                 _acc_default = (
                     safe_getboolean(self._config, "auto", "creative_acceptance_default", fallback=True)
@@ -2295,11 +1831,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     )
                     continue
 
-            # AUTO-CR-17: prose has no meaningful objective shell test, and a
-            # small model often invents nonsensical checks (e.g. "diff
-            # chapter_1.txt chapter_2.txt") that fail on every attempt, burning
-            # the whole task. In creative mode force acceptance to the "true"
-            # no-op — quality is judged by Gate-2 and the canon gate instead.
+            # Prose has no meaningful shell check, so creative acceptance is forced to the no-op true (AUTO-CR-17).
             if self._task_mode == "creative" and acceptance.strip().lower() != "true":
                 logger.info(
                     "_parse_candidates [%s]: item %d — overriding creative "
@@ -2325,24 +1857,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 cluster_name, rejected, len(data),
             )
 
-        # AUTO-CR-18: hard-cap creative tasks — a small model ignores the
-        # "up to N" request and emits many overlapping "synchronize X" tasks,
-        # which collapse every chapter into a copy of one when run
-        # sequentially over shared files. Keep only the first N.
+        # Creative tasks are capped at max_tasks_creative: a small model emits overlapping tasks that collapse chapters (AUTO-CR-18).
         if self._task_mode == "creative":
-            # BUGFIX (FIX-1 #6): fallback= only covers a *missing* key — a
-            # present but non-numeric max_tasks_creative (e.g. "three", or a
-            # leftover empty value) raised ValueError straight out of
-            # getint, and nothing on the path from _review_one_cluster up to
-            # --auto caught it, so one bad value in agents.ini crashed the
-            # whole plan phase *after* the architect's LLM call had already
-            # produced the candidates this cap exists to trim. Degrade to
-            # the documented default (1) — the strictest setting, and the
-            # safe direction for a cap whose purpose is to stop overlapping
-            # creative tasks. Guarded inline (not via a shared helper) so
-            # extract_config_reads (tools/collect/ast_facts.py) still sees
-            # this as a literal getint call — matches this class's own
-            # __init__ guards and gate1_filter.py's established style.
+            # A malformed max_tasks_creative falls back to 1 instead of crashing the plan phase (FIX-1 #6).
             try:
                 cap = self._config.getint("architect", "max_tasks_creative", fallback=1)
             except ValueError as exc:
@@ -2386,9 +1903,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         return "\n\n".join(parts)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Convenience factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _salvage_json_objects(text: str) -> list:
     """Extract complete top-level JSON objects from a (possibly truncated) array.
@@ -2575,9 +2090,7 @@ def review_clusters(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TaskRewriter  (LOOP-2)
-# ─────────────────────────────────────────────────────────────────────────────
+# TaskRewriter (LOOP-2)
 
 _REWRITER_SYSTEM_DEFAULT = (
     "You are an architect who has reviewed failed implementation attempts. "
@@ -2651,18 +2164,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
         super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
 
         arch = "architect"
-        # BUGFIX (FIX-1 #7): every conversion below used to be bare.
-        # configparser's fallback= only covers a *missing* key — a key that is
-        # present but malformed (rewrite_max_tokens = many, think = maybe,
-        # num_ctx = 8k) raises ValueError out of the constructor, and
-        # make_outer_loop builds the rewriter unconditionally, so one bad
-        # value killed the rewrite phase before it could rewrite anything.
-        # Each read is guarded independently so a bad key degrades to its
-        # documented default and the other four still apply. Wrapped
-        # per-call (not via a shared helper) so extract_config_reads
-        # (tools/collect/ast_facts.py) still sees each literal call — a
-        # shared helper's call shape is invisible to that AST scanner.
-        # Matches ClusterReviewer.__init__'s established style (above).
+        # Each rewriter setting is converted with a fallback to its default, so a malformed key cannot break construction (FIX-1 #7).
         try:
             self._max_tokens = int(
                 config.get(arch, "rewrite_max_tokens", fallback="512")
@@ -2818,12 +2320,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             )
             return original_task
 
-        # Guard: reject acceptance_check values that look like prose rather than
-        # a real shell command (a valid check starts with a known executable
-        # token and is short). When the LLM drifts and writes a sentence
-        # instead, bash can't find a binary for it and every attempt fails
-        # with exit 127 — even on correct code — so falling back to the
-        # original command is always safer.
+        # A rewritten acceptance_check that reads like prose (no known executable) is dropped: bash would fail every attempt with exit 127.
         if new_acceptance and not _looks_like_shell_command(new_acceptance):
             logger.warning(
                 "TaskRewriter._parse_rewrite: acceptance_check looks like prose, "
@@ -2832,12 +2329,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             )
             new_acceptance = ""   # force fallback to original below
 
-        # Guard: if the rewriter produced the same instruction and acceptance_check
-        # as the original (semantic identity — same string content), return the
-        # *original_task object* unchanged.  outer_loop.py checks `new_task is not
-        # task` for object identity; returning a new dict with identical values would
-        # pass that check, waste a rewrites_done slot, and leave the coder cycling
-        # through the same strategy forever.
+        # An identical rewrite returns the original task object, so outer_loop's identity check sees no change and no rewrite slot is wasted.
         orig_instruction = original_task.get("instruction", "").strip()
         orig_acceptance  = original_task.get("acceptance_check", "").strip()
         effective_acceptance = new_acceptance or orig_acceptance
@@ -2860,9 +2352,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
         return rewritten
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Internal utilities
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Known executable tokens that legitimately start an acceptance_check command.
 _SHELL_COMMAND_PREFIXES: tuple[str, ...] = (

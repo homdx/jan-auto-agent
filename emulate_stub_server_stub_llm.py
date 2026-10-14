@@ -123,11 +123,7 @@ def build_reply(system: str, user: str) -> str:
 
     # 2. Architect — creative planner
     if "creative-writing planner" in system:
-        # Parse ONLY the "Files in this group" listing to find EXISTING
-        # chapter numbers — never scan the whole prompt (that would also
-        # match the goal text or file contents and misidentify the target,
-        # e.g. re-targeting an already-written chapter_1.txt for "editing"
-        # instead of planning chapter_2.txt).
+        # Parse only the "Files in this group" listing for existing chapter numbers; goal text must not match.
         listing_block = user.split("Files in this group", 1)[-1].split("File contents:", 1)[0]
         existing_nums = sorted(set(
             int(m) for m in re.findall(r"chapter_(\d+)\.txt", listing_block)
@@ -210,9 +206,7 @@ def build_reply(system: str, user: str) -> str:
         _log(f"coder_creative(attempt={n})", system, user, text)
         return text
 
-    # 4. Gate-2 validator — creative editor. Structurally blind to anything
-    #    not present in the chapter text itself (no bible/prior-chapter
-    #    access) — only catches repetition/incompleteness here, by design.
+    # 4. Gate-2 creative editor: sees only the chapter text, so it catches repetition and incompleteness only.
     if "creative writing editor validating a chapter" in system:
         draft_marker = "CHANGED FILE CONTENT"
         draft = user.split(draft_marker, 1)[-1] if draft_marker in user else user
@@ -234,8 +228,7 @@ def build_reply(system: str, user: str) -> str:
         _log("gate1_creative", system, user, reply)
         return reply
 
-    # 6. Continuity validator — sharper check against KNOWN FACTS (bible +
-    #    previous chapter). This is the ONLY gate with long-range memory.
+    # 6. Continuity validator: checks against KNOWN FACTS (bible and previous chapter); the only gate with long-range memory.
     if "KNOWN FACTS" in system and "continuity checker" in system:
         known, _, new_chapter = user.partition("NEW CHAPTER:")
 
@@ -247,8 +240,7 @@ def build_reply(system: str, user: str) -> str:
                 "фактам действие происходит в баре «Маяк»; вернуть место "
                 "действия в бар."
             )
-        # (b) corrupted-bible fact: bible claims father already fully
-        #     recovered, chapter (correctly) says partial/early recovery
+        # (b) Corrupted bible fact: the bible says the father fully recovered, but the chapter says partial recovery.
         elif "полностью выздоровел" in known and re.search(
             r"заговорил.{0,40}обрывками|обрывками.{0,40}заговорил|левая рука не слушается",
             new_chapter,
@@ -259,10 +251,7 @@ def build_reply(system: str, user: str) -> str:
                 "рукой, которая не слушается — привести состояние отца в "
                 "соответствие с установленными фактами."
             )
-        # (c) NEW: long-range relapse check — Viktor drinking whiskey when
-        #     the bible (from chapter 1, several chapters back) says he's
-        #     been sober 3 years. Only catchable if the bible still carries
-        #     this fact this far out.
+        # (c) Long-range relapse: Viktor drinks although the bible from chapter 1 says he has been sober for 3 years.
         elif re.search(r"трезв|не (пь[её]т|употребляет).{0,20}(алкогол|спиртн)|три года.{0,25}(не пь|не употреб|трезв)", known, re.IGNORECASE) \
                 and re.search(r"виски|выпил|бокал[а]? виски", new_chapter, re.IGNORECASE):
             reply = (
@@ -313,11 +302,7 @@ def build_reply(system: str, user: str) -> str:
         _log("canon_ground", system, user, reply)
         return reply
 
-    # 10. Story bible fact extraction — CORRUPTED once, right after
-    #     chapter_2, to simulate a small-model bible-extraction mistake
-    #     feeding forward into chapter_3's continuity check. Viktor's
-    #     sobriety fact (extracted after chapter 1) is left UNCORRUPTED —
-    #     that's the fact chapter_5's long-range test depends on.
+    # 10. Bible extraction: corrupted once after chapter 2 to test a small-model mistake; the sobriety fact stays intact for chapter 5.
     if "Extract ONLY immutable or slowly-changing facts" in system:
         with _BIBLE_CALLS_LOCK:
             BIBLE_CALLS += 1
@@ -333,8 +318,7 @@ def build_reply(system: str, user: str) -> str:
                 "• Встречи происходят в баре «Маяк»."
             )
         elif call_num == 2:
-            # After chapter 2: hallucinated premature "full recovery" —
-            # nothing in chapter 2 said this; models a small-model mistake.
+            # After chapter 2: a hallucinated early full recovery, as a small model might produce.
             reply = (
                 "• Виктор — владелец автосервиса «Мотор», у банка 30 дней на "
                 "погашение долга.\n"

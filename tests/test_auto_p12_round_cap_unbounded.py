@@ -50,9 +50,7 @@ from tools.auto.architect import ClusterReviewer
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Unit level — ArchProbe.execute(..., unbounded=True)
-# ─────────────────────────────────────────────────────────────────────────────
+# Unit level: ArchProbe.execute(..., unbounded=True)
 
 class _FakeBridge:
     usable = True
@@ -90,8 +88,7 @@ class TestUnboundedExecute:
         them."""
         bridge = _FakeBridge({"a": "AAA", "b": "BBB"})
         probe = ArchProbe(bridge, max_chars=100, max_total_chars=10)
-        # Simulate a batch that already spent its whole digest budget in
-        # earlier rounds, exactly the state the round-cap branch finds it in.
+        # Batch has already spent its whole digest budget.
         probe._chars_used = probe._max_total_chars
         assert probe.budget_exhausted is True
 
@@ -124,9 +121,7 @@ class TestUnboundedExecute:
         assert probe.chars_used > 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# End to end — the round-cap branch inside ClusterReviewer.review_clusters
-# ─────────────────────────────────────────────────────────────────────────────
+# End to end: round-cap branch in ClusterReviewer.review_clusters
 
 def _cfg(**over: str) -> configparser.ConfigParser:
     arch = {

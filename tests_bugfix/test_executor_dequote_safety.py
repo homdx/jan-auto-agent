@@ -56,6 +56,5 @@ def test_dequote_strips_only_shell_quoting():
     assert Executor._dequote('r"m"') == "rm"
     assert Executor._dequote("su\\do") == "sudo"
     assert Executor._dequote("cu``rl") == "curl"
-    # Spaces and everything else are left alone — the helper must not join
-    # separate arguments into an accidental blocked token.
+    # Spaces are left alone: the helper must not join separate arguments into one token.
     assert Executor._dequote("pytest -k a b") == "pytest -k a b"

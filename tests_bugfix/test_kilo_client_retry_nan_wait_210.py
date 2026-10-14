@@ -21,8 +21,7 @@ def test_nan_wait_with_a_quota_phrase_is_quota_like_none_would_be():
 
 
 def test_nan_wait_without_a_quota_phrase_is_none_not_backoff():
-    # Old (buggy) behaviour: nan <= bound is False, so this fell through to
-    # the backoff/quota tests and returned "backoff" here.
+    # Old behaviour: nan <= bound is False, so NaN fell through and returned backoff.
     assert _retry_past_the_bound(float("nan"), 3, False, 60.0) is None
     assert _retry_past_the_bound(None, 3, False, 60.0) is None
 
@@ -33,10 +32,7 @@ def test_nan_wait_on_the_first_attempt_matches_nones_first_attempt_behaviour():
 
 
 def test_inf_wait_still_answers_quota_as_before():
-    # inf is always past bound, and always past _BACKOFF_CROSSING_FACTOR *
-    # bound too (no finite doubling could ever reach it), so every call reads
-    # "quota" regardless of attempt or whether a phrase was named — unaffected
-    # by the NaN fix, which never touches a value that is not NaN.
+    # inf is past every bound, so it always reads quota, unaffected by the NaN fix.
     assert _retry_past_the_bound(float("inf"), 1, False, 60.0) == "quota"
     assert _retry_past_the_bound(float("inf"), 3, False, 60.0) == "quota"
     assert _retry_past_the_bound(float("inf"), 3, True, 60.0) == "quota"

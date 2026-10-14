@@ -55,8 +55,7 @@ def _ticket_with(size_line: str | None) -> str:
 def _sandbox(tmp_path, monkeypatch, size_line, legs_by_size=None):
     sb = tc.Sandbox(tmp_path, tickets=((T1, _ticket_with(size_line)),
                                        (T2, tc._ticket("02", "second"))))
-    # an entry may have taught the bench's roster the key already: it is
-    # replaced (or, for `None`, removed) rather than written a second time
+    # The bench roster may already hold the key from an entry; it is replaced (or removed for None) rather than written twice.
     ini = sb.repo / "contest.ini"
     text = re.sub(r"(?m)^legs_by_size\s*=.*\n", "", ini.read_text(encoding="utf-8"))
     if legs_by_size is not None:
@@ -118,8 +117,7 @@ def test_P4_unknown_size_is_none(tmp_path, line):
 
 def test_P5_a_size_in_the_body_is_not_the_header(tmp_path):
     body = _ticket_with(None) + "\nA note: **Size:** L tickets get a relay.\n"
-    # the header has no Size line; a mention far below it may be read or not,
-    # but it must never turn an unsized ticket into a relay by itself
+    # The header has no Size line; a mention far below may or may not be read, but it must never make an unsized ticket a relay by itself.
     assert _size_of(tmp_path, body) in (None, "L")
 
 
@@ -224,8 +222,7 @@ def test_R3_the_refusal_names_the_leg_count_it_would_have_used(
     assert code != 0
     lines = [re.sub(r"--legs\s+\S+", "", ln) for ln in text.splitlines()
              if "intake" in ln or "refus" in ln.lower() or "--legs" in ln]
-    # `L=1` in the roster: the count it would have used is 1 — said as a number
-    # next to "leg", and never as the 3 of the shipped default
+    # `L=1` in the roster: the count it would use is 1, stated as a number next to "leg", never the shipped default of 3.
     assert any(re.search(r"\b1\s*leg", ln) for ln in lines), text
     assert not any(re.search(r"\b3\s*legs?\b", ln) for ln in lines), text
 

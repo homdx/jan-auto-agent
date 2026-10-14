@@ -50,8 +50,7 @@ class TestFilenameKeywordCollision:
         assert r.intent == "show"
 
     def test_show_with_bare_read_filename(self):
-        # "read" is a has_show keyword; read.py alone must not force "show"
-        # when the user actually said "explain".
+        # 'read' is a keyword; read.py alone must not force show when the user said 'explain'.
         r = parse_prompt("explain def helper in read.py")
         assert r.intent == "explain"
 

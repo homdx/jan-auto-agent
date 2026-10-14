@@ -10,9 +10,7 @@ import configparser
 from tools.auto.utils import _cfg_mode
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # _cfg_mode unit tests
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(**sections) -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
@@ -52,9 +50,7 @@ class TestCfgMode:
         assert _cfg_mode(cfg, "coder", "missing_key", "creative") is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Coder picks up max_tokens_creative / num_ctx_creative
-# ─────────────────────────────────────────────────────────────────────────────
+# Coder picks up max_tokens_creative and num_ctx_creative
 
 def _make_coder(task_mode: str, extra_coder: dict | None = None):
     from tools.auto.coder import Coder
@@ -109,8 +105,7 @@ class TestCoderCreativeConfig:
             "max_tokens": "800",
             "max_tokens_creative": "",   # empty → treated as absent by _cfg_mode
         })
-        # empty string is falsy for _cfg_mode: it returns "" which int("") raises
-        # so let's test the case where the key is simply missing
+        # An empty value is falsy for _cfg_mode and would break int(); test a missing key instead.
         from tools.auto.coder import Coder
         cfg = _cfg(**{
             "api":       {"active": "local", "verify_ssl": "false"},
@@ -123,9 +118,7 @@ class TestCoderCreativeConfig:
         assert c2._max_tokens == 800   # falls back to base key
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # RepoIngestor picks up max_file_kb_creative
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestRepoIngestorCreativeConfig:
 
@@ -158,9 +151,7 @@ class TestRepoIngestorCreativeConfig:
         assert r._max_file_kb == 500   # built-in default
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Architect creative_acceptance_default is config-driven
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_cluster_reviewer(task_mode: str, auto_cfg: dict | None = None):
     from tools.auto.architect import ClusterReviewer
@@ -235,20 +226,14 @@ class TestArchitectCreativeAcceptanceDefault:
         assert len(tasks) == 0   # rejected when default disabled
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # agents.ini has the new keys
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_agents_ini_has_creative_coder_keys():
     cfg = configparser.ConfigParser()
     cfg.read("agents.ini")
     assert cfg.has_option("coder", "num_ctx_creative"),    "missing [coder] num_ctx_creative"
     assert cfg.has_option("coder", "max_tokens_creative"), "missing [coder] max_tokens_creative"
-    # NOTE: agents.ini was retuned for an 8192-token base context (was 4096
-    # when this test was first written); num_ctx_creative is now equal to
-    # the base num_ctx (see agents.ini's own comment on why it's kept
-    # explicit rather than removed) and max_tokens_creative was rescaled
-    # accordingly. See agents.ini's [coder] section for the current math.
+    # agents.ini was retuned for an 8192-token base; num_ctx_creative stays explicit and max_tokens_creative was rescaled.
     assert int(cfg.get("coder", "num_ctx_creative"))    == 8192
     assert int(cfg.get("coder", "max_tokens_creative")) == 2800
 
@@ -257,8 +242,7 @@ def test_agents_ini_has_creative_search_key():
     cfg = configparser.ConfigParser()
     cfg.read("agents.ini")
     assert cfg.has_option("search", "max_file_kb_creative"), "missing [search] max_file_kb_creative"
-    # NOTE: rescaled from 400 when agents.ini moved from a 4096- to an
-    # 8192-token base context — see agents.ini's [search] section.
+    # max_file_kb_creative was rescaled when agents.ini moved to an 8192-token base.
     assert int(cfg.get("search", "max_file_kb_creative")) == 550
 
 

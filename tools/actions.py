@@ -79,9 +79,7 @@ class OrchestratorActions:
         return {"Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}"}
 
-    # ------------------------------------------------------------------ #
-    # Full-file search (/search)                                          #
-    # ------------------------------------------------------------------ #
+    # Full-file search (/search)
 
     @staticmethod
     def _parse_payload_and_file(user_input: str, command: str):
@@ -93,10 +91,7 @@ class OrchestratorActions:
         body = user_input.strip()[len(command):].strip()
         if not body:
             return None, None
-        # Bugfix: the bare substring "::" also matches inside identifiers
-        # ("std::vector"), so "/search std::vector in utils.cpp" was split
-        # on the symbol instead of falling through to the " in " form.
-        # The documented syntax has spaces around the separator.
+        # The separator is " :: " with spaces; a bare "::" would split identifiers like std::vector.
         if " :: " in body:                     # /<command> <file> :: <payload>
             file_path, payload = body.split(" :: ", 1)
             return payload.strip(), file_path.strip()
@@ -170,19 +165,7 @@ class OrchestratorActions:
             tracer.event("search_fullfile", "orchestrator", "llm_response", content=answer)
             return strip_think(answer).strip()
         except Exception as e:
-            # AUTO-BUG: same asymmetric-resilience bug as _edit_file_content /
-            # _answer_from_file (see their comments) — a transient network/API
-            # error here used to come back as "" indistinguishable from the
-            # model's own legitimate "NONE" sentinel (no answer in this
-            # chunk). run_search() treated both identically: silently move
-            # on to the next chunk, no retry. If the chunk that hit the
-            # transient error was the one actually containing the answer,
-            # it is lost for good — the search reports "no answer found"
-            # even though the correct answer was sitting right there and
-            # simply never got a second try. None lets run_search retry
-            # the same chunk a bounded number of times before giving up on
-            # it, instead of conflating "no answer here" with "the call to
-            # ask about this chunk failed."
+            # A transient error is None, not "", so run_search retries the chunk instead of treating it as no answer.
             logger.error(f"/search model call failed: {e}")
             print(f"[{_ts()}] search failed: {e}")
             return None
@@ -251,13 +234,7 @@ class OrchestratorActions:
         budget = self.search_full_file_max_chars
         if len(source) <= budget:
             print(f"[{_ts()}] Full-file search over {file_path} ({len(source)} chars).")
-            # BUGFIX: the multi-chunk path below already retries a transient
-            # network/API error (None) up to 3 times before giving up on a
-            # chunk — this single-file path called _ask_over_text and threw
-            # the return value away entirely, so the exact same error on a
-            # SMALL file (one that fits the budget and never gets chunked)
-            # got zero retries: the search just printed nothing and
-            # returned silently. Same asymmetric-resilience bug, same fix.
+            # The single-file path retries transient errors (None) the same way the chunked path does.
             _RETRY = 3
 
             def _ask_full_file():
@@ -277,11 +254,7 @@ class OrchestratorActions:
                 print(f"[{_ts()}] ⚠️  Search unreachable after {_RETRY} attempts.")
                 return
 
-            # BUGFIX: returning on any non-None answer skipped both checks
-            # the chunked path below applies — the model's "NONE" sentinel
-            # was reported as a found answer, and _validate_text_answer
-            # never ran on single-chunk files. Whether an answer gets
-            # grounded must not depend on whether the file needed chunking.
+            # NONE is no answer, and the single-chunk path gets the same grounding check as the chunked one.
             if not ans or ans.strip().upper() == "NONE":
                 print(f"[{_ts()}] No answer found in {file_path} for: {query}")
                 return
@@ -313,18 +286,7 @@ class OrchestratorActions:
         print(f"[{_ts()}] {file_path} is {len(source)} chars > budget {budget}; "
               f"splitting into {len(chunks)} chunks and searching each.")
         for i, ch in enumerate(chunks, 1):
-            # AUTO-BUG: a transient network/API error asking about THIS
-            # chunk used to come back as "" — identical to the model's own
-            # legitimate "NONE" (no answer here) — and this loop treated
-            # both the same: silently move on to the next chunk. If the
-            # chunk that failed was the one actually containing the answer,
-            # it was lost for good; the search would report "no answer
-            # found" even though the correct answer was right there and
-            # simply never got a second try. Give a genuine failure (None)
-            # a small bounded number of retries before giving up on this
-            # chunk, same spirit as the retry logic elsewhere in this file
-            # but scoped to one chunk so a persistently broken connection
-            # can't stall the whole multi-chunk search.
+            # A transient error (None) on a chunk is retried a bounded number of times, not read as no answer.
             _CHUNK_RETRY_ATTEMPTS = 3
 
             def _ask_this_chunk(_ch=ch, _i=i, _n=len(chunks)):
@@ -371,9 +333,7 @@ class OrchestratorActions:
         print(f"[{_ts()}] No chunk contained a validated answer to: {query}")
 
 
-    # ------------------------------------------------------------------ #
-    # Validated text Q&A (FAQ / documentation files)                      #
-    # ------------------------------------------------------------------ #
+    # Validated text Q&A (FAQ and documentation files)
 
     _GENERIC_VERBS = {"show", "view", "get", "answer", "ask", "explain",
                       "describe", "find", "tell", "please"}
@@ -441,15 +401,7 @@ class OrchestratorActions:
             tracer.event("text_answerer", "orchestrator", "llm_response", content=ans)
             return strip_think(ans).strip()
         except Exception as e:
-            # AUTO-BUG: same asymmetric-resilience bug as _edit_file_content
-            # (see its comment) — a transient network/API error here used
-            # to come back as "" indistinguishable from a legitimately
-            # empty answer, so run_text_qa() would validate an EMPTY
-            # answer, get an ordinary (misleading) needs_fix verdict about
-            # the answer's content rather than the real network failure,
-            # and burn a whole iteration + wrong feedback instead of
-            # retrying the generation call the way the validator call two
-            # lines later already retries on the identical failure mode.
+            # A transient error here is None, so the run retries the generation instead of validating an empty answer.
             logger.error(f"text answer call failed: {e}")
             print(f"[{_ts()}] answer generation failed: {e}")
             return None
@@ -503,18 +455,7 @@ class OrchestratorActions:
         tracer.event("orchestrator", "text_validator", "llm_request",
                      params={"question": question}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
-        # AUTO-BUG: same class of bug as _validate_edit (see its comment) —
-        # a network/API failure and a successfully-returned-but-malformed
-        # (non-JSON) response used to share one except clause and both came
-        # out as {"_api_error": True}. In run_text_qa(), _api_error takes
-        # the exponential-backoff retry path, which explicitly skips
-        # `iteration += 1` on `continue`, so `iteration >= self.max_iterations`
-        # never trips either — a validator that reliably answers with prose
-        # instead of STRICT JSON burns the entire timeout budget in
-        # escalating sleeps instead of counting as an ordinary needs_fix
-        # round. Only a genuine request_completion failure is a real API
-        # error; a parse failure on a response that DID arrive is a normal
-        # needs_fix with corrective feedback the model can act on.
+        # A network failure is an API error; a malformed reply is _unparseable and gets normal feedback, not a backoff retry.
         try:
             content = request_completion(url, headers, payload, self.timeout_seconds,
                                          stream=stream_mode,
@@ -531,20 +472,7 @@ class OrchestratorActions:
             return self._parse_llm_json(content)
         except Exception as e:
             logger.warning(f"text validator returned unparseable content: {e}")
-            # AUTO-BUG (follow-up): run_search() has NO retry loop — its
-            # docstring's own contract is "if the validator is unreachable,
-            # accept the candidate answer as-is rather than blocking the
-            # search," and it originally implemented that by checking this
-            # method's _api_error flag. When the fix above stopped labelling
-            # a parse failure as _api_error (correctly, for run_text_qa's
-            # retry loop), it silently broke that contract for run_search:
-            # a validator that never produces valid JSON now causes EVERY
-            # chunk to be rejected as needs_fix, so run_search reports "no
-            # answer found" even when a genuinely correct candidate answer
-            # was found in every single chunk. _unparseable lets run_search
-            # apply its own fail-open rule to this failure mode too, while
-            # run_text_qa's retry loop (which only checks _api_error) is
-            # unaffected and still advances iteration/feeds back correctly.
+            # A parse failure is _unparseable, so run_search's fail-open rule still applies to it.
             return {
                 "status": "needs_fix",
                 "grounded": False,
@@ -575,14 +503,7 @@ class OrchestratorActions:
             print(f"[{_ts()}] \U0001f4c4 No explicit question — treating the file content as the question.")
         knowledge = source
 
-        # AUTO-FIX (fable follow-up 3): this used to only PRINT "validating
-        # against chunks" and then pass the full document anyway — a no-op
-        # message. With the head-truncation behavior of an overfull Ollama
-        # context, the system prompt (not the document tail) is what got cut.
-        # Now the document is actually reduced to the budget, keeping the
-        # head and tail halves (question-relevant material in FAQs/docs tends
-        # to live near headings at the top or recent additions at the bottom)
-        # with an explicit elision marker so the model knows text is missing.
+        # Over-budget documents keep the head and tail, with an elision marker, instead of being passed whole.
         if len(knowledge) > self.search_full_file_max_chars:
             _budget = self.search_full_file_max_chars
             _half = max(1, _budget // 2)
@@ -617,11 +538,7 @@ class OrchestratorActions:
             _new_answer = self._answer_from_file(question, file_path, knowledge, feedback)
 
             if _new_answer is None:
-                # AUTO-BUG: retry the transient generation failure the same
-                # way an _api_error from the validator is retried below,
-                # instead of validating an empty answer with misleading
-                # content-based feedback. Keep the previous best `answer`
-                # (if any) rather than clobbering it with the failure.
+                # Retry a transient generation failure, keeping the previous best answer.
                 _api_err_count += 1
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Answer generation unavailable — "
@@ -656,9 +573,7 @@ class OrchestratorActions:
                 break
 
             if validation.get("_api_error"):
-                # Issue 7: exponential backoff instead of immediate break.
-                # Keep the current best answer; do NOT feed the error back as
-                # feedback (that derails the answerer on the next attempt).
+                # Back off on an API error; keep the current best answer and do not feed the error back as feedback.
                 _api_err_count += 1
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Validator unavailable — "
@@ -683,18 +598,7 @@ class OrchestratorActions:
                 print(f"[{_ts()}] ❗ Validator feedback: {feedback}")
             iteration += 1
 
-        # FIX: run_text_qa's own docstring (step 4) promises to "render the
-        # final, validated answer" — but the loop above only ever streamed
-        # each draft live during generation (via _answer_from_file's
-        # on_token callback) and printed one-line validator verdicts
-        # ("approved" / feedback). There was no concluding block: on
-        # multi-iteration runs the final answer is just whichever streamed
-        # draft happened to print last, with no clear marker of which draft
-        # is the validated one, and unlike run_edit there was no warning at
-        # all if the loop exhausted max_iterations/timeout without ever
-        # being approved. Neither caller (main.py) uses this method's
-        # return value, so this concluding print is the only place the
-        # user ever sees a clearly-labelled final answer.
+        # A concluding block prints the final validated answer, and a warning if the loop exhausted without approval.
         total = time.time() - start
         print(f"\n[{_ts()}] ── ANSWER — {file_path} — {total:.1f}s from request ──")
         if validation.get("status") != "approved":
@@ -704,9 +608,7 @@ class OrchestratorActions:
         print(answer.strip() if answer and answer.strip() else "(no answer produced)")
         print(f"\n[{_ts()}] status={validation.get('status', 'unknown')}  "
               f"grounded={validation.get('grounded')}")
-    # ------------------------------------------------------------------ #
-    # In-place file editing (/edit) — writes the file, with backup + diff  #
-    # ------------------------------------------------------------------ #
+    # In-place file editing (/edit): writes the file, with backup and diff
 
     @staticmethod
     def _parse_edit_command(user_input: str):
@@ -777,10 +679,7 @@ class OrchestratorActions:
             trace_content = base_user
 
         elif previous_revised:
-            # Retry with context: previous output becomes an assistant message
-            # so the correction is a clean new turn. It deliberately re-includes
-            # the full DOCUMENT and INSTRUCTION — without it, weak models mistake
-            # the feedback text for the new document to edit.
+            # Retry with context: the previous output is an assistant turn, and the document and instruction are restated.
             correction = (
                 f"That edit was rejected.\n\n"
                 f"Error: {feedback}\n\n"
@@ -803,10 +702,7 @@ class OrchestratorActions:
             )
 
         else:
-            # Clean/reset retry: single-turn with delimited correction, appended
-            # to the same user message when previous_revised isn't available. We
-            # reference the document by its label (not "above") and re-state the
-            # instruction, so the model doesn't have to scroll up mentally to find it.
+            # Clean retry: a single turn with a delimited correction, referring to the document by its label.
             correction_block = (
                 f"\n\n---CORRECTION---\n"
                 f"Error in previous attempt: {feedback}\n"
@@ -852,20 +748,7 @@ class OrchestratorActions:
             tracer.event("file_editor", "orchestrator", "llm_response", content=out)
             return out
         except Exception as e:
-            # AUTO-BUG: this used to return "" on ANY exception here — same
-            # as a genuinely empty LLM reply — and run_edit() treated an
-            # empty result as fatal: "No content produced" and an immediate,
-            # unconditional return with NO retry, NO backoff, and NO
-            # checkpoint. That's a real asymmetry: the validator call two
-            # steps later gets full exponential-backoff retry (Issue 7) for
-            # this exact class of transient network/API error, but the
-            # generation call that produces the edit in the first place got
-            # none — a single dropped connection permanently kills the
-            # whole /edit command, misleadingly reported as "the model said
-            # nothing." Returning None (vs "" for a genuinely empty reply)
-            # lets run_edit tell the two apart and retry only the real
-            # transient-failure case, the same way it already retries a
-            # validator API error.
+            # A transient failure returns None, not "", so run_edit retries it instead of reporting no content.
             logger.error(f"file edit call failed: {e}")
             print(f"[{_ts()}] edit generation failed: {e}")
             return None
@@ -885,13 +768,7 @@ class OrchestratorActions:
         )
         user = (f"ORIGINAL:\n{original}\n\nINSTRUCTION:\n{instruction}\n\n"
                 f"REVISED:\n{revised}")
-        # AUTO-FIX (fable follow-up 3): ORIGINAL + REVISED is two full copies
-        # of the file. If that exceeds the context window, Ollama silently
-        # drops the HEAD of the prompt — the system prompt and the start of
-        # ORIGINAL — and the validator issues a verdict on partial data
-        # without anyone knowing. Don't silently trust it: warn loudly.
-        # (chars/token ≈ 2 for Cyrillic-heavy text, 4 for Latin — use the
-        # project-wide estimator.)
+        # ORIGINAL plus REVISED can overflow the context window and silently lose the prompt head; warn when it does.
         _nc = getattr(self, "num_ctx", 0)
         if _nc:
             try:
@@ -914,25 +791,7 @@ class OrchestratorActions:
         tracer.event("orchestrator", "edit_validator", "llm_request",
                      params={"instruction": instruction}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
-        # AUTO-BUG: network/API failure and a malformed (non-JSON) response
-        # from a server that DID respond used to share one try/except and
-        # both came out as {"_api_error": True}. In run_edit(), _api_error
-        # takes the exponential-backoff retry path, which explicitly does
-        # NOT advance `iteration` (`continue` skips `iteration += 1`) so
-        # the `iteration >= self.max_iterations` escape check can never
-        # trip either — nothing bounds that path except the overall task
-        # timeout. A validator that reliably replies with prose instead of
-        # STRICT JSON (a real, observed small-model failure mode elsewhere
-        # in this project — see gate1_filter's skip_llm and coder.py's
-        # AUTO-CR-13 JSON-wrapper salvage) then burns the entire
-        # [loop] timeout_seconds budget in escalating sleeps, retrying the
-        # exact same prompt with no corrective feedback, instead of
-        # counting as an ordinary "needs_fix" round that would advance
-        # iteration, feed the parse error back as feedback, and let the
-        # loop terminate normally at max_iterations. Only a genuine
-        # request_completion failure (network/HTTP) is a real API error;
-        # a JSON-parse failure on a response that DID arrive is validated
-        # separately below as a normal needs_fix.
+        # A network failure is an API error; a malformed reply is validated as a normal needs_fix (no unbounded backoff).
         try:
             content = strip_think(request_completion(url, headers, payload, self.timeout_seconds,
                                                       stream=stream_mode,
@@ -948,15 +807,7 @@ class OrchestratorActions:
             return self._parse_llm_json(content)
         except Exception as e:
             logger.warning(f"edit validator returned unparseable content: {e}")
-            # BUGFIX: this was the only one of the three sibling validator
-            # methods (_validate_text_answer, ValidatorAgent.validate, and
-            # this one) that didn't set _unparseable on a parse failure —
-            # an inconsistency, not currently a live bug (run_edit doesn't
-            # check the flag), but any future caller that does — the way
-            # run_search already checks `_api_error or _unparseable` — would
-            # silently misroute this failure, and prompt_evaluator's
-            # json_ok_rate scoring would mis-classify it if this validator
-            # is ever wired into the evaluator.
+            # A parse failure sets _unparseable, like the other validators.
             return {
                 "status": "needs_fix",
                 "feedback": (
@@ -1021,8 +872,7 @@ class OrchestratorActions:
             print(f"[{_ts()}] ▶  Resuming run_edit from iteration {iteration} "
                   "(checkpoint restored).")
 
-        # Use a while loop (not for-range) so API-error iterations can be
-        # retried without consuming the iteration counter.
+        # A while loop lets an API error retry without using up the iteration count.
         while iteration <= self.max_iterations:
             if time.time() - start >= self.timeout_seconds:
                 print(f"[{_ts()}] ⏳ timeout; using best edit so far.")
@@ -1055,14 +905,7 @@ class OrchestratorActions:
             )
 
             if _new_revised is None:
-                # AUTO-BUG: a transient network/API error generating the
-                # edit used to fall through to the "no content produced"
-                # check below and return immediately — no retry, no
-                # backoff, no checkpoint — even though the validator call
-                # a few lines later gets full exponential-backoff retry
-                # for the identical failure mode. Apply the same treatment
-                # here so one dropped connection doesn't permanently kill
-                # the whole /edit command.
+                # A transient generation failure is retried, as the validator call is, instead of ending /edit.
                 _api_err_count += 1
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Edit generation unavailable — "
@@ -1140,18 +983,12 @@ class OrchestratorActions:
 
             iteration += 1
 
-        # Guard: if the loop never ran or every iteration returned empty
-        # content, revised is still "" — do NOT write an empty file.
+        # An empty revision is never written, so the target is not emptied.
         if not revised.strip():
             print(f"[{_ts()}] No content produced — file left unchanged.")
             return
 
-        # AUTO-FIX (fable follow-up 3): if the loop exhausted max_iterations
-        # with the validator still saying needs_fix, we are about to write
-        # content the validator NEVER approved. The gates exist to do their
-        # job — so say it loudly instead of writing in silence. (The write
-        # still happens: the timestamped .bak below makes it reversible, and
-        # the last attempt is usually closer to the goal than the original.)
+        # If the loop ends with needs_fix, the file is written anyway (the .bak keeps it reversible), and the user is told.
         if validation.get("status") != "approved":
             print(f"[{_ts()}] ⚠️  WRITING UNAPPROVED EDIT — validator never "
                   f"approved after {self.max_iterations} iteration(s). "
@@ -1168,8 +1005,7 @@ class OrchestratorActions:
         try:
             with open(backup, "w", encoding="utf-8") as b:
                 b.write(original)
-            # Atomic write (same pattern as state.py's _atomic_write): a
-            # process killed mid-write must not leave a truncated target.
+            # Atomic write, as in state.py, so a killed process leaves no truncated target.
             _tmp = target + ".tmp-edit"
             with open(_tmp, "w", encoding="utf-8") as f:
                 f.write(revised)

@@ -51,8 +51,7 @@ def _symbol(module_path, name):
 def test_resolve_import_exact_and_package_prefix():
     index = {"tools.prompt_parser": "tools/prompt_parser.py", "tools.collect": "tools/collect/__init__.py"}
     assert resolve_import("tools.prompt_parser", index) == "tools/prompt_parser.py"
-    # coarser from-import form (extract_imports records only the source
-    # module) resolves to the package's __init__.
+    # A from-import (extract_imports records only the source module) resolves to the package __init__.
     assert resolve_import("tools.collect.model", index) == "tools/collect/__init__.py"
     assert resolve_import("os.path", index) is None
 
@@ -88,8 +87,7 @@ def test_imported_by_is_exact_reverse_of_import_edges():
 
 
 def test_imported_by_available_for_every_scanned_module_zero_importers_included():
-    # COLLECT-8 AC: blast-radius (imported_by) is available for every
-    # module, including ones nobody imports — no defensive .get needed.
+    # imported_by is available for every module, including those nobody imports.
     modules = scan_repo(FIXTURE_ROOT)
     edges = import_edges(modules)
     reverse = imported_by(edges)
@@ -117,16 +115,7 @@ def test_import_cycle_does_not_crash_graph_construction():
 
 
 def test_entry_points_include_main_py_on_real_repo():
-    # Restrict to production modules: a test importing `main` (e.g. to
-    # drive its CLI) is not itself part of the call graph `main.py` is the
-    # root of, so it shouldn't disqualify `main.py` as an entry point.
-    #
-    # AUTO-P6: the prefix list, not a single literal. This filter was
-    # written when `tests/` was the only test directory; the tests_bugfix/
-    # reorganisation moved three files that `import main` into a directory
-    # this check did not know about, and `main.py` silently stopped being an
-    # entry point. The failure names neither the moved files nor the filter,
-    # so match on every directory that holds tests rather than on one.
+    # Production modules only: a test importing main is not part of main.py's call graph. The prefix list covers every test directory (AUTO-P6).
     _TEST_DIRS = ("tests/", "tests_bugfix/", "tests_slow/")
     modules = [
         m for m in scan_repo(REPO_ROOT)
@@ -171,8 +160,7 @@ def test_build_call_edges_skips_ambiguous_symbol_names(tmp_path):
     (pkg / "caller.py").write_text("def wrapper():\n    return run()\n", encoding="utf-8")
     modules = scan_repo(tmp_path)
     edges = build_call_edges(tmp_path, modules)
-    # `run` is ambiguous (owned by both one.py and two.py) -> not attributed
-    # to either, rather than guessed.
+    # `run` is ambiguous (owned by one.py and two.py): not attributed to either.
     assert edges["pkg/caller.py"] == frozenset()
 
 
@@ -248,26 +236,18 @@ def test_mixed_python_java_repo_imported_by_is_symmetric(tmp_path):
     assert edges["other/Consumer.java"] == frozenset({"com/example/Point.java"})
     assert reverse["com/example/Point.java"] == frozenset({"other/Consumer.java"})
 
-    # ...and the unrelated Python file neither imports nor is imported by
-    # either Java file — languages don't bleed into each other's edges.
+    # The unrelated Python file neither imports nor is imported by either Java file: languages do not bleed.
     assert edges["helper.py"] == frozenset()
     assert reverse["helper.py"] == frozenset()
 
-    # Full symmetry, both directions, across all three modules at once —
-    # the COLLECT-26 AC, verbatim ("imported_by is symmetric for both
-    # languages at once"), not just spot-checked on the one real edge.
+    # Symmetry across all three modules, both directions (COLLECT-26).
     for a in edges:
         for b in edges:
             assert (b in reverse[a]) == (a in edges.get(b, frozenset()))
 
 
 def test_java_cannot_import_python_module_no_crash_no_edge(tmp_path):
-    # "Java can't import .py here or vice versa" (COLLECT-26 AC): a
-    # same-named module in the other language must not accidentally
-    # resolve — resolve_import works purely off each language's own
-    # dotted-name index, so there's no shared namespace for a collision
-    # to even occur in, but this pins that explicitly rather than by
-    # inference.
+    # Java cannot import a Python module with the same name; no crash and no edge, pinned explicitly.
     import configparser
 
     from tools.collect.java_parser import is_available

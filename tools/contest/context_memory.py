@@ -79,59 +79,33 @@ _LOG = logging.getLogger(__name__)
 DEFAULT_DAYS = 7.0
 #: The default memory file, next to the rounds' output.
 DEFAULT_FILENAME = "context-memory.json"
-#: KC-69: the output Kilo reserves when the provider named none — Kilo's own
-#: default maximum output, and the 32 000 sensenova's overflow says was asked.
+#: The output Kilo reserves when the provider names none (Kilo's default; sensenova asked 32 000).
 DEFAULT_OUTPUT_RESERVE = 32000
-#: KC-69: the tokens Kilo 7.6.2 keeps free under ``limit.input`` when the config
-#: sets no ``compaction.reserved`` — ``min(20 000, the model's output)``.
+#: Tokens Kilo 7.6.2 keeps free under limit.input when no compaction.reserved is set.
 KILO_COMPACT_RESERVE = 20000
-#: The default fill, as a percent of the remembered size, at which the runner
-#: compacts a session that has no limit of its own. 0 turns the compact off.
+#: Default fill, as a percent of the remembered size, at which a session with no limit is compacted.
 DEFAULT_COMPACT_AT_PERCENT = 80.0
-#: Round 145: ``[contest] context_min_window`` — the smallest window a
-#: ``last_ok`` may size a model by. No coding session works below it (the round
-#: prompt and the tools alone are ~15–20k), so a floor under it is a plan's cap
-#: or a broken reply, not the model's window: remembered, it would compact
-#: every turn for ever. 0 turns the floor off.
+#: Round 145: context_min_window is the smallest window last_ok may size a model by; 0 disables the floor.
 DEFAULT_MIN_WINDOW = 32000
-#: Round 145/149: ``[contest] context_full_refusal_percent`` — "close enough to
-#: the wall to be evidence". (1) a provider's refusal with no words about a size
-#: is read as an overflow when the session it refused holds at least this
-#: percent of the window it is sized by (round 145). (2) a loose memory record
-#: (``grew`` far past ``last_ok``) sizes the model only when ``last_ok`` is at
-#: least this percent of the window Kilo declares, or of
-#: ``context_limit_fallback`` when Kilo declares nothing (round 149). 0 turns
-#: both readings off.
+#: Round 145/149: context_full_refusal_percent decides when a near-full refusal or a loose record counts as a size; 0 disables both.
 DEFAULT_FULL_REFUSAL_PERCENT = 60.0
-#: KC-40: the default fill, as a percent of a known size, at which the runner
-#: asks a session that holds an uncommitted diff for its own account of it,
-#: before a compact shrinks the history that explains the diff. Kept above
-#: `DEFAULT_COMPACT_AT_PERCENT` on purpose: at the default numbers the ask fires
-#: at 90 %, and a fill there has already earned the compact at 80 % — so the
-#: summary is what goes out first of the two. Set it below the compact's percent
-#: to ask earlier, of a session the compact has not reached yet. 0 turns the
-#: summary off, and a value at or above 100 turns it off too — a summary is
-#: asked of a session that still has room to answer it.
+#: KC-40: the fill (percent) at which a session with an uncommitted diff is asked for its own summary, before a compact; 0 or 100+ disables it.
 DEFAULT_SUMMARY_AT_PERCENT = 90.0
 _DAY = 86400.0
 
-#: The limit the provider names for itself. The sensenova wording is the one in
-#: the ticket's table, kenary's carries no number at all, and OpenRouter's
-#: ``context_length_exceeded`` puts the two numbers after a colon.
+#: The limit a provider names in its error (sensenova, kenary and OpenRouter formats).
 _LIMIT_RE = re.compile(
     r"(?:maximum\s+context\s+length|context\s+length|context\s+window|context\s+limit|"
     r"context_length_exceeded|limit)\s*(?:of|is|:|=)?\s*(\d[\d,]*)",
     re.IGNORECASE,
 )
-#: The prompt the provider names, when it names one: the input it counted, not
-#: the output it was asked for.
+#: The input count a provider names in its overflow message, not the output it was asked for.
 _PROMPT_RE = re.compile(
     r"prompt\s+contains(?:\s+at\s+least)?\s+(\d[\d,]*)\s*input\s*tokens?", re.IGNORECASE
 )
 
 
-#: KC-69: the output the provider reserved on top of the prompt — ``you requested
-#: 32000 output tokens`` — which the prompt budget does not get to use.
+#: The output a provider reserved on top of the prompt, which the prompt budget cannot use (KC-69).
 _OUTPUT_RE = re.compile(r"requested\s+(\d[\d,]*)\s*output\s*tokens?", re.IGNORECASE)
 
 
@@ -152,8 +126,7 @@ def _number(value) -> int | None:
     else:
         return None
     try:
-        # the float -> int step is inside the try: `int(nan)` is a ValueError and
-        # `int(inf)` an OverflowError, and `json.loads` hands out both
+        # int() is inside the try, so nan and inf are caught as the ValueError and OverflowError they raise.
         out = int(raw)
     except (TypeError, ValueError, OverflowError):
         return None
@@ -274,8 +247,7 @@ class OverflowRecord:
         )
 
 
-#: KC-73: a ``last_ok`` sizes a model only when the request that overflowed
-#: grew less than this share on top of it (`size_of`).
+#: A last_ok sizes a model only when the overflowing request grew less than this share on top of it.
 LOOSE_FLOOR_SHARE = 0.25
 
 
@@ -337,16 +309,13 @@ def size_of(record: OverflowRecord, min_window: int = DEFAULT_MIN_WINDOW,
     loose = (record.grew is not None
              and record.grew > record.last_ok * LOOSE_FLOOR_SHARE)
     if loose:
-        # KC-73 + round 149: a loose last_ok is evidence of the wall only when
-        # it is close enough to the wall to be one
+        # A loose last_ok is evidence of the wall only when it is close enough to the wall (KC-73, round 149).
         wall = declared_n if declared_n is not None else _number(fallback)
         if wall is None or share <= 0:
             return None
         return record.last_ok if record.last_ok >= share * wall else None
     if share > 0:
-        # round 149: a model Kilo declares at 32 768 can remember a tight
-        # 28 000 — the floor drops to share × D when D is known. Round 152:
-        # the round's fallback is the same wall when Kilo declares nothing.
+        # Round 149/152: the floor is share x declared window when known, else the fallback window.
         wall = declared_n if declared_n is not None else _number(fallback)
         if wall is not None:
             floor = min(floor, share * wall)
@@ -485,8 +454,7 @@ def load(path, *, days: float = DEFAULT_DAYS, now: float | None = None) -> list[
         keep = span * _DAY if math.isfinite(span) else 0.0
         stamp = time.time() if now is None else float(now)
     except (TypeError, ValueError):
-        # a *days* that is not a number of days is no age cut at all: a record
-        # that cannot be aged is one that must not be trusted by anybody
+        # A days value that is not a number is no age cut, and such a record is not trusted.
         return []
     if not keep > 0 or not math.isfinite(stamp):
         return []
@@ -529,13 +497,11 @@ def add(path, record: OverflowRecord, *, days: float = DEFAULT_DAYS,
         at = float(record.at)
         if not math.isfinite(at):
             return False
-        # the age cut is *now*, not the record's own time: a record written with
-        # a back-dated `at` must not prune its neighbours to its own age
+        # The age cut uses now, not the record's own time, so a back-dated record cannot prune the others.
         stamp = time.time() if now is None else float(now)
         span = float(days)
         keep = span * _DAY if math.isfinite(span) else 0.0
-        # no age cut is no memory at all (context_memory_days = 0): a file that
-        # can never be pruned grows one line per overflow, forever
+        # No age cut means no memory at all, so the file would grow without limit (context_memory_days = 0).
         if not keep > 0 or not math.isfinite(stamp):
             return False
         target = Path(path)

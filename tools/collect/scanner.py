@@ -101,10 +101,7 @@ def scan_java_module(source: str, module_path: str) -> ModuleRecord:
     if result.error is not None:
         return ModuleRecord(path=module_path, parse_error=result.error, language=Language.JAVA)
     if result.has_error:
-        # tree-sitter recovered a tree but flagged internal ERROR nodes —
-        # record this as a parse_error too (extracting facts from an
-        # unreliable tree risks exactly the kind of unchecked claim
-        # COLLECT-1 exists to prevent).
+        # Tree-sitter recovered a tree but flagged error nodes: record a parse_error rather than trust facts from it.
         return ModuleRecord(
             path=module_path,
             parse_error=f"Java source has syntax errors: {module_path}",
@@ -224,14 +221,7 @@ def scan_repo(
     happens to be installed.
     """
     root = Path(root)
-    # CC-13: `[collect] skip_dirs` prunes the walk itself, not just the
-    # manifest built from it — the artifact's module list is this walk's
-    # output, so a directory that is skipped only when the manifest is written
-    # would still be re-summarised (Pass B, one LLM call per module) on every
-    # build and would sit in the module list as a phantom dependency. The walk
-    # and the manifest both use `manifest.skip_dirs_from_config`, so they
-    # cannot disagree about the list; a config without the key gives the
-    # defaults and the walk is exactly what it was.
+    # skip_dirs prunes the walk itself, so the artifact's module list and the manifest agree; no key means the defaults.
     ingestor = RepoIngestor(root, config, extra_skip_dirs=_collect_skip_dirs(config))
     enabled = enabled_languages(config)
     java_exts = java_extensions_from_config(config)
@@ -247,36 +237,14 @@ def scan_repo(
     modules: List[ModuleRecord] = []
     for rel in scannable:
         try:
-            # utf-8-sig: a module saved with a BOM (Notepad, some IDEs) imports fine, and read as utf-8 it was
-            # a parse error here — no symbols, imports or except sites (the other source reads of collect too)
+            # Read as utf-8-sig: a BOM-prefixed file (Notepad, some IDEs) must parse.
             source = (root / rel).read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError) as exc:
-            # BUGFIX: an unreadable file (permission error, a broken
-            # symlink, a file deleted in a race between the walk above and
-            # this read, or — most commonly — a `.py`/`.java` file that
-            # simply isn't valid UTF-8) used to propagate straight out of
-            # `scan_repo`, aborting the *entire* scan and losing every
-            # already-collected module along with it. That directly
-            # contradicts this module's own documented contract (see the
-            # module docstring and `scan_module`'s `SyntaxError` handling):
-            # one broken file must never take down coverage of the rest of
-            # the tree. Record it the same way an unparseable file already
-            # is — `parse_error` set, empty structural fields — and keep
-            # going, instead of letting the read failure crash the run.
+            # An unreadable or non-UTF-8 file is recorded as a parse_error, not a scan abort; the other modules are kept.
             language = Language.JAVA if _language(rel) == Language.JAVA else Language.PYTHON
             modules.append(ModuleRecord(path=rel, parse_error=f"{rel}: {exc}", language=language))
             continue
-        # AUTO-FIX (high-priority audit): the file-read step above is
-        # guarded so one unreadable file can't take down the whole scan
-        # (see the BUGFIX comment on that except block), but the symbol-
-        # extraction call itself was NOT — an unexpected AST shape during
-        # _walk_type_body's recursive walk (java_facts.py) would propagate
-        # straight out of scan_repo, aborting coverage of every other file
-        # already collected. That directly contradicts this loop's own
-        # documented invariant. tree-sitter's own parse failure is already
-        # handled inside scan_java_module (via parse_java's fault-tolerant
-        # contract); this catches everything else — a bug in the Python-side
-        # symbol/import extraction walking an otherwise-valid tree.
+        # A bug in symbol extraction must not abort the scan of other files: catch it per file.
         try:
             if _language(rel) == Language.JAVA:
                 modules.append(scan_java_module(source, rel))

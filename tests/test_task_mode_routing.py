@@ -19,9 +19,7 @@ from unittest.mock import MagicMock, patch
 
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_ini(tmp_path: Path, task_mode: str | None) -> Path:
     """Write a minimal agents.ini; omit task_mode key when None."""
@@ -50,9 +48,7 @@ def _make_ini(tmp_path: Path, task_mode: str | None) -> Path:
     return ini
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1 & 2 — AutoController.task_mode
-# ─────────────────────────────────────────────────────────────────────────────
+# 1-2: AutoController.task_mode
 
 class TestAutoControllerTaskMode:
     def test_reads_docs_mode(self, tmp_path):
@@ -86,9 +82,7 @@ class TestAutoControllerTaskMode:
         assert c.task_mode == "code"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3 — _run_task_loop accepts task_mode kwarg
-# ─────────────────────────────────────────────────────────────────────────────
+# 3: _run_task_loop accepts task_mode
 
 class TestRunTaskLoopSignature:
     def test_accepts_task_mode_kwarg(self, tmp_path):
@@ -136,9 +130,7 @@ class TestRunTaskLoopSignature:
         assert tasks_done == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4 — make_outer_loop accepts task_mode kwarg
-# ─────────────────────────────────────────────────────────────────────────────
+# 4: make_outer_loop accepts task_mode
 
 class TestMakeOuterLoopTaskMode:
     def _base_config(self) -> configparser.ConfigParser:
@@ -196,9 +188,7 @@ class TestMakeOuterLoopTaskMode:
         assert kwargs.get("task_mode") == "docs"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5 — make_inner_loop accepts task_mode and stores it on validator
-# ─────────────────────────────────────────────────────────────────────────────
+# 5: make_inner_loop accepts task_mode and stores it on the validator
 
 class TestMakeInnerLoopTaskMode:
     def _base_config(self) -> configparser.ConfigParser:
@@ -263,9 +253,7 @@ class TestMakeInnerLoopTaskMode:
         assert il.coder._task_mode == "docs"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6 — LLMGate2Validator accepts and stores task_mode
-# ─────────────────────────────────────────────────────────────────────────────
+# 6: LLMGate2Validator accepts and stores task_mode
 
 class TestLLMGate2ValidatorTaskMode:
     def test_stores_docs_mode(self):
@@ -294,9 +282,7 @@ class TestLLMGate2ValidatorTaskMode:
         assert v.task_mode == "code"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Medium #1 — _StubCoder.generate() accepts prefetched_context kwarg
-# ─────────────────────────────────────────────────────────────────────────────
+# _StubCoder.generate() accepts prefetched_context
 
 class TestStubCoderSignature:
     """_StubCoder must accept prefetched_context so broken-env failures are clean."""

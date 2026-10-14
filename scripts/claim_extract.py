@@ -32,8 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="list the sections, no network")
     args = ap.parse_args(argv)
 
-    # min_chars=0: /extract is free, and the default cut (lenz_claim_filter's, which pays per
-    # claim) dropped a short section's claims here with nothing printed
+    # min_chars=0: extract is free, and the default cut (which pays per claim) dropped a short section's claims silently.
     sections = lf.split_sections(args.report.read_text(encoding="utf-8-sig"), min_chars=0)
     # ...but a part that is headings only (the report's `# Title`) has no claim to extract
     sections = [s for s in sections if any(ln.strip() and not ln.lstrip().startswith("#")
@@ -43,8 +42,7 @@ def main(argv: list[str] | None = None) -> int:
             print("-", sec.splitlines()[0][:100])
         return 0
     cache = lf.Cache(args.cache)
-    # ask for the key only when a section is not cached: a second run sends
-    # nothing and so needs none
+    # Ask for the key only when a section is not cached: a second run sends nothing and needs none.
     todo = [sec for sec in sections if cache.get("extract", sec) is None]
     key = lf.api_key() if todo else ""
     seen: set[str] = set()

@@ -30,12 +30,7 @@ from typing import Callable, Optional
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO
 from tools.auto.git_manager import make_git_manager, GitError
 from tools.auto.utils import highest_completed_round
-# NOTE: make_outer_loop is deliberately NOT imported at module level here.
-# _run_task_loop() imports it locally (see below) precisely so that tests
-# can mock it via patch("tools.auto.outer_loop.make_outer_loop", ...) — the
-# established convention used throughout tests/test_auto_g*.py. A module-
-# level import used to sit here as an alternate "patch target", but it was
-# never actually live (the local import always shadowed it); see CR notes.
+# make_outer_loop is imported inside _run_task_loop, so tests can patch it at its source module.
 
 # Epic G Integrations
 from tools.auto.run_trace import setup_run_trace
@@ -51,9 +46,7 @@ STOP_RUNTIME_CAP = "runtime_cap"
 STOP_TASK_CAP    = "task_cap"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RunLimits — thin value object carrying the two caps
-# ─────────────────────────────────────────────────────────────────────────────
+# RunLimits: the two caps
 
 class RunLimits:
     """Carries the wall-clock and task caps for one autonomous session.
@@ -156,23 +149,16 @@ class RunLimits:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-CR-19-4 — startup config lint (guards AUTO-CR-19-1 from regressing)
-# ─────────────────────────────────────────────────────────────────────────────
+# Startup config lint: guards AUTO-CR-19-1 from regressing
 
-# (section, legacy bare key) pairs that are code-specific by convention; each
-# has a mode-specific override form f"{key}_{task_mode}" (e.g. "system_creative").
-# Linted here so a future edit can't reintroduce a generic override without a
-# matching mode variant, per AUTO-CR-19-1's "mode key > legacy key > builtin" rule.
+# Legacy system-prompt keys that need a mode-specific override form (AUTO-CR-19-1).
 _CR19_LEGACY_SYSTEM_KEYS = (
     ("validator_agent", "system"),
     ("coder", "system"),
     ("architect", "system"),
 )
 
-# Below this base num_ctx, the 4k-era prompt budgets (see agents_4k.ini) are
-# known to be too tight for creative mode's larger architect/coder prompts —
-# unless an explicit num_ctx_creative override compensates.
+# Below this base num_ctx the 4k-era prompt budgets apply (see agents_4k.ini).
 _CR19_SMALL_NUM_CTX_THRESHOLD = 8192
 
 
@@ -277,9 +263,7 @@ def _lint_probe_config(config: "configparser.ConfigParser | None") -> list[str]:
     return warnings
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AutoController
-# ─────────────────────────────────────────────────────────────────────────────
 
 class AutoController:
     """Orchestrates an autonomous improvement run.
@@ -330,28 +314,9 @@ class AutoController:
         self.dry_run     = dry_run
         self.agent_dir   = base_path / ".agent"
 
-        # AUTO-DM-1: task_mode is read once here and forwarded everywhere
-        # (defaults to "code", so existing configs are unaffected). self.config
-        # is likewise parsed exactly once and reused everywhere, instead of
-        # re-reading agents.ini from disk on each call.
-        #
-        # NOTE: a nonexistent config_path is intentionally NOT an error here
-        # — self.config just stays empty and every getter below falls back
-        # to its coded default. Many tests rely on this ("none.ini" as
-        # shorthand for "use defaults"), and AutoController itself has no
-        # way to distinguish "user made a typo" from "test wants defaults
-        # on purpose". The CLI entry point (main.py) is where a real path
-        # typo should be caught loudly instead — see main.py's --config
-        # handling for --auto/--validate-plan.
+        # task_mode and config are read once here; a nonexistent config path means defaults (tests rely on it); main.py catches real typos.
         self.config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
-        # AUTO-FIX (medium-priority audit): the NOTE above already makes a
-        # missing config_path a non-error by design — extend the same
-        # "fall back to defaults" treatment to a config file that EXISTS
-        # but fails to parse (bad .ini syntax), rather than letting
-        # AutoController.__init__ crash on a config typo. This is a
-        # narrower fix than "catch everything": a genuinely malformed file
-        # still leaves self.config effectively empty (same end state as
-        # "missing"), so every getter's fallback still applies uniformly.
+        # A config file that exists but does not parse falls back to defaults, like a missing one (AUTO-FIX).
         if Path(config_path).exists():
             try:
                 self.config.read(config_path, encoding="utf-8")
@@ -360,24 +325,14 @@ class AutoController:
                     "AutoController: %s is malformed (%s) — proceeding "
                     "with default settings", config_path, exc,
                 )
-        # AUTO-CR-10: normalise task_mode (typo-tolerant) so a misspelling like
-        # 'creativy' is corrected with a loud warning instead of silently
-        # degrading to code mode.
-        # ── SKILLS-1: apply the skill overlay before ANYTHING reads config ──
-        # A skill is a config overlay, not a runtime concept: it rewrites
-        # [auto] task_mode, the per-agent system_{mode} prompts, the Gate-3
-        # order and any token caps, and then every downstream component runs
-        # unmodified. It has to land here, after the file is read and before
-        # task_mode is normalised, because the overlay is what SETS task_mode.
+        # Normalise task_mode (typo-tolerant), then apply the skill overlay: a skill is a config overlay, so it must come first (SKILLS-1).
         self.skill = None
         if skill:
             from tools.skills import SkillError, apply_skill
             try:
                 self.skill = apply_skill(self.config, skill, base_dir=self.base_dir)
             except SkillError as exc:
-                # Fail LOUD. A skill the user named explicitly but that could
-                # not load must never degrade into "run without it" — that
-                # produces a plausible-looking run against the wrong prompts.
+                # A skill named explicitly must not silently fall back to running without it: fail loud.
                 raise ValueError(f"--skill {skill!r}: {exc}") from exc
 
         from tools.auto.utils import normalize_task_mode
@@ -385,20 +340,10 @@ class AutoController:
         self.task_mode, _mode_warn = normalize_task_mode(_raw_mode)
         if _mode_warn:
             logger.warning("controller: %s", _mode_warn)
-        # AUTO-CR-19-4: lint for the exact config trap AUTO-CR-19-1 fixed —
-        # a code-specific legacy "system" override left in place for a
-        # non-code task_mode with no matching system_{mode} override.
-        # Pure logging; never raises, never changes self.task_mode.
+        # Lint for a code-specific legacy system override left in a non-code mode (AUTO-CR-19-4); logging only.
         _lint_mode_config(self.config, self.task_mode)
         _lint_probe_config(self.config)
-        # AUTO-DEBUG-1: always-on startup banner (not gated by LLM_DEBUG or
-        # [trace] console_echo) so "is probing even eligible this run" is
-        # answerable from the first few lines of stdout instead of being
-        # inferred after the fact from a trace file. `_lint_probe_config`
-        # only speaks up when something is *wrong*; this speaks up every
-        # time, so silence elsewhere (e.g. no "probe fired" line later,
-        # see architect.py AUTO-DEBUG-1) can be read as a real negative
-        # rather than "maybe it just wasn't logged".
+        # Always-on startup line stating whether probing is enabled, so its absence later reads as a real negative (AUTO-DEBUG-1).
         _probe_enabled = safe_getboolean(self.config, "architect", "probe_enabled", fallback=False)
         _use_in_auto = safe_getboolean(self.config, "collect", "use_in_auto", fallback=False)
         logger.info(
@@ -478,9 +423,7 @@ class AutoController:
         """Return seconds elapsed since :meth:`run` was called."""
         return self._time_fn() - self._start_time
 
-    # ------------------------------------------------------------------
     # Public run API
-    # ------------------------------------------------------------------
 
     def run(self) -> int:
         """Execute the autonomous run and return an exit code (0 = success).
@@ -511,16 +454,7 @@ class AutoController:
         self.progress_display = make_progress_display(self.state, cfg, task_mode=self.task_mode)
         self.progress_display.code_total = len(self.state.all_tasks())
 
-        # AUTO-E1/E2: Setup metrics stream and auto tuner
-        # FOLLOW-UP (JAN-BUG-04 residual): AutoMetricsStream.__init__ now
-        # raises a clear RuntimeError instead of a bare OSError when its
-        # directory can't be created — better diagnostics, but this call
-        # site was still unguarded, so the improved error still aborted
-        # the entire --auto run over a metrics sidecar failure, exactly
-        # what JAN-BUG-04 said must not happen ("metrics loss is
-        # acceptable; aborting the run is not"). Guard it here: log and
-        # continue with metrics disabled (every downstream use already
-        # checks `if self.metrics_stream`) rather than crash startup.
+        # Metrics are optional: a failure to set them up is logged and the run continues without them (JAN-BUG-04).
         try:
             self.metrics_stream = AutoMetricsStream(self.agent_dir)
         except Exception as exc:
@@ -536,10 +470,7 @@ class AutoController:
         # AUTO-A3: ensure the target folder is a git repo with agent identity.
         self._setup_git()
 
-        # Reset any tasks that were blocked in a prior session back to TODO so
-        # their dependencies are re-evaluated this session (see docstring on
-        # _reset_resettable_blocked_tasks for why this isn't simply "reset
-        # every BLOCKED task").
+        # Blocked tasks from a prior session go back to TODO so their dependencies are re-checked this session.
         self._reset_resettable_blocked_tasks(cfg)
 
         resume_info = self.state.resume_info()
@@ -552,10 +483,7 @@ class AutoController:
         # Update progress to "running"
         self.state.update_progress(status="running")
 
-        # AUTO-G0: delegates to pipeline.run_pipeline(), which handles PLAN
-        # (ingest → architect → gate1 → prioritise → emit) and EXECUTE
-        # (outer_loop per task, commit, exhaustion). controller.run() stays
-        # thin — all orchestration is unit-testable via pipeline.py in isolation.
+        # Delegates to pipeline.run_pipeline (plan, then execute); the controller stays thin and testable (AUTO-G0).
         from tools.auto.pipeline import run_pipeline
         stop_reason, session_tasks_done = run_pipeline(self)
 
@@ -571,9 +499,7 @@ class AutoController:
 
         return 0
 
-    # ------------------------------------------------------------------
     # Private helpers
-    # ------------------------------------------------------------------
 
     def _run_task_loop(
         self,
@@ -601,30 +527,10 @@ class AutoController:
         """
         pending = self.state.resume_info()["pending"]
         tasks_done = 0
-        # BUGFIX (verified-bugs audit #1): tasks_done (below) is
-        # intentionally "tasks that passed" — AC4's own test suite
-        # (tests/test_auto_g4.py::TestG4RunContinues::
-        # test_exhausted_tasks_not_counted_as_done) pins that as the
-        # counter's contract for progress reporting / run.log, and this
-        # fix must not change it. But check_caps() below was ALSO being
-        # fed tasks_done, so an exhausted/blocked task (which never
-        # increments tasks_done) never counted against max_tasks_per_run
-        # either — a run hitting repeated failures could attempt far more
-        # than max_tasks_per_run tasks, bounded only by max_runtime_min,
-        # silently violating the documented "maximum tasks to execute
-        # this session" contract (see this module's [auto] docstring).
-        # tasks_processed tracks every task this loop actually ran (pass
-        # or exhaustion) and is used for the cap check only, leaving
-        # tasks_done and its AC4 semantics untouched.
+        # tasks_processed counts every task run (passed or exhausted) and feeds the cap check; tasks_done keeps its passing-only meaning (audit #1).
         tasks_processed = 0
 
-        # AUTO-FIX (podrugi sim): a repeat --auto invocation against a
-        # directory whose plan.json is already fully done used to exit with
-        # a bare "run_finished" and no explanation — from the outside it
-        # looked like the run silently did nothing. Say why, and say what to
-        # do about it, before the (correct) early exit below.
-        # NOTE: resume_info()["pending"] is a LIST of tasks, not a count —
-        # the first version of this fix compared it to 0 and never fired.
+        # A repeat run on a finished plan says why it exits, instead of looking like it did nothing (podrugi sim).
         if not pending:
             _total = len(self.state.all_tasks())
             if _total > 0:
@@ -638,37 +544,26 @@ class AutoController:
                             "task(s) — exiting without work; stale plan.json "
                             "is the likely cause on a repeat --auto "
                             "invocation.", _total)
-            # _total == 0 (architect produced nothing) is already reported by
-            # the plan-phase logs — no extra message needed here.
+            # No total is reported here, since the plan-phase logs already say the architect produced nothing.
 
         # ── Build execution helpers once per loop ──────────────────────────
         if cfg is None:
             cfg = self._cfg()
 
-        # NOTE: make_outer_loop must be imported here (locally, per-call), not
-        # hoisted to module scope. tests/test_auto_g*.py mock it via
-        # patch("tools.auto.outer_loop.make_outer_loop", ...); a fresh local
-        # import is what makes that patch visible here. Hoisting this would
-        # silently break ~15 test files that rely on the local re-resolve.
+        # make_outer_loop is imported per call, not at module scope, so tests can patch it at its source.
         from tools.auto.outer_loop import make_outer_loop
         from tools.auto.commit_on_success import CommitOnSuccess
         from tools.auto.exhaustion_handler import make_exhaustion_handler
         from tools.auto.executor import make_executor
         from tools.auto.bug_fix_loop import make_bug_fix_loop
 
-        # COLLECT-24: built ONCE per run (not per task) — see
-        # tests/test_collect_bridge_wiring.py::test_collect_model_loaded_once_per_run.
-        # Replaces the old COLLECT-23 collect_context_for() method, which was
-        # correct but never actually called from this loop.
+        # The collect bridge is built once per run, not per task (COLLECT-24).
         collect_bridge = self._get_collect_bridge(task_mode)
 
         outer_loop = make_outer_loop(cfg, self.base_dir, self.state,
                                        task_mode=task_mode, run_goal=self.goal,
                                        collect_bridge=collect_bridge)
-        # AUTO-CR-14: the bare CommitOnSuccess left summary_memory=None, so the
-        # creative synopsis hook (CR-5) never fired — starving continuity (each
-        # chapter only saw the previous one) and disabling the canon gate. Wire
-        # SummaryMemory here, reusing self.git, so it actually runs.
+        # The synopsis hook is wired with the commit helper so the creative continuity runs (AUTO-CR-14).
         _summary_memory = None
         if task_mode == "creative" and self.git is not None:
             try:
@@ -677,20 +572,14 @@ class AutoController:
                     cfg, base_dir=self.base_dir, task_mode=task_mode,
                 )
             except ValueError:
-                # resolve_llm_profile deliberately raises ValueError for a
-                # misconfigured [summary] llm_profile — surface it at
-                # construction time, not silently swallowed.
+                # A misconfigured [summary] profile is an operator error: raised at construction, not swallowed.
                 raise
             except Exception as exc:  # noqa: BLE001 — never block commits on setup
                 logger.warning(
                     "controller: could not build SummaryMemory — synopsis "
                     "updates will be skipped: %s", exc,
                 )
-        # AUTO-CR-23-1: build the StoryBible here too, the same way as
-        # SummaryMemory, so durable facts are actually maintained in
-        # production — make_story_bible was previously never called anywhere.
-        # Without it, the bible's always-on injection and the continuity
-        # gate's anchor never fire.
+        # The story bible is built like SummaryMemory, so its injection and continuity anchor actually run (AUTO-CR-23-1).
         _story_bible = None
         if task_mode == "creative":
             try:
@@ -728,8 +617,7 @@ class AutoController:
             self.base_dir,
             timeout_sec=self.limits.exec_timeout_sec,
             max_retained_workspaces=self.limits.workspace_retain_count,
-            # RUN-3: the same [executor] pytest_serial the task loop's
-            # executor reads (make_inner_loop) — one setting, both executors.
+            # Reads the same [executor] pytest_serial as the task loop, so there is one setting (RUN-3).
             pytest_serial=safe_getboolean(cfg, "executor", "pytest_serial", fallback=True),
         )
         bug_fix_loop = make_bug_fix_loop(
@@ -800,15 +688,7 @@ class AutoController:
                 if self.run_trace:
                     self.run_trace.log_task_done(task["id"], commit_hash)
 
-                # ── AUTO-G5: post-commit regression check ──────────────────
-                # BUGFIX (check-regressions-guard): this call used to be
-                # bare. _check_regressions() is fail-open internally (see
-                # the guards inside the method), but anything that can run
-                # before its own try/except -- e.g. self.state.all_tasks()
-                # -- was still able to raise and escape here uncaught. The
-                # task that was just committed is already fully accounted
-                # for, so losing the rest of this post-commit step must
-                # never cost the tasks still pending in plan.json.
+                # Post-commit regression check: guarded, so a failure cannot cost the tasks still pending (AUTO-G5, bugfix).
                 try:
                     self._check_regressions(task["id"], executor, bug_fix_loop)
                 except Exception as exc:  # noqa: BLE001 — never abort the run
@@ -823,31 +703,11 @@ class AutoController:
                         f"continuing with remaining tasks"
                     )
 
-                # ── V9: the collect artifact predates this commit ───────────
-                # Placed after the regression loop on purpose: those fixes
-                # commit on top of `commit_hash`, so the tree the NEXT task
-                # sees is HEAD, and paths from both commits must be dirty.
+                # The collect artifact predates this commit: mark the paths dirty after the regression fixes, since HEAD moved (V9).
                 self._invalidate_collect(task["id"], collect_bridge, commit_hash)
 
             elif getattr(result, "unavailable", False) is True:
-                # ── RUN-7: the Gate-2 reviewer never answered ─────────────
-                # A provider outage, not an exhaustion. OuterLoop already put
-                # the task back to TODO with no round consumed and no
-                # feedback_round_N.md, so there is nothing to review, no
-                # knowledge note to write and no investigation ticket to
-                # open — an AUTO-C6 ticket here would send someone chasing a
-                # review that never happened. Before this result existed
-                # `not passed` always meant `exhausted`, which is what the
-                # plain `else` below still handles.
-                #
-                # The coder's unreviewed candidate is still dirty in base_dir
-                # (Bug 2 below): the next session re-runs the coder from a
-                # clean tree anyway, so discard it now rather than let the
-                # next successful task's commit sweep it in. RUN-8: the same
-                # path serves a coder call that died before the model
-                # answered (unavailable_stage == "coder") — nothing was
-                # produced at all, so the wording must not blame the coder
-                # for a rejection it did not receive.
+                # A Gate-2 outage (or a coder call that died) is not an exhaustion: no knowledge note or ticket; the candidate is discarded (RUN-7, RUN-8).
                 _u_stage = ""
                 if result.inner_results:
                     _u_stage = str(
@@ -863,11 +723,7 @@ class AutoController:
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
                 ex_outcome = exhaustion_handler.handle(task, result)
-                # Bug 2: the coder writes its candidate into base_dir before
-                # validation, so an exhausted task leaves that edit dirty — and
-                # commit() stages everything (git add -u/.), which would sweep
-                # it into the next successful task's commit. Discard the
-                # uncommitted residue now (no-op when git is disabled).
+                # An exhausted task's uncommitted edit is discarded now, so the next commit does not sweep it in (Bug 2).
                 self._discard_exhausted_residue(task["id"])
                 self.state.log(
                     f"task {task['id']} exhausted — "
@@ -899,28 +755,18 @@ class AutoController:
                     feedback=last_feedback,
                     attempts=total_attempts,
                     prompt_store=self.auto_tuner.prompt_store,
-                    # RUN-7: an outage is neither an approval nor a rejection
-                    # — its own status keeps the auto-tuner from demoting a
-                    # validator prompt nobody wrote (a "rejected" row here
-                    # would). record_gate2() ignores `approved` when set.
+                    # An outage is neither approval nor rejection, so the auto-tuner does not demote a prompt on it (RUN-7).
                     unavailable=getattr(result, "unavailable", False) is True,
                 )
                 tune_outcome = self.auto_tuner.maybe_tune()
                 if tune_outcome.promoted:
-                    # Full record (score/agent/reason) also lands in
-                    # agent_trace.jsonl via auto_tuner's
-                    # tracer.event(kind="prompt_promoted") call, so
-                    # analyze_logs.py can report promoted rewrites alongside
-                    # denied ones.
+                    # The full record is also in agent_trace.jsonl; the run log gets the promotion (AC4).
                     self.state.log(
                         f"[AUTO-E1] auto_tuner promoted validator prompt: "
                         f"score={tune_outcome.new_prompt_score:.2f}"
                     )
                 elif getattr(tune_outcome, "triggered", False):
-                    # Candidate was evaluated but denied. Print only — run.log
-                    # must stay silent for non-promoted outcomes (AC4); the
-                    # full record already lands in agent_trace.jsonl via
-                    # auto_tuner's tracer.event(kind="prompt_denied") call.
+                    # A denied candidate is printed only: run.log stays silent for non-promoted outcomes (AC4).
                     print(
                         f"[AUTO-E1] auto_tuner denied candidate prompt: "
                         f"score={tune_outcome.new_prompt_score:.4f} — "
@@ -1026,12 +872,7 @@ class AutoController:
             if not tid.startswith(_FIX_PREFIX):
                 return False
             root = by_id.get(_root_task_id(tid))
-            # The root must be something this same filter will actually KEEP,
-            # otherwise the check runs nowhere.  Merely existing is not
-            # enough: a root that is not DONE (re-planned, reset, still in
-            # progress) is excluded from done_tasks below, so skipping its
-            # fix task too would silently drop the only remaining coverage
-            # of that acceptance check.
+            # The root must be a task this filter keeps; otherwise its check would run nowhere and coverage is lost.
             return (
                 root is not None
                 and root.get("status") == STATUS_DONE
@@ -1047,11 +888,7 @@ class AutoController:
             and not _is_redundant_fix_task(t)
         ]
         for done_task in done_tasks:
-            # Bug 6: respect the run's time budget here too.  _run_task_loop
-            # only checks caps between tasks; a regression that breaks several
-            # earlier tasks could otherwise drive a long BugFixLoop cascade
-            # (rounds × attempts of LLM calls each) with no cap check until
-            # control returns to the main loop.
+            # Respect the run's time budget here too, since regression fixes can cascade (Bug 6).
             if self.is_runtime_exceeded():
                 logger.info(
                     "_check_regressions: runtime cap reached — stopping "
@@ -1063,12 +900,7 @@ class AutoController:
                 )
                 break
 
-            # BUGFIX (check-regressions-guard): executor.run() shells out to
-            # re-run a previously-recorded acceptance check, and can raise
-            # OSError (a vanished workspace), a timeout, or GitError. Guard
-            # per done_task rather than around the whole loop, so one flaky
-            # check does not skip the regression check for every other
-            # already-DONE task in this same batch.
+            # One flaky check must not skip the regression check for the other done tasks (check-regressions-guard).
             try:
                 exec_result = executor.run(done_task)
             except Exception as exc:  # noqa: BLE001 — fail-open, keep checking siblings
@@ -1095,12 +927,7 @@ class AutoController:
                     f"after commit of {just_committed_id} "
                     f"(rc={exec_result.exit_code})"
                 )
-                # BUGFIX (check-regressions-guard): handle_regression() drives
-                # a full BugFixLoop (git + executor + LLM subprocesses) and
-                # can raise for the same reasons as executor.run() above.
-                # Guarded separately so the failure is attributed to the
-                # right stage and the loop still moves on to the next
-                # done_task instead of aborting the whole regression pass.
+                # A failing bug-fix loop is attributed to its stage and the pass moves on (check-regressions-guard).
                 try:
                     bfl_result = bug_fix_loop.handle_regression(
                         done_task, exec_result, self.base_dir
@@ -1205,9 +1032,7 @@ class AutoController:
         """
         from tools.auto.bug_fix_loop import _FIX_PREFIX
 
-        # Bugfix (config-crash audit): unguarded, unlike RunLimits.from_config
-        # above. Wrapped per-call, not via a helper, so extract_config_reads
-        # still recognizes the literal call site.
+        # Guarded per call, like the other config reads; a malformed value does not abort the run (config-crash audit).
         try:
             max_rounds_cfg = cfg.getint("auto", "max_rounds_per_task", fallback=10)
         except ValueError as exc:
@@ -1219,34 +1044,13 @@ class AutoController:
         for task in self.state.all_tasks():
             if task["status"] != STATUS_BLOCKED:
                 continue
-            # Case 3: a synthetic BUG-FIX-* task parked by BugFixLoop.
-            #
-            # BugFixLoop marks these BLOCKED precisely to keep an unresolvable
-            # regression out of the pending queue — otherwise the main loop
-            # picks the fix task up next session and re-runs it directly,
-            # outside the ticket short-circuit and outside the fix_attempts
-            # bound.  Resetting it here undid that on EVERY startup, reopening
-            # the bypass for exactly the cases parking exists for (a run
-            # killed mid-fix, or an inconclusive attempt), since neither has
-            # burned enough rounds to trip the case-2 check below.
-            #
-            # Fix tasks carry no depends_on, so case 1 (unmet dependency)
-            # cannot apply to them: BLOCKED here always means parked or
-            # round-exhausted, and neither benefits from a reset.  BugFixLoop
-            # owns their lifecycle and re-upserts the task (restoring TODO)
-            # when the ticket gate authorises another attempt, so skipping
-            # them does not make a retry impossible.
+            # Parked BUG-FIX tasks stay BLOCKED: resetting them on startup would bypass the fix-attempt bound.
             if task["id"].startswith(_FIX_PREFIX):
                 continue
             if highest_completed_round(self.state.task_dir(task["id"])) >= max_rounds_cfg:
                 continue  # round-exhausted — resetting would not help
             self.state.set_task_status(task["id"], STATUS_TODO)
-            # Give the retry a full fresh wall-clock budget, not the leftover
-            # one from the blocked attempt. Without this the reset is a no-op
-            # in disguise: OuterLoop.run_task reads this file back on resume
-            # and computes _remaining = max(budget - consumed, 0), which is 0
-            # for a task that was already parked, so it stops before round 1
-            # and sets the status straight back to BLOCKED.
+            # A retry gets a fresh wall-clock budget; otherwise the parked task's leftover budget stops it before round 1.
             try:
                 self.state.clear_task_deadline(task["id"])
             except OSError as exc:
@@ -1350,9 +1154,7 @@ class AutoController:
             self._collect_bridge_cache = cache
         if task_mode in cache:
             return cache[task_mode]
-        # Defensive: some tests build AutoController via __new__() and never
-        # run __init__, so self.config may be absent — behave exactly like
-        # "no [collect] section" (bridge disabled) rather than raising.
+        # Tests may build the controller without __init__; then there is no config and the bridge stays disabled.
         cfg = getattr(self, "config", None)
         if cfg is None:
             cache[task_mode] = None
@@ -1386,15 +1188,7 @@ class AutoController:
         """
         if bridge is None:
             return
-        # A commit was attempted (git is configured) but produced no hash.
-        # Two different reasons land here, and only one of them is stale:
-        #   * git said there was nothing to commit — the coder wrote nothing,
-        #     the tree is unchanged, and every block in the artifact is still
-        #     exactly right. Blind nothing. Falling back to `target_files`
-        #     here would suppress a fact that predates no edit at all.
-        #   * git could not commit (index.lock, a hung hook) after staging —
-        #     the tree really does hold a change. `has_staged_changes()`
-        #     says so, so `target_files` is still the safer guess.
+        # No hash after a commit: if git had nothing to commit the facts are still valid; if git failed after staging, use target_files.
         if not commit_hash and self.git is not None and not self._tree_has_uncommitted_changes():
             logger.info(
                 "_invalidate_collect: task %s committed nothing and the tree "
@@ -1417,11 +1211,7 @@ class AutoController:
                 )
                 paths = None
         if paths is None:
-            # No git, or git could not be asked. An *empty* answer is not
-            # this case: `diff-tree` lists nothing for a merge or an
-            # `--allow-empty` commit, and then nothing was written, so
-            # nothing is stale — falling back would blind files the task
-            # never touched.
+            # No git: fall back to the task's target files; an empty diff-tree answer means nothing changed, so nothing is stale.
             paths = list(self._task_target_files(task_id))
         try:
             bridge.invalidate(paths)
@@ -1483,9 +1273,7 @@ class AutoController:
         if bridge is None:
             return
         try:
-            # M4: the trace event goes first — the run.log line below is the
-            # human-readable reader, the event is what analyze_logs renders
-            # from. Both are one-per-run.
+            # The trace event goes first; the run.log line is the human reader. Both are written once per run (M4).
             bridge.emit_collect_summary()
         except Exception:  # noqa: BLE001 — never abort the run
             pass
@@ -1517,9 +1305,7 @@ class AutoController:
         return bridge.context_for(target_file)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Convenience wrapper used by main.py
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_auto(
     goal: str,
@@ -1547,19 +1333,7 @@ def run_auto(
     try:
         return controller.run()
     except RuntimeError as exc:
-        # BUGFIX: StateStore.initialise()'s "plan already holds a different
-        # goal — refusing to silently resume it" guard raises RuntimeError
-        # with a deliberately clear, multi-line, actionable message (existing
-        # goal / new goal / exactly what to do about it). That guard runs
-        # inside controller.run() (state.initialise() is called there, not
-        # in __init__), so it fell into the branch below meant for genuinely
-        # unexpected crashes: logger.exception() dumped a full Python
-        # traceback to the console, then the same message was printed again
-        # under an alarming "Fatal error:" banner. A deliberate, well-
-        # designed safety check ended up looking exactly like an internal
-        # bug in the tool instead of the guard it actually is. Give it the
-        # same clean, traceback-free "Error: ..." treatment as the
-        # constructor's own known-error cases just above.
+        # The plan-goal safety refusal is a deliberate error: printed cleanly, without a traceback or a fatal banner (BUGFIX).
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:  # pragma: no cover

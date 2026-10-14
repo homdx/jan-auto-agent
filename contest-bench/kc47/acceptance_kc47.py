@@ -318,8 +318,7 @@ def _session_of(fake, directory):
 
 
 def _stall_run(tmp_path, *, bash_timeout_ms=None, command=CMD, idle=1, turn=20, pause=6):
-    # KC-9: a silence is a continue now; these runs are about the stall line
-    # itself, so no continue budget (as `_stall_config`)
+    # KC-9: a silence is a continue now; these runs test the stall line, so no continue budget.
     cfg = make_config(["agent-a"], turn_timeout_sec=turn, idle_event_timeout_sec=idle,
                       max_continues_per_attempt=0)
     sb = Sandbox(tmp_path)

@@ -118,21 +118,11 @@ def parse_java(source: str, module_path: str) -> JavaParseResult:
         )
     try:
         parser = _get_parser()
-        # tree-sitter operates on bytes, not `str`; `errors="replace"` is
-        # belt-and-suspenders (by the time `source` reaches this function
-        # it has already been successfully decoded once by the caller —
-        # see scanner.scan_repo — so re-encoding to UTF-8 should never
-        # actually hit a bad character), not a substitute for scan_repo's
-        # own read_text(encoding="utf-8").
+        # Source is already decoded UTF-8 by the caller; errors="replace" is only a guard.
         tree = parser.parse(source.encode("utf-8", errors="replace"))
     except Exception as exc:  # noqa: BLE001 - a parser crash degrades to `error`, never aborts the scan
         return JavaParseResult(tree=None, error=f"{module_path}: {exc}")
-    # BUGFIX (audit): Parser.parse() is typed Optional[Tree] and can
-    # return None (not raise) — tree.root_node was dereferenced
-    # unconditionally right after, so a None tree crashed with
-    # AttributeError instead of degrading to `error` like every other
-    # failure mode in this function, violating its own "never aborts the
-    # scan" contract.
+    # BUGFIX (audit): parse() can return None; degrade to an error instead of crashing (the scan is never aborted).
     if tree is None:
         return JavaParseResult(tree=None, error=f"{module_path}: parser.parse() returned no tree")
     return JavaParseResult(tree=tree, error=None, has_error=bool(tree.root_node.has_error))

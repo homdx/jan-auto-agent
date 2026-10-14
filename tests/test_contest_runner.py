@@ -110,9 +110,7 @@ class CollectBridge:
 '''
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the sandbox
-# ─────────────────────────────────────────────────────────────────────────────
+# The sandbox
 
 def _git(cwd, *args) -> str:
     r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
@@ -233,9 +231,7 @@ def work_edit_same(directory, text):
     _write(Path(directory) / "pkg" / "thing.py", _REPEAT_BYTES)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the fake, with the two knobs the scenarios need
-# ─────────────────────────────────────────────────────────────────────────────
+# The fake, with the two knobs the scenarios need
 
 class _BenchHandler(_kilo_fake._Handler):
     def do_POST(self):
@@ -255,10 +251,7 @@ class _BenchHandler(_kilo_fake._Handler):
 class _BenchFake(FakeKiloServer):
     """``bad_models`` → 400 on ``POST /session``; ``"questions": N`` in a turn."""
 
-    # FL-1 (round 84): the interval of the heartbeat that covers a scenario
-    # hook's real git work — see _run_turn. Far inside the shortest silence
-    # window any test here configures (`_stall_config`'s 3 s), because what a
-    # loaded box drifts past is the absolute margin, not the ratio.
+    # Heartbeat during a scenario hook's git work; far inside the shortest silence window the tests configure (FL-1).
     HOOK_BEAT_S = 0.1
 
     def __init__(self, scenario=None, **kw):
@@ -287,13 +280,7 @@ class _BenchFake(FakeKiloServer):
                 self.unanswered.append(qid)
                 return
         plain = {k: v for k, v in turn.items() if k != "questions"}
-        # FL-1 (round 84): the hook heartbeat that used to live here moved to
-        # FakeKiloServer._run_turn — every consumer of the fake needs it, not
-        # just this file (tests/test_contest_cli.py runs a real `git` commit
-        # from a hook under a silence window too). What stays here is the
-        # *completion* beat for a turn that scripts no idle: it puts "no
-        # event for N s" at the end of the turn's work rather than at the
-        # start of it.
+        # The completion beat lives in FakeKiloServer; this file keeps only the turn-end beat (FL-1).
         super()._run_turn(session, plain, text)
         if plain.get("idle") is False:
             self._emit({"type": "session.status",
@@ -394,35 +381,13 @@ def _aborted(fake) -> bool:
     return bool(fake.calls(path="/abort"))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# config, policy, harness
-# ─────────────────────────────────────────────────────────────────────────────
+# Config, policy and harness
 
 def make_config(agents, **over) -> ContestConfig:
     specs = tuple(AgentSpec(name=a, provider_id="kenary", model_id=f"{a}:free") for a in agents)
     gate = LlmSettings(base_url="https://gate-test/v1", api_key="k", model="test/gate",
                        api_format="openai", response_format=True, temperature=0.0, max_tokens=256)
-    # FL-1 (round 84, round 7): `turn_timeout_sec` is a wall-clock deadline the
-    # *runner* puts over the whole turn — and 58 turns in this file run a real
-    # `git commit` from their `on_prompt` hook under it. That makes the default
-    # a Shape-2 hang guard (postmortem §8), not an assertion: no test here
-    # asserts that the default fires, and the four that are *about* the turn
-    # deadline set a short one explicitly. At 30 s it was a bound around
-    # unbounded work, and the operator's stress run walked through it —
-    # `test_retry_backoff_is_observed` came back STALLED with
-    # `no idle after 30s`. 300 s, so only a genuine hang reaches it.
-    # KC-36: `turn_extend_sec = 0` keeps the pre-KC-36 clock — the hard kill
-    # at `turn_timeout_sec`, `on_deadline` never passed, and the stall line the
-    # turns above compare byte for byte. The turn-deadline tests set it
-    # explicitly.
-    # KC-9: a SILENT idle waits `error_retry_backoff_sec` before its continue,
-    # and the roster default is 15 s — four silence tests each slept it out for
-    # real (~+70 s on the suite).
-    # 0 here; the tests that are *about* the backoff set their own.
-    # KC-42: `first_touch_sec = 0` is the ticket's off switch, so every test
-    # here runs without a first-touch clock. The six that are about it set the
-    # key themselves; a default of 420 would put a live watch on every other
-    # turn in this file, which is not what any of them is testing.
+    # Defaults are hang guards: long turn deadline, no backoff, no first-touch clock; tests that care set their own (FL-1, KC-36, KC-9, KC-42).
     kw = dict(agents=specs, max_parallel=1, max_rework=2, turn_timeout_sec=300,
               turn_extend_sec=0, idle_event_timeout_sec=60, max_questions_per_turn=3,
               error_retry_backoff_sec=0, first_touch_sec=0,
@@ -577,15 +542,11 @@ def _permission_turn(on_prompt, patterns):
                             "input": {"command": "ls"}, "output": "ok"}]}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the contract
-# ─────────────────────────────────────────────────────────────────────────────
+# The contract
 
 def test_agent_state_is_a_string_enum_whose_last_four_are_terminal():
     names = [s.name for s in AgentState]
-    # KC-42 adds DEAD: the agent never touched a file, so there is nothing to
-    # harvest and nothing to score — the fifth terminal state, and reported
-    # apart from the stalls in the round's own table.
+    # DEAD (KC-42) is the fifth terminal state: no file touched, nothing to harvest; reported apart from stalls.
     assert names == ["CREATED", "PROMPTED", "WAITING", "HARVESTING", "REWORK",
                      "READY", "GAVE_UP", "STALLED", "ERROR", "DEAD"]
     assert AgentState.READY == "READY" and json.dumps(AgentState.READY) == '"READY"'
@@ -609,8 +570,7 @@ TEST_TIMEOUT_SENTENCE = (
     "give that `bash` call a `timeout` of at least 1200000 ms."
 )
 
-#: KC-53 §4: compared with whitespace collapsed (`_flat`), so rewrapping the
-#: prompt's lines does not break the pin — only rewording does.
+#: Compared with whitespace collapsed, so rewrapping the prompt does not break the pin (KC-53).
 GIT_SEQUENTIAL_SENTENCE = (
     "Run git commands one after another, never as parallel tool calls: two of them "
     "at once collide on your worktree's index.lock."
@@ -676,9 +636,7 @@ def test_agent_run_and_round_state_round_trip_through_json(tmp_path):
     assert state.table_rows()[0]["last_reason"] == "boom"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# run_agent — the Acceptance scenarios
-# ─────────────────────────────────────────────────────────────────────────────
+# run_agent: the acceptance scenarios
 
 def test_happy_path_one_turn_ready_state_and_one_turns_line(tmp_path):
     scenario = {"session": {"cost": 0.42, "tokens": {"input": 10, "output": 5, "total": 15}},
@@ -910,9 +868,7 @@ def test_a_round_without_tmp_roots_keeps_the_prompt_and_runs(tmp_path):
         assert "scratch dir is" not in text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-53: the prompt names the scratch space that needs no reviewer
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_round_prompt_lists_the_scratch_roots_and_offers_its_own_folder(tmp_path):
     """Acceptance 1: both globs and `/tmp/contest/<agent>/`, as their own paragraph
@@ -998,10 +954,7 @@ def test_the_prompt_of_a_resumed_session_lists_the_scratch_roots(tmp_path):
 
 
 def test_three_questions_in_one_turn_stall_and_abort(tmp_path):
-    # No on_prompt: the reject of question 3 unblocks the fake, which then runs
-    # on_prompt on its own thread while the runner's terminal branch reads the
-    # tree (KC-41). Files written in that window get a deadline commit and the
-    # stall ends READY. This test is about the question stall, not the work.
+    # No on_prompt: rejecting question 3 unblocks the fake; this test is about the question stall, not the work.
     scenario = {"turns": [{"events": ["busy"], "questions": 3, "delay": 0.5}]}
     sb, fake, _h, run, aborted = _run_one(tmp_path, scenario)
     assert run.state is AgentState.STALLED and aborted
@@ -1043,15 +996,12 @@ def test_idle_event_timeout_stalls_a_silent_session(tmp_path):
     cfg = make_config(["agent-a"], turn_timeout_sec=300, idle_event_timeout_sec=1, max_continues_per_attempt=0)
     _sb, _fake, _h, run, aborted = _run_one(tmp_path, {"turns": [{"events": [], "idle": False}]}, cfg)
     assert run.state is AgentState.STALLED and aborted
-    # took the idle-event path (last_error/idle_status below), not the
-    # turn_timeout path — a load-independent way to tell the two apart, since
-    # a wall-clock bound on top is exactly what FL-1 (round 84) found flaky.
+    # The idle-event path (last_error), not the turn-timeout path: a load-independent way to tell them apart.
     assert run.last_error == "no event for 1s"
     assert run.turns[0]["idle_status"] == "stalled"
 
 
-#: The round 86 command: what five of the six silence stalls in contest-out
-#: were running when the window fired.
+#: The round 86 command that five of the six silence stalls were running.
 TEST_SUITE_COMMAND = "python3 -m pytest tests -n 4"
 
 
@@ -1195,9 +1145,7 @@ def test_turn_timeout_stalls_a_session_that_never_idles(tmp_path):
         scenario["turns"][0]["on_prompt"] = lambda d, t: fake.pulse(fake.sessions()[-1].id, 0.3, 20)
         run = Harness(sb, fake, cfg).go()
         aborted = _aborted(fake)
-    # fired on turn_timeout, not the (60 s) idle-event path — idle_status/
-    # last_error say so directly and load-independently; FL-1 (round 84)
-    # found the wall-clock bound this used to carry on top flaky.
+    # Fired on turn_timeout; idle_status and last_error say so without a wall-clock bound (FL-1).
     assert run.state is AgentState.STALLED and aborted
     assert run.turns[0]["idle_status"] == "timeout"
     assert run.last_error == "no idle after 1s"
@@ -1240,25 +1188,17 @@ def test_server_going_away_mid_turn_is_error(tmp_path):
     assert run.turns[0]["idle_status"] == "closed"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-21: a STALLED / ERROR turn with a commit on its branch is harvested
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-21: a STALLED or ERROR turn with a commit on its branch is harvested
 
-# FL-1 (round 84): the two tests that must *survive* a silence window rather
-# than trip it — see test_events_of_the_session_keep_a_turn_alive for why the
-# window, the runtime and the tolerance for a starved box are all one number.
+# Keep-alive tests: the silence window, runtime and starved-box tolerance are one number (FL-1).
 KEEPALIVE_WINDOW_S = 8
 KEEPALIVE_BEAT_S = 0.2
 KEEPALIVE_BEATS = 60          # 12 s of beats, comfortably past the window
 
-# The chatty *neighbour* does not have to outlive anything: its turn ends on
-# its own, well inside the window the silent agent is tripping. See
-# test_a_silent_agent_stalls_next_to_a_chatty_one.
+# The chatty neighbour's turn ends well inside the window the silent agent trips.
 NEIGHBOUR_BEATS = 10          # 2 s of chatter under an 8 s window
 
-# The keep-alive turn does not have to outrun its own window any more — the
-# semantics are settled deterministically in test_contest_kilo_client.py — so
-# it runs for a quarter as long under a window nothing plausibly starves past.
+# The keep-alive turn runs a quarter as long under a window nothing plausibly starves past.
 CHATTY_WINDOW_S = 60
 CHATTY_BEATS = 25             # 5 s of beats, a twelfth of the window
 
@@ -1266,15 +1206,7 @@ CHATTY_BEATS = 25             # 5 s of beats, a twelfth of the window
 def _stall_config(**over) -> ContestConfig:
     """A silence stall inside the turn deadline, so the turn is `stalled`, not a
     turn timeout."""
-    # FL-1 (round 84): 3 s, not 1 s. These tests want the stall to fire, so
-    # the window is their *slow* path and widening it costs a green run only
-    # the two extra seconds it spends proving the stall. What it buys is
-    # 2.9 s of margin over the 0.1 s hook heartbeat above, where a 1 s window
-    # left 0.9 s — and 0.9 s is inside what the operator's 32-worker stress
-    # run drifts by.
-    # KC-9: a silence under the deadline is a `continue` into the same session
-    # now; these tests are about the STALLED край itself, so no budget — the
-    # KC-9 tests set their own.
+    # Stall tests use a 3 s window: a 1 s window left too little margin over the hook heartbeat (FL-1, KC-9).
     kw = dict(turn_timeout_sec=300, idle_event_timeout_sec=3, max_continues_per_attempt=0)
     kw.update(over)
     return make_config(["agent-a"], **kw)
@@ -1374,12 +1306,7 @@ def test_a_stalled_turn_reads_the_rejected_commit_from_the_harvest(tmp_path, mon
     assert turn["harvest"]["verdict"] == "REWORK"
     assert turn["harvest"]["reasons"] == ["no_progress_row"]
     assert len(_prompts(fake)) == 1
-    # The fallback is gone for good, not just unused. KC-41 (round 80) adds the one
-    # `rev-parse` it is entitled to: a deadline commit is the runner's *own* new
-    # commit, and its sha is the progress row the harvest is about to read — it is
-    # not a fallback for a claim. So the check is that the one call is that one:
-    # inside `_deadline_commit`, reading the commit it just made, and nowhere
-    # else in the module.
+    # The fallback is gone; the one rev-parse allowed is the deadline commit's own, inside _deadline_commit (KC-41).
     source = Path(runner_mod.__file__).read_text(encoding="utf-8")
     assert source.count("rev-parse") == 1
     body = source.split("def _deadline_commit(", 1)[1].split("\ndef ", 1)[0]
@@ -1501,8 +1428,7 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
         return ALL_ROOTS_PASS, []
 
     monkeypatch.setattr(harvest_module, "run_tests_detail", roots)
-    # FL-1 (round 84): committed before the round, not from the turn's hook —
-    # see `_run_one`. This one goes through `run_round`, so it does it by hand.
+    # Committed before the round, not from the turn's hook; run_round needs it done by hand (FL-1).
     work_ready(str(sb.ws("agent-a").path), "")
     scenario = {"turns": [{"events": [], "idle": False}]}
     with _BenchFake(scenario) as fake:
@@ -1519,10 +1445,7 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
     assert isinstance(run.turns[0]["harvest"]["elapsed"], float)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-29: a stall the runner asked for keeps STALLED — the work is exported,
-# never promoted
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-29: a stall the runner asked for keeps STALLED; its work is exported, never promoted
 
 def test_a_runner_asked_stall_harvests_the_commit_but_never_promotes(tmp_path, caplog):
     """The work is committed and claimed before the turn, and the turn asks
@@ -1607,11 +1530,7 @@ def test_a_session_that_ended_on_its_own_keeps_the_kc21_line_verbatim(tmp_path, 
     assert not any("(harvest:" in line for line in lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-41: a turn that ends with the work on disk and nothing committed is
-# committed by the runner, claimed by the runner, and harvested like any other
-# entry
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-41: work on disk with nothing committed is committed and harvested by the runner, like any entry
 
 def work_dirty_ready(directory, text):
     """KC-41: a finished entry that never got as far as a commit — a change, the
@@ -1753,8 +1672,7 @@ def test_a_clean_stall_is_untouched_by_the_deadline_commit(tmp_path, monkeypatch
     assert not ws.progress_csv.exists()
     (turn,) = run.turns
     assert "harvest" not in turn and "deadline_commit" not in turn
-    # the flag is in `state.json` either way, so a consumer reading the round
-    # file never has to guess whether the key was forgotten or meant
+    # The flag is always in state.json, so a reader never guesses whether it was forgotten.
     assert run.to_dict()["deadline_commit"] is False
 
 
@@ -1975,8 +1893,7 @@ def test_a_provider_error_turn_with_a_dirty_tree_is_still_committed(tmp_path):
             run = h.go()
     finally:
         harvest_module.run_tests_detail = orig
-    # a provider error is not the store, so the harvest promotes it and KC-62's
-    # flag never applies — but the work is still on the branch, which is KC-41
+    # A provider error is not the store, so the harvest promotes it and KC-62's flag does not apply (KC-41).
     assert run.state is AgentState.READY, (run.state, run.last_error)
     assert run.deadline_commit is True
     assert run.to_dict()["deadline_commit"] is True
@@ -1985,9 +1902,7 @@ def test_a_provider_error_turn_with_a_dirty_tree_is_still_committed(tmp_path):
 
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-57: a harvest has a wall-clock budget, and the queue is visible
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _FakeClock:
     """`time.monotonic` on a clock the test advances; nothing else is touched.
@@ -2204,9 +2119,7 @@ def test_the_rounds_table_totals_each_agents_test_lock_wait(tmp_path):
     assert set(rows[0]) == set(rows[1])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-22: a turn that ends idle with uncommitted work gets a continue, not a rework
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-22: an idle turn with uncommitted work gets a continue, not a rework
 
 def _harvest_calls(monkeypatch):
     """Monkeypatch `_harvest` with a counting wrapper; return the counter list."""
@@ -2287,10 +2200,7 @@ def test_max_continues_zero_harvests_a_dirty_idle_turn_at_once(tmp_path):
     assert [t["kind"] for t in run.turns if t["kind"] == "continue"] == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-39: a continue whose diff repeats the previous one opens a new session
-
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-39: a repeated continue diff opens a new session; the signature hashes content, not file names.
 
 def test_diff_signature_hashes_the_content_not_the_file_list(tmp_path):
     """Same file list, different bytes → different signatures; an added
@@ -2388,8 +2298,7 @@ def test_a_repeated_diff_on_the_last_continue_opens_a_new_session(tmp_path):
     assert run.session_id == fresh.id and run.sessions == 2
     assert run.continues == 0 and run.last_diff_signature == ""
 
-    # the abort of the first session goes out after the run and before the
-    # POST /session that opens the replacement
+    # The first session's abort goes out before the POST that opens the replacement.
     log = [r["path"] for r in fake.requests]
     opened = [i for i, path in enumerate(log) if path == "/session"]
     aborted = log.index(f"/session/{old.id}/abort")
@@ -2593,17 +2502,14 @@ def test_resume_into_a_dirty_worktree_first_prompt_names_it(tmp_path):
     assert "uncommitted" not in b_prompts2[0]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-19: retryable session errors — bounded retry into the same session
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-19: retryable session errors get a bounded retry into the same session
 
 _ECONNRESET = {"name": "APIError", "data": {"message": "Connection reset by server",
                "isRetryable": True, "metadata": {"code": "ECONNRESET"}}}
 
 
 def _make_retry_config(**over) -> ContestConfig:
-    # FL-1 (round 84, round 7): 300 s, not 30. These turns commit for real and
-    # none of these tests is about the turn deadline — see make_config.
+    # The turn deadline is 300 s here, since these turns commit for real and do not test it (FL-1).
     kw = dict(max_error_retries=2, error_retry_backoff_sec=0,
               turn_timeout_sec=300, idle_event_timeout_sec=60)
     kw.update(over)
@@ -2659,16 +2565,10 @@ def test_retry_backoff_is_observed(tmp_path):
     sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
     elapsed = time.monotonic() - started
     assert run.state is AgentState.READY
-    # the backoff was observed, measured where it actually happened: from the
-    # errored turn going idle to the retry prompt going out.
+    # The backoff is measured from the errored turn going idle to the retry prompt.
     error_turn, retry_turn = run.turns
     assert retry_turn["sent_at"] - error_turn["idle_at"] >= cfg.error_retry_backoff_sec
-    # No upper bound on `elapsed`. It measures the whole of `_run_one` —
-    # building the sandbox out of real git worktrees, two full turns, the
-    # harvest — and none of that is the backoff. The stress run measured 78 s
-    # for it on a doubly-loaded box while the assertion above, which is the
-    # actual claim, was true. `backoff + 2 * turn_timeout` looked like a
-    # deadline and was a box number in disguise.
+    # No upper bound on elapsed: it measures the whole run, not the backoff; the backoff assertion is the claim.
 
 
 def test_retries_exhausted_then_error(tmp_path):
@@ -2791,32 +2691,24 @@ def test_ctrl_c_during_retry_backoff_ends_the_round(tmp_path):
             run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
                       make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir)
         elapsed = time.monotonic() - started
-    # the interrupt cut the 60 s backoff short; any loaded box still lands well
-    # under the full wait, and a regression that ignored SIGINT would sit here
-    # for the whole backoff.
+    # SIGINT cuts the backoff short; a regression that ignored it would wait the whole backoff.
     assert elapsed < cfg.error_retry_backoff_sec
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-45: a dropped response stream is a retryable error, not an ended agent
-# ─────────────────────────────────────────────────────────────────────────────
 
-#: The round 86 payload, quoting included — Kilo wraps the provider's message in
-#: a literal pair of quotes, and it carries no `isRetryable` and no `metadata`.
+#: The round 86 payload, quoted by Kilo, with no isRetryable and no metadata.
 _INTERRUPTED_STREAM = {"name": "UnknownError",
                        "data": {"message": "\"the model's provider interrupted the response stream\""}}
-#: The round 92 `agnes-3-0-flash` payload: the same drop in other words, which
-#: the round 86 wording did not match — it ended the agent ERROR after one turn.
+#: The round 92 payload, a drop worded differently, which the round 86 wording did not match.
 _INTERRUPTED_BEFORE_FINISH = {
     "name": "UnknownError",
     "data": {"message": "\"the model's provider interrupted the response before it finished. "
                         "send the request again as a new request\""}}
-#: Kilo's text for the same class on the stream log, which never reached
-#: `session.error` in round 86.
+#: Kilo's text for the same class on the stream log, which never reached session.error in round 86.
 _UPSTREAM_UNAVAILABLE = {"name": "UnknownError",
                          "data": {"message": "upstream unavailable for model x"}}
-#: The round 86 `nex-n2-5-pro` payload: refused on its very first request,
-#: before any tool call.
+#: The round 86 payload refused on its first request, before any tool call.
 _REJECTED_REQUEST = {"name": "UnknownError",
                      "data": {"message": "the model's provider rejected the request. "
                                           "check the model id, request fields, and context length"}}
@@ -2935,8 +2827,7 @@ def test_finished_replies_counts_the_answers_that_finished():
     tool_calls = {"info": {"role": "assistant", "finish": "tool-calls"}, "parts": []}
     length = {"info": {"role": "assistant", "finish": "length"}, "parts": []}
     open_reply = {"info": {"role": "assistant"}, "parts": []}
-    # the reply Kilo writes for the refused call itself (round 88,
-    # nemotron-3-super-120b-a12b): an error and no `finish` — not an answer
+    # The reply Kilo writes for a refused call: an error and no finish, not an answer (round 88).
     refused = {"info": {"role": "assistant", "error": {"name": "UnknownError"}}, "parts": []}
     user = {"info": {"role": "user"}, "parts": []}
     assert _finished_replies(_Transcript([user, tool_calls]), None) == 1
@@ -3027,11 +2918,7 @@ def test_a_retry_after_an_error_waits_for_its_own_idle(tmp_path):
         {"events": ["busy"], "error": dict(_INTERRUPTED_STREAM), "idles_after_error": 2},
         {"on_prompt": _work_ready_late, "events": ["busy", "idle"]},
     ]}
-    # A backoff of 1 s, not the 0 of `_make_retry_config`: at 0 the retry's
-    # mark could be taken before the tap had read the two leftover idles off
-    # the stream (1 in 48 under 16 parallel runs), so they landed after the
-    # mark and passed for the retry's own. Live the backoff is 15 s; what this
-    # pins is the mark, and the leftovers must be in the tap for it to matter.
+    # A 1 s backoff so the retry mark follows the two leftover idles the tap has read (live backoff is 15 s).
     sb, fake, _h, run, _ = _run_one(tmp_path, scenario,
                                     _make_retry_config(error_retry_backoff_sec=1))
     _assert_ready(run, sb.ws("agent-a"))
@@ -3142,17 +3029,12 @@ def test_the_transcript_is_read_for_a_rejected_request_only(tmp_path, monkeypatc
     assert run.state is AgentState.READY and len(reads) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-54: a context overflow — the work goes on in a fresh session
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-54: a context overflow: the work goes on in a fresh session
 
-#: The payload round 91's five agents sent back: the provider's `name`, the
-#: message under `data`. `_is_overflow` must read it before the KC-19 retry
-#: path sees it.
+#: The overflow payload round 91's agents sent: the name, with the message under data; read before the KC-19 retry path.
 _OVERFLOW = {"name": "ContextOverflowError",
              "data": {"message": "the request exceeds the model's maximum context length"}}
-#: The same overflow with the provider's retry flag set. The overflow check
-#: still wins, because a prompt into the full session overflows again.
+#: The same overflow with the retry flag set; the overflow check still wins.
 _RETRYABLE_OVERFLOW = {"name": "ContextOverflowError",
                        "data": {"message": "the request exceeds the model's maximum context length",
                                 "isRetryable": True, "metadata": {"code": "ECONNRESET"}}}
@@ -3247,9 +3129,7 @@ def test_an_overflow_turn_with_a_clean_tree_is_a_stall_not_a_crash(tmp_path, mon
 
     monkeypatch.setattr("tools.contest.runner._harvest", boom)
     scenario = {"turns": [{"events": ["busy"], "error": _OVERFLOW}]}
-    # KC-69: with a continue left the overflow is compacted and goes on
-    # (`test_a_clean_overflow_is_compacted_and_the_work_goes_on`); none left is
-    # KC-54's stall
+    # With a continue left, an overflow is compacted and the work goes on; with none left it is the KC-54 stall (KC-69).
     sb, fake, _h, run, _ = _run_one(tmp_path, scenario,
                                     _stall_config(max_continues_per_attempt=0))
     assert run.state is AgentState.STALLED
@@ -3381,12 +3261,9 @@ def test_an_overflow_with_an_unreadable_tree_is_a_clean_stall(tmp_path, monkeypa
     assert _runner_has(caplog, "tree unreadable")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-73: Kilo's own overflow compact is waited out, its asks answered
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-73: Kilo's own overflow compact is waited out, and its asks are answered
 
-#: Round 78's agnes-2-0-flash asked this right after Kilo's own compact: a
-#: `cd` out of its worktree into the directory above it.
+#: Round 78's agnes asked this right after a compact: a cd out of its worktree.
 _OUTSIDE_ASK = {"permission": "external_directory",
                 "patterns": ["/home/renat/Project/opensource/github/agent-offline/*"],
                 "metadata": {"command": "cd .. && git log --oneline -10",
@@ -3547,12 +3424,9 @@ def test_a_non_overflow_session_error_is_error_as_before(tmp_path):
     assert run.turns[0]["idle_status"] == "error"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-56: a turn cut off at `finish: "length"` goes on, it is not harvested
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-56: a turn cut off at finish length goes on; it is not harvested
 
-#: round 74's sensenova window: `limit.context` of the model that was cut off at
-#: 244 410 + 17 734 = 262 144
+#: Round 74's sensenova window: 244 410 + 17 734 = 262 144 tokens.
 _LIMIT = 262_144
 
 
@@ -3855,9 +3729,7 @@ def test_a_failed_post_session_on_a_context_cut_off_is_error(tmp_path, monkeypat
     assert (sb.out_dir / "agent-a.session.json").is_file()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-9: a cut or silent idle is nudged with continue into the same session
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_a_cut_turn_with_running_tool_continues_in_the_same_session(tmp_path):
     """Acceptance 1: a turn whose last assistant message has empty text and a
@@ -4103,9 +3975,7 @@ def test_run_round_hands_each_agent_its_models_context_limit(tmp_path):
     assert len(_session_posts(fake)) == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # run_round
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_round_two_agents_ready_with_state_json_and_table_rows(tmp_path):
     sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
@@ -4158,20 +4028,7 @@ def test_max_parallel_one_runs_two_agents_sequentially(tmp_path):
 
 def test_max_parallel_two_overlaps_two_agents(tmp_path):
     sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
-    # The first turn is held until the second session exists, not for a fixed
-    # time. A 3 s delay used to stand in for that, and three suites sharing 8
-    # cores pushed the second `POST /session` past it — the overlap looked
-    # missing though max_parallel=2 was honoured. With the hold, load only makes
-    # the test slower: a runner that serialises the agents never opens the
-    # second session while the first is held, the hold runs out, and that turn
-    # records it never saw two sessions. The fake's hook heartbeat keeps the
-    # held turn busy, so no silence window fires.
-    #
-    # The proof is what each held turn saw, not the request order: the runner
-    # reads `GET /session/<id>/message` right after it creates a session, before
-    # the prompt, so on a loaded box that read can come before the second
-    # `POST /session` though the first turn has not even started —
-    # `_creates_and_reads` took it for the first agent finishing.
+    # The first turn is held until the second session exists, so load only slows the test; the proof is what each held turn saw.
     fake = None
     saw_both: list = []
 
@@ -4192,9 +4049,7 @@ def test_max_parallel_two_overlaps_two_agents(tmp_path):
         between, _finished_first = _creates_and_reads(fake)
     for name in ("agent-a", "agent-b"):
         _assert_ready(_by_name(state)[name], sb.ws(name))
-    # both turns ran while both sessions existed — the second session opened
-    # before the first turn could finish; a serialised runner leaves the first
-    # turn's entry False
+    # Both turns ran while both sessions existed; a serialised runner would leave the first turn's entry False.
     assert saw_both == [True, True], (saw_both, between)
 
 
@@ -4291,13 +4146,7 @@ def test_a_silent_agent_stalls_next_to_a_chatty_one(tmp_path):
 
         def run_turn(session, turn, text):
             if session.directory.endswith("agent-b"):
-                # The beats start *before* the git work, not after it: b's
-                # silence clock is already running when this hook is entered.
-                # b chats for at least ~2 s and idles once its work is
-                # committed (`idle_after`), inside a's 8 s window on an idle
-                # box — what matters here is the neighbour's *traffic*, not
-                # how long the neighbour lasts, and b must not idle before its
-                # own commit and PROGRESS.csv row exist, or it is not READY.
+                # Beats start before the git work, so the silence clock never fires while b commits.
                 work_done = threading.Event()
                 fake.pulse(session.id, KEEPALIVE_BEAT_S, NEIGHBOUR_BEATS,
                            then_idle=True, idle_after=work_done)
@@ -4406,9 +4255,7 @@ def test_resume_adopts_a_ready_worktree_without_a_session(tmp_path):
     assert state.started_at == 1.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# run_tests — KC-16: the pytest roots inside the harvest
-# ─────────────────────────────────────────────────────────────────────────────
+# run_tests: KC-16, the pytest roots inside the harvest
 
 THING_CHANGED = "def thing():\n    return 42\n"
 TEST_BREAKS = "def test_thing():\n    assert False\n"
@@ -4523,9 +4370,7 @@ def test_run_tests_true_never_runs_the_roots_twice_at_once(tmp_path, monkeypatch
         return ALL_ROOTS_PASS, []
 
     def on_prompt(directory, text):
-        # FL-1 (round 84): a rendezvous between two agent threads, not a
-        # deadline — 2 s was short enough for a loaded box to break the
-        # barrier and turn a scheduling delay into a test failure.
+        # A rendezvous between two agent threads, not a deadline; a long wait keeps a loaded box from breaking it (FL-1).
         barrier.wait(60)
         work_ready(directory, text)
 
@@ -4573,9 +4418,7 @@ def test_resume_harvests_the_mid_flight_worktree_with_the_roots(tmp_path, monkey
     assert harvested[0][1] == _branch_sha(sb.ws("agent-b"))   # the commit it scores
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-18: the round narrates itself — one INFO line per transition, a heartbeat
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-18: the round narrates itself: one INFO line per transition and a heartbeat
 
 LOGGER = "tools.contest.runner"
 
@@ -4617,9 +4460,7 @@ def test_rework_and_error_lines_carry_the_codes_and_the_payload(tmp_path, caplog
 def test_heartbeat_names_the_waiting_agent_and_its_time_in_state(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=LOGGER)
     sb = Sandbox(tmp_path)
-    # FL-1 (round 84): the silence window is incidental here — this test is
-    # about the heartbeat *log line*, and the turn only has to reach READY.
-    # A 5 s window was one more thing for a loaded box to trip over.
+    # The silence window is incidental here: this test is about the heartbeat log line (FL-1).
     cfg = make_config(["agent-a"], progress_every_sec=0.2, idle_event_timeout_sec=120)
     scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"], "delay": 1.0}]}
     with _BenchFake(scenario) as fake:
@@ -4644,11 +4485,7 @@ def test_progress_every_sec_zero_logs_transitions_but_no_heartbeat(tmp_path, cap
     assert not [t for t in threading.enumerate() if t.name.startswith("contest-progress")]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-22 follow-up: what the landed tests leave open — the off switch on --resume,
-# the porcelain lines as git prints them, a bounded listing, and the behaviours
-# the implementation has but nothing pins down
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-22 follow-up: the open cases: --resume's off switch, porcelain lines, a bounded listing, and unpinned behaviours
 
 import tools.contest.runner as _runner_module  # noqa: E402
 from tools.contest.runner import continue_message  # noqa: E402
@@ -4767,14 +4604,10 @@ def test_continue_turns_and_the_resume_nudge_leave_the_json_shape_alone(tmp_path
                           "first_touch_nudges_used", "first_touch_resets",
                           "summary", "summaries", "summary_attempted_at_attempt",
                           "summary_session_id"}
-    # KC-41: the key is present on a run that never used it, and reads `false` —
-    # a consumer cannot tell "the model claimed this" from "the key was written
-    # before the flag existed" by its presence alone
+    # KC-41: deadline_commit is always present and false when unused, so presence alone does not mean the model claimed it.
     assert agent["deadline_commit"] is False
     assert agent["compactions"] == 0
-    # KC-39: one session, which is also the attempt's own count — both keys, so
-    # a consumer can tell the run's total from the attempt's — and the signature
-    # of the diff the continue was granted against
+    # KC-39: sessions and sessions_this_attempt both recorded, with the diff signature the continue was granted against.
     assert agent["sessions"] == 1 and agent["sessions_this_attempt"] == 1
     signatures = [t.get("diff_signature") for t in agent["turns"]]
     assert signatures[0] == agent["last_diff_signature"] and len(signatures[0]) == 64
@@ -4838,9 +4671,7 @@ def test_continue_message_is_bounded_for_a_huge_tree():
     assert len(text.splitlines()) < 60
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-27: the heartbeat shows phase, files-based progress, and test duration
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_repo(tmp_path) -> Path:
     """A bare repo with a base commit, like Sandbox but standalone."""
@@ -4993,8 +4824,7 @@ def test_harvest_elapsed_in_turns_jsonl_and_state_json(tmp_path, caplog, monkeyp
     assert len(turns) == 1
     assert "elapsed" in turns[0]["harvest"]
     assert isinstance(turns[0]["harvest"]["elapsed"], float)
-    # KC-57: `waited` rides next to `elapsed`, 0.0 here because this harvest
-    # took the round's pytest slot at once and waited for nobody.
+    # waited rides next to elapsed; it is 0.0 here, since the slot was free at once (KC-57).
     assert isinstance(turns[0]["harvest"]["waited"], float)
     assert turns[0]["harvest"]["waited"] == 0.0
 
@@ -5131,9 +4961,7 @@ def test_the_heartbeat_puts_one_agent_per_line_in_aligned_columns(tmp_path):
     assert rows[1][2 + len(names[0]) + 1:].startswith("HARVESTING"), line
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-36: a turn that is still changing files extends its own deadline
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _churn_ws(tmp_path: Path, agent: str = "agent-a") -> Workspace:
     """`_make_repo` as a `Workspace`: what `_churn` and the turn's clock read."""
@@ -5188,8 +5016,7 @@ def test_churn_counts_files_and_lines_for_untracked_tracked_and_committed(tmp_pa
     _git(repo, "commit", "-q", "-m", "work")
     assert _runner_module._churn(ws) == (2, 5)
 
-    # `.smoke_tests/` is a link `sync_test_tiers.py` makes, not a turn: both
-    # numbers ignore it, and so does the heartbeat's files count
+    # .smoke_tests/ is a link made by sync_test_tiers.py, so neither count includes it.
     _write(repo / ".smoke_tests" / "x", "1\n2\n3\n4\n5\n")
     assert _runner_module._churn(ws) == (2, 5)
     assert _runner_module._worktree_files(ws) == 2
@@ -5396,8 +5223,7 @@ def test_a_growing_worktree_is_extended_once(tmp_path, caplog):
     (ext,) = run.turns[0]["extensions"]
     assert ext["files"] == 1 and ext["lines"] > 0 and ext["granted"] == 1, ext
     assert ext["at"] == pytest.approx(1.0, abs=0.6)
-    # the stall line names the last sample the deadline refused: the same
-    # file, grown by the time the extended deadline came due
+    # The stall line names the last sample refused by the deadline: the same file, grown.
     assert "(1 files," in run.last_error and "unchanged for" in run.last_error, \
         run.last_error
     (line,) = [l for l in _lines(caplog, "agent-a: WAITING") if " +" in l]
@@ -5423,30 +5249,19 @@ def test_growth_every_time_stops_at_turn_max_sec(tmp_path):
     assert (run.turns[0]["idle_at"] - run.turns[0]["sent_at"]) >= cfg.turn_max_sec - 0.5
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-48: an ended agent leaves no process in its worktree
-# ─────────────────────────────────────────────────────────────────────────────
 
-#: A grace far inside the 5 s default: a TERM that is honoured is honoured in
-#: milliseconds, so no test here waits out the grace.
+#: A short grace: a TERM that is honoured is honoured in milliseconds, so no test waits it out.
 _GRACE_SEC = 0.2
 
-# Both payloads print READY *after* their handler is installed, so a test can
-# wait for the child to be armed before the reap under test fires. Without the
-# gate a TERM that lands during Python's own start-up is honoured, and a child
-# meant to ignore SIGTERM dies by it.
+# Both payloads print READY after their handler is installed, so a test can wait until the child is armed.
 _READY = "sys.stderr.write('READY\\n'); sys.stderr.flush()\n"
 _KILL = "import signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n" \
         + _READY + "time.sleep(600)\n"
 _TERM = "import sys, time\n" + _READY + "time.sleep(600)\n"
 
 
-#: The holder a stray runs under: it starts the payload with its cwd where the
-#: test wants it, relays READY with the payload's pid, and prints its exit code.
-#: The holder's own cwd is `/`, outside every tree, so it is never a candidate;
-#: the payload is this process's *grandchild* — the round 86 shape, where the
-#: suites were no child of the runner — because the reap spares the runner's own
-#: children (the backend's agent loop, the harvest's judge).
+#: The holder a stray runs under: payload cwd set, READY relayed, exit code printed; the payload is a grandchild, as in round 86.
 _HOLDER = """
 import subprocess, sys
 p = subprocess.Popen([sys.executable, "-c", sys.argv[2]], cwd=sys.argv[1],
@@ -5628,8 +5443,7 @@ def test_the_rounds_end_reaps_every_worktree_on_ctrl_c(tmp_path, monkeypatch):
         return out
 
     def leak_and_interrupt(directory, text):
-        # agent-a's own reap is done: its session.json is written in the same
-        # `finally`, right after it, so it is out before this hook runs on
+        # The reap writes session.json in the same finally, so it is written before this hook runs.
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline and not (sb.out_dir / "agent-a.session.json").is_file():
             time.sleep(0.02)
@@ -5659,9 +5473,7 @@ def test_the_rounds_end_reaps_every_worktree_on_ctrl_c(tmp_path, monkeypatch):
 
     assert rcs == [-signal.SIGKILL, -signal.SIGKILL], rcs
     stray_a, stray_b = leaked
-    # the sweep ran in the main thread over both trees: agent-a's own reap had
-    # already returned, and agent-b never reached one of its own, so the round's
-    # exit is the only reap that could still reach either sleeper.
+    # The sweep runs over both trees in the main thread: agent-b never reached its own reap, so the exit is the only one that can.
     for tree, stray in ((ws_a, stray_a), (ws_b, stray_b)):
         sweeps = [c for c in calls if c[2] is main and c[1] == str(tree.path)]
         assert sweeps, calls
@@ -5771,9 +5583,7 @@ def test_two_runs_on_one_model_id_extend_on_their_own_churn(tmp_path):
     assert span(growing) > span(flat) + 1.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-65 — the agents' pytest worker count
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-65: the agents' pytest worker count
 
 def _eight_cores(monkeypatch) -> None:
     """`core_count` reads `os.cpu_count`; the rule is stated for an 8-core box."""
@@ -6070,9 +5880,7 @@ def test_the_agents_tmpdir_is_scratch_the_policy_allows(tmp_path):
     assert denied._completion_fn.calls == 1, "no dir, so the gate answers"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-66: the gate's 429 is the agent's time, granted back to the turn
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _RateLimitedGate:
     """A gate transport that 429s, waiting between its tries.
@@ -6202,9 +6010,7 @@ def test_the_gate_grant_leaves_the_churn_room_alone(tmp_path):
     assert clock.gate_added == 180.0 and clock.gate_attempts == 5
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-58: an agent's own full suite waits for a round-wide slot
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
 def _suite_slots_are_clean():
@@ -6340,8 +6146,7 @@ def test_two_agents_share_one_suite_slot(tmp_path, monkeypatch):
                         holding.get(_runner_module._path_of(worktree), set()))
     monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
     slots = _runner_module._SUITE_SLOTS
-    # both turns stay alive past the checks below — until the second reply is
-    # seen — where a fixed 20 s delay made the test sit out all 20 s of it
+    # Both turns stay alive until the second reply is seen, not for a fixed 20 s delay.
     release = threading.Event()
 
     with _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, hold=release,
@@ -6469,9 +6274,7 @@ def test_a_background_suite_holds_its_slot_until_its_process_exits(tmp_path, mon
     its pytest process runs in the worktree and releases it when the process
     exits. No `release` is called — the poll is what finds the process gone.
     """
-    # Names no run_agent of another test uses: a round test's agent thread that ends late releases its
-    # slot by name in its `finally` (`_SUITE_SLOTS` is module state), and under load an `agent-b` of an
-    # earlier test popped this test's waiter ("status None", a flake of the full suite on 8 cores).
+    # Names no run_agent of another test uses: a late agent thread releases its slot by name, so tests cannot pop each other's waiter.
     clock = _FakeClock()
     monkeypatch.setattr(_runner_module, "time", clock)
     monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
@@ -6498,8 +6301,7 @@ def test_a_background_suite_holds_its_slot_until_its_process_exits(tmp_path, mon
         assert entered["waited"] == pytest.approx(30.0, abs=1.0)
         # the hold is gone but the entry is not: only an explicit release drops it
         assert slots.status("kc58-holder") == ("done", 30.0, 0)
-        # agent-b holds the slot now; whether the poll has already noticed that
-        # no pytest is left is a timing question, not something this test owns
+        # Whether the poll has noticed that no pytest is left is a timing question, not this test's.
         second = slots.status("kc58-waiter")
         assert second[0] in ("running", "done") and second[2] == 0, second
     finally:
@@ -6513,9 +6315,7 @@ def test_a_holder_past_its_ceiling_stops_blocking_without_a_kill(tmp_path, monke
     the next waiter goes in beside it — and the holder's process is not
     signalled. The ceiling is a queue rule, not a kill.
     """
-    # Names no run_agent of another test uses: a round test's agent thread that ends late releases its
-    # slot by name in its `finally` (`_SUITE_SLOTS` is module state), and under load an `agent-b` of an
-    # earlier test popped this test's waiter ("status None", a flake of the full suite on 8 cores).
+    # Names no run_agent of another test uses: a late agent thread releases its slot by name, so tests cannot pop each other's waiter.
     clock = _FakeClock()
     monkeypatch.setattr(_runner_module, "time", clock)
     monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
@@ -6593,8 +6393,7 @@ def test_the_harvest_takes_a_suite_slot_too_and_gives_it_back(tmp_path, monkeypa
 
     def roots(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0,
               test_lock=None):
-        # KC-50: the real `harvest` takes the slot through `test_lock`, around
-        # the roots it runs
+        # KC-50: the real harvest takes the slot through test_lock around the roots it runs.
         with test_lock:
             got.update(run_tests=run_tests, budget=budget_sec, ahead=ahead)
         return harvest_module.Harvest(verdict="READY", reasons=(), commit=None, facts={},
@@ -6645,10 +6444,7 @@ def test_the_heartbeat_names_the_suite_queue_and_its_ceiling(tmp_path, monkeypat
     assert "(suite 16m, over the ceiling)" in line, line
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-81: the heartbeat names a silent kilo serve — once per silent spell, never
-# a kill, never an abort; state.json carries server_silent
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-81: the heartbeat names a silent kilo serve: once per silent spell, never a kill or an abort; state.json carries server_silent
 
 def _kilo_silent_harness(tmp_path, agents=("agent-a",), *, silent_sec=0.3, every=0.1,
                          log_path=True, server_pid=None, events_for=()):
@@ -6730,8 +6526,7 @@ def test_kilo_silent_warns_once_when_events_and_log_are_still(tmp_path, caplog):
     assert f"log idle since {idle_since}" in note, note
     assert "1 live agent without an event" in note, note
     assert "the server looks hung" in note and "--fresh" in note, note
-    # state.json has server_silent: the seconds the server has actually been
-    # silent (whole seconds, at least the window) and the pid
+    # state.json carries server_silent: the whole seconds the server was silent, and its pid.
     data = json.loads((sb.out_dir / "state.json").read_text(encoding="utf-8"))
     silent = data.get("server_silent")
     assert silent and silent["pid"] == os.getpid(), data
@@ -6739,8 +6534,7 @@ def test_kilo_silent_warns_once_when_events_and_log_are_still(tmp_path, caplog):
     assert silent["seconds"] >= int(hb.kilo_silent_sec), silent
     # reloaded round state keeps the key for `contest status`
     assert RoundState.from_dict(data).server_silent == silent
-    # the check never aborts: there is nothing here that could, and the state
-    # is still PROMPTED — no terminal state was forced on any session
+    # The check never aborts, so the state stays PROMPTED and no terminal state is forced.
     assert all(r.state is AgentState.PROMPTED for r in state.agents)
     assert hb.server_pid == os.getpid()
 
@@ -6773,11 +6567,7 @@ def test_kilo_silent_stays_quiet_while_the_log_grows(tmp_path, caplog):
     """KC-81: the same still events, but kilo-serve.log keeps growing — the
     server is fine, so no warning."""
     caplog.set_level(logging.WARNING, logger=LOGGER)
-    # A 2 s window, not 0.3 s: under a loaded box (three `pytest -n 8` runs of
-    # tests/) the writer thread below was starved past 0.3 s, the log read as
-    # still for one tick and the check warned ("kilo serve silent 0s"). The
-    # agent has no events.jsonl, so it reads idle since the round started
-    # (30 s ago) — the growing log is the only thing that keeps it quiet.
+    # A 2 s window, not 0.3 s, so a starved writer thread on a loaded box cannot read as silence; the growing log keeps it quiet.
     sb, hb, state, saved, log_file, restore = _kilo_silent_harness(
         tmp_path, silent_sec=2.0)
     stop = threading.Event()
@@ -6807,19 +6597,14 @@ def test_kilo_silent_stays_quiet_while_an_agent_gets_events(tmp_path, caplog):
     """KC-81: one live agent keeps receiving events — the log side alone never
     warns; a quiet agent among busy ones is the stall logic's business."""
     caplog.set_level(logging.WARNING, logger=LOGGER)
-    # A 2 s window, not 0.3 s: under three concurrent `pytest -n 8` runs the
-    # writer thread below was starved past a 0.3 s window and the busy agent
-    # read as silent ("kilo serve silent 0s"). The still sides are backdated a
-    # minute so the window stays the only thing between quiet and a warning.
+    # A 2 s window, not 0.3 s, for the same starvation reason; the still sides are backdated so the window is the only thing between quiet and a warning.
     sb, hb, state, saved, log_file, restore = _kilo_silent_harness(
         tmp_path, agents=("agent-a", "agent-b"), events_for=("agent-b",),
         silent_sec=2.0)
     old = time.time() - 60
     os.utime(log_file, (old, old))
     os.utime(sb.out_dir / "agent-b" / "events.jsonl", (old, old))
-    # agent-b already has an events.jsonl; keep appending to agent-a's instead.
-    # It exists before the heartbeat starts: an absent file reads as idle since
-    # the round started, so a first tick ahead of the writer would warn.
+    # agent-b already has an events.jsonl; keep appending to agent-a's instead, since an absent file reads as idle.
     busy = sb.out_dir / "agent-a" / "events.jsonl"
     busy.parent.mkdir(parents=True, exist_ok=True)
     busy.write_text('{"t": %s, "event": {"type": "busy"}}\n' % time.time(), encoding="utf-8")
@@ -6865,8 +6650,7 @@ def test_kilo_silent_warns_again_after_a_second_spell(tmp_path, caplog):
         _runner_module._worktree_files, _runner_module._commits_above = restore
     warns = _silent_warnings(caplog)
     assert len(warns) == 2, warns
-    # the same server, the same log; only how long it was silent and the cpu of
-    # that interval differ between the two spells
+    # Same server and log; only the silent time and the cpu of that interval differ.
     def shape(w):
         return re.sub(r"cpu \S+,", "cpu N,", re.sub(r"silent \S+:", "silent N:", w))
     assert shape(warns[0]) == shape(warns[1]), warns
@@ -7134,9 +6918,7 @@ def test_unchanged_for_counts_from_the_last_sample_that_differed(tmp_path):
                       turn_max_sec=14400, idle_event_timeout_sec=0)
     clock = _runner_module._turn_deadline(AgentRun(agent=cfg.agents[0], workspace=ws), cfg)
     _write(ws.path / "pkg" / "a.py", "x\n" * 100)
-    # the sample counts the diff against the base file, so 100 lines written
-    # is 101 changed: 100 added and the base line deleted. The numbers here are
-    # churn, not file sizes.
+    # The sample counts the diff against the base file: 100 lines written is 101 changed (100 added, base line deleted).
     assert clock.on_deadline(600.0) == 600              # granted: 1 file / 101 lines
     _write(ws.path / "pkg" / "a.py", "x\n" * 99)        # churn down to 100
     assert clock.on_deadline(1200.0) is None            # refused: no growth, no edit
@@ -7293,8 +7075,7 @@ def test_the_suite_wait_is_granted_back_and_the_silence_clock_runs_from_the_repl
         assert run.state is AgentState.READY, run.last_error
         turns = [json.loads(line) for line in
                  (sb.out_dir / names[0] / "turns.jsonl").read_text().splitlines()]
-        # the turn idled on its own — not a silence stall that the harvest
-        # happened to rescue because the work was already committed
+        # The turn idled on its own, not through a silence stall the harvest rescued.
         assert turns[0]["idle_status"] == "idle", turns[0]
         assert turns[0]["suite_wait_sec"] >= 2, turns[0]
     finally:
@@ -7392,10 +7173,7 @@ def test_the_harvest_does_not_count_against_agent_max_sec(tmp_path, monkeypatch)
     assert len(calls) == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-10 — the fill is read before every prompt, and at 80 % of a model the
-#          provider declares no limit for, the session is compacted
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-10: the fill is read before every prompt, and a session at 80% of a model with no declared limit is compacted
 
 #: The fallback window `contest.ini` ships: a 32k-context free tier.
 FALLBACK = 32768
@@ -7652,15 +7430,9 @@ def test_the_state_shows_the_sessions_a_run_has_opened(tmp_path):
     assert cells[columns.index("sessions")] == "2"
 
 
-# ═════════════════════════════════════════════════════════════════════════════
 # KC-42: an agent that has touched no file is nudged, then reset, then DEAD
-# ═════════════════════════════════════════════════════════════════════════════
 
-#: A turn that emits `busy` forever and writes nothing — round 64's
-#: `nex-n2-5-pro`: never silent, so the silence clock never fires; busy, so
-#: KC-9's continue never runs; and nothing on disk, so there is no diff for
-#: KC-39 to compare. The `idle: False` is what keeps the turn alive past its
-#: scripted events.
+#: A turn that emits busy forever and writes nothing (round 64's nex-n2-5-pro): no silence, no continue, no diff; idle False keeps it alive.
 NEVER_TOUCHES = {"events": ["busy"], "idle": False}
 
 
@@ -7689,9 +7461,7 @@ def test_first_touch_nudge_reset_and_dead(tmp_path, monkeypatch):
     and is `DEAD` at the third — one nudge, one reset, one dead end, all three
     recorded in `turns.jsonl`."""
     _fast_poll(monkeypatch)
-    # `abort_idles` is the live server's answer to an abort: the turn ends and
-    # the wait comes back, which is what lets the reset and the DEAD land
-    # instead of the wait sitting out the turn deadline.
+    # abort_idles is the live server's answer to an abort: the turn ends and the wait comes back at once.
     scenario = {"abort_idles": True, "turns": [dict(NEVER_TOUCHES)] * 4}
     sb = Sandbox(tmp_path)
     cfg = _ft_config()
@@ -7715,9 +7485,7 @@ def test_first_touch_nudge_reset_and_dead(tmp_path, monkeypatch):
     assert sb.base_sha in prompts[2][1]
 
     rows = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
-    # the attempt's budget is per attempt, so the fresh session does not get a
-    # second nudge: nudge, reset, DEAD — two turns, the second one in the new
-    # session, and the second session is never prompted at all
+    # The attempt's budget is per attempt, so the fresh session gets no second nudge: nudge, reset, DEAD.
     assert len(rows) == 2
     first, second = rows
     assert first["first_touch_nudges"] == 1 and first["first_touch_reset"] == 1
@@ -7773,8 +7541,7 @@ def test_a_touch_after_a_nudge_ends_the_escalation(tmp_path, monkeypatch):
     _fast_poll(monkeypatch)
     sb = Sandbox(tmp_path)
     cfg = _ft_config()
-    # turn 0 chats and writes nothing, so the nudge is sent into it; the nudge
-    # itself is turn 1, and it is turn 1 that answers by doing the ticket
+    # Turn 0 writes nothing, so the nudge is sent into it and turn 1 does the ticket.
     scenario = {"turns": [
         {"events": ["busy"], "idle": False},
         {"on_prompt": work_ready, "events": ["busy", "idle"]},
@@ -7897,8 +7664,7 @@ def test_a_dead_agent_is_not_harvested_and_never_holds_the_round(tmp_path, monke
     dead_turns = runs["agent-a"].turns
     assert dead_turns and not any("harvest" in t for t in dead_turns)
     assert runs["agent-a"].commit is None
-    # nothing exported for it: no patch (no commit) and no `.diff` (DEAD is not
-    # one of the states whose tree is read for one — there is nothing in it)
+    # Nothing is exported for it: no patch and no .diff, since DEAD is not a state that exports one.
     assert not [p for p in patches if p.name.startswith("agent-a")]
     assert _commits(sb.ws("agent-a").path) == 0
 
@@ -7968,9 +7734,7 @@ def test_a_tree_that_cannot_be_read_is_not_a_dead_end(tmp_path, monkeypatch):
             fake.sessions()[-1].id, 0.2, 60)
         run = Harness(sb, fake, cfg).go()
     assert run.state is not AgentState.DEAD, (run.state, run.last_error)
-    # the watch did its work — it read the tree, found nothing, and nudged — and
-    # the turn still ended where the ordinary edges take it, on a harvest whose
-    # own read of the same tree failed the same way
+    # The watch read the tree, found nothing and nudged; the turn then ended on a harvest whose own read failed the same way.
     assert run.state is AgentState.GAVE_UP
     assert run.turns[-1]["harvest"]["verdict"] != "READY"
 
@@ -8005,8 +7769,7 @@ def test_the_nudge_names_the_files_the_ticket_declares():
     assert "Nothing has been modified" in text
     # the elapsed the watch measured, not the ticket's text
     assert "7m" in text
-    # no critique: the runner cannot tell a reading agent from a wedged one, so
-    # it says the state and the files and nothing about the effort
+    # The runner says the state and the files, and nothing about the effort.
     assert "no commit made" in text
     assert "the turn's clock is running" in text
     assert "idle" not in text and "stalled" not in text.lower()
@@ -8014,9 +7777,7 @@ def test_the_nudge_names_the_files_the_ticket_declares():
     assert "- (" in bare and "Nothing has been modified" in bare
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-50: a mechanical harvest never waits behind another agent's roots
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize("slots", [1, 0])
@@ -8064,9 +7825,7 @@ def test_kc50_a_mechanical_harvest_does_not_wait_behind_anothers_roots(
     assert _runner_module._TEST_RUNS_LOCK.status("agent-b") is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-43: legs — a relay of whole turns in one worktree
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-43: legs: a relay of whole turns in one worktree
 
 
 def _leg_run(sb, name="agent-a", **fields) -> AgentRun:
@@ -8243,9 +8002,7 @@ def test_run_round_is_run_leg_with_no_leg_number(tmp_path):
                 resume=state)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-75: an empty turn after a provider 4xx/5xx is retried on its own budget
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-75: an empty turn after a provider 4xx or 5xx is retried on its own budget
 
 def test_a_silent_turn_after_a_provider_error_does_not_spend_a_continue(tmp_path):
     """Round 120: a free model rate-limited by the provider ends its turn empty.
@@ -8344,13 +8101,10 @@ def test_the_idle_before_a_queued_nudge_is_not_the_nudges_turn(tmp_path, monkeyp
     assert len(_prompts(fake)) == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-74: the record carries the tests, the last word, the summary, what is left
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-74: the record carries the tests, the last word, the summary, and what is left
 
 
-#: KC-74: the red root the ticket describes — one failure, its short-summary row
-#: with the node id, and the stats line with both counts.
+#: KC-74: the red root the ticket describes: one failure, its summary row and the stats line.
 _REDFIXTURE = ("FAILED tests/test_thing.py::test_red - AssertionError: assert 42 == 40\n"
                "==== 1 failed, 41 passed in 2.34s ====\n")
 
@@ -8568,8 +8322,7 @@ def test_the_turn_keeps_the_roots_and_the_last_words_for_the_record(tmp_path, mo
     monkeypatch.setattr(harvest_module, "run_tests_detail",
                         lambda cwd, **kw: ("tests:1✗ tests_bugfix:absent", []))
     ws = sb.ws("agent-a")
-    # a test file, so the judge runs the suite — the harvest skips roots it has
-    # nowhere to run them in
+    # A test file makes the judge run the suite, since the harvest has no roots to run it in.
     _work(str(ws.path), test=True, claim=True)
     assistant = "the change is in pkg/thing.py; the red test is tests/test_thing.py::test_red"
     config = make_config(["agent-a"], max_rework=0)

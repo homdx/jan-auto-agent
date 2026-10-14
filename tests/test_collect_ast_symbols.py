@@ -144,16 +144,7 @@ def test_extract_all_defined_names_excludes_fabricated_name():
 
 
 def test_extract_all_defined_names_excludes_function_local_variables():
-    # BUGFIX (found via adversarial review of the first version of this
-    # function): `ast.walk` visits every node regardless of enclosing
-    # scope, so an ordinary local variable assigned inside a function body
-    # — completely unrelated to anything citable via `module.py:name`
-    # syntax — was being added to this set the same as a module-level
-    # constant. In a module of any real size, generic local-variable names
-    # (`result`, `data`, `ctx`, ...) are close to guaranteed to collide
-    # with *something*, silently excusing a large class of fabricated
-    # `path.py:identifier` citations that happen to reuse one of those
-    # names — reopening exactly the hole this function exists to close.
+    # Regression: function locals are not citable module-level names.
     source = (
         "def unrelated_helper():\n"
         "    result = compute()\n"
@@ -180,13 +171,7 @@ def test_extract_all_defined_names_keeps_class_body_attributes_but_not_method_lo
 
 
 def test_extract_all_defined_names_keeps_attrs_of_a_function_local_class():
-    # BUGFIX: found via review of the local-variable fix above. A class
-    # statement's own body is always its own scope (attributes are real,
-    # citable names) regardless of what *encloses* the `class` statement
-    # — including a function. Before this fix, a class defined inside a
-    # function inherited that function's "local, non-citable" scope for
-    # its own body, so `Local.ATTR` was wrongly excluded the same as an
-    # ordinary local variable, even though it's a genuine class attribute.
+    # Regression: a class's own attributes stay citable inside a function.
     source = (
         "def f():\n"
         "    class Local:\n"
@@ -206,8 +191,7 @@ def test_extract_all_defined_names_keeps_attrs_of_a_function_local_class():
 
 
 def test_extract_all_defined_names_broader_than_public_symbols():
-    # The whole point of this function: it must see names `extract_symbols`
-    # (COLLECT-4's public-surface index) deliberately doesn't track.
+    # Must see names that extract_symbols (COLLECT-4) does not track.
     source = (
         "MAX_RETRIES = 3\n"
         "\n"

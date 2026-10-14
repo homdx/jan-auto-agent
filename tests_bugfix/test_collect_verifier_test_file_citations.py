@@ -72,8 +72,7 @@ def test_test_file_citing_a_module_it_does_not_import_still_drops():
 
 
 def test_non_test_module_citing_its_own_import_still_drops():
-    # "Non-test rules unchanged": a shipped module importing pkg.widget may
-    # still not cite widget_helper — Pass B never saw pkg/widget.py.
+    # Non-test rules unchanged: a shipped module importing pkg.widget may not cite its symbols.
     consumer = _module("pkg/consumer.py", "import pkg.widget\n",
                        "Calls widget_helper from its dependency.")
     purpose, report = _run([consumer, _module("pkg/widget.py", TARGET_SRC)])
@@ -82,8 +81,7 @@ def test_non_test_module_citing_its_own_import_still_drops():
 
 
 def test_a_shipped_module_named_like_a_test_is_not_widened():
-    # tools/collect/test_map.py is shipped code in this repo (L5): the ticket's
-    # literal "test_*.py anywhere" would relax Pass C for it — it must not.
+    # Shipped code named like a test file (tools/test_map.py) must not be widened.
     shipped = _module("tools/test_map.py", "import pkg.widget\n",
                       "Wraps widget_helper for the map.")
     purpose, _ = _run([shipped, _module("pkg/widget.py", TARGET_SRC)])
@@ -99,8 +97,7 @@ def test_conftest_and_every_test_root_are_test_code():
 
 
 def test_a_line_citation_into_an_imported_module_still_drops():
-    # The widening is for symbols only: a test never read pkg/widget.py's
-    # line numbers, Pass B was not shown them either.
+    # Widening is for symbols only: a test never sees line numbers from an imported module.
     test = _module("tests/test_widget.py", "import pkg.widget\n",
                    "Asserts on pkg/widget.py:1 behaviour.")
     purpose, report = _run([test, _module("pkg/widget.py", TARGET_SRC)])

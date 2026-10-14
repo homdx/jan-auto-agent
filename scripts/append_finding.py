@@ -59,10 +59,7 @@ def main():
             return 1
         out = f"validation-v{row['variant']}-{a['reviewer'].strip().lower()}.csv"
 
-    # One reviewer, one file. A model that writes Kilo.csv on one call and
-    # kilo.csv on the next splits its own work in half and defeats the dedupe,
-    # which is per-file — so refuse the second spelling rather than silently
-    # starting a rival file.
+    # One reviewer, one file. Two spellings (Kilo.csv and kilo.csv) would split one reviewer's work and defeat the per-file dedupe, so refuse the second spelling.
     d, base = os.path.dirname(out) or ".", os.path.basename(out)
     if os.path.isdir(d):
         twins = [f for f in os.listdir(d)
@@ -86,12 +83,7 @@ def main():
         problems.append("--file is required — a finding with no location cannot be checked")
     elif not a.get("allow_missing_file") and not os.path.exists(
             os.path.join(a.get("repo_root") or ".", row["file"])):
-        # A reviewer that has not opened the file can still satisfy a non-empty
-        # --file by typing something. glm-4.5-flash filled 13 of its 45 rows with
-        # "tools/auto/x.py", which does not exist: those rows grouped under a
-        # path nobody else used, so they read as solo discoveries instead of
-        # merging with everyone else's verdict on the same symbol. A finding is
-        # about live code, so the path has to resolve.
+        # A reviewer can type any path for --file. Rows must name an existing file, or they group under a path nobody else used and look like solo discoveries.
         problems.append(f"--file {row['file']!r} does not exist under "
                         f"{a.get('repo_root') or '.'!r} — "
                         f"a finding is about live code, so give the real path you read "

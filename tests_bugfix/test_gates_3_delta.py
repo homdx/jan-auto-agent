@@ -64,9 +64,7 @@ def validator() -> DeltaValidator:
     return DeltaValidator()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # The observed defect
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_byte_identical_content_is_rejected(validator, repo):
     committed = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -102,9 +100,7 @@ def test_trivial_whitespace_only_difference_still_rejected(validator, repo):
     assert verdict.approved is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fail-open — nothing here may look like a no-op by accident
-# ─────────────────────────────────────────────────────────────────────────────
+# Fail open: nothing here may look like a no-op by accident
 
 def test_brand_new_file_is_approved(validator, repo):
     """The primary Creative.MD workflow: target doesn't exist at HEAD yet.
@@ -137,9 +133,7 @@ def test_empty_rel_path_fails_open(validator, repo):
     assert validator.check("anything", repo, rel_path="").approved is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Feedback / verdict shape
-# ─────────────────────────────────────────────────────────────────────────────
+# Feedback and verdict shape
 
 def test_feedback_names_the_file_and_is_actionable(validator, repo):
     committed = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -157,9 +151,7 @@ def test_verdict_is_the_dataclass_gate_registry_expects():
     assert hasattr(v, "approved")  # _rejected_by_approved reads this
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # No LLM, ever
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_check_makes_no_network_call(validator, repo, monkeypatch):
     """Pinned for the same reason existence_validator pins it: 'make it
@@ -176,9 +168,7 @@ def test_check_makes_no_network_call(validator, repo, monkeypatch):
     validator.check(committed, repo, rel_path="CHANGELOG.md")  # must not raise
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# make_delta_validator — factory / config
-# ─────────────────────────────────────────────────────────────────────────────
+# make_delta_validator: factory and config
 
 def _cfg(text: str = "") -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
@@ -211,9 +201,7 @@ def test_non_boolean_delta_check_enables_rather_than_crashes():
     assert make_delta_validator(cfg) is not None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Registry wiring — resolve_gate_order / GATES_BY_NAME
-# ─────────────────────────────────────────────────────────────────────────────
+# Registry wiring: resolve_gate_order and GATES_BY_NAME
 
 def test_delta_is_registered():
     assert "delta" in GATES_BY_NAME
@@ -259,9 +247,7 @@ def test_explicit_gates_list_can_still_omit_delta():
     assert [s.name for s in resolve_gate_order(cfg, "creative")] == ["canon", "fact"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# run_gates() — proves delta actually blocks the pipeline, before the LLM gates
-# ─────────────────────────────────────────────────────────────────────────────
+# run_gates(): delta blocks the pipeline before the LLM gates
 
 class _StubVerdict:
     def __init__(self, approved: bool, text: str = "problem"):
@@ -366,9 +352,7 @@ def test_delta_accepts_at_cap_after_repeated_no_op(repo):
     assert second is None  # accepted at cap, still unchanged on disk
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UnicodeDecodeError — file at HEAD with non-UTF-8 bytes
-# ─────────────────────────────────────────────────────────────────────────────
+# UnicodeDecodeError: a file at HEAD with non-UTF-8 bytes
 
 def test_non_utf8_file_at_head_does_not_crash(validator, tmp_path):
     """A file committed with non-UTF-8 bytes (e.g. latin-1 encoded) must
@@ -379,8 +363,7 @@ def test_non_utf8_file_at_head_does_not_crash(validator, tmp_path):
     _git("init", cwd=tmp_path)
     _git("config", "user.email", "test@example.com", cwd=tmp_path)
     _git("config", "user.name", "Test", cwd=tmp_path)
-    # Write a file with non-UTF-8 bytes (latin-1: 0xe9 = 'é' in latin-1,
-    # but an invalid standalone byte in UTF-8).
+    # Writes non-UTF-8 bytes: 0xe9 is a valid latin-1 character but not valid UTF-8.
     (tmp_path / "data.txt").write_bytes(b"caf\xe9: non-utf-8 content\n")
     _git("add", ".", cwd=tmp_path)
     _git("commit", "-m", "init", cwd=tmp_path)

@@ -30,10 +30,7 @@ class Anchor:
     text: str   # "Policy._mechanical", "tools/contest/gates.py", "a73e389"
     start: int
     end: int
-    #: a path's longer readings when words with single spaces stand before it (`my file.py` was
-    #: anchored as `file.py`): ``((start, text, quoted), …)``, longest first, each ending at
-    #: ``end``. Resolution takes one only when the repository has that file (`_resolve_path`);
-    #: not part of equality, so an anchor compares as it always did.
+    #: Longer readings of a path with spaces, longest first; resolution uses one only when the file exists. Not part of equality.
     wider: tuple = field(default=(), compare=False, repr=False)
 
 

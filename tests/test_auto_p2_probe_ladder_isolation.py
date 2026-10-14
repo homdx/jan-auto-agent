@@ -60,9 +60,7 @@ from tools.auto.architect import ClusterReviewer
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared fixtures — mirror test_auto_h5_empty_response_retry.py
-# ─────────────────────────────────────────────────────────────────────────────
+# Shared fixtures (as in test_auto_h5_empty_response_retry.py)
 
 def _cfg(**architect_overrides: str) -> configparser.ConfigParser:
     c = configparser.ConfigParser()
@@ -168,9 +166,7 @@ def _fake_parser(ops):
     return _parse
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-P2-1 / AC-P2-2 — a probe consumes neither ladder's budget
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-P2-1 / AC-P2-2: a probe consumes neither ladder's budget
 
 class TestProbeDoesNotConsumeLadderRetries:
 
@@ -245,9 +241,7 @@ class TestProbeDoesNotConsumeLadderRetries:
         assert mock_llm.call_count == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-P2-3 / AC-P2-7 / AC-P2-8 — when a reply is NOT a probe
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-P2-3 / 7 / 8: a reply that is not a probe
 
 class TestNonProbeRepliesAreUnaffected:
 
@@ -327,9 +321,7 @@ class TestNonProbeRepliesAreUnaffected:
         assert arch_probe.extract_probe_request("") == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-P2-4 / AC-P2-5 / AC-P2-6 — regression net for the 4-tuple change
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-P2-4 / 5 / 6: regression net for the 4-tuple change
 
 class TestExistingLaddersStillWork:
     """Deliberate overlap with test_auto_h4/h5_*.py — see module docstring."""
@@ -400,9 +392,7 @@ class TestExistingLaddersStillWork:
         assert out is None, "a failed call must stay distinguishable from 0 candidates"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-P2-9 — a probe reply that also carried usable tasks
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-P2-9: a probe reply that also carries usable tasks
 
 def test_probe_reply_keeps_salvaged_candidates(
     cfg, cluster_and_base, monkeypatch

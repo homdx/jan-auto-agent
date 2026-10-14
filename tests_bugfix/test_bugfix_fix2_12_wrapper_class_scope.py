@@ -52,9 +52,7 @@ def _note(source: str, symbol: str, instruction: str = INSTRUCTION):
 
 # ── the reported defect ──────────────────────────────────────────────────────
 
-# The guarded, unrelated class is deliberately FIRST: re.search() returns the
-# earliest match in the file, so with the order reversed the old code picked
-# the correct wrapper by luck and the bug stays invisible.
+# The unrelated guarded class comes first: with the order reversed, the old code would pass by luck.
 TWO_CLASSES = '''\
 class Unrelated:
     def _read_int(self, s, k):

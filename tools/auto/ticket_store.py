@@ -68,12 +68,7 @@ logger = logging.getLogger(__name__)
 # ── Valid field values ────────────────────────────────────────────────────────
 
 TICKET_TYPES   = {"bug", "investigation"}
-# "verification-failed" is terminal-but-loud: a fix was recorded as passing and
-# committed, yet the acceptance check fails again on a later re-check. The
-# recorded fix did not hold, so neither "fixed" (a lie — the run would report
-# green over a broken check) nor "deferred" (implies the agent gave up while
-# trying, not that it wrongly believed it had succeeded) describes it. An
-# operator resets it to "open" to allow another attempt.
+# "verification-failed": a recorded fix whose check fails again later; it is neither fixed nor deferred, so an operator resets it.
 TICKET_STATUSES = {"open", "in-progress", "fixed", "deferred",
                    "verification-failed"}
 
@@ -91,9 +86,7 @@ _REQUIRED: dict[str, type] = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Exceptions
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TicketError(RuntimeError):
     """Base class for TicketStore errors."""
@@ -111,9 +104,7 @@ class TicketSchemaError(TicketError):
     """Raised when a ticket dict violates the schema."""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Schema helper
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_ticket(
     id: str,    # noqa: A002 — matches ticket schema field; builtin not used here.
@@ -193,9 +184,7 @@ def _validate(ticket: dict) -> None:
         raise TicketSchemaError("'title' must be a non-empty string")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # TicketStore
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TicketStore:
     """Manages ticket persistence under *tickets_dir*.
@@ -237,24 +226,16 @@ class TicketStore:
             raise TicketAlreadyExists(
                 f"Ticket '{ticket['id']}' already exists at {path}"
             )
-        # AUTO-T37 FIX: _ensure_dir() (mkdir) can raise OSError on permission
-        # errors or read-only file systems.  Convert to TicketError so callers
-        # get a domain exception rather than a raw OS error — and can catch it
-        # alongside TicketAlreadyExists without also swallowing unrelated errors.
+        # Directory creation errors become a TicketError, so callers catch one domain exception (AUTO-T37).
         try:
             self._ensure_dir()
         except OSError as exc:
             raise TicketError(
                 f"Could not create ticket directory '{self._dir}': {exc}"
             ) from exc
-        # BUGFIX (audit): _write() itself was unguarded here — a disk-full
-        # or permission error raised a raw OSError past this method's own
-        # documented Raises: (TicketSchemaError, TicketAlreadyExists),
-        # inconsistent with the _ensure_dir() conversion right above it.
+        # A write failure is converted to a documented error, not a raw OSError (BUGFIX).
         try:
-            # exclusive: the exists() check above is only a fast path — two
-            # racing creates of one id both pass it, and a plain replace let
-            # the second silently overwrite the first.
+            # An exclusive create stops two racing creates of one id from overwriting each other.
             self._write(path, ticket, exclusive=True)
         except FileExistsError as exc:
             raise TicketAlreadyExists(
@@ -307,15 +288,7 @@ class TicketStore:
                 path, f"expected a JSON object, got {type(ticket).__name__}"
             )
             return None
-        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): a dict
-        # missing required fields (id/type/status/linked_task — the same
-        # schema make_ticket() always produces) used to pass through
-        # untouched. Callers that trust get()'s return shape (e.g.
-        # indexing ticket["status"] directly) would then crash far from
-        # here with no indication the ticket file itself was incomplete.
-        # Quarantine it the same way an unreadable or wrong-shape file
-        # already is, rather than handing back a ticket-shaped dict that
-        # isn't actually one.
+        # A ticket missing a required field is quarantined like an unreadable file, so callers do not get a wrong shape (AUTO-FIX).
         _required_ticket_keys = {"id", "type", "status", "linked_task"}
         _missing = _required_ticket_keys - ticket.keys()
         if _missing:
@@ -343,20 +316,7 @@ class TicketStore:
         two ordinary back-to-back calls, no mocking required.  A numeric
         suffix disambiguates so neither call's evidence is destroyed.
         """
-        # FIX-1 #8 (second half): this stamp was on the LOCAL clock while
-        # this module's own schema (lines 16-17) records created_at /
-        # updated_at as ISO-8601 UTC via _ts(). Fixing only _ts() would
-        # leave a quarantine copy named in local time sitting beside the
-        # very ticket fields it belongs to, with nothing on either name to
-        # say which clock it came from -- the exact confusion _ts() was
-        # fixed to remove, just moved into the filename. Same instant, same
-        # "Z" marker, filename-safe formatting.
-        #
-        # Guarded via the module-level `datetime` symbol rather than a
-        # shared helper in utils: tests_bugfix/test_ticket_store_corrupt.py
-        # freezes the clock with monkeypatch.setattr(ticket_store,
-        # "datetime", ...), and routing this through utils would silently
-        # make those four collision tests unfreezable.
+        # Quarantine stamps use UTC, the same clock as the ticket fields; tests freeze this module's datetime (FIX-1 #8).
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         dest  = path.with_suffix(f".json.corrupt-{stamp}")
         suffix_n = 0
@@ -388,14 +348,7 @@ class TicketStore:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("TicketStore.list_all: skipping %s — %s", p.name, exc)
                 continue
-            # AUTO-FIX: _read() only does json.loads — a file that is
-            # valid JSON of the wrong shape (a list, a string) used to
-            # pass this try/except (no exception raised) and get appended
-            # as-is, then blow up AttributeError on the .sort() below,
-            # which every non-dict entry reaches regardless of its own
-            # position in the glob. get() already treats this exact case
-            # ("expected a JSON object, got <type>") as unusable; skip it
-            # here too instead of contradicting get()'s quarantine design.
+            # A file that is JSON of the wrong shape is skipped, as get() already does (AUTO-FIX).
             if not isinstance(ticket, dict):
                 logger.warning(
                     "TicketStore.list_all: skipping %s — expected a JSON "
@@ -484,12 +437,7 @@ class TicketStore:
             raise TicketSchemaError(
                 f"Ticket '{ticket_id}' is corrupt ({exc}) — quarantined"
             ) from exc
-        # AUTO-FIX: a file that is valid JSON of the wrong shape (a list,
-        # a string) used to reach ticket.update(fields) below and raise a
-        # raw AttributeError. get() already quarantines this exact case;
-        # do the same here and raise the TicketSchemaError this method's
-        # own docstring already documents, instead of an undocumented
-        # AttributeError leaking out of an internal implementation detail.
+        # A wrong-shape file raises the documented schema error, not an attribute error (AUTO-FIX).
         if not isinstance(ticket, dict):
             self._quarantine(
                 path, f"expected a JSON object, got {type(ticket).__name__}"
@@ -504,12 +452,7 @@ class TicketStore:
         ticket.update(fields)
         ticket["updated_at"] = _ts()
         _validate(ticket)
-        # BUGFIX: create() wraps _write() in try/except OSError and re-raises
-        # as TicketError (AUTO-T37). update() did not — a disk-full,
-        # permission-denied, or read-only-filesystem failure from
-        # atomic_write_text() propagated as a raw OSError past this method's
-        # own docstring (which only lists TicketNotFound and
-        # TicketSchemaError), inconsistent with create()'s established contract.
+        # Update converts write failures to TicketError, as create does (AUTO-T37, BUGFIX).
         try:
             self._write(path, ticket)
         except OSError as exc:
@@ -530,18 +473,7 @@ class TicketStore:
             already absent (no-op — never raises).
         """
         path = self._path(ticket_id)
-        # B5: do NOT precede the unlink with an exists() check. The two are
-        # separate syscalls, and a concurrent cleanup (a second run sharing
-        # this .agent/, a ticket sweep, a manual rm) can remove the file in
-        # between. A bare unlink() then raised FileNotFoundError out of a
-        # method documented as "no-op if already absent (never raises)".
-        #
-        # unlink(missing_ok=True) after an exists() check would absorb the
-        # exception but still return True for a file this call did not
-        # remove. Letting the unlink itself be the single source of truth
-        # keeps both halves of the contract honest: the file was either there
-        # and is now gone (True), or it was already absent (False). Other
-        # errors (PermissionError, IsADirectoryError) still propagate.
+        # Delete ignores a file that is already gone, using the unlink itself as the check, so a race cannot raise (B5).
         try:
             path.unlink()
         except FileNotFoundError:
@@ -562,12 +494,7 @@ class TicketStore:
     # ── Private ──────────────────────────────────────────────────────────────
 
     def _path(self, ticket_id: str) -> Path:
-        # Bugfix: ticket ids are typically system-generated (e.g.
-        # "TICKET-AUTO-T1", "BUG-FIX-AUTO-T1") so this was not previously
-        # exploitable, but unlike state.py's task directories (which have
-        # always sanitized task_id via _safe_task_id) this path was built
-        # straight from the raw id with no defense if that ever changes —
-        # a ticket id containing ".." or "/" could escape self._dir.
+        # Ticket ids are sanitised in the file name, so an id with ".." or "/" cannot leave the ticket directory (bugfix).
         return self._dir / f"{safe_filename_component(ticket_id)}.json"
 
     def _ensure_dir(self) -> None:
@@ -575,13 +502,7 @@ class TicketStore:
 
     @staticmethod
     def _read(path: Path) -> Any:
-        # B10: this is json.loads, so it returns whatever the file holds. The
-        # class only ever WRITES an object, but a hand-edited file, a restored
-        # backup or an older format can leave a list, a scalar or null behind.
-        # Any, not "dict | list": narrowing to two container types would still
-        # be a lie about the other three. Every caller (get(), list_all(),
-        # update()) already isinstance-checks the result; the annotation was
-        # the only thing claiming they did not have to.
+        # A ticket file may hold any JSON value; callers check the shape they get (B10).
         return json.loads(path.read_text(encoding="utf-8"))
 
     @staticmethod
@@ -593,9 +514,7 @@ class TicketStore:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_ticket_store(agent_dir: str | Path) -> TicketStore:
     """Return a :class:`TicketStore` rooted at ``<agent_dir>/tickets/``.
@@ -610,6 +529,4 @@ def make_ticket_store(agent_dir: str | Path) -> TicketStore:
     return TicketStore(Path(agent_dir) / "tickets")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────

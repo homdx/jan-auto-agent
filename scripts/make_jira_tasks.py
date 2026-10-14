@@ -78,17 +78,7 @@ def main():
 
     with open(a.truth, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
         truth_rows = list(csv.DictReader(fh))
-    # The same defect often gets reported at several symbols — the constant, the
-    # constructor that binds it, the attribute it lands on. Those are one bug and
-    # one ticket. A `duplicate_of` column naming the canonical finding folds the
-    # aliases in rather than filing the same work three times.
-    # An alias is folded into the row its `duplicate_of` chain ends in. A chain that ends
-    # in a name that is not a REAL row (missing, mistyped, FALSE) or that loops back on
-    # itself has no canonical row to fold into: its aliases are one bug all the same, so
-    # the first of them is the ticket and the rest fold into it. A defect is never
-    # dropped for naming a bad canonical.
-    # a claim-check row of a world claim (how = "world fact", CC-8) says a fact about the world
-    # is true, not that the code has a defect: "Python was created by Guido" was filed as one
+    # Aliases fold into their canonical row; a world-fact claim (CC-8) is not filed as a code defect.
     world = [r for r in truth_rows if is_world_fact(r.get("how"))]
     if world:
         print(f"skipped {len(world)} world-fact row(s): a true fact is not a defect", file=sys.stderr)
@@ -162,8 +152,7 @@ def main():
 
         if longest(both, "repro"):
             T += ["## Reproduction\n", "```", longest(both, "repro"), "```\n"]
-        # Prefer a stage-3 adjudicator's write-up; fall back to the one-line
-        # `how` recorded straight in truth.csv when no truth-*.csv was supplied.
+        # Prefer a stage-3 adjudicator's write-up; fall back to the one-line `how` in truth.csv when no truth-*.csv was supplied.
         how = longest(v, "how") or (row.get("how") or "").strip()
         if how:
             T += ["## How it was verified\n", how + "\n"]

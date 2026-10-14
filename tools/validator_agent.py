@@ -26,9 +26,7 @@ def _safe_stdout_write(t: str) -> None:
     except (BrokenPipeError, OSError):
         pass
 
-# Hardcoded prompt extracted to a named module-level constant — the canonical
-# fallback PromptStore can always return to. Runtime values are injected via
-# .format() in validate(); do not use f-string here.
+# Hardcoded fallback prompt: PromptStore can always return to it. Values are injected via .format() in validate(), not an f-string.
 VALIDATOR_PROMPT_HARDCODED = (
     "You are a code completeness validator. Your job is to check whether a code block "
     "has all the definitions it needs — nothing more.\n"
@@ -113,13 +111,7 @@ class ValidatorAgent:
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        # pull prompt dynamically at call time so any push()/rollback()
-        # takes effect on the very next pipeline run with zero code change.
-        # Guarded: get_current() reads from disk — a corrupted store file,
-        # a removed parent directory, or a truncated JSON payload all raise
-        # out of _load(). Left unguarded, that crashes the entire
-        # validation pass instead of just this call; fall back to the
-        # hardcoded prompt, same as the invalid-placeholder case just below.
+        # The prompt is read at call time, so push() and rollback() apply on the next run; a store failure falls back to the hardcoded prompt.
         try:
             template = (
                 self.prompt_store.get_current("validator_agent")
@@ -168,19 +160,7 @@ class ValidatorAgent:
         tracer.event("validator_agent", "llm", "llm_request",
                      content=prompt, model=self.model, temperature=self.temperature)
 
-        # AUTO-BUG: this used to wrap the network call AND json.loads() in
-        # one try/except, so a successfully-returned-but-malformed (non-JSON)
-        # reply was indistinguishable from a genuine network/HTTP failure —
-        # both came out as {"_api_error": True}. main.py's run_pipeline()
-        # retries _api_error with exponential backoff via a `continue` that
-        # explicitly skips `iteration += 1`, so `iteration >= self.max_iterations`
-        # never trips either: a validator that reliably answers with prose
-        # instead of the required STRICT JSON burns the whole run's timeout
-        # budget in escalating sleeps, retrying the identical prompt with no
-        # corrective feedback, instead of counting as an ordinary needs_fix
-        # round that advances iteration and tells the model what to fix.
-        # Only a genuine request_completion failure is a real API error; a
-        # parse failure on a response that DID arrive is a normal needs_fix.
+        # Network and parse failures are separate: only a failed request is an API error, so a prose reply counts as needs_fix and advances the iteration.
         try:
             if self.stream:
                 ts = time.strftime("%H:%M:%S")
@@ -201,13 +181,7 @@ class ValidatorAgent:
                                              api_format=self.api_format,
                                              ssl_context=self.ssl_context)
         except urllib.error.HTTPError as e:
-            # The error body is a SECOND unguarded read on the same socket, so
-            # the transport problem that produced the HTTPError can raise again
-            # while draining it. Sibling handlers do not nest: an exception
-            # raised inside this block is NOT offered to the `except Exception`
-            # below, so an unguarded e.read() escaped validate() entirely and
-            # the ERROR path was less robust than the success path. Fall back
-            # to a placeholder body and let the HTTPError verdict stand.
+            # The error body is read under its own guard, so a second socket failure cannot escape validate(); a placeholder body keeps the HTTPError verdict.
             try:
                 body = e.read().decode("utf-8", errors="replace")
             except Exception as body_err:
@@ -235,20 +209,7 @@ class ValidatorAgent:
             parsed_result = json.loads(content)
         except Exception as e:
             logger.warning(f"ValidatorAgent: unparseable reply — {e}")
-            # AUTO-BUG (follow-up): prompt_evaluator.py's _shadow_score()
-            # computes json_ok_rate = fraction of results WITHOUT
-            # _api_error, as a direct proxy for "did the candidate prompt
-            # produce valid JSON." Before the fix above, a malformed reply
-            # WAS labelled _api_error, so that proxy was correct. Now that
-            # malformed-but-received replies are a distinct outcome, a
-            # candidate prompt that never produces valid JSON has none of
-            # its failures labelled _api_error and json_ok_rate silently
-            # inverts to 1.0 — rewarding exactly the failure mode it exists
-            # to penalise, which could get a bad candidate PROMOTED by the
-            # AutoTuner. _unparseable lets that caller (and any other) tell
-            # "genuine API error" apart from "response arrived, wrong
-            # format" apart from "valid JSON" — all three are different
-            # outcomes worth scoring differently.
+            # A reply that arrived but is not JSON is _unparseable, not _api_error, so json_ok_rate still penalises a prompt that never produces JSON.
             _err = {
                 "status": "needs_fix",
                 "feedback": (
@@ -262,15 +223,7 @@ class ValidatorAgent:
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
 
-        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): valid
-        # JSON that isn't an object (a list, a string, a number) or is an
-        # object missing the required "status" key — the field the whole
-        # STRICT JSON contract described in the error message above exists
-        # to guarantee — used to sail through unchecked; the very next
-        # line's `.get("suggested_searches")` would even raise
-        # AttributeError on a non-dict reply before reaching the caller.
-        # Treat both cases the same way an unparseable reply already is —
-        # needs_fix, with feedback naming exactly what was wrong.
+        # Valid JSON that is not an object, or lacks the required "status" key, is needs_fix with feedback naming the problem.
         if not isinstance(parsed_result, dict) or "status" not in parsed_result:
             logger.warning(
                 "ValidatorAgent: reply parsed as JSON but is not a valid "
@@ -289,8 +242,7 @@ class ValidatorAgent:
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
 
-        # Enforce max_hints: cap the suggested_searches list so the outer
-        # loop does not expand search scope beyond the configured limit.
+        # Cap suggested_searches at max_hints, so the outer loop cannot widen the search scope.
         if isinstance(parsed_result.get("suggested_searches"), list):
             parsed_result["suggested_searches"] = \
                 parsed_result["suggested_searches"][:self.max_hints]

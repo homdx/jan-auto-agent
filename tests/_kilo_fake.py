@@ -187,13 +187,7 @@ def _offered(provider_id: str, name: str, model_ids) -> dict:
     }
 
 
-#: The offer the fake answers ``GET /provider`` with when a scenario names
-#: none: one provider whose ``id`` is ``kenary`` and whose ``name`` is the
-#: display string ``kenari`` — so a roster that spells the display name is
-#: refused the way the live server's would be — carrying the model ids the
-#: contest suites roster by default (`tests/test_contest_cli.py`'s
-#: ``kenary/agent-a:free``, ``kenary/agent-b:free``, and ``--models
-#: x:free,y:free``).
+#: Default offer for GET /provider: provider "kenary" (display name "kenari"), with the model ids the contest suites use.
 DEFAULT_OFFER = {
     "all": [_offered("kenary", "kenari", ("hy3:free", "agent-a:free", "agent-b:free",
                                           "x:free", "y:free"))],
@@ -263,21 +257,11 @@ class _Session:
         self.messages: list = []
         self.turn_index = 0
         self.aborted = False
-        # KC-73: Kilo's own loop is running in the session (an overflow's
-        # autocompact); `summarize` blocks until it is not, as Kilo's does
+        # KC-73: a running autocompact in the session makes summarize wait, as Kilo's does.
         self.busy = threading.Event()
 
 
-# FL-1 (round 84, round 7): how long a scripted turn waits for the client to
-# answer a permission or a question before giving up and recording it in
-# `unanswered`. A hang guard, not an assertion — nothing in either test root
-# asserts that it fires, and one test asserts the opposite (`not
-# fake.unanswered`). At 20 s it was a wall-clock bound on a round trip that
-# has to cross an SSE stream, a reader thread, the client's callback and an
-# HTTP POST; the operator's stress run walked through it, and
-# `test_permission_in_the_middle_is_answered_and_idle_is_reached` came back
-# with the reply delivered over HTTP but `permission.replied` never emitted,
-# because the turn thread had already stopped waiting for it.
+#: Reply timeout for scripted permission and question prompts: a hang guard, not an assertion (FL-1).
 REPLY_TIMEOUT_S = 300.0
 
 
@@ -298,12 +282,9 @@ class FakeKiloServer:
         self._port = port
         self.reply_timeout = float(reply_timeout)
         self._bus = _Bus()
-        #: round 145: `PATCH /config` calls so far — a stream opened after one
-        #: starts with `server.connected`, as 7.6.2's does
+        #: round 145: PATCH /config calls so far; a stream opened after one starts with server.connected.
         self._config_reloads = 0
-        #: round 153: the limits a `PATCH /config` set, by the directory it
-        #: named and the model it named — the offer for that directory answers
-        #: with them, which is the read-back a push is checked against
+        #: Limits set by PATCH /config, per directory and model: the read-back a push is checked against (round 153).
         self._patched_limits: dict = {}
         self.requests: list = []
         self._sessions: dict = {}
@@ -619,9 +600,7 @@ class FakeKiloServer:
         with self._lock:
             return self._sessions.get(sid)
 
-    # FL-1 (round 84): the interval of the heartbeat that covers a scenario
-    # hook's real work — see _run_turn. Far inside the shortest silence window
-    # any caller configures.
+    # Heartbeat interval during a scenario hook, far below the shortest silence window (FL-1).
     HOOK_BEAT_S = 0.1
 
     def _run_turn(self, session: _Session, turn: dict, text: str) -> None:
@@ -633,23 +612,7 @@ class FakeKiloServer:
 
         on_prompt = turn.get("on_prompt")
         if callable(on_prompt):
-            # FL-1 (round 84): heartbeat for as long as the hook runs.
-            #
-            # A scenario hook does real work — usually a `git` commit in a
-            # worktree, which is hundreds of ms on an idle box and seconds on
-            # a loaded one. The caller's silence clock (`idle_event_timeout`)
-            # is already running by then: it started when `wait_idle` did,
-            # right after `prompt_async` returned, and this method runs on its
-            # own thread. So without this a turn whose hook commits could have
-            # the stall fire *while the commit was being written* — the
-            # harvest then read an empty branch, or the stall beat a scripted
-            # `session.error` to the tap and the turn came back STALLED.
-            #
-            # A real agent emits while it works, so the fake does too. The
-            # beats stop the moment the hook returns, so the silence still
-            # starts exactly where the agent stopped and no stall test is
-            # weakened — the silence has to arrive after the beats for those
-            # tests to pass at all.
+            # Heartbeat while a hook runs, so a stall cannot fire mid-commit; beats stop when the hook returns (FL-1).
             hook_done = threading.Event()
 
             def _beat() -> None:
@@ -677,15 +640,12 @@ class FakeKiloServer:
 
         pause = turn.get("pause_before_idle_sec")
         if pause is not None:
-            # KC-12's stall shape: one heartbeat, then that many seconds of
-            # nothing — no idle, no error, no turn.close. The wait is what has
-            # to notice; the sleep only keeps the turn "running" that long.
+            # KC-12 stall shape: one heartbeat, then silence: no idle, no error, no turn.close.
             self._emit(self._event_for(session, "busy"))
             self._sleep(float(pause))
             return
 
-        # KC-64: the provider keeps failing — Kilo's own retry loop, as round
-        # 106 showed it for bynara: busy, then retry with attempt n
+        # KC-64: the provider keeps failing, so Kilo's own retry loop runs (round 106, bynara).
         for n in range(1, int(turn.get("retries") or 0) + 1):
             self._emit({"type": "session.status",
                         "properties": {"sessionID": session.id,
@@ -741,21 +701,18 @@ class FakeKiloServer:
 
         error = turn.get("error")
         if error is not None:
-            # session.error is *instead of* the assistant message and the idle:
-            # the model never answered, so it has nothing to say.
+            # session.error replaces the assistant message and the idle, so the model has nothing to say.
             if isinstance(error, str):
                 error = {"name": error, "message": error}
             session.info["error"] = error
-            # KC-67: Kilo keeps the assistant message it opened for the refused
-            # reply — all-zero tokens, no finish (round 114, sn68-var1)
+            # KC-67: Kilo keeps the assistant message for a refused reply, with all-zero tokens (round 114).
             if turn.get("message_info") is not None:
                 info = {"role": "assistant", "sessionID": session.id, "time": time.time()}
                 info.update(turn["message_info"])
                 session.messages.append({"info": info, "parts": []})
             self._emit({"type": "session.error",
                         "properties": {"sessionID": session.id, "error": error}})
-            # KC-63: Kilo 7.6.2 follows a session.error with session.idle
-            # events for the same session (two for mimo-v2-5 in round 106)
+            # KC-63: Kilo follows a session.error with idle events for the same session (round 106).
             for _ in range(int(turn.get("idles_after_error") or 0)):
                 self._emit({"type": "session.idle",
                             "properties": {"sessionID": session.id}})
@@ -764,14 +721,11 @@ class FakeKiloServer:
             return
 
         parts = [_tool_part(p) for p in (turn.get("tool_parts") or [])]
-        # KC-9: a turn with no `assistant` key ends the way a live one does —
-        # with a reply — so the runner reads it as FINISHED; `"assistant": ""`
-        # is the reply a free tier cut to nothing, a CUT or a SILENT idle.
+        # KC-9: a turn with no assistant key ends with a reply, so the runner reads it as finished.
         text = turn.get("assistant", "done")
         if text:
             parts.append({"type": "text", "text": text})
-        # KC-56: `message_info` goes onto the assistant message's `info` —
-        # `finish` and `tokens` the way Kilo reports a reply cut off at a limit
+        # KC-56: message_info goes onto the assistant message's info, as Kilo reports a cut-off reply.
         info = {"role": "assistant", "sessionID": session.id, "time": time.time()}
         info.update(turn.get("message_info") or {})
         if turn.get("cut"):
@@ -976,9 +930,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._stream_events()
 
         if _RE_PROVIDER.fullmatch(path):
-            # the offer: `providers` replaces it wholesale, `providers_status`
-            # makes the route answer an error instead (KC-25's intake line); a
-            # `PATCH /config` for this directory has already taken its limit in
+            # Offer answer: providers replaces the list; providers_status makes the route fail (KC-25).
             return self._json(int(self.fake.scenario.get("providers_status", 200)),
                               self.fake.provider_body(directory))
 
@@ -1003,19 +955,12 @@ class _Handler(BaseHTTPRequestHandler):
     # ── POST ───────────────────────────────────────────────────────────────
 
     def do_PATCH(self) -> None:
-        # round 145: `PATCH /config` — a model's limit for one directory. The
-        # fake records it (`fake.calls("PATCH")`) and answers with the body,
-        # as 7.6.2 does. Round 153: the patch also takes its limit into the
-        # offer for that directory, which is the read-back a push is checked
-        # against — unless the model's limit is the fake's own config content,
-        # which outranks it.
+        # round 145/153: PATCH /config records the model's limit and takes it into that directory's offer.
         body = self._body()
         path, query = self._record(body)
         if path == "/config":
             self.fake._take_limits(body, query.get("directory") or self.fake.directory)
-            # 7.6.2 reloads the directory's instance: `server.instance.disposed`
-            # and the end of every open `/event` stream; a stream opened after
-            # it starts with `server.connected`
+            # 7.6.2 reloads the directory's instance: disposed event first, then server.connected on new streams.
             self.fake._emit({"type": "server.instance.disposed", "properties": {}})
             self.fake._config_reloads += 1
             with self.fake._bus._lock:
@@ -1050,8 +995,7 @@ class _Handler(BaseHTTPRequestHandler):
             session = self.fake._session(m.group(1))
             if session is None:
                 return self._not_found(path)
-            # KC-49: `reject_variants` maps a variant to the `session.error`
-            # payload a provider answers it with (glm-4-7-flash:free's `max`)
+            # KC-49: reject_variants maps a variant to the session.error a provider answers it with.
             rejected = (self.fake.scenario.get("reject_variants") or {}).get(
                 (session.model or {}).get("variant"))
             if rejected is not None:
@@ -1082,8 +1026,7 @@ class _Handler(BaseHTTPRequestHandler):
             session = self.fake._session(m.group(1))
             if session is None:
                 return self._not_found(path)
-            # KC-67: `summarize_status` makes the compact refused, so the runner's
-            # fail-open path — prompt anyway, no compact — is reachable
+            # KC-67: summarize_status refuses the compact, so the runner's fail-open path is reachable.
             status = int(self.fake.scenario.get("summarize_status", 204))
             # KC-73: Kilo answers a compact only once the session is free
             deadline = time.monotonic() + float(
@@ -1105,12 +1048,7 @@ class _Handler(BaseHTTPRequestHandler):
             if session is None:
                 return self._not_found(path)
             session.aborted = True
-            # KC-42: opt-in, and off by default so every test that counts an
-            # abort keeps the wait it had. Kilo answers an abort by ending the
-            # turn — a `session.idle`, or a `MessageAbortedError` on the turn
-            # that was already starting — and a scenario that drives the
-            # runner's own abort (a stall, KC-42's session reset) needs the
-            # wait to end on it rather than to sit out the turn deadline.
+            # KC-42: opt-in abort: the wait ends on the abort's own turn end, not the deadline (off by default).
             if self.fake.scenario.get("abort_idles"):
                 self.fake._emit({"type": "session.idle",
                                  "properties": {"sessionID": session.id}})
@@ -1179,9 +1117,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# a minimal OpenAI-compatible endpoint, for KC-34's OpenRouterBackend
-# ─────────────────────────────────────────────────────────────────────────────
+# A minimal OpenAI-compatible endpoint for KC-34's OpenRouterBackend
 
 def _openai_reply(content=None, calls=(), usage=(10, 20), *, role="assistant"):
     """One ``/chat/completions`` reply in the shape the endpoint returns.

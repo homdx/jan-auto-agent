@@ -93,9 +93,7 @@ def test_canon_gate_checks_second_target_file(tmp_path):
     result = loop.run_task(dict(TASK), tmp_path)
 
     assert SECOND_FILE in canon.checked_files
-    # cap=1: attempt 1 rejects on the second file's conflict (spending the
-    # cap), attempt 2 hits the cap and is accepted-with-warning. Two attempts
-    # only happen if the conflict was actually detected and acted on.
+    # cap=1: attempt 1 rejects on the second file's conflict; attempt 2 hits the cap and is accepted with a warning.
     assert result.attempts_used == 2
 
 

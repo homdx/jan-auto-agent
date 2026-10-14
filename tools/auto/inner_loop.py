@@ -63,29 +63,14 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_MAX_ATTEMPTS = 5
-# RUN-7: re-runs of ONLY the Gate-2 validator call (never the coder or the
-# executor) when it came back without a verdict — a transport/parse error
-# such as the HTTP 429 "monthly usage limit" that blocked AUTO-T6 on
-# ../testtext2. [auto] validator_unavailable_retries is the count; the pause
-# between calls is [collect] error_retry_wait_sec, the one existing knob
-# that already names the project's HTTP retry pause (request_completion's
-# own per-request retries sit below this layer and are exhausted by the
-# time approve() reports "validator unavailable").
+# Validator re-runs when it returns no verdict (a transport or parse error); the count is validator_unavailable_retries (RUN-7).
 _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES  = 2
 _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC = 60.0
-# RUN-8: the coder side of the same shape. The socket sat silent for 80
-# minutes on a live run before the stream-read timeout fired and the coder
-# came back with nothing; before this key that ate the task's
-# max_task_seconds budget, charged the attempt, and told the model it had
-# failed. [auto] coder_transport_retries is the count; the pause between
-# calls reuses [collect] error_retry_wait_sec, the same outage-class wait
-# RUN-7's validator re-runs use.
+# Coder re-runs after a silent socket; the count is coder_transport_retries (RUN-8).
 _DEFAULT_CODER_TRANSPORT_RETRIES   = 2
 _DEFAULT_CODER_TRANSPORT_WAIT_SEC  = 60.0
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Data classes
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class AttemptRecord:
@@ -110,34 +95,17 @@ class InnerLoopResult:
     last_feedback: str   = ""
     records:       list  = field(default_factory=list)   # list[AttemptRecord]
     context_satisfied: bool = True   # pull-model: False ⇒ last attempt still needed context
-    # RUN-7: True when the round ended because the Gate-2 validator was
-    # unreachable/unparseable on every retry — a technical failure, never a
-    # real {"approved": false}. ``passed`` is False alongside this, but the
-    # attempt that hit it is NOT counted in ``attempts_used`` and no
-    # "validator rejected" line was appended to feedback — the coder must
-    # never be told the reviewer rejected it when no reviewer ever answered.
+    # Set when the validator never answered on any retry: a technical failure, not a rejection, and the coder is not told it was rejected (RUN-7).
     unavailable:   bool  = False
-    # RUN-7: the last "validator unavailable: …" text, kept ONLY for the
-    # outer loop's WARNING log line — never fed to a coder/feedback file.
+    # The last "validator unavailable" text, kept only for the outer loop's warning and never fed back.
     unavailable_reason: str = ""
-    # RUN-8: which stage ended this round unavailable — "coder" (the coder
-    # call died before the model could answer, RUN-8) or "gate2" (RUN-7).
-    # "" on a legacy/older result and on a Round that was not left
-    # unavailable; the outer loop and the controller key their log line off
-    # it, so a coder outage reads as a coder outage rather than as a
-    # validator that never answered.
+    # Which stage left the round unavailable ("coder" or "gate2"), so the log names the real outage (RUN-8).
     unavailable_stage: str = ""
-    # RUN-8: wall-clock seconds spent inside a coder call that ended in a
-    # transport failure, credited back against this task's deadline inside
-    # run_task. The outer loop adds it to its own shared _task_deadline so
-    # the seconds are not charged twice. 0.0 when nothing died on the wire
-    # or when there was no deadline to credit against.
+    # Seconds a dead coder call used, credited back to the task deadline once, so they are not charged twice (RUN-8).
     deadline_credit_s: float = 0.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM-backed Gate-2 validator  (LOOP-1)
-# ─────────────────────────────────────────────────────────────────────────────
+# LLM-backed Gate-2 validator (LOOP-1)
 
 _GATE2_SYSTEM_CODE = (
     "You are a code-change validator. "
@@ -206,14 +174,7 @@ _GATE2_SYSTEM_CREATIVE = (
     "author copies such sentences verbatim, and your terse phrasing then becomes "
     "flat 'telling' prose, which loops. ONLY for a factual value (a name, gender, "
     "age, date, place) may you give the exact corrected value.\n"
-    # AUTO-FIX (language-leak): these three example bullets used to be written
-    # in Russian. Models copy the language of the example rather than obeying
-    # "write in the chapter's language" a few lines above, so an entirely
-    # English project got its whole critique in Russian — observed across 61
-    # consecutive rejections on an English CHANGELOG.md. The examples are now
-    # language-neutral English AND the caller injects the resolved language
-    # explicitly (see _language_directive), because "the chapter's language"
-    # asks the model to infer something the system already knows for certain.
+    # The example bullets are language-neutral English, and the language is injected explicitly, so a project is not critiqued in Russian (AUTO-FIX).
     "Example of the FORMAT ONLY. Its language carries no meaning — write your "
     "own reply in the chapter's language, whatever that is, and do not reuse "
     "this wording:\n"
@@ -320,11 +281,7 @@ class LLMGate2Validator:
     Any network / parse error returns ``(False, "validator unavailable: …")``.
     """
 
-    # RUN-10: the [loop] retry budget for this validator's own call, resolved
-    # in __init__ below. Empty on purpose at class level: several tests build
-    # the validator with object.__new__() and hand it only the attributes they
-    # need, and those stay on request_completion()'s built-in budget exactly as
-    # they were before RUN-10, instead of losing the call to an AttributeError.
+    # Empty at class level: objects built without __init__ keep request_completion's default budget instead of an AttributeError (RUN-10).
     _retry_kwargs: dict = {}
 
     def __init__(
@@ -349,14 +306,7 @@ class LLMGate2Validator:
         self.api_key     = api_key
         self.api_format  = api_format
         self.temperature = temperature
-        # AUTO-FIX (medium-priority audit): timeout was passed straight
-        # through with no cast/clamp, unlike max_hints just below —
-        # non-numeric or non-positive values reach urllib as-is instead of
-        # failing fast here with a clear picture of what went wrong. This
-        # is a defensive floor for direct callers (e.g. tests); the normal
-        # config-driven path already resolves a safe int upstream (the
-        # make_inner_loop factory's own try/except around config.getint)
-        # before it ever reaches here.
+        # The timeout is cast and clamped like max_hints, so a bad value cannot break the call (AUTO-FIX).
         try:
             self.timeout = max(1, int(timeout))
         except (TypeError, ValueError):
@@ -365,40 +315,21 @@ class LLMGate2Validator:
         self.ssl_context = ssl_context
         self.base_dir    = Path(base_dir)
         self.last_missing_context: list[str] = []
-        # RUN-7: side channel mirroring last_missing_context — True only
-        # when the most recent approve() call fell through to the
-        # `except Exception` exit (transport/parse error), never for a
-        # model-issued rejection. approve_verdict() reads this into
-        # Gate2Verdict.unavailable.
+        # Side channel: True only when the validator failed to answer (transport or parse error), never for a real rejection (RUN-7).
         self.last_unavailable: bool = False
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
         self._config     = config
-        # RUN-10: the [loop] HTTP retry budget for this validator's own
-        # request_completion() call — read once here, next to the timeout the
-        # make_inner_loop factory resolves from the same [loop] section. A
-        # None config (a directly constructed validator, as tests do) gives
-        # request_completion()'s built-in defaults.
+        # The validator's HTTP retry budget comes from the [loop] section; a directly built validator uses the defaults (RUN-10).
         from tools.llm_stream import retry_kwargs_from_config
         self._retry_kwargs = retry_kwargs_from_config(config)
-        # AUTO-FIX (fable follow-up): Gate-2 in code/docs mode requires
-        # strict JSON with no soft-parse fallback (see AUTO-BUG-10) — a
-        # thinking model truncated mid-<think> here fails closed exactly
-        # like architect/coder did before the think=false fix.
-        # BUGFIX (audit): resolve_validator_llm_profile's profile-resolved
-        # think override was computed by callers and then silently
-        # dropped — this always re-read the base [validator_agent] think
-        # key instead, ignoring any per-profile override. Accept an
-        # explicit think= and only fall back to the config read when the
-        # caller didn't resolve one (None), preserving old behaviour.
+        # Gate 2 needs strict JSON; a per-profile think override is honoured, and the base key is used only when none is given (BUGFIX).
         self._think = (
             think if think is not None
             else (safe_getboolean(config, "validator_agent", "think", fallback=False) if config is not None else False)
         )
-        # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
-        # override > (code-mode-only) legacy "system" key > built-in.
-        # See _resolve_validator_system for the full priority rationale.
+        # System prompt: the mode-specific override first, then the legacy key in code mode, then the built-in (AUTO-DM-5, AUTO-CR-19-1).
         self._system = _resolve_validator_system(config, self.task_mode)
 
         # Task 3 — smart context additions
@@ -434,23 +365,7 @@ class LLMGate2Validator:
         budget = max(800, 6000 // max(len(files), 1))
         blocks = []
         for rel in files:
-            # B8: files_written is coder output, not code. A non-string entry
-            # (None, an int, a dict from a lenient JSON parse) makes
-            # `_base / rel` raise TypeError, which the `except OSError` below
-            # does not catch -- so one junk entry aborted the whole Gate-2
-            # prompt build instead of degrading to a note, which is this
-            # helper's entire job. An empty string is unusable too:
-            # `_base / ""` is just `_base`, and reading a directory raises.
-            #
-            # The check sits BEFORE the try on purpose. Detecting the bad
-            # entry from inside the exception handler would depend on which
-            # exception the path join happens to raise, and a pathlib.Path
-            # entry (which joins fine) would slip past unnoticed.
-            #
-            # Each bad entry gets its own visible block rather than being
-            # filtered out. A silently shorter list reads to the validator as
-            # "nothing suspicious here" at exactly the moment the coder
-            # invented a path -- the opposite of what this pipeline is for.
+            # A non-string or empty entry gets its own visible note instead of aborting the prompt build (B8).
             if not isinstance(rel, str) or not rel.strip():
                 blocks.append(
                     f"--- (not a usable path: {rel!r}) ---\n"
@@ -463,10 +378,7 @@ class LLMGate2Validator:
                 content = (_base / rel).read_text(
                     encoding="utf-8", errors="replace")
             except OSError as exc:
-                # Final-polish: a file absent WITH a .coder.bak sibling is a
-                # deliberate deletion (coder's delete:true), not a read
-                # failure — say so, or the validator may treat the feature
-                # as an error.
+                # A file missing with a .coder.bak sibling is a deliberate deletion, not a read failure (AUTO-FIX).
                 if not (_base / rel).exists() and (
                     _base / (rel + ".coder.bak")
                 ).exists():
@@ -610,16 +522,7 @@ class LLMGate2Validator:
                         sample = text
                         break
 
-            # AUTO-FIX (podrugi run): when the run starts from user-provided
-            # chapters (the documented Creative.MD workflow: hand-written
-            # chapter_1.txt + goal "продолжи рассказ"), synopsis.md /
-            # story_bible.md do not exist yet — they are only written AFTER
-            # the first generated chapter is accepted. That left this gate
-            # blind exactly on the first generated chapter: an all-English
-            # chapter_2 sailed through and then poisoned the synopsis.
-            # Fallback: establish the language from the chapters already on
-            # disk (excluding the files the coder just wrote and reserved
-            # meta files).
+            # With no synopsis yet, the language is taken from the chapters already on disk (podrugi run, AUTO-FIX).
             if not sample:
                 _written = set(getattr(coder_result, "files_written", []) or [])
                 _reserved = {"synopsis.md", "story_bible.md", "IMPROVEMENTS.md",
@@ -684,11 +587,7 @@ class LLMGate2Validator:
         self.last_missing_context = []
         self.last_unavailable = False   # RUN-7: reset every call, like last_missing_context
 
-        # AUTO-FIX: cheap deterministic language pre-gate for creative mode —
-        # catches a chapter that drifted into the wrong language WITHOUT
-        # spending an LLM call on it. Only ever short-circuits to REVISE; it
-        # never approves on its own, so a false trigger still gets caught by
-        # the real LLM review below on the next attempt.
+        # A cheap language check for creative mode: it only ever asks for a revision, never approves on its own (AUTO-FIX).
         _lang_reason = self._creative_language_mismatch(coder_result, base_dir)
         if _lang_reason:
             logger.info(
@@ -726,8 +625,7 @@ class LLMGate2Validator:
                 + self._read_changed_content(coder_result, task=task, base_dir=base_dir)
             )
 
-            # AUTO-CR-30: on a re-review, show the model its OWN previous critique
-            # so it verifies what was actually fixed rather than repeating itself.
+            # On a re-review the model sees its own previous critique, so it checks what was fixed (AUTO-CR-30).
             if prior_critique and prior_critique.strip():
                 user_msg += (
                     "\n\n--- YOUR PREVIOUS REVIEW (of the earlier draft) ---\n"
@@ -777,11 +675,7 @@ class LLMGate2Validator:
                 return strip_think(_r or "")
 
             raw = _call_validator(user_msg)
-            # ── Guard: empty response ─────────────────────────────────────────
-            # An empty body means the model returned nothing at all (network
-            # timeout that still got a 200, or a model that refused silently).
-            # json.loads("") raises the cryptic "Expecting value: line 1 column
-            # 1 (char 0)" — we surface a clearer message instead.
+            # An empty reply is reported clearly, not as a JSON decoding error.
             if not raw or not raw.strip():
                 raise ValueError(
                     "validator model returned an empty response "
@@ -791,10 +685,7 @@ class LLMGate2Validator:
             # ── Creative mode: line-oriented soft verdict (AUTO-CR-2) ─────────
             if self.task_mode == "creative":
                 approved, reason, unparseable = _parse_verdict_soft(raw)
-                # AUTO-CR-31: if the model buried the verdict (e.g. it started
-                # with "Let's go through each point:" instead of APPROVED/REVISE),
-                # re-ask ONCE with a hard nudge before falling open. Capped at a
-                # single retry — no loop, max two validator calls total.
+                # If the verdict is buried in prose, the validator is asked once more with a hard nudge (AUTO-CR-31).
                 if unparseable:
                     logger.info(
                         "LLMGate2Validator [creative]: verdict unparseable — "
@@ -818,24 +709,10 @@ class LLMGate2Validator:
                     )
                 if approved:
                     return True, ""
-                # AUTO-CR-29: the prompt now asks for a NUMBERED LIST of every
-                # problem, but _parse_verdict_soft is line-oriented and would
-                # lose a multi-line critique. Feed the coder the FULL reviewer
-                # reply minus the leading verdict token instead.
+                # The full critique is passed to the coder, since a numbered list would be cut by the line parser (AUTO-CR-29).
                 critique = raw.strip()
                 import re as _re  # local import — matches _parse_verdict_soft's convention; approve() has no module-level `re` import in scope
-                # AUTO-FIX: the previous fixed-length-slice approach checked
-                # bare "revise"/"reject" as prefixes, so a validator reply in
-                # the past tense ("REVISED: ...", "REJECTED: ...") matched
-                # the bare token first and had only 6 chars sliced off,
-                # leaving a stray "D:"/"ED:" fragment prepended to the
-                # critique handed to the coder. Match the whole word (with
-                # an optional past-tense "d"/"ed" suffix) plus any trailing
-                # ":" in one regex pass instead, so every accepted spelling
-                # of the verdict is stripped cleanly regardless of tense.
-                # "no" keeps requiring an explicit colon, same as before —
-                # bare "no" alone was never a valid strip token, only "no:"
-                # was, so that narrower case is preserved unchanged.
+                # Verdict words are matched whole, so a past-tense reply such as "REVISED" is not read as a prefix (AUTO-FIX).
                 critique = _re.sub(
                     r"^(?:revise[d]?|reject(?:ed)?)\s*:?\s*|^no\s*:\s*",
                     "",
@@ -853,13 +730,7 @@ class LLMGate2Validator:
             elif "```" in raw:
                 raw = raw.split("```")[1].split("```")[0].strip()
 
-            # ── Guard: empty AFTER fence-stripping ────────────────────────
-            # The pre-strip empty check above only catches a fully-empty raw
-            # reply. A reply like "```json\n```" (fences with nothing inside)
-            # passes that check but becomes "" once the fences are stripped,
-            # so json.loads("") would raise the same cryptic
-            # "Expecting value: line 1 column 1 (char 0)" error. Surface a
-            # clear message instead.
+            # A reply that is only code fences is reported as empty, not as a JSON error.
             if not raw or not raw.strip():
                 raise ValueError(
                     "validator model returned empty JSON content "
@@ -867,19 +738,14 @@ class LLMGate2Validator:
                 )
 
             parsed   = json.loads(raw)
-            # Guard against valid-but-non-object JSON (list / string / null):
-            # the .get(...) calls below would otherwise raise AttributeError
-            # (caught, but with a cryptic message). Unwrap a single-element list;
-            # otherwise raise a clear error → fail-closed in the except handler.
+            # A valid JSON that is not an object gets a clear error instead of an attribute error; a one-item list is unwrapped.
             if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
                 parsed = parsed[0]
             if not isinstance(parsed, dict):
                 raise ValueError(
                     f"validator returned {type(parsed).__name__}, expected JSON object"
                 )
-            # BUGFIX: same string-vs-list class of bug as _format_gate2_feedback —
-            # an LLM may return "missing_context" as a string. Without a type
-            # guard, iterating a string yields single characters.
+            # missing_context may come back as a string; it is type-checked so characters are not iterated (BUGFIX).
             raw_missing = parsed.get("missing_context")
             if isinstance(raw_missing, list):
                 self.last_missing_context = [
@@ -922,8 +788,7 @@ class LLMGate2Validator:
             task, exec_result, coder_result,
             base_dir=base_dir, prior_critique=prior_critique,
         )
-        # RUN-7: last_unavailable is set by approve() itself only on the
-        # `except Exception` exit — never for a real {"approved": false}.
+        # last_unavailable is set only on the exception exit, never for a real rejection (RUN-7).
         return Gate2Verdict(approved=approved, reason=reason,
                             unavailable=self.last_unavailable)
 
@@ -979,36 +844,13 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         _re.compile(r"\b(нет|без)\s+противоречий\b"),
         _re.compile(r"\bпротиворечий\s+нет\b"),
         _re.compile(r"\bне\s+противоречит\b"),
-        # negated / absent contradictions expressed without «нет/без»:
-        #   «противоречий не обнаружено / не выявлено», «противоречия отсутствуют»
-        # AUTO-BUG: real LLM replies routinely insert filler words between the
-        # noun and the negated verb — «противоречий В ТЕКСТЕ не обнаружено»,
-        # «противоречий С ТЕКСТОМ не обнаружено» — which the old
-        # immediately-adjacent ``\s+`` pattern missed, falling through to the
-        # bare «противоречи» REVISE pattern below and flipping a genuine
-        # APPROVED into a false REVISE. Allow up to 3 filler words (bounded so
-        # it can't jump across an unrelated sentence) in between.
-        #
-        # BUGFIX: the filler-gap fix above first shipped as `не\s+\w+` — ANY
-        # "не + word" — which also matched the critic negating their OWN
-        # reaction/expectation rather than the existence of a contradiction:
-        # «противоречий мне не понравилось», «противоречий я здесь не
-        # одобрю», «противоречий не ожидал найти» all wrongly APPROVED.
-        # Restrict the negated verb to ones that actually mean "not found /
-        # not detected" instead of accepting any verb.
+        # Russian negated-contradiction patterns: filler words are allowed between the noun and the verb, but only search verbs count (AUTO-BUG).
         _re.compile(
             r"противоречи\w*(?:\s+\S+){0,3}\s+"
             r"(?:отсутств\w*|не\s+(?:обнаружен\w*|выявлен\w*|найден\w*|"
             r"встречает\w*|замечен\w*|видн\w*))"
         ),
-        #   «не вижу / не обнаружил / не нашёл … противоречий» — same filler-word
-        #   gap allowed on this side (e.g. «не смог найти каких-либо противоречий»).
-        # BUGFIX: the original `\bне(?:\s+\S+){0,3}\s+противоречи` allowed ANY
-        # gap after «не», so «не ожидал встретить противоречия» / «не
-        # нравятся противоречия» — negating the critic's expectation/liking,
-        # not the presence of a contradiction — wrongly APPROVED too. Require
-        # «не» to be followed by a search/perception verb (вижу, нахожу,
-        # обнаружил, ...) before the filler-word gap kicks in.
+        # The negation must be followed by a search or perception verb; "not expected" or "not liked" do not approve (BUGFIX).
         _re.compile(
             r"\bне\s+(?:вижу|нахожу|нашёл|нашел|обнаружил|выявил|заметил|"
             r"встретил|встречаю|смог\s+найти)"
@@ -1017,18 +859,14 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         # «не против» / «непротив»
         _re.compile(r"\bне\s+против\b"),
         _re.compile(r"\bнепротив\b"),
-        # «одобрен* / одобряю» — NOT preceded by «не » or «не» (one-word
-        # negation «неодобренный» must not match; the (?<!не) lookbehind
-        # catches the no-space form, (?<!не ) catches the spaced form).
+        # Approval words not preceded by a negation (one-word and spaced forms both checked).
         _re.compile(r"(?<!не)(?<!не )одобр"),
         # «принято / принимаю / можно принять» — NOT preceded by «не » or «не»
         _re.compile(r"(?<!не)(?<!не )принят"),
         _re.compile(r"\bможно\s+принять\b"),
-        # «всё верно» / «все верно» — NOT preceded by «не » (the one-word
-        # form «невсё» has no \b before «всё» so \b already blocks it).
+        # "всё верно" / "все верно" count only when not preceded by "не " (the one-word form is blocked by \b).
         _re.compile(r"(?<!не )\b(всё|все)\s+верно\b"),
-        # «соответствует» — NOT preceded by «не » or «не» (one-word
-        # negation «несоответствует» must not match).
+        # "соответствует" does not match after "не" or "не " (the negated one-word form).
         _re.compile(r"(?<!не)(?<!не )соответствует\b"),
         # «соглас*» (согласен/согласна/…) — NOT preceded by «не»/«нет»
         _re.compile(r"(?<!не)(?<!нет)(?<!не )(?<!нет )соглас"),
@@ -1057,42 +895,14 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         _re.compile(r"\b(нужно|надо|следует)\s+(изменить|поправить|переписать|исправить|доработать|переделать)"),
         # «(так) нельзя оставлять»
         _re.compile(r"нельзя\s+оставля"),
-        # standalone negative answer «Нет, …» / «Нет.» — comma/period only,
-        # so approvals like «нет проблем» / «нет замечаний» (followed by a
-        # space) are NOT caught here. «нет противоречий» already returned
-        # APPROVED above.
-        # AUTO-BUG: this used to fire unconditionally on ANY "Нет, ..."
-        # opener, which also caught casual-Russian approvals where "Нет" is
-        # a discourse filler rather than a substantive rejection — "Нет,
-        # всё хорошо." / "Нет, всё нормально." / "Нет, всё в порядке."
-        # ("nah, it's all fine") were confidently misclassified as REVISE
-        # even though nothing else in the reply objects to anything. A
-        # negative lookahead excludes exactly that "Нет, <all-good phrase>"
-        # shape while leaving every other "Нет, ..." opener — including the
-        # test-locked "Нет, так нельзя оставлять" / "Нет, это не подходит"
-        # — classified as REVISE exactly as before.
+        # A standalone "No," opener is a rejection, except the discourse filler "No, it's all fine" (AUTO-BUG).
         _re.compile(
             r"^нет(?:[,.]|$)"
             r"(?!\s*(?:всё|все)\s+(?:хорошо|нормально|в\s+порядке|ок(?:ей)?|отлично|супер)\b)"
         ),
     ]
 
-    # ── English "NO, <it's all good>" discourse-filler guard ────────────────
-    # BUGFIX: the subject phrase was optional before every adjective, so a
-    # bare "NO GOOD: <reason>" — the English idiom for "this is bad", and
-    # shaped like a REJECT verdict — matched as affirmative and inverted a
-    # real rejection. Only GOOD now requires an explicit subject ("no, it's
-    # good"); "no fine" / "no great" have no such negative reading.
-    #
-    # BUGFIX (verified-bugs follow-up report): "NO problems, it's perfect."
-    # is a clean approval ("there are no problems") but didn't match either
-    # alternative above — "PROBLEMS" is a noun, not a subject phrase
-    # (IT'S/THAT'S/...) or one of the bare adjectives (FINE/PERFECT/...) —
-    # so it fell through to the bare startswith("NO") REJECT branch below,
-    # a false rejection. "NO PROBLEMS/ISSUES/CONCERNS/COMPLAINTS" is itself
-    # already an unambiguous all-clear regardless of what follows, so it's
-    # a third top-level alternative rather than requiring a GOOD/FINE-style
-    # continuation.
+    # English "NO, it's good" guard: an explicit subject is needed before the adjective; "NO PROBLEMS" is a clean approval (BUGFIX).
     _EN_DISCOURSE_OK = _re.compile(
         r"^NO[,.]?\s*(?:"
         r"(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|EVERYTHING IS|ALL)"
@@ -1103,33 +913,14 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r")\b"
     )
 
-    # ── English "NO <revisions/changes/…> NEEDED" approval guard ────────────
-    # AUTO-BUG: "NO REVISIONS NEEDED" is a clean approval, but the bare
-    # startswith("NO") check below read it as a rejection with the reason
-    # "REVISIONS NEEDED". Match the "nothing left to do" shape first.
+    # "NO REVISIONS NEEDED" is a clean approval, matched before the generic "NO" rejection (AUTO-BUG).
     _EN_NOTHING_NEEDED = _re.compile(
         r"^NO\s+(?:FURTHER\s+|ADDITIONAL\s+|MORE\s+)?"
         r"(?:REVISIONS?|CHANGES?|EDITS?|FIXES?|CORRECTIONS?|ADJUSTMENTS?)\s+"
         r"(?:NEEDED|REQUIRED|NECESSARY)\b"
     )
 
-    # ── English "OK, but/however/so <problem>" caveat guard ─────────────────
-    # BUGFIX (verified-bugs follow-up report): the bare `^OK\b` approval
-    # match below fires on the very FIRST token and never looks at what
-    # follows on the rest of the line — so "OK, but the character's
-    # motivation is wrong and the ending contradicts chapter 3." and "OK so
-    # chapter needs a full rewrite before it can be accepted" both matched
-    # `^OK\b` and returned an immediate, unconditional approval despite
-    # explicitly stating real problems right after the "OK". Mirrors the
-    # existing _EN_DISCOURSE_OK / _EN_NOTHING_NEEDED guards in spirit (a
-    # narrow, high-confidence pattern checked before the bare prefix match,
-    # not general sentiment analysis): BUT/HOWEVER/SO immediately after
-    # "OK" are contrastive/consequence markers that — in a validator-verdict
-    # context — reliably introduce a caveat or problem, never a plain
-    # affirmation (unlike a bare "OK looks good to me" / "OK looks fine" /
-    # "OK the chapter is fine", none of which use a contrastive marker and
-    # all of which remain approved exactly as before). Reason extraction
-    # mirrors the REVISE/REJECT/NO branch below.
+    # English "OK, but ..." caveat guard: an approval followed by a problem is not an approval (BUGFIX).
     _EN_OK_CAVEAT = _re.compile(
         r"^OK[,.]?\s+(BUT|HOWEVER|SO)\b[,:]?\s*(.*)$"
     )
@@ -1158,10 +949,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         norm = _normalise(raw)
         upper = raw.strip().upper()
 
-        # ── English "OK, but/however/so <problem>" caveat guard ───────────
-        # Checked BEFORE the bare APPROVED/OK prefix match below, so a
-        # caveat right after "OK" is caught before the prefix match would
-        # otherwise return an unconditional approval.
+        # A caveat right after OK is checked before the plain OK approval (BUGFIX).
         _ok_caveat = _ok_caveat_reason(raw)
         if _ok_caveat is not None:
             return False, _ok_caveat, False
@@ -1170,18 +958,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
             return True, "", False
 
-        # ── English "NO, <it's all good>" discourse-filler guard ─────────
-        # AUTO-BUG: bare `upper.startswith("NO")` below misread a casual
-        # "No, it's perfect!" / "No, that's fine." / "No, all good here." —
-        # where "No" is conversational filler answering an implicit "any
-        # issues?" rather than a rejection — as a REVISE verdict, mangling
-        # the reason to ", it's perfect!". The Russian branch already has
-        # an equivalent guard for the identical discourse pattern ("Нет,
-        # всё хорошо" not misread as REVISE); this mirrors it for English
-        # so the same casual sentiment is treated consistently regardless
-        # of language. Genuine rejections opening with "No" but naming an
-        # actual problem ("No, this doesn't work", "No, fix the ending")
-        # are unaffected — only an explicit all-good phrase is excluded.
+        # A casual "No, it's perfect" is an approval, not a rejection; a "No" that names a real problem still rejects (AUTO-BUG).
         if _EN_DISCOURSE_OK.match(upper):
             return True, "", False
 
@@ -1196,32 +973,12 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
                 reason = rest if rest else "validator rejected (no reason given)"
                 return False, reason, False
 
-        # ── English verdict on a LATER line (behind a preamble) ──────────
-        # AUTO-BUG: the two English checks above only fire when the token is
-        # the FIRST token of the whole candidate string. The candidate list
-        # is [first_non_empty_line, whole_text] precisely so a verdict that
-        # isn't on line 1 can still be found via the whole-text fallback —
-        # but that fallback only ever helped RUSSIAN verdicts, because the
-        # Russian rules below use substring .search() over the whole text
-        # while the English rules use .startswith(). Result: a validator that
-        # emits a perfectly clear English "REVISE:/REJECT:/NO:" but prepends
-        # ANY preamble line ("Here is my verdict:\nREVISE: fix the ending")
-        # had its rejection silently dropped and the chapter fail-opened to
-        # APPROVED — while the identical reply in Russian was correctly
-        # REVISE. The protocol is "first token of a LINE", so scan each line
-        # rather than only the candidate's own start. Kept AFTER the two
-        # startswith checks and BEFORE the Russian heuristics: every input
-        # that already returned a definite verdict is byte-for-byte
-        # unchanged, and an explicit English protocol token outranks the
-        # fuzzy Russian keyword match (a bare «одобряю» elsewhere in the text
-        # must not override an explicit "REVISE:" line).
+        # A verdict on a later line behind a preamble is found too, since the protocol is the first token of a line (AUTO-BUG).
         for _line in raw.splitlines():
             _lu = _line.strip().upper()
             if not _lu:
                 continue
-            # Same caveat guard as the top-level check above, applied
-            # per-line so a caveat on a later line (behind a preamble) is
-            # also caught before the bare OK-prefix match below.
+            # The same caveat check, per line, so a caveat behind a preamble is also caught.
             _line_ok_caveat = _ok_caveat_reason(_line)
             if _line_ok_caveat is not None:
                 return False, _line_ok_caveat, False
@@ -1246,9 +1003,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
                 reason = _reason_from(raw.strip(), norm)
                 return False, reason, False
 
-        # Only the *first* non-empty line is tried for the line-first pass.
-        # Break after processing the first candidate so that the second
-        # candidate (whole text) is only reached when the first line had no match.
+        # The line-first pass uses only the first non-empty line.
         if raw == first_line:
             # did not match on first line — try whole text next iteration
             continue
@@ -1263,11 +1018,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
 def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
     """Build a structured rejection string from a Gate-2 dict (LOOP-1)."""
     feedback = parsed.get("feedback", "no reason given")
-    # BUGFIX: an LLM may return "hints" as a string instead of a list
-    # ("fix the ending" rather than ["fix the ending"]). Without a type
-    # guard, [:max_hints] slices the string and enumerate() iterates over
-    # individual characters ("1. f", "2. i", "3. x"). Wrap a string in a
-    # list so it is treated as a single hint; drop any other non-list type.
+    # A hints string is wrapped as one hint, so it is not sliced character by character (BUGFIX).
     raw_hints = parsed.get("hints")
     if isinstance(raw_hints, list):
         hints = raw_hints
@@ -1288,41 +1039,20 @@ def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RUN-3: exec-failure detail — for a test runner the cause is at the tail
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# The feedback the coder gets after a failed acceptance check used to be the
-# first 400 characters of the winning stream. For a script that is the
-# interesting part; for pytest it is xdist's "bringing up nodes..." banner
-# plus the frame of the error box, and the one line that says what went
-# wrong (``E   ModuleNotFoundError: …``) sits at the END of the box. Live
-# runs on ../testtext and ../testtext6: 438 executor rejections, every exit-1
-# collection error and every exit-5 run cut before that line — AUTO-T11
-# re-emitted the same file 25 times.
+# Failure detail: the coder gets the tail of the output, where the one-line error sits (RUN-3).
 
 # Head budget, unchanged, for non-pytest commands.
 _EXEC_HEAD_BUDGET = 400
-# Tail budget for a pytest run: 400 characters do not hold one collection
-# error; the validator prompt already allows 2 000 for this same stream.
+# Tail budget for a pytest run; 400 characters are too few for one collection error.
 _EXEC_TAIL_BUDGET = 1500
 
-# pytest exit 5 is "no tests were collected" — the one exit code whose output
-# carries no diagnostic at all, so the coder gets the interpretation spelled
-# out instead of a code from a table it does not have.
+# Pytest exit 5 means no tests were collected; the coder is told so in words (RUN-3).
 _NO_TESTS_COLLECTED_MSG = (
     "no tests collected — the -k expression matched nothing "
     "or the file defines no test_* function"
 )
 
-# The two report sections that hold the ``E   …`` line:
-#   ==================================== ERRORS ====================================
-#   =================================== FAILURES ===================================
-# ``short test summary info`` is deliberately NOT an anchor: pytest prints it
-# AFTER the boxes, so starting there would hand the coder the one-line digest
-# and drop the diagnostic line this fix exists to deliver. It still arrives —
-# it follows the last box — and it is what the plain-tail fallback shows when
-# there is no box at all.
+# Report sections that hold the error line (ERRORS, FAILURES); the summary is not an anchor, since it comes last (RUN-3).
 _PYTEST_BOX_HEADER_RE = re.compile(r"^=+ (?:ERRORS|FAILURES) =+\s*$", re.MULTILINE)
 # xdist prints one of these per worker while the pool starts.
 _XDIST_BANNER_RE = re.compile(r"^\s*bringing up nodes\.\.\.\s*$")
@@ -1405,9 +1135,7 @@ def _build_exec_detail(exec_result) -> str:
     return detail
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # InnerLoop
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _trace_stage(task_id: str, attempt: int, stage: str, content: str, **extra) -> None:
     """AUTO-CR-27: emit one stage-decision trace event. Never raises — tracing
@@ -1462,10 +1190,7 @@ class InnerLoop:
         self.validator    = validator
         self.max_attempts = max(1, int(max_attempts))
         self._broker      = context_broker or ContextBroker()
-        # COLLECT-24: tools.auto.collect_bridge.CollectBridge or None.
-        # Used both for the static per-task block prepended below in
-        # run_task(), and (already wired into self._broker by the caller,
-        # typically make_inner_loop) for pull-model symbol resolution.
+        # The collect bridge serves the static block and pull-model lookups (COLLECT-24).
         self._collect_bridge = collect_bridge
         # AUTO-CR-7: optional periodic canon/fact gate (creative mode only).
         self.canon_validator = canon_validator
@@ -1473,12 +1198,9 @@ class InnerLoop:
         self.fact_validator  = fact_validator
         # AUTO-CR-21: optional Russian rhythm/rhyme gate (creative mode only).
         self.prosody_validator = prosody_validator
-        # AUTO-CR-23-3: optional continuity gate vs bible + previous chapter
-        # (creative mode only).
+        # Optional continuity gate against the bible and the previous chapter (creative mode only, AUTO-CR-23-3).
         self.continuity_validator = continuity_validator
-        # podrugi-3: optional theme/content gate vs story-level guidelines
-        # (creative mode only) — the one gate that judges WHAT the chapter
-        # says, not whether it is consistent.
+        # The theme gate judges what the chapter says against the story guidelines (creative mode only).
         self.theme_validator = theme_validator
         self.existence_validator = existence_validator
         # selfhost pilot: deterministic tests-mandate gate for code mode.
@@ -1486,17 +1208,9 @@ class InnerLoop:
         self.task_mode    = str(task_mode)
         # AUTO-CR-21-4: hard wall-clock cap per task; 0 disables the guard.
         self.max_task_seconds = max(0, int(max_task_seconds))
-        # AUTO-CR-22-1: run-level goal, propagated into per-task gate checks
-        # whenever a task's own "goal" key is absent — the architect emits
-        # only title/instruction per task, so the gates (fact/prosody) would
-        # otherwise only see the keyword if it happened to be echoed into the
-        # per-task instruction text.
+        # The run goal is used by per-task gates when a task has no goal of its own (AUTO-CR-22-1).
         self._run_goal    = str(run_goal or "")
-        # RUN-7: bounds on re-running ONLY the Gate-2 validator call when it
-        # reports "unavailable" rather than a verdict. 0 retries = one call,
-        # then the round is left unreviewed. Guarded here as well as in
-        # make_inner_loop so a direct caller (tests, embedders) handing over a
-        # bad value degrades to the default instead of raising into a run.
+        # Gate-2 retry bounds are checked here too, so a bad value falls back to the default instead of raising (RUN-7).
         try:
             self._validator_unavailable_retries = max(0, int(validator_unavailable_retries))
         except (TypeError, ValueError):
@@ -1505,8 +1219,7 @@ class InnerLoop:
             self._validator_unavailable_wait_sec = max(0.0, float(validator_unavailable_wait_sec))
         except (TypeError, ValueError):
             self._validator_unavailable_wait_sec = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC
-        # RUN-8: same guards — a bad value degrades to the default rather
-        # than raising into a run.
+        # A bad value degrades to the default, not an error (RUN-8).
         try:
             self._coder_transport_retries = max(0, int(coder_transport_retries))
         except (TypeError, ValueError):
@@ -1560,16 +1273,9 @@ class InnerLoop:
         task_id = task.get("id", "")
         feedback: list[str] = list(prior_feedback or [])
         _prior_validator_critique: str = ""   # AUTO-CR-30: last Gate-2 critique
-        # RUN-7: only a validator that exposes approve_verdict() can ever
-        # report `unavailable` (a fake/older validator with just approve()
-        # keeps today's two-outcome behaviour — approve()'s own tuple return
-        # is unchanged and carries no such distinction).
+        # Only a validator with approve_verdict() can report unavailable; older validators keep the two-outcome behaviour (RUN-7).
         _validator_has_verdict = hasattr(self.validator, "approve_verdict")
-        # AUTO-CR-30: detect (once) whether the validator method we will
-        # actually call accepts prior_critique, so we never break fakes/older
-        # validators that don't. RUN-7: that is approve_verdict() when the
-        # validator has one — inspecting approve() instead would pass the
-        # kwarg to a method that may not take it.
+        # Detect once whether the validator accepts prior_critique, so older validators are not broken (AUTO-CR-30, RUN-7).
         try:
             import inspect as _inspect
             _validator_method = (
@@ -1587,25 +1293,14 @@ class InnerLoop:
         prefetched_context: str = ""
         resolved_context: dict[str, str] = {}   # accumulates every symbol the validator has asked for
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
-        # GATES-1: one counter per gate, keyed by GateSpec.name, replacing the
-        # five separate _<gate>_revisions locals. run_gates mutates it in place.
+        # One revision counter per gate, keyed by GateSpec.name; run_gates updates it in place (GATES-1).
         _gate_revisions: dict[str, int] = {}
         _tests_mandate_rejections: int = 0  # selfhost: code-without-tests rejections
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
 
-        # COLLECT-24: static per-task collect context, computed once per task
-        # (not per attempt) and seeded into prefetched_context before the
-        # first coder call. Purely additive: "" when no bridge was wired in,
-        # the model is absent/stale, or target_files have no collect record.
-        # OPT-1: computed once and kept in a local for the whole round. The
-        # pull-model reassignments below (`prefetched_context =
-        # format_for_prompt(...)`) replace the WHOLE string, so this seeded
-        # block was silently dropped the first time the coder asked for extra
-        # context -- the collect record vanished from the prompt at exactly
-        # the point the coder had admitted it was missing something. Both
-        # reassignment sites re-prepend it via _with_collect_block().
+        # Collect context is computed once per task and re-added after every context reassignment, so it is not lost (COLLECT-24).
         _collect_block = ""
         if self._collect_bridge is not None:
             _collect_block = self._collect_bridge.context_for_many(
@@ -1626,19 +1321,14 @@ class InnerLoop:
                 return _collect_block + "\n\n"
             return _collect_block + "\n\n" + formatted
         _start_time = time.monotonic()  # AUTO-CR-21-4: wall-clock guard reference point
-        # AUTO-CR-33: prefer a task-wide deadline shared across rounds; fall back
-        # to a per-call budget when called standalone (no deadline passed).
+        # A task-wide deadline is shared across rounds; standalone calls use a per-call budget (AUTO-CR-33).
         if deadline is not None:
             _eff_deadline = deadline
         elif self.max_task_seconds > 0:
             _eff_deadline = _start_time + self.max_task_seconds
         else:
             _eff_deadline = None
-        # RUN-8: seconds returned to the deadline by coder calls that ended in
-        # a transport failure. Credited against _eff_deadline in the coder step
-        # below as they happen, and handed back to the outer loop with the
-        # result so its own shared _task_deadline is not short the same
-        # seconds. 0.0 when nothing died on the wire or there is no deadline.
+        # Seconds returned to the deadline by coder calls that died on the wire (RUN-8).
         _deadline_credit_s = 0.0
 
         # LOOP-4: prepend prior implementation history
@@ -1655,19 +1345,10 @@ class InnerLoop:
 
         for attempt in range(1, self.max_attempts + 1):
 
-            # ── AUTO-CR-21-4 / CR-33: hard wall-clock guard (task-wide) ──────
-            # Independent safety valve for pathological tasks (e.g. the CR-21
-            # rhythm/rhyme runaway), with the deadline shared across outer-loop
-            # rounds (CR-33) so the cap is the real per-task budget, not budget
-            # × rounds. None disables the guard.
+            # Hard wall-clock guard for the whole task, shared across rounds; None disables it (AUTO-CR-21-4, CR-33).
             if _eff_deadline is not None:
                 if time.monotonic() >= _eff_deadline:
-                    # BUGFIX (audit): this always attributed the deadline to
-                    # max_task_seconds, even when _eff_deadline actually came
-                    # from the `deadline` parameter (the outer-loop's
-                    # task-wide budget shared across rounds) — e.g. logging
-                    # "0s from max_task_seconds" when max_task_seconds is 0
-                    # but a real shared deadline was passed in and reached.
+                    # The log names the real source of the deadline, the shared budget or max_task_seconds (BUGFIX).
                     if deadline is not None:
                         logger.warning(
                             "InnerLoop: task wall-clock limit reached (from the "
@@ -1694,21 +1375,12 @@ class InnerLoop:
                         deadline_credit_s=_deadline_credit_s,
                     )
 
-            # ── 1. Coder ──────────────────────────────────────────────────────
-            # RUN-8: a coder call that died before the model could answer
-            # (CoderResult.error_kind == "transport") is not an attempt —
-            # nothing was produced, so there is nothing to feed back and no
-            # attempt to charge. Re-run ONLY the call, on the same attempt
-            # number, without appending a feedback line and without touching
-            # prior_feedback. Any result without the field (a fake or older
-            # coder) is treated as today's charged attempt.
+            # 1. Coder: a call that died before any answer is re-run without charging an attempt or adding feedback (RUN-8).
             _coder_calls_allowed = 1 + self._coder_transport_retries
             _transport_exhausted = False
             _coder_raised: Exception | None = None
             for _c_call in range(_coder_calls_allowed):
-                # Measured so the call can give its wall-clock back to the
-                # shared deadline below: time spent waiting on a dead socket
-                # is not this task's budget.
+                # Time spent on a dead socket is given back to the shared deadline, not charged to the task (RUN-8).
                 _call_start = time.monotonic()
                 try:
                     coder_result = self.coder.generate(
@@ -1760,11 +1432,7 @@ class InnerLoop:
                 continue
 
             if _transport_exhausted:
-                # RUN-8: every re-run died before the model answered — this
-                # attempt produced nothing, so it is not charged
-                # (attempts_used below excludes it) and NO feedback line is
-                # appended: the coder must not be told it failed when it
-                # never got to say anything. Same left-todo exit as RUN-7.
+                # Every re-run died before the model answered: the attempt is not charged and the coder gets no feedback line (RUN-8).
                 logger.warning(
                     "InnerLoop: task %s attempt %d — coder transport failure "
                     "after %d call(s): %s",
@@ -1789,10 +1457,7 @@ class InnerLoop:
             if coder_missing or not getattr(coder_result, "context_satisfied", True):
                 _any_missing = True
             if coder_missing:
-                # Accumulate into the SAME running context as the validator path
-                # so neither side clobbers the other's pulls (was: overwrite via
-                # fetch(), which dropped reviewer-accumulated context when the
-                # next rejection carried no missing_context of its own).
+                # Coder pulls accumulate into the same context as validator pulls, so neither overwrites the other.
                 newly = self._broker.resolve(coder_missing, target_files, base_dir_path)
                 resolved_context.update(newly)
                 prefetched_context = _with_collect_block(
@@ -1800,16 +1465,10 @@ class InnerLoop:
                 logger.info("InnerLoop: attempt %d coder requested context %s — accumulated (%d total)",
                             attempt, coder_missing, len(resolved_context))
 
-            # RUN-1: paths outside target_files were dropped by the coder's
-            # allow-list guard. Collected before the success check so the
-            # REJECTED trace (nothing landed at all) can name them too.
+            # Paths the coder was not allowed to touch are collected before the success check, so a rejected run can name them (RUN-1).
             files_skipped = list(getattr(coder_result, "files_skipped", []) or [])
 
-            # RUN-4: the budget this attempt went out at, plus whether its
-            # cut-off reply just raised it for the next one. The ladder is
-            # only visible on the coder decision events, so
-            # trace_round_snapshot.py counts it from these two params. Fakes
-            # without the fields add nothing.
+            # The budget this attempt used, and whether its cut-off reply raised it, is recorded for the round trace (RUN-4).
             _budget = int(getattr(coder_result, "max_tokens", 0) or 0)
             _trace_extra: dict = {}
             if _budget:
@@ -1818,9 +1477,7 @@ class InnerLoop:
                     getattr(coder_result, "budget_raised", False))
 
             if not getattr(coder_result, "succeeded", True):
-                # Context is accumulated above even on coder failure: the next
-                # attempt benefits from symbols already resolved, regardless of
-                # whether the current attempt produced valid code.
+                # Context is kept even when the coder failed: the next attempt benefits from symbols already resolved.
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
                 _trace_stage(task_id, attempt, "coder", "REJECTED",
                              skipped=files_skipped, **_trace_extra)
@@ -1828,14 +1485,7 @@ class InnerLoop:
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
 
-            # RUN-1: a `target_files` skip is protection, not a verdict — the
-            # attempt goes on to the executor, but the model must still learn
-            # that its extra files never hit disk, otherwise a test file it
-            # "wrote" will be missing when it reasons about the next round.
-            # The note must not read "coder failed": _write_round_feedback and
-            # the prompt-optimizer summariser key on that prefix to mean a
-            # rejected attempt. Traced through the existing coder stage (no new
-            # event kind) so trace_round_snapshot / the M5 harness can count it.
+            # Skipped paths are noted in the feedback so the model knows they never hit disk, without calling it a failure (RUN-1).
             if files_skipped:
                 _trace_stage(task_id, attempt, "coder", "OK_WITH_SKIPS",
                              written=list(getattr(coder_result, "files_written", []) or []),
@@ -1895,11 +1545,7 @@ class InnerLoop:
             if not getattr(exec_result, "passed", False):
                 ec  = getattr(exec_result, "exit_code", 1)
                 cmd = getattr(exec_result, "command",   "") or ""
-                # Include stderr so argparse / runtime error messages reach the coder.
-                # Priority: traceback > stderr > stdout (most diagnostic first).
-                # RUN-3: for a pytest run the stdout slice is the TAIL — the
-                # head is xdist's banner and the top of the error box, and
-                # the E-line that names the cause used to be cut at 400 chars.
+                # Stderr is included, and the pytest tail is kept, since the error line sits at the end (RUN-3).
                 detail = _build_exec_detail(exec_result)
                 fb  = (
                     f"attempt {attempt}: exec failed (exit {ec})"
@@ -1911,20 +1557,12 @@ class InnerLoop:
                 records.append(AttemptRecord(attempt, True, False, False, fb))
                 continue
 
-            # ── 3. Validator (subjective half of Gate 2) ─────────────────────
-            # AUTO-CR-30: only pass prior_critique to validators that accept
-            # it (real LLMGate2Validator); fakes/older validators are unaffected.
+            # 3. Validator: prior critique is passed only to validators that accept it (AUTO-CR-30).
             _ap_kwargs = {"base_dir": base_dir_path}
             if _validator_accepts_prior:
                 _ap_kwargs["prior_critique"] = _prior_validator_critique
 
-            # RUN-7: "validator unavailable: …" (a transport/parse error) is
-            # not a verdict. Re-run ONLY this call — the coder output and the
-            # executor result are still valid — up to
-            # validator_unavailable_retries times, then give up on the WHOLE
-            # round rather than charge the attempt as a rejection. A model
-            # that answered {"approved": false} is a rejection however terse:
-            # Gate2Verdict.unavailable is set only on approve()'s except exit.
+            # A validator outage is re-run alone, up to the retry limit; only an explicit answer counts as a rejection (RUN-7).
             approved = None
             vfb = ""
             _gate2_unavailable = False
@@ -1940,9 +1578,7 @@ class InnerLoop:
                         vfb      = verdict.feedback()
                         _gate2_unavailable = bool(getattr(verdict, "unavailable", False))
                     else:
-                        # A fake/older validator with only approve() keeps
-                        # today's behaviour: its tuple carries no third
-                        # outcome, so an outage string stays a rejection.
+                        # An older validator keeps the two-outcome behaviour, since its result has no unavailable marker (RUN-7).
                         approved, vfb = self.validator.approve(
                             task, exec_result, coder_result, **_ap_kwargs
                         )
@@ -1976,11 +1612,7 @@ class InnerLoop:
                 continue
 
             if _gate2_unavailable:
-                # RUN-7: every retry came back unavailable — this attempt is
-                # NOT charged (attempts_used below excludes it) and NO
-                # feedback line is appended: the coder must not be told the
-                # reviewer rejected it when no reviewer ever answered.
-                # _prior_validator_critique is untouched by design.
+                # A round where every retry was unavailable is not charged, and the coder gets no rejection feedback (RUN-7).
                 logger.warning(
                     "InnerLoop: task %s attempt %d — gate2 validator still "
                     "unavailable after %d call(s): %s",
@@ -2025,16 +1657,7 @@ class InnerLoop:
                     )
                 continue
 
-            # ── APPROVED ──────────────────────────────────────────────────────
-            # GATES-1: the five Gate-3 gates (canon, fact, continuity, theme,
-            # prosody) used to live here as five hand-written, structurally
-            # identical ~65-line blocks. They are now declared once in
-            # tools/auto/gate_registry.GATES and executed by a single shared
-            # runner, so the fail-open + revision-cap policy exists in exactly
-            # one place and gate ORDER is data rather than statement order.
-            # Behaviour is intentionally unchanged, including the per-gate
-            # quirks (canon's should_check file filter, its skip-check-when-
-            # capped branch, and its unprefixed AttemptRecord text).
+            # The Gate-3 gates run from one registry, so the fail-open and revision policy lives in one place (GATES-1).
             _rejection = run_gates(
                 self,
                 task=task,
@@ -2080,9 +1703,7 @@ class InnerLoop:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 def resolve_validator_llm_profile(config, *, base_url, api_key, model,
                                   api_format, num_ctx, verify_ssl,
@@ -2178,12 +1799,9 @@ def make_inner_loop(
     system prompts).  Defaults to ``"code"`` — no behavioural change for
     existing call sites.
     """
-    # AUTO-CR-16: creative editing/review benefits from more coder→review→
-    # revise cycles than code. Prefer a creative-specific cap when set.
+    # Creative editing gets a larger cap on coder, review and revise cycles than code (AUTO-CR-16).
     from tools.auto.utils import _cfg_mode
-    # Bugfix (config-crash audit): _cfg_mode returns the raw string by
-    # contract (callers cast), so a malformed max_attempts_per_task value
-    # crashed this int() with no fallback.
+    # A malformed retry count falls back to the default instead of crashing (config-crash audit).
     try:
         max_attempts = int(_cfg_mode(
             config, "auto", "max_attempts_per_task", task_mode,
@@ -2200,12 +1818,7 @@ def make_inner_loop(
     active_profile = config.get("api", "active", fallback="local")
     api_section    = f"api_{active_profile}"
 
-    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
-    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
-    # each literal config.getX(...) call shape — see
-    # RunLimits.from_config's comment for the full reasoning. (This is the
-    # actual source of the values LLMGate2Validator.__init__ receives as
-    # plain args — the unguarded reads lived here, not in __init__ itself.)
+    # Config reads are guarded per call, so one bad value cannot crash construction (AUTO-FIX).
     base_url   = config.get(api_section, "base_url",   fallback="http://localhost:1337/v1")
     api_key    = config.get(api_section, "api_key",    fallback="jan")
     model      = config.get(api_section, "model",      fallback="qwen2.5-14b-instruct")
@@ -2251,9 +1864,7 @@ def make_inner_loop(
     except ValueError as exc:
         logger.warning("config [auto] workspace_retain_count invalid (%s) — using 5", exc)
         ws_retain = 5
-    # RUN-3: workspace pytest runs in-process unless the project opts back
-    # into the xdist pool. safe_getboolean returns the fallback for an absent
-    # [executor] section, a missing key and a malformed value alike.
+    # Serial pytest is read with a safe fallback for a missing section, key or bad value (RUN-3).
     pytest_serial = safe_getboolean(config, "executor", "pytest_serial", fallback=True)
 
     # ── Coder ─────────────────────────────────────────────────────────────────
@@ -2314,10 +1925,7 @@ def make_inner_loop(
             **_val_kwargs,
         )
 
-    # ── ContextBroker ─────────────────────────────────────────────────────────
-    # COLLECT-24: collect_bridge is threaded into the broker so pull-model
-    # symbol resolution (Pass 3) can answer from collect facts, in addition
-    # to InnerLoop.run_task's own static per-task block using the same bridge.
+    # The collect bridge is passed to the context broker, so pull-model lookups can use collect facts (COLLECT-24).
     try:
         _max_symbols = config.getint("context_broker", "max_symbols", fallback=20)
     except ValueError as exc:
@@ -2328,23 +1936,15 @@ def make_inner_loop(
         collect_bridge=collect_bridge,
     )
 
-    # ── GATES-1: Gate-3 validators, built from the declarative registry ───────
-    # Five near-identical try/import/make_X blocks collapsed into one loop.
-    # build_validators applies the same never-block-the-loop-on-setup rule
-    # each block had: a factory that raises or is missing yields None, which
-    # run_gates reads as "this gate is off".
+    # The Gate-3 validators are built from the registry; a factory that fails yields None, which means the gate is off.
     _gate_validators = build_validators(
         config, base_dir, task_mode=task_mode, broker=broker,
     )
-    # GATES-2: resolved once here rather than per attempt, and attached to
-    # the loop so run_gates honours the configured [gates] order.
+    # The gate order is resolved once here, so run_gates honours the configured [gates] order (GATES-2).
     _gate_order = resolve_gate_order(config, task_mode)
 
 
-    # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
-    # Bugfix (config-crash audit): both reads were unguarded. Wrapped
-    # per-call, not via a helper, so extract_config_reads still sees the
-    # literal calls.
+    # The per-task wall-clock guard reads are guarded per call, so a bad value falls back to the default (AUTO-CR-21-4).
     try:
         max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
     except ValueError as exc:
@@ -2363,11 +1963,7 @@ def make_inner_loop(
         )
         require_tests = False
 
-    # RUN-7: how many times to re-run ONLY the Gate-2 validator call when it
-    # came back without a verdict (transport/parse error) before the round is
-    # left unreviewed, and the pause between those calls. The pause reuses
-    # [collect] error_retry_wait_sec — the same outage-class wait the collect
-    # summarizer already reads — so an operator tunes one knob for both.
+    # Validator re-runs and their pause come from the [collect] outage-wait knob, so one setting tunes both (RUN-7).
     try:
         validator_unavailable_retries = config.getint(
             "auto", "validator_unavailable_retries",
@@ -2391,11 +1987,7 @@ def make_inner_loop(
         )
         validator_unavailable_wait_sec = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC
 
-    # RUN-8: how many times to re-run ONLY the coder call when it came back
-    # without the model having answered at all (CoderResult.error_kind ==
-    # "transport" — a stream-read timeout, URLError, HTTPError). The wait
-    # between those calls reuses [collect] error_retry_wait_sec, the same
-    # outage-class knob the validator re-runs above read.
+    # Coder re-runs on a dead call, with the same outage-wait knob as the validator (RUN-8).
     try:
         coder_transport_retries = config.getint(
             "auto", "coder_transport_retries",

@@ -39,10 +39,7 @@ def _run(tmp_path: Path, *files: Path, extra=()) -> tuple[int, str, str]:
         (truth.read_text(encoding="utf-8") if truth.exists() else "")
 
 
-# ── bug: a finding every adjudicator left UNDECIDED vanished ─────────────────
-# `distinct` (the votes that are not UNDECIDED) is empty, so the finding was neither
-# settled nor disputed: not in the report, not in the truth file, counted in
-# "findings" only, and the exit code said nothing was left open.
+# Regression: a finding every adjudicator left UNDECIDED vanished from the report.
 
 def test_a_finding_everyone_left_undecided_is_reported_and_leaves_the_run_open(tmp_path):
     a = _csv(tmp_path / "truth-alice.csv", [{"finding": "a.py::open", "truth": "UNDECIDED", "how": "unsure"}])
@@ -70,10 +67,7 @@ def test_the_counts_add_up(tmp_path):
     assert "2 findings · 1 settled · 1 disputed" in report
 
 
-# ── bug: `--arbiter` was compared with the lower-cased adjudicator names ──────
-# Adjudicators are named from the file stem, lower-cased (`truth-Bob.csv` → `bob`), but
-# the arbiter was compared as typed: `--arbiter Bob` never matched and the split stayed
-# open without a word.
+# Regression: --arbiter was compared as typed, not with the lower-cased adjudicator names.
 
 def _split(tmp_path: Path) -> tuple[Path, Path]:
     a = _csv(tmp_path / "truth-alice.csv", [_real("b.py::split", "HIGH")])
@@ -102,10 +96,7 @@ def test_without_an_arbiter_a_split_stays_open(tmp_path):
     assert code == 4 and "Disputed (1)" in report and "b.py::split" not in truth
 
 
-# ── bug: the reported severity was the longest word, not the most severe ─────
-# `longest()` is for the text fields (consequence, evidence, how); it picked the
-# severity too, so MEDIUM (6 letters) beat HIGH (4), and the "Confirmed real" list,
-# which is sorted by severity, ranked the finding by the lower rating.
+# Regression: the reported severity was the longest word, not the most severe.
 
 def test_the_most_severe_rating_is_the_one_reported(tmp_path):
     a = _csv(tmp_path / "truth-alice.csv", [_real("c.py::sev", "HIGH")])

@@ -42,20 +42,17 @@ def test_heading_section_extracted():
     section = extract_prose_section(source, "The Pact", ".md")
     assert "## The Pact" in section
     assert "They swore an oath under the broken beam." in section
-    # Stops at the next heading of equal-or-higher level — sibling and
-    # next-chapter content must NOT leak in.
+    # Stops at the next heading of equal or higher level: sibling and next-chapter text must not leak in.
     assert "Aftermath" not in section
     assert "Chapter 2" not in section
 
-    # A full-chapter heading query returns the whole chapter, including its
-    # sub-headings, up to the next top-level heading.
+    # A chapter heading returns the whole chapter, including sub-headings, up to the next top-level heading.
     chapter = extract_prose_section(source, "Chapter 1: The Beginning", ".md")
     assert "The Pact" in chapter
     assert "Aftermath" in chapter
     assert "Chapter 2" not in chapter
 
-    # Substring/fragment match also resolves (query is a fragment of the
-    # heading text, case-insensitive).
+    # A fragment of the heading text matches too, case-insensitively.
     fragment = extract_prose_section(source, "the storm", ".md")
     assert "The sea rose against the cliffs." in fragment
 
@@ -105,8 +102,7 @@ def test_broker_searches_earlier_chapters_first():
         assert "from the rocks" in block
         assert "years later" not in block
 
-    # Out-of-numeric-order filenames on disk must not change the result —
-    # the broker sorts by chapter number, not directory listing order.
+    # Filename order on disk does not matter: the broker sorts by chapter number.
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         (d / "chapter_10.md").write_text(
@@ -141,8 +137,7 @@ def test_code_symbol_path_unchanged():
         assert resolved["my_helper"].strip() == direct.strip()
         assert "def my_helper(x):" in resolved["my_helper"]
 
-    # A mixed project (code + prose) must route each file through the
-    # correct strategy independently.
+    # A mixed code and prose project routes each file through its own strategy.
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         (d / "chapter_1.md").write_text("# Chapter 1\n\nThe Dragon woke.\n")

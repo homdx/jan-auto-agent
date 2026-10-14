@@ -46,9 +46,7 @@ from tools.auto.architect import (
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def cfg() -> configparser.ConfigParser:
@@ -121,9 +119,7 @@ def _make_candidate(title: str = "Fix something") -> CandidateTask:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RETRY — AC-R1 through AC-R6
-# ─────────────────────────────────────────────────────────────────────────────
+# Retry: AC-R1 to AC-R6
 
 class TestRetryOnTransientErrors:
 
@@ -233,9 +229,7 @@ class TestRetryOnTransientErrors:
         mock_sleep.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BATCH CLUSTER-NAME NORMALISATION (AUTO-T1 regression)
-# ─────────────────────────────────────────────────────────────────────────────
+# Batch cluster-name normalisation (AUTO-T1 regression)
 
 class TestBatchClusterNameNormalisation:
     """A cluster large enough to need more than one review batch must still
@@ -286,9 +280,7 @@ class TestBatchClusterNameNormalisation:
             verify_ssl=False,
         )
 
-        # Batch 1/2 is only shown tools/a.py, but the LLM cites tools/b.py —
-        # a real file belonging to the SAME cluster, just not to the batch
-        # actually under review. Batch 2/2 (tools/b.py) reports nothing.
+        # Batch 1 sees tools/a.py, but the LLM cites tools/b.py from the same cluster; batch 2 reports nothing.
         cross_batch_payload = json.dumps([{
             "title": "Cross-batch citation",
             "instruction": "Do the fix.",
@@ -312,9 +304,7 @@ class TestBatchClusterNameNormalisation:
         assert results[0].cluster == "agents"
         assert "(batch" not in results[0].cluster
 
-    # Guards against a regression in the other direction: a cluster small
-    # enough to fit in a single batch never had a suffix to strip, so the
-    # fix must be a true no-op for the common (non-batched) case.
+    # A single-batch cluster has no suffix to strip: the fix must be a no-op for the common case.
     def test_single_batch_cluster_name_unaffected(
         self, reviewer: ClusterReviewer, cluster_and_base
     ) -> None:
@@ -326,9 +316,7 @@ class TestBatchClusterNameNormalisation:
         assert results[0].cluster == "agents"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHECKPOINT — AC-C1 through AC-C9
-# ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint: AC-C1 to AC-C9
 
 class TestCandidateSerialisation:
 

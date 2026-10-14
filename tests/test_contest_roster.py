@@ -57,8 +57,7 @@ from tools.contest.roster import (
     load_roster,
 )
 
-# Hermetic: the committed contest.ini alone, copied where no contest.local.ini sits next to
-# it, so an operator's local overrides never change what these tests see.
+# Hermetic: only the committed contest.ini is read, so local overrides never change these tests.
 _COMMITTED_DIR = Path(tempfile.mkdtemp(prefix="committed-ini-"))
 atexit.register(shutil.rmtree, _COMMITTED_DIR, ignore_errors=True)
 shutil.copy(REPO_ROOT / "contest.ini", _COMMITTED_DIR / "contest.ini")
@@ -68,8 +67,7 @@ LOCAL = "contest.local.ini"
 #: The api_key the committed contest.ini asks the environment for.
 GATE_KEY_ENV = "CONTEST_GATE_API_KEY"
 
-#: The rules the probe sent in every session (PROBE.md) — the first three of
-#: every rule list, before the deny_commands are appended.
+#: The rules the probe sends in every session, before deny_commands are appended (PROBE.md).
 PROBE_RULES = [
     {"permission": "*", "pattern": "*", "action": "allow"},
     {"permission": "external_directory", "pattern": "*", "action": "ask"},
@@ -94,9 +92,7 @@ model = kenary/hy3:free
 """
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
 
 def write_ini(directory: Path, text: str, name: str = "contest.ini") -> Path:
     """Write *text* as a roster in *directory* and return its path."""
@@ -127,9 +123,7 @@ def gate_key(monkeypatch):
     return "test-gate-key"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the committed contest.ini
-# ─────────────────────────────────────────────────────────────────────────────
+# The committed contest.ini
 
 def test_committed_contest_ini_loads(gate_key):
     cfg = load_roster(COMMITTED)
@@ -190,9 +184,7 @@ def test_committed_api_key_is_an_env_reference_not_a_secret():
     assert "<token>" not in text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the model split
-# ─────────────────────────────────────────────────────────────────────────────
+# The model split
 
 def test_model_splits_at_the_first_slash(tmp_path):
     path = write_ini(
@@ -229,9 +221,7 @@ def test_model_without_a_slash_names_its_section(tmp_path):
         load_roster(write_ini(tmp_path, text))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# fail closed: typos are found at load time, naming themselves
-# ─────────────────────────────────────────────────────────────────────────────
+# Fail closed: typos are found at load time, naming themselves
 
 def test_unset_env_reference_names_the_section_and_key(tmp_path):
     text = add_to_contest(MINIMAL, "out_dir = ${SURELY_NOT_SET_ROSTER}")
@@ -293,9 +283,7 @@ def test_unreadable_overlay_names_it(tmp_path):
                     overlay=tmp_path / "no-such-overlay.ini")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# fail open: an absent or malformed value falls back, it never aborts a round
-# ─────────────────────────────────────────────────────────────────────────────
+# Fail open: an absent or malformed value falls back; it never aborts a round
 
 def test_absent_keys_take_their_documented_defaults(tmp_path):
     text = """
@@ -447,8 +435,7 @@ max_continues_per_attempt = %s
 model = kenary/hy3:free
 """
     assert load_roster(write_ini(tmp_path, base % "1")).max_continues_per_attempt == 1
-    # 0 disables the mechanism; a negative value parses to itself and the
-    # runner's `> 0` guard reads it as off, like the other [contest] ints.
+    # 0 turns the mechanism off; a negative value is read as off too, like the other [contest] ints.
     assert load_roster(write_ini(tmp_path, base % "0")).max_continues_per_attempt == 0
     assert load_roster(write_ini(tmp_path, base % "-1")).max_continues_per_attempt == -1
 
@@ -475,9 +462,7 @@ def test_malformed_gate_boolean_falls_back_inside_the_profile(tmp_path):
     assert load_roster(write_ini(tmp_path, text)).gate_settings.response_format is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# layers: contest.ini -> contest.local.ini -> overlay
-# ─────────────────────────────────────────────────────────────────────────────
+# Layers: contest.ini, then contest.local.ini, then the overlay
 
 def test_local_ini_overrides_the_api_key(tmp_path):
     base = write_ini(tmp_path, MINIMAL.replace("api_key = test-key",
@@ -542,9 +527,7 @@ def test_env_reference_in_an_ignored_section_is_not_expanded(tmp_path):
     assert load_roster(write_ini(tmp_path, text)).gate_settings.api_key == "test-key"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the session rules: one place, the probe's shape
-# ─────────────────────────────────────────────────────────────────────────────
+# Session rules: one place, the probe's shape
 
 def test_session_rules_are_the_probe_rules_then_one_deny_per_command():
     rules = ContestConfig(deny_commands=("git push*", "sudo *", "rm -rf /*")).session_rules()
@@ -634,9 +617,7 @@ def test_committed_rules_match_the_probe(gate_key):
     assert list(BASE_RULES) == PROBE_RULES
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the gate profile
-# ─────────────────────────────────────────────────────────────────────────────
+# The gate profile
 
 def test_gate_settings_comes_from_resolve_llm_profile(monkeypatch, tmp_path):
     calls = []
@@ -668,12 +649,7 @@ def test_gate_defaults_answer_in_json():
 
 
 def test_gate_profile_reads_the_committed_section(gate_key, tmp_path):
-    # The operator's real gate lives in a git-ignored contest.local.ini next to
-    # the committed file, so `load_roster(COMMITTED)` layers it on and reddens
-    # these placeholders on exactly the machines configured to run rounds. Read
-    # the committed section straight from HEAD, into a directory with no local
-    # override, so the test asserts what is committed and nothing the operator
-    # put beside it.
+    # Read the committed section from HEAD, with no local override, so the test asserts what is committed.
     committed = subprocess.run(
         ["git", "show", "HEAD:contest.ini"],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
@@ -706,12 +682,9 @@ def test_gate_profile_expands_an_env_reference(tmp_path, monkeypatch):
     assert load_roster(write_ini(tmp_path, text)).gate_settings.api_key == "expanded-key"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the round's backend — KC-34
-# ─────────────────────────────────────────────────────────────────────────────
+# The round's backend (KC-34)
 
-#: The agents' own profile when `backend = openrouter`: the gate's section with
-#: the OpenRouter endpoint and a key that is not the gate's.
+#: The agents' own profile for backend = openrouter: the gate section with another endpoint and key.
 OPENROUTER_PROFILE = """
 [openrouter]
 base_url = https://openrouter.ai/api/v1
@@ -864,9 +837,7 @@ def test_kilo_needs_no_openrouter_key_even_when_the_section_says_an_env_ref(tmp_
     assert cfg.openrouter_settings is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the shape of what this module exports
-# ─────────────────────────────────────────────────────────────────────────────
+# The shape of what this module exports
 
 def test_config_and_agent_spec_are_frozen():
     with pytest.raises(FrozenInstanceError):
@@ -941,9 +912,7 @@ def test_workspace_kind_refuses_a_value_that_is_not_a_kind(tmp_path):
         load_roster(ini)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-55: the gate's retry budget
-# ─────────────────────────────────────────────────────────────────────────────
 
 GATE_LIMIT_KEYS = ("gate_retries", "gate_retry_wait_sec",
                    "gate_retry_max_wait_sec", "gate_deadline_sec")
@@ -1011,9 +980,7 @@ def test_a_malformed_gate_retries_falls_back_to_the_default(tmp_path):
     assert load_roster(write_ini(tmp_path, text)).gate_retries == 4
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-36: turn_extend_sec and turn_max_sec — the turn clock is a floor
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-36: turn_extend_sec and turn_max_sec: the turn clock is a floor
 
 def test_turn_extend_sec_and_turn_max_sec_parse_and_default(tmp_path):
     """KC-36: both keys parse, default 600 / 7200, and are in CONTEST_KEYS."""
@@ -1084,9 +1051,7 @@ def test_the_turn_limits_survive_a_models_override(tmp_path):
     assert (models.turn_timeout_sec, models.turn_extend_sec, models.turn_max_sec) == (3600, 900, 18000)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-65: pytest_workers_* and agent_tmpdir — the agents' pytest sizes to the box
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-65: pytest_workers and agent_tmpdir: the agents' pytest sizes to the box
 
 KC65_KEYS = ("pytest_workers_per_agent", "pytest_workers_few_agents",
              "pytest_workers_few", "pytest_workers_min")

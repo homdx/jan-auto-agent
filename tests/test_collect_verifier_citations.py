@@ -76,16 +76,7 @@ def test_claim_citing_unknown_module_fails_citation_check():
 
 
 def test_claim_citing_real_symbol_from_a_different_module_fails_citation_check():
-    # BUGFIX (found via self-play hallucination session on this repo):
-    # `known_symbols` is the whole repo's flat symbol table (built once by
-    # `verify_repo`), so a symbol that's real *somewhere* used to pass
-    # `citation_check` even when it belongs to a module Pass B was never
-    # shown while summarizing this one (`summarizer.py`'s prompt is scoped
-    # to a single module's facts/source — COLLECT-16). A claim like "this
-    # module implements backoff_seconds" while summarizing formatter.py is
-    # a pure fabrication even though `backoff_seconds` genuinely exists in
-    # tools/backoff.py — citation_check must require the citation to
-    # belong to the module the claim is actually about.
+    # A symbol real in another module must not pass: the citation must belong to the module the claim is about (regression).
     known = frozenset({
         "pkg/prompt_store.py:get_current",
         "pkg/other_module.py:some_function",
@@ -100,10 +91,7 @@ def test_claim_citing_real_symbol_from_a_different_module_fails_citation_check()
 
 
 def test_claim_citing_real_location_from_a_different_module_fails_citation_check():
-    # Same fabrication shape, via a `path:line` citation instead of a
-    # symbol name: the line is genuinely in range for *some* scanned
-    # module, just not the one this claim's `purpose`/`notes` field was
-    # attached to.
+    # The same fabrication via a path:line citation that is in range for a different module.
     claim = Claim(
         text="foo", module="pkg/prompt_store.py",
         location="pkg/other_module.py:5",
@@ -114,15 +102,7 @@ def test_claim_citing_real_location_from_a_different_module_fails_citation_check
 
 
 def test_cross_module_hallucination_end_to_end_is_dropped():
-    # Full extract -> verify path (not just citation_check in isolation),
-    # using two real modules from this repo, mirroring exactly the
-    # self-play repro that found the bug.
-    #
-    # NOTE: this sentence cites *two* separate things from the wrong
-    # module (a symbol and a location) — since the multi-citation fix,
-    # `extract_claims` correctly produces one `Claim` per citation instead
-    # of only the first, so both get independently caught and dropped
-    # (previously this test only asserted on the first of the two).
+    # Full extract-then-verify path with two real modules, matching the self-play repro (one claim per citation).
     mod_a_path = "tools/formatter.py"
     mod_b_path = "tools/backoff.py"
     repo_root = Path(__file__).parent.parent
@@ -231,16 +211,7 @@ def test_claim_provenance_is_always_llm():
     assert claim.provenance == Provenance.LLM
 
 
-# ── citation_check: access (the fabricated-access gap) ─────────────────────────
-#
-# `contradiction_check` only ever drops an `access_crash` claim when Pass A
-# has a *matching* record that's GUARDED — a crash claim about an access
-# expression Pass A has no record of at all (not GUARDED, not UNGUARDED,
-# simply absent — because it doesn't correspond to any real subscript site
-# in the module) found no contradiction and was silently kept, reaching
-# the artifact as a fabricated structural claim. These tests pin the fix:
-# an access_crash claim must cite a real, cataloged access site, exactly
-# the way a symbol or location claim must cite a real one.
+# citation_check: access claims must cite a real, cataloged access site (the fabricated-access gap).
 
 
 def test_claim_citing_fabricated_access_fails_citation_check():
@@ -266,19 +237,14 @@ def test_claim_citing_real_cataloged_access_passes_citation_check():
 
 
 def test_generic_claim_mentioning_brackets_without_crash_kind_is_not_access_checked():
-    # Scoped to kind="access_crash" only: a claim that merely mentions
-    # bracket syntax in passing (kind="generic") was never asserting that
-    # access is a cataloged crash site, so it must not be penalized for
-    # not matching one.
+    # Only kind=access_crash must match a real site; a generic claim that mentions brackets is not penalized.
     module, _ = _prompt_store_module()
     claim = Claim(text="x", module=module.path, kind="generic", access="unrelated[0]")
     assert citation_check(claim, frozenset(), {module.path: 20}, frozenset()) is None
 
 
 def test_fabricated_access_crash_claim_dropped_end_to_end_via_verify_claims():
-    # The exact end-to-end reproduction: a crash claim about an access
-    # that doesn't exist anywhere in the module's real guarded_accesses
-    # must not survive to the artifact.
+    # End to end: a crash claim about an access that does not exist must not reach the artifact.
     module, source = _prompt_store_module()
     known = frozenset(sym.qualname for sym in module.public_symbols)
     line_counts = {module.path: source.count("\n") + 1}
@@ -296,8 +262,7 @@ def test_fabricated_access_crash_claim_dropped_end_to_end_via_verify_claims():
 
 
 def test_real_unguarded_finding_still_survives_after_access_citation_check():
-    # The fix must not overcorrect: a claim about a real, cataloged
-    # UNGUARDED access — a genuine finding — must still be kept.
+    # A genuine UNGUARDED finding must still be kept after the fix.
     module = ModuleRecord(
         path="pkg/real_bug.py",
         guarded_accesses=(
@@ -309,22 +274,7 @@ def test_real_unguarded_finding_still_survives_after_access_citation_check():
     assert citation_check(claim, frozenset(), {module.path: 20}, known_accesses) is None
 
 
-# ── fabricated `path.py:identifier` symbol citations (COLLECT-17 follow-up) ───
-#
-# `extract_claims` only ever set `claim.symbol` by matching a sentence
-# against a name already in `known_symbols` (`_symbol_patterns`) — an
-# outright *invented* symbol never matches any of those patterns, so it
-# fell through as `kind="generic"` with `symbol=None` and survived
-# untouched, indistinguishable from ordinary unfalsifiable prose. A first
-# attempt at closing that gap (routing any `path.py:identifier`-shaped
-# mention into `citation_check`) over-corrected: it also caught *real*
-# names Pass A's `public_symbols` index doesn't track by design — module-
-# level constants and class methods, both out of `extract_symbols`'
-# deliberately top-level-only scope (COLLECT-4). The fix has to
-# distinguish "invented" from "real but unindexed", via
-# `ast_facts.extract_all_defined_names` — a broader, permissive
-# "does this name appear anywhere in the module's source" check used only
-# to *decline* to flag something, never to positively verify a claim.
+# Fabricated path.py:identifier citations: invented names are flagged, while real but unindexed names are not (COLLECT-17).
 
 
 def _known_names(source: str) -> "frozenset[str]":
@@ -352,11 +302,7 @@ def test_fabricated_symbol_citation_is_flagged_and_dropped():
 
 
 def test_real_but_unindexed_module_level_constant_is_not_flagged():
-    # BUGFIX: found via review of the first attempt at this fix.
-    # `tools/collect/summarizer.py:DEFAULT_NUM_CTX` is a real, genuine
-    # constant — just not a "public symbol" by COLLECT-4's own top-level-
-    # only definition. A citation of it must not be dropped as if it were
-    # a fabrication.
+    # A real module-level constant that Pass A does not index is not a fabrication.
     mod_path = "tools/collect/summarizer.py"
     source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
     assert "DEFAULT_NUM_CTX" in source  # sanity: the constant is real
@@ -379,10 +325,7 @@ def test_real_but_unindexed_module_level_constant_is_not_flagged():
 
 
 def test_real_but_unindexed_class_method_is_not_flagged():
-    # Same false-positive shape, via a class method instead of a
-    # module-level constant — `render` is a real method of
-    # `OutputFormatter`, just nested (out of `public_symbols`' top-level
-    # scope) rather than fabricated.
+    # A real class method, nested and so not in public_symbols, is not a fabrication.
     mod_path = "tools/formatter.py"
     source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
     module = scan_module(source, mod_path)
@@ -402,12 +345,7 @@ def test_real_but_unindexed_class_method_is_not_flagged():
 
 
 def test_cross_module_citation_of_real_unindexed_name_still_dropped():
-    # The `known_names` guard is scoped to the module actually being
-    # summarized — it must not let a citation of some *other* module's
-    # real-but-unindexed name through, since Pass B was never shown that
-    # other module's facts/source to have legitimately known that name
-    # from in the first place (same reasoning as the cross-module
-    # citation-check fix this guard sits alongside).
+    # The known_names exemption is scoped to the module summarized: another module's unindexed name is still dropped.
     mod_a, mod_b = "tools/collect/summarizer.py", "tools/formatter.py"
     src_a = (REPO_ROOT / mod_a).read_text(encoding="utf-8")
     src_b = (REPO_ROOT / mod_b).read_text(encoding="utf-8")
@@ -429,11 +367,7 @@ def test_cross_module_citation_of_real_unindexed_name_still_dropped():
 
 
 def test_full_pipeline_distinguishes_fabricated_from_real_unindexed_names():
-    # End-to-end via the real `verify_repo` orchestration (not just
-    # `extract_claims`/`verify_claims` in isolation): scans two real
-    # modules from this repo, attaches one fabricated and one real-but-
-    # unindexed claim to each, and checks the verification report gets
-    # both right in a single run.
+    # End to end through verify_repo: one fabricated and one real-but-unindexed claim are judged correctly.
     mod_a, mod_b = "tools/collect/summarizer.py", "tools/formatter.py"
     src_a = (REPO_ROOT / mod_a).read_text(encoding="utf-8")
     src_b = (REPO_ROOT / mod_b).read_text(encoding="utf-8")
@@ -460,24 +394,14 @@ def test_full_pipeline_distinguishes_fabricated_from_real_unindexed_names():
     assert "_totally_invented_helper_fn" not in by_path[mod_a].summary.purpose
     # ...real-but-unindexed constant survives...
     assert "DEFAULT_NUM_CTX" in by_path[mod_a].summary.purpose
-    # ...and a real-but-unindexed method in a completely different,
-    # LLM-summary-free module survives too (no citation to fail, since it
-    # wasn't a known symbol OR flagged as fabricated).
+    # A real-but-unindexed method in an LLM-free module survives (nothing to fail).
     assert "render" in by_path[mod_b].summary.purpose
 
     reasons = {d["reason"] for d in report["dropped"]}
     assert REASON_NO_CITATION in reasons
 
 
-# ── multiple citations in one sentence (COLLECT-17 follow-up) ─────────────────
-#
-# `extract_claims` used to capture only the *first* location/symbol/access
-# match per sentence via `.search()`. A sentence citing two things of the
-# same kind — one real, one fabricated — only ever produced one `Claim`,
-# carrying the real citation; the fabricated one was never extracted into
-# anything `citation_check` could see, so it survived verbatim right next
-# to the real citation that (from the verifier's perspective) "vouched for"
-# the whole sentence.
+# Multiple citations in one sentence: each is extracted and checked separately (COLLECT-17).
 
 
 def test_two_symbol_citations_one_sentence_real_and_fabricated_both_dropped():
@@ -500,8 +424,7 @@ def test_two_symbol_citations_one_sentence_real_and_fabricated_both_dropped():
         claims, module=module, known_symbols=known_symbols,
         line_counts={mod_path: source.count("\n") + 1}, fail_open_locs=frozenset(),
     )
-    # The real citation alone would have survived on its own — but its
-    # sentence also makes a fabricated claim, so neither survives.
+    # The real citation would survive alone, but its sentence also makes a fabricated claim.
     assert kept == []
     assert len(dropped) == 2
     reasons = {d.reason for d in dropped}
@@ -569,11 +492,7 @@ def test_sibling_swept_claim_names_the_real_reason_not_always_citation():
 
 
 def test_two_real_citations_one_sentence_both_survive_without_duplicating_text():
-    # Sanity/non-regression: a sentence citing *two real* things must
-    # still fully survive, and the reconstructed artifact text must not
-    # end up with the sentence duplicated (one `Claim` per citation means
-    # `kept` now legitimately contains 2 `Claim`s sharing this sentence's
-    # `.text` -- `_verify_text` must dedupe when rejoining them).
+    # Two real citations in one sentence both survive, and the artifact text is not duplicated.
     mod_path = "tools/collect/summarizer.py"
     source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
     from tools.collect.model import LLMSummary
@@ -592,8 +511,7 @@ def test_two_real_citations_one_sentence_both_survive_without_duplicating_text()
 
 
 def test_sentence_with_no_citations_still_produces_exactly_one_generic_claim():
-    # Non-regression: the multi-citation rewrite must not turn an ordinary
-    # unfalsifiable sentence into zero claims (or several).
+    # The multi-citation rewrite must not turn an unfalsifiable sentence into zero or several claims.
     mod_path = "tools/collect/summarizer.py"
     source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
     module = scan_module(source, mod_path)
@@ -609,22 +527,11 @@ def test_sentence_with_no_citations_still_produces_exactly_one_generic_claim():
     assert claims[0].kind == "generic"
 
 
-# ── bare short-name over-matching against common words (COLLECT-17 follow-up) ─
-#
-# Found via forensic comparison of two real collect runs against this repo:
-# `known_symbols` is a repo-wide flat table, so a bare (unprefixed) mention
-# of a short symbol name matched *any* symbol anywhere with that name, not
-# just ones plausibly meant by the sentence. Two distinct false-positive
-# shapes, both from real verification_report.json rows on this exact repo.
+# Bare short-name matching: common words must not match unrelated symbols (COLLECT-17).
 
 
 def test_bare_mention_of_own_modules_main_is_not_flagged_against_other_mains():
-    # Real repro: `analyze_logs.py` genuinely defines its own `main`, but
-    # so do several *other* top-level scripts in this repo (`main.py`,
-    # `restore_synapse.py`, `tools/collect/cli.py`, ...). The old bare-name
-    # loop flagged "Entry point is main() via argparse." as a failed
-    # citation to *every one* of those other files' `main` — six separate
-    # drops for one true, local, unremarkable sentence.
+    # A bare mention of main in analyze_logs.py is not checked against other files' main.
     mod_a_path, mod_b_path = "analyze_logs.py", "main.py"
     src_a = (REPO_ROOT / mod_a_path).read_text(encoding="utf-8")
     src_b = (REPO_ROOT / mod_b_path).read_text(encoding="utf-8")
@@ -647,14 +554,7 @@ def test_bare_mention_of_own_modules_main_is_not_flagged_against_other_mains():
 
 
 def test_bare_mention_of_generic_word_matching_unrelated_symbol_is_not_flagged():
-    # Real repro: some far-off test file happens to define a top-level
-    # `task` symbol; that's the *only* module anywhere that has one, so it
-    # isn't even ambiguous — yet the old bare-name loop matched the word
-    # "task" in ordinary prose about a completely unrelated module ("task
-    # metrics", "task planning") as a failed citation to that one file,
-    # over and over, for any module whose summary happened to use the
-    # word. A single undecorated lowercase word is too generic a match to
-    # trust as a citation either way.
+    # A single generic word such as "task" is too generic to count as a citation.
     mod_path = "analyze_logs.py"
     src = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
     module = scan_module(src, mod_path)
@@ -674,13 +574,7 @@ def test_bare_mention_of_generic_word_matching_unrelated_symbol_is_not_flagged()
 
 
 def test_bare_mention_of_real_multiword_helper_still_checked_cross_module():
-    # Non-regression: the narrowing must not swallow the mechanism's actual
-    # intended catch. A real, *distinctive* (multi-word) symbol borrowed
-    # from a module Pass B was never shown facts for is still exactly the
-    # kind of cross-module fabrication this checker exists to drop — same
-    # shape as `test_cross_module_hallucination_end_to_end_is_dropped`,
-    # pinned separately here so it can't regress alongside the bare-name
-    # narrowing above.
+    # A real, distinctive multi-word symbol from another module is still dropped (non-regression).
     mod_a_path, mod_b_path = "tools/formatter.py", "tools/backoff.py"
     src_a = (REPO_ROOT / mod_a_path).read_text(encoding="utf-8")
     src_b = (REPO_ROOT / mod_b_path).read_text(encoding="utf-8")
@@ -706,11 +600,7 @@ def test_bare_mention_of_real_multiword_helper_still_checked_cross_module():
 
 
 def test_bare_mention_of_real_camelcase_class_still_checked_cross_module():
-    # Same non-regression as above, for the *other* shape my narrowing
-    # deliberately keeps checkable: a single-word CamelCase class name
-    # (no underscore at all) — `short == short.lower()` is what actually
-    # exempts it, not the underscore check, so this needs its own case
-    # rather than assuming the snake_case test above covers it.
+    # A single-word CamelCase class name is still checked across modules (non-regression).
     mod_a_path, mod_b_path = "tools/backoff.py", "tools/formatter.py"
     src_a = (REPO_ROOT / mod_a_path).read_text(encoding="utf-8")
     src_b = (REPO_ROOT / mod_b_path).read_text(encoding="utf-8")

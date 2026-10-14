@@ -52,8 +52,7 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 @pytest.fixture(autouse=True)
 def _empty_seeds(monkeypatch):
-    # Seed contracts and the gate map are COLLECT-10/11 content, not under test
-    # here; neutralising them keeps the graph deterministic.
+    # Seed contracts and the gate map are not under test here; neutralise them to keep the graph deterministic.
     monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules, root=None: [])
     monkeypatch.setattr(cli_mod.gates_mod, "build_gates_map", lambda modules, root: [])
 
@@ -139,9 +138,7 @@ def _collect_and_load(mini_repo: Path) -> CollectModel:
     return loader_mod.load(mini_repo)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# V1-1 / V1-3 / V1-4 / V1-9 — a real artifact, loaded
-# ─────────────────────────────────────────────────────────────────────────────
+# V1-1, V1-3, V1-4, V1-9: a real artifact, loaded
 
 class TestGraphTablesLoaded:
 
@@ -223,9 +220,7 @@ class TestGraphTablesLoaded:
         assert first.entry_points == second.entry_points
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# V1-5 / V1-6 — both schema directions, over a real artifact
-# ─────────────────────────────────────────────────────────────────────────────
+# V1-5, V1-6: both schema directions over a real artifact
 
 def _rewrite_artifact(mini_repo: Path, mutate) -> CollectModel:
     """Collect for real, then apply `mutate` to the on-disk artifact and reload.
@@ -347,9 +342,7 @@ class TestGraphTablesSchema:
         assert model.status == loader_mod.STATUS_ABSENT
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# V1-2 / V1-7 / V1-8 / V1-10 — model-level, no collect run needed
-# ─────────────────────────────────────────────────────────────────────────────
+# V1-2, V1-7, V1-8, V1-10: model-level, no collect run needed
 
 def _entry(path: str, blast: int) -> RiskEntry:
     return RiskEntry(
@@ -446,8 +439,7 @@ class TestModelLevel:
             assert not CollectModel._is_test_path(path, recorded), path
         for path in tests:
             assert CollectModel._is_test_path(path, recorded), path
-        # The recorded signal is what rescues a test file that sits outside the
-        # known test directories — and nothing else.
+        # The recorded signal rescues a test file outside the known test directories, and nothing else.
         assert CollectModel._is_test_path("examples/hello-world/test_hello.py", recorded)
         assert not CollectModel._is_test_path(
             "examples/hello-world/test_hello.py", frozenset()

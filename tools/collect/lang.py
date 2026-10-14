@@ -34,9 +34,7 @@ class Language:
     ALL = frozenset({PYTHON, JAVA})
 
 
-#: Recognized file extension (lowercase, leading dot) -> `Language`. The
-#: single source of truth both `detect_language` and `supported_extensions`
-#: read from, so the two can never drift apart.
+#: Extension (lowercase, with dot) -> Language; detect_language and supported_extensions both read it.
 _EXTENSION_MAP = {
     ".py": Language.PYTHON,
     ".java": Language.JAVA,
@@ -69,8 +67,7 @@ def detect_language(path: Union[str, Path]) -> Optional[str]:
     return _EXTENSION_MAP.get(suffix)
 
 
-#: `[collect] languages`' own fallback, when the key/section/config
-#: object itself is absent — see `enabled_languages`.
+#: Default when [collect] languages is absent.
 _DEFAULT_ENABLED_LANGUAGES: FrozenSet[str] = frozenset({Language.PYTHON})
 
 
@@ -105,14 +102,7 @@ def enabled_languages(config: Optional["configparser.ConfigParser"]) -> FrozenSe
         return _DEFAULT_ENABLED_LANGUAGES
     raw = config.get("collect", "languages", fallback=Language.PYTHON)
     langs = {part.strip().lower() for part in raw.split(",") if part.strip()}
-    # Filter out unrecognized language names (typos like "pythn" that
-    # would silently disable all scanning — scan_repo's language filter
-    # never matches "pythn", so zero modules would be scanned). If at
-    # least one configured value is recognized, keep only the recognized
-    # ones (a typo alongside "python" drops the typo, keeps Python). If
-    # none are recognized, fall back to the default rather than scanning
-    # zero languages — the docstring's "a config typo should never
-    # silently turn off Python scanning" guarantee.
+    # Drop unrecognised names (typos); keep the recognised ones, and fall back to Python if none are recognised.
     valid = {lang for lang in langs if lang in Language.ALL}
     return frozenset(valid) if valid else _DEFAULT_ENABLED_LANGUAGES
 

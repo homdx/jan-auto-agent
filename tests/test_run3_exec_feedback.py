@@ -262,8 +262,7 @@ def test_serial_flag_leaves_scripts_and_explicit_worker_counts_alone(tmp_path):
 
 
 def test_serial_flag_needs_a_pool_to_suppress(tmp_path):
-    # A project whose config asks for no workers never gets an unknown flag —
-    # on a machine without pytest-xdist that flag would fail every check.
+    # No workers configured: the unknown flag must not appear without pytest-xdist.
     exe = make_executor(_repo(tmp_path, addopts="-q --strict-markers"))
     assert "-n 0" not in _command(exe, "python -m pytest tests/test_ok.py -q")
     (tmp_path / "bare").mkdir()
@@ -303,8 +302,7 @@ def test_config_key_reaches_the_task_loop_executor(tmp_path):
 
 
 def test_controller_passes_the_same_key_to_the_regression_executor():
-    # AUTO-G5 builds its own executor in controller._run_task_loop; it must
-    # read the same [executor] key, or `false` would only reach half the runs.
+    # AUTO-G5 reads the same [executor] key, or `false` would only reach half the runs.
     src = (PROJECT_ROOT / "tools" / "auto" / "controller.py").read_text(encoding="utf-8")
     g5 = src[src.index("# AUTO-G5: executor + bug_fix_loop"):]
     call = g5[:g5.index("bug_fix_loop = ")]
@@ -343,9 +341,7 @@ def test_real_exit_5_feedback_end_to_end(tmp_path):
 
 
 def test_p_no_xdist_would_have_broken_every_workspace_run(tmp_path):
-    # The ticket's other option. With addopts = -n auto in force, disabling
-    # the plugin makes pytest exit 4 ("unrecognized arguments: -n") before a
-    # single test runs — which is why the flag is -n 0.
+    # -n 0 is needed: with addopts = -n auto, disabling xdist makes pytest exit 4.
     r = _run(make_executor(_repo(tmp_path), pytest_serial=False),
              "python -m pytest -p no:xdist tests/test_ok.py -q")
     assert r.exit_code == 4 and "unrecognized arguments" in r.stderr

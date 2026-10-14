@@ -88,9 +88,7 @@ class AutoTuner:
         self.trigger_avg_iter = trigger_avg_iter
         self.trigger_json_fail_rate = trigger_json_fail_rate
 
-    # ------------------------------------------------------------------ #
-    # Public API                                                           #
-    # ------------------------------------------------------------------ #
+    # Public API
 
     def maybe_tune(self) -> TuneOutcome:
         """
@@ -110,10 +108,7 @@ class AutoTuner:
                 reason=f"{total} runs — not enough data (need {self.min_runs})",
             )
 
-        # Check signal thresholds.
-        # A threshold of 0 means "disabled" — treat as always-above-threshold so
-        # test code (and any caller that wants to force a tuning cycle) can set
-        # trigger_avg_iter=0 / trigger_json_fail_rate=0 to bypass the guard.
+        # A threshold of 0 disables the check, so tests and callers can force a tuning cycle.
         avg_iter = summary.get("avg_iterations", 0.0)
         json_fail = summary.get("json_parse_failure_rate", 0.0)
         above_avg  = (self.trigger_avg_iter       <= 0) or (avg_iter  > self.trigger_avg_iter)
@@ -143,18 +138,7 @@ class AutoTuner:
             )
 
         if eval_result.promoted:
-            # Push to store.
-            # FOLLOW-UP (JAN-BUG-03 regression): PromptStore._save() now
-            # raises RuntimeError on a write failure instead of silently
-            # swallowing it (see prompt_store.py). That's correct for
-            # push()/rollback() callers who need to know a save didn't
-            # happen — but it means this call, which used to be a no-op
-            # on disk-full/permission errors, can now raise here. Left
-            # unguarded that would escape maybe_tune() (which is
-            # documented "never raises") and abort the whole --auto run
-            # over an optional prompt-tuning write. Fail closed instead:
-            # log it, report the tuning cycle as failed, and let the run
-            # continue on the prompt version already active in memory.
+            # A failed prompt-store write must not abort --auto: log it, report the cycle as failed, and keep the prompt already in memory.
             try:
                 self.prompt_store.push(self.agent_name, candidate, eval_result.score)
             except Exception as exc:
@@ -262,14 +246,11 @@ def make_auto_tuner(
     Auto metrics are rooted at <agent_dir>/metrics.json, not the interactive
     metrics.json, fulfilling the AUTO-E2 isolation requirement.
     """
-    # Prompt store — isolated from the interactive prompts.json so that
-    # auto-mode promotions (driven by binary pass/fail signals) never silently
-    # overwrite prompts used by human-driven interactive sessions.
+    # Separate prompt store, so auto-mode promotions never overwrite interactive prompts.
     if prompt_store is None:
         default_store = str(agent_dir / "auto_prompts.json")
         store_path_str = config.get("auto", "prompt_store_path", fallback=default_store)
-        # Bugfix (config-crash audit): unguarded. Wrapped per-call, not via
-        # a helper, so extract_config_reads still sees the literal call.
+        # Config read guarded per call; extract_config_reads still sees the literal call.
         try:
             max_versions = config.getint("prompt_store", "max_versions", fallback=3)
         except ValueError as exc:
@@ -284,16 +265,7 @@ def make_auto_tuner(
     if metrics_collector is None:
         metrics_collector = MetricsCollector(metrics_path=agent_dir / "metrics.json")
 
-    # Tuner settings + PromptOptimizer/PromptEvaluator construction.
-    # Guarded: configparser's `fallback=` only covers a MISSING key — a
-    # malformed value that IS present ("enabled = yes-please",
-    # "min_runs_before_optimize = three") still raises ValueError straight
-    # past it. PromptOptimizer/PromptEvaluator construction can likewise
-    # raise (bad model name, malformed API key, missing config section).
-    # The auto-tuner is an optional optimisation on top of --auto, not a
-    # dependency of it — a misconfiguration here must degrade to "tuner
-    # disabled for this run" rather than aborting the whole autonomous run
-    # before a single task is attempted.
+    # Tuner setup is optional: any misconfiguration disables the tuner for this run instead of aborting --auto.
     try:
         enabled = config.getboolean("prompt_optimizer", "enabled", fallback=True)
         min_runs = config.getint("prompt_optimizer", "min_runs_before_optimize", fallback=5)
@@ -347,5 +319,4 @@ def make_auto_tuner(
     )
 
 
-# record_gate2_result is imported from tools.auto.auto_metrics (AUTO-E2) and
-# re-exported above via the import line.  Canonical implementation lives there.
+# record_gate2_result is re-exported from tools.auto.auto_metrics (AUTO-E2).

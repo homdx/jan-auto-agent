@@ -25,8 +25,7 @@ import claim_vote as cv  # noqa: E402
 import claimcheck_truth as ct  # noqa: E402
 import lenz_claim_filter as lf  # noqa: E402
 
-#: the one test that serves fake voters on 127.0.0.1 from this process (port 0, no xdist group);
-#: the script under test runs in child processes, which a monkeypatch cannot reach anyway
+#: The only test that runs a fake voter server in this process (port 0, no xdist group).
 LOCAL_SERVER = {"test_run_claim_check_prints_the_hint_and_makes_no_call"}
 
 

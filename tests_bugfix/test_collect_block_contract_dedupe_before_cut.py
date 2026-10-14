@@ -60,15 +60,13 @@ from tools.collect.model import ContractRecord, FunctionRecord, ModuleRecord
 
 TARGET = "pkg/hub.py"
 
-# A 117-char contract line: long enough that one copy plus the short one is a
-# meaningful budget, and identical to its duplicate byte for byte.
+# A long contract line, identical to its duplicate byte for byte.
 BIG = "z" * 100
 LINE_C1 = f"contract c1: {BIG}"
 LINE_C2 = "contract c2: small"
 
 HEAD = len(_COLLECT_HEADER) + 1 + len(f"module: {TARGET}")
-# head + exactly one copy of c1 + c2 — the budget the old code wasted on the
-# duplicate.
+# Budget for head + one copy of c1 + c2: the space the old code wasted on the duplicate.
 BUDGET_FITTING_BOTH_DISTINCT = HEAD + len(LINE_C1) + 1 + len(LINE_C2) + 1
 
 

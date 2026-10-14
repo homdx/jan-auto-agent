@@ -59,12 +59,10 @@ from tools.contest.kilo_client import EventTap  # noqa: E402
 from tools.contest.workspace import Workspace  # noqa: E402
 import tools.contest.backend as backend_mod  # noqa: E402
 
-#: The ``limit`` the runner pushes for a model remembered at 98 777 tokens —
-#: `context_memory.kilo_limit(98_777, None)`, the shape `PATCH /config` sends.
+#: The limit pushed for a model remembered at 98 777 tokens, as PATCH /config sends it.
 PUSHED_LIMIT = {"context": 131_072, "input": 98_777, "output": 20_000}
 
-#: `.kilo/kilo.jsonc` the agent writes on its own: no model limit in it, so no
-#: content compare against a pushed window matches it.
+#: The agent's own .kilo/kilo.jsonc has no model limit, so no pushed window matches it.
 AGENT_FILE = '{"provider": {"timeout": {"request": 600}}}\n'
 
 
@@ -108,9 +106,7 @@ def _backend(fake, directory: str, log: str) -> KiloBackend:
     return backend
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# A. the reconnect
-# ─────────────────────────────────────────────────────────────────────────────
+# A. The reconnect
 
 def test_a_failed_tap_start_is_retried_and_the_next_turn_is_heard(tmp_path, monkeypatch):
     """`EventTap.start` raising on the first attempt: the retry is what the
@@ -174,13 +170,11 @@ def test_a_reconnect_that_cannot_reopen_raises_and_keeps_the_live_tap(tmp_path, 
         assert isinstance(KiloTapReconnectError("x"), ContestBackendError), \
             "the runner catches one class for both"
         assert backend._tap is old_tap
-        # round 160: the old tap is stopped before the new one starts (one
-        # writer on the log); its stream had ended at the reload already
+        # The old tap is stopped before the new one starts, so there is one writer on the log (round 160).
         assert old_tap.join(2.0) is True
         closed = [e["properties"]["error"] for e in old_tap.events if e["type"] == "tap.closed"]
         assert any("stream ended" in reason for reason in closed), closed
-        # round 160: the reconnect's own wait took that one, so the failure
-        # records a fresh `tap.closed` for the next waiter
+        # The reconnect's own wait took the old close, so the failure records a fresh tap.closed (round 160).
         assert old_tap.events[-1]["type"] == "tap.closed"
         assert "could not be reopened" in closed[-1]
         assert fake.calls("PATCH"), "the patch did land: only the stream is broken"
@@ -313,9 +307,7 @@ def test_a_reload_that_does_not_end_the_stream_bounds_the_reconnect(tmp_path, ca
     backend.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# B. the `.kilo` guards
-# ─────────────────────────────────────────────────────────────────────────────
+# B. The .kilo guards
 
 def test_a_tracked_rules_file_does_not_stop_the_push(tmp_path):
     """A checkout that tracks `.kilo/rules/x.md` but no project file: only a
@@ -431,8 +423,7 @@ def test_only_the_file_the_run_pushed_is_dropped(tmp_path, content, kept):
     if kept:
         assert project.read_text(encoding="utf-8") == content
 
-    # a run that pushed nothing keeps every untracked file, unless it is a
-    # leftover of an earlier attempt and says so
+    # A run that pushed nothing keeps its untracked files, unless they are an earlier attempt's leftover.
     project.unlink(missing_ok=True)
     project.parent.mkdir(parents=True, exist_ok=True)
     project.write_text(AGENT_FILE, encoding="utf-8")
@@ -489,12 +480,9 @@ def test_a_push_from_a_linked_worktree_leaves_the_repository_s_exclude_alone(tmp
     assert _git(worktree, "status", "--porcelain") == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Kilo's own `.kilo/.gitignore` (judge, round 151)
-# ─────────────────────────────────────────────────────────────────────────────
+# Kilo's own .kilo/.gitignore (round 151)
 
-#: What 7.6.2 writes, byte for byte, when it opens a workspace whose `.kilo/` has
-#: no `.gitignore` — checked live: no trailing newline, and neither project file.
+#: What Kilo 7.6.2 writes for a new .kilo/ with no .gitignore: no trailing newline and no project files.
 KILO_OWN_GITIGNORE = ("node_modules\npackage.json\npackage-lock.json\npnpm-lock.yaml\n"
                       "bun.lock\nyarn.lock\n.gitignore\nagent-manager.json")
 
@@ -569,9 +557,7 @@ def test_the_ignore_is_written_again_after_the_agent_removed_kilo(tmp_path):
     assert _git(repo, "status", "--porcelain", "-uall") == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# round 160: one writer on events.jsonl at a time
-# ─────────────────────────────────────────────────────────────────────────────
+# Round 160: one writer on events.jsonl at a time
 
 class _NoReloadClient:
     """`set_model_limit` that answers and reloads nothing: the old stream stays
@@ -622,9 +608,7 @@ def test_the_old_tap_is_gone_before_the_new_one_writes(tmp_path, monkeypatch):
     assert sum(1 for rec in lines if rec["event"].get("type") == "bench.once") == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# round 159: a Ctrl-C never waits on a reload
-# ─────────────────────────────────────────────────────────────────────────────
+# Round 159: Ctrl-C never waits on a reload
 
 def test_an_interrupt_during_a_slow_reconnect_returns_at_once(tmp_path, monkeypatch):
     """The new tap's start is held on a barrier (a slow open, a hung socket):
@@ -708,9 +692,7 @@ def test_a_reconnect_that_publishes_into_an_interrupt_leaves_no_thread(tmp_path,
         backend.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# C. round 161: any reconnect failure after a 200 is a reconnect failure
-# ─────────────────────────────────────────────────────────────────────────────
+# C. Round 161: any reconnect failure after a 200 is a reconnect failure
 
 def _breaks_once(monkeypatch, name: str, message: str) -> None:
     """`EventTap.<name>` raises *message* on its first call, then runs as before

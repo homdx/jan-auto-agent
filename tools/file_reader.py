@@ -39,12 +39,7 @@ def read_file(path: str) -> str:
     if not resolved.is_file():
         raise FileNotFoundError(f"Not a file: {resolved}")
 
-    # AUTO-FILEREADER-GUARD-1: a file that exists and IS a regular file
-    # can still be unreadable (permissions changed after the check above,
-    # or from the start) — .stat()/.read_text() raised a raw
-    # PermissionError/OSError with no indication of which path was at
-    # fault, unlike every other failure mode this function already
-    # reports clearly.
+    # Unreadable regular file (e.g. permissions): report the path, as other failures do.
     try:
         size = resolved.stat().st_size
     except OSError as exc:

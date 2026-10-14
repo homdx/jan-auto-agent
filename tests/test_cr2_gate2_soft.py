@@ -17,9 +17,7 @@ from tools.auto.inner_loop import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_validator(task_mode: str = "creative") -> LLMGate2Validator:
     cfg = configparser.ConfigParser()
@@ -54,9 +52,7 @@ _DUMMY_EXEC_RESULT = SimpleNamespace(passed=True, exit_code=0, stdout="", stderr
 _DUMMY_CODER_RESULT = SimpleNamespace(succeeded=True, files_written=["chapter_03.md"])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # _parse_verdict_soft unit tests
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestParseVerdictSoft:
 
@@ -148,9 +144,7 @@ class TestParseVerdictSoft:
         assert "plot hole" in reason
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # LLMGate2Validator integration tests (mock LLM call)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestLLMGate2ValidatorCreative:
 
@@ -198,9 +192,7 @@ class TestLLMGate2ValidatorCreative:
         assert validator.last_missing_context == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Regression: code mode JSON path unchanged
-# ─────────────────────────────────────────────────────────────────────────────
+# Regression: code-mode JSON path unchanged
 
 class TestCodeModeJsonVerdictUnchanged:
 
@@ -237,9 +229,7 @@ class TestCodeModeJsonVerdictUnchanged:
         assert "unavailable" in fb.lower() or "decode" in fb.lower() or "json" in fb.lower()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Regression: missing_context guarded against non-list JSON shapes
-# ─────────────────────────────────────────────────────────────────────────────
+# Regression: missing_context ignores non-list JSON shapes
 
 class TestMissingContextTypeGuard:
     """BUGFIX (same class of bug as the ``hints`` field — see
@@ -324,9 +314,7 @@ class TestMissingContextTypeGuard:
         assert validator.last_missing_context == ["RealSymbol"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # System prompt tests
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_creative_system_prompt_no_json_contract():
     """Creative Gate-2 system prompt must NOT require JSON output."""

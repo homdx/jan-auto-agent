@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
-# 2legs/make_target.sh — KC-77: (re)build the external demo repo at $TARGET.
-#
-# A Calc class with one test, the two contest scripts and tickets 01/02,
-# committed as one base commit. Rebuilding is refused unless $TARGET is
-# missing or is a demo repo this script made (its first commit subject
-# matches), so a mistyped TARGET never wipes a real repository.
-#
-# usage: source 2legs/env.sh && 2legs/make_target.sh
+# Builds the demo repo at $TARGET; refuses to overwrite a repo it did not make (KC-77).
 set -euo pipefail
 : "${JAN:?source 2legs/env.sh first}" "${TARGET:?source 2legs/env.sh first}"
 SUBJECT="demo: Calc + contest scripts + tickets 01/02"

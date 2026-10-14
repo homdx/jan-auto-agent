@@ -55,9 +55,7 @@ from tools.auto.state import StateStore
 from tools.auto.view_trace import load_events, apply_filters
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared helpers / factories
-# ─────────────────────────────────────────────────────────────────────────────
+# Shared helpers and factories
 
 def _make_state(tmp_path: Path, tasks=None) -> StateStore:
     store = StateStore(tmp_path / ".agent")
@@ -163,9 +161,7 @@ def _real_run_trace(tmp_path) -> RunTrace:
     return setup_run_trace(state, cfg)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — Single run_trace id for the whole run
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: one run_trace id for the whole run
 
 class TestSingleRunTraceId:
     def test_setup_run_trace_returns_run_trace(self, tmp_path):
@@ -200,9 +196,7 @@ class TestSingleRunTraceId:
         rt.log_task_done.assert_called_once()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — log_run_start called once at top of controller.run()
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: log_run_start is called once, at the top of controller.run()
 
 class TestRunStart:
     def test_log_run_start_called_once(self, tmp_path):
@@ -222,14 +216,11 @@ class TestRunStart:
             run_pipeline(ctrl)
 
         ctrl.run_trace.log_run_start.assert_not_called()  # run_pipeline doesn't call it
-        # log_run_start is controller.run()'s responsibility; _run_task_loop doesn't
-        # call it — verify task_start was called (pipeline is wired)
+        # log_run_start belongs to controller.run(); here only task_start is checked.
         ctrl.run_trace.log_task_start.assert_called_once_with("T-RS", "Task T-RS")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC3 — Phase transitions logged via log_phase
-# ─────────────────────────────────────────────────────────────────────────────
+# AC3: phase transitions are logged via log_phase
 
 class TestPhaseTransitions:
     def _run_fresh_plan(self, tmp_path):
@@ -281,9 +272,7 @@ class TestPhaseTransitions:
         assert phases.index("started") < phases.index("done")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC4 — log_task_start called once per pending task
-# ─────────────────────────────────────────────────────────────────────────────
+# AC4: log_task_start is called once per pending task
 
 class TestTaskStart:
     def _run_tasks(self, tmp_path, tasks, results):
@@ -337,9 +326,7 @@ class TestTaskStart:
         assert call_order == ["start", "outer_loop"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC5 — log_task_done called for passed tasks
-# ─────────────────────────────────────────────────────────────────────────────
+# AC5: log_task_done is called for passed tasks
 
 class TestTaskDone:
     def test_task_done_called_for_passed_task(self, tmp_path):
@@ -395,9 +382,7 @@ class TestTaskDone:
         assert ctrl.run_trace.log_task_done.call_count == n
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC6 — log_task_blocked for exhausted and dep-blocked tasks
-# ─────────────────────────────────────────────────────────────────────────────
+# AC6: log_task_blocked for exhausted and dep-blocked tasks
 
 class TestTaskBlocked:
     def test_blocked_called_for_exhausted_task(self, tmp_path):
@@ -443,9 +428,7 @@ class TestTaskBlocked:
         assert "T-MISSING" in args[1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC7 — log_run_finished on clean end
-# ─────────────────────────────────────────────────────────────────────────────
+# AC7: log_run_finished on a clean end
 
 class TestRunFinished:
     def test_run_finished_called_after_all_tasks(self, tmp_path):
@@ -464,8 +447,7 @@ class TestRunFinished:
             stop_reason, _ = ctrl._run_task_loop()
 
         assert stop_reason is None
-        # controller.run() calls log_run_finished; verify _run_task_loop returns
-        # None so controller.run() would call it
+        # controller.run() calls log_run_finished, so _run_task_loop returns None.
         ctrl.run_trace.log_run_finished.assert_not_called()  # loop itself doesn't call it
         # The None return means the controller's finalise block will call it
         assert stop_reason is None
@@ -487,9 +469,7 @@ class TestRunFinished:
         assert stop_reason == "task_cap"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC8 — log_run_capped when cap fires
-# ─────────────────────────────────────────────────────────────────────────────
+# AC8: log_run_capped when the cap fires
 
 class TestRunCapped:
     def test_task_cap_returns_task_cap_reason(self, tmp_path):
@@ -515,8 +495,7 @@ class TestRunCapped:
         ctrl  = _make_controller(tmp_path, tasks)
         ctrl.limits      = RunLimits(max_runtime_sec=1.0)
         ctrl._start_time = 0.0
-        # After the first task is done, all subsequent time calls return 9999
-        # so the cap fires at the top of the second task's iteration.
+        # After the first task, every clock call returns 9999, so the cap fires in the second task.
         call_count = [0]
         def fake_time():
             call_count[0] += 1
@@ -535,9 +514,7 @@ class TestRunCapped:
         assert stop_reason == "runtime_cap"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC9 — Gate-1 rejections logged via log_gate1_rejected
-# ─────────────────────────────────────────────────────────────────────────────
+# AC9: Gate 1 rejections are logged via log_gate1_rejected
 
 class TestGate1Rejected:
     def test_gate1_rejected_logged_for_each_rejection(self, tmp_path):
@@ -585,9 +562,7 @@ class TestGate1Rejected:
         assert "false positive" in args[1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC10 — run.log records phase-transition and task lifecycle strings
-# ─────────────────────────────────────────────────────────────────────────────
+# AC10: run.log records phase transitions and task lifecycle strings
 
 class TestRunLog:
     def _read_log(self, state) -> str:
@@ -677,9 +652,7 @@ class TestRunLog:
         assert "task done" in log or "completed" in log
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC11 — Full reconstructability via view_trace
-# ─────────────────────────────────────────────────────────────────────────────
+# AC11: full reconstructability via view_trace
 
 class TestReconstructability:
     def test_trace_file_written_after_run(self, tmp_path):
@@ -792,9 +765,7 @@ class TestReconstructability:
         assert "T-DEP" in params_str
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC12 — progress_display=None and run_trace=None are safe
-# ─────────────────────────────────────────────────────────────────────────────
+# AC12: progress_display=None and run_trace=None are safe
 
 class TestNoneSafe:
     def test_run_trace_none_in_task_loop(self, tmp_path):

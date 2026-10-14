@@ -198,8 +198,7 @@ def test_prepare_round_is_idempotent_after_progress_and_commits(repo, config):
     _git(laguna.path, "commit", "-q", "-m", "stray")
     laguna.path.joinpath("runs", "laguna", "PROGRESS.csv").write_text("done\n")
 
-    # rerun — KC-23: a rerun over commits needs force=True (the operator's
-    # --fresh) on purpose; without it the refusal is the whole point
+    # A rerun over commits needs force=True; without it the refusal is intended.
     wss2 = prepare_round(repo, config, 40, base, force=True)
     laguna2 = next(ws for ws in wss2 if ws.agent == "laguna")
 
@@ -675,9 +674,7 @@ def test_reset_worktree_prunes_a_registration_whose_folder_was_removed(repo, con
     assert "prunable" not in _git(repo, "worktree", "list")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-59: a clone per agent, and a scratch dir per agent
-# ─────────────────────────────────────────────────────────────────────────────
+# Clone per agent, and a scratch dir per agent
 
 _BRIDGE_SRC = (
     "class CollectBridge:\n"
@@ -980,8 +977,7 @@ def test_scratch_helpers_fail_open(tmp_path):
     assert agent_tmp_dir(("  ",), "") is None and agent_tmp_dir(("  ",), None) is None
     roots = tmp_root_dirs((str(tmp_path / "tmp") + "/*",))
     assert roots == (tmp_path / "tmp",)
-    # only an absolute or ~-absolute root derives a scratch dir: a relative one
-    # would make the agent's dir depend on the runner's cwd
+    # Only absolute or ~-absolute roots derive a scratch dir; a relative one would depend on the cwd.
     assert tmp_root_dirs(("scratch/*", "./scratch/*", "../scratch/*")) == ()
     assert agent_tmp_globs(("scratch/*",), "laguna") == ()
     assert tmp_root_dirs(("~/scratch/*",)) == (Path.home() / "scratch",)
@@ -1023,9 +1019,7 @@ def test_harvest_and_format_patch_of_a_clone_match_a_worktree_at_the_same_commit
     assert _format_patch(clone.path, base).startswith("From " + sha)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-43: a leg carries the previous leg's checkout — and nothing else's
-# ─────────────────────────────────────────────────────────────────────────────
+# A leg carries the previous leg's checkout, and nothing else.
 
 
 def _leg_one(repo, config, round_no=40):

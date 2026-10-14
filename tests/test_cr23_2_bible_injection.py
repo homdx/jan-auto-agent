@@ -75,8 +75,7 @@ class TestBibleInjection:
     def test_bible_survives_tight_budget(self, tmp_path: Path):
         """A tiny num_ctx that forces the synopsis to drop older sections
         still includes the bible block in full."""
-        # Five prior chapters, each with a sizeable synopsis section, so a
-        # tight budget must drop some of them.
+        # Five prior chapters with sizeable synopses, so a tight budget must drop some.
         synopsis_sections: dict[str, str] = {}
         for i in range(1, 6):
             synopsis_sections[f"chapter_0{i}.md"] = f"- Fact A ch{i}\n- Fact B ch{i}\n" * 5
@@ -88,23 +87,18 @@ class TestBibleInjection:
         bible_fact = "The hero's eyes are amber and her promise to the king is unbroken"
         _make_bible(tmp_path, f"• {bible_fact}")
 
-        # Tight enough that the common path's synopsis fill has to drop the
-        # oldest sections (chapter_01/02), but not so tight that the
-        # pathological zero-budget branch kicks in instead.
+        # Tight enough to drop the oldest sections, but not so tight that the zero-budget branch runs.
         assembler = _assembler(tmp_path, num_ctx=950, max_tokens=500)
         context = assembler.build_creative_context(
             target_file="chapter_06.md",
             all_chapter_files=[f"chapter_0{i}.md" for i in range(1, 6)],
         )
 
-        # The bible fact must survive regardless of what happens to the
-        # synopsis.
+        # The bible fact survives regardless of what happens to the synopsis.
         assert "STORY FACTS (must not contradict):" in context
         assert bible_fact in context
 
-        # The tight budget should still be forcing a synopsis drop — this
-        # documents that the bible takes priority over synopsis sections,
-        # not that the budget stopped being tight.
+        # The bible takes priority over synopsis sections: the budget is still tight, so a drop happens.
         assert _DROP_MARKER in context
 
     def test_no_bible_file_unchanged(self, tmp_path: Path):
@@ -156,8 +150,7 @@ class TestBibleInjection:
 
         # Header + at most 100 chars of bible content.
         bible_section = context.split("STORY FACTS (must not contradict):\n", 1)[1]
-        # Whatever comes next (synopsis/prev-chapter) is separated by a
-        # blank line; isolate just the bible portion.
+        # Synopsis and prev-chapter text follow after a blank line; isolate the bible portion.
         bible_text = bible_section.split("\n\n", 1)[0]
         assert len(bible_text) <= 100
 
@@ -177,10 +170,7 @@ class TestBibleInjection:
         """If the synopsis/prev-chapter core degrades to '', but the bible
         is present, the bible block alone is still returned (never silently
         dropped to '')."""
-        # chapter_01 exists but is unreadable in practice we simulate by
-        # giving an enormous previous chapter with no synopsis at all, and a
-        # budget so tiny that even the floor-based degrade path can't
-        # produce a synopsis block; the bible should still come through.
+        # Enormous previous chapter, no synopsis fits: the bible must still come through.
         huge = "word " * 20000
         _make_chapter(tmp_path, "chapter_01.md", huge)
         _make_bible(tmp_path, "• Hero's name is Aisha")

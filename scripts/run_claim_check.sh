@@ -1,25 +1,5 @@
 #!/usr/bin/env bash
-# The claim check end to end, one report in, logs and tables out:
-#   extract (Lenz /extract, free, cached)  ->  vote (free models, ini profiles)
-#   [-> truth.csv + pending.md with --truth, and a Lenz hint: commands + cost, never run (CC-9)]
-# Nothing here spends Lenz credits.  Everything lands in claim-check-out/<UTC>/:
-#   claims.json  votes.json  extract.log  vote.log  [truth.csv  pending.md  lenz-claims.md  truth.log]
-#
-#   scripts/run_claim_check.sh report.md                   # voters from [claim_vote] llm_profiles
-#   RUNS=5 scripts/run_claim_check.sh report.md --profiles a b c
-#   scripts/run_claim_check.sh report.md --target . --ref origin/<head> --truth validate1/truth.csv   # CC-6 + CC-8
-#   scripts/run_claim_check.sh report.md --target . --ref HEAD --truth validate1/truth.csv --dry-run  # print, run nothing
-#
-# --target / --ref / --base / --fetch / --profiles / --models ... go to claim_vote.py as they are.
-# --truth FILE (CC-8): claimcheck_truth.py at the end; a bare name lands in the output directory
-# (a new one every run: a new file each time, never the shared key), pending.md always does.  An existing FILE is appended to (its rows are an operator's work: a run
-# that replaced validate1/truth.csv lost the hand-checked rows); --force replaces it, --append is the default.
-# --dry-run: print the commands and exit 0 — no network, nothing written.
-# --no-lenz-hint (CC-9): no Lenz block in pending.md and on the console (with --truth only; the
-# block is text — no run of this script calls /assess or /verify, with or without it).
-# These are taken out of the options before claim_vote.py sees them (it refuses what it does not know).
-#
-# LENZ_API_KEY is read from the environment, else asked for on the console.
+# Runs the claim check end to end: extract, vote, then the truth report.
 set -uo pipefail
 report="${1:?usage: run_claim_check.sh REPORT [--truth OUT.csv [--append|--force]] [--dry-run] [--no-lenz-hint] [claim_vote.py options]}"
 shift
@@ -60,8 +40,7 @@ mkdir -p "$out"
 echo "== claim check of $report -> $out"
 python3 scripts/claim_extract.py "$report" --out "$out/claims.json" 2>&1 | tee "$out/extract.log"
 [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "extract failed, see $out/extract.log"; exit 1; }
-# a report with no claim is no failed vote: claim_vote.py refuses an empty claims file (it ran both runs
-# for nothing and said exit 0), so the run ends here and says so
+# No claims: end here, since claim_vote.py refuses an empty claims file.
 if [ "$(tr -d ' \t\r\n' < "$out/claims.json")" = "[]" ]; then      # no python3 of its own: the pipeline runs three
     echo "== no claims in $report — nothing to vote on"
     exit 0

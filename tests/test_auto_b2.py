@@ -41,9 +41,7 @@ from tools.auto.architect import (
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def minimal_config() -> configparser.ConfigParser:
@@ -113,9 +111,7 @@ def _grounded_item(**overrides) -> dict:
     return base
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC4 — well-formed response → correct CandidateTask objects
-# ─────────────────────────────────────────────────────────────────────────────
+# AC4: a well-formed reply gives correct CandidateTask objects
 
 class TestWellFormedResponse:
     def test_returns_candidate_task(
@@ -171,9 +167,7 @@ class TestWellFormedResponse:
         assert {r.title for r in results} == {"Task A", "Task B"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — ungrounded candidates rejected at parse time
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: ungrounded candidates are rejected at parse time
 
 class TestGroundingRejection:
     def test_missing_cited_location_entirely(
@@ -240,9 +234,7 @@ class TestGroundingRejection:
         assert results[0].title == "Valid task"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — strip_think applied before JSON parsing
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: strip_think runs before JSON parsing
 
 class TestStripThink:
     def test_think_block_stripped(
@@ -269,9 +261,7 @@ class TestStripThink:
         assert results[0].title == "After think"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC3 — fail-closed on bad output and network errors
-# ─────────────────────────────────────────────────────────────────────────────
+# AC3: fail closed on bad output and network errors
 
 class TestFailClosed:
     def test_invalid_json_returns_empty(
@@ -315,9 +305,7 @@ class TestFailClosed:
         assert results == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC5 — markdown code fences stripped before parsing
-# ─────────────────────────────────────────────────────────────────────────────
+# AC5: markdown code fences are stripped before parsing
 
 class TestMarkdownFenceStripping:
     def test_json_fenced_response(
@@ -343,9 +331,7 @@ class TestMarkdownFenceStripping:
         assert results[0].title == "Fenced"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC6 — empty clusters are skipped (no LLM call)
-# ─────────────────────────────────────────────────────────────────────────────
+# AC6: empty clusters are skipped (no LLM call)
 
 class TestEmptyClusterSkipped:
     def test_empty_cluster_produces_no_call(
@@ -378,9 +364,7 @@ class TestEmptyClusterSkipped:
         assert len(results) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Unit tests for CitedLocation.is_valid()
-# ─────────────────────────────────────────────────────────────────────────────
+# CitedLocation.is_valid() unit tests
 
 class TestCitedLocationIsValid:
     def test_valid_with_symbol(self) -> None:
@@ -399,9 +383,7 @@ class TestCitedLocationIsValid:
         assert not CitedLocation(file="a.py", symbol=None, line_start=None).is_valid()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Unit tests for _to_int_or_none helper
-# ─────────────────────────────────────────────────────────────────────────────
+# _to_int_or_none unit tests
 
 class TestToIntOrNone:
     def test_int(self) -> None:

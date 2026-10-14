@@ -90,8 +90,7 @@ class GitManager:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    # Lines that must be present in the repo's .gitignore so the agent never
-    # accidentally commits internal state files or coder backup artefacts.
+    # Entries the repo's .gitignore must contain, so internal state and backups are never committed.
     _GITIGNORE_ENTRIES: tuple[str, ...] = (
         ".agent/",       # all agent state (plan.json, run.log, trace files, …)
         "*.coder.bak",   # per-file backups written by Coder before each edit
@@ -147,8 +146,7 @@ class GitManager:
             logger.warning("ensure_gitignore_committed: cannot write .gitignore: %s", exc)
             return
 
-        # Stage only .gitignore and commit immediately so stage_all() later
-        # never sees it as a pending change.
+        # Stage only .gitignore and commit it at once, so stage_all() never sees it as a pending change.
         try:
             self._run(["git", "add", ".gitignore"], "git add .gitignore failed")
             self._run(
@@ -159,8 +157,7 @@ class GitManager:
                 "ensure_gitignore_committed: committed .gitignore with entries: %s", missing
             )
         except GitError as exc:
-            # Non-fatal: the file was written; future commits may pick it up,
-            # but the entries are at least present for git to honour.
+            # Non-fatal: the file is written and the entries are present for git to honour.
             logger.warning("ensure_gitignore_committed: commit failed: %s", exc)
 
     def configure_identity(self) -> None:
@@ -213,22 +210,7 @@ class GitManager:
             return
         self._run(["git", "reset", "--hard", "HEAD"], "git reset --hard failed")
 
-        # `git clean -fd` removes UNTRACKED files.  The docstring above assumes
-        # .gitignore shields internal agent state from it — but
-        # ensure_gitignore_committed() is best-effort: on OSError (read-only
-        # .gitignore, permissions, full disk) it logs a warning and returns,
-        # leaving ".agent/" un-ignored.  In that state this clean deletes the
-        # entire run: plan.json, tickets, feedback rounds, run.log.  Verified:
-        #
-        #   .agent/plan.json exists before: True
-        #   .agent/plan.json exists after : False
-        #   .agent dir exists after       : False
-        #
-        # `git reset --hard` above already reverts every TRACKED edit, which is
-        # the residue this method exists to remove.  So when the shield is not
-        # actually in place, skip the clean and keep the state: leaving some
-        # untracked residue behind is a far smaller harm than destroying the
-        # run's own bookkeeping mid-flight.
+        # `git clean -fd` deletes untracked files, so .agent/ must be ignored; if the .gitignore write failed, this clean would delete the whole run.
         if not self._agent_state_is_ignored():
             logger.warning(
                 "discard_working_changes: .agent/ is not covered by .gitignore "
@@ -268,24 +250,7 @@ class GitManager:
 
     def has_staged_changes(self) -> bool:
         """Return ``True`` if there is at least one staged change."""
-        # BUGFIX (report §4, item 10): missing an OSError catch (e.g. the
-        # git binary itself is missing, or unusable) for a subprocess call
-        # of the same class as _run()'s — inconsistent with the sibling
-        # method _agent_state_is_ignored() just above, which already
-        # catches (subprocess.TimeoutExpired, OSError).
-        #
-        # Deliberately NOT fail-closed like _agent_state_is_ignored(),
-        # though: that method guards a best-effort optional cleanup step
-        # (skip .agent/ cleaning if unsure), where returning False on
-        # failure is safe. has_staged_changes() gates whether commit()
-        # actually commits — commit() calls self._run(["git", "commit", ...])
-        # right after, which itself raises GitError (not caught) if git is
-        # genuinely unusable. Failing closed here would just relabel that
-        # same problem as "nothing to commit — skipping" and silently
-        # no-op the commit instead of surfacing that git is broken. Raise
-        # a GitError instead, matching _run()'s own established pattern
-        # for this exact class of subprocess failure (see the
-        # TimeoutExpired branch a few lines below).
+        # Raise GitError on failure, not False: a false answer would silently skip the commit instead of showing that git is broken.
         try:
             result = subprocess.run(
                 ["git", "diff", "--cached", "--quiet"],
@@ -392,8 +357,7 @@ class GitManager:
         if not sha:
             return []
         try:
-            # -z: the names as they are. Without it git C-quotes a non-ASCII name ('"caf\\303\\251.py"'),
-            # and the collect facts of that file were never marked stale
+            # -z: names as written. Without it git C-quotes non-ASCII names, so their collect facts were never marked stale.
             out = self._run(
                 ["git", "diff-tree", "-z", "--no-commit-id", "--name-only", "-r", sha],
                 "git diff-tree failed",
@@ -424,16 +388,7 @@ class GitManager:
 
     # ── Private ──────────────────────────────────────────────────────────────
 
-    # FL-2 (round 85): the ladder is no longer this class's. It is
-    # `tools.git_run.run_git`, shared with every other git caller in the tree —
-    # `workspace._git`, `gates.git`, `runner._dirty_tree`, `manifest._run_git`,
-    # `cli.export_patches`, `delta_validator` — so a held `.git/index.lock` costs
-    # the same two seconds for every command instead of being waited out by one
-    # module and fatal to the rest. FL-1 (round 84) put it here first, as the
-    # caller the 32-worker stress run happened to hit; it now lives once, and
-    # these aliases keep the names the class has always had. See `tools/git_run`
-    # for the rationale — why the lock is a transient, and why the ladder is
-    # bounded by the same error that already names stale locks as the likely cause.
+    # Lock retries are shared with the other git callers through tools.git_run.run_git (see there for why a held lock is transient).
     _LOCK_CONTENTION_RE = LOCK_CONTENTION_RE
     _LOCK_RETRIES = LOCK_RETRIES
     _LOCK_BACKOFF_S = LOCK_BACKOFF_S
@@ -524,9 +479,7 @@ class GitManager:
         return proc.stdout
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience factory — used by AutoController
-# ─────────────────────────────────────────────────────────────────────────────
+# Convenience factory, used by AutoController
 
 def make_git_manager(
     repo_dir: str | Path,

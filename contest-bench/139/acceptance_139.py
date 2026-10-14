@@ -141,8 +141,7 @@ def test_header_shape_exact(repo, capsys):
 def test_base_missing_is_question_mark(repo, capsys):
     write_state(repo / "out" / "07", 7, [agent("solo")], base=None)
     rc, out, err = run(capsys, "run", "view", "7")
-    # cmd_status itself cannot read a state.json without base_sha; its exit
-    # code is run view's (the ticket), so only the header is arena's to get right
+    # cmd_status cannot read state.json without base_sha; its exit code belongs to run view, so only the header matters here.
     assert header(out).rstrip().endswith("base ?")
     assert "Traceback" not in err
 

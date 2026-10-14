@@ -77,9 +77,7 @@ def test_summarize_module_passes_facts_and_source_to_the_model():
 
     summarize_module(module, _source(), stub_llm)
 
-    # The facts block must mention at least one real extracted symbol name,
-    # not a placeholder — this is the "input = already extracted Pass A
-    # facts + source" requirement from the task description.
+    # The facts block names a real extracted symbol, not a placeholder.
     assert "public_symbols" in seen["user"]
     assert any(s.qualname.split(":")[-1] in seen["user"] for s in module.public_symbols)
     assert "Source:" in seen["user"]
@@ -149,14 +147,7 @@ def test_summarize_module_never_raises_on_malformed_reply():
     assert result.summary == LLMSummary(purpose="", notes="")
 
 
-# ── empty replies are retry-worthy, not silently accepted (COLLECT-16 follow-up) ─
-#
-# Found via forensic comparison of two real collect runs against this repo:
-# a blank completion — the shape a flaky/rate-limited provider route tends
-# to fail with — used to reach `_parse_llm_summary` exactly like any other
-# reply and degrade to an empty summary with zero retries and zero trace of
-# what happened. `EmptyReplyError` gives it the same retry-with-backoff
-# treatment a raised network error already gets.
+# Empty replies are retry-worthy, not silently accepted (COLLECT-16 follow-up): EmptyReplyError gets retry with backoff.
 
 
 @pytest.mark.parametrize("raw", ["", "   ", "\n\t \n"])
@@ -168,10 +159,7 @@ def test_summarize_module_raises_empty_reply_error_on_blank_reply(raw):
 
 
 def test_summarize_module_does_not_raise_on_well_formed_but_empty_summary():
-    # Non-regression: a *real*, well-formed reply that just happens to say
-    # nothing (a model's deliberate "no purpose/notes worth writing" for a
-    # near-empty file) is not the failure this exception targets — it's
-    # indistinguishable from a legitimate answer and must not be retried.
+    # A well-formed reply that says nothing is a legitimate answer and must not be retried.
     module = _module()
     reply = json.dumps({"purpose": "", "notes": ""})
     stub_llm = lambda system, user: reply  # noqa: E731
@@ -203,11 +191,7 @@ def test_summarize_repo_retries_blank_reply_then_succeeds():
 
 
 def test_summarize_repo_gives_up_gracefully_after_persistent_blank_replies():
-    # Same fail-open guarantee as a persistently-raising LLM
-    # (`test_summarize_repo_gives_up_after_max_retries_without_aborting_batch`)
-    # — retries are bounded, and exhausting them against an always-blank
-    # reply must still settle on a structural-only module, never raise out
-    # of `summarize_repo` itself.
+    # Persistent blank replies give up after bounded retries and settle on a structural-only module.
     module = _module()
     sources = {"pkg/error_handling.py": _source()}
     errors_seen = []
@@ -237,9 +221,7 @@ def test_summarization_never_touches_structural_fields():
 
     result = summarize_module(module, _source(), stub_llm)
 
-    # Every static field is unchanged (dataclasses.replace only touched
-    # `summary`); COLLECT-1's provenance map for the structural fields
-    # still says "static", never "llm".
+    # Static fields are unchanged by the summary; their provenance stays static.
     assert result.path == module.path
     assert result.public_symbols == module.public_symbols
     assert result.imports == module.imports
@@ -289,15 +271,12 @@ def test_truncate_source_cuts_down_to_budget():
 
 
 def test_budget_chars_is_never_negative():
-    # A pathological config (max_tokens >= num_ctx) must degrade to a 0
-    # budget, not a negative slice.
+    # A config where max_tokens >= num_ctx degrades to a zero budget, not a negative slice.
     assert _budget_chars(num_ctx=100, max_tokens=1000) == 0
 
 
 def test_budget_chars_falls_back_when_num_ctx_is_zero():
-    # num_ctx=0 means "server default" elsewhere in this project (see
-    # llm_stream._build_payload) — the budget helper must not compute a
-    # near-zero char budget from a literal zero.
+    # num_ctx=0 means the server default; the budget must not come out near zero.
     assert _budget_chars(num_ctx=0, max_tokens=DEFAULT_MAX_TOKENS) > 0
 
 
@@ -380,8 +359,7 @@ def test_summarize_repo_gives_up_after_max_retries_without_aborting_batch():
         on_error=lambda path, exc, count: errors_seen.append((path, count)),
     )
 
-    # Both modules kept (structural-only) — one perpetually-failing module
-    # does not lose the other's slot in the output, and does not raise.
+    # Both modules are kept structurally, so a failing module does not lose the other's slot.
     assert len(out) == 2
     assert all(m.summary is None for m in out)
     # 1 initial + max_retries(2) retries = 3 attempts recorded per module
@@ -430,14 +408,7 @@ def test_summarize_repo_checkpoint_skips_already_done_modules_on_resume(tmp_path
     assert out[0].summary.purpose == "cached"
 
 
-# ── RUN-11: a Ctrl-C mid-Pass B costs one module, and a resume is honest ────
-#
-# summarize_repo already checkpointed every landed summary (EPIC E) but no
-# production caller passed checkpoint_path, so an interrupted full build
-# wrote nothing. These tests pin the half that lives here: an entry is tied
-# to the source it was summarized from (sha), a resume says what it kept
-# and what it re-derived, and a broken checkpoint degrades instead of
-# raising.
+# RUN-11: a Ctrl-C mid Pass B costs one module; an entry is tied to its source sha, and a broken checkpoint degrades.
 
 
 def _two_modules():
@@ -660,9 +631,7 @@ def test_summarize_repo_corrupt_or_foreign_checkpoint_degrades_to_no_checkpoint(
         assert calls == [], f"{label}: no resume may be claimed"
         assert [m.summary.purpose for m in out] == ["fresh", "fresh"], label
 
-    # A file whose entries were recorded but are individually malformed is
-    # still a checkpoint that was read: all of them are rejected and the
-    # operator is told so, rather than silently losing the attempt.
+    # Malformed entries are all rejected and reported, not silently dropped.
     checkpoint = tmp_path / "non_dict_entry_state.json"
     checkpoint.write_bytes(_checkpoint_bytes(
         {"loop": "collect_summarize",
@@ -753,12 +722,7 @@ def test_collect_llm_budget_prefers_collect_section_override():
     assert max_tokens == 300
 
 
-# ── §2.3 regression: malformed values must degrade, not crash ─────────────────
-# `fallback=` on a configparser read only covers a *missing* key, not a
-# malformed *value* — a non-numeric num_ctx/max_tokens used to raise a raw
-# ValueError straight out of collect_llm_budget(), which crashed both the
-# `--collect` CLI action (unguarded call site) and the interactive `/collect`
-# REPL command (whose `except CollectCliError` doesn't catch ValueError).
+# Regression (2.3): malformed numeric config values degrade to defaults instead of crashing --collect or /collect.
 
 
 def test_collect_llm_budget_malformed_collect_num_ctx_falls_back_to_zero():
@@ -782,8 +746,7 @@ def test_collect_llm_budget_malformed_max_tokens_falls_back_to_default():
 
 
 def test_collect_llm_budget_malformed_values_do_not_affect_the_other_field():
-    # A bad num_ctx shouldn't stop a valid max_tokens from being read, and
-    # vice versa — each field degrades independently.
+    # A bad num_ctx does not stop a valid max_tokens from being read, and the reverse.
     cfg = _cfg("[collect]\nnum_ctx = bogus\nmax_tokens = 128\n")
     num_ctx, max_tokens = collect_llm_budget(cfg)
     assert num_ctx == 0

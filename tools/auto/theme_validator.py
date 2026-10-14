@@ -101,8 +101,7 @@ class ThemeValidator:
         lang_instr = language_instruction(detect_language(new_text))
         system = _THEME_SYSTEM + (("\n" + lang_instr) if lang_instr else "")
         if lang_instr:
-            # Same carve-out as the continuity validator: the language lock
-            # must never swallow the English verdict token itself.
+            # Same carve-out as the continuity validator: the language lock never swallows the verdict word.
             system += (
                 "\nEXCEPTION TO THE LANGUAGE RULE ABOVE: the verdict word "
                 "itself — APPROVED or REVISE — must always be written in "
@@ -139,9 +138,7 @@ def make_theme_validator(config, *, settings=None) -> "ThemeValidator | None":
     build_validators` passes a resolved value, via ``[validator_agent]
     theme_llm_profile``.
     """
-    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
-    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
-    # the literal config.getX(...) call shape.
+    # Each config read is wrapped separately, so extract_config_reads still sees the literal calls.
     try:
         enabled = config.getboolean(
             "validator_agent", "theme_check_creative", fallback=False
@@ -173,8 +170,7 @@ def make_theme_validator(config, *, settings=None) -> "ThemeValidator | None":
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-        # GATE3-PROFILE-2: only pass settings= when a profile was actually
-        # resolved — see the identical comment in canon_validator.py.
+        # Pass settings= only when a profile was resolved (as in canon_validator.py).
         llm_call = (
             _make_llm_call(config, task_mode="creative", settings=settings)
             if settings is not None

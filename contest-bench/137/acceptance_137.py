@@ -58,8 +58,7 @@ def test_repo_seam_is_the_checkout_root():
 
 
 def _kv(row: dict) -> tuple[str, str]:
-    # Column names are the entry's choice (a "key" column is masked by emit),
-    # so read a view row as its first two values.
+    # Column names are the entry's choice (a "key" column is masked by emit), so read a view row by its first two values.
     vals = list(row.values())
     return str(vals[0]), vals[1]
 

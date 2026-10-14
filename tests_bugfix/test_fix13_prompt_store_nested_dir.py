@@ -40,9 +40,7 @@ class TestNestedDirectoryIsCreated:
         ps = PromptStore(store_path=store_path, max_versions=3)
         ps.push("validator_agent", "a new optimized prompt", 0.9)
 
-        # A second, independent PromptStore pointed at the same path must
-        # see the pushed prompt — proves it actually reached disk, not just
-        # the in-memory `data` dict of the first instance.
+        # A second store on the same path must see the pushed prompt, proving it reached disk.
         ps_reloaded = PromptStore(store_path=store_path, max_versions=3)
         assert ps_reloaded.get_current("validator_agent") == "a new optimized prompt"
 

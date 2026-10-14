@@ -37,14 +37,11 @@ MAX_BATCH = 20          # /assess takes at most 20 claims per call
 DEFAULT_MAX = 12        # our own cap: one credit per claim
 VERIFY_CREDITS = 10     # what one /verify costs, for the console estimate
 
-# A sentence is *internal* when it names something that only exists in this
-# repo: a path, a ticket id, a backticked identifier with _ or a dot-suffix.
+# A sentence is internal when it names something that exists only in this repo (path, ticket id, identifier).
 _TICKET = re.compile(r"\b(?:KC|FL|AR|AUTO|SLOW|GATE1)-[\w-]*\d")
 _BACKTICK = re.compile(r"`([^`]+)`")
 _PATHLIKE = re.compile(r"(?:\w+/)+\w|\b\w+/(?![\w/])|\.(?:py|md|ini|json|csv|sh)\b")
-# Ordinary words that carry a slash ("read/write", "TCP/IP") and plain
-# fractions ("24/7") are not paths; they are cut out before _PATHLIKE looks,
-# or a public claim holding one is never sent and is voted CODE-CHECK.
+# Slash words ("read/write", "TCP/IP", "24/7") are not paths; cut them out before _PATHLIKE matches.
 _SLASH_WORDS = re.compile(
     r"(?<![\w/.])(?:and/or|either/or|read/write|r/w|input/output|i/o|tcp/ip|"
     r"client/server|yes/no|true/false|on/off|pass/fail|success/failure|"
@@ -67,8 +64,7 @@ _HINTS = re.compile(
 def _repo_symbols(root: Path) -> set[str]:
     """Names defined in the repo's own code: def/class names and file stems."""
     names: set[str] = set()
-    # -z: NUL-separated and unquoted, so "my module.py" stays one file and a
-    # non-ASCII name is not C-quoted; surrogateescape keeps any bytes readable.
+    # NUL-separated and unquoted, so names with spaces or non-ASCII stay readable.
     try:
         raw = subprocess.run(["git", "ls-files", "-z", "*.py"], cwd=root,
                              capture_output=True, check=True).stdout
@@ -92,8 +88,7 @@ def split_sentences(text: str) -> list[str]:
         line = line.strip()
         if not line or line.startswith(("|", "#", "```")):
             continue
-        # one real list marker ("- ", "* ", "+ ", "1. ", "12) ", "1.2. ") and
-        # only that: "404 is ...", "3.5 seconds ...", "-1 is ..." keep their words
+        # Only one real list marker is removed, so numbers at the start of a sentence keep their words.
         line = re.sub(r"^(?:[-*+]|\d+(?:\.\d+)*[.)])\s+", "", line, count=1)
         line = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"\1", line)   # bold, not "2 ** 10"
         label = _LABEL.match(line)
@@ -109,9 +104,7 @@ def split_sentences(text: str) -> list[str]:
 
 
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z`])")
-#: an abbreviation is no sentence end: "e.g. Python is widely used ..." went to Lenz as a claim of its own.
-#: Not `no`, `etc`, `fig`: each ends sentences ("Is it thread-safe? No. The cache leaks ...", "JSON, YAML, etc.
-#: The loader ..."), and "no. 5" or "Fig. 3" is never cut anyway (a cut needs a capital or a backtick after it)
+#: Abbreviations such as e.g., i.e., vs and approx do not end a sentence; "no", "etc" and "fig" are left out of the list.
 _ABBREV_END = re.compile(r"(?:^|[\s(])(?:e\.g|i\.e|vs|cf|approx|resp|incl|esp)\.$", re.I)
 
 
@@ -141,8 +134,7 @@ def is_internal(sentence: str, symbols: set[str]) -> bool:
     for tok in _BACKTICK.findall(sentence):
         if tok in symbols or _CODEISH.search(tok):
             return True
-    # a repo name written bare; only snake_case ones, a plain word ("render")
-    # is too often an English word as well
+    # A bare word is a repo name only when it is snake_case, since plain words are often English.
     return any(tok in symbols for tok in _SNAKE.findall(sentence))
 
 
@@ -175,8 +167,7 @@ class Cache:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
-        # valid JSON that is not an object ([] or null) is an empty cache too;
-        # the next put rewrites the file as an object
+        # Valid JSON that is not an object is an empty cache; the next put rewrites it as an object.
         self.data: dict = data if isinstance(data, dict) else {}
 
     @staticmethod
@@ -238,8 +229,7 @@ def _heading_parts(text: str) -> list[str]:
         if mark and not fence:
             fence = mark.group(1)
         elif mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence) and not mark.group(2).strip():
-            # CommonMark: a fence closes only with as many of its own character or more, and nothing after
-            # them: a ```` fence quoting a ``` sample was closed by the sample, and a `## ` inside cut there
+            # A fence closes only with as many of its own characters, as CommonMark requires.
             fence = ""
         elif not fence and re.match(r"#{2,3} ", line) and cur:
             parts.append("".join(cur))
@@ -390,8 +380,7 @@ def main(argv: list[str] | None = None) -> int:
             print("  -", sec.splitlines()[0][:100])
         return 0
 
-    # The key is asked for only when something must go out: a fully cached
-    # run (every section, every claim) and an empty send need none.
+    # The key is asked for only when something must be sent.
     keys: list[str] = []
 
     def need_key() -> str:

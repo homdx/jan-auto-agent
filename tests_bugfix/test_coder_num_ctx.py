@@ -41,8 +41,7 @@ def _capture_payload(coder, monkeypatch):
         cap["payload"] = payload
         return '{"files": []}'
 
-    # monkeypatch, not an assignment: the fake stayed tools.llm_stream.request_completion for the rest of the
-    # process, and a later test of a real call in the same worker got '{"files": []}' (a flake of xdist)
+    # monkeypatch restores request_completion; a leaked fake broke a later real call in the same xdist worker.
     monkeypatch.setattr(C._llm_stream, "request_completion", _fake)
     with tempfile.TemporaryDirectory() as d:
         try:

@@ -71,12 +71,7 @@ def _make_filter() -> Gate1Filter:
     )
 
 
-# The exact shape from the field log: a docstring pasted verbatim (with a
-# real newline) into the "evidence" string value instead of "\\n". Uses
-# single-quoted triple-quotes so the ONLY JSON defect under test is the
-# literal newline — embedding literal double quotes here would be a
-# second, unrelated defect (unescaped `"` breaking the string boundary)
-# that strict=False does not and should not paper over.
+# Literal newline in a JSON string value, as in the field log; single-quoted triple quotes isolate that defect.
 _EVIDENCE_SNIPPET = (
     "class NonDeterministicPayload(RuntimeError):\n"
     "    '''Raised when a structural payload contains a clock-dependent "

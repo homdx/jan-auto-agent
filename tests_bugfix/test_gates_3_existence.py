@@ -58,9 +58,7 @@ def validator() -> ExistenceValidator:
     return ExistenceValidator()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # The two observed defects
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_named_missing_test_file_is_rejected(validator, repo):
     """The first observed defect, verbatim."""
@@ -108,9 +106,7 @@ def test_both_findings_appear_together(validator, repo):
     assert "test files" in feedback
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# False positives — the failure mode that gets a gate switched off
-# ─────────────────────────────────────────────────────────────────────────────
+# False positives: the failure mode that gets a gate switched off
 
 def test_prose_mention_without_backticks_is_ignored(validator, repo):
     """"the main script" is not a claim about a path."""
@@ -179,9 +175,7 @@ def test_test_file_naming_conventions_are_recognised(validator, repo, name):
     assert validator.check("Run `pytest`.", repo).approved is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Reference extraction
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_references_read_from_fenced_blocks(validator):
     text = "```bash\npython run_me.py\n```\n"
@@ -201,9 +195,7 @@ def test_trailing_punctuation_is_stripped(validator, repo):
     assert validator.check("Run `main.py,` now.", repo).approved is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fail-open and determinism
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_missing_base_dir_fails_open(validator, tmp_path):
     verdict = validator.check("`ghost.py`", tmp_path / "nope")
@@ -237,9 +229,7 @@ def test_verdict_exposes_the_approved_field():
     assert ExistenceVerdict(approved=False).approved is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory and configuration
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(text: str = "") -> configparser.ConfigParser:
     cfg = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
@@ -298,9 +288,7 @@ def test_default_extensions_cover_the_common_doc_targets():
         assert ext in DEFAULT_EXTENSIONS
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Registry wiring
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_gate_is_registered():
     assert "existence" in GATES_BY_NAME
@@ -365,9 +353,7 @@ def test_build_validators_skips_it_for_creative(tmp_path):
     assert out["existence_validator"] is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shipped configuration
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_hello_docs_skill_uses_the_existence_gate():
     from tools.skills.loader import apply_skill

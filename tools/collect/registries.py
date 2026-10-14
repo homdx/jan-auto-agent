@@ -42,18 +42,10 @@ import yaml
 
 from tools.collect.model import ContractRecord, ModuleRecord, Provenance
 
-#: Default location of the hand-maintained seed-contract data file
-#: (COLLECT-10). Relative to this module, not the CWD, so
-#: `build_seed_contracts` works regardless of where the caller's process
-#: happens to be running from.
+#: Default path of the hand-kept seed contracts file, resolved from this module, not the CWD.
 DEFAULT_CONTRACTS_SEED_PATH = Path(__file__).parent / "contracts_seed.yaml"
 
-#: The repo `contracts_seed.yaml` actually documents — this package's own
-#: source tree (`tools/collect/registries.py` -> `tools/collect` ->
-#: `tools` -> repo root). Used by `build_seed_contracts` to tell a
-#: self-scan (`collect` run against this very repo, where the seed's
-#: citations are meaningful) apart from `--base <some other repo>` (where
-#: they describe code that was never scanned and can never resolve).
+#: Repo root of this package, used to tell a self-scan from a scan of another repo.
 _SEED_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -196,10 +188,7 @@ def build_fail_open_registry(
                 tree = ast.parse(source, filename=m.path)
                 comments = _line_comments(source)
             except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
-                # BUGFIX (audit): ast.parse raises ValueError (not
-                # SyntaxError) on null-byte input; a null-byte module used
-                # to crash build_fail_open_registry instead of degrading
-                # to rationale=None like every other parse failure here.
+                # A null byte makes ast.parse raise ValueError, so treat it as a parse failure (BUGFIX).
                 tree = None
                 comments = {}
 
@@ -253,20 +242,11 @@ def _load_seed_entries(seed_path: Path) -> List[Dict[str, object]]:
     """
     if not seed_path.exists():
         return []
-    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): the
-    # yaml.safe_load() call itself used to be unguarded — a malformed seed
-    # YAML raised a bare yaml.YAMLError with no file-path context. This is
-    # still "allowed to raise" per the docstring above (seeding stays
-    # optional only for an *absent* file), just with a message that names
-    # the offending file.
+    # A malformed seed YAML raises with the file path in the message (AUTO-FIX).
     try:
         raw = yaml.safe_load(seed_path.read_text(encoding="utf-8"))
     except (yaml.YAMLError, UnicodeDecodeError) as exc:
-        # BUGFIX (audit): UnicodeDecodeError added — a non-UTF-8 seed file
-        # raised uncaught here, inconsistent with the sibling
-        # UnicodeDecodeError handling in risk.py/graph.py/test_map.py and
-        # with this function's own "allowed to raise, but with a message
-        # that names the offending file" contract just above.
+        # A non-UTF-8 seed file raises the same named error as a bad YAML (BUGFIX).
         raise ContractCitationError(
             f"{seed_path}: not valid YAML ({exc})"
         ) from exc
@@ -276,11 +256,7 @@ def _load_seed_entries(seed_path: Path) -> List[Dict[str, object]]:
         raise ContractCitationError(
             f"{seed_path}: expected a YAML list of contract entries, got {type(raw).__name__}"
         )
-    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): the list-type
-    # check above didn't verify each ELEMENT is a dict — a string or number
-    # entry passed through silently and crashed build_seed_contracts's
-    # `entry.get("name")` with an unhelpful AttributeError far from this
-    # file and with no indication of which entry (by index) was bad.
+    # Each seed entry must be a dict, and a bad one is reported by index (AUTO-FIX).
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
             raise ContractCitationError(
@@ -356,12 +332,7 @@ def build_seed_contracts(
     contracts: List[ContractRecord] = []
     for entry in entries:
         if not isinstance(entry, dict):
-            # AUTO-REG-GUARD-1: a stray non-dict item in the seed YAML
-            # (e.g. a bare string/list entry from a typo'd list) would
-            # otherwise raise a raw, confusing AttributeError from
-            # entry.get(...) below. Same failure posture as the
-            # missing-field case just below — a malformed seed entry is
-            # itself a citation failure, not something to skip silently.
+            # A non-dict seed entry is a citation failure, not a silent skip (AUTO-REG-GUARD-1).
             raise ContractCitationError(
                 f"{seed_path}: seed entry {entry!r} is not a mapping "
                 f"(expected name/description/known_edge keys, got "
@@ -485,10 +456,7 @@ def _method_line_range(source: str, class_name: str, method_name: str) -> Option
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
-        # BUGFIX (audit): ast.parse raises ValueError (not SyntaxError) on
-        # null-byte input — a null-byte source used to crash
-        # AlreadySafeIndex.__init__ instead of returning None like every
-        # other parse failure here.
+        # A null byte makes ast.parse raise ValueError, so return None like other parse failures (BUGFIX).
         return None
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == class_name:
@@ -534,22 +502,9 @@ class AlreadySafeIndex:
         self._fail_open_by_location = {e.location: e for e in fail_open_registry}
 
         self._contracts_by_edge: Dict[str, List[ContractRecord]] = {}
-        # (known_edge, contract.name) -> (first_line, last_line), populated
-        # only for contracts whose description names a specific method of
-        # a class-shaped known_edge — see `_referenced_method`. A
-        # class-level known_edge with no such reference never enters
-        # either of the two sets below: it means the contract genuinely
-        # intends its whole known_edge range, not one method within it, so
-        # `query()` keeps matching at that (correct, class-wide) grain.
+        # Line ranges for contracts that name one method, so query() narrows to it.
         self._contract_line_range: Dict[Tuple[str, str], Tuple[int, int]] = {}
-        # (known_edge, contract.name) pairs whose description named a
-        # specific method but whose range this __init__ could not resolve
-        # (no `root`, file missing, method not found). `query()` must
-        # treat these as *not* matching rather than silently falling back
-        # to the class-wide range — that fallback is exactly the false
-        # "safe: contract" claim for unrelated methods this fix exists to
-        # close (found on the real `PromptStore`/`_save` seed contract:
-        # every line in every other method of the class matched too).
+        # Contracts that name a method whose range is unknown never match, instead of the whole class.
         self._contract_wants_narrowing: set = set()
         for c in contracts:
             if not c.known_edge:
@@ -607,15 +562,7 @@ class AlreadySafeIndex:
         accesses = self._guarded_by_location.get(location)
         relevant = accesses
         if access is not None:
-            # AUTO-FIX (COLLECT-26-class gap, mirrors verifier.py's
-            # _normalize_access): raw `a.access == access` compared quote
-            # style literally, so a guard recorded as `entry['stack']`
-            # never matched a query for `entry["stack"]` — the identical
-            # site, differing only in which quote character was used —
-            # and a correctly-guarded access was reported `unknown`
-            # instead of `guarded`. verifier.py already fixed this exact
-            # class of bug for its own access-citation comparisons; do
-            # the same quote-folding here so the two call sites agree.
+            # Compare access strings after quote normalisation, as verifier.py does (AUTO-FIX).
             wanted = access.replace('"', "'")
             relevant = (
                 [a for a in accesses if a.access.replace('"', "'") == wanted]
@@ -628,8 +575,7 @@ class AlreadySafeIndex:
                 guarded = relevant[0]
                 return SafetyAnswer(True, "guarded", detail=guarded.guard)
             if "GUARDED" in statuses and "UNGUARDED" in statuses:
-                # Only reachable with access=None on a genuinely mixed
-                # line: distinct accesses whose guard status disagrees.
+                # Reached only for a mixed line whose accesses disagree on guard status.
                 cited = ", ".join(sorted({f"{a.access}={a.status}" for a in relevant}))
                 return SafetyAnswer(
                     False,
@@ -653,24 +599,7 @@ class AlreadySafeIndex:
         if module is not None and line_str.isdigit():
             line_num = int(line_str)
             symbol = _enclosing_symbol_qualname(module, line_num)
-            # AUTO-FIX (COLLECT-26 Java gap): COLLECT-4 only inventories
-            # top-level defs/classes for Python, so a Python qualname is
-            # always bare "path:TopLevelName" and this loop never runs —
-            # class-wide contracts have matched Python lines correctly
-            # all along. Java is different by design (java_facts.py):
-            # `public_symbols` also includes each method's own qualname
-            # ("Foo.java:PromptStore._save"), since Java has no top-level
-            # functions to fall back to. `_enclosing_symbol_qualname`
-            # picks the closest-preceding symbol, so a line inside a
-            # method resolves to the METHOD's qualname — which a
-            # class-wide (unnarrowed) contract's known_edge
-            # ("Foo.java:PromptStore") never equals, so every such
-            # contract silently failed to cover any of its own methods.
-            # Walk up the dotted qualname one enclosing type at a time so
-            # a method-level symbol can still reach its class-level
-            # contract; the exact symbol is tried first so an
-            # already-correct match (Python, or a Java field/initializer
-            # line with no method of its own) is unaffected.
+            # Walk up the qualname so a method-level symbol still reaches its class-level contract (AUTO-FIX, COLLECT-26).
             candidates = []
             if symbol is not None:
                 candidates.append(symbol)
@@ -690,22 +619,15 @@ class AlreadySafeIndex:
                         if rng[0] <= line_num <= rng[1]:
                             matched.append(c)
                     elif key not in self._contract_wants_narrowing:
-                        # No specific method named in the description at
-                        # all — the class-wide known_edge is genuinely
-                        # what this contract means to cover.
+                        # No method is named in the description, so the class-wide range applies.
                         matched.append(c)
-                    # else: description named a method but the range
-                    # couldn't be resolved (no root, file missing, method
-                    # not found) — do not match; see __init__ comment.
+                    # A named method that cannot be resolved does not match (see __init__).
                 if matched:
                     names = ", ".join(c.name for c in matched)
                     return SafetyAnswer(True, "contract", detail=names, provenance=Provenance.DERIVED)
 
         if relevant:
-            # Every entry reaching here is UNGUARDED (the GUARDED-only and
-            # mixed-status cases already returned above) — and, when
-            # `access` was given, specifically the entry for that access,
-            # not some other one sharing the same location.
+            # Every entry here is unguarded; the one for this access is reported.
             return SafetyAnswer(False, "unguarded", detail=relevant[0].access)
 
         return SafetyAnswer(False, "unknown")

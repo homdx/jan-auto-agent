@@ -131,18 +131,7 @@ class PlanEmitter:
         atomic_write_text(md_path, md_content)
         logger.info("emit: wrote %s (%d bytes)", md_path, len(md_content))
 
-        # 2. Upsert all auto tasks into plan.json via StateStore.
-        # BUGFIX (unguarded upsert loop): upsert_task() validates against the
-        # plan.json schema and raises ValueError on a violation. The tasks
-        # here are derived from LLM-authored candidates, so a violation is a
-        # normal-frequency event, not a can't-happen. Unguarded, the first
-        # bad task aborted emit() *after* IMPROVEMENTS.md had been written
-        # and after every earlier task had already been persisted by its own
-        # upsert — leaving plan.json half-populated, uncommitted, and out of
-        # sync with the IMPROVEMENTS.md sitting next to it. Skip the offender
-        # instead: the remaining tasks are independently valid and a plan
-        # missing one task is recoverable, where a half-written one needs
-        # manual repair before the next run can resume.
+        # 2. Upsert the auto tasks into plan.json; a bad task is skipped so one invalid candidate cannot leave a half-written plan.
         state_tasks = backlog.to_state_tasks()
         upserted = 0
         rejected: list[str] = []
@@ -165,8 +154,7 @@ class PlanEmitter:
             upserted, len(state_tasks),
         )
         if rejected:
-            # IMPROVEMENTS.md still lists these — say so, or the mismatch
-            # between the file and plan.json reads as a lost write.
+            # IMPROVEMENTS.md still lists these; say so, so the mismatch is not read as a lost write.
             self._state.log(
                 f"emit: {len(rejected)} task(s) listed in "
                 f"{IMPROVEMENTS_FILENAME} were not added to plan.json "
@@ -189,15 +177,7 @@ class PlanEmitter:
         commit_msg = (
             f"auto({_COMMIT_TASK_ID}): emit plan — {n_auto} task(s)"
         )
-        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): unlike
-        # this module's other two real GitManager.commit()/commit_task()
-        # callers (CommitOnSuccess, plan_validator._commit_validation),
-        # this one was unguarded — a GitError here (hook rejection, git
-        # lock file, disk full) propagated straight out of emit(), even
-        # though the plan itself (plan.json/IMPROVEMENTS.md) had already
-        # been written to disk at this point. Degrade the same way the
-        # other two callers do: log and continue with the plan considered
-        # emitted, just not committed.
+        # Log a git failure and continue: the plan is already written, so it is emitted but not committed.
         try:
             commit_hash = self._git.commit(commit_msg)
         except GitError as exc:
@@ -289,11 +269,7 @@ class PlanEmitter:
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("_load_cluster_hashes: could not read hash file: %s", exc)
             return {}
-        # BUGFIX (audit): no isinstance check — a valid-JSON but
-        # wrong-shape hash file (e.g. a list) was returned as-is, and the
-        # caller's `stored.get(cluster.name)` then crashed with
-        # AttributeError instead of degrading to "no stored hash" the way
-        # a missing/corrupt file already does above.
+        # A non-dict hash file counts as no stored hash, as a missing or corrupt file does.
         if not isinstance(data, dict):
             logger.warning(
                 "_load_cluster_hashes: hash file is not a JSON object "

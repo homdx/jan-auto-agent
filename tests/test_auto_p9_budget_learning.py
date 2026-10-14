@@ -81,9 +81,7 @@ def _learner(costs=(), *, warmup=3, headroom=2.0, ceiling=0,
     return p
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # The estimator
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestSeededCap:
 
@@ -168,9 +166,7 @@ class TestSampling:
         assert p._max_total_chars == 10000
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Ladder selection
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(**over: str) -> configparser.ConfigParser:
     arch = {"temperature": "0.2", "max_tokens": "512", "probe_enabled": "true",

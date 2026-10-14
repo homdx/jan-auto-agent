@@ -163,77 +163,54 @@ __all__ = [
 #: The ticket folder the round reads; `scripts/next_task.py` hands it out.
 TASKS_DIR = "epic-tasks"
 
-#: The committed roster at the repo root; a `contest.local.ini` next to it
-#: overrides it, `load_roster`'s own rule (KC-2).
+#: The committed roster at the repo root; contest.local.ini next to it overrides it (KC-2).
 DEFAULT_ROSTER = "contest.ini"
 
-#: The provider id behind a `--models` id that does not name its own. The id
-#: `POST /session` wants — not the display name the id may have been read from.
+#: Provider id for a --models id that does not name its own; the id POST /session wants.
 DEFAULT_PROVIDER = "kenary"
 
-#: The committed `contest.ini`'s gate model. It is not a model anyone can call,
-#: so a round that still runs on it has no gate to probe (KC-55 §5).
+#: The committed gate model placeholder; a round still on it has no gate to probe (KC-55).
 GATE_PLACEHOLDER_MODEL = "some/model"
 
-#: KC-65: the plugin the agents' pytest loads, and the directory it lives in.
-#: The directory — not the runner's repo root, which would make an agent's pytest
-#: import the runner's `tools` instead of the code in its own clone — is what
-#: goes on PYTHONPATH; the module name is what PYTEST_PLUGINS carries.
+#: Pytest plugin module name, loaded from its own directory so the agent imports its own tools (KC-65).
 PYTEST_WORKERS_PLUGIN = "contest_pytest_workers"
 PYTEST_WORKERS_PLUGIN_DIR = Path(__file__).resolve().parent / "pytest_plugin"
 
-#: KC-62: the box intake scans for the neighbours that share the server's store.
-#: A test points it at a fake `/proc` to rehearse a box it cannot read.
+#: The /proc root scanned for neighbours sharing the store (KC-62); tests point it at a fake.
 _PROC_ROOT = "/proc"
 
 #: The status this command runs, exactly: the first word of `**Status:**`.
 OPEN = "open"
 
-#: The words that take a lower ticket off the offer — exactly
-#: `scripts/next_task.py`'s `SKIP_STATUS`, duplicated the way `_STATUS_RE`
-#: already duplicates that script's status regex: the runner does not read
-#: `scripts/`. Anything else is still on offer — `open`, but also `running` or
-#: `wip` when a round runs on another machine, and a ticket with no status line
-#: at all — and a session prompted without a ticket would get it. `closed`
-#: (AR-14) is parked too: a closed ticket is no longer wanted at all, so it must
-#: not block a higher round at intake.
+#: Ticket statuses that take a ticket off the offer, duplicated from scripts/next_task.py (SKIP_STATUS).
 PARKED = ("landed", "queued", "closed")
 
 #: Exit codes.
 EXIT_OK, EXIT_NO_READY, EXIT_FAILED = 0, 2, 1
 
-#: `**Status:** open — round 55 …` → `open`. `next_task.py`'s `_status`,
-#: duplicated the way `gates.declared_files` already duplicates that ticket's
-#: `**File:**` parse instead of importing a script.
+#: Status word of a ticket (open, running, ...), parsed the way next_task.py parses it.
 _STATUS_RE = re.compile(r"^\*\*Status:\*\*[ \t]*(\S+)", re.MULTILINE)
 
 #: `# KC-16 — \`python3 -m tools.contest run …\`` → `KC-16`.
 _TITLE_RE = re.compile(r"^#\s*([A-Za-z0-9_.-]+)", re.MULTILINE)
 
-#: `**File:**` / `**Symbol:**` / `**Status:**` → the label alone. Every label a
-#: ticket declares, in one pass — `intake` needs to know the two it refuses
-#: without, and nothing else.
+#: Field labels (File, Symbol, Status) of a ticket block.
 _FIELD_LABEL_RE = re.compile(r"^\*\*([A-Za-z][A-Za-z0-9 _-]*):\*\*", re.MULTILINE)
 
-#: The labels `scripts/next_task.py` reads to name the code it hands the
-#: sessions: without one of them the sessions get no finding at all.
+#: Labels that next_task.py needs to name the code for a session; without them there is no finding.
 _REQUIRED_LABELS = ("File", "Symbol")
 
 #: `NN-…md`, `next_task.py`'s `TICKET_RE` with its optional leading zeros.
 _TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
 
-#: `**Size:** XS` / `**Size:** S (measurement only)` → `XS` / `S` — the line's first
-#: word; whatever follows it is a parenthetical note, KC-44.
+#: Size word of a Size line: its first word, with any parenthetical after it ignored (KC-44).
 _SIZE_RE = re.compile(r"^\*\*Size:\*\*\s*(\S+)", re.MULTILINE)
 
-#: KC-44: the four sizes the epic's tickets carry, upper-cased. A `**Size:**` line
-#: that spells anything else is no size, the same as no line at all.
+#: The four ticket sizes, upper-cased; any other Size value counts as no size (KC-44).
 KNOWN_SIZES = ("XS", "S", "M", "L")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# tickets
-# ─────────────────────────────────────────────────────────────────────────────
+# Tickets
 
 def _status_of(body: str) -> str:
     """The body's `**Status:**` first word, lower-cased; `""` when absent.
@@ -269,8 +246,7 @@ def _ticket_body(tasks_dir, name, at=None) -> str:
     that tree reads as `""`, the same as an unreadable file below.
     """
     if at:
-        # `tasks_dir` is one level under the repo root, so its own name is the
-        # repo-root-relative path `git ls-tree` / `git show` want
+        # tasks_dir sits one level under the repo root, so its name is the path git wants.
         return gates.git(str(Path(tasks_dir).parent), "show",
                          f"{at}:{Path(tasks_dir).name}/{name}")
     try:
@@ -327,8 +303,7 @@ def _tickets(tasks_dir, at=None) -> list:
     return sorted(found, key=lambda item: item[0])
 
 
-#: AR-3: the temp folders `ticket_file` wrote a base-only ticket into; `cmd_run`
-#: removes them when it returns, a failure included.
+#: Temp folders for base-only tickets (AR-3); cmd_run removes them on return, even on failure.
 _TEMP_TICKET_DIRS: list = []
 
 
@@ -403,9 +378,7 @@ def ticket_size(ticket_path) -> str | None:
     return size if size in KNOWN_SIZES else None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the roster's flags
-# ─────────────────────────────────────────────────────────────────────────────
+# Roster flags
 
 def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
     """`--models a:free,b:free` → a roster of `AgentSpec`s.
@@ -440,8 +413,7 @@ def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
     parsed = []
     for item in filter(None, (m.strip() for m in models.split(","))):
         item, _, variant = item.partition("@")
-        # split at the FIRST "/", the roster's own rule: `kilo/nex-agi/nex-n2.5-pro:free`
-        # is provider `kilo`, model `nex-agi/nex-n2.5-pro:free`
+        # The split is at the first slash, as the roster does: kilo is the provider.
         prov, slash, model_id = item.partition("/")
         if not slash:
             prov, model_id = "", item
@@ -527,19 +499,13 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
         listed = listed_variants(providers, agent.provider_id, agent.model_id)
         if wanted != HIGHEST:
             if wanted not in listed:
-                # the refusal is the list; nothing is asked, and the run does
-                # not start, so a probe here would only burn a request against
-                # the key that is about to be refused
+                # A refused key is listed as a failure; no probe is sent for it.
                 failures.append(
                     f"[{agent.name}] {agent.model}: no variant '{wanted}' — listed: "
                     f"{', '.join(listed) if listed else '(none)'}")
                 resolved.append(agent)
                 continue
-            # KC-61: a named variant used to be sent unasked, so an exhausted
-            # key reached the round when the variant was named. One request per
-            # provider/model@variant is the whole cost — OpenRouter counts a
-            # failed request against the free quota too. Without a probe there
-            # is nothing to ask, and the named variant is sent as today.
+            # Probe a named variant once per provider/model, since a failed request counts against the quota (KC-61).
             if probe_for is not None:
                 key = (agent.provider_id, agent.model_id, wanted)
                 if key not in probed:
@@ -548,9 +514,7 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
                 if answer is None:
                     resolved.append(agent)      # hello came back, as today
                 elif _is_quota(answer, quota_re):
-                    # the key is out until its reset: one console line, and the
-                    # agent is left out — the round runs one agent short
-                    # instead of being refused for one dry key
+                    # A dry key leaves that agent out, and the round runs one agent short.
                     notes.append(_quota_skip_line(agent, answer))
                 else:
                     # today's tolerance: a refusal for its own reason is a note
@@ -575,8 +539,7 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
             notes.append(f"{agent.model}@{HIGHEST} → {pick.describe()}")
         if not pick.usable and pick.tried and all(
                 _is_quota(reason, quota_re) for _rung, reason in pick.tried):
-            # KC-61: every rung answered a quota — the same dry key, not a
-            # model that cannot talk: left out like a named variant's
+            # A dry key is left out like a named variant, since the model itself can talk (KC-61).
             notes.append(_quota_skip_line(agent, pick.tried[-1][1]))
             continue
         if not pick.usable:
@@ -867,8 +830,7 @@ def _roster_path(repo, roster: str) -> Path:
     return path if path.is_absolute() else Path.cwd() / path
 
 
-#: KC-76: what the agents' prompt runs inside their clone of the target — the
-#: prompt names both scripts, so a base without them fails on the first turn.
+#: Scripts the agents' prompt runs in their clone of the target; a base without them fails at once (KC-76).
 _TARGET_FILES = ("scripts/next_task.py", "scripts/append_task.py")
 
 
@@ -908,9 +870,7 @@ def _round_out_dir(repo, config: ContestConfig, round_no: int) -> Path:
     return repo / config.out_dir / f"{round_no:02d}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# intake
-# ─────────────────────────────────────────────────────────────────────────────
+# Intake
 
 def _run_line(argv, number: int) -> str:
     """`python3 -m tools.contest` + this invocation's argv with the `--ticket`
@@ -990,8 +950,7 @@ class Intake:
     #: the roster with every `highest` resolved (KC-49); empty = the config's as is
     agents: tuple = ()
 
-    #: the `KILO_CONFIG_CONTENT` a `--register-missing` round runs on: the
-    #: operator's own value with the missing models merged in (KC-35)
+    #: The KILO_CONFIG_CONTENT for a --register-missing round: the operator's value plus the missing models (KC-35).
     config_content: str | None = None
 
     #: the `provider/model` ids that registration put on offer this round
@@ -1178,8 +1137,7 @@ def _context_limits(providers) -> dict:
         if not isinstance(models, dict):
             continue
         for model_id, model in models.items():
-            # keyed like `roster_missing` reads the offer: by the `models` key,
-            # which is what `AgentSpec.model_id` names
+            # Keyed by the models key, as roster_missing reads the offer and AgentSpec.model_id names it.
             limit = model.get("limit") if isinstance(model, dict) else None
             context = limit.get("context") if isinstance(limit, dict) else None
             if isinstance(context, int) and not isinstance(context, bool) and context > 0:
@@ -1283,8 +1241,7 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
     gives the round's real server the same one.
     """
     agents = config.agents
-    # no offer to read: `highest` — the round's default — quietly becomes no
-    # variant, and the round's own `server:` line reports why there was none
+    # Without an offer, highest quietly becomes no variant, and the server line says why.
     unresolved = _without_highest(agents)
     # KC-35: the overlay the registered round runs on, and the ids it got
     content: str | None = None
@@ -1307,9 +1264,7 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
         providers = KiloClient(server, str(repo)).providers()
         missing = roster_missing(providers, agents)
 
-        # the attached server reads the operator's own kilo.jsonc and this
-        # process cannot change it: the flag refuses, and the other agents still
-        # get their KC-25 check so the round is not refused twice
+        # The attached server cannot be changed here, so the flag refuses; other agents still get their check (KC-25).
         if missing and register_missing and attached is not None:
             others = tuple(agent for agent in agents if agent not in missing)
             return _Offer(
@@ -1328,9 +1283,7 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
                                                 env={"KILO_CONFIG_CONTENT": content})
             logs.append(second_log)
             if second is None:
-                # the overlay would not even start a server: no registration
-                # happened, and the hint's own advice — re-run with the flag —
-                # is what the operator just did, so the line says what failed
+                # No registration happened, so the line says the flag did not take effect.
                 return _Offer([f"registration did not take: "
                                f"{', '.join(agent.model for agent in missing)} — "
                                "kilo serve with KILO_CONFIG_CONTENT did not start"],
@@ -1350,9 +1303,7 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
                 registered = tuple(agent.model for agent in missing)
                 missing = ()
         elif missing and register_missing:
-            # refused on other grounds already (`resolve=False`): nothing is
-            # registered, but the ids the flag would register are still not
-            # failures, and no hint tells the operator to pass a flag they passed
+            # Nothing is registered for agents refused on other grounds, and no flag hint is given for them.
             others = tuple(agent for agent in agents if agent not in missing)
             return _Offer(roster_on_offer(providers, others, kilo_bin=kilo_bin),
                           unresolved, [], [])
@@ -1363,8 +1314,7 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
         if failures or not resolve:
             return _Offer(failures, unresolved, [], [])
 
-        # KC-55 §5: the gate's two checks, both of them free of a session — the
-        # share check off the offer just read, and one probe call of its own
+        # The gate's two checks need no session: the share check on the offer, and one probe call (KC-55).
         warnings = []
         share = gate_share_line(providers, agents, _gate_base_url(config))
         if share:
@@ -1374,9 +1324,7 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
         if refusals:
             return _Offer(list(refusals), unresolved, [], warnings)
 
-        # KC-61: the probe carries the round's own quota rule, so a dry key
-        # answers in about a second instead of burning HELLO_TIMEOUT_SEC per
-        # model — and its answer reads as a quota at intake, not at the runner
+        # The probe uses the round's quota rule, so a dry key answers in about a second (KC-61).
         max_retry_wait = float(getattr(config, "provider_retry_max_wait_sec", 0) or 0)
         quota_re = _quota_re(config)
         probe_kwargs = {}
@@ -1385,39 +1333,23 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
         if quota_re is not None:
             probe_kwargs["quota_re"] = quota_re
 
-        # KC-11: wrap the existing probe_for with cache logic.
-        # For `highest` and a fresh cache entry whose variant the model still
-        # lists: no session is opened — the try_one returns success for the
-        # cached variant and the recorded reason for the rungs above it. A
-        # cached variant the server no longer lists is stale, whatever its age:
-        # it would fail every rung and refuse the round, so it is probed live.
-        # After a live probe the result is saved; a live probe that found
-        # nothing drops the entry, so a later run cannot trust an old winner
-        # that `--reprobe` just saw fail.
-        # For a named variant: the existing KC-61 single-rung hello_probe runs
-        # as before; the cache is not consulted (the operator committed to the
-        # name, and the probe checks it works, not what the best variant is).
+        # Cache logic around the live probe: a fresh cached winner is used, a stale or failed one is probed (KC-11).
         _cache = probe_cache if probe_cache is not None else {}
-        # `probe_ttl_days = 0` means "always re-probe", so 0 is kept, not
-        # replaced by the default
+        # probe_ttl_days = 0 means always re-probe, so the zero is kept, not replaced by the default.
         try:
             _ttl = float(getattr(config, "probe_ttl_days", 7))
         except (TypeError, ValueError):
             _ttl = 7.0
         import time as _time
 
-        # KC-70: the probes run side by side (`probe_parallel`), so the KC-11
-        # cache and the probe memory below are written from several threads
+        # Probes run side by side (probe_parallel), so the cache and memory are written from threads (KC-70).
         _lock = threading.Lock()
 
         def _save_cache():
             if probe_cache_path:
                 save_probe_cache(probe_cache_path, _cache)
 
-        # KC-70: a named variant that answered within `probe_memory_hours` is
-        # not asked again — the memory is read once here and written once
-        # after the probes, with this run's answers in and the stale ones out.
-        # `--reprobe` asks every one anyway and still writes what it saw.
+        # A named variant that answered recently is not asked again, unless --reprobe (KC-70).
         _memory_hours = probe_memory.hours_of(config)
         _memory_path = probe_memory.memory_path(config, repo)
         _memory = ([] if reprobe or _memory_hours <= 0
@@ -1428,15 +1360,12 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
         _retry_wait = float(getattr(config, "probe_retry_wait_sec", 0) or 0)
 
         def probe_for(agent):
-            # KC-70: a rung refused for a reason a second ask gets past — a
-            # timeout, a 429, an empty reply — is asked `probe_retries` more
-            # times before its refusal counts, `highest`'s rungs included
+            # A refusal that a second ask can pass is retried probe_retries times first (KC-70).
             base_try_one = with_retries(
                 hello_probe(server, agent.provider_id, agent.model_id, **probe_kwargs),
                 retries=_retries, wait_sec=_retry_wait, quota_re=quota_re,
                 label=agent.model)
-            # Only cache-check for agents whose variant is `highest` — a named
-            # variant goes through the single-rung path, with KC-70's memory.
+            # Only highest agents use the cache check; a named variant takes the single-rung path (KC-70).
             if agent.variant != HIGHEST:
                 key3 = (agent.provider_id, agent.model_id, agent.variant)
                 if probe_memory.answered(_memory, *key3):
@@ -1461,8 +1390,7 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
                     probed_at = 0.0
                 age_days = (_time.time() - probed_at) / 86400.0
                 cached_variant = entry.get("variant")
-                # kilo_version: no version is available at this call site yet,
-                # so only the age and the current variant list decide
+                # No kilo version is known here, so the age and the current variant list decide.
                 if 0 <= age_days < _ttl and cached_variant in rungs:
                     tried_map = {t[0]: t[1] for t in (entry.get("tried") or [])
                                  if isinstance(t, (list, tuple)) and len(t) == 2}
@@ -1474,8 +1402,7 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
 
                     return _cached
 
-            # Live probe: wrap base_try_one to save the result on first
-            # success, and to drop the entry once the last rung has failed.
+            # Live probe: the result is saved on the first success and dropped after the last rung fails.
             tried_box: list = []
 
             def _caching(variant):
@@ -1508,12 +1435,9 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
             per_provider=int(getattr(config, "probe_per_provider", 0) or 0))
         if _memory_hours > 0:
             probe_memory.update(_memory_path, _answered, _refused, hours=_memory_hours)
-        # KC-56: the same read's `limit.context`, so the runner can tell a full
-        # context window from a spent output budget without asking again
+        # The same read gives limit.context, so a full window is told from a spent output budget (KC-56).
         if allow_unprobed:
-            # KC-11 `--allow-unprobed`: a `highest` agent no rung answered for
-            # is started with no variant instead of refusing the round; its
-            # failure line becomes a note so the operator still reads why
+            # --allow-unprobed starts an agent with no variant instead of refusing the round (KC-11).
             kept = []
             for line in failures:
                 if ": no variant answered 'say: hello'" in line:
@@ -1604,9 +1528,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
         base_sha = gates.git(str(repo), "rev-parse", "--verify", f"{base_ref}^{{commit}}")
     except WorkspaceError as exc:
         failures.append(str(exc))
-    # the sessions read `epic-tasks/` from the base's tree; without a base to
-    # read from the checkout stands in for those reads, and the line above says
-    # why the base is unusable
+    # Without a base, the checkout stands in for the base's reads (see the line above).
     at = base_sha or None
 
     found = gates.ticket_for_round(tasks_dir, round_no)
@@ -1633,10 +1555,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
                 f"{name} is not open (**Status:** {status or 'missing'}) — "
                 "only an open ticket is on offer"
             )
-        # KC-7: `scripts/next_task.py` builds the finding it prints from
-        # `**File:**` and `**Symbol:**`, so a ticket without one would hand the
-        # sessions a ticket with no code to fix. Read from the base tree, like
-        # the status above.
+        # A ticket with no File or Symbol label is refused, since the finding needs both (KC-7).
         for label in _missing_labels(body):
             failures.append(
                 f"{name} has no **{label}:** line — scripts/next_task.py reads "
@@ -1653,12 +1572,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
                           base_ref, base_is_head)
             )
 
-    # KC-55 §3: the gate's worst case must fit inside the silence clock it
-    # holds. The gate runs synchronously inside `wait_idle`'s loop, so while it
-    # waits the session produces no events and every second counts; a worst
-    # case at or over `idle_event_timeout_sec` makes the runner declare its own
-    # agent `STALLED`. `gate_worst_case_sec` is the one place the number comes
-    # from, so the intake line and the tests read the same value.
+    # The gate's worst case must fit inside the silence clock, or the agent is marked STALLED (KC-55).
     worst_case = gate_worst_case_sec(config)
     idle = config.idle_event_timeout_sec
     if config.gate_settings is not None and isinstance(idle, (int, float)) \
@@ -1668,9 +1582,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
             f"{_seconds(worst_case)} s ≥ idle_event_timeout_sec {_seconds(idle)} — "
             f"lower gate_deadline_sec in contest.ini, or raise idle_event_timeout_sec")
 
-    # KC-37 §2: the gate is not one of the round's own models. It reads no
-    # server, so it goes before the offer check and a refused round spends no
-    # model call, the gate probe included.
+    # The gate is checked before the offer check, so a refused round uses no model call (KC-37).
     failures.extend(gate_model_refusals(config, config.agents))
 
     # an openrouter round has no offer to probe: `highest` is no variant there
@@ -1678,19 +1590,13 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
     offer = None
     attached = None
     if dry_run:
-        # KC-7: the plan is the whole point. Every check that needs a server is
-        # skipped and announces itself, so the plan reads as unchecked instead of
-        # as checked: no `kilo serve` here at all, the throwaway offer server of
-        # the offer check included, no session opened, nothing asked of the gate.
-        # `resolve_variants` never runs, so a `highest` stays a `highest` — the
-        # plan shows what the roster says, which is what `--dry-run` is for.
+        # Dry run skips every check that needs a server and says so, so the plan is not read as checked (KC-7).
         print("dry-run: skipped the offer check — no server was started")
         print("dry-run: skipped the variant probe — no session was opened")
         print("dry-run: skipped the gate probe — the gate was not asked")
         offer = _Offer([], agents, [], [])
     elif config.backend == "kilo":
-        # an openrouter round has no Kilo server at all: nothing to resolve,
-        # nothing to attach to, and no offer to check the roster against
+        # An openrouter round has no Kilo server, so there is nothing to resolve or attach to.
         if config.server == "spawn":
             try:
                 find_kilo_binary(config.kilo_bin)
@@ -1702,11 +1608,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
             except KiloServerError as exc:
                 failures.append(str(exc))
 
-        # the roster the round would run, against what the server offers: the
-        # refusal that used to arrive as one agent's first-turn `session.error`
-        # the variant probe spends model calls, so it only runs for a round
-        # that has passed every other check
-        # KC-11: load (or start) the probe cache from next to the roster ini.
+        # The variant probe costs model calls, so it runs last, after every other check (KC-11).
         _probe_cache_path: str | None = None
         _probe_cache: dict | None = None
         if roster_path:
@@ -1725,8 +1627,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
             print(line)
 
     if offer is None:
-        # no offer was read: an openrouter round, or a backend that failed
-        # before the check — nothing was resolved and nothing was registered
+        # No offer was read (openrouter, or a failed backend), so nothing was resolved or registered.
         offer = _Offer([], agents, [], [])
 
     if failures:
@@ -1745,28 +1646,15 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the patches
-# ─────────────────────────────────────────────────────────────────────────────
+# Patches
 
-#: KC-31: the terminal states whose tree is read for a `.diff` when the turn
-#: ended without a commit. `READY` is never here — the harvest always names its
-#: commit — and `GAVE_UP` is a scored REWORK after the last attempt, not work
-#: that died unclaimed. KC-41 does not join them: a turn whose work the runner
-#: committed for it *has* a commit, so it exports as `<agent>.STALLED.patch`
-#: above and this loop skips it. The `.diff` remains for the case KC-41 cannot
-#: help — a terminal turn whose worktree is genuinely clean, or one whose
-#: deadline commit was refused, or a round run with `deadline_commit = false`.
+#: Terminal states whose worktree diff is exported when the turn ended with no commit (KC-31, KC-41).
 _DIFF_STATES = (AgentState.STALLED, AgentState.ERROR)
 
-#: KC-31: the one trailing comment the diff's untracked files go in — `git diff`
-#: has no view of a path that is not in the index, so those are named, not
-#: inlined.
+#: Comment line that names the untracked files, since git diff does not show them (KC-31).
 _UNTRACKED_NOTE = "# untracked (not inlined): "
 
-#: KC-31: the orchestrator's own rows in the worktree. `_dirty_tree`'s `runs/`
-#: rule, duplicated here for the same reason: `runs/<agent>/PROGRESS.csv` is not
-#: the agent's work, and it must not open a diff.
+#: The orchestrator's own runs/ rows, which are not agent work and never open a diff (KC-31).
 _RUNS_PREFIX = "runs/"
 
 
@@ -1888,8 +1776,7 @@ def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
         target.write_text(patch + "\n", encoding="utf-8")
         written.append(target)
 
-    # KC-31: the agents the patch loop skipped — no commit to format, so the
-    # work is in the tree rather than on the branch.
+    # Agents the patch loop skipped have no commit, so their work is in the tree, not the branch (KC-31).
     for run in state.agents:
         if run.commit or run.state not in _DIFF_STATES:
             continue
@@ -1937,8 +1824,7 @@ def _provider_quota_lines(state: RoundState) -> list:
         reasons = groups[provider]
         when = ""
         for reason in reasons:
-            # the runner's reason ends `(retry at YYYY-MM-DD HH:MM UTC)`, so the
-            # group is the timestamp alone, its closing paren and all dropped
+            # The runner's reason ends in a retry time, which is kept as the timestamp alone.
             match = re.search(r"retry at (.+?)(?:\)\s*)?$", reason)
             if match:
                 when = match.group(1)
@@ -1948,9 +1834,7 @@ def _provider_quota_lines(state: RoundState) -> list:
     return lines
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the command
-# ─────────────────────────────────────────────────────────────────────────────
+# Command
 
 def _start_server(config: ContestConfig, out_dir: Path, env: dict | None = None):
     """`KiloServer.spawn` when `server = spawn`, else `.attach` to the URL.
@@ -2033,8 +1917,7 @@ def _kilo_neighbour_note(config: ContestConfig, server, *,
     try:
         count, data_dir = kilo_neighbours(pid, proc_root=proc_root)
     except OSError:
-        # a scan that cannot read `/proc` at all is no line, and never a reason
-        # to refuse the round: intake would otherwise die over a bookkeeping line
+        # A scan that cannot read /proc gives no line and never refuses the round.
         return None
     if count <= warn or not data_dir:
         return None
@@ -2051,15 +1934,11 @@ def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConf
     OpenRouter profile is expanded and resolved.
     """
     if args.models:
-        # the roster's backend picks the provider behind a bare id: an
-        # openrouter round has no Kilo to route through, so the default there
-        # is the gateway, not `kenary`
+        # An openrouter round defaults to the gateway provider, not kenary (the roster's backend picks it).
         provider = args.provider or ("openrouter" if config.backend == "openrouter"
                                      else DEFAULT_PROVIDER)
         config = replace(config, agents=agents_from_models(args.models, provider=provider))
-    # KC-49: every agent that names no variant of its own gets `--variant`,
-    # else `[contest] variant` (`highest` unless the roster says otherwise);
-    # `default` is no variant at all
+    # Agents with no variant of their own get --variant, else [contest] variant, else highest (KC-49).
     variant = getattr(args, "variant", None) or config.variant or HIGHEST
     config = replace(config, agents=tuple(
         replace(agent, variant=None) if (agent.variant or variant) == DEFAULT
@@ -2071,8 +1950,7 @@ def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConf
     if getattr(args, "legs", None) is not None:
         config = replace(config, legs=max(1, int(args.legs)))
     if args.no_gate:
-        # the mechanical layer still decides; every ask it cannot decide is the
-        # existing `gate-failed` reject, recorded like any decision
+        # The mechanical layer still decides; any ask it cannot decide is a recorded gate-failed reject.
         config = replace(config, gate_settings=None)
     return config
 
@@ -2196,9 +2074,7 @@ def _with_remembered_limits(config: ContestConfig, out_dir: Path,
             context_memory.min_window(config),
             declared=agent.context_limit, fallback=fallback, share_pct=share_pct)
         if agent.context_limit and (size is None or size >= agent.context_limit):
-            # Kilo's declared window stands unless the provider has refused
-            # below it (round 145: zai's glm-4.5-flash, 131 072 declared,
-            # refused at 98 777) — then the smaller one is the window
+            # Kilo's declared window stands unless the provider refused below it (round 145).
             size = None
             output = None
         limit = context_memory.kilo_limit(size, output, percent)
@@ -2273,23 +2149,18 @@ def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tes
     if legs is None:
         legs = _legs_of(config)
     if legs > 1:
-        # KC-43: only a relay says so — a round of one leg prints the plan it always did.
-        # KC-44: where the number came from — flag, size or config — in the round's
-        # first legs line.
+        # Legs are named only for a relay, with where the number came from (KC-43, KC-44).
         where = f" ({legs_from})" if legs_from else ""
         facts = facts + (("legs", f"{legs}{where} — {out_dir.name}.1 … {out_dir.name}.{legs}"),)
     width = max(len(key) for key, _ in facts)
     for key, value in facts:
         print(f"{key:<{width}} {value}")
         if key == "agents" and result.registered:
-            # KC-35: what --register-missing added for this round alone — named
-            # here because kilo.jsonc was not touched, so the log is the only
-            # record that the ids were ever registered
+            # The registered ids are logged here, since kilo.jsonc itself is not touched (KC-35).
             print("registered for this round (kilo.jsonc untouched): "
                   + ", ".join(result.registered))
         if key == "agents":
-            # KC-67: the models the round knows the size of from a past overflow
-            # — the only ones the runner will compact itself
+            # KC-67: the models whose size is known from a past overflow, the only ones compacted by the runner.
             for line in _context_memory_lines(config, out_dir):
                 print(line)
 
@@ -2393,11 +2264,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     `legs` line; a round of one leg keeps the state and the plan it always
     had.
     """
-    # `contest-bench/kc6/live_smoke.py` sets the same default: the committed
-    # roster's ${CONTEST_GATE_API_KEY} reference must resolve for `load_roster`
-    # to read the file at all, and a key that is not real is safe — the gate
-    # then answers `gate unavailable: …` per ask, a `gate-failed` reject in
-    # decisions.jsonl. This command adds no key check; KC-7's intake does.
+    # The gate key placeholder is set so the roster loads; a fake key only gives gate-failed rejects (KC-7).
     os.environ.setdefault("CONTEST_GATE_API_KEY", "unset-for-the-round")
 
     repo = _target_repo(args.target)
@@ -2411,10 +2278,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return EXIT_FAILED
 
     try:
-        # `--backend` goes into `load_roster`, not into `_apply_flags`: the
-        # backend decides whether the OpenRouter profile is expanded and
-        # resolved, so the flag has to be in place before the roster is read —
-        # applied afterwards, `config.openrouter_settings` would still be None.
+        # --backend is passed to load_roster, since it decides how the roster is expanded.
         config = load_roster(_roster_path(repo, args.roster), backend=args.backend)
     except RosterError as exc:
         print(f"intake: {exc}", file=sys.stderr)
@@ -2425,11 +2289,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return EXIT_FAILED
     config = _apply_flags(config, args)
     run_tests = not args.no_tests
-    # KC-44: the legs the round runs, and where the number came from — the flag
-    # when it was passed, else the ticket's own `**Size:**` when `[contest]
-    # legs_by_size` names a count for it, else `[contest] legs` as today. The
-    # ticket is read from the checkout; an unreadable header is no size, and
-    # no size is the round of today.
+    # Legs come from the flag, else the ticket size with legs_by_size, else [contest] legs (KC-44).
     ticket_name = None
     try:
         ticket_name = gates.ticket_for_round(tasks_dir, args.ticket)[0]
@@ -2447,10 +2307,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"intake: --resume cannot continue a round of {legs} legs — resume one "
               f"leg's folder with `--out <folder> --legs 1`", file=sys.stderr)
         return EXIT_FAILED
-    # KC-44: the refusal this ticket exists for — an L ticket that would run in
-    # one leg, unless `--legs` says so out loud. Names the size, the leg count
-    # it would have used and the flag that overrides it, and stops before a
-    # worktree is prepared.
+    # An L ticket that would run in one leg is refused unless --legs says so (KC-44).
     if size == "L" and legs == 1 and getattr(args, "legs", None) is None:
         detail = (f"legs_by_size says L={legs}" if legs_from == "size"
                   else f"legs_by_size names no L, so [contest] legs = {legs} stands")
@@ -2478,10 +2335,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     resume = None
     if args.resume:
-        # KC-65: the read comes before the plan, because the plan names the
-        # worker count the resumed round holds. A `--resume` whose state.json
-        # is missing or unreadable then fails before the plan is printed, as it
-        # already fails before any server starts.
+        # A --resume without a readable state.json fails before the plan is printed (KC-65).
         state_path = out_dir / "state.json"
         if not state_path.is_file():
             print(f"intake: --resume: no {state_path} — nothing to resume", file=sys.stderr)
@@ -2492,35 +2346,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"intake: --resume: {state_path} is unreadable: {exc}", file=sys.stderr)
             return EXIT_FAILED
 
-    # KC-65: the count the first prompts read, from the round's agents — on
-    # `--resume` from state.json, so it is the round's count and not the
-    # command line's. Capped at `max_parallel`: the pool holds that many slots,
-    # so ten agents with a pool of four do not size for ten. The runner keeps
-    # the rule itself; this is only the value it writes before the server spawns.
+    # Worker count the first prompts read, from the round's agents, capped at max_parallel (KC-65).
     live = min(int(config.max_parallel), round_live_agents(config, resume))
     workers = agent_pytest_workers(live, core_count(), config)
     fixed = int(config.pytest_workers_per_agent) > 0
 
-    # KC-65: the agents' temp dir is the round's own, so a round does not leave
-    # the operator's /tmp holding every `tmp_path` fixture of every agent. It is
-    # made just before the server spawns, below, so a round that fails before
-    # that leaves nothing behind. The parent is the operator's.
+    # The agents' temp dir is the round's own and is made just before the server spawns (KC-65).
     agent_tmp = agent_tmp_path(config, args.ticket)
     agent_tmp_created = False
 
     env = _agent_env(workers)
     if config_content is not None:
-        # KC-35: the overlay intake proved in its throwaway goes to the round's
-        # own server too, or the round would run on an unregistered list;
-        # KC-69 adds the remembered `limit.context` to it
+        # The intake overlay goes to the round's own server too, with the remembered context limit (KC-35, KC-69).
         env["KILO_CONFIG_CONTENT"] = config_content
     if agent_tmp is not None:
         for key in ("TMPDIR", "TEMP", "TMP"):
             env[key] = str(agent_tmp)
 
     if getattr(args, "dry_run", False):
-        # KC-7: intake has already skipped every server check, so this is the
-        # plan and the prompt — no server is started after here.
+        # Intake already skipped every server check, so this is the plan and the prompt only (KC-7).
         return _dry_run(repo, result, config, out_dir, args, run_tests=run_tests,
                         workers=workers, fixed=fixed, agent_tmp=agent_tmp,
                         legs=legs, legs_from=legs_from)
@@ -2539,10 +2383,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"intake: {exc}", file=sys.stderr)
             return EXIT_FAILED
 
-    # KC-43: a round of `legs` legs is a relay of whole turns in the same
-    # worktrees, one `<out>.<leg>` folder each; a round of one leg is the round
-    # this command always ran, in the folder with no suffix. The loop below runs
-    # once in that case, and everything in it is the code that ran before.
+    # A relay is a round of whole turns, one folder per leg; one leg is the round as it always ran (KC-43).
     relay = legs > 1
     leg = 1 if relay else None
     prior: RoundState | None = None
@@ -2551,11 +2392,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     while True:
         leg_out = _leg_out_dir(out_dir, leg)
         leg_out.mkdir(parents=True, exist_ok=True)
-        # KC-65: the file the agents' pytest reads, written before the server
-        # spawns, so the first prompts already read a sane number. A write that
-        # fails keeps the round going — the env then carries no
-        # CONTEST_PYTEST_WORKERS_FILE, the plugin answers None, and xdist takes its
-        # own answer from PYTEST_XDIST_AUTO_NUM_WORKERS.
+        # Worker count file is written before the server spawns; a failed write falls back to xdist (KC-65).
         workers_file = leg_out / WORKERS_FILE
         try:
             write_pytest_workers(workers_file, workers)
@@ -2588,9 +2425,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                   f"{leg - 1} left it", file=sys.stderr)
             break
 
-        # KC-62: the box decides what the round is likely to lose. One line at
-        # intake, so the operator knows before the first prompt that the store is
-        # shared — the agents' own retries are the recovery, not the notice.
+        # One intake line says the Kilo store is shared, since agents retry on their own (KC-62).
         note = _kilo_neighbour_note(config, server, proc_root=_PROC_ROOT)
         if note:
             print(note, file=sys.stderr)
@@ -2598,9 +2433,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # the agents this leg runs: every one on leg 1, then only those that ran out
         expected = (None if prior is None else
                     {run.agent.name for run in prior.agents if run.state in RELAY_STATES})
-        # KC-81: the log the round started its server with, so the heartbeat can
-        # name a hung one. An attached server (or openrouter's none) has no log
-        # of this round — `None` is "log ?", events side only.
+        # The server log the heartbeat names; an attached or openrouter server has none (KC-81).
         server_log = getattr(server, "log_path", None) if server is not None else None
         try:
             if relay:
@@ -2611,8 +2444,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                                 legs=legs, legs_from=legs_from,
                                 log_path=server_log)
             else:
-                # KC-44: a round of one leg is the round `run_round` has always
-                # been — no legs keys in its `state.json`
+                # A one-leg round keeps the state it always had, with no legs keys (KC-44).
                 state = run_round(config, args.ticket, result.ticket_path, workspaces,
                                   make_backend=make_backend, out_dir=leg_out, resume=resume,
                                   run_tests=run_tests, server_pid=server.pid if server else None,
@@ -2620,16 +2452,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         finally:
             if server is not None:
                 server.close()
-            # KC-65: the temp dir is the round's — removed here, with the server,
-            # and only when this round made it. Never the parent.
+            # The temp dir is the round's own: removed here with the server, and only if this round made it (KC-65).
             if agent_tmp_created:
                 shutil.rmtree(agent_tmp, ignore_errors=True)
         final_out = leg_out
         if not relay:
             break
 
-        # KC-43: what the leg left goes to the next one as a record, written for
-        # every agent that ran — never a reason to stop the round
+        # What a leg left is written as a record for every agent that ran, and never stops the round (KC-43).
         for run in state.agents:
             if expected is not None and run.agent.name not in expected:
                 continue
@@ -2660,11 +2490,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         prior, leg = state, leg + 1
 
     patches = export_patches(state, workspaces, final_out)
-    # KC-7: the two files that make `<out>/` the input `contest-bench` reads.
-    # Written here, in the round's own exit path, so the operator never writes
-    # them by hand. A failure to write either is a `warn:` line and nothing else
-    # — the patches are the round's result, and these are only how the next
-    # stage finds them, so the exit code stays the round's own.
+    # Writes the two files that make the output folder the input of contest-bench (KC-7).
     exports_written: list = []
     try:
         target = export.write_entrants(final_out, state.base_sha, state, patches, repo=repo)
@@ -2685,9 +2511,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"{label}: {target}")
     for row in state.table_rows():
         print(json.dumps(row, ensure_ascii=False))
-    # KC-61: one line per provider out of quota, with its reset time — the
-    # reason the agents ended is in each row's last_reason, and it is the same
-    # reason five times over, so the summary says it once per provider.
+    # One quota line per provider that ran out, with its reset time (KC-61).
     for line in _provider_quota_lines(state):
         print(line)
     for patch in patches:
@@ -2735,8 +2559,7 @@ def draft_callables(config, no_review: bool) -> tuple:
     them for the draft.
     """
     if config.draft_settings is None:
-        # `run` needs no draft profile: the refusal is here, not at load time, so
-        # a round never fails because someone typed the profile's section wrong.
+        # A missing draft profile is refused in run, not at load, so a typo never fails the round.
         if not config.draft_llm_profile:
             reason = ("[contest] draft_llm_profile is not set — name an LlmSettings "
                       "section (base_url, api_key, model) in " + LOCAL_FILENAME +
@@ -2749,10 +2572,7 @@ def draft_callables(config, no_review: bool) -> tuple:
 
     review_call = None
     if not no_review:
-        # The reviewer is `[contest] draft_review_llm_profile` when it is set —
-        # tickets then have their own writer/reviewer pair and the round's gate
-        # keeps its model — and the gate's model otherwise: the same resolution
-        # and transport the gate uses, and no model, URL or key in this module.
+        # The reviewer is the draft review profile if set, else the gate's model and transport (round 148).
         review_settings = config.gate_settings
         review_key = "gate_llm_profile"
         if config.draft_review_llm_profile:
@@ -2767,9 +2587,7 @@ def draft_callables(config, no_review: bool) -> tuple:
             raise DraftSetupError("[contest] gate_llm_profile is not set — the review "
                                   "runs on the gate's model, so name it in "
                                   + LOCAL_FILENAME + " as run does, or pass --no-review")
-        # A model reviewing its own ticket approves its own blind spots: the
-        # reviewer must be a different model from the drafter, not just a
-        # different section naming the same one.
+        # The reviewer must be a different model from the drafter, not only a different section (KC-79).
         if _same_model(review_settings, config.draft_settings):
             raise DraftSetupError("the review model is the draft model ("
                                   + str(getattr(config.draft_settings, "model", "")) +
@@ -2838,8 +2656,7 @@ def cmd_draft(args: argparse.Namespace) -> int:
             print(f"draft: {problem}", file=sys.stderr)
         if result.rejected_path:
             print(f"draft: rejected draft saved to {result.rejected_path}", file=sys.stderr)
-        # EXIT_NO_READY is 2: the lint or the review refused, the problems are
-        # printed, the operator fixes the draft or the repo and re-runs the brief.
+        # Exit code 2 means the lint or review refused; the problems are printed for a re-run.
         return EXIT_NO_READY
     if getattr(args, "no_review", False):
         print("draft: --no-review: the gate model's review was skipped", file=sys.stderr)
@@ -2895,9 +2712,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         except (RosterError, OSError) as exc:
             print(f"status: cannot find the round's folder: {exc}", file=sys.stderr)
             return EXIT_FAILED
-    # Round 148: a round of legs writes `<NN>.1 … <NN>.K` and no `<NN>/state.json`;
-    # only the last leg's file is the whole round (revive_round.py's rule), so a
-    # bare round folder with no state of its own reads its highest leg.
+    # A round of legs has no state.json of its own; the last leg's file is the whole round (round 148).
     if not (out_dir / "state.json").is_file():
         legs = sorted(
             (int(leg), sibling)
@@ -2919,9 +2734,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         return EXIT_FAILED
     for line in export.render_table(state, export.round_patches(out_dir, state)):
         print(line)
-    # KC-81: the heartbeat's silent-spell record, so a hung server shows up here
-    # without opening the round's log. One line, not a table row — SUMMARY.md has
-    # no line for it either, and `state.json` is the only source.
+    # One line for the server's silent spell (KC-81); state.json is its only source.
     silent = state.server_silent
     if isinstance(silent, dict):
         try:
@@ -3080,11 +2893,9 @@ def main(argv=None) -> int:
     if not args.cmd:
         parser.print_usage(sys.stderr)
         return 2
-    # the runner's progress lines (one per transition) are the operator's only
-    # view of a live round: `live_smoke.py` configures the same
+    # The runner's progress lines are the operator's only live view of a round (live_smoke.py sets the same).
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(name)s %(message)s")
-    # this invocation's argv, so intake can print the `run` line with the
-    # blocked ticket's number in it instead of re-deriving the command
+    # This invocation's argv, so intake can print the run line with the blocked ticket's number.
     args.argv = list(argv) if argv else list(sys.argv[1:])
     return args.func(args)

@@ -44,8 +44,7 @@ import re
 import subprocess
 from pathlib import Path
 
-# `[ \t]*`, not `\s*`: an empty Status line must not read (and then overwrite) the
-# first word of the line below it.
+# `[ \t]*`, not `\s*`: an empty Status line must not swallow the first word of the next line.
 STATUS_RE = re.compile(r"^(\*\*Status:\*\*[ \t]*)(\S+)(.*)$", re.MULTILINE)
 TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
 #: `| 48 | `KC-9` | queued — …` → the status word in the third cell.
@@ -123,10 +122,7 @@ def next_steps(status: str, number: int, repo: Path, tasks_dir: Path, base: str)
         titles = {int(TICKET_RE.match(p.name).group(1)): title_id(p.read_text(), p.name)
                   for p in tasks_dir.glob("*.md") if TICKET_RE.match(p.name)}
         nxt = sorted(k for k, v in statuses.items() if v in ("queued", "open") and k != n)
-        # the landed ticket's own epic first: `KC-9` → `KC-`; old epics' parked
-        # tickets only when this one has nothing left
-        # a ticket whose heading starts with a number (`# 150 — …`), or has no
-        # heading (the file name), has no family: every ticket still to land
+        # Same family first (KC-9 -> KC-); a ticket with no family qualifies for every epic.
         m = re.match(r"[A-Za-z]+-?", titles.get(n, ""))
         family = m.group(0) if m else ""
         nxt = [k for k in nxt if titles[k].startswith(family)] or nxt
@@ -230,9 +226,7 @@ def main(argv=None) -> int:
         rows = index.read_text()
         row_re = re.compile(INDEX_ROW.format(n=args.number), re.MULTILINE)
         if row_re.search(rows):
-            # the whole status cell is rewritten: only the first word used to be,
-            # so a flip kept the old sha (`open `abc`` / a landed row with the
-            # previous winner's sha)
+            # Rewrite the whole status cell: only the first word used to be, so a flip kept the old sha.
             cell = f"landed `{args.sha}`" if args.status == "landed" else args.status
             index.write_text(row_re.sub(lambda m: m.group(1) + cell + m.group(3), rows, count=1))
             paths.append(str(index.relative_to(repo)))

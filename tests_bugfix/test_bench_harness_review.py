@@ -23,10 +23,7 @@ def _git(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-# ── static_checks.py: "key documented in agents.ini [section], with its default" ──
-# Bug: the key was searched as a substring and the default as `key = default\b` with
-# nothing on the left, so `retries` was "documented" by `max_retries = 3`, and a default
-# of `0` was met by `timeout = 0.5` (`\b` sits between the 0 and the dot).
+# Regression: static_checks matched keys and defaults as substrings (retries inside max_retries).
 
 def _static(tmp_path: Path, ini: str, keys: list) -> dict:
     wt = tmp_path / "wt"
@@ -91,9 +88,7 @@ def test_a_commented_example_and_a_prose_mention_still_document_a_key(tmp_path):
     assert result["S.pace default 2 in agents.ini"] is True
 
 
-# ── validate_inputs.py: "the files it changed are exactly the files its patch touches" ──
-# Bug: `patch_files` read only the `a/` path of `diff --git a/old b/new`, so a patch
-# that renames a file was reported as differing from the worktree that applied it.
+# Regression: patch_files read only the a/ path, so renamed files looked changed.
 
 def _validate_inputs():
     spec = importlib.util.spec_from_file_location("_bugs_validate_inputs", HARNESS / "validate_inputs.py")

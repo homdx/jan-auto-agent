@@ -116,8 +116,7 @@ _FREE_VALUES = (FREE_YES, FREE_MAYBE, FREE_NO)
 # `x:free`, `x-free` — the name says so itself.
 _FREE_SUFFIX_RE = re.compile(r"[:-]free$", re.IGNORECASE)
 
-#: The `[contest]` keys that name a judge's LLM profile, and what the judge is
-#: called in a refusal. A judge never competes in the round it judges.
+#: The [contest] keys that name a judge's profile, and the judge's name in a refusal.
 JUDGE_KEYS = (
     ("gate_llm_profile", "the gate model"),
     ("draft_llm_profile", "the ticket writer"),
@@ -129,8 +128,7 @@ AVAILABLE_COLUMNS = ["NAME", "PROVIDER", "FREE", "CTX", "IN-PROFILE", "LAST-TEST
 
 #: The scores file, next to the model cache.
 SCORES_RELPATH = Path(".arena") / "model-scores.json"
-#: `arena model test` runs at most this many models at once: every `kilo run`
-#: writes the one shared Kilo store (`py_model_test.py -j` is capped the same).
+#: At most this many models are tested at once, since each kilo run writes the shared store.
 TEST_JOBS = 4
 #: Seconds a model has to answer, and attempts on a rate limit (429 / 403).
 TEST_TIMEOUT = 240
@@ -317,8 +315,7 @@ def _kilo_list(repo: Path, providers: list[str]) -> dict[str, dict[str, dict]]:
         names = list(providers) or _kilo_providers(kilo, check)
         found: dict[str, dict[str, dict]] = {}
         for provider in names:
-            # `kilo_models` reports a failure on stderr and answers `{}`; that
-            # text is the reason, so it is caught rather than printed.
+            # The Kilo failure text on stderr is the reason, so it is caught, not printed.
             noise = io.StringIO()
             with contextlib.redirect_stderr(noise):
                 models = check.kilo_models(kilo, provider, True)
@@ -359,8 +356,7 @@ def _records_of(listing: dict[str, dict[str, dict]], now: float) -> list[dict]:
     check = _model_check()
     records = []
     for provider, meta in listing.items():
-        # `free_from_kilo`: price 0 on a text tool-calling model; its own FREE /
-        # MAYBE split is by name, which `_free_of` redoes with the suffix rule.
+        # Free models are split into FREE and MAYBE by name, which _free_of redoes with the suffix rule.
         zero = {row[0]: row[1] for row in check.free_from_kilo(meta)}
         for model, data in meta.items():
             ctx = ((data or {}).get("limit") or {}).get("context")
@@ -560,10 +556,7 @@ def _with_key(text: str, name: str, key: str, value: Optional[str]) -> str:
     pattern = re.compile(r"^" + re.escape(key) + r"\s*[=:]", re.IGNORECASE)
     at = next((i for i in range(start + 1, end) if pattern.match(lines[i])), None)
     if at is not None:
-        # an indented line under the key is the rest of its value — as configparser
-        # reads it: a blank or comment line between two indented lines does not end
-        # the value (`empty_lines_in_values`), so the scan looks past them and stops
-        # only at an unindented line; trailing blanks and comments stay (bug 167)
+        # An indented line continues the value, as configparser reads it; only an unindented line ends it (bug 167).
         stop = at + 1
         for i in range(at + 1, end):
             line = lines[i]
@@ -753,10 +746,7 @@ def _direct_for(provider: str, url: str, key: str, now: float) -> list[dict]:
     except urllib.error.HTTPError as err:
         raise ModelError(f"{provider}: direct list failed: HTTP {err.code}") from err
     except (OSError, ValueError, http.client.HTTPException) as err:
-        # Bug 208: a cut body is `http.client.IncompleteRead` or `BadStatusLine`, an
-        # HTTPException that is neither an OSError nor a ValueError, so it escaped the
-        # one-line hint and was a traceback instead. A message that is empty
-        # (`ResponseNotReady()`) names the exception, never a blank reason.
+        # An HTTP exception with an empty message names itself, never a blank reason (bug 208).
         detail = _hide(str(err), key) or type(err).__name__
         raise ModelError(f"{provider}: direct list failed: {detail}") from err
     for r in recs:
@@ -854,9 +844,7 @@ class ScoreStore:
         self.path = Path(path)
         self.days = days
         self._lock = threading.Lock()
-        #: the newest `at` this store has written: a thread whose own `at` is a
-        #: few ms older than a record that landed first must not read that record
-        #: as "from the future" and drop it
+        #: The newest "at" written: a record a few ms older than one that landed first must not be dropped as future.
         self._newest = 0.0
 
     def load(self, now: Optional[float] = None) -> list[dict]:
@@ -1199,9 +1187,7 @@ def drop(repo: Path, args: argparse.Namespace) -> int:
         current = split_names(profiles[name].get("models", ""))
         for entry in entries:
             if not any(same_model(c, entry) for c in current):
-                # a name the profile lacks gets `use`'s typo hint; a name it holds
-                # is dropped without asking Kilo — a retired model is no longer
-                # listed, and it is the one an operator most wants out
+                # A name the profile lacks gets the typo hint; a name it holds is dropped without asking Kilo (a retired model).
                 resolve_names(repo, [entry])
                 raise ModelError(
                     f"profile {name!r} has no {base_of(entry)!r} "
@@ -1247,8 +1233,7 @@ def replace_model(repo: Path, args: argparse.Namespace) -> int:
             )
         after_list = [new[0] if same_model(c, old) else c for c in current]
         before, after = ",".join(current), ",".join(after_list)
-        # a no-op is answered before Kilo is asked: it was a Kilo call for nothing, and a model
-        # already in the profile refused as a judge although nothing would change
+        # A no-op is answered before Kilo is asked, and a judge already in the profile is refused.
         if before == after:
             print(f"profile {name!r}: models = {after} (unchanged)")
             return EXIT_OK
@@ -1265,13 +1250,10 @@ def replace_model(repo: Path, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-# ── AR-63: the ticket's writer and reviewer, as profile roles ────────────────
-#: The two ticket roles a profile may hold. A role is not a round agent, so
-#: `check_not_judge` does not apply to it: the ticket writer may also be the gate.
+# AR-63: the ticket writer and reviewer are profile roles; they are not round agents, so the judge check does not apply.
 ROLES = ("writer", "reviewer")
 
-#: The profile key each role is stored under, both `None` in `profile.KNOWN_KEYS`
-#: so neither ever becomes a runner flag.
+#: The profile key each role is stored under; both are None in KNOWN_KEYS, so neither is a runner flag.
 ROLE_KEYS = {"writer": "writer", "reviewer": "reviewer"}
 
 
@@ -1489,25 +1471,20 @@ def draft_pair(repo: Path, args: argparse.Namespace, prof: dict, config) -> tupl
     prof_same = bool(raw_same) and profile.fresh_on(raw_same, "same_model_review")
     same_flag = bool(getattr(args, "same_model", False))
     same_model = prof_same or same_flag
-    # Only the flag contradicts `--no-review`: a profile that allows one model to
-    # review does not ask for a review, so `--no-review` on it still just skips it.
+    # Only the flag contradicts --no-review; a profile that allows one model to review still skips the review.
     if same_flag and no_review:
         raise ModelError("--same-model and --no-review contradict: one reviews with "
                          "the writer, the other skips the review")
     w_flag = getattr(args, "writer", None)
     r_flag = getattr(args, "reviewer", None)
     stored = {role: str(prof.get(role) or "").strip() for role in ROLES}
-    # `--same-model` belongs here too: AR-7's path refuses one model outright, so
-    # old keys naming one model with the flag are resolved below, as step 4 says.
+    # --same-model is refused here too, and old keys naming one model are resolved below.
     new_path = bool(w_flag or r_flag or any(stored.values()) or same_model)
     old_key_set = bool(getattr(config, "draft_llm_profile", "")
                        or getattr(config, "draft_review_llm_profile", "")
                        or getattr(config, "gate_llm_profile", ""))
 
-    # Nothing AR-63 at all, and AR-7's own keys are still in play: hand the pair
-    # to `draft_callables`, so a checkout that only ever used the old keys
-    # refuses in AR-7's own words. Only when literally nothing is configured
-    # anywhere does the "no ticket writer" line below get to speak.
+    # With no AR-63 keys and AR-7's keys set, refuse in AR-7's own words; the writer message appears only when nothing is set.
     if not new_path and old_key_set:
         llm_call, review_call = contest_cli.draft_callables(config, no_review)
         writer_label = _label_of(_old_writer_settings(config))
@@ -1551,8 +1528,7 @@ def draft_pair(repo: Path, args: argparse.Namespace, prof: dict, config) -> tupl
             raise ModelError("no ticket reviewer — arena model set-role reviewer "
                              "PROVIDER/MODEL -p P, or --reviewer, --same-model, "
                              "or --no-review")
-        # `_same_model` compares the model id only: neither the provider nor the URL
-        # makes one model into two reviewers.
+        # Only the model id is compared, so the provider and URL do not make two reviewers.
         if contest_cli._same_model(writer_settings, reviewer_settings):
             if not same_model:
                 raise ModelError(f"writer and reviewer are the same model "

@@ -134,8 +134,7 @@ def test_stale_auto_refresh_true_calls_refresh_and_reloads(mini_repo, monkeypatc
     assert bridge is not None
     assert len(calls) == 1
     assert Path(calls[0][0][0]) == mini_repo
-    # The operator's config and its path reach action_refresh unchanged —
-    # Pass B (off here) and the collect dir are resolved from them.
+    # Config and path reach action_refresh unchanged; Pass B and the collect dir resolve from them.
     assert calls[0][1]["config"].get("collect", "use_in_auto") == "true"
     assert calls[0][1]["config_path"] == str(config_path)
     assert bridge.usable is True
@@ -332,12 +331,7 @@ def test_no_event_without_the_flag(mini_repo, monkeypatch):
     assert [e for e in events if e.get("kind") == "collect_refresh"] == []
 
 
-# ── RUN-11: the line and the event say what Pass B is about to do ───────────
-#
-# The count was the hash diff, which understates the bill three orders of
-# magnitude on a collector_version bump: the live run read "refreshing 1
-# module(s)" while Pass B was about to work over 543 modules, and
-# collect_refresh.modules recorded the same 1.
+# RUN-11: the line and event report Pass B's real work (modules), not the hash diff.
 
 
 def test_entry_refresh_reports_a_version_bump_as_a_full_rebuild(mini_repo, monkeypatch, capsys):

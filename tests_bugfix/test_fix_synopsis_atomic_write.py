@@ -58,8 +58,7 @@ def test_synopsis_not_written_with_bare_write_text(tmp_path):
     with patch.object(pathlib.Path, "write_text", spy):
         sm._write_section("chapter_01.md", "• Иван\n")
 
-    # atomic_write_text uses os.replace internally so write_text on _synopsis_path
-    # is never called directly by the production code.
+    # atomic_write_text uses os.replace, so production code never calls write_text on the synopsis path.
     assert not synopsis_direct_writes, (
         "Production code called write_text() directly on synopsis.md. "
         "It must go through atomic_write_text() instead."

@@ -45,8 +45,7 @@ MODULE = textwrap.dedent("""\
         return data
 """)
 
-# The smallest artifact that gives the voters something to read: one contract on the cited module.
-# Everything else is the empty container the producer always writes.
+# Smallest artifact the voters can read: one contract on the cited module, plus the empty container.
 ARTIFACT = {
     "modules": [],
     "contracts": [{"name": "the contract", "known_edge": "pkg/m0.py", "kind": "seed"}],
@@ -486,8 +485,7 @@ def test_collect_is_a_set_option_and_a_suffix_of_the_variant_name():
     assert l2.variant_name(7, ("collect",), "all") == "on-7-all+collect"
     assert l2.variant_name(5, ("collect",)) == "on-5+collect"
     assert l2.variant_name(5, ("notests", "collect")) == "on-5-notests+collect"
-    # +collect is the artifact the judges were handed, not another switch of the vote: with the same
-    # size and rule it is a sibling variant, so --resume cannot mistake one for the other
+    # +collect is a sibling variant, not another vote switch, so --resume cannot confuse the two.
     assert l2.parse_sets("5:all+collect,5:all") == [(5, "all", ("collect",)), (5, "all", ())]
     with pytest.raises(SystemExit, match="named twice"):
         l2.parse_sets("5:all+collect,5:all+collect")
@@ -532,8 +530,7 @@ def test_check_collect_walks_with_the_list_the_manifest_recorded(tmp_path):
     tree = _tree(tmp_path)
     (tree / "contest-out").mkdir()
     (tree / "contest-out" / "extra.py").write_text("X = 1\n", encoding="utf-8")
-    # the manifest skipped contest-out, so its hash map has no extra.py: the check must walk with the
-    # list the manifest recorded, or it would call that file a difference of the tree
+    # The manifest skipped contest-out, so the check walks the manifest's own file list.
     assert l2.check_collect(_artifact(tree, _skip_cfg("contest-out")), tree) == ""
     # a manifest of the default list still sees every new file
     default = _artifact(tree, _cfg())
@@ -645,8 +642,7 @@ def _l2_results(collect_line):
     base = {"rc": 0, "ok": True, "seconds": 1, "checked": 4, "voters": [], "accept": "all", "opts": [], "removed": {}}
     off = dict(base, variant="off", removed={"AUTO-T2": "x", "AUTO-T3": "x"})
     off2 = dict(base, variant="off-2", removed={"AUTO-T2": "x", "AUTO-T3": "x"})
-    # a +collect variant is judged against the baselines that had the model (review of CC-13: against `off`
-    # it counted the reader's change with the model as the vote's)
+    # A +collect variant is judged against the baselines that had the model (CC-13).
     had = {"collect": "fresh", "collect_reader": "used", "collect_pack": "not used"}
     offc = dict(base, variant="off+collect", opts=["collect"], removed={"AUTO-T2": "x", "AUTO-T3": "x"}, **had)
     offc2 = dict(base, variant="off-2+collect", opts=["collect"], removed={"AUTO-T2": "x", "AUTO-T3": "x"}, **had)

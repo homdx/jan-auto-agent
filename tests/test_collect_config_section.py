@@ -99,8 +99,7 @@ def test_empty_config_parser_returns_defaults():
 
 
 def test_missing_collect_section_does_not_break_check(mini_repo):
-    # No agents.ini / no [collect] at all — /collect --check must behave
-    # exactly like it always has: report "never run", write nothing.
+    # Without [collect], --check reports "never run" and writes nothing.
     result = action_check(mini_repo, config=None)
     assert result.wrote is False
     assert result.fresh is False

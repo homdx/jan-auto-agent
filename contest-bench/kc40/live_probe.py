@@ -267,8 +267,7 @@ def main() -> int:
     started = time.monotonic()
 
     def make_backend(workspace):
-        # one `KiloBackend` per worktree over the shared server, as `cmd_run`
-        # builds them (`cli._make_backends`)
+        # One KiloBackend per worktree over the shared server, built as cmd_run builds them (cli._make_backends).
         return KiloBackend(server, str(workspace.path),
                            events_log=str(out / workspace.agent / "events.jsonl"))
     try:

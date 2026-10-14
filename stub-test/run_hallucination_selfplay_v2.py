@@ -65,9 +65,7 @@ def hallucinating_llm_call(system: str, user: str) -> str:
 
     sentences = []
 
-    # 6. NEGATION-FLIP: find an UNGUARDED access Pass A recorded and claim
-    #    it's safe. This is the false-negative direction — dangerous because
-    #    a downstream reader would stop worrying about a real crash site.
+    # 6. NEGATION-FLIP: claims an unguarded access Pass A recorded is safe (hides a real crash site).
     if module and module.guarded_accesses:
         ua = next((g for g in module.guarded_accesses if g.status == "UNGUARDED"), None)
         if ua:
@@ -83,8 +81,7 @@ def hallucinating_llm_call(system: str, user: str) -> str:
             f"It exposes a helper called {fake_name} in {module_path} for validation."
         )
 
-    # 8. TWIN-CITE: two location citations in ONE sentence — first true,
-    #    second false — to check whether only the first is validated.
+    # 8. TWIN-CITE: two citations in one sentence, the second false, to check the second is validated.
     if module and module.public_symbols:
         real_sym = module.public_symbols[0]
         sentences.append(
@@ -92,16 +89,14 @@ def hallucinating_llm_call(system: str, user: str) -> str:
             f"against {module_path}:888888 for regressions."
         )
 
-    # 9. SELF-CONTRADICT: assert both GUARDED and crashing for the SAME access
-    #    within the same purpose text.
+    # 9. SELF-CONTRADICT: marks the same access both GUARDED and crashing.
     if module and module.guarded_accesses:
         ga = next((g for g in module.guarded_accesses if g.status == "GUARDED"), None)
         if ga:
             sentences.append(f"{ga.access} is fully guarded at {ga.location}.")
             sentences.append(f"{ga.access} will raise an unguarded exception at {ga.location}.")
 
-    # 10. OFF-BY-ONE-LINE: real module, line = actual file's line count + 1
-    #     (one past the real end of file).
+    # 10. OFF-BY-ONE-LINE: a line one past the real end of the file.
     if module_path:
         try:
             real_line_count = len((ROOT / module_path).read_text(encoding="utf-8").splitlines())

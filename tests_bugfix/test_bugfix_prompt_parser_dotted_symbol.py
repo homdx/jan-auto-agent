@@ -30,8 +30,7 @@ def test_dotted_symbol_reference_with_def_still_extracts_target():
 
 
 def test_bare_filename_with_no_in_marker_still_works():
-    # No explicit "in " marker anywhere -> falls back to the original
-    # first-match behavior, unchanged.
+    # No "in " marker: falls back to the original first-match behaviour.
     parsed = _parse_via_regex("show me utils.py")
     assert parsed is not None
     assert parsed.file_path == "utils.py"

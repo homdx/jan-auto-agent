@@ -259,8 +259,7 @@ def test_R4_growth_every_time_is_capped_at_turn_max_sec(tmp_path):
     run, took = _one(tmp_path, cfg, grow_for=30)
     assert run.state is AgentState.STALLED
     granted = [e["granted"] for e in run.turns[0].get("extensions") or []]
-    # the last grant is clipped so the turn totals turn_max_sec; a grant computed
-    # from a live clock may be 0.9999 rather than 1, but never a third sliver
+    # The last grant is clipped so the turn totals turn_max_sec; a grant from a live clock may be 0.9999 rather than 1, but never a third sliver.
     assert len(granted) == 2 and granted[0] == 2, run.turns[0]
     assert abs(1 + sum(granted) - 4) < 0.05, granted
     assert took < 10, took

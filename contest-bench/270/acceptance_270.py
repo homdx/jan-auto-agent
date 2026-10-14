@@ -175,8 +175,7 @@ def main() -> int:
             for claim in DANGLING:
                 chunks = chunks_for(claim, vh)
                 sha = re.search(r"\b([0-9a-f]{7,40})\b", claim).group(1)
-                # the note names the sha; no chunk passes itself off as that commit's evidence
-                # (a `gitlog:` of a named path is the history words' chunk, not the commit's)
+                # The note must name the sha; no chunk may pass as that commit's evidence, and a `gitlog:` of a path does not count.
                 ok = any(ch.kind == "note" and sha in ch.text for ch in chunks) \
                     and not any(ch.id.startswith(f"git:{sha[:7]}") for ch in chunks)
                 hit += ok

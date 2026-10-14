@@ -117,9 +117,7 @@ def _retry_subset(kwargs: dict) -> dict:
     return {key: kwargs[key] for key in _RETRY_KEYS}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. The one reader
-# ─────────────────────────────────────────────────────────────────────────────
+# The one reader
 
 class TestRetryKwargsFromConfig:
     """`retry_kwargs_from_config` — the single reader for the [loop] budget."""
@@ -158,8 +156,7 @@ class TestRetryKwargsFromConfig:
         }
 
     def test_negative_clamp_keeps_the_types(self):
-        # max(0, 0.0) returns the int 0; the float knobs must stay floats so a
-        # caller can't be handed a different type for the same knob.
+        # Float knobs stay floats, so a caller gets the same type for the same knob.
         cfg = _cfg({"error_retries": "-5", "error_retry_wait_sec": "0",
                     "max_retry_after_sec": "0"})
         out = retry_kwargs_from_config(cfg)
@@ -194,8 +191,7 @@ class TestRetryKwargsFromConfig:
                    for r in caplog.records)
 
     def test_a_broken_config_artifact_degrades_to_the_defaults(self):
-        # Fail-open: something that is not a ConfigParser must not raise into a
-        # run — every caller reads this once in its constructor.
+        # Fail-open: a non-ConfigParser must not raise into a run.
         class Broken:
             def get(self, *args, **kwargs):
                 raise OSError("no such file")
@@ -230,9 +226,7 @@ class TestSignatureDefaultsDidNotMove:
         assert DEFAULT_MAX_RETRY_AFTER_SEC == params["max_retry_after_sec"].default
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Every auto-mode call site passes the budget through
-# ─────────────────────────────────────────────────────────────────────────────
+# Every auto-mode call site passes the budget through
 
 def _drive_architect(cfg, tmp_path, rec: Recorder) -> None:
     from tools.auto.architect import ClusterReviewer
@@ -419,8 +413,7 @@ class TestEveryAutoModeCallSitePassesTheBudget:
     def test_a_collect_budget_is_never_read_by_auto_mode(self, tmp_path,
                                                          monkeypatch, name,
                                                          drive, replies):
-        # [collect] still owns Pass B's numbers; the auto-mode callers must not
-        # pick them up just because the names are identical.
+        # [collect] owns Pass B's numbers; auto-mode callers do not pick them up by name.
         cfg = _cfg(dict(_BUDGET))
         cfg.add_section("collect")
         cfg.set("collect", "error_retries", "7")
@@ -487,9 +480,7 @@ class TestCollectPassBKeepsItsOwnBudget:
         assert kwargs["max_retry_after_sec"] == 180
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. The two budgets nest
-# ─────────────────────────────────────────────────────────────────────────────
+# The two budgets nest
 
 def _always_429(counter: dict):
     """A transport that raises HTTP 429 on every call, with no Retry-After."""
@@ -562,9 +553,7 @@ class TestGate1BudgetsNest:
         assert "LLM call failed:" in reason
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. One INFO line per run, into run.log
-# ─────────────────────────────────────────────────────────────────────────────
+# One INFO line per run, into run.log
 
 _HELLO_PY_INITIAL = '''\
 def greet():
@@ -612,9 +601,7 @@ def _git_init(path: Path) -> None:
 
 
 def _write_ini(tmp: Path, *, budget: dict | None = None) -> Path:
-    # Written line by line, not with an indented f-string: a multi-line
-    # substitution would break textwrap.dedent and leave [architect] on the
-    # same logical line as the last [loop] value.
+    # Lines are built one by one, so a multi-line substitution cannot break textwrap.dedent.
     lines = [
         "[auto]",
         "git_user = agent",
@@ -729,8 +716,7 @@ class TestPipelineLogsTheBudgetOnce:
     def test_the_budget_line_precedes_the_architect(self, _log):
         budget_at = _log.find("LLM retry budget [loop]:")
         assert budget_at >= 0
-        # Everything in run.log before the budget line is banner/init output;
-        # the plan phase's first log line comes after it.
+        # The banner lines come before the budget line; the plan phase logs after it.
         plan_at = _log.find("plan")
         assert plan_at > budget_at
 

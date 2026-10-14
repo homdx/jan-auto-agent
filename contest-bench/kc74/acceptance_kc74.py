@@ -285,8 +285,7 @@ def empty_leg(tmp_path_factory):
     mp.setenv("CONTEST_GATE_API_KEY", "unset-for-the-test")
     try:
         sb = _sandbox(tmp_path_factory.mktemp("empty"), mp)
-        # tests on, as in a live round: the harvest's blocking reasons keep the
-        # roots from running, so `tests_run` is `skipped: …` — no root ran
+        # Tests on, as in a live round: blocking reasons keep the roots from running, so tests_run reads skipped.
         _red_roots(mp)
         code, fake = _run(mp, lambda d, t: None, lambda a, leg: ("", []), ["--legs", "2"],
                           tests=True)

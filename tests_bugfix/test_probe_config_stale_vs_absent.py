@@ -44,9 +44,7 @@ from tools.auto import collect_bridge as cb
 from tools.collect.loader import CollectModel, STATUS_ABSENT, STATUS_FRESH, STATUS_STALE
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(**over: str) -> configparser.ConfigParser:
     arch = {
@@ -107,9 +105,7 @@ def _trace(tmp_path: Path, reviewer: ClusterReviewer, bridge, name="t.jsonl") ->
     return cfgs[0]["params"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CollectBridge.status
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestBridgeStatus:
 
@@ -170,9 +166,7 @@ class TestBridgeStatus:
         assert b.pull_symbol("fn") == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # probe_config reason
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestProbeConfigReason:
 
@@ -277,9 +271,7 @@ class TestProbeConfigReason:
         assert cfgs[0]["content"] == "collector exploded"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # analyze_logs still parses the new reason
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _ev(kind: str, **params) -> dict:
     return {"run_id": "r1", "kind": kind, "ts": "2026-01-01T00:00:00Z",
@@ -327,9 +319,7 @@ class TestReporting:
         assert "something_new" in out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # _shrink is untouched
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_shrink_still_runs_from_context_for() -> None:
     """L2-9: the new `status` read is one line above the budget gate, so it

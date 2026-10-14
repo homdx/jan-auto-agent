@@ -57,12 +57,9 @@ from tools.collect.model import ModuleRecord
 
 TARGET = "pkg/hub.py"
 
-# Six callers with 2-char names: one caller name costs 4 chars ("aa" + ", "),
-# exactly the amount the defect borrowed from them. Six so the cap of five has a
-# remainder to announce.
+# Six callers with 2-char names: one name costs 4 chars, the amount the defect borrowed. Six exceeds the cap of five.
 CALLERS = ("aa", "bb", "cc", "dd", "ee", "ff")
-# One 4-char callee: "calls_into: a.py" (16) vs its own count
-# "calls_into: 1 target" (20) — the floor is 4 chars LONGER than the full form.
+# One 4-char callee: its floor is 4 chars longer than the full form.
 CALLS = ("a.py",)
 
 HEAD = len(_COLLECT_HEADER) + 1 + len(f"module: {TARGET}")

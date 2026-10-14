@@ -1,8 +1,4 @@
-# source this in EVERY new terminal tab before any 2legs step:
-#   source <path-to-jan>/2legs/env.sh
-# Paths are derived from this file's location, so it works on any machine:
-#   JAN    = the jan-auto-agent checkout holding this 2legs/ folder
-#   TARGET = ext-demo-repo next to it (override: TARGET=/x source env.sh)
+# Source in every new terminal before any 2legs step; TARGET can be overridden.
 _here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export JAN=$(cd "$_here/.." && pwd)
 export TARGET=${TARGET:-$(cd "$JAN/.." && pwd)/ext-demo-repo}

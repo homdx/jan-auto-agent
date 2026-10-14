@@ -183,9 +183,7 @@ def _reason(h: Harvest, code: str) -> Reason:
     return next(r for r in h.reasons if r.code == code)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. The golden case: the script's stdout and CSV are byte-identical
-# ─────────────────────────────────────────────────────────────────────────────
+# 1. Golden case: stdout and CSV are byte-identical
 
 
 def _run(script: Path, tmp_path: Path, tasks: Path, base: str, trees: list[Workspace],
@@ -283,9 +281,7 @@ def test_judge_worktree_counts_a_rename_under_its_new_path(tmp_path):
     assert row["off_ticket_files"] == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. `declared_files` and the moved helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# 2. declared_files and the moved helpers
 
 
 def test_declared_files_reads_file_and_also_touches(round_):
@@ -437,8 +433,7 @@ def test_run_tests_summary_and_tail_agree(round_, tmp_path):
     if importlib.util.find_spec("pytest_timeout"):
         assert before.run_tests(str(wt.path)) == summary
     else:
-        # The old module always passed `--timeout=180`; without the plugin
-        # pytest exits 4 there, while the gate leaves the flag out (KC-76).
+        # Without the plugin pytest exits 4 on --timeout, so the gate leaves the flag out (KC-76).
         assert summary.startswith("tests:PASS")
 
     _edit(wt, "tests/test_probe.py",
@@ -582,9 +577,7 @@ def test_run_tests_detail_does_not_mark_unparseable_failures_flaky(
     assert tail[0] == "--- tests"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-57: the roots have a wall-clock budget
-# ─────────────────────────────────────────────────────────────────────────────
 
 #: A test that will outlive any budget the tests below give it.
 _SLOW = """\
@@ -595,12 +588,7 @@ def test_slow_kc57():
     time.sleep(90)
 """
 
-#: `_SLOW`, and it drops a marker beside itself the moment it starts. `-v` prints
-#: the node id before the test body runs, so once the marker exists the line that
-#: names the test is already in the output: the marker says the nested pytest got
-#: through interpreter start, plugins, `conftest.py` and collection — the one thing
-#: the `the budget hit in:` line needs and a starved process cannot promise inside a
-#: fixed budget (KC-184).
+#: Slow test marker: dropped when the nested test starts, so the budget line can name the test (KC-184).
 _SLOW_MARKED = """\
 import pathlib
 import time
@@ -814,18 +802,14 @@ def test_harvest_budget_reworks_with_tests_slow(round_, tmp_path):
     wt = _worktree(repo, base, tmp_path)
     _edit(wt, "tools/auto/probe.py", "PROBE = 1\n")
     _edit(wt, "tests/test_probe.py", "def test_probe():\n    assert True\n")
-    # the harvest runs the suite in a worktree of its own and drops it after, so the marker is
-    # written outside it, where this test can still see it
+    # The marker is written outside the harvest's worktree, where the test can still see it.
     started = tmp_path / "test_slow_kc57.started"
     _edit(wt, "tests/test_slow_kc57.py",
           f"import pathlib\nimport time\n\n\ndef test_slow_kc57():\n"
           f"    pathlib.Path({str(started)!r}).write_text('started')\n    time.sleep(90)\n")
     _record(wt, ticket.name, outcome="DONE", commit=_commit(wt, "a test that outlives the budget"))
 
-    # KC-184's rule here too: the slow test's *name* is in the reason only when the nested pytest
-    # reached it inside the budget, which on a starved machine is its speed, not the rule (this
-    # test failed 1 run in 3 under -n 8 with 8 busy cores, before and after the claimcheck fixes).
-    # A 3 s budget spent in start-up is retried once with 60 s, under the 90 s the test sleeps.
+    # KC-184: the test name appears in the reason only when the nested pytest reaches it within the budget; retried once with 60 s.
     for budget in (3.0, 60.0):
         started.unlink(missing_ok=True)
         h = harvest(wt, ticket, run_tests=True, budget_sec=budget)
@@ -981,9 +965,7 @@ def test_run_tests_reports_the_tier_check_when_the_tree_has_one(round_, tmp_path
     assert tail[0] == "--- tiers" and any("missing link test_new.py" in l for l in tail)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. `harvest`: the claim and the facts become a verdict
-# ─────────────────────────────────────────────────────────────────────────────
+# 3. harvest: the claim and the facts become a verdict
 
 
 def test_harvest_without_a_progress_row_reworks(round_, tmp_path):
@@ -1179,8 +1161,7 @@ def test_harvest_degrades_a_truncated_row_to_an_empty_claim(round_, tmp_path):
     assert _codes(h) == ["no_commit"]
     assert h.commit is None
 
-    # a row of one field: every claim field after the ticket is None, and the
-    # sentence degrades the same way — `progress_not_done` names EMPTY
+    # A row with one field leaves the later claim fields None, so progress_not_done names EMPTY.
     wt.progress_csv.write_text(
         "ticket,finding,outcome,commit,note\n" + ticket.name + "\n",
         encoding="utf-8")
@@ -1605,9 +1586,7 @@ def test_harvest_reworks_when_the_path_is_not_a_worktree(round_, tmp_path):
     assert "not a git worktree" in _reason(h, "commits_ne_1").text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. The verdict's shape, and the message the runner sends
-# ─────────────────────────────────────────────────────────────────────────────
+# 4. The verdict's shape, and the runner's message
 
 
 def test_reason_codes_are_the_tickets_list():
@@ -1711,17 +1690,12 @@ def test_rework_message_has_no_also_noted_without_a_note():
     assert msg.index("Attempt 1 of 2") < msg.index("- 01-r1.md") < msg.index("Ground rules")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. KC-60: the roots run on the commit, and the tree is left exactly as it was
-# ─────────────────────────────────────────────────────────────────────────────
+# 5. KC-60: the roots run on the commit, and the tree is left as it was
 
-#: The base repo's own noise filter. The harvest never carries a list of its
-#: own — `git status` applies this file and reports nothing it matches.
+#: The base repo's noise filter; the harvest uses git status with this file, not a list of its own.
 IGNORED = "runs/\n__pycache__/\n.pytest_cache/\nscratch/\n"
 
-#: The committed check that makes a missing tier link a failing test. It reads
-#: the tree git has, so it passes in a tree that carries the link and fails in
-#: one that does not.
+#: Committed check for a missing tier link: passes when the link is in the tree, fails when it is not.
 TIER_LINKS = """\
 from pathlib import Path
 
@@ -2042,9 +2016,7 @@ def test_a_checkout_that_cannot_be_made_is_not_a_pass(tmp_path, monkeypatch):
     assert _registered_worktrees(repo) == before
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-50: the roots run only for a verdict they can decide
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def test_harvest_skips_roots_when_blocking_reasons_already_present(

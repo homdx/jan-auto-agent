@@ -80,9 +80,7 @@ VOTE_SKIPPED = re.compile(r"Gate 1 vote: .*?, skipped (\d+)")
 #: contest.ini's section of this script
 INI_SECTION = "gate1_layer2"
 DEFAULT_OFF_RUNS = 2
-#: CC-13: the line Gate 1 prints at the start of a run — whether the collect model was there and
-#: whether the reader and the vote pack used it, so a variant says what its judges had
-#: a stale line names why in parentheses — files moved, another collector version, another skip_dirs list
+#: The line Gate 1 prints at the start of a run; a stale line names why in parentheses (CC-13).
 COLLECT_LINE = re.compile(r"collect: (fresh|stale(?: \([^)]*\))?|present|absent)"
                           r" — reader: (used|not used), vote pack: (used|not used)")
 #: the vote line's tail with vote_collect = auto: how many collect chunks the packs put to the voters carried
@@ -168,24 +166,17 @@ def build_ini(dest: Path, local: configparser.ConfigParser, base_ini: Path, mode
     for key in ("base_url", "api_key", "model"):
         cfg["gate1_llm"][key] = rd[key]
     cfg["gate1"]["presence_llm_profile"] = "gate1_llm"
-    # one hung request must not hold a variant for the 40 minutes agents.ini allows a Coder (the first live
-    # run sat 35 minutes on a connection that never answered): the reader gives up and retries after this
-    # this bounds one attempt; [gate1] presence_deadline_sec of the base ini bounds one whole check (its retries
-    # included: 61 attempts of 240 s held one candidate for about 4 h)
+    # One hung request gives up after the reader timeout and retries; presence_deadline_sec bounds the whole check.
     cfg["loop"]["timeout_seconds"] = str(reader_timeout)
     cfg["gate1"]["claim_vote"] = mode
     cfg["gate1"]["vote_accept"] = accept
     cfg["gate1"]["vote_confirm"] = "off" if "veto" in opts else "on"
     cfg["gate1"]["vote_skip_tests"] = "on" if "notests" in opts else "off"
-    # CC-13: +collect hands the judges the artifact of --collect-from. vote_collect = auto puts it in the
-    # voters' packs; use_in_auto = true gives the single reader the same model it gets in --auto, so the
-    # variant measures the pipeline as --auto runs it, not a leaner one.
+    # CC-13: +collect gives the judges the artifact, and the single reader the same model as --auto.
     cfg["gate1"]["vote_collect"] = "auto" if "collect" in opts else "off"
     cfg["collect"]["use_in_auto"] = "true" if "collect" in opts else "false"
     if "collect" in opts and collect_skip is not None:
-        # the artifact's own [collect] skip_dirs (what its manifest recorded beyond the defaults): with the base
-        # ini's list instead, the judges' freshness test compares two lists, calls the artifact stale, and the
-        # reader goes without it (the README builds it with contest-out, rounds, claim-check-out)
+        # The artifact keeps its own [collect] skip_dirs, so its freshness test compares like with like (CC-13).
         cfg["collect"]["skip_dirs"] = collect_skip
     if voters:
         for v in voters:
@@ -267,17 +258,13 @@ def check_collect(artifact_dir: Path, work: Path, config: "configparser.ConfigPa
         return problem
     walk = _cp.ConfigParser(interpolation=None)
     if config is not None:
-        # raw: the walk needs the skip lists and the languages, not the keys, and a key with a `%` in it
-        # would stop the check with an interpolation error the run itself never meets
+        # The walk reads only the skip lists and languages, and raw keys avoid interpolation errors (CC-13).
         walk.read_dict({name: dict(config.items(name, raw=True)) for name in config.sections()})
     if not walk.has_section("collect"):
         walk.add_section("collect")
     walk["collect"]["skip_dirs"] = extra
     try:
-        # the manifest's own paths plus whatever the walk finds now: a manifest built with `[collect]
-        # languages = python,java` lists files a python-only walk does not, so without the union every
-        # .java file is "the manifest has it and the clone does not". `hash_tree` drops the paths that are
-        # gone, which is how a deletion reaches the diff as `removed`.
+        # The paths are the manifest's plus the current walk, so a deletion shows as removed (CC-13).
         paths = sorted(man.file_hashes.keys() | {m.path for m in scan_repo(work, config=walk)})
         current = mf.hash_tree(work, paths)
     except OSError as exc:
@@ -395,8 +382,7 @@ def read_report(text: str, titles: dict) -> dict:
             res["votes_skipped"] = int(k.group(1))
     c = COLLECT_LINE.search(text)
     if c:
-        # the state word alone (`stale`), and why in its own field: "stale (2 modules changed)" in `collect`
-        # was never `stale` to the summary, which then called a run that had the model NO COLLECT
+        # The state word is read alone; the reason is kept in its own field, so stale is still stale (CC-13).
         head, _, detail = c.group(1).partition(" (")
         res["collect"], res["collect_reader"], res["collect_pack"] = head, c.group(2), c.group(3)
         if detail:
@@ -420,8 +406,7 @@ def run_variant(out: Path, name: str, known: Path, repo: Path, sha: str, base_in
               collect_skip=collect_skip)
     prepare_target(vdir / "target", repo, sha, known / "plan.json")
     if collect_from is not None and "collect" in opts:
-        # CC-13: the artifact was checked against this sha before any variant ran (--collect-from),
-        # and the clone is the same tree, so the copy is what the judges read.
+        # The artifact is checked against the sha before any variant runs (CC-13).
         install_collect(collect_from, vdir / "target", ini)
     started = time.time()
     timed_out = False
@@ -476,11 +461,7 @@ def _collect_cell(r: dict) -> str:
 
 
 def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> tuple:
-    # every baseline run that ran, of the variant's own kind: a variant is compared with each, so the verdict
-    # does not depend on which of the noisy `off` runs came first (PASS against 14, FAIL against 10). CC-13: a
-    # `+collect` variant against the baselines that had the model (the reader with it, the vote off), the others
-    # against the ones without — against a reader without the model, the reader's own change was counted as the
-    # vote's. A `+collect` baseline that never had the model is no baseline of either kind.
+    # Every baseline run is compared, so the verdict does not depend on which run came first (CC-13).
     def bases_of(kind: bool) -> list:
         return [r for r in results if r["variant"].startswith("off") and r["ok"] and _is_collect(r) == kind
                 and (not kind or _had_collect(r))]
@@ -526,8 +507,7 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
                 best_tr = min(len(x["true_bugs_rejected"]) for x in scs)
                 third = math.ceil(r.get("checked", len(ids)) / 3)
                 veto = "veto" in r.get("opts", [])
-                # a veto-only vote decides little by design, so no third is asked of it — but one that never
-                # vetoed did nothing, and "not worse than off" was a PASS for an inert switch
+                # A veto-only vote decides little; a voter that never vetoed did nothing.
                 decided = r.get("votes_decided", 0)
                 enough = decided >= 1 if veto else decided >= third
                 ok = (len(sc["false_positives_through"]) <= best_fp and len(sc["true_bugs_rejected"]) <= best_tr
@@ -538,9 +518,7 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
                     "FAIL (needs fp<=%s, true rejected<=%s, decided>=%d)" % (n_off, n_off, 1 if veto else third)
                 if unresolved:
                     verdict += f" — on {len(ids) - len(unresolved)} of {len(ids)} candidates, {len(unresolved)} unresolved"
-        # CC-13: a `+collect` variant is a measurement of the judges WITH the collect model; one whose run did not
-        # have it (absent, stale, the reader or the vote pack without it) is a different measurement and must
-        # not be credited with a PASS or blamed with a FAIL
+        # A +collect variant is measured only when its run had the model; otherwise it is neither PASS nor FAIL.
         col = _collect_cell(r)
         if kind and not _had_collect(r):
             verdict = (f"NO COLLECT (the run says collect: {r.get('collect') or 'no line'}"
@@ -558,8 +536,7 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
         if len(offs) < 2:
             continue
         a, b = offs[0], offs[1]
-        # on the candidates both judged, as the verdicts count them: one the reader could not judge in either
-        # run was a false positive of the other run here (kept and FALSE), and a flip
+        # A candidate both runs could not judge is not a false positive of either run.
         both_out = set(a.get("inconclusive") or ()) | set(b.get("inconclusive") or ())
         flips = sorted((set(a["removed"]) ^ set(b["removed"])) - both_out)
         lines += ["", f"Noise of the baseline{' with the collect model' if kind else ''}: `{a['variant']}` and "
@@ -571,8 +548,7 @@ def summary(out: Path, results: list, ids: list, truth: dict, titles: dict) -> t
                       + f". A difference between a vote variant and `{a['variant']}` smaller than that is not a result."]
     without, with_ = bases_of(False), bases_of(True)
     if without and with_:
-        # CC-13's first half of the pass rule, the reader alone: Gate 1 with the vote off, with the model and without,
-        # counted on the candidates every one of those runs judged
+        # The reader-alone pass rule counts the candidates that every one of those runs judged (CC-13).
         skip = unresolved_of[False] | unresolved_of[True]
         fp = lambda rs: sorted(len(score(x, ids, truth, skip=skip)["false_positives_through"]) for x in rs)  # noqa: E731
         tr = lambda rs: sorted(len(score(x, ids, truth, skip=skip)["true_bugs_rejected"]) for x in rs)  # noqa: E731
@@ -616,10 +592,7 @@ def main(argv=None) -> int:
     known = Path(args.known)
     sets = parse_sets(args.sets)
     off_runs = args.off_runs if args.off_runs is not None else ini_off_runs(ROOT / "contest.ini")
-    # CC-13: whenever a variant opts in, the baselines run twice over — `off…` without the model and `off…+collect`
-    # with it (the reader reads it, the vote is off) — and each variant is judged against its own kind. The
-    # baselines used to be renamed `off+collect` with nothing in them: a `+collect` variant (its reader with the
-    # model) was judged against a reader without it, and the reader's own change was counted as the vote's.
+    # Baselines run with and without the model, and each variant is judged against its own kind (CC-13).
     any_collect = any("collect" in opts for _, _, opts in sets)
     plain = [("off" if i == 0 else f"off-{i + 1}", [], "all", ()) for i in range(max(1, off_runs))]
     variants = plain + ([(name + "+collect", [], "all", ("collect",)) for name, *_ in plain] if any_collect else [])
@@ -633,8 +606,7 @@ def main(argv=None) -> int:
     plan = json.loads((known / "plan.json").read_text(encoding="utf-8"))
     ids = [t["id"] for t in plan["tasks"]]
     titles = {t["id"]: t["title"] for t in plan["tasks"]}
-    # Gate 1's "kept, presence unknown" line names a candidate by its title: two of one title could not be told
-    # apart, and a run marked both unresolved when one was
+    # Two candidates with one title cannot be told apart, so both are marked unresolved.
     twins = sorted(t for t, n in Counter(titles.values()).items() if n > 1)
     if twins:
         print(f"{known / 'plan.json'}: candidates share a title ({twins[0]!r}): the run's log names a candidate "
@@ -666,9 +638,7 @@ def main(argv=None) -> int:
         return 2
     collect_skip = None
     if args.collect_from:
-        # the artifact is what every +collect variant reads; a wrong one is a wrong table, so it is
-        # checked against a throwaway clone of the target before a single variant starts — and read there
-        # with the ini a +collect variant gets, the way the judges read it
+        # The artifact is checked against a throwaway clone of the target before any variant starts (CC-13).
         collect_skip, problem = collect_skip_dirs(Path(args.collect_from))
         if not problem:
             scratch = out / ".collect-check"
@@ -690,8 +660,7 @@ def main(argv=None) -> int:
         if "--out" not in cmd and "--resume" not in cmd:
             cmd += ["--out", str(out)]
         with open(out / "nohup.out", "a") as fh:
-            # the child runs where this one was started: its relative --local-ini / --known / --out were
-            # checked and printed against this directory, and cwd=ROOT read them from another one
+            # The child runs in the directory the relative paths were checked against.
             subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
                              cwd=os.getcwd())
         print(f"started in the background.\n  progress: {out}/progress.log\n  answer:   {out}/SUMMARY.md (when progress.log says DONE)")
@@ -729,8 +698,7 @@ def main(argv=None) -> int:
         summary(out, results, ids, truth, titles)      # a partial SUMMARY.md after every variant
     verdicts = summary(out, results, ids, truth, titles)
     bad = [v for v, x in verdicts.items() if x.startswith("FAIL")]
-    # an `on` variant with no verdict (no answers recorded, no baseline) is not a pass: 0 said "every on variant
-    # passed" when none had been judged
+    # An on variant with no verdict is not a pass.
     undecided = [v for v, x in verdicts.items() if not v.startswith("off") and x not in ("ERROR",)
                  and not x.startswith(("PASS", "FAIL"))]
     log(out, "verdicts: " + "; ".join(f"{k} = {v}" for k, v in verdicts.items()))

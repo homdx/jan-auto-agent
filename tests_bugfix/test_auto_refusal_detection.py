@@ -39,9 +39,7 @@ from tools.auto.inner_loop import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_coder() -> Coder:
     import configparser
@@ -86,9 +84,7 @@ _TASK = {
     "cited_locations": [{"file": "mod.py", "symbol": "foo", "line_start": 1}],
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. InnerLoop retry behaviour on coder failure
-# ─────────────────────────────────────────────────────────────────────────────
+# 1. InnerLoop retry on coder failure
 
 class TestInnerLoopRetry:
     """A coder failure must keep looping up to max_attempts (no special-casing)."""
@@ -137,9 +133,7 @@ class TestInnerLoopRetry:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 3. Validator empty-response and refusal guards
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestValidatorEmptyGuard:
     """LLMGate2Validator.approve must surface clear errors for empty / refused responses."""

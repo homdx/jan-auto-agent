@@ -36,24 +36,15 @@ from typing import List, Optional, Set
 
 from tools.collect.model import FunctionRecord
 
-#: tree-sitter-java node types that introduce a new named type — the
-#: Java analogue of Python's `ast.ClassDef`, just four-way instead of
-#: one-way (class vs. interface vs. enum vs. record all matter to the
-#: JIRA AC, unlike Python where `class` is the only keyword).
+#: tree-sitter-java node types that declare a type (class, interface, enum, record).
 _TYPE_DECL_TYPES = frozenset(
     {"class_declaration", "interface_declaration", "enum_declaration", "record_declaration"}
 )
 
-#: A method or constructor — Java's `ast.FunctionDef` analogue. Both are
-#: recorded as symbols; only the signature rendering differs (a
-#: constructor has no return type to show).
+#: Method or constructor declaration nodes; the signature rendering differs (no return type on constructors).
 _METHOD_DECL_TYPES = frozenset({"method_declaration", "constructor_declaration"})
 
-#: The three explicit Java access-level keywords `_access_modifier` looks
-#: for among a declaration's `modifiers` children. Anything else in that
-#: node (`static`, `final`, `abstract`, `sealed`, `non-sealed`,
-#: `synchronized`, an `@Annotation`, ...) isn't an access level and is
-#: ignored for this purpose.
+#: The access keywords _access_modifier looks for; other modifiers are not access levels.
 _ACCESS_KEYWORDS = frozenset({"public", "private", "protected"})
 
 _KEYWORD_FOR_DECL_TYPE = {
@@ -65,17 +56,7 @@ _KEYWORD_FOR_DECL_TYPE = {
 
 
 def _text(node) -> str:
-    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): callers pass
-    # `node.child_by_field_name("name")` results straight through, and
-    # tree-sitter returns None when a grammar node is missing the
-    # requested field — a malformed parse, or simply a future grammar
-    # version adding/renaming fields. `None.text` raised an unguarded
-    # AttributeError deep inside symbol extraction, which (per
-    # scan_java_module's own contract) should degrade to a recorded
-    # parse_error, never crash the caller. Returning "" here lets every
-    # existing call site's `_text(...)` degrade gracefully — a symbol with
-    # an unrecognised name is simply an unnamed one, same handling this
-    # module already gives to other "not present in this grammar" cases.
+    # A missing grammar field yields "" instead of an AttributeError, so the symbol is unnamed and extraction continues.
     if node is None:
         return ""
     return node.text.decode("utf-8", errors="replace")
@@ -203,10 +184,7 @@ def _method_name(node) -> str:
     name_node = node.child_by_field_name("name")
     if name_node is not None:
         return _text(name_node)
-    # A constructor_declaration's "name" field is present in every
-    # tree-sitter-java grammar version this project has tested against,
-    # but degrade to the enclosing class's own name rather than crash if
-    # a future grammar update ever changes that.
+    # A constructor without a name field is reported as <init> rather than crashing.
     return "<init>"
 
 
@@ -228,10 +206,7 @@ def _walk_type_body(
             _record_method_decl(
                 child, module_path, containing_qualname, symbols, default_access=member_default_access
             )
-        # Anything else at this level (field_declaration, a plain block,
-        # comments, enum_constant, ...) isn't a symbol COLLECT-26 tracks —
-        # left alone, not recursed into (a field initializer's anonymous
-        # class body, like a Python closure's body, is out of scope).
+        # Other members (fields, blocks, comments) are not tracked and are not recursed into.
 
 
 def _record_type_decl(
@@ -283,10 +258,7 @@ def _record_type_decl(
     )
     body = node.child_by_field_name("body")
     if body is not None:
-        # JLS §9.4: an interface member with no explicit access keyword
-        # is implicitly public, unlike a class member (implicitly
-        # package-private) — the one place this recursion needs to know
-        # what kind of type it's inside, not just walk uniformly.
+        # JLS 9.4: interface members are implicitly public; class members are package-private.
         member_default = "public" if node.type == "interface_declaration" else "package-private"
         _walk_type_body(body, module_path, qualname, symbols, member_default_access=member_default)
 

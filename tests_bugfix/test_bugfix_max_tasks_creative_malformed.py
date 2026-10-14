@@ -160,8 +160,7 @@ class TestNonCreativeModeUnaffected:
             }
             for i in range(3)
         ]
-        # Malformed max_tasks_creative must not even be consulted (and must
-        # certainly not crash) when task_mode != "creative".
+        # A malformed max_tasks_creative is never read outside creative mode, so it cannot crash.
         cands = reviewer._parse_candidates(
             json.dumps(items), "support", [f"file_{i}.py" for i in range(3)]
         )

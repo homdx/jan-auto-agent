@@ -197,8 +197,7 @@ def test_gates_md_empty_input_says_none():
 
 def test_test_map_md_lists_zero_coverage_from_mini_repo():
     ctx = _mini_repo_context()
-    # collect_mini_repo has no tests/ directory of its own, so every module
-    # is on the zero-list — a known, checkable property of this fixture.
+    # collect_mini_repo has no tests/ dir, so every module is zero-coverage.
     assert set(ctx["zero_coverage"]) == {m.path for m in ctx["modules"]}
     md = render_test_map(ctx["test_map"], zero_coverage=ctx["zero_coverage"], thin_coverage=ctx["thin_coverage"])
     for path in ctx["zero_coverage"]:
@@ -209,8 +208,7 @@ def test_test_map_md_lists_zero_coverage_from_mini_repo():
 
 
 def test_risk_index_md_preserves_input_order_without_resorting():
-    # Deliberately NOT alphabetical / NOT score order, to prove the
-    # renderer doesn't quietly re-sort behind risk.compute_risk_index's back.
+    # Input order is kept: the renderer must not re-sort behind risk.compute_risk_index.
     entries = [
         RiskEntry(path="pkg/z.py", loc=5, blast_radius=0, unguarded_count=0, undocumented_fail_open_count=0, zero_coverage=False, score=5),
         RiskEntry(path="pkg/a.py", loc=500, blast_radius=9, unguarded_count=3, undocumented_fail_open_count=2, zero_coverage=True, score=999),

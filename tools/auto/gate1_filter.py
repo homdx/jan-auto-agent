@@ -152,9 +152,7 @@ _SYSTEM_PROMPTS: dict[str, str] = {
     "creative": _SYSTEM_PROMPT_CREATIVE,
 }
 
-# {instruction} — the candidate's instruction (problem description)
-# {location}    — human-readable location string
-# {code_block}  — the actual code at the cited location
+# Placeholders of the user prompt template: instruction, location and code block.
 _USER_PROMPT_TMPL = """\
 Claimed problem: {instruction}
 
@@ -183,16 +181,12 @@ substring from the code block above, or "" if rejecting>", \
 "reason": "<one sentence explaining your decision>"}}
 """
 
-# _MAX_CONTEXT_LINES and _MAX_BLOCK_CHARS are now read from [gate1] in
-# agents.ini (max_context_lines / max_block_chars).
-# These defaults apply only when the keys are absent from the config.
+# Context-size defaults, used only when [gate1] lacks max_context_lines and max_block_chars.
 _DEFAULT_MAX_CONTEXT_LINES = 60
 _DEFAULT_MAX_BLOCK_CHARS   = 4000
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Result types
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class FilterResult:
@@ -246,9 +240,7 @@ class FilterResult:
         return "" if self.accepted else self.reason
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Gate1Filter
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Gate1Filter(_llm_stream.LLMClientBase):
     """Runs the two-stage Gate 1 filter over a list of :class:`CandidateTask`.
@@ -269,47 +261,15 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         Whether to verify the server's TLS certificate.
     """
 
-    # Max extra nudge-retries when the presence-check verdict comes back
-    # unparseable (bad JSON / missing "verdict" field), before failing
-    # closed on the task. Previously hardcoded to a single retry, then 5.
-    # AUTO-RETRY-TEMP-1: with _UNPARSEABLE_TEMPERATURES having 2 entries,
-    # 6 is deliberately an even multiple of that — every token tier the
-    # ladder reaches gets BOTH temperatures tried (0.0 then 0.1) before
-    # escalating further, including the last one; an odd max would leave
-    # the final tier's second temperature untried.
+    # Retries for an unparseable presence verdict: six, an even number so each token tier tries both temperatures (AUTO-RETRY-TEMP-1).
     _UNPARSEABLE_MAX_RETRIES = 6
 
-    # Empty raw='' responses on retry are usually a thinking model (e.g.
-    # qwen3) burning its whole max_tokens budget on <think> and never
-    # reaching the JSON answer. Each token TIER doubles the budget so
-    # there's real headroom left after the thinking trace.
-    #
-    # The floor and ceiling are NOT derived from self._max_tokens: a
-    # small configured max_tokens (e.g. 512) is exactly the thing causing
-    # the truncation, so multiplying it stays small too (512 -> 768 ->
-    # 1024 -> ... was observed live and never escaped the failure). The
-    # ceiling instead tracks self._num_ctx (the model's actual context
-    # profile — e.g. 128k), since that's the real budget available.
+    # Token budget floor and ceiling for empty replies: not from max_tokens (the small value causing the cut); the ceiling tracks num_ctx.
     _UNPARSEABLE_TOKENS_FLOOR = 4096
     _UNPARSEABLE_TOKENS_STEP_MULT = 2.0
     _UNPARSEABLE_TOKENS_DEFAULT_CEILING = 32768
     _UNPARSEABLE_TOKENS_CTX_FRACTION = 0.5
-    # AUTO-RETRY-TEMP-1: fixed, ABSOLUTE temperatures tried at EACH token
-    # tier before escalating to the next tier — deliberately NOT computed
-    # relative to the configured base temperature (subtracting a step
-    # from an already-0.0 base is a no-op forever, which is exactly the
-    # bug this replaces: confirmed live, a [gate1_llm] temperature=0.0
-    # profile produced byte-for-byte IDENTICAL broken JSON on every one
-    # of 5 retries, because at temp=0.0 the model is deterministic and
-    # more max_tokens alone doesn't change tokens the model already
-    # committed to earlier in the same greedy decode — only a genuinely
-    # different sampling temperature can escape a deterministic dead end
-    # like a repeated escaping mistake). Retry-recovery mode uses its own
-    # low, fixed schedule regardless of what temperature the happy path
-    # was configured with. Each token tier is tried once at EVERY value
-    # in this tuple, in order, before the tier doubles — e.g. with the
-    # default (0.0, 0.1) and 5 total attempts: (4096, 0.0), (4096, 0.1),
-    # (8192, 0.0), (8192, 0.1), (16384, 0.0).
+    # Fixed absolute temperatures per token tier, not relative to the base (which would stay at 0.0); see AUTO-RETRY-TEMP-1.
     _UNPARSEABLE_TEMPERATURES = (0.0, 0.1)
 
     def __init__(
@@ -325,16 +285,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
     ) -> None:
         super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
         self._task_mode  = task_mode
-        # GATE1-CTX-1/-2: tools.auto.collect_bridge.CollectBridge or None.
-        # Feeds two additive grounding notes (collect contracts, existing
-        # test coverage) in _build_grounding_notes — see that method.
+        # The collect bridge (optional) adds contract and coverage notes to the grounding (GATE1-CTX).
         self._collect_bridge = collect_bridge
 
         sec = "gate1"
-        # Bugfix (config-crash audit): unguarded — one malformed
-        # [gate1]/[loop] value crashed Gate1 construction outright. Wrapped
-        # per-call, not via a helper, so extract_config_reads still sees
-        # each literal call.
+        # Config reads are guarded per call (config-crash audit): one malformed value falls back instead of crashing.
         try:
             self._temperature = float(config.get(sec, "temperature", fallback="0.0"))
         except ValueError as exc:
@@ -345,14 +300,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] max_tokens is malformed (%s) — using default 512", sec, exc)
             self._max_tokens = 512
-        # GATE1-LEARN-1: remember which max_tokens budget produced a
-        # parseable verdict and START the next candidate there. Without
-        # this every candidate re-climbed the unparseable ladder from the
-        # configured max_tokens (512 -> 4096 -> 4096 -> 8192 -> 8192 ->
-        # 16384) — 5-6 calls per ticket on a model that consistently needs
-        # the same budget. The start is the MEDIAN of the last
-        # unparseable_learn_window successes, so one outlier cannot pin
-        # every later candidate to a 16k budget.
+        # Learn the budget that worked: the next candidate starts at the median of recent successes (GATE1-LEARN-1).
         try:
             self._unparseable_learn = config.getboolean(sec, "unparseable_learn", fallback=True)
         except ValueError as exc:
@@ -364,23 +312,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] unparseable_learn_window is malformed (%s) — using default 8", sec, exc)
             self._unparseable_learn_window = 8
-        # GATE1-LEARN-2 (field report, log-test.txt: 33 candidates, 63 calls,
-        # 3.5 h — a thinking model that answers in 6-60 s when it answers,
-        # and returns an EMPTY reply after burning the whole budget (~300 s
-        # at 32k, ~650 s at 64k) when it does not; the ladder then repeated
-        # the initial call's exact settings, doubled a budget that was not
-        # the problem, and twice asked for more than the provider allows
-        # (HTTP 400)). Three opt-in knobs, all defaulting to the old
-        # behaviour:
-        #   unparseable_retry_mode = strict|fast — fast never repeats the
-        #     (max_tokens, temperature) pair the initial call already used,
-        #     and an EMPTY reply does not raise the token tier (an empty
-        #     reply is exhaustion, not truncation) — only the temperature
-        #     changes; the ladder still climbs after a non-empty garbled
-        #     reply. strict = the full ladder, every step, wait for raw.
-        #   unparseable_max_tokens_cap = 0|N — hard ceiling on any re-ask
-        #     budget (provider limit, e.g. 65536); 0 = num_ctx ceiling only.
-        #   unparseable_max_retries = N — ladder length (was fixed at 6).
+        # Opt-in retry knobs, defaults keep the old behaviour: retry mode, a max_tokens cap and the ladder length (GATE1-LEARN-2).
         try:
             _mode = config.get(sec, "unparseable_retry_mode", fallback="strict").strip().lower()
             if _mode not in ("strict", "fast"):
@@ -402,35 +334,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] unparseable_max_retries is malformed (%s) — using default %d", sec, exc, self._UNPARSEABLE_MAX_RETRIES)
             self._unparseable_max_retries = self._UNPARSEABLE_MAX_RETRIES
-        # RUN-9: how many times to re-issue the SAME request (same
-        # max_tokens, same temperature, no nudge) when the reply came back
-        # empty AND the stream metadata says the budget was never spent —
-        # no content chunks, no finish_reason="length", completion_tokens
-        # nowhere near the cap, no reasoning streamed. That is a degraded
-        # provider (HTTP 200 with a role-only chunk, 20-60 s, `429 Server is
-        # busy` on the neighbouring calls), not the exhausted thinking model
-        # GATE1-LEARN-2 was written for; the ladder's nudge ("your previous
-        # reply was not valid JSON") and empty-pin were the wrong answer to
-        # it — one re-ask out of six and the candidate ended UNKNOWN. The
-        # retry is the RUN-5 shape: a technical failure, tried again, outside
-        # the ladder. 0 restores today's behaviour exactly.
+        # Re-issue the same request when an empty reply came from a degraded provider, not an exhausted budget (RUN-9).
         try:
             self._presence_empty_retries = max(0, int(config.get(
                 sec, "presence_empty_retries", fallback="2")))
         except ValueError as exc:
             logger.warning("config [%s] presence_empty_retries is malformed (%s) — using default 2", sec, exc)
             self._presence_empty_retries = 2
-        # RUN-5: what to do with a presence check the provider never
-        # answered. Before this key there were only two outcomes — the
-        # ladder's exit was `return False, reason` whether the model had
-        # examined the code and disagreed or had returned nothing at all
-        # (empty reply, unparseable reply, transport error after every
-        # retry), and both were dropped from the plan exactly like a
-        # genuine rejection. Live runs: 35 % of gate-1 candidates in one
-        # run were in the second group and none of them had been examined.
-        # Default keep — silence is not a verdict; reject = the old
-        # behaviour, for operators who would rather have a small, certain
-        # plan than a large, partly unverified one.
+        # What to do with a presence check the provider never answered: keep, reject or retry (RUN-5).
         try:
             _unknown_policy = config.get(sec, "presence_unknown", fallback="keep").strip().lower()
             if _unknown_policy not in ("keep", "reject"):
@@ -439,56 +350,22 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] presence_unknown is malformed (%s) — using default keep", sec, exc)
             self._presence_unknown_policy = "keep"
-        # (max_tokens that yielded a parseable verdict, newest last), keyed
-        # by presence model — a per-candidate presence_llm_profile can
-        # switch models mid-run and their budgets are not comparable.
+        # Learned budgets are kept per presence model, since budgets from different models are not comparable.
         self._unparseable_samples: dict[str, list[int]] = {}
-        # GATE1-PAR-1: the learned window is shared between presence
-        # workers — one lock around its reads and appends.
+        # GATE1-PAR-1: the learned window is shared by presence workers, so one lock guards it.
         self._learn_lock = threading.Lock()
-        # M4: counters the stage split needs and that no result record
-        # carries. `presence_reask` counts a candidate whose first verdict
-        # was unparseable and whose answer therefore came from the re-ask
-        # ladder (GATE1-LEARN-2); `non_py_requests` counts presence calls
-        # whose `cited_location.file` is not a `.py` — L1's number to drive
-        # to zero. RUN-5 adds `presence_unknown`: a candidate the presence
-        # ladder ended without any verdict from the model (empty reply,
-        # JSON decode failure, transport error after every retry). It is a
-        # counter rather than a column derivable from `all_results` for the
-        # same reason `presence_reask` is — a candidate that was kept as
-        # unknown and then dropped as a duplicate leaves only a `duplicate`
-        # record behind. All three are folded into the `counters` dict
-        # `filter()` fills via `split_gate1_results()`.
-        # `_counter_lock`: presence_workers > 1 increments these from a
-        # thread pool, so `x += 1` needs serialising.
+        # Stage-split counters that no result record carries (reask, non-.py requests, unknown); updated under a lock when workers run in parallel (M4).
         self.presence_reask: int = 0
         self.presence_unknown: int = 0
-        # RUN-9: WHY the empty replies were empty. `presence_empty_transport`
-        # counts candidates whose FIRST reply was empty with no evidence the
-        # budget was spent (the degraded-provider shape — retried, not
-        # nudged); `presence_empty_exhausted` counts ones whose first reply
-        # finished with "length", burned ~all of max_tokens, or streamed
-        # only reasoning (the shape the empty-pin is for). Each candidate
-        # lands in at most one of the two. `presence_nothink_ignored` is per
-        # (base_url, model) per run: the provider streamed reasoning on a
-        # think=false call, so `reasoning.exclude` is not honoured there and
-        # a no-think rung cannot help that model.
+        # Why empty replies were empty: transport (retried) or exhausted budget (empty-pinned); no-think ignored per provider (RUN-9).
         self.presence_empty_transport: int = 0
         self.presence_empty_exhausted: int = 0
         self.presence_nothink_ignored: int = 0
         self.non_py_requests: int = 0
         self._counter_lock = threading.Lock()
-        # RUN-9: (base_url, model) pairs already warned about ignoring
-        # `reasoning.exclude` — one WARNING per pair per run, not one per
-        # candidate, so a fleet of empty replies stays one line.
+        # One warning per (base_url, model) per run, not one per candidate, so a fleet of empty replies stays one line (RUN-9).
         self._nothink_warned: set = set()
-        # GATE1-PAR-1: how many presence checks run at once. 1 (default)
-        # is the pre-existing sequential loop, byte-for-byte. N>1 runs the
-        # Stage-B LLM calls through a thread pool of N workers; each call
-        # still honours 429/Retry-After on its own (tools.llm_stream
-        # AUTO-RATE-1), so an over-eager N degrades to waiting, not to
-        # failing. Results are collected in the original candidate order,
-        # so dedup (Stage C) sees the same sequence as before.
+        # Presence checks run in a thread pool when presence_workers > 1; the default 1 keeps the sequential loop (GATE1-PAR-1).
         try:
             self._presence_workers = max(1, int(config.get(
                 sec, "presence_workers", fallback="1")))
@@ -500,16 +377,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] skip_llm is malformed (%s) — using default False", sec, exc)
             self._skip_llm = False
-        # L1: Stage A0 — a candidate whose cited location the collect model
-        # does not index (an .ini/.md/.yaml the architect was handed
-        # verbatim) costs no presence LLM call. Live: 74 of 834 Stage-B calls
-        # were spent judging non-code files, 23 of them CONFIRMED, so the
-        # stage asks "does the model know this path" and never "is this
-        # extension allowed" (the artifact indexes .py and .java; a language
-        # it learns tomorrow needs no allowlist change here). Code mode only
-        # — docs/creative runs are about the prose the model does not index.
-        # `false` makes Stage A0 a no-op and every candidate reaches Stage B
-        # exactly as before.
+        # Stage A0: a candidate whose cited file the collect model does not index costs no presence call; code mode only (L1).
         try:
             self._skip_llm_for_unindexed = config.getboolean(
                 sec, "skip_llm_for_unindexed", fallback=True)
@@ -519,8 +387,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 sec, exc,
             )
             self._skip_llm_for_unindexed = True
-        # CC-10: three voters with the code and a quote shortcut the single reader when they are
-        # sure. `[gate1] claim_vote = off` (the default) builds nothing: Gate 1 is as it was.
+        # CC-10: three voters with a quote shortcut decide when sure; claim_vote off builds nothing.
         try:
             self._vote = _gate1_vote.build(config)
         except Exception as exc:  # noqa: BLE001 — a wrong vote setting must not stop Gate 1
@@ -531,11 +398,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [loop] timeout_seconds is malformed (%s) — using default 300.0", exc)
             self._timeout = 300.0
-        # R3 (CC-10 layer 2): [loop] timeout_seconds bounds ONE attempt of the reader's request, and
-        # with the [loop] retry budget (60 retries, 10 s apart) a provider that accepts the connection
-        # and never answers held one presence check for 61 x 240 + 600 s, about 4.2 h — the variant's
-        # 3 h limit ran out first. This bounds one presence check of one candidate, every retry and
-        # re-ask of it included (not the Gate 1 run); past it the check is `unknown`. 0 = no bound.
+        # One presence check, with every retry included, is bounded by the presence deadline; past it the check is unknown (CC-10).
         try:
             self._presence_deadline_sec = float(config.get(
                 sec, "presence_deadline_sec", fallback=str(DEFAULT_PRESENCE_DEADLINE_SEC)) or 0)
@@ -547,27 +410,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             logger.warning("config [%s] presence_deadline_sec is malformed (%s) — using default %.0f",
                            sec, exc, DEFAULT_PRESENCE_DEADLINE_SEC)
             self._presence_deadline_sec = DEFAULT_PRESENCE_DEADLINE_SEC
-        # CC-10: one view of each target directory for the run — the anchor index is cached on the
-        # view, and a view built per candidate re-read and re-parsed every file of the tree each time
-        # (5 s a candidate on this repository, 17 minutes at the 200-candidate cap)
+        # One view per target directory per run, so the anchor index is built once and not per candidate (CC-10).
         self._vote_views: dict = {}
         self._vote_views_lock = threading.Lock()
-        # AUTO-RETRY-BACKOFF-1: how many extra attempts (after the first)
-        # a plain LLM-call EXCEPTION (network error, HTTP 4xx/5xx that
-        # bubbled up as an exception — NOT an unparseable-but-received
-        # verdict, which has its own separate _UNPARSEABLE_MAX_RETRIES
-        # escalation above) gets before this candidate fails closed as a
-        # technical failure. Previously hardcoded to a single immediate
-        # retry with no wait at all — real field reports showed brief
-        # provider outages (a few consecutive HTTP 400/5xx) outlasting
-        # that single instant retry, and every candidate hit during the
-        # outage window was marked REJECTED — indistinguishable in
-        # plan.json from a genuine "already fixed" verdict unless someone
-        # manually re-read the run log (see _is_technical_failure and its
-        # use in plan_validator.py, which now excludes exactly these
-        # failures from ever removing a task from plan.json — this retry
-        # budget exists to make hitting that safety net less common in
-        # the first place, not instead of it).
+        # Extra attempts for a plain LLM exception before the candidate fails closed as a technical failure (AUTO-RETRY-BACKOFF-1).
         try:
             self._llm_call_retry_max = max(0, config.getint(
                 sec, "llm_call_retry_max", fallback=3))
@@ -598,14 +444,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 sec, exc, _DEFAULT_MAX_BLOCK_CHARS,
             )
             self._max_block_chars = _DEFAULT_MAX_BLOCK_CHARS
-        # AUTO-FIX: Gate 1's presence check wants a tiny, deterministic JSON
-        # verdict — no reasoning needed in the reply. A thinking model (e.g.
-        # qwen3) wraps its answer in <think>... by default; with a
-        # small max_tokens that reasoning can consume the whole budget and
-        # truncate before any JSON is emitted, so strip_think() discards
-        # everything and every candidate fails closed. Default to disabling
-        # thinking for Gate 1's call (Ollama "think" field); an explicit
-        # [gate1] think = true in agents.ini re-enables it.
+        # The presence verdict is a tiny JSON: reasoning is stripped so a thinking model cannot use up the budget (AUTO-FIX).
         try:
             self._think = config.getboolean(sec, "think", fallback=False)
         except ValueError as exc:
@@ -618,31 +457,13 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [api_%s] num_ctx is malformed (%s) — using default 0", _active, exc)
             self._num_ctx = 0
-        # AUTO-JSONMODE-1: single GLOBAL switch (not per-[gate1]) — read
-        # from [api], same section that already governs `active` above, so
-        # one ini flag covers every LLM call this project makes. Default
-        # false: current best-effort JSON parsing/salvage behaviour is
-        # unchanged unless a user opts in. When true, every call this class
-        # makes asks the endpoint to enforce valid JSON at the engine level
-        # (see build_chat_request's *response_format* parameter); if that
-        # endpoint doesn't support it, request_completion() detects the
-        # HTTP 400, logs a loud warning, and falls back to today's
-        # behaviour for the rest of the run — no action needed here.
+        # JSON mode is one global switch in [api], default off; if the endpoint rejects it, the call falls back for the rest of the run (AUTO-JSONMODE-1).
         try:
             self._response_format = config.getboolean("api", "response_format", fallback=False)
         except ValueError as exc:
             logger.warning("config [api] response_format is malformed (%s) — using default False", exc)
             self._response_format = False
-        # AUTO-THINKDEPTH-1: single GLOBAL switch + depth value, same
-        # pattern as [api] response_format above — off by default, so
-        # existing [gate1] think = true/false on/off behaviour (self._think
-        # above) is completely unaffected unless a user opts in. When on,
-        # a reasoning-depth hint ("low"/"medium"/"high", whatever the
-        # target model recognises) is forwarded alongside think=True; has
-        # no effect at all when self._think is False. If the endpoint
-        # doesn't support the depth value, build_chat_request/
-        # request_completion detect it, log a loud warning, and fall back
-        # to plain think on/off for the rest of the run.
+        # Reasoning depth is one global switch in [api], default off; an endpoint that rejects the value falls back to plain think (AUTO-THINKDEPTH-1).
         try:
             _think_effort_enabled = config.getboolean("api", "think_effort_enabled", fallback=False)
         except ValueError as exc:
@@ -654,8 +475,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             else None
         ) or None
 
-        # ── DM-3: select system prompt based on task_mode + ini overrides ─────
-        # Priority: mode-specific ini key > legacy "system" key > built-in constant.
+        # System prompt by task_mode: mode key, legacy key, then built-in constant (DM-3).
         mode_ini_key = f"system_{task_mode}" if task_mode != "code" else None
         if mode_ini_key and config.has_option(sec, mode_ini_key):
             self._system = config.get(sec, mode_ini_key).strip()
@@ -666,11 +486,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         self._init_presence_provider(config, sec, base_url, api_key, model,
                                       api_format, verify_ssl)
 
-    # GATE1-PROVIDER-2: split out of __init__ (rather than inlined) so the
-    # provider-selection logic — the part with the actual "which section
-    # wins" decisions — has one clear entry/exit point to read and to test
-    # against, instead of being interleaved with the dozen unrelated
-    # [gate1] scalar reads above it.
+    # Presence-provider selection is split out of __init__, so the "which section wins" logic is in one place (GATE1-PROVIDER-2).
     def _init_presence_provider(
         self, config: configparser.ConfigParser, sec: str,
         base_url: str, api_key: str, model: str, api_format: str,
@@ -727,17 +543,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         independent verdict from whatever the shared provider's url+model
         has recorded — no extra wiring needed here for that part.
         """
-        # GATE3-PROFILE-6: the field-by-field resolution (unset -> exact
-        # copy of the shared provider; named section -> required
-        # base_url/api_key/model + optional overrides falling back to
-        # THIS instance's own resolved values, never a hardcoded literal
-        # and never another profile's value) used to be duplicated here
-        # and in resolve_validator_llm_profile below. Both now delegate to
-        # the shared tools.auto.llm_profile.resolve_llm_profile, which
-        # this docstring's two modes describe (that module is the
-        # authoritative source of the field-resolution behaviour; this
-        # method's job is only to translate to/from this class's own
-        # self._presence_* attribute names and its ssl_context caching).
+        # Field resolution is shared with the validator profiles: an unset profile copies the shared provider, a named one overrides it (GATE3-PROFILE-6).
         defaults = LlmSettings(
             base_url=base_url, api_key=api_key, model=model,
             api_format=api_format, verify_ssl=verify_ssl,
@@ -754,13 +560,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         self._presence_api_key         = settings.api_key
         self._presence_model           = settings.model
         self._presence_api_format      = settings.api_format
-        # No profile: reuse this instance's own ssl_context object as-is
-        # (identity, not just an equivalent rebuild) rather than
-        # constructing a fresh one from settings.verify_ssl — some
-        # callers compare `is self._ssl_context` and a freshly built
-        # SSLContext, while behaviourally equivalent, is a different
-        # object. A profile that actually sets its own verify_ssl gets a
-        # context built for its own value, same as before this refactor.
+        # No profile: reuse this instance's ssl_context object as it is, not a rebuilt equivalent.
         self._presence_ssl_context = (
             self._ssl_context if profile_name is None
             else (_llm_stream.make_unverified_context()
@@ -773,17 +573,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         self._presence_response_format = settings.response_format
         self._presence_think_effort    = settings.think_effort
 
-        # AUTO-PRESENCE-LOG-1: field report — a run's presence-check
-        # requests went to a URL that matched neither [api_*] section in
-        # the config the user was looking at, and there was no way to
-        # tell from the log alone whether presence_llm_profile was even
-        # in effect for that run without reverse-engineering it from
-        # request URLs buried in a much larger log. One clear line at
-        # startup removes the guesswork. Logged here (rather than relying
-        # on resolve_llm_profile's own generic log line) so the message
-        # keeps its established "Gate1Filter: presence-check provider"
-        # wording and this logger's name, unchanged for anyone grepping
-        # existing logs or filtering on tools.auto.gate1_filter.
+        # One startup line says which presence provider the run uses, so it need not be reverse-engineered from URLs (AUTO-PRESENCE-LOG-1).
         if profile_name is None:
             logger.info(
                 "Gate1Filter: presence-check provider = %s (%s) — shared "
@@ -838,11 +628,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             Every candidate that was dropped, with the stage and reason logged.
         """
         base_dir = Path(base_dir)
-        # CC-13: one line per run, every variant (the vote off included), that says whether the
-        # collect model was there and who got it — the judges are the single reader and the CC-10
-        # voters, and without it a run's log cannot say what either had.
-        # one read of the artifact per Gate 1 run, not per process: the auto loop refreshes the artifact
-        # between tasks, and a read cached from an earlier run said `absent` for a tree that had one since
+        # One line per run says whether the collect model was present and who got it; the artifact is read once per run, not cached across runs (CC-13).
         _gate1_vote.clear_collect_reads()
         print(self._collect_line(base_dir), flush=True)
         all_results: list[FilterResult] = []
@@ -860,11 +646,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 all_results.append(FilterResult(
                     candidate=c, accepted=False, stage="existence", reason=reason,
                 ))
-                # AUTO-LOG-1: existence has no "the call failed" failure mode
-                # of its own (no LLM, no network) — a rejection here always
-                # means the citation genuinely doesn't resolve (or, with
-                # cluster_files, was hallucinated), which is Gate 1 doing
-                # its job, not an anomaly. INFO, not WARNING.
+                # An existence rejection is Gate 1 doing its job, not an anomaly, so it is logged at info (AUTO-LOG-1).
                 logger.info(
                     "Gate1[existence] REJECTED %r — %s", c.title, reason,
                 )
@@ -874,19 +656,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             f"{len(existence_passed)}/{len(candidates)} candidate(s) passed"
         )
 
-        # ── Stage A0 (L1): a location the collect model does not index costs
-        # no LLM call ──────────────────────────────────────────────────────
-        # The architect is handed config/doc files verbatim (one observed
-        # prompt was 12k chars of agents*.ini), and Stage B would spend one
-        # presence call per candidate judging a claim against a file that is
-        # not code. 23 of the 74 live non-code calls were CONFIRMED — a doc
-        # that contradicts the code is a real finding — so this stage never
-        # rejects non-code outright: it asks the model "do you know this
-        # path" and drops only the genuinely unindexed. Code mode only, and
-        # a new_file citation is exempt (its path does not exist yet by
-        # design). Fail-open at every step: no bridge, an unusable model, a
-        # bridge that raises, or `skip_llm_for_unindexed = false` all leave
-        # every candidate exactly where Stage A put it.
+        # Stage A0: a location the collect model does not index costs no LLM call; code mode only, and new files are exempt (L1).
         if (
             self._skip_llm_for_unindexed
             and self._task_mode == "code"
@@ -900,10 +670,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     continue
                 a0_removed += 1
                 ext = Path(c.cited_location.file).suffix or "no extension"
-                # Recorded through the existing stage="existence" channel so
-                # the split's Stage-A bucket counts it and analyze_logs.py
-                # needs no change; the distinct prefix keeps the two
-                # separable in the log and the trace's per-candidate event.
+                # Recorded under the existence stage with its own prefix, so it is counted and still separable in the log.
                 reason = (
                     f"location is not an indexed source file ({ext}) — the "
                     f"collect model does not index {c.cited_location.file!r}, "
@@ -933,12 +700,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         presence_passed: list[tuple[CandidateTask, str]] = []  # (task, reason)
 
         if self._skip_llm or self._task_mode == "creative":
-            # AUTO-CR-8: Stage B verifies a claimed issue is present in existing
-            # text — an improvement-detector — but for creative GENERATION the
-            # target chapter is new/empty, so "is the issue present?" is
-            # meaningless and would reject every task. Creative quality is
-            # governed downstream by the soft Gate-2 (CR-2) and canon gate
-            # (CR-7) instead, so existence is sufficient here.
+            # Creative generation has no existing text to check, so existence is enough here; Gate 2 and the canon gate judge quality (AUTO-CR-8).
             _why = "LLM skipped" if self._skip_llm else "creative mode — existence only"
             presence_passed = [(c, f"existence check passed ({_why})") for c, _ in existence_passed]
         else:
@@ -970,23 +732,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                             no_answer = verdict == _PRESENCE_UNKNOWN
                             ok, verdict = False, "rejected"
                             reason = voted.reason + ("" if no_answer else f"; single reader: {reason}")
-                # Logged here, at completion, so that with presence_workers
-                # > 1 the verdict lines still appear as soon as each check
-                # finishes rather than after the whole batch.
+                # Logged at completion, so verdict lines appear as each check finishes even with parallel workers.
                 if verdict == _PRESENCE_UNKNOWN:
-                    # RUN-5: the ladder ended with no verdict at all — the
-                    # provider returned nothing, or nothing parseable, or the
-                    # call never came back. WARNING, like any anomaly. Never
-                    # REJECTED: that word is reserved for a model that read
-                    # the code and disagreed, so a log grep for "REJECTED"
-                    # still counts exactly what the model rejected. What the
-                    # candidate does instead is [gate1] presence_unknown.
+                    # No verdict at all is a warning, never REJECTED: that word stays reserved for what the model actually rejected (RUN-5).
                     logger.warning(
                         "Gate1[presence] UNKNOWN %r — %s", c.title, reason,
                     )
                     if self._presence_unknown_policy == "reject":
-                        # Today's behaviour, for operators who would rather
-                        # have a small, certain plan.
+                        # Today's behaviour, for operators who prefer a small, certain plan.
                         return False, reason
                     logger.info(
                         "Gate1[presence] KEPT (presence_unknown = keep) %r — %s",
@@ -994,26 +747,18 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     )
                     return True, reason
                 if ok:
-                    # AUTO-LOG-1: symmetric with REJECTED below — a
-                    # confirmation used to be entirely silent (no log line
-                    # at all), which made "why don't I see the ones that
-                    # passed?" a fair question with no answer. Same level
-                    # (INFO) as a genuine rejection: both are ordinary
-                    # outcomes of the same check.
+                    # A confirmation is logged at info like a rejection, so passing candidates are visible too (AUTO-LOG-1).
                     logger.info(
                         "Gate1[presence] CONFIRMED %r — %s", c.title, reason,
                     )
                 else:
-                    # A model that answered "rejected". `_finish_presence`
-                    # hands any technical failure to the UNKNOWN branch
-                    # above, so no failure can reach this line as a rejection.
+                    # A model's rejection; technical failures never reach this line (see the unknown branch above).
                     logger.info(
                         "Gate1[presence] REJECTED %r — %s", c.title, reason,
                     )
                 return ok, reason
 
-            # GATE1-PAR-1: with presence_workers > 1 the LLM calls overlap;
-            # outcomes are always consumed below in the original order.
+            # With several presence workers the LLM calls overlap, but outcomes are read in order (GATE1-PAR-1).
             outcomes: list[tuple[bool, str] | None] = [None] * n_presence
             llm_slots = [
                 (i, c, block) for i, (c, block) in enumerate(existence_passed, 1)
@@ -1032,23 +777,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
 
             for i, (c, block) in enumerate(existence_passed, 1):
                 if c.cited_location.new_file:
-                    # AUTO-BUG (new_file): same reasoning as AUTO-CR-8 above —
-                    # a file that does not exist yet has no existing content
-                    # to check problem-presence against. "Is this problem
-                    # present in: [nothing]" is meaningless here and would
-                    # incorrectly reject every legitimate new-file task.
+                    # A new file has no existing content, so there is nothing to check its problem against (AUTO-BUG).
                     presence_passed.append(
                         (c, "new file — existence check sufficient"))
                     continue
                 ok, reason = outcomes[i - 1]
                 if ok:
                     if reason.startswith(UNKNOWN_PRESENCE_REASON):
-                        # RUN-5: the reason travels with the task. The plan
-                        # phase keeps only the CandidateTask (the FilterResult
-                        # stays here), so the one field that reaches plan.json
-                        # and the coder prompt is the instruction — a task the
-                        # model never verified says so where the coder reads
-                        # it, instead of looking like every confirmed one.
+                        # The reason travels with the task, so the coder reads that the model never verified it (RUN-5).
                         c.instruction = _with_presence_unknown_note(c.instruction, reason)
                     presence_passed.append((c, reason))
                 else:
@@ -1056,10 +792,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                         candidate=c, accepted=False, stage="presence", reason=reason,
                     ))
 
-        # RUN-5: "confirmed" now covers candidates the presence stage let
-        # through, which under `presence_unknown = keep` includes ones the
-        # model never answered. Say how many those are on the same line, or
-        # the number above silently mixes verified and unverified tasks.
+        # Counts how many confirmed tasks were never verified by the model, so the total is not read as all verified (RUN-5).
         _unknown_kept = sum(
             1 for _, r in presence_passed if r.startswith(UNKNOWN_PRESENCE_REASON)
         )
@@ -1072,24 +805,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             )
         )
 
-        # ── Stage C: deduplication ────────────────────────────────────────────
-        # AUTO-FIX (found via a live run, hello-creative-split/Flow 4):
-        # creative-mode target-fingerprint dedup used to keep whichever
-        # candidate a FIXED cluster review order happened to produce first,
-        # with no regard for which one actually saw the file it targets.
-        # entry_orchestration is always reviewed before support, so when
-        # entry_orchestration's REVIEW OF main.py ALONE proposed a task
-        # targeting CHANGELOG.md — a file it never saw, cited_location=
-        # main.py — and support's LATER review of CHANGELOG.md itself
-        # correctly proposed the real new entry, cited_location=
-        # CHANGELOG.md — the ungrounded one always won the collision purely
-        # by review order, every time this shape of goal comes up. Now: on
-        # a target-fingerprint collision, a later candidate that IS grounded
-        # in its own target file (cited_location.file appears in
-        # target_files) replaces an earlier one that ISN'T, instead of
-        # always losing to it. Does not change dedup on the full
-        # fingerprint (`fp`) — only the creative-only target-fingerprint
-        # path (`tfp`) that this bug lives in.
+        # Stage C dedup: in creative mode a grounded candidate replaces an ungrounded one with the same target (AUTO-FIX).
         accepted: list[CandidateTask] = []
         seen_fingerprints: set[str] = set()
         seen_target_fingerprints: set[str] = set()
@@ -1112,14 +828,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 ):
                     superseded = accepted[target_fp_index[tfp]]
                     accepted[target_fp_index[tfp]] = c
-                    # BUGFIX (audit): the normal accept path below
-                    # (seen_fingerprints.add(fp) at the end of this loop
-                    # body) never runs for this supersede branch, since it
-                    # continues before reaching it — so `c`'s own `fp` was
-                    # never registered. A later candidate with the SAME
-                    # `fp` (but a different `tfp`) then found is_fp_dup
-                    # False and passed through as if `c` had never been
-                    # seen, instead of being caught as a duplicate of it.
+                    # The superseding candidate's full fingerprint is registered too, so a later duplicate is still caught (BUGFIX).
                     seen_fingerprints.add(fp)
                     all_results.append(FilterResult(
                         candidate=superseded, accepted=False, stage="duplicate",
@@ -1159,8 +868,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             print(f"🗳 Gate 1 vote: asked {c['votes_asked']}, decided {c['votes_decided']}, "
                   f"overridden by the reader {c['votes_overridden']}, requests {c['votes_requests']}, "
                   f"skipped {c.get('votes_skipped', 0)}"
-                  # CC-13: "vote pack: used" at the start says the model was handed over; this says how many
-                  # of its facts the voters were actually shown (chunks of kind `collect` in the packs voted on)
+                  # Also says how many collect facts the voters were shown, not only that the pack was used (CC-13).
                   + (f", collect chunks {c.get(_gate1_vote.COUNTER_COLLECT_CHUNKS, 0)}"
                      if getattr(self._vote.cfg, "vote_collect", "off") == "auto" else "")
                   + (f" — stopped: {self._vote.stopped}" if self._vote.stopped else ""))
@@ -1168,10 +876,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             f"✅ Gate 1 done — {len(accepted)} accepted, "
             f"{len(rejected)} rejected ({len([r for r in rejected if r.stage == 'duplicate'])} duplicate(s))\n"
         )
-        # M4: the split is computed here, because `all_results` is the only
-        # place a `FilterResult` for an *accepted* candidate exists — the
-        # return tuple carries rejected results only. A caller that does not
-        # pass `counters` gets exactly the pre-M4 return value.
+        # The stage split is computed from all results; a caller without counters gets the pre-M4 return value (M4).
         if counters is not None:
             try:
                 counters.update(
@@ -1230,17 +935,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except Exception:   # noqa: BLE001 — a read that fails is "not used"
             vote_used = False
         if not state:
-            # neither judge asked for the model: say whether an artifact is on disk, without reading
-            # it (a read is a full scan and hash of the tree, ~14 s here, for a label nobody uses):
-            # `present` = there, not checked; `absent` = never built
+            # Reports whether a collect artifact is on disk, without reading it: a read is a full scan of the tree (label only).
             try:
                 cl = _gate1_vote._collect_loader()
                 state = "present" if cl is not None and cl.artifact_present(base_dir, config=self._config) else "absent"
             except Exception:   # noqa: BLE001
                 state = "absent"
         state = state or "absent"
-        # a version or a skip_dirs list that differs is stale with no file moved: "0 modules changed" named
-        # the one thing that had not happened
+        # A version or skip_dirs change is stale with no file moved, so the line says so (CC-13).
         parts = ([f"{changed} module{'s' if changed != 1 else ''} changed"] if changed else []) + list(causes)
         head = f"stale ({', '.join(parts)})" if state == "stale" and parts else state
         return (f"📦 collect: {head} — reader: {'used' if reader_used else 'not used'}, "
@@ -1286,8 +988,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             return True
         try:
             if not bool(getattr(bridge, "usable", False)):
-                # Stale/absent: no membership question can be asked, so every
-                # candidate reaches Stage B exactly as it did before L1.
+                # A stale or missing learned set asks no membership question, so every candidate reaches Stage B.
                 return True
             path = str(getattr(candidate.cited_location, "file", "") or "")
             if not path:
@@ -1312,11 +1013,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         """
         loc = candidate.cited_location
 
-        # AUTO-BUG: new_file candidates declare that this path does not exist
-        # yet and this task is what creates it — the existence/hallucination
-        # checks below exist to catch citations of content that was never
-        # real, which does not apply here. Still confirm the path resolves
-        # inside base_dir (no ../ escape) and isn't already a directory.
+        # A new_file path is exempt from the existence checks but must still resolve inside base_dir and not be a directory (AUTO-BUG).
         if loc.new_file:
             candidate_path = (base_dir / loc.file).resolve()
             try:
@@ -1325,18 +1022,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 return False, f"new_file path escapes base_dir: {loc.file!r}", ""
             if candidate_path.is_dir():
                 return False, f"new_file path is an existing directory: {loc.file!r}", ""
-            # BUGFIX: new_file's entire premise is "this path does not exist
-            # yet and this task creates it" — that's *why* the checks below
-            # (which exist to catch citations of content that was never
-            # real) are skipped, and why Stage B is handed an empty block
-            # instead of the file's actual content. If the architect (or a
-            # confused/hallucinating model) marks new_file=true for a path
-            # that already exists as a regular file, none of that logic
-            # holds: the coder would still just overwrite target_files
-            # normally, but now with zero visibility into what's already
-            # there — silently clobbering real content instead of raising a
-            # legitimate "already exists" existence failure the way an
-            # ordinary (non-new_file) citation of that same path would.
+            # A new_file path that already exists as a file is rejected, so the coder cannot silently overwrite real content (BUGFIX).
             if candidate_path.is_file():
                 return (
                     False,
@@ -1363,13 +1049,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 )
 
         abs_path = base_dir / loc.file
-        # BUGFIX (audit): no containment check here — the new_file branch
-        # above already confirms candidate_path resolves inside base_dir
-        # (relative_to(base_dir.resolve())), but this normal (non-new_file)
-        # branch reads and returns file content straight from base_dir /
-        # loc.file with no such check. An LLM-generated loc.file like
-        # "../../etc/passwd" reads outside the repo and hands its content
-        # to Stage B as if it were a legitimate cited block.
+        # The normal read is contained in base_dir too, so an escaping cited path cannot leak outside content (BUGFIX).
         try:
             abs_path.resolve().relative_to(base_dir.resolve())
         except ValueError:
@@ -1384,20 +1064,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except OSError as exc:
             return False, f"cannot read {loc.file!r}: {exc}", ""
 
-        # FIX-2 #13: an extensionless file is not a Python file. The old
-        # `or ".py"` default asserted a language the path never claimed, so
-        # Makefile / Dockerfile / Jenkinsfile / .gitignore content was handed
-        # to the AST-based Python strategy. An empty extension is the honest
-        # answer: block_extractor then assumes no language and uses its
-        # language-neutral brace search, and extract_module_docstring returns
-        # "" rather than parsing a non-Python file as Python.
+        # An extensionless file is not treated as Python; its block is read with the language-neutral search (FIX-2 #13).
         file_ext = Path(loc.file).suffix
 
-        # AUTO-CR-8: in docs/creative mode a FILE alone is sufficient grounding,
-        # since small models often hallucinate line_start and the target
-        # chapter may be new/empty, which would make strict line-range
-        # validation wrongly reject every candidate. So treat the citation as
-        # file-only and hand Stage B a head-of-file block (possibly empty).
+        # Docs and creative mode: a file alone counts as grounding, since line numbers are often wrong or missing (AUTO-CR-8).
         if self._task_mode != "code":
             lines = source.splitlines()
             block = "\n".join(lines[: self._max_context_lines])
@@ -1424,8 +1094,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         start = loc.line_start  # may be None in docs/creative mode (file-only citation)
         end   = loc.line_end if loc.line_end is not None else start
 
-        # docs/creative: file-only citation — no symbol, no line range.
-        # Return a truncated head of the file so Stage B still has context.
+        # docs and creative files cite only a file, so a truncated head of it is returned.
         if start is None:
             block = "\n".join(lines[: self._max_context_lines])
             return True, "file-only citation (no line range)", _truncate(block, self._max_block_chars)
@@ -1437,17 +1106,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 "",
             )
         if end < start:
-            # Inverted range (line_end before line_start) would slice to an
-            # empty block yet still be reported as "line range found".  Reject
-            # it as a real existence failure instead.
+            # An inverted line range is handled as an empty range instead of slicing wrongly.
             return (
                 False,
                 f"line_end={end} is before line_start={start}",
                 "",
             )
         if end > total:
-            # Clamp a too-large end rather than reject — a slightly-off end
-            # line is still useful.
+            # A too-large end is clamped rather than rejected, since a slightly-off line is still useful.
             end = total
 
         # Include some context around the cited range, capped to max_context_lines.
@@ -1494,13 +1160,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             source = (base_dir / loc.file).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
-        # FIX-2 #13: an extensionless file is not a Python file. The old
-        # `or ".py"` default asserted a language the path never claimed, so
-        # Makefile / Dockerfile / Jenkinsfile / .gitignore content was handed
-        # to the AST-based Python strategy. An empty extension is the honest
-        # answer: block_extractor then assumes no language and uses its
-        # language-neutral brace search, and extract_module_docstring returns
-        # "" rather than parsing a non-Python file as Python.
+        # An extensionless file is not treated as Python; its docstring is not parsed as Python (FIX-2 #13).
         file_ext = Path(loc.file).suffix
         try:
             return extract_module_docstring(source, file_ext)
@@ -1562,17 +1222,13 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     candidate.instruction, base_dir,
                 )
             except Exception as exc:  # pragma: no cover - defensive, see docstring
-                # AUTO-H2-6, same contract as AUTO-H2-3: best-effort context
-                # enrichment must never take down Stage B over a bug in the
-                # repo-wide search.
+                # Grounding notes are best-effort: a bug in the repo-wide search must not stop Stage B (AUTO-H2-6).
                 logger.warning("Gate1._build_grounding_notes: target_file_context failed (%s) — skipping", exc)
                 tf_note = None
             if tf_note:
                 notes.append(tf_note)
 
-            # AUTO-H2-6b: covers the case tf_note above does not — cited_file
-            # already matches target_files (so tf_note found nothing) but
-            # neither matches what the instruction is actually about.
+            # A second grounding note for an instruction about a symbol outside the cited file (AUTO-H2-6b).
             try:
                 if_note = instruction_file_context(
                     candidate.instruction, loc.file, base_dir,
@@ -1591,9 +1247,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     candidate.cited_location.file, base_dir,
                 )
             except Exception as exc:  # pragma: no cover - defensive, see docstring
-                # AUTO-H2-3 is best-effort context enrichment. A bug in the
-                # repo-wide search must never take down Stage B, which is
-                # the actual check that matters here.
+                # Callee context is best-effort too: Stage B is the check that matters (AUTO-H2-3).
                 logger.warning("Gate1._build_grounding_notes: callee_context failed (%s) — skipping", exc)
                 cc_note = None
             if cc_note:
@@ -1608,9 +1262,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         if contract_note:
             notes.append(contract_note)
 
-        # GATE1-CTX-2: existing test coverage for the cited module, from
-        # collect's test_map — surfaces coverage even when the citation
-        # itself is the SOURCE file, not a test file.
+        # Existing test coverage for the cited module, even when the citation is the source file (GATE1-CTX-2).
         try:
             coverage_note = existing_test_coverage_note(self._collect_bridge, loc.file)
         except Exception as exc:  # noqa: BLE001
@@ -1619,8 +1271,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         if coverage_note:
             notes.append(coverage_note)
 
-        # GATE1-CTX-3: flag a truncated code_block explicitly rather than
-        # relying on the model to notice the in-band "...[truncated]" marker.
+        # A truncated code block is flagged explicitly, not left to the model (GATE1-CTX-3).
         trunc_note = truncation_safety_note(code_block)
         if trunc_note:
             notes.append(trunc_note)
@@ -1776,10 +1427,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         loc = candidate.cited_location
         location_str = _location_str(loc)
 
-        # M4: one gate-1 LLM request is about to go out, and the file it
-        # cites may not be a module at all. L1 drives this to zero and needs
-        # the number to prove it — "gate1 accepted=N rejected=M" cannot say
-        # it.
+        # Counts each presence request that cites a non-module file, so the count can be driven to zero (M4).
         try:
             if not str(getattr(loc, "file", "") or "").endswith(".py"):
                 self._count("non_py_requests")
@@ -1789,8 +1437,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         grounding_notes = self._build_grounding_notes(
             candidate, code_block, module_docstring, base_dir,
         )
-        # [gate1] presence_deadline_sec: the bound on this whole check, every call of it included
-        # (passed only when set, so a transport stub with the old signature still fits)
+        # presence_deadline_sec bounds the whole check; it is passed only when set, for old stubs.
         _deadline = (time.monotonic() + self._presence_deadline_sec
                      if getattr(self, "_presence_deadline_sec", 0) else None)
         _until = {"deadline": _deadline} if _deadline is not None else {}
@@ -1827,10 +1474,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 num_ctx=self._presence_num_ctx, think=_think,
                 response_format=self._presence_response_format,
                 think_effort=self._presence_think_effort,
-                # RUN-9: ask for the trailing usage chunk — it is what lets
-                # an empty reply be classified. A gateway that rejects the
-                # field 400s once, has it stripped for the rest of the run,
-                # and its replies simply carry no token count.
+                # Ask for the trailing usage chunk, which classifies an empty reply; a gateway that rejects it is retried without (RUN-9).
                 stream=True,
             )
             _meta_box: list = []
@@ -1865,27 +1509,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             )
             return cleaned, meta
 
-        # AUTO-RETRY-BACKOFF-1 (field report: agents_128k.ini + kenari.id
-        # returned HTTP 400 "upstream_rejected" for three consecutive
-        # candidates within one second — a provider/config-level outage,
-        # not a judgment that the code was already fixed; a later report
-        # showed the SAME pattern against a different provider ("api.ai")
-        # outlasting a single instant retry). Previously a single
-        # immediate retry with no wait — not enough for an outage that
-        # takes longer than an instant to clear. Each retry after the
-        # first sleeps self._llm_call_retry_wait_sec seconds first, giving
-        # a real window for the provider to recover. Still fail-closed —
-        # returns (False, reason) after all retries are exhausted — but
-        # plan_validator.py's removal logic (AUTO-REMOVE-GUARD-1) now
-        # never lets a technical failure like this one actually delete a
-        # task from plan.json; this retry budget exists to make hitting
-        # that safety net less common in the first place, not instead of
-        # it.
+        # Retry a plain provider exception with a wait, since brief provider outages outlast one instant retry (AUTO-RETRY-BACKOFF-1).
         sleep = _sleep_fn or time.sleep
         last_exc: "Exception | None" = None
         cleaned = ""
-        # GATE1-LEARN-1: the first call goes out at the budget that has
-        # been answering, not at the configured floor that has not.
+        # The first call starts at the budget that has been answering, not the configured floor (GATE1-LEARN-1).
         _learned = self._learned_max_tokens()
         _initial_tokens = (
             self._presence_max_tokens if _learned is None else _learned
@@ -1899,17 +1527,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 len(self._unparseable_samples.get(self._presence_model, ())),
                 self._presence_max_tokens,
             )
-        # RUN-9: an empty reply whose metadata shows no sign the budget was
-        # spent is a transport failure and takes the same road as an
-        # exception — the same request again, after the same wait — not the
-        # ladder's nudge. The two budgets are independent: an exception
-        # during a transport retry still gets its `llm_call_retry_max`
-        # chances (a 404 in the middle of a retry is not a verdict either),
-        # and a transport-empty never consumes the exception budget. `meta`
-        # is the CompletionMeta of the LAST reply, `empty_kind` its
-        # classification (None once a non-empty reply arrived, or when the
-        # transport reported no metadata to classify from);
-        # `first_empty_kind` is what the candidate is counted as.
+        # An empty reply without budget exhaustion is a transport failure: the same request again after a wait, not the nudge (RUN-9).
         meta = None
         empty_kind: "str | None" = None
         first_empty_kind: "str | None" = None
@@ -1961,10 +1579,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     continue
             break
         if last_exc is not None:
-            # NOTE: must keep the exact "LLM call failed:" prefix (see
-            # _is_technical_failure below) so this still logs at WARNING
-            # like any other real anomaly, not INFO like a routine
-            # rejection.
+            # Keep the "LLM call failed:" prefix so this logs as a warning and is recognised as a technical failure (see _is_technical_failure).
             reason = f"LLM call failed: {last_exc} (after {self._llm_call_retry_max} retries)"
             logger.warning("Gate1._check_presence: %s — no verdict obtained", reason)
             tracer.event(
@@ -1972,15 +1587,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 content=f"[ERROR] {last_exc}", model=self._presence_model,
                 params={"candidate": candidate.title},
             )
-            # RUN-5: no verdict was ever received, so this is `unknown`, not a
-            # rejection. reasks=0 — the ladder never ran; the outer call
-            # itself was the thing that failed.
+            # No verdict was received, so the candidate is unknown, not rejected (RUN-5).
             return self._finish_presence(False, reason)
 
         if empty_kind is not None:
-            # RUN-9: the reply never started — say what the stream metadata
-            # said instead of running an empty string through the JSON
-            # decoder for "Expecting value: line 1 column 1".
+            # An empty reply is described by its stream metadata, not run through the JSON decoder (RUN-9).
             confirmed, reason, unparseable = False, _empty_cause(empty_kind), True
         else:
             confirmed, reason, unparseable = self._parse_presence_response(
@@ -1989,17 +1600,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         if not unparseable:
             self._record_parseable_budget(_initial_tokens)
 
-        # AUTO-CR-31-style re-ask: an unparseable verdict (bad JSON, wrong
-        # shape, unrecognised verdict word — as opposed to a genuine
-        # "rejected") is often a thinking-model (e.g. qwen3) truncated
-        # mid-<think> by a small max_tokens, not an actual answer. Retry
-        # with a hard nudge up to _UNPARSEABLE_MAX_RETRIES extra calls
-        # before falling back to fail-closed.
+        # An unparseable verdict is often a thinking model cut off mid-think: retry with a nudge before failing closed (AUTO-CR-31).
         if unparseable:
-            # RUN-9: whether the ladder starts from an EMPTY reply (with a
-            # classification) or from a garbled one — decides the think=off
-            # rung below. Taken here, before the ladder overwrites
-            # `empty_kind` with its own replies' classifications.
+            # Whether the ladder started from an empty reply decides the think-off rung; read before the ladder overwrites it (RUN-9).
             _ladder_entered_empty = empty_kind is not None
             nudge = (
                 "\n\nIMPORTANT: your previous reply was not valid JSON with a "
@@ -2009,20 +1612,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 "reasoning, no markdown fences, no other text."
             )
             last_confirmed, last_reason, last_cleaned = confirmed, reason, cleaned
-            # Ceiling tracks the model's real context profile (num_ctx),
-            # not the (possibly tiny) configured max_tokens — e.g. a
-            # 128k-context profile should be allowed to actually use a
-            # meaningful chunk of that on a stuck retry, not just a few
-            # hundred tokens more than a small default.
+            # The retry ceiling follows the model's real context size, not the configured max_tokens (GATE1-LEARN).
             ctx_ceiling = (
                 int(self._presence_num_ctx * self._UNPARSEABLE_TOKENS_CTX_FRACTION)
                 if self._presence_num_ctx
                 else self._UNPARSEABLE_TOKENS_DEFAULT_CEILING
             )
             _n_temps = len(self._UNPARSEABLE_TEMPERATURES)
-            # GATE1-LEARN-1: the ladder starts at the first tier that is
-            # not below the budget the initial call already had — a
-            # re-ask at 4096 after a learned 16384 failed cannot help.
+            # The learned-budget ladder starts at the first tier not below the budget that already failed (GATE1-LEARN-1).
             _start_tier = 0
             while (
                 self._UNPARSEABLE_TOKENS_FLOOR
@@ -2038,12 +1635,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             _hard_cap = self._unparseable_max_tokens_cap or None
             _initial_temp = float(self._presence_temperature)
             _tried: set = {(int(_initial_tokens), round(_initial_temp, 4))}
-            # GATE1-LEARN-2 (fast): an EMPTY reply pins the tier — the
-            # model spent the whole budget and said nothing, so more
-            # budget is more silence. None = no pin yet.
-            # A pin below the ladder floor is not honoured: a tiny
-            # budget CAN be the reason for an empty reply (a <think>
-            # block truncated before any answer strips to "").
+            # An empty reply pins the tier, since more budget only gives more silence; a pin below the floor is not honoured (GATE1-LEARN-2).
             _pin_floor = self._UNPARSEABLE_TOKENS_FLOOR
             _empty_pin: "int | None" = (
                 _initial_tokens
@@ -2052,11 +1644,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             )
             _made = 0
             for attempt in range(1, _max_retries + 1):
-                # AUTO-RETRY-TEMP-1: 2-D grid — every temperature in
-                # _UNPARSEABLE_TEMPERATURES is tried at the CURRENT token
-                # tier before the tier doubles. tier_index and temp_index
-                # both derive from the same attempt counter, so this
-                # needs no extra state beyond the loop variable itself.
+                # Every temperature is tried at a token tier before the tier doubles, from one attempt counter (AUTO-RETRY-TEMP-1).
                 tier_index = _start_tier + (attempt - 1) // _n_temps
                 temp_index = (attempt - 1) % _n_temps
                 _uncapped_tokens = (
@@ -2083,23 +1671,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                         continue
                     _tried.add(_key)
                 if _capped_by_provider and attempt_tokens == _hard_cap:
-                    # RUN-9: logged here, after the empty-pin clamp and the
-                    # already-tried skip, so the line names the budget that
-                    # is actually about to be sent. Logged before the clamp
-                    # it used to say "max_tokens=131072 capped at 65536" and
-                    # the very next line "max_tokens=32768 already tried".
+                    # Logged after the clamps, so the line names the budget actually sent (RUN-9).
                     logger.info(
                         "Gate1._check_presence [%s]: re-ask max_tokens=%d "
                         "capped at unparseable_max_tokens_cap=%d.",
                         candidate.title, attempt_tokens, _hard_cap,
                     )
                 if attempt_tokens < _uncapped_tokens and attempt_tokens == ctx_ceiling:
-                    # AUTO-CTX-CAP-WARN-1: a stale/small num_ctx silently
-                    # capping escalation below what it should be has
-                    # bitten in the field more than once — this makes
-                    # the cap itself loud and actionable instead of
-                    # something only visible by reverse-engineering the
-                    # token numbers in the log by hand.
+                    # A small num_ctx that silently caps escalation is reported as a warning (AUTO-CTX-CAP-WARN-1).
                     logger.warning(
                         "Gate1._check_presence [%s]: escalation wants "
                         "max_tokens=%d but is capped at %d by "
@@ -2122,9 +1701,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 )
                 try:
                     cleaned_n, meta = _call(
-                        # RUN-9: the nudge ("your previous reply was not valid
-                        # JSON") goes out only after a NON-empty reply. A
-                        # model that said nothing has nothing to correct.
+                        # The "not valid JSON" nudge goes out only after a non-empty reply; a silent model has nothing to correct (RUN-9).
                         user_msg if last_cleaned.strip() == "" else user_msg + nudge,
                         max_tokens=attempt_tokens,
                         temperature=attempt_temp,
@@ -2143,12 +1720,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 )
                 if not unparseable_n:  # this answer was clear — use it
                     self._record_parseable_budget(attempt_tokens)
-                    # M4: this candidate's answer came from the ladder, not
-                    # from the first call. Counted regardless of whether the
-                    # re-ask said confirmed or rejected — what is being
-                    # measured is how the presence stage ended, and
-                    # "the model would not answer at its normal budget" is
-                    # the fact the fail_closed counter alone cannot tell.
+                    # Counts a candidate whose answer came from the ladder, whatever the verdict (M4).
                     self._count("presence_reask")
                     return self._finish_presence(confirmed_n, reason_n, reasks=_made)
                 last_confirmed, last_reason, last_cleaned = confirmed_n, reason_n, cleaned_n
@@ -2156,20 +1728,12 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     _empty_pin = attempt_tokens
                 empty_kind = None
                 if cleaned_n.strip() == "" and meta is not None:
-                    # Every empty reply gets its classification line, the
-                    # ladder's included — at the budget it was made with.
+                    # Every empty reply is classified, including those of the ladder, at its own budget.
                     empty_kind = _classify_empty_reply(meta, attempt_tokens)
                     self._log_empty_reply(candidate.title, empty_kind, meta)
                     last_reason = _empty_cause(empty_kind)
 
-            # RUN-9: the rung today's ladder does not have. When the operator
-            # asked for thinking and the ladder was entered on an EMPTY
-            # reply, one more re-ask with think=False at the pinned budget
-            # and the initial temperature is a real, cheap thing to try
-            # before giving up — the thinking is what ate the budget. Skipped
-            # (and said so, once per candidate) when think is already off:
-            # there is nothing to switch off, and the presence_nothink_ignored
-            # diagnostic above is what says whether "off" even took.
+            # One more re-ask with thinking off at the pinned budget, when the ladder started on an empty reply (RUN-9).
             if (_ladder_entered_empty and _max_retries > 0
                     and self._presence_think is True):
                 _rung_tokens = _empty_pin if _empty_pin is not None else _initial_tokens
@@ -2217,12 +1781,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     candidate.title,
                 )
 
-            # RUN-9: the cause that travels with the candidate names the
-            # shape of the last reply — `empty (transport)`, `empty
-            # (exhausted)`, `garbled` — not the JSON decoder's view of an
-            # empty string. Without stream metadata (nothing to classify
-            # from) the parse reason is kept, so a run against such a
-            # provider reads exactly as before.
+            # The cause names the reply's shape (empty by transport, empty by exhaustion, garbled), not the JSON decoder's view (RUN-9).
             _cause = _reply_cause(last_cleaned, last_reason, empty_kind)
             logger.warning(
                 "Gate1._check_presence [%s]: verdict still unparseable after "
@@ -2304,22 +1863,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            # AUTO-CTRLCHAR-1: field report — the model sometimes pastes a
-            # multi-line docstring straight into a string value (e.g.
-            # "evidence") with a literal newline instead of an escaped
-            # "\n". Strict JSON forbids raw control characters inside
-            # strings, so this is REJECTED here even though it's not a
-            # truncation problem (more max_tokens is a no-op) and not
-            # reliably a sampling problem either (a different temperature
-            # can still copy the exact same substring from the
-            # deterministic source shown to the model, hitting this same
-            # failure again on retry). Retry json.loads with strict=False,
-            # which accepts literal control characters inside strings per
-            # Python's documented relaxation of the JSON spec, before
-            # giving up. This only recovers the *encoding* of characters
-            # that were already going to be in the string — it doesn't
-            # change which keys/values are present, so the AUTO-H3
-            # evidence-substring check below still applies unchanged.
+            # A raw newline inside a JSON string is accepted by a non-strict parse; the evidence check below still applies (AUTO-CTRLCHAR-1).
             try:
                 data = json.loads(stripped, strict=False)
             except json.JSONDecodeError:
@@ -2362,16 +1906,13 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         if verdict == "rejected":
             return False, reason or "LLM found problem absent or already fixed", False
 
-        # Unrecognised verdict → fail closed, but this is a parse failure,
-        # not a genuine rejection — eligible for re-ask.
+        # An unrecognised verdict fails closed as a parse failure, so it may be asked again.
         msg = f"unrecognised verdict {verdict!r} — failing closed"
         logger.warning("Gate1._parse_presence_response [%s]: %s", candidate_title, msg)
         return False, msg, True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience factory (mirrors architect.review_clusters pattern)
-# ─────────────────────────────────────────────────────────────────────────────
+# Convenience factory (as in architect.review_clusters)
 
 def filter_candidates(
     candidates: list[CandidateTask],
@@ -2454,33 +1995,21 @@ def filter_candidates(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
 # RUN-5: three presence outcomes, not two
-# ─────────────────────────────────────────────────────────────────────────────
 
-# The third presence outcome. `_check_presence` returns it as the verdict when
-# the re-ask ladder (or the outer call retry) ends with `_is_technical_failure`
-# true — the provider never gave a verdict at all.
+# Third presence outcome: the provider never gave a verdict (RUN-5).
 _PRESENCE_CONFIRMED = "confirmed"
 _PRESENCE_REJECTED = "rejected"
 _PRESENCE_UNKNOWN = "unknown"
 #: [gate1] presence_deadline_sec when the ini does not set it (R3: half an hour a candidate)
 DEFAULT_PRESENCE_DEADLINE_SEC = 1800.0
 
-# The reason a candidate is accepted with no verdict behind it. Prefix-matched
-# by `gate1_outcome()` (so an acceptance that was never a model verdict is not
-# counted as `presence_confirmed`) and by `_is_technical_failure()` (so
-# plan_validator's AUTO-REMOVE-GUARD-1 still refuses to delete it from
-# plan.json instead of reading "no verdict" as "already fixed").
+# Reason for a candidate accepted with no verdict; it is matched so it is not counted as confirmed and not removed from the plan (RUN-5).
 UNKNOWN_PRESENCE_REASON = "presence unknown — provider gave no verdict"
 
-# RUN-5: the line appended to a kept-unknown candidate's instruction, so the
-# reason reaches plan.json and the coder prompt (the FilterResult never
-# leaves filter()). `_with_presence_unknown_note` appends it once.
+# The note appended to a kept-unknown candidate's instruction, so the reason reaches plan.json and the coder (RUN-5).
 _PRESENCE_UNKNOWN_NOTE_HEAD = "Gate 1 note: "
 
 
@@ -2503,21 +2032,11 @@ def _with_presence_unknown_note(instruction: str, reason: str) -> str:
     )
 
 
-# RUN-9: the two kinds of empty reply, and the cause strings that travel
-# with a candidate that ended without a verdict. A *transport*-empty showed
-# no evidence the budget was spent (no content chunks, no
-# finish_reason="length", completion_tokens nowhere near the cap, no
-# reasoning streamed) — a degraded provider, worth the same request again.
-# An *exhausted*-empty finished with "length", burned ~all of max_tokens, or
-# streamed only reasoning — the budget went somewhere, and more budget is
-# more silence. `garbled` is a non-empty reply that never parsed. All three
-# are prefix-matched by `_is_technical_failure`, so a candidate that ended
-# on one of them is still "no verdict", never a rejection.
+# Empty-reply kinds and their cause strings (transport, exhausted, garbled); all are "no verdict", never a rejection (RUN-9).
 _EMPTY_KIND_TRANSPORT = "transport"
 _EMPTY_KIND_EXHAUSTED = "exhausted"
 _GARBLED_CAUSE = "garbled"
-# completion_tokens at or above this fraction of max_tokens counts as "the
-# budget was spent" even when the provider never sent finish_reason.
+# Completion tokens at this share of max_tokens count as a spent budget, even without finish_reason.
 _EXHAUSTED_TOKEN_FRACTION = 0.9
 
 
@@ -2591,22 +2110,15 @@ def _is_technical_failure(reason: str) -> bool:
         "expected JSON object,",
         "unrecognised verdict ",
         UNKNOWN_PRESENCE_REASON,
-        # RUN-9: the causes an empty / garbled reply ends on (see
-        # `_reply_cause`) — no verdict, never a rejection.
+        # The causes of an empty or garbled reply are logged, and never count as a rejection (RUN-9).
         "empty (",
         _GARBLED_CAUSE,
     ))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # M4: the per-stage split
-# ─────────────────────────────────────────────────────────────────────────────
 
-# The columns `plan_phase` always prints, in order. Every field is always
-# printed — zero when the mode does not produce it — so log parsing stays
-# stable across `unparseable_retry_mode` and across L1 landing. `already_safe`
-# is deliberately NOT here: it is V12's stage and it does not exist in this
-# tree, so a zero column for it would read as "V12 ran and found nothing".
+# Stage-split columns, always printed in this order so log parsing stays stable (M4).
 _GATE1_SPLIT_FIELDS = (
     "existence",
     "presence_confirmed",
@@ -2622,23 +2134,14 @@ _GATE1_SPLIT_FIELDS = (
     "non_py",
 )
 
-# An acceptance whose `reason` starts with one of these was never asked of an
-# LLM — skip_llm, creative mode, or a new file. Not a model verdict, so it
-# belongs in no presence column: counting it as `presence_confirmed` would
-# make the presence number larger than the number of presence calls made.
-# RUN-5 adds `presence_unknown`: a candidate the provider never answered at
-# all, passed through by `[gate1] presence_unknown = keep`. Also not a model
-# verdict, so it is counted only by the `presence_unknown` column (fed from
-# the filter's own counter), never as a confirmation.
+# Acceptance reasons that were never asked of the model; they are not counted as confirmed (M4).
 _NON_MODEL_CONFIRMATIONS = (
     "existence check passed",
     "new file —",
     UNKNOWN_PRESENCE_REASON,
 )
 
-# Returned for a stage this split does not know about. Distinct from `""`
-# (an existence-only acceptance, which is expected and silent): this one is a
-# gap in the split, and `split_gate1_results` warns about it.
+# A stage the split does not know: a gap in the split, which split_gate1_results warns about.
 _UNKNOWN_STAGE = "_unknown_stage"
 
 
@@ -2669,11 +2172,7 @@ def gate1_outcome(stage: str, reason: str, accepted: bool) -> str:
     if reason.startswith(UNKNOWN_PRESENCE_REASON):
         return ""
     if _is_technical_failure(reason):
-        # Empty reply, bad JSON, a call that never came back: the model was
-        # asked and never answered, and the candidate was rejected for the
-        # lack of an answer rather than for the claim. Only reachable now
-        # when `[gate1] presence_unknown = reject` — with the default `keep`
-        # the same outcome is counted in `presence_unknown` instead.
+        # An unanswered presence check is a fail-closed rejection only when the config says reject; by default it is counted as unknown.
         return "presence_fail_closed"
     if accepted and reason.startswith(_NON_MODEL_CONFIRMATIONS):
         return ""
@@ -2823,10 +2322,7 @@ def _truncate(text: str, max_chars: int = _DEFAULT_MAX_BLOCK_CHARS) -> str:
     return text[:max_chars] + f"\n... [truncated — {len(text) - max_chars} more chars]"
 
 
-# AUTO-H3: minimum evidence length before a quote counts as "real". Guards
-# against a model satisfying the letter of the requirement with something
-# trivially present everywhere (a single keyword like "def", a stray
-# punctuation mark) instead of an actual line that supports the verdict.
+# Minimum length of a quote that counts as evidence, so a trivial token cannot satisfy the requirement (AUTO-H3).
 _MIN_EVIDENCE_CHARS = 8
 
 

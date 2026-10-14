@@ -49,8 +49,7 @@ class TestLegacyStreamingStdoutFailureDoesNotRetry:
              patch("builtins.print", side_effect=BrokenPipeError("pipe closed")):
             reply = agent._answer_legacy("question?", [("doc.md", "content")], stream=True)
 
-        # The LLM call must have run exactly once — the print() failure
-        # must not have triggered a retry.
+        # The LLM call runs exactly once: a print() failure must not retry.
         assert call_count == 1
         # The already-obtained reply must still be returned, not discarded.
         assert reply == "the answer"
@@ -108,8 +107,7 @@ class TestLegacyStreamingOnTokenBrokenPipe:
         finally:
             sys.stdout = _real_stdout
 
-        # The LLM call must have run exactly once — the on_token
-        # BrokenPipeError must not have triggered a retry.
+        # The LLM call runs exactly once: BrokenPipeError must not retry.
         assert call_count == 1
         # The already-obtained reply must still be returned, not discarded.
         assert reply == "the answer"

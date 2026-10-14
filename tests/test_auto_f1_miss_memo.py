@@ -32,9 +32,7 @@ import pytest
 from tools.auto.arch_probe import ArchProbe, ProbeOp, ProbeOpTally
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _FakeBridge:
     """Counting double — only `usable`, `pull_symbol` and `module_symbols`
@@ -62,9 +60,7 @@ def _ops(*names: str) -> list[ProbeOp]:
     return [ProbeOp("facts", n) for n in names]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # The memo
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestMissMemo:
 
@@ -175,15 +171,7 @@ class TestMissMemo:
             "a facts miss must not memo-block a module lookup of the same name"
         )
 
-    # ── AUTO-F1 follow-up: scope and the solo-repeat gap ───────────────────
-    #
-    # A run trace showed the memo firing on a `read` miss and rendering
-    # "`tools/auto/inner_loop.py:254-350` is not a symbol in this
-    # repository" — the epic's non-goals rule out `module`/`read`
-    # ("No change to `module` or `read`. They work."), and a path is not
-    # a symbol regardless. The two tests below pin that down: `module`
-    # and `read` misses are never memoised, so a message written for
-    # `facts` can never be attached to either.
+    # Module and read misses are never memoised.
 
     def test_module_misses_are_never_memoised(self) -> None:
         bridge = _FakeBridge({})

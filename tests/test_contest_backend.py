@@ -60,9 +60,7 @@ from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext  # noqa: E
 from tools.contest.roster import ContestConfig  # noqa: E402
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# fakes for the two backends' transports
-# ─────────────────────────────────────────────────────────────────────────────
+# Fakes for the two backends' transports
 
 class AgentPipe:
     """The agent's two pipes as one in-process object, for the backend tests.
@@ -156,9 +154,7 @@ def _decision(event: dict, worktree: Path) -> "tuple":
     return policy.decide(event, ctx), called
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the protocol
-# ─────────────────────────────────────────────────────────────────────────────
+# The protocol
 
 def test_both_backends_satisfy_the_protocol_at_runtime(tmp_path):
     """`@runtime_checkable` means a backend missing a method fails here."""
@@ -194,9 +190,7 @@ def test_contest_backend_error_is_the_runner_s_new_exception():
     assert str(exc) == "no such route"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KiloBackend
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _RecordingClient:
     """A `KiloClient` stand-in: records every call, answers scripted bodies."""
@@ -382,9 +376,7 @@ def test_kilo_backend_aborts_without_raising(monkeypatch, tmp_path):
     assert backend._tap.stopped == 0, "abort is not interrupt: it does not close the stream"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OpenRouterBackend — the mechanics, over an in-process pipe
-# ─────────────────────────────────────────────────────────────────────────────
+# OpenRouterBackend: mechanics over an in-process pipe
 
 def test_openrouter_prompt_writes_the_text_to_the_subprocess_stdin():
     backend, pipe = _agent()
@@ -431,9 +423,7 @@ def test_openrouter_wait_idle_times_out_on_a_silent_agent():
                                on_question=lambda e: None)
     elapsed = time.monotonic() - started
     assert result.status == "timeout"
-    # FL-1 (round 84): the lower bound is the claim (it waited out the 0.3 s
-    # deadline rather than returning early) and only gets safer under load.
-    # The upper bound is a "did not hang" guard, so it is generous.
+    # FL-1 (round 84): the lower bound is the claim (it waited out the deadline); the upper bound is a generous did-not-hang guard.
     assert 0.25 < elapsed < 30.0, elapsed
     assert 0.25 < result.elapsed < 30.0
     backend.close()
@@ -587,9 +577,7 @@ def test_openrouter_needs_a_base_url():
         OpenRouterBackend("sk", "", "/tmp")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the agent loop, for real — a spawned subprocess against the fake endpoint
-# ─────────────────────────────────────────────────────────────────────────────
+# The agent loop for real: a spawned subprocess against the fake endpoint
 
 def test_the_agent_loop_runs_tool_calls_and_asks_about_bash(tmp_path, monkeypatch):
     """One real subprocess over `_kilo_fake.FakeOpenRouter`: the file is written,
@@ -621,8 +609,7 @@ def test_the_agent_loop_runs_tool_calls_and_asks_about_bash(tmp_path, monkeypatc
     assert len(fake.requests) == 3, [record["path"] for record in fake.requests]
     assert fake.requests[0]["authorization"] == "Bearer sk-test"
     assert fake.requests[0]["body"]["model"] == "agnes-2-5-flash:free"
-    # a write is asked about too, with the path in `patterns`; the worktree
-    # decides it mechanically, the gate is never called for either
+    # A write is also asked about, with the path in patterns; the worktree decides both mechanically, with no gate call.
     assert [event["properties"]["permission"] for event in asked] == ["write", "bash"]
     assert asked[0]["properties"]["patterns"] == ["pkg/thing.py"]
     assert asked[1]["properties"]["metadata"]["command"] == "ls pkg"

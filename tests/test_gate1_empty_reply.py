@@ -88,9 +88,7 @@ LOGGER = "tools.auto.gate1_filter"
 NUDGE = "IMPORTANT: your previous reply was not valid JSON"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _config(gate1_over: dict | None = None, *, api_format: str = "openai",
             extra: dict | None = None) -> configparser.ConfigParser:
@@ -238,9 +236,7 @@ def _think_off(p):
     return (p.get("reasoning") or {}).get("exclude") is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Config
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestConfig:
 
@@ -264,9 +260,7 @@ class TestConfig:
         assert re.search(r"^presence_empty_retries\s*=\s*2\b", gate1, re.M)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # The classifier
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestClassifier:
 
@@ -301,9 +295,7 @@ class TestClassifier:
         assert not _is_technical_failure("already handled")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-2 / AC-7 / AC-8: transport-empty
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-2, AC-7, AC-8: transport-empty
 
 class TestTransportEmpty:
 
@@ -433,9 +425,7 @@ class TestTransportEmpty:
         assert len(rejected) == 12 and all(len(v) == 3 for v in prov.calls.values())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Beyond the letter: a failure inside the retry is neither a verdict nor a crash
-# ─────────────────────────────────────────────────────────────────────────────
+# A failure inside the retry is neither a verdict nor a crash
 
 class TestFailureInsideTheRetry:
 
@@ -464,9 +454,7 @@ class TestFailureInsideTheRetry:
         assert rejected["candidate 0"] == "already handled" and len(prov.calls["tools/c0.py"]) == 4
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AC-3: exhausted-empty keeps today's path
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestExhaustedEmpty:
 
@@ -538,9 +526,7 @@ class TestExhaustedEmpty:
         assert rejected == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AC-4: the think=off rung
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestNoThinkRung:
 
@@ -599,9 +585,7 @@ class TestNoThinkRung:
         assert len(prov.calls["tools/c0.py"]) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AC-5: the no-think request is not honoured
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestNoThinkIgnored:
 
@@ -634,9 +618,7 @@ class TestNoThinkIgnored:
         assert counters["presence_nothink_ignored"] == 1 and rejected["candidate 0"] == "already handled"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-4 / point 4: the split line and the wording
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-4 and point 4: the split line and its wording
 
 class TestSplitAndWording:
 
@@ -675,9 +657,7 @@ class TestSplitAndWording:
         assert all(e["params"].get("candidate") == "candidate 0" for e in events if e["kind"] == "llm_request")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AC-9: the cap log names the budget that is sent
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestCapLog:
 
@@ -712,9 +692,7 @@ class TestCapLog:
         assert max(p["max_tokens"] for p in prov.calls["tools/c0.py"]) == 8192
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AC-6: stream_options end to end (real request_completion, fake urlopen)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _sse(*chunks) -> bytes:
     return b"".join(f"data: {json.dumps(c)}\n\n".encode() for c in chunks) + b"data: [DONE]\n\n"

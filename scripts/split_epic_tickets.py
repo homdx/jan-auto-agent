@@ -46,8 +46,7 @@ SOURCES = [
      re.compile(r"^##\s+(L\d+)\s+—\s+(.+?)\s*$", re.M)),
 ]
 
-# The rounds. Each entry is one round: every agent does this ticket, you pick
-# the best, merge it, then the next round starts from the merged tree.
+# Rounds: every agent does the same ticket; you pick the best, merge it, and the next round starts from the merged tree.
 ROUND_ORDER = [
     "L2",                                    # calibration — tiny, one right answer
     "M1",                                    # the baseline. Blocks everything after it.

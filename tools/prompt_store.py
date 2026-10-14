@@ -10,8 +10,7 @@ from tools.config_safe import safe_getint
 
 logger = logging.getLogger(__name__)
 
-# Lazy imports of the hardcoded constants — imported at call time to avoid
-# circular imports if agent modules ever import from prompt_store in the future.
+# Lazy imports of the hardcoded prompts, so a future circular import is avoided.
 def _get_hardcoded(agent_name: str) -> str:
     """Return the module-level hardcoded constant for the given agent."""
     if agent_name in ("validator_agent", "validator"):
@@ -54,17 +53,7 @@ class PromptStore:
         else:
             self.store_path = Path("prompts.json")
 
-        # AUTO-FIX (high-priority audit, DeepSeek-plan finding): max_versions
-        # <= 0 used to reach push() unclamped. push() appends the new entry
-        # THEN evicts down to max_versions, so max_versions=0 emptied the
-        # stack back to zero right after adding to it — the very next line,
-        # `data[agent_name]["current_version"] = stack[-1]["version"]`, then
-        # raised IndexError on the empty list. A concrete, reproducible
-        # crash (not just defense-in-depth), and also inconsistent with the
-        # "0 means no cap" convention this codebase uses elsewhere (e.g.
-        # RunLimits) — here 0 meant "always crash," not "unlimited." Clamp
-        # to a minimum of 1: a version history of at least the newest entry
-        # is the smallest value that keeps push()'s own indexing safe.
+        # max_versions is clamped to at least 1, since push() indexes the newest entry (AUTO-FIX).
         if max_versions is not None:
             self.max_versions = max(1, int(max_versions))
         elif config is not None:
@@ -72,9 +61,7 @@ class PromptStore:
         else:
             self.max_versions = 3
 
-    # ------------------------------------------------------------------ #
-    # Public API                                                           #
-    # ------------------------------------------------------------------ #
+    # Public API
 
     def get_current(self, agent_name: str) -> str:
         """Return the active prompt for agent_name, falling back to hardcoded."""
@@ -147,10 +134,7 @@ class PromptStore:
         entry = data.get(agent_name)
         if not entry or not entry.get("stack"):
             return "hardcoded"
-        # Bugfix: raised KeyError when the stack is non-empty but
-        # current_version is absent (older store format, hand-edited file).
-        # get_current() and get_store_summary() already fall back to the top
-        # of the stack; this site — on main.py's per-turn path — did not.
+        # Falls back to the top of the stack when current_version is missing (bugfix).
         stack = entry["stack"]
         current_version = entry.get("current_version", stack[-1]["version"])
         return f"v{current_version}"
@@ -205,9 +189,7 @@ class PromptStore:
         )
         return True
 
-    # ------------------------------------------------------------------ #
-    # Internal helpers                                                     #
-    # ------------------------------------------------------------------ #
+    # Internal helpers
 
     def _load(self) -> dict:
         """Load the store, or an empty dict if it is missing or unusable.
@@ -264,11 +246,7 @@ class PromptStore:
         """
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         dest  = self.store_path.with_suffix(f".json.corrupt-{stamp}")
-        # Same-second collision guard — see TicketStore._quarantine for the
-        # reasoning and the reproduction. Narrower here than the ticket case
-        # (there is only one store_path, not one per id), but reproducible
-        # the same way: two quarantines of this file within the same
-        # wall-clock second otherwise silently overwrite each other.
+        # A same-second quarantine gets a numbered name, so the files do not overwrite (BUGFIX).
         suffix_n = 0
         while dest.exists():
             suffix_n += 1
@@ -290,14 +268,7 @@ class PromptStore:
 
     def _save(self, data: dict) -> None:
         try:
-            # 0. Ensure the parent directory exists — mirrors
-            # MetricsCollector.record()'s atomic-write helper. Without this,
-            # a configured store_path whose directory doesn't exist yet
-            # (e.g. "state/prompts.json") makes mkstemp raise
-            # FileNotFoundError, which the except below only logs: push()
-            # returns normally, the file is never written, and the very next
-            # get_current() re-reads from disk, finds nothing, and silently
-            # serves the stale/hardcoded prompt as if the push never happened.
+            # Creates the parent directory first, so a missing folder does not silently drop the push (BUGFIX).
             self.store_path.parent.mkdir(parents=True, exist_ok=True)
 
             # 1. Create a temporary file in the same directory as the target
@@ -306,13 +277,7 @@ class PromptStore:
             # 2. Write the JSON data to the temp file
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-                # BUGFIX: flush + fsync before the rename — os.replace alone
-                # only guarantees the RENAME is atomic, not that the bytes
-                # written above are durable. A power loss / kernel panic /
-                # OOM-kill between json.dump and os.replace can otherwise
-                # produce a 0-byte or partially-flushed prompts.json, which
-                # the next run reads back as corrupt and quarantines,
-                # losing all prior A/B tuning history.
+                # Flush and fsync before the rename, so a crash does not leave a partial store (BUGFIX).
                 f.flush()
                 os.fsync(f.fileno())
 
@@ -327,8 +292,5 @@ class PromptStore:
                 except OSError:
                     pass
             logger.error(f"PromptStore failed to write {self.store_path}: {e}")
-            # 5. Re-raise so callers (push/rollback) know the save did not
-            # happen, instead of silently returning as if it succeeded —
-            # without this, the caller believes the new state is durable
-            # while the store still holds the stale/previous data on disk.
+            # Re-raise a failed save, so the caller does not think the new state is durable (BUGFIX).
             raise RuntimeError(f"PromptStore failed to write {self.store_path}") from e

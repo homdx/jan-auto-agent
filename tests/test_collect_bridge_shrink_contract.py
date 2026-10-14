@@ -27,8 +27,7 @@ import logging
 
 from tools.auto.collect_bridge import _SHRINK_SYSTEM_PROMPT, CollectBridge
 
-# A budget large enough that __init__'s max(200, ...) floor never interferes,
-# and a raw string comfortably larger than it.
+# Budget above __init__'s 200-char floor, with a raw string larger than it.
 _BUDGET = 400
 _RAW = "R" * 800
 _TRUNC_NOTICE = "chars truncated by CollectBridge"
@@ -199,8 +198,7 @@ def test_hard_truncation_never_exceeds_budget_reported_repro():
 
 
 def test_hard_truncation_never_exceeds_budget_across_budgets_and_lengths():
-    # __init__ floors max_context_chars at 200, so budgets below that are not
-    # reachable — start at the floor itself.
+    # __init__ floors max_context_chars at 200; budgets below that are unreachable.
     for budget in (200, 400, 999, 1000, 9999, 10000):
         for raw_len in (budget + 1, budget + 40, budget * 3, budget * 50):
             bridge = CollectBridge(None, max_context_chars=budget, summarizer_call=None)

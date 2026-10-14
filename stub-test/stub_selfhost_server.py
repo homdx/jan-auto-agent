@@ -93,8 +93,7 @@ def build_reply(system: str, user: str) -> str:
         return reply
 
     if "You are a code-change validator" in system:
-        # Судим ТОЛЬКО по exit-коду текущего прогона; слова "failed" из
-        # истории фидбека прошлых попыток не должны заражать вердикт.
+        # Judge ONLY by the current run's exit code; "failed" words from earlier feedback history must not contaminate the verdict.
         failed = bool(re.search(r"exit\s+code:\s*[1-9]", user))
         verdict = ({"approved": False,
                     "feedback": "human_duration tests failed.",

@@ -131,8 +131,7 @@ class TestReasoningFieldFallback:
         # First request had the field; retried request must not.
         assert "reasoning" in handler_cls.received_bodies[0]
         assert "reasoning" not in handler_cls.received_bodies[1]
-        # This is a payload-shape fix, not a rate limit — no sleep, no
-        # error_retries budget spent.
+        # A payload-shape fix, not a rate limit: no sleep and no error_retries spent.
         sleep.assert_not_called()
 
     def test_fallback_does_not_consume_error_retries_budget(self):

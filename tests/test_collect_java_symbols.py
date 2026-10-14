@@ -75,8 +75,7 @@ def test_sealed_interface_records_permits_clause():
 
 
 def test_interface_abstract_method_is_implicitly_public():
-    # JLS 9.4: an interface member with no explicit keyword is public, not
-    # package-private the way a class member would be.
+    # JLS 9.4: interface members without a keyword are public.
     m = _modules()["com/example/Shape.java"]
     syms = _symbols(m)
     area = syms["Shape.area"]

@@ -73,9 +73,7 @@ def test_add_profiles_works_through_a_commented_config(kilo, tmp_path, capsys):
     assert "https://api.acme.invalid/v1" in text
 
 
-# From the Sonnet 5.5 entry of round 210, on this solution's contract: an unreadable
-# config is one `ValueError` line (``ask`` records it as the voter's error), never a
-# `SystemExit` raised inside a voter's worker thread.
+# An unreadable config is one ValueError line (recorded as the voter's error), never SystemExit in a worker thread.
 SONNET_CONFIG = """{
   // a whole-line comment
   "provider": {

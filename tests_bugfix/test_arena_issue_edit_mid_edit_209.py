@@ -49,15 +49,10 @@ HEADER = """**Status:** {status}
 
 """
 
-#: This project's own root — injected into every `$EDITOR` script's
-#: `sys.path` so it can reuse `tools.arena.gitref.commit_file_on` to build the
-#: competing commit the same way arena itself would.
+#: Project root, put on each $EDITOR script's sys.path to reuse commit_file_on.
 PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
 
-# A competing commit, built the same way `_commit_plumbed` builds one: read
-# the ref's current text for `COMPETE_CFG["rel"]`, append its "marker", commit
-# it onto `COMPETE_CFG["ref"]` — then make our own edit to the temp file ($1),
-# appending `COMPETE_CFG["append"]`.
+# Competing commit, built as _commit_plumbed does; then the editor's own edit appends a marker.
 COMPETE_THEN_EDIT = """#!/bin/sh
 python3 - "$1" <<'PY'
 import json, os, sys
@@ -80,8 +75,7 @@ tmp_path.write_text(tmp_path.read_text(encoding="utf-8") + cfg["append"], encodi
 PY
 """
 
-# Edits the temp file only — no competing commit — for the "an untouched
-# branch is still edited fine" sanity checks.
+# Edits the temp file only, with no competing commit (sanity checks).
 APPEND = """#!/bin/sh
 python3 - "$1" <<'PY'
 import os, sys
@@ -184,10 +178,7 @@ def test_checked_out_edit_refuses_when_the_same_ticket_changed_mid_edit(repo, tm
     assert "git log -3 --oneline arena" in hints[0]
     assert any("kept here" in h for h in hints)
     assert any("edit" in h and str(NN) in h for h in hints)
-    # the competing change is still there — nothing was lost. The working
-    # tree itself never saw it (the competing commit landed by plumbing,
-    # which never touches the index or worktree of a checked-out branch),
-    # but the branch's own tree — what a push or the next read sees — has it.
+    # The competing change survives; the branch's own tree (what a push or next read sees) has it.
     assert _git(repo, "log", "-1", "--format=%s") == "competing change"
     assert "-- race --" in _on_ref(repo, "arena", NN)
     kept = [h for h in hints if "kept here" in h][0]

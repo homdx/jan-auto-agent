@@ -51,9 +51,7 @@ REFUSED_AT = 98_777
 LIMIT = {"context": 98_777, "input": 79_021, "output": 8_192}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _git(cwd, *args, check=True) -> str:
     out = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True,
@@ -158,9 +156,7 @@ def _install_tap(monkeypatch, cls) -> None:
     monkeypatch.setattr(kilo_client, "EventTap", cls)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# A1. a failing start inside the reconnect never leaves a dead tap
-# ─────────────────────────────────────────────────────────────────────────────
+# A1: a failing start inside the reconnect never leaves a dead tap
 
 def test_a1_one_failing_start_still_leaves_a_working_tap_or_a_backend_error(tmp_path, live,
                                                                              monkeypatch):
@@ -258,9 +254,7 @@ def test_a1_runner_a_patch_that_answered_200_is_never_repeated(tmp_path, monkeyp
         "a failed reconnect was reported as a window that never went over"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# A2. interrupt() racing the reconnect leaves no tap thread running
-# ─────────────────────────────────────────────────────────────────────────────
+# A2: interrupt() racing the reconnect leaves no tap thread running
 
 def test_a2_interrupt_mid_reconnect_leaves_no_live_tap(tmp_path, live, monkeypatch):
     repo = _repo(tmp_path / "repo")
@@ -275,8 +269,7 @@ def test_a2_interrupt_mid_reconnect_leaves_no_live_tap(tmp_path, live, monkeypat
             created.append(self)
 
         def start(self):
-            # the barrier: the reconnect's new tap starts only once interrupt()
-            # is on its way, so the swap and the stop overlap
+            # The reconnect's new tap starts only once interrupt() is on its way.
             interrupting.wait(2.0)
             time.sleep(0.3)
             return super().start()
@@ -305,9 +298,7 @@ def test_a2_interrupt_mid_reconnect_leaves_no_live_tap(tmp_path, live, monkeypat
             assert not thread.is_alive(), "a tap thread outlived the interrupt"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# A3. an injected tap is never rebuilt
-# ─────────────────────────────────────────────────────────────────────────────
+# A3: an injected tap is never rebuilt
 
 class _StubClient:
     def __init__(self) -> None:
@@ -317,8 +308,7 @@ class _StubClient:
         self.limits.append((provider_id, model_id, dict(limit)))
 
     def model_limits(self, provider_id, model_id):
-        # round 153: the backend reads the window back after a push; a stub that
-        # kept the push answers with it
+        # The backend reads the window back after a push; a stub keeps the pushed answer.
         return dict(self.limits[-1][2]) if self.limits else None
 
 
@@ -358,9 +348,7 @@ def test_a3_an_injected_tap_with_events_log_is_never_rebuilt(tmp_path, monkeypat
     assert not tap.stopped
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# A4. a reload that does not end the stream: bounded and logged
-# ─────────────────────────────────────────────────────────────────────────────
+# A4: a reload that does not end the stream is bounded and logged
 
 def test_a4_a_reload_that_keeps_the_stream_is_bounded_and_logged(tmp_path, live, caplog):
     caplog.set_level(logging.DEBUG)
@@ -380,9 +368,7 @@ def test_a4_a_reload_that_keeps_the_stream_is_bounded_and_logged(tmp_path, live,
     assert _tap_alive(one.backend._tap)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# B5. only the two project files block the push
-# ─────────────────────────────────────────────────────────────────────────────
+# B5: only the two project files block the push
 
 def test_b5_a_tracked_rule_file_does_not_block_the_push(tmp_path, live):
     repo = _repo(tmp_path / "repo")
@@ -410,9 +396,7 @@ def test_b5_tracked_kilo_files_names_no_rule_file(tmp_path):
     assert not [p for p in tracked_kilo_files(str(repo)) if "rules" in str(p)]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# B6. git that does not answer fails closed
-# ─────────────────────────────────────────────────────────────────────────────
+# B6: git that does not answer fails closed
 
 def _break_git(monkeypatch, how: str) -> None:
     real = subprocess.run
@@ -452,9 +436,7 @@ def test_b6_git_that_does_not_answer_deletes_nothing(tmp_path, monkeypatch, how)
     assert target.is_file()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# B7. --resume: the stale file is gone before KiloServer.spawn
-# ─────────────────────────────────────────────────────────────────────────────
+# B7: --resume: the stale file is gone before KiloServer.spawn
 
 def test_b7_resume_drops_the_stale_file_before_the_server_spawns(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("CONTEST_GATE_API_KEY", "unset-for-the-test")
@@ -485,9 +467,7 @@ def test_b7_resume_drops_the_stale_file_before_the_server_spawns(tmp_path, monke
     holder: list = []
 
     def spawn(binary, *, log_path, **kwargs):
-        # the intake's throwaway offer-check server (`_offer_server`, a
-        # `kilo-offer-*` temp log) opens no workspace; the round's server is
-        # the one that must find the workspace clean
+        # The intake's throwaway offer-check server opens no workspace; only the round's server must find it clean.
         if "kilo-offer-" not in Path(log_path).name:
             seen.append(stale.exists())
         return KiloServer.attach(holder[-1].url)
@@ -501,9 +481,7 @@ def test_b7_resume_drops_the_stale_file_before_the_server_spawns(tmp_path, monke
     assert seen[0] is False, "the stale project file was still there at spawn"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# B8. an agent-authored project file survives to the harvest
-# ─────────────────────────────────────────────────────────────────────────────
+# B8: an agent-authored project file survives to the harvest
 
 AGENT_FILE = '{\n  // the agent\'s own\n  "permission": {"bash": "ask"}\n}\n'
 
@@ -536,9 +514,7 @@ def test_b8_an_agent_file_survives_a_run_that_pushed(tmp_path):
     assert target.is_file() and target.read_text(encoding="utf-8") == AGENT_FILE
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# B9. a push from a linked worktree leaves the main exclude alone
-# ─────────────────────────────────────────────────────────────────────────────
+# B9: a push from a linked worktree leaves the main exclude alone
 
 def _common_exclude(repo: Path) -> Path:
     return repo / ".git" / "info" / "exclude"
@@ -558,9 +534,7 @@ def test_b9_a_worktree_push_leaves_the_main_exclude_byte_identical(tmp_path, liv
     assert _git(main, "status", "--porcelain") == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# regressions: what 147–149 already did keeps working
-# ─────────────────────────────────────────────────────────────────────────────
+# Regressions: behaviour from 147-149 still holds
 
 def test_r_the_written_project_file_stays_out_of_git_status(tmp_path, live):
     repo = _repo(tmp_path / "repo")
@@ -617,11 +591,7 @@ def test_r_a_runner_pushed_file_is_gone_after_the_run(tmp_path):
     assert written and not written[0].exists()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# B10/B11. the project file stays out of the diff next to what Kilo itself writes
-# (live, 7.6.2: Kilo writes its own `.kilo/.gitignore`, no project names in it,
-# into a `.kilo/` that has none, and never rewrites one)
-# ─────────────────────────────────────────────────────────────────────────────
+# B10/B11: the project file stays out of the diff next to what Kilo writes (its own .kilo/.gitignore).
 
 KILO_OWN_GITIGNORE = ("node_modules\npackage.json\npackage-lock.json\npnpm-lock.yaml\n"
                       "bun.lock\nyarn.lock\n.gitignore\nagent-manager.json")

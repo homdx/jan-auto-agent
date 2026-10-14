@@ -165,9 +165,7 @@ def test_minimum_form_empty_full_returns_empty():
     assert _minimum_form("public_symbols", fn, "") == ""
 
 
-# -- _fit_pack_to_budget tests ------------------------------------------------
-# Use simple string-based renderers that accept a single `remaining`
-# argument (mirroring the _allowing wrapper used by build_collect_context_block).
+# String renderers that accept one `remaining` argument, like _allowing.
 
 
 def _make_renderer(full: str, floor: str):
@@ -268,8 +266,7 @@ def test_fit_pack_pass_2_drops_trailing_rows_when_floors_exceed_budget():
         name: _minimum_form(name, renderers[name], form)
         for name, form in full.items()
     }
-    # callers floor cost is 30, head is 6: budget 36 fits head + callers
-    # floor but not head + callers + calls_into floor (6+30+22=58).
+    # Budget 36 fits head plus callers' floor, but not calls_into's too.
     budget = head_len + sum(_row_cost(f) for f in floors.values()) // 2
     result = _fit_pack_to_budget(renderers, full, head_len, budget)
     kept = [name for name, form in result.items() if form]

@@ -49,8 +49,7 @@ def test_creative_mode_uses_editor_persona():
 
 
 def test_dependency_and_convention_rules_present():
-    # Rules 10/11 ride on the shared contract, so they must reach code and docs
-    # modes; creative is prose-native and deliberately carries neither.
+    # Rules 10/11 reach code and docs modes; creative carries neither.
     for mode in ("code", "docs"):
         s = _coder(mode)._system
         assert "third-party dependency" in s, f"rule 10 missing for mode={mode!r}"
@@ -59,9 +58,7 @@ def test_dependency_and_convention_rules_present():
 
 
 def test_json_contract_preserved_across_modes():
-    # The JSON contract must survive for code and docs modes.
-    # Creative mode deliberately uses a prose-native protocol (AUTO-CR-1) and
-    # does NOT carry the JSON contract.
+    # JSON contract holds for code and docs; creative uses prose (AUTO-CR-1).
     for mode in ("code", "docs"):
         s = _coder(mode)._system
         assert '"files"' in s, f"JSON contract missing for mode={mode!r}"

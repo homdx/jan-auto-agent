@@ -123,18 +123,12 @@ def test_build_call_edges_skips_ambiguous_java_method_names(tmp_path):
     )
     modules = scan_repo(tmp_path, config=_java_enabled_config())
     edges = build_call_edges(tmp_path, modules)
-    # `run` is declared by both One and Two -> ambiguous, not attributed
-    # to either, rather than guessed (same principle as the Python
-    # `test_build_call_edges_skips_ambiguous_symbol_names`).
+    # Ambiguous method names are not attributed to either class.
     assert edges["pkg/Caller.java"] == frozenset()
 
 
 def test_mini_repo_overloaded_area_method_is_not_misattributed():
-    # The real mini-repo fixture already has two classes (Circle, Square,
-    # both in Shape.java) that each declare an `area()` method — the
-    # overload-heavy case the COLLECT-29 AC names explicitly. No other
-    # file in the fixture calls `area()` unqualified, so this mainly
-    # pins "no crash, no edge fabricated out of an ambiguous name."
+    # Overloaded area() in two classes: no crash, and no edge from an ambiguous name.
     modules = scan_repo(FIXTURE_ROOT, config=_java_enabled_config())
     edges = build_call_edges(FIXTURE_ROOT, modules)
     for path, targets in edges.items():
@@ -200,8 +194,7 @@ def test_build_call_edges_skips_java_file_with_has_error(tmp_path):
         "    }\n"
         "}\n",
     )
-    # Re-parse in build_call_edges must skip the has_error tree, not
-    # extract doThing from the recovered tree and create a false edge.
+    # Re-parse skips error trees instead of inventing a doThing edge.
     edges = build_call_edges(tmp_path, modules)
     assert edges.get("pkg/Caller.java", frozenset()) == frozenset(), (
         "has_error Java file must not produce call edges — "

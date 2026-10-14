@@ -38,9 +38,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.auto.coder import Coder
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _check(content: str) -> tuple[bool, str]:
     """Thin wrapper so tests don't repeat the class name."""
@@ -75,9 +73,7 @@ def _write(
                               allowed_paths=allowed, skipped_out=skipped_out)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Unit — _check_content_safety
-# ─────────────────────────────────────────────────────────────────────────────
+# Unit: _check_content_safety
 
 class TestCheckContentSafety:
 
@@ -248,9 +244,7 @@ class TestCheckContentSafety:
         assert reason == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bug-2 regression — false positives and single-quote bypass (open root write)
-# ─────────────────────────────────────────────────────────────────────────────
+# Regression: false positives and single-quote bypass in open-root writes
 
 class TestBug2FalsePositives:
     """Verify that the improved pattern matching no longer fires on legitimate
@@ -327,9 +321,7 @@ class TestBug2FalsePositives:
         assert safe is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Integration — _write_files honours the content guard
-# ─────────────────────────────────────────────────────────────────────────────
+# Integration: _write_files honours the content guard
 
 class TestWriteFilesContentGuard:
 

@@ -133,8 +133,7 @@ def test_modified_sees_a_rename_with_a_space_in_the_new_name(repo):
     assert tickets._modified(repo) == ["epic-tasks/07-x y.md"]
 
 
-# ── the shared reader: `_dirty_tasks`, `_uncommitted` and `_modified` never
-#    read `status --porcelain` on their own ──────────────────────────────────
+# Shared reader: _dirty_tasks, _uncommitted and _modified never call status --porcelain themselves.
 
 def test_uncommitted_and_modified_share_gitref_status_paths():
     """Pins the fix to one implementation: both call into `gitref.status_paths`

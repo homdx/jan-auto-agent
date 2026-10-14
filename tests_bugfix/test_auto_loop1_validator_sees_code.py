@@ -56,8 +56,7 @@ def _capture_prompt(monkeypatch_target_value):
         captured["user"] = payload["messages"][-1]["content"]
         return monkeypatch_target_value
 
-    # approve() does `from tools.llm_stream import request_completion` at call
-    # time, so patching the module attribute is what takes effect.
+    # approve() imports request_completion at call time, so patch the module attribute.
     return captured, patch("tools.llm_stream.request_completion", side_effect=_fake)
 
 

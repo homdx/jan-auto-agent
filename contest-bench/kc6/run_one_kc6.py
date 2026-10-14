@@ -81,9 +81,7 @@ def write(p: Path, text: str):
     p.write_text(text, encoding="utf-8")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the sandbox: one repo, one worktree per agent
-# ─────────────────────────────────────────────────────────────────────────────
+# The sandbox: one repo, one worktree per agent
 
 class Sandbox:
     def __init__(self, root: Path, agents=("agent-a",)):
@@ -176,9 +174,7 @@ def work_no_test(directory, text):
     work(directory, test=False)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the fake server, with the two knobs the ticket's scenarios need
-# ─────────────────────────────────────────────────────────────────────────────
+# Fake server with the two knobs the scenarios need
 
 def load_fake():
     """`tests/_kilo_fake.py` of the *base* tree — the bench's, not the entry's."""
@@ -256,9 +252,7 @@ def wait_subscribers(fake, n, timeout=5.0):
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# contract helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Contract helpers
 
 def runner():
     import tools.contest.runner as r
@@ -386,9 +380,7 @@ def assert_ready(run, ws, where=""):
           f"{where}commit {run.commit!r} != worktree HEAD {sha[:12]}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# scenarios
-# ─────────────────────────────────────────────────────────────────────────────
+# Scenarios
 
 SCENARIOS = {}
 
@@ -994,8 +986,7 @@ def s25_permissions_do_not_cross_agents(tmp):
     def hook(directory, text):
         work_ready(directory, text)
 
-    # the fake scripts one turn list for every session; agent-b's permission is
-    # rewritten per session below
+    # One turn list for every session; agent-b's permission is rewritten per session below.
     scen = {"turns": [_permission_turn(hook, ["/tmp/*"])]}
     with bench_fake(scen) as fake:
         # agent-b's session gets the outside pattern: patch the permission per session
@@ -1217,9 +1208,7 @@ def s30_stall_with_a_chatty_neighbour(tmp):
     check(aborts[0] - t0 < 4.0, f"agent-a aborted only after {aborts[0] - t0:.1f}s — its silence clock was reset by agent-b's events")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# main
-# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
 
 def main():
     if sys.argv[1] == "--list":

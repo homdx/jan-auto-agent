@@ -46,9 +46,7 @@ from tools.auto.inner_loop import (
 from tools.auto.outer_loop import OuterLoop
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _minimal_config(
     *,
@@ -126,9 +124,7 @@ def _valid_response(files: list[tuple[str, str]] | None = None) -> str:
     return json.dumps({"files": [{"path": p, "content": c} for p, c in files]})
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Small file passthrough
-# ─────────────────────────────────────────────────────────────────────────────
+# 1. Small file passes through unchanged
 
 class TestSmallFilePassthrough:
     """File ≤ max_file_chars → output byte-for-byte identical."""
@@ -171,9 +167,7 @@ class TestSmallFilePassthrough:
         assert result == source
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. Large Python file, cited symbol present
-# ─────────────────────────────────────────────────────────────────────────────
+# 2. Large Python file: the cited symbol is present
 
 class TestLargePythonCitedSymbol:
     """Large valid Python file → cited block always present; total ≤ budget + cited."""
@@ -232,15 +226,11 @@ class TestLargePythonCitedSymbol:
         budget = 300
         chunks = chunk_file(source, ".py", max_chars=budget)
         result = select_relevant_chunks(chunks, "Alpha", budget_chars=budget)
-        # Non-cited chunks that don't fit should be stubbed
-        # (total can exceed budget only because of the cited chunk guarantee)
-        # At minimum, stubs should appear for some symbols
+        # Non-cited chunks that do not fit are stubbed; the total may exceed the budget only through the cited chunk.
         assert "not included" in result or len(result) <= budget * 3
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Large Java / brace-language chunking
-# ─────────────────────────────────────────────────────────────────────────────
+# 3. Large Java and brace-language chunking
 
 class TestLargeJavaBraceChunking:
     """Large .java file with two classes → both detected; cited symbol present."""
@@ -303,9 +293,7 @@ class TestLargeJavaBraceChunking:
         assert isinstance(result, str)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. missing_context in first response → second call made, context_satisfied False
-# ─────────────────────────────────────────────────────────────────────────────
+# 4. missing_context in the first response: a second call, context_satisfied False
 
 class TestMissingContextProbe:
     """When LLM returns missing_context, a second call is made and
@@ -448,9 +436,7 @@ class TestMissingContextProbe:
         assert "SomeHelper" in captured_user_msgs[1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. missing_context absent → one call only, context_satisfied = True
-# ─────────────────────────────────────────────────────────────────────────────
+# 5. No missing_context: one call, context_satisfied True
 
 class TestMissingContextAbsent:
     def test_one_call_when_no_missing_context(self, tmp_path: Path) -> None:
@@ -478,9 +464,7 @@ class TestMissingContextAbsent:
         assert r.context_satisfied is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. Symbol not found by SearchAgent → second call still made, no crash
-# ─────────────────────────────────────────────────────────────────────────────
+# 6. Symbol not found by SearchAgent: the second call still happens, no crash
 
 class TestSymbolNotFoundBySearchAgent:
     def test_second_call_made_even_when_symbol_not_found(self, tmp_path: Path) -> None:
@@ -512,10 +496,7 @@ class TestSymbolNotFoundBySearchAgent:
         ):
             result = coder.generate(task, base_dir)
 
-        # Second call should still have been triggered (dep_ctx may be empty but
-        # the probe still ran). In practice with empty dep_ctx, second call is
-        # skipped — this is correct behaviour per spec: "if dep_ctx:" guard.
-        # The important thing: no exception raised.
+        # With empty dep_ctx the second call is skipped (the dep_ctx guard); the point is that nothing raises.
         assert result is not None
         assert not result.error or result.succeeded
 
@@ -541,9 +522,7 @@ class TestSymbolNotFoundBySearchAgent:
         assert result is not None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. context_probe = false → request_completion called exactly once
-# ─────────────────────────────────────────────────────────────────────────────
+# 7. context_probe off: request_completion is called exactly once
 
 class TestContextProbeDisabled:
     def test_only_one_llm_call_when_probe_disabled(self, tmp_path: Path) -> None:
@@ -594,9 +573,7 @@ class TestContextProbeDisabled:
         mock_fetch.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. Exception in smart path → output contains [truncated —, no exception
-# ─────────────────────────────────────────────────────────────────────────────
+# 8. An exception in the smart path: output has the truncation marker, no exception
 
 class TestSmartPathException:
     def testchunk_file_parse_failure_returns_truncated(self) -> None:
@@ -643,9 +620,7 @@ class TestSmartPathException:
         assert result == "(no content)"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. Reviewer large file → cited symbol in validator prompt, not just first N chars
-# ─────────────────────────────────────────────────────────────────────────────
+# 9. Reviewer on a large file: the cited symbol is in the validator prompt, not just the first N chars
 
 class TestReviewerLargeFile:
     """LLMGate2Validator._read_changed_content uses smart chunking so that
@@ -707,9 +682,7 @@ class TestReviewerLargeFile:
         assert content in result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10. config = None in validator → _search_agent = None, _fetch_needed_flat returns ""
-# ─────────────────────────────────────────────────────────────────────────────
+# 10. config=None in validator: no search agent, and the fetch returns empty
 
 class TestValidatorConfigNone:
     def test_search_agent_none_when_config_none(self) -> None:
@@ -744,9 +717,7 @@ class TestValidatorConfigNone:
         assert "x = 1" in result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 11 & 12. Rewrite gate with context_satisfied flag
-# ─────────────────────────────────────────────────────────────────────────────
+# 11-12: rewrite gate with the context_satisfied flag
 
 @dataclass
 class _FakeCoderResult:
@@ -834,21 +805,13 @@ class TestRewriteGateContextSatisfied:
         state.upsert_task(dict(TASK))
 
         mock_inner = MagicMock()
-        # FL-1 (round 84): state explicitly that this fixture wants no
-        # wall-clock task budget, rather than relying on the
-        # _task_budget_seconds guard to turn an unset MagicMock attribute
-        # into 0. Un-set, a bare MagicMock() coerces via float() to 1.0 (it
-        # implements __float__), which used to install a real 1-second
-        # budget across all rounds nobody asked for and made this test race
-        # its own wall clock to reach the round the rewriter is eligible for.
+        # Set the task budget to 0 explicitly: an unset MagicMock coerces to 1.0 and would race the clock (FL-1).
         mock_inner.max_task_seconds = 0
 
         outer = OuterLoop(
             inner_loop=mock_inner,
             state=state,
-            # A test asserting a rewriter is called must not be spending
-            # its wall clock to get there — give the eligible round
-            # (rewrite_every_n_rounds=2) comfortable headroom.
+            # Give the eligible round (rewrite_every_n_rounds=2) headroom, so the test does not race its own clock.
             max_rounds=8,
             task_rewriter=rewriter,
             rewrite_every_n_rounds=2,

@@ -172,8 +172,7 @@ FN = {"verdict": "FALSE", "unanimous": False}    # the same for FALSE
 US = {"verdict": "UNSURE", "unanimous": False}
 SP = {"verdict": "SPLIT", "unanimous": False}
 STATES = {"UT": UT, "UF": UF, "TN": TN, "FN": FN, "US": US, "SP": SP}
-# rows: base; columns: head  UT        UF        TN         FN         US         SP
-# NEW only when the base side says FALSE (round 285 live: TRUE with a dissenter at base is not new)
+# Rows: base verdict; columns: head verdict.
 MATRIX = {"UT": ("STILL", "FIXED", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR"),
           "UF": ("NEW", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR", "UNCLEAR"),
           "TN": ("UNCLEAR",) * 6,

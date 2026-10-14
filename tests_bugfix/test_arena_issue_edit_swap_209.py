@@ -36,8 +36,7 @@ HEADER = """**Status:** open
 
 """
 
-#: The editor: first the competing change (what a second terminal or a push would do while
-#: the editor stays open), then the operator's own edit.
+#: Editor: a competing change first (as a second terminal or push would), then the operator's edit.
 EDITOR = """#!/bin/sh
 python3 - "$1" <<'PY'
 import os, subprocess, sys

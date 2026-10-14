@@ -102,20 +102,11 @@ __all__ = [
 #: The gate is the expensive second model; it gets one shot per permission.
 GATE_TIMEOUT = 60.0
 
-#: KC-55: a reply that carries neither ``allow`` nor ``reject`` — the empty body
-#: included — is asked once more, after ``GATE_RETRY_WAIT``. ``request_completion``
-#: already retried that call's own transport errors, so this is the one extra
-#: call the gate spends on a body it could not parse; the last attempt's verdict
-#: stands, and a clean verdict is never re-asked.
+#: Gate retries after a reply with no verdict, one extra call (KC-55).
 GATE_RETRIES = 1
 GATE_RETRY_WAIT = 2.0
 
-#: The reply budget of that one extra call: at least this many tokens, and at
-#: least twice the profile's. A reasoning gate model thinks before it writes,
-#: whatever ``think = false`` asks — ``hy3:free`` spent all of a 256-token
-#: budget thinking on every round-46 ask it failed (``finish_reason: length``,
-#: ``content: ""``, replayed live) and answered in ~450 tokens with 1024 — so
-#: the same request with the same budget fails the same way twice.
+#: Token floor for that extra call, since a reasoning model needs room to think before it writes.
 GATE_RETRY_MIN_TOKENS = 2048
 
 
@@ -133,27 +124,16 @@ def _roomier(payload: dict) -> None:
         holder[key] = max(2 * current, GATE_RETRY_MIN_TOKENS)
 
 
-#: KC-55 §5: the probe intake sends the gate once before the round starts — the
-#: same request shape as a real ask, with one attempt and no retries, so a dead
-#: key or a model that is not on offer is refused at intake instead of after 30
-#: minutes of ``gate-failed`` rejects.
+#: Probe the gate once at intake with the real request shape, so a dead key is refused early (KC-55).
 GATE_PROBE_MESSAGE = "permission: probe\ncommand: true"
 
-#: KC-55 §5: intake's probe spends one attempt only — a 429 is transient and is
-#: exactly what the real ask retries, so a probe that burned the budget would
-#: hide the very thing it is there to notice.
+#: The probe makes one attempt only, so a 429 does not use up the probe.
 _GATE_PROBE_RETRIES = 0
 
-#: KC-55 §1: the gate's transport budget. Absent or unreadable values degrade to
-#: these, so a policy built without a roster still fails fast like KC-3's gate.
-#: KC-66: 4 retries of 30 s — 5 tries in all. Three waits of 10 s was a budget
-#: that ran out while a key shared with eight agents was still cooling, so the
-#: action was rejected rather than retried.
+#: Gate transport defaults, used when the roster has no value (KC-55, KC-66).
 _GATE_RETRY_DEFAULTS = (4, 30.0, 60.0, 600.0)
 
-#: KC-66: the minutes one gate decision asks back per two tries. The gate waits
-#: inside `KiloClient.wait_idle`'s loop, so every second of a 429 is the
-#: agent's turn, not the gate's: two tries buy a minute, three or four buy two.
+#: Minutes of agent time given back per gate decision for its own waits (KC-66).
 GATE_TIME_BACK_MIN = 60.0
 
 
@@ -176,19 +156,14 @@ def gate_time_back_sec(tries) -> float:
     return float((count + 1) // 2) * GATE_TIME_BACK_MIN
 
 
-#: The only two replies a Decision may carry. ``Literal`` keeps the type
-#: narrow; ``Decision.__post_init__`` keeps it narrow at run time too.
+#: The only two replies a Decision may carry; __post_init__ enforces it at run time too.
 REPLIES: tuple[str, ...] = ("once", "reject")
-#: ``context`` (KC-69) is the runner's own refusal of an ask made in a session
-#: at or past ``compact_at_percent`` of its size — the policy never returns it.
-#: ``test-cache`` (212) is the runner's answer to a pytest ask it already ran on
-#: the same tree: a reject carrying the earlier result, never the policy's.
+#: Layers a decision can come from; context and test-cache refusals are the runner's, not the policy's (KC-69, 212).
 LAYERS: tuple[str, ...] = (
     "mechanical", "gate", "gate-failed", "budget", "context", "test-cache",
 )
 
-#: A reason is sent to the agent as the tool error and written to
-#: decisions.jsonl — one line, so it stays readable in both places.
+#: A reason goes to the agent and to decisions.jsonl, so it is kept to one line.
 MAX_REASON_CHARS = 200
 
 #: The keys ``Policy.record`` writes, in order, to decisions.jsonl.
@@ -209,22 +184,15 @@ DECISION_KEYS: tuple[str, ...] = (
 #: How much of the gate's reply a gate-failed reason may quote.
 _GATE_FAIL_QUOTE = 80
 
-#: KC-55: the sentence a gate-failed reason ends with after a 429 or a 5xx, for
-#: the agent that is about to read it — the reviewer is overloaded, and a
-#: command inside its own worktree never needed one in the first place.
+#: Hint appended to a gate-failed reason after an overload status (429 or 5xx) (KC-55).
 _GATE_OVERLOAD_HINT = (
     " — the reviewer is overloaded; a command inside your worktree needs no reviewer"
 )
 
-#: KC-55: the status of ``HTTP 429 from https://…``, the RuntimeError
-#: ``request_completion`` raises. The reason names the status only: never the
-#: URL, never the body, never a key.
+#: Matches the HTTP status in a gate error; only the status is kept, never the URL or body (KC-55).
 _GATE_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b")
 
-#: KC-55: the error name of ``TimeoutError calling https://…`` or
-#: ``ValueError reading response body from …`` — ``request_completion`` wraps a
-#: dropped connection or a garbled body in a RuntimeError, so the name comes
-#: out of the text rather than from ``type(exc).__name__``.
+#: Matches the error name in a gate network error, taken from the text (KC-55).
 _GATE_NETWORK_RE = re.compile(r"^(\w+Error) (?:calling|reading)\b")
 
 
@@ -292,9 +260,7 @@ def _gate_failed_reason(name: str, attempts: int, elapsed: float,
     return reason
 
 
-#: The paths no tool call may ever touch, from the ticket's denylist. The
-#: round's other worktrees and the repo's own ``.git`` are added by KC-4
-#: through ``PolicyContext.forbidden``.
+#: Root path, which no tool call may touch.
 _ROOT = Path("/")
 _HOME: "Path | None"
 
@@ -333,12 +299,7 @@ def _hard_denylist() -> tuple:
 
 HARD_DENYLIST: tuple = _hard_denylist()
 
-#: The devices a command writes to or reads from without touching a place
-#: (KC-28): ``2>/dev/null`` is the commonest suffix a model puts on a probe,
-#: and a gate call to ask whether writing nothing to nowhere is safe is a call
-#: the gate can lose. Matched against the token as written and as resolved
-#: (``/dev/stdout`` is a symlink into ``/proc``). Only these four: ``/dev/shm``
-#: and the block devices are places the gate should see.
+#: Device files that are safe to write or read without touching a place (KC-28).
 NULL_DEVICES: frozenset = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
 
 
@@ -390,9 +351,7 @@ cost the machine.
 """
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the two records
-# ─────────────────────────────────────────────────────────────────────────────
+# The two records
 
 @dataclass(frozen=True)
 class PolicyContext:
@@ -436,16 +395,9 @@ class Decision:
     reason: str = ""
     gate_elapsed: "float | None" = None
     gate_raw: "str | None" = None
-    #: KC-55: the transport attempts and re-asks behind this decision — the
-    #: ``_sleep_fn`` calls plus one, since one of those counts the retry budget
-    #: and the other the re-ask of an unparsable reply. ``1`` is today's
-    #: fail-fast gate, and ``record`` then writes no ``gate_attempts`` key, so
-    #: the one-attempt records stay byte-identical.
+    #: Transport attempts and re-asks behind one gate decision; 1 means no gate_attempts key is written (KC-55).
     gate_attempts: int = 1
-    #: KC-66: the seconds this decision asks the turn back for the gate's own
-    #: waits. Derived from ``gate_attempts`` in ``__post_init__`` and never set
-    #: by a caller, so the decision, decisions.jsonl and the turn cannot disagree
-    #: about the number. ``0.0`` for a gate that never waited.
+    #: Seconds the turn gets back for the gate's own waits, derived from gate_attempts (KC-66).
     gate_added_sec: float = 0.0
 
     def __post_init__(self) -> None:
@@ -483,9 +435,7 @@ def gate_worst_case_sec(config: "ContestConfig | None") -> float:
     return float(deadline) + GATE_TIMEOUT
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# reading the event
-# ─────────────────────────────────────────────────────────────────────────────
+# Reading the event
 
 def _as_list(value) -> list:
     """A list or tuple as a list; anything else as ``[]``."""
@@ -502,13 +452,7 @@ def _metadata(props: dict) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
-#: Characters a glob from ``properties.patterns`` may carry and still name a
-#: path. Anything with shell syntax in it is a command: PROBE.md §Facts 2
-#: records that a ``bash: ask`` event carries the command text in
-#: ``patterns`` — and in ``always`` — not a file name. Resolving such a
-#: string would land under the caller's cwd and read as "inside the
-#: worktree", which is exactly backwards, so it is judged by
-#: ``deny_commands`` instead.
+#: Characters that make a glob a command, not a path (PROBE.md §Facts 2).
 _NOT_A_PATH = (" ", "\t", "\n", "|", ">", "<", "&", ";", "`")
 
 
@@ -543,22 +487,10 @@ def _pathlike(text: str) -> bool:
     return False
 
 
-#: The asks whose ``patterns`` name one file, never a command: Kilo's ``edit``
-#: (its write and patch tools ask as ``edit`` too) and ``read``, and the
-#: OpenRouter backend's ``read`` and ``write``. They name the file *relative
-#: to the session's directory* — round 46's asks were ``patterns:
-#: ["AGENTS.md"]`` with the absolute path only in ``metadata.filepath`` — so
-#: ``_pathlike``'s rule for command words would drop every one of them: no
-#: path at all, the "inside the worktree" check never met, and an edit of the
-#: agent's own file went to the gate. There a bare word is a file name.
+#: Asks whose patterns name one file relative to the session directory, never a command.
 _FILE_PERMISSIONS = frozenset({"edit", "read", "write"})
 
-#: Kilo's own configuration inside a worktree: what Kilo marks
-#: ``configProtected`` (``.kilo/``, ``.kilocode/``, ``kilo.json[c]``,
-#: ``opencode.json[c]``) except ``AGENTS.md``, which is this repo's own
-#: document and a file tickets name. An edit of one of these can change what
-#: Kilo lets the agent do — a ``permission`` block in a project ``kilo.json`` —
-#: so it is never settled by geometry: it goes to the gate, as it always has.
+#: Kilo's own config files inside a worktree; an edit of one always goes to the gate.
 _KILO_CONFIG_FILES = frozenset({"kilo.json", "kilo.jsonc", "opencode.json", "opencode.jsonc"})
 _KILO_CONFIG_DIRS = frozenset({".kilo", ".kilocode"})
 
@@ -571,11 +503,7 @@ def _kilo_config(path: Path, worktree: "Path | None") -> bool:
     return parts[-1] in _KILO_CONFIG_FILES or any(part in _KILO_CONFIG_DIRS for part in parts)
 
 
-#: One token of a ``bash`` command: a quoted string kept whole (so
-#: ``"/tmp/my dir/f"`` is one token, not a path and a bare word), else a
-#: maximal run up to whitespace or a shell operator — ``>``, ``>>``, ``<``,
-#: ``|``, ``&&``, ``;``, ``(`` and ``)`` each end a token, so a redirect
-#: target or the second command of a pipeline starts fresh.
+#: One token of a bash command; a quoted string is kept whole.
 _CMD_TOKEN = re.compile(r'"[^"]*"|\'[^\']*\'|[^\s<>|&;()"\']+')
 
 
@@ -616,10 +544,7 @@ def _command_paths(command) -> list:
     return paths
 
 
-#: A shell variable the policy can expand: ``$HOME``/``${HOME}`` and
-#: ``$PWD``/``${PWD}`` are the two spellings the round's agents actually type.
-#: Any other ``$VAR`` is dropped by ``_pathlike`` and, if it names a path
-#: (``$VAR/`` in a token), makes the mechanical layer refuse to decide.
+#: Shell variables the policy expands: $HOME and $PWD only; any other $VAR is refused.
 _KNOWN_SHELL_VARS = ("$HOME", "${HOME}", "$PWD", "${PWD}")
 _UNRESOLVED_VAR_TOKEN_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/")
 
@@ -641,21 +566,15 @@ def _unresolved_var(command) -> bool:
     return False
 
 
-#: The options that name a subset of the tests rather than a directory: a
-#: `-k`/`-m` run is a targeted one whatever else it is given. `=` forms too, so
-#: `-k=foo` reads the same as `-k foo`; 206: and the attached forms `-kfoo` /
-#: `-mslow` (a single-dash token that starts with `-k` or `-m`), and
-#: `--deselect`, which leaves part of the root out.
+#: Options that select a subset of the tests; a -k or -m run is targeted whatever else it has (206).
 _SELECTOR_OPTIONS = frozenset({"-k", "--keywords", "-m", "--markers", "--deselect"})
 _SELECTOR_PREFIXES = ("-k", "-m", "--keywords=", "--markers=", "--deselect=")
 
-#: An option that ends the invocation instead of running anything at all —
-#: `--collect-only` included: it imports the suite in seconds and runs none of it.
+#: Options that end the invocation without running anything, --collect-only included.
 _NO_RUN_OPTIONS = frozenset({"-h", "--help", "-V", "--version", "--co",
                              "--collect-only", "--fixtures", "--markers"})
 
-#: The suffixes of a test *file*: a token that ends in one is a targeted run,
-#: never a whole root.
+#: Suffixes of a test file; a token ending in one is a targeted run, never a whole root.
 _SUITE_FILE_SUFFIXES = (".py",)
 
 
@@ -666,9 +585,7 @@ def _unquote_token(token: str) -> str:
     return token
 
 
-#: The escapes an ANSI-C string (``$'…'``) turns into a single character.
-#: Anything else after the backslash is not an escape the shell defines, and
-#: the reader keeps the backslash as written rather than guess.
+#: ANSI-C escapes that become one character; any other backslash is kept as written.
 _ANSI_C_SIMPLE = {
     "n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v",
     "\\": "\\", "'": "'", '"': '"', "?": "?",
@@ -964,8 +881,7 @@ def _scan(command: str) -> tuple:
                     i += 1
                 continue
             if c == "$" and i + 1 < n and command[i + 1] == "'":
-                # $'…' inside a substitution: \ escapes there, so \' is a quote
-                # character and not the end of the string
+                # Inside a substitution, a backslash escape in $'...' makes the quote a character, not an end.
                 end = _ansi_c_end(command, i)
                 cur.append(command[i:end])
                 i = end
@@ -1012,10 +928,7 @@ def _scan(command: str) -> tuple:
             i += 1
             continue
 
-        # a # that starts a word opens a comment that runs to the end of the
-        # line: nothing in it is a heredoc, a quote or a substitution, so a
-        # <<EOF in a comment declares no heredoc and a ; in it no separator.
-        # A # inside a word (a#b, $#) and a # in a quoted string are data.
+        # A # that starts a word is a comment to the end of the line; a # inside a word is data.
         if c == "#" and word_start:
             while i < n and command[i] != "\n":
                 i += 1
@@ -1069,8 +982,7 @@ def _scan(command: str) -> tuple:
             i += 1
             continue
         if c == "$" and i + 1 < n and command[i + 1] == "'":
-            # $'…' is an ANSI-C string: \ escapes there, so \' is a quote
-            # character and the string runs on to the next bare '
+            # In $'...' a backslash escape keeps the string running past the quote (ANSI-C).
             end = _ansi_c_end(command, i)
             cur.append(command[i:end])
             word_start = False
@@ -1127,8 +1039,7 @@ def _scan(command: str) -> tuple:
                     else:
                         break
                 elif d == "$" and j + 1 < n and command[j + 1] == "'":
-                    # $'…' is a quote too: its body is quote-removed, so the
-                    # delimiter of <<$'EOF' is EOF and the body is data.
+                    # In a heredoc delimiter, $'...' quotes the word, so the body is data.
                     k = _ansi_c_close(command, j)
                     if k < 0:
                         break
@@ -1183,12 +1094,9 @@ def _scan(command: str) -> tuple:
     if in_heredoc:
         # an unterminated heredoc: the rest is still searched, never skipped
         body = command[hd_start:]
-        # quoted or not: an unclosed heredoc is a reader's guess, so its
-        # substitutions are searched (fail closed) — and with quotes blind,
-        # as _scan(body) below is not: an apostrophe there swallows the rest
+        # An unclosed heredoc is searched for substitutions anyway, failing closed (quotes are not trusted here).
         subs.extend(_subs_in_text(body))
-        # a quote in the body is a plain character, so the text is read line by
-        # line: an apostrophe on one line must not swallow the next
+        # The body is read line by line, so an apostrophe does not swallow the next line.
         for line in body.split("\n"):
             more_pieces, more_subs = _scan(line)
             pieces.extend(more_pieces)
@@ -1242,9 +1150,7 @@ def _pytest_argvs(piece: str) -> list:
 #: A shell variable set for one command: `PYTHONPATH=. pytest tests`.
 _ENV_ASSIGN_RE = ENV_ASSIGN_RE
 
-#: Commands that run the rest of their line as the command: the suite behind
-#: them is still the suite. `timeout 1500 python3 -m pytest tests` is how the
-#: agents of rounds 103–105 ran theirs most often.
+#: Wrapper commands that run the rest of their line; the suite behind them is still the suite.
 _WRAPPERS = COMMAND_WRAPPERS
 
 
@@ -1381,17 +1287,9 @@ def _extract_paths(props: dict, base: "Path | None" = None) -> list:
             file_ask and not any(ch in original for ch in _NOT_A_PATH)
         ):
             continue
-        # KC-52 follow-up: ``/*`` strips to the root, not to the empty
-        # string — "" is not absolute, so it was joined to *base* (KC-51)
-        # and ``rm -rf /*`` was judged "inside worktree", auto-approved
-        # before ``deny_commands`` was ever consulted.
+        # "/*" strips to the root, not to the empty string, so rm -rf /* is not auto-approved (KC-52).
         target = original.removesuffix("/*") or "/"
-        # KC-13: the shell expands these before it runs the command, so
-        # ``cat $HOME/.ssh/id_rsa`` is the same ask as ``cat ~/.ssh/id_rsa``
-        # and ``cat $PWD/x`` the same as ``cat ./x``. Each is rewritten to
-        # that spelling rather than run through ``os.path.expandvars``: the
-        # runner's own ``$PWD`` is its checkout, not the agent's worktree, so
-        # ``$PWD/x`` must resolve against *base* the way ``./x`` does (KC-51).
+        # $HOME and $PWD are rewritten to the spelling the policy reads, not expanded (KC-13, KC-51).
         for var in ("${HOME}/", "$HOME/"):
             if target.startswith(var):
                 target = "~/" + target[len(var):]
@@ -1402,15 +1300,13 @@ def _extract_paths(props: dict, base: "Path | None" = None) -> list:
             # ``~/.ssh/x`` must land on the home denylist, not under the cwd
             target = os.path.expanduser(target)
         if base is not None and not Path(target).is_absolute():
-            # KC-51: a relative command token resolves against the worktree,
-            # the directory the command starts in — never the runner's cwd.
+            # A relative command token resolves against the worktree the command starts in (KC-51).
             target = str(Path(base) / target)
         resolved = _resolve(target)
         if resolved is None:
             continue
         if target in NULL_DEVICES or str(resolved) in NULL_DEVICES:
-            # KC-28: a null device is not a place — a command whose only
-            # path is ``/dev/null`` is a no-path ask, settled by layer 1
+            # A null device is not a place, so a command whose only path is /dev/null is settled by layer 1 (KC-28).
             continue
         if resolved not in originals:
             originals[resolved] = []
@@ -1502,10 +1398,7 @@ def _inline_scripts(piece: str) -> list:
     return []
 
 
-#: 205 (31): words that run their argument as the command, for ``deny_commands``
-#: only, mapped to their options that take a separate value. ``COMMAND_WRAPPERS``
-#: is shared with ``is_pytest_command`` and stays as it is: `sudo pytest` is not
-#: a question the suite recogniser has to answer, `sudo git push` is a push.
+#: Words that run their argument as the command, for deny_commands only (205 (31)).
 _DENY_WRAPPERS = {
     "sudo": ("-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "-T", "-R",
              "--user", "--group", "--close-from", "--chdir", "--host", "--prompt",
@@ -1525,22 +1418,14 @@ _DENY_WRAPPERS = {
     "command": (),
 }
 
-#: The wrappers whose first plain argument is theirs, not the command's:
-#: `timeout 9 git push`, `chroot /srv git push`.
+#: Wrappers whose first plain argument is their own, not the command's (timeout 9 git push).
 _DENY_WRAPPER_OPERAND = frozenset({"timeout", "chroot"})
 
-#: 205 (32): shell reserved words that can stand where a command word stands;
-#: the command they lead to is the next word. `fi`, `done` and `}` close a
-#: compound and run nothing — a piece that holds only them is no command.
+#: Shell reserved words that can stand where a command word stands (205 (32)).
 _SHELL_RESERVED = frozenset({"if", "then", "elif", "else", "fi", "do", "done", "while",
                              "until", "time", "!", "{", "}"})
 
-#: 205 (29): `git`'s global options that take the next word as their value.
-#: Every other word starting with `-` before the subcommand is a value-less flag
-#: (`--no-pager`, `-P`, `--bare`, `--git-dir=x`, `--exec-path=x`).
-# `--exec-path` and `--list-cmds` take a value only glued on with `=`: a bare
-# `--exec-path` is a flag of its own, so `git --exec-path push` is still read
-# as a push (the deny side errs towards denying).
+#: git global options that take the next word as their value (205 (29)); others are value-less flags.
 _GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace",
                                 "--config-env", "--super-prefix", "--attr-source"})
 
@@ -1655,8 +1540,7 @@ def _deny_candidates(command: str, _depth: int = 0) -> list:
         if _depth < _MAX_NESTING:
             nested += _inline_scripts(piece)
         tokens = piece.split()
-        # every bare group opener / closer goes, not only the first and last token:
-        # `( ( git push ) )`, `! ( git push )` and `{ { git push; }; }` are a push.
+        # Every bare group opener and closer is removed, not just the first and last token.
         while tokens and not tokens[0].strip("({!"):
             tokens.pop(0)
         while tokens and not tokens[-1].strip(")}"):
@@ -1719,14 +1603,9 @@ def _deny_globs(pattern: str) -> tuple:
     return (pattern, pattern + " *")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the gate's reply
-# ─────────────────────────────────────────────────────────────────────────────
+# The gate's reply
 
-#: The head of a gate object cut off by ``max_tokens``: ``{"verdict":
-#: "allow", "reason": "AGENTS.md is inside the agent's worktree and is`` —
-#: round 46, sensenova-6-7-flash-lite-var1. The verdict is whole, closing
-#: quote and all; only the reason ran out.
+#: Head of a gate object cut off by max_tokens; the verdict is whole, only the reason ran out (round 46).
 _TRUNCATED_VERDICT_RE = re.compile(
     r'^\{\s*"verdict"\s*:\s*"(allow|reject)"\s*(?:,\s*"reason"\s*:\s*"((?:[^"\\]|\\.)*))?',
     re.IGNORECASE,
@@ -1849,9 +1728,7 @@ def _gate_user_message(props: dict, ctx: PolicyContext, tmp_roots: tuple = ()) -
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the policy
-# ─────────────────────────────────────────────────────────────────────────────
+# The policy
 
 class Policy:
     """Decides every ``permission.asked`` event of a contest session.
@@ -2007,8 +1884,7 @@ class Policy:
                     f"deny_commands match: {pattern}",
                 )
             if _unresolved_var(command):
-                # KC-13: a ``$FOO/x`` is not a place the mechanical layer can
-                # see — the gate decides, not the "no path outside" rule.
+                # A $FOO/x path is not a place the mechanical layer can see, so the gate decides (KC-13).
                 return None
 
         if _inside_worktree_or_tmp(pairs, worktree, self._tmp_roots(ctx)):
@@ -2167,8 +2043,7 @@ class Policy:
                     return Decision("reject", "gate",
                                     f"gate: {reason or 'rejected'}", elapsed, text, attempts)
                 if ask < GATE_RETRIES:
-                    # the same request once more, with room to finish; the
-                    # last attempt's verdict stands
+                    # The same request is sent once more, and the last attempt's verdict stands.
                     wait(GATE_RETRY_WAIT)
                     _roomier(payload)
             elapsed = float(self._clock() - start)
@@ -2271,10 +2146,7 @@ class Policy:
             attempts = getattr(decision, "gate_attempts", 1) if decision_ok else 1
             if isinstance(attempts, (int, float)) and not isinstance(attempts, bool) \
                     and attempts > 1:
-                # KC-55: how hard the gate tried. Absent for one attempt, so a
-                # record of today's fail-fast gate stays byte-identical. KC-66:
-                # the time that cost the turn rides in the same two keys, which
-                # is exactly the same condition.
+                # Gate attempts and their time are recorded only when there was more than one attempt (KC-55, KC-66).
                 entry["gate_attempts"] = int(attempts)
                 entry["gate_added_sec"] = int(
                     getattr(decision, "gate_added_sec", 0.0) or 0.0)

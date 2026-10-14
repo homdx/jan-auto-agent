@@ -47,8 +47,7 @@ class TestResetClearsDeadline:
         ))
         state.set_task_status("AUTO-T1", STATUS_BLOCKED)
 
-        # Simulate OuterLoop.run_task having written the deadline start time
-        # on the first attempt (outer_loop.py:164).
+        # The deadline start time written on the first attempt (outer_loop.py:164).
         state.write_task_file("AUTO-T1", "deadline_started_at.txt", "1700000000.0")
         deadline_path = state.task_dir("AUTO-T1") / "deadline_started_at.txt"
         assert deadline_path.exists(), (

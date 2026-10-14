@@ -183,8 +183,7 @@ class TestQuarantineSameSecondCollision:
         path = _plant(tmp_path, "BUG-AUTO-T1", "CORRUPT-A")
         store._quarantine(path, "first corruption")
 
-        # A fresh file recreated at the same id, itself found corrupt
-        # within the same frozen second.
+        # A fresh file at the same id, also corrupt, within the same frozen second.
         path = _plant(tmp_path, "BUG-AUTO-T1", "CORRUPT-B")
         store._quarantine(path, "second corruption")
 

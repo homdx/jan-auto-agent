@@ -47,9 +47,7 @@ def _run(tmp_path: Path, truth: Path, *verdicts: Path) -> tuple[list[tuple[str, 
     return rows, tickets
 
 
-# ── bug: the severity was the longest word, not the most severe ──────────────
-# `longest()` picks the longest *string*: for HIGH and MEDIUM it gave MEDIUM, in the
-# ticket and in the order of the index ("highest severity first").
+# Regression: severity was the longest word, not the most severe.
 
 def test_the_ticket_carries_the_most_severe_rating(tmp_path):
     truth = _truth(tmp_path, [{"finding": "a.py::sev"}])
@@ -69,9 +67,7 @@ def test_a_finding_rated_high_and_medium_sorts_before_one_rated_only_medium(tmp_
     assert [row[1] for row in rows] == ["b.py::high_and_medium", "a.py::only_medium"]
 
 
-# ── bug: an unrated finding was shown as MEDIUM but sorted as the least severe ─
-# The ticket's severity defaults to MEDIUM, the sort key to "unrated" (last), so an
-# index that says "highest severity first" listed a MEDIUM after a LOW.
+# Regression: an unrated finding was shown as MEDIUM but sorted as least severe.
 
 def test_the_index_order_agrees_with_the_severity_it_shows(tmp_path):
     truth = _truth(tmp_path, [{"finding": "a.py::low"}, {"finding": "b.py::unrated"},
@@ -83,9 +79,7 @@ def test_the_index_order_agrees_with_the_severity_it_shows(tmp_path):
         [("HIGH", "c.py::high"), ("MEDIUM", "b.py::unrated"), ("LOW", "a.py::low")]
 
 
-# ── bug: a REAL finding whose `duplicate_of` names no REAL finding got no ticket ──
-# Aliases were only folded into a canonical row that is itself REAL; one pointing at a
-# missing, mistyped or non-REAL row was neither folded nor filed — the defect was lost.
+# Regression: a REAL finding whose duplicate_of names no REAL row was neither folded nor filed.
 
 def test_a_real_finding_whose_canonical_is_missing_is_filed_on_its_own(tmp_path):
     truth = _truth(tmp_path, [{"finding": "d.py::alias", "duplicate_of": "zzz.py::missing"}])

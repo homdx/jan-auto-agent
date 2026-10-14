@@ -105,22 +105,9 @@ def test_suggested_orders_reference_real_gates(profile: Path):
                 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GATE3-PROFILE-4 — the GATE3-PROFILE-2/3 per-component LLM profile keys
-# ─────────────────────────────────────────────────────────────────────────────
-# Same two properties as the [gates] block above (parity + inertness), for
-# the profile keys GATE3-PROFILE-2/3 added: canon/fact/continuity/theme
-# _llm_profile in [validator_agent], [summary] llm_profile, and [architect]
-# plan_llm_profile. A tenth profile added later, or an eleventh key added to
-# an existing one, cannot silently omit these — this test is where that
-# would be caught, the same way test_documented_gate_names_are_real already
-# catches a stale "Known gates:" line.
+# Parity and inertness for the per-component LLM profile keys (GATE3-PROFILE-2/3).
 
-#: The new keys documented by GATE3-PROFILE-4, and which section each one's
-#: (commented) example lives in. Deliberately excludes prosody: it has no
-#: profile key at all (see the block's own closing paragraph and the
-#: profile_key=None comment on its GateSpec in gate_registry.py) — there is
-#: no key to require parity for.
+#: New profile keys (GATE3-PROFILE-4) and their sections. Prosody is excluded: it has no profile key.
 _NEW_PROFILE_KEYS: dict[str, str] = {
     "canon_llm_profile": "validator_agent",
     "fact_llm_profile": "validator_agent",

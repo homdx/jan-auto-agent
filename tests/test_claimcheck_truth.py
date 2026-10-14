@@ -223,8 +223,7 @@ def test_finding_key_forms():
     sym = [_ra("path", "app.py", True, "app.py"), _ra("symbol", "Store.compact", True, "app.py", "Store.compact")]
     assert tr.finding_key("c", sym) == "app.py::Store.compact"
     assert tr.finding_key("c", [_ra("path", "lib/x.py", True, "lib/x.py")]) == "lib/x.py"
-    # a symbol that is not found in a file that is there: the file and the name (review batch m №73: keyed by
-    # the file alone, a reviewer's `app.py::gone_fn` never matched it, and the file's real claims shared it)
+    # Symbol not found in an existing file: keyed by file and name (review batch m).
     assert tr.finding_key("c", [_ra("symbol", "gone_fn", False, "app.py")]) == "app.py::gone_fn"
     # a symbol not found anywhere, a dangling path: neither is a key
     lost = [_ra("symbol", "gone_fn", False, ""), _ra("path", "nope.py", False, "")]

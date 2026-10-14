@@ -40,8 +40,7 @@ REASONS = (CHUNK_NOT_IN_PACK, QUOTE_NOT_IN_PACK)
 
 SYSTEM = "You are a careful technical fact checker."
 
-# Same job, three wordings (as `CLAIM-1`): the first sentence swaps its words around, so
-# the prompts differ from the very first token and no prefix cache can match.
+# Three wordings of one job, so the prompts differ from the first token and no prefix cache matches.
 OPENERS = (
     "Judge each of the following claims as TRUE, FALSE or UNSURE.",
     "Each of the following claims must be judged by you: TRUE, FALSE or UNSURE.",
@@ -149,9 +148,7 @@ def _text(value) -> str:
 def _rows_to_votes(rows, order: list) -> dict:
     votes: dict = {}
     rows = [row for row in rows if isinstance(row, dict)]
-    # a reply that numbers the claims from 0 (an id 0, none equal to the claim count): read 0-based. Read
-    # 1-based, the id 0 was dropped and every other vote went to the claim before its own — unanimous
-    # world verdicts inverted, with no quote to catch it
+    # Claim ids may start at 0: read 0-based when a reply uses them, or every vote lands on the wrong claim.
     ids = {_row_id(row.get("id")) for row in rows}
     shift = 1 if 0 in ids and len(order) not in ids else 0
     for row in rows:
@@ -166,13 +163,9 @@ def _rows_to_votes(rows, order: list) -> dict:
     return votes
 
 
-#: start positions one reply is decoded from, at most this many from its head and as many from its
-#: tail: each try reads to the end of what it opens, so trying every `[` of a 5,000-deep reply took
-#: seconds, and 10,000 deep raised RecursionError. Only the head was tried, and a valid answer after
-#: ~8k characters of code-heavy reasoning (600 `[`, 400 `{`) was a lost vote: an answer comes last
+#: Start positions tried per reply (head and tail), so a long reply costs bounded work and a valid answer late in it is still found.
 MAX_STARTS = 400
-#: characters decoded over all the tries of one reply: one long unterminated nesting made every try
-#: read to the end (1.6 MB in 19 s); a cheap failure (`a[i]` in prose) costs what it read
+#: Total characters decoded across all tries of one reply, so one unterminated nesting cannot make every try read to the end.
 MAX_DECODE_WORK = 4_000_000
 #: what a try that hit the interpreter's recursion limit is counted as
 _RECURSION_COST = 4_000
@@ -220,8 +213,7 @@ def json_values(text: str, ch: str, *, strict: bool = False, past: bool = False)
 
 def _lists(text: str):
     """Every JSON list in *text*, in order of where it starts (`json_values`)."""
-    # strict=False: a model copying a code line into "quote" writes the line break as a bare
-    # newline, which strict JSON forbids; the whole reply was lost to it, not just the quote
+    # strict=False: a bare newline inside a quoted string is accepted, instead of losing the whole reply.
     for value in json_values(text, "["):
         if isinstance(value, list):
             yield value
@@ -240,9 +232,7 @@ def parse_votes_v2(text: str, order: list) -> dict:
     an `id` written as a string (`"3"`, `"CLAIM-3"`). A row with an unknown verdict or an
     `id` out of range is dropped; garbage gives {} (the voter cast no votes)."""
     text = text if isinstance(text, str) else ""
-    # the trailing-comma pass tracks strings from the top: one stray `"` in the prose before the
-    # JSON (`a 5" screen`) put it out of step, and `"TRUE",}` lost the vote; it also runs from
-    # the first `[` / `{`, past the prose
+    # Trailing-comma repair starts at the first [ or {, so stray quotes in the prose before the JSON do not desync it.
     lst, obj = text.find("["), text.find("{")
     tails = [text[k:] for k in (lst, obj) if k > 0]
     for candidate in (text, _drop_trailing_commas(text), *map(_drop_trailing_commas, tails)):
@@ -250,8 +240,7 @@ def parse_votes_v2(text: str, order: list) -> dict:
             votes = _rows_to_votes(rows, order)
             if votes:
                 return votes
-    # no list: some models answer with the rows one after another (one object a line, or one
-    # object for a one-claim prompt); round 280's live smoke lost every vote of one voter to it
+    # No list: some models answer one object per line; read them as rows rather than losing the vote.
     for candidate in (_drop_trailing_commas(text), *map(_drop_trailing_commas, tails)):
         votes = _rows_to_votes(_objects(candidate), order)
         if votes:

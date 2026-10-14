@@ -45,9 +45,7 @@ def _config(**sections) -> configparser.ConfigParser:
     return c
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Unset key
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_unset_key_returns_defaults_unchanged():
     config = _config(validator_agent={})
@@ -81,9 +79,7 @@ def test_empty_value_treated_as_unset_not_as_profile_named_empty():
     assert name is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Missing section / missing required options
-# ─────────────────────────────────────────────────────────────────────────────
+# Missing section or required options
 
 def test_named_section_missing_raises_naming_key_section_and_removal():
     config = _config(validator_agent={"canon_llm_profile": "ghost"})
@@ -125,8 +121,7 @@ def test_missing_required_options_raises_listing_all_missing(present_keys):
 
 
 def test_required_fields_never_inherited_from_defaults():
-    # A profile missing model must raise even though defaults has a model —
-    # the required trio is never silently filled from defaults.
+    # The required trio (model and others) is never filled from defaults, even when defaults has a model.
     config = _config(
         validator_agent={"canon_llm_profile": "strong"},
         strong={"base_url": "https://a.example", "api_key": "k"},
@@ -137,9 +132,7 @@ def test_required_fields_never_inherited_from_defaults():
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Full profile resolution
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_full_profile_overrides_everything():
     config = _config(
@@ -270,9 +263,7 @@ def test_think_effort_disabled_in_profile_clears_effort_even_if_default_had_one(
     assert settings.think_effort is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Malformed optional values
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize(
     "field_name,bad_value",
@@ -303,9 +294,7 @@ def test_malformed_optional_value_logs_warning_and_keeps_default(field_name, bad
     assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Isolation between profiles / defaults
-# ─────────────────────────────────────────────────────────────────────────────
+# Isolation between profiles and defaults
 
 def test_two_profiles_read_in_same_process_share_no_value():
     config = _config(
@@ -354,9 +343,7 @@ def test_resolving_a_profile_does_not_mutate_defaults():
     assert DEFAULTS == original
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Logging on the profile-configured path
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_configured_profile_logs_one_info_line_naming_provider_model_section(caplog):
     config = _config(

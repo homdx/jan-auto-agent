@@ -115,9 +115,7 @@ class TestEveryProfile:
         assert ("num_ctx=" in text) is bool(0 < num_ctx < 8192)
 
 
-# Chars-per-token used for the headroom arithmetic. Deliberately optimistic
-# (real English/code prose runs ~3.5–4); a budget that fails this check would
-# fail worse in practice.
+# Chars-per-token for headroom; optimistic on purpose.
 _CPT = 3.5
 
 # What a probe round adds on top of the architect prompt, beyond the digest.
@@ -181,14 +179,7 @@ def test_probe_budgets_are_coherent(profile: str) -> None:
     total = cfg.getint("architect", "probe_max_total_chars")
 
     assert rounds >= 1, "0 rounds disables probing without saying so"
-    # AUTO-P13 revision: this used to read "<= 5, no measured run ever
-    # needed more than 3 rounds". A live run against agents_128k.ini's
-    # actual (remote, 1M-token) endpoint needed all 5 of its then-configured
-    # rounds and still hit the cap mid-batch with escalation budget unused
-    # — the opposite of what that comment claimed. 10 is a sanity ceiling
-    # against a runaway typo (e.g. an extra zero), not a measured maximum;
-    # see agents_128k.ini's own probe_max_rounds comment for the specific
-    # figure this repo has actually observed needing more than 3.
+    # rounds must be 1..10; 10 is a runaway-typo ceiling, not a measured maximum.
     assert rounds <= 10, "probe_max_rounds looks like a runaway value (>10)"
     assert per_op > 0
     assert total >= per_op, (
@@ -211,12 +202,7 @@ def test_every_profile_declares_its_probe_budget() -> None:
         p for p in PROFILES
         if not _load(p).has_option("architect", "probe_max_rounds")
     ]
-    # agents_128k.ini used to be the documented exception — the operator's
-    # live, hand-tuned profile, deliberately skipped by every AUTO-P patch.
-    # It has since been removed from the repository (it carried credentials
-    # and now lives only locally), so the exception list is allowed to be
-    # empty. Written as a subset check rather than equality so the test
-    # survives the profile coming back without needing another edit.
+    # The exception list may be empty: agents_128k.ini has left the repo.
     assert set(missing) <= {"agents_128k.ini"}, (
         f"profiles without an explicit AUTO-P budget block: {missing}"
     )
@@ -236,12 +222,7 @@ def test_no_profile_is_silently_probe_ready() -> None:
         p for p in PROFILES
         if _load(p).getboolean("collect", "use_in_auto", fallback=False)
     ]
-    # agents_128k.ini was the only shipped profile with a collect artifact,
-    # and it is no longer in the repository (see the note above). What this
-    # test guards is unchanged and still worth guarding: NO OTHER profile may
-    # quietly become probe-ready, because enabling probing where collect is
-    # off produces lookups that resolve nothing and fall straight through to
-    # the forced call — a measurement of the plumbing, not of the feature.
+    # No other profile may become probe-ready while collect is off.
     assert set(ready) <= {"agents_128k.ini"}, (
         f"probe-ready profiles changed: {ready}. Update AUTO-P-RUNBOOK.md "
         f"and re-check the enabling instructions in README.md."

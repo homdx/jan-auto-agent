@@ -77,9 +77,7 @@ def test_canonical_dumps_normalizes_tuples_to_lists():
 
 
 def test_canonical_dumps_normalizes_set_order():
-    # Two sets built in a different insertion order must canonicalize
-    # identically — this is exactly the "imports" case (COLLECT-4/-5),
-    # which is naturally assembled via a set before being sorted.
+    # Equal sets in different insertion order canonicalize identically (the imports case).
     s1 = {"os", "sys", "json"}
     s2 = {"json", "os", "sys"}
     assert canonical_dumps(s1) == canonical_dumps(s2) == '["json","os","sys"]'
@@ -96,9 +94,7 @@ def test_canonical_dumps_rejects_clock_dependent_keys_when_nested():
 
 
 def test_canonical_dumps_check_forbidden_can_be_disabled_for_manifests():
-    # The manifest itself (COLLECT-2) legitimately carries `generated_at` —
-    # canonicalization must still be available to it, just without the
-    # structural-payload guard.
+    # Manifests may carry generated_at: canonicalization works without the forbidden-key guard.
     payload = {"generated_at": "2026-07-14T00:00:00Z", "git_sha": "abc123"}
     assert canonical_bytes(payload, check_forbidden=False) == (
         b'{"generated_at":"2026-07-14T00:00:00Z","git_sha":"abc123"}'

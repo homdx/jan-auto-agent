@@ -95,8 +95,7 @@ class TestResetClearsDeadline:
         store.write_task_file(EXHAUSTED_ID, "deadline_started_at.txt", stale_start)
         store.write_task_file(PARKED_ID, "deadline_started_at.txt", stale_start)
 
-        # Resettable = BLOCKED with no rounds burned (case 1, dependency).
-        # The other two are BLOCKED for reasons a reset must not undo.
+        # Resettable = BLOCKED with no rounds burned; the other two are blocked for reasons a reset must keep.
         tdir = store.task_dir(EXHAUSTED_ID)
         for n in range(1, 11):
             (tdir / f"feedback_round_{n}.md").write_text(f"# round {n}\n")
@@ -181,8 +180,7 @@ def test_stale_deadline_is_what_blocks_the_attempt(tmp_path):
     store = _store(tmp_path)
     loop, inner = _outer_loop(store, tmp_path)
     store.set_task_status(RESETTABLE_ID, STATUS_TODO)
-    # RUN-2: "no budget left" is now a consumed total, not an old start time —
-    # a bare timestamp can no longer be read as "already exhausted".
+    # RUN-2: "no budget left" is a consumed total, not an old start time.
     store.write_task_file(
         RESETTABLE_ID, "deadline_started_at.txt",
         json.dumps({"consumed_s": 1e9}),
@@ -215,8 +213,7 @@ def test_reset_then_resume_actually_runs_the_task(tmp_path):
     """
     store = _store(tmp_path)
     store.set_task_status(RESETTABLE_ID, STATUS_BLOCKED)
-    # RUN-2: an exhausted ledger, in the current format — so that without the
-    # reset the resume would start with 0 seconds and be re-blocked.
+    # RUN-2: an exhausted ledger in the current format, so the resume would be re-blocked without the reset.
     store.write_task_file(
         RESETTABLE_ID, "deadline_started_at.txt",
         json.dumps({"consumed_s": 1e9}),

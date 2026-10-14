@@ -63,8 +63,7 @@ class TestCreateConvertsOSError:
         with patch.object(store, "_ensure_dir", side_effect=OSError("Permission denied")):
             with pytest.raises(TicketError) as exc_info:
                 store.create(ticket)
-        # The TicketError message must mention the directory so the operator
-        # can tell at a glance what went wrong.
+        # The TicketError message must name the directory, so the operator can see what failed.
         assert "ticket directory" in str(exc_info.value).lower() or "permission" in str(exc_info.value).lower()
 
     def test_ticket_error_chains_original_oserror(self, tmp_path):
@@ -123,8 +122,7 @@ class TestExhaustionHandlerStillDegradesGracefully:
             lambda self: (_ for _ in ()).throw(OSError("Permission denied")),
         )
 
-        # Must not raise — the path is still returned even though the
-        # underlying file write failed.
+        # Must not raise: the path is still returned though the file write failed.
         path = handler._open_ticket(
             ticket_id="TICKET-AUTO-T37",
             linked_task="AUTO-T37",

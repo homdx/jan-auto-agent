@@ -37,9 +37,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.auto.git_manager import GitError, GitManager, make_git_manager
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_config(git_user: str, git_email: str) -> configparser.ConfigParser:
     """Return a ConfigParser with an [auto] section pre-populated."""
@@ -63,9 +61,7 @@ def _fresh_gm(tmp_path: Path, cfg: configparser.ConfigParser | None = None) -> G
     return gm
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # ensure_repo
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestEnsureRepo:
     def test_creates_git_dir(self, tmp_path):
@@ -96,9 +92,7 @@ class TestEnsureRepo:
         assert (deep / ".git").is_dir()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — Identity from agents.ini [auto]
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: identity comes from agents.ini [auto]
 
 class TestConfigureIdentity:
     def test_git_user_read_from_config(self, tmp_path):
@@ -153,9 +147,7 @@ class TestConfigureIdentity:
             gm.configure_identity()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — No empty commits
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: no empty commits
 
 class TestEmptyCommitGuard:
     def test_commit_returns_none_when_nothing_staged(self, tmp_path):
@@ -199,9 +191,7 @@ class TestEmptyCommitGuard:
         assert result is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# commit() — returns SHA
-# ─────────────────────────────────────────────────────────────────────────────
+# commit() returns the SHA
 
 class TestCommit:
     def test_commit_returns_sha_string(self, tmp_path):
@@ -240,9 +230,7 @@ class TestCommit:
         assert sha is not None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC3 — commit_task message format
-# ─────────────────────────────────────────────────────────────────────────────
+# AC3: commit_task message format
 
 class TestCommitTask:
     def test_message_follows_convention(self, tmp_path):
@@ -287,9 +275,7 @@ class TestCommitTask:
         assert sha1 != sha2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # get_current_hash
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestGetCurrentHash:
     def test_returns_none_before_any_commit(self, tmp_path):
@@ -314,9 +300,7 @@ class TestGetCurrentHash:
         assert h1 != h2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # get_commit_author / get_commit_message
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestCommitInspection:
     def test_get_commit_author_name(self, tmp_path):
@@ -346,9 +330,7 @@ class TestCommitInspection:
         assert gm.get_commit_message(sha) == "auto(AUTO-A3): Git integration"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # make_git_manager factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestMakeGitManager:
     def test_returns_git_manager_instance(self, tmp_path):
@@ -379,9 +361,7 @@ class TestMakeGitManager:
         assert isinstance(gm2, GitManager)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # GitError
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestGitError:
     def test_bad_command_raises_git_error(self, tmp_path):
@@ -395,9 +375,7 @@ class TestGitError:
             gm._run(["git", "no-such-subcommand"], "cmd failed")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # stage_all
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestStageAll:
     def test_stages_new_file(self, tmp_path):

@@ -66,11 +66,7 @@ def total(values):
 '''
 TEST_BASE = "from pkg.thing import total\n\n\ndef test_total_two():\n    assert total([1, 2]) == 3\n"
 
-#: The ticket. Its first instruction is a command that cannot succeed — a
-#: `kilo` subcommand that does not exist — and it is asked for *before* the
-#: change, so a model that follows it literally cannot get to `pkg/thing.py` at
-#: all. That is the shape of round 64's `nex-n2-5-pro`, produced on purpose
-#: instead of waited for.
+#: KC-42 probe: the first instruction cannot succeed (a `kilo` subcommand that does not exist), on purpose; round 64's `nex-n2-5-pro` came from the same shape.
 TICKET = """# 01 — `pkg/thing.py`: `total([])` must return 0
 
 **Status:** open — KC-42's live probe.

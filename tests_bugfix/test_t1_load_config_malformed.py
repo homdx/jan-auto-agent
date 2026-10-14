@@ -33,9 +33,7 @@ def _make_orc(ini_text: str) -> Orchestrator:
     orc = Orchestrator.__new__(Orchestrator)
     orc.config = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
     orc.config.read_string(ini_text)
-    # load_config tries to read the file only when it exists on disk.
-    # "nonexistent_xyz.ini" is guaranteed absent, so the file-read step is
-    # skipped and the already-populated orc.config is used as-is.
+    # load_config skips the file read when the file is absent; the populated config is used.
     orc.load_config("nonexistent_xyz.ini")
     return orc
 
@@ -138,8 +136,7 @@ class TestBuildAgentsAlsoGuarded:
             "[validator_agent]\ntemperature = bad\nmax_hints = bad\n",
             encoding="utf-8",
         )
-        # Full __init__ (not the __new__ shortcut) — exercises the real
-        # unguarded __init__ -> _build_agents() chain end to end.
+        # Full __init__ (not __new__) exercises the unguarded __init__ -> _build_agents() chain.
         orc = Orchestrator(config_path=str(bad_ini))
         assert orc.prompt_store.max_versions == 3
         assert orc.search_agent.max_file_kb == 500

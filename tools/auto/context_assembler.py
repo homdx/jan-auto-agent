@@ -45,20 +45,13 @@ from tools.auto.utils import chars_per_token
 
 logger = logging.getLogger(__name__)
 
-# Matches "chapter_07", "chapter_7", "Chapter_07.md", etc. — the number is
-# whatever digits follow "chapter_", case-insensitive.
+# Matches chapter_07, chapter_7 and similar names, case-insensitive.
 _CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
 
-# Fixed overhead reserved for the task framing injected around this context
-# (TASK ID / TITLE / INSTRUCTION / CITED LOCATION / target file listing,
-# plus the closing "produce the chapter now" instruction) in coder.py's
-# user prompt template. Approximate, intentionally generous.
+# Fixed token overhead for the task framing around the context (generous estimate).
 _INSTRUCTION_OVERHEAD_TOKENS = 300
 
-# Markers used by AUTO-CR-5's SummaryMemory.update() to key sections in
-# synopsis.md. Parsing here is read-only and independent of CR-5 — if
-# synopsis.md does not exist yet (CR-5 not wired up / first run), this
-# assembler still works using only the previous chapter's full text.
+# Section markers in synopsis.md (AUTO-CR-5); read-only, so the assembler works without the synopsis.
 _SECTION_RE = re.compile(
     r"<!--\s*BEGIN\s+(?P<name>\S+)\s*-->(?P<body>.*?)<!--\s*END\s+(?P=name)\s*-->",
     re.DOTALL,
@@ -66,33 +59,21 @@ _SECTION_RE = re.compile(
 
 _DROP_MARKER = "… [older synopsis omitted]"
 
-# AUTO-CR-23-2: default cap on how much of story_bible.md is injected per
-# prompt. Small and fixed — the bible itself is already kept small by
-# AUTO-CR-23-1 (story_bible_max_chars), this is just the per-prompt ceiling.
+# Default cap on story_bible.md in each prompt (AUTO-CR-23-2).
 _DEFAULT_BIBLE_BUDGET_CHARS = 700
 
 _BIBLE_HEADER = "STORY FACTS (must not contradict):"
 
-# COLLECT-23: header for the opt-in collect-context injection block (see
-# `build_collect_context_block` below). Kept distinct from the story-bible
-# header above so a prompt log can tell the two apart at a glance.
+# Header of the opt-in collect-context block (COLLECT-23), distinct from the bible header.
 _COLLECT_HEADER = "COLLECT MODEL (static facts, do not contradict):"
 
-# PLAN-v2 V2.3: the announced remainder for a budget-cut symbol list. The old
-# silent `[:20]` claimed to be a complete list; `CollectBridge.
-# _format_module_block` already announces its own cut ("… and N more symbol(s)
-# not listed"), and this matches that honesty.
+# Announcement for a symbol list cut by budget, matching the collect bridge's own cut note (V2.3).
 _SYMBOLS_CUT_NOTE = " … (+{extra} more, cut for budget)"
 
-# PLAN-v2 V3: the announcement the three neighbourhood rows share. `+N` counts
-# entries of the list the row itself is showing, so the announced remainder
-# always reconciles with the count the row leads with.
+# Announcement shared by the neighbourhood rows; the remainder reconciles with the count the row shows (V3).
 _CUT_NOTE = ", +{extra}"
 
-# PLAN-v2 V3: per-row name caps. The count is the fact, the names are the
-# courtesy — each row leads with the total and then shows a bounded number of
-# names, so a list of 25 costs the same one line as a list of 2. Constants
-# rather than config keys: there is no plausible second value for them.
+# Per-row name caps: the count is the fact, names are courtesy, so each row stays one line (V3).
 _CALLERS_MAX_NAMES = 5
 _CALLS_INTO_MAX_NAMES = 5
 _TESTS_MAX_NAMES = 3
@@ -101,13 +82,7 @@ _CALLERS_PREFIX = "callers: "
 _CALLS_INTO_PREFIX = "calls_into: "
 _TESTS_PREFIX = "tests: "
 
-# PLAN-v2 V5: the one row whose material comes from Pass B (the LLM
-# summaries) rather than the AST. Up to three neighbours, and the `(llm)`
-# label on every line — it is the only non-static row in the pack, so the
-# label is what tells the model this prose is weaker evidence than the rows
-# above it. COLLECT-1's provenance isolation is preserved by labelling, not
-# by exclusion: `is_safe()` still reads only static facts and never touches
-# `summary`.
+# The LLM-summary row, labelled (llm) because it is weaker evidence than the static rows (V5).
 _NEIGHBOURS_MAX_ENTRIES = 3
 _NEIGHBOURS_PURPOSE_MAX_CHARS = 110
 _NEIGHBOURS_PREFIX = "neighbours: "
@@ -116,14 +91,7 @@ _NEIGHBOURS_LLM_LABEL = " (llm)"
 _SENTENCE_ENDINGS = ".!?"
 _WHITESPACE_RE = re.compile(r"\s+")
 
-# PLAN-v2 V3: the forms that replace an empty row. Each asserts an absence
-# rather than printing "0" — the absence is the useful fact and costs nothing.
-# The entry-point note has two shapes: a module nobody imports at all, and one
-# whose only importers are test files (`main.py`: 13 importers, every one a
-# test). The second keeps its count — "13 test files import this" is still a
-# fact — but says plainly that shipped code is not among them, because
-# "nothing imports this" would be false and a coder reading the pack would
-# rightly stop trusting it.
+# Forms that replace an empty row: an absence is stated, not printed as 0; entry-point wording depends on whether only tests import it (V3).
 _ENTRY_POINT_NOTE = "entry point — nothing imports this"
 _ENTRY_POINT_TESTS_ONLY_NOTE = (
     "entry point — nothing in shipped code imports this; {count} test {noun} {verb}"
@@ -189,12 +157,7 @@ def _row_contract(model, target_file: str, remaining: "int | None") -> str:
     if not contracts:
         return ""
 
-    # A contract may be both seeded and derived (`COLLECT-10`), so two distinct
-    # `ContractRecord`s can render byte-identically. Dedupe the rendered lines
-    # BEFORE the cut, the way `_row_config_read` already does: the block's own
-    # dedupe would remove the duplicate anyway, so a row measured with it in
-    # counts budget it never spends, and a cut sized on that count drops a
-    # contract line the budget could have afforded.
+    # Dedupe rendered contract lines before the cut, so the budget is not spent on duplicates (V2.4).
     lines: "list[str]" = []
     for contract in sorted(contracts, key=lambda c: c.name):
         line = f"contract {contract.name}: {contract.description}"
@@ -246,9 +209,7 @@ def _row_public_symbols(model, target_file: str, remaining: "int | None") -> str
     record = model.module(target_file)
     if record is None:
         return ""
-    # A hand-edited artifact can carry a symbol whose qualname is not a string.
-    # Skip only the malformed entry so a row still says what it can say, and a
-    # single broken record never raises into a run.
+    # A malformed qualname is skipped, so one bad record never raises into a run.
     symbols = [
         s.qualname
         for s in record.public_symbols
@@ -276,11 +237,7 @@ def _row_public_symbols(model, target_file: str, remaining: "int | None") -> str
     if len(listed) == len(symbols):
         return f"{prefix}{', '.join(listed)}"
 
-    # The greedy pass above reserved no room for the announcement, and the note
-    # gets longer as more symbols are cut, so trim again until the announced
-    # line itself fits — otherwise a LARGER budget could render FEWER symbols
-    # than a smaller one. If even a single symbol plus the note does not fit,
-    # the row is absent rather than a bare "nothing listed" announcement.
+    # Trim until the announced line fits: a larger budget must never render fewer symbols than a smaller one.
     while listed:
         extra = len(symbols) - len(listed)
         line = f"{prefix}{', '.join(listed)}{_SYMBOLS_CUT_NOTE.format(extra=extra)}"
@@ -564,10 +521,7 @@ def _row_neighbours(
 
     candidates: "list[str]" = []
     for path in tuple(model.callers_of(target_file)) + tuple(model.calls_into(target_file)):
-        # A neighbour is not the target: this row exists because the target's
-        # own source is already in the prompt. `callers_of`/`calls_into`
-        # cannot return the target from a produced artifact (the graph drops
-        # self-edges), but a hand-edited one can.
+        # A neighbour is never the target itself; a hand-edited artifact could list it, so it is filtered here.
         if path and path != target_file and path not in candidates:
             candidates.append(path)
 
@@ -580,9 +534,7 @@ def _row_neighbours(
         neighbour = model.module(path)
         if neighbour is None or neighbour.summary is None:
             continue
-        # `getattr`, not attribute access: a hand-edited artifact can carry a
-        # summary that is not an `LLMSummary`, and a malformed row degrades to
-        # a skipped neighbour rather than a raise into a run.
+        # Non-LLMSummary values in a hand-edited artifact are skipped, not raised (getattr).
         purpose = _first_sentence(getattr(neighbour.summary, "purpose", ""))
         if not purpose:
             continue
@@ -609,27 +561,7 @@ def _neighbour_paths_in(lines) -> "tuple[str, ...]":
     )
 
 
-# PLAN-v2: the ordered row list that IS the per-task fact pack. Highest
-# value first — "value" = how hard this fact is to get from the target file's
-# own source, which the coder already has in full in the same prompt. The
-# tuple order IS the priority, and cutting a row under budget pressure IS the
-# `continue` in `build_collect_context_block` below. V3 ships the first three
-# rows (the neighbourhood: who imports this, what this imports, what tests it);
-# V5 puts `neighbours` next — the only row carrying LLM prose, so it is the
-# first thing a budget cut drops. The last three rows are the ones V2 ported
-# verbatim out of the old single pass, `public_symbols` still last because it is
-# the row the target file's own source makes redundant.
-#
-# L6: the order is unchanged, but a row is no longer dropped whole. The three
-# rows that carry a `+N` tail (`callers`, `calls_into`, `tests`) shrink by
-# dropping names from the end down to their count alone before the loop gives
-# up on them — the count is the fact, the names are the courtesy — and
-# `public_symbols` is only ever rendered into whatever that leaves. The three
-# one-fact-per-line rows (`neighbours`, `contract`, `config_read`) shrink the
-# same way, by whole lines from the end, so a line of `config_read` never loses
-# to `public_symbols` either. Nothing is ever rendered at the cost of a row
-# above it: the rendered rows are a prefix of this tuple, `public_symbols`
-# excepted, which is the only row that may appear after a gap.
+# Ordered pack rows: the tuple order is the priority; under budget a row is cut from the end, the count kept (PLAN-v2, L6).
 _PACK_ROWS = (
     ("callers", _row_callers),
     ("calls_into", _row_calls_into),
@@ -640,22 +572,10 @@ _PACK_ROWS = (
     ("public_symbols", _row_public_symbols),
 )
 
-# L6: the rows whose material is a count plus a courtesy list of names, so a
-# budget cut can drop names from the end and keep the count. The set is by name
-# rather than a third `_PACK_ROWS` field: the tuple order is pinned byte for
-# byte by the V2/V3 tests, and it stays so. `public_symbols` is not here — it
-# already cuts at a symbol boundary on its own and stays last, so it only ever
-# takes the budget no row above it could use. `neighbours` / `contract` /
-# `config_read` are not here either: they have no count to fall back to, so no
-# floor is reserved for them and they are cut to their first line and no lower.
+# Rows that keep their count and shed names when cut; public_symbols cuts itself at a symbol boundary (L6).
 _SHRINKABLE_ROWS = frozenset({"callers", "calls_into", "tests"})
 
-# PLAN-v2 V6: when `pack_enabled = false`, the fact pack collapses to the V2
-# baseline — exactly the three rows V2 ported verbatim out of the old single
-# pass. The neighbourhood rows added by V3–V5 are omitted entirely, so the
-# block is byte-identical to what a pre-V3 tree produced (same rows, same
-# order, same dedupe). `pack_enabled` is a V6 bridge config; this tuple exists
-# so the two modes never drift.
+# With pack_enabled off the pack is the V2 baseline rows only, byte-identical to a pre-V3 tree (V6).
 _V2_PACK_ROWS = (
     ("contract", _row_contract),
     ("config_read", _row_config_read),
@@ -735,13 +655,7 @@ def _fit_pack_to_budget(
             continue
         give = _row_cost(form) - _row_cost(floors.get(name, ""))
         if give <= 0:
-            # This row cannot give ground: its smallest form is not smaller than
-            # its full form. `calls_into` with one short target is the case —
-            # "calls_into: a.py" is 16 chars, its own count is
-            # "calls_into: 1 target" and 20. Borrowing the deficit from here
-            # would make `owed` grow and cut a row above it by more than the
-            # budget requires, which is the displacement this pass exists to
-            # avoid, so it is skipped rather than taken from.
+            # A row that cannot give ground (its smallest form is not smaller) is skipped, not taken from.
             continue
         take = min(owed, give)
         owed -= take
@@ -893,9 +807,7 @@ def build_collect_context_block_stats(
             logger.warning("collect block row %r failed for %s: %s", name, target_file, exc)
             return ""
 
-    # Every row in its uncapped form first: the cut below measures against the
-    # full pack, so it never decides what a row may keep from what the rows
-    # above it happened to claim.
+    # Uncapped rows first: the cut measures against the full pack.
     def _allowing(name: str, render) -> "Callable[[int | None], str]":
         return lambda allowance: _render(name, render, allowance)
 
@@ -921,9 +833,7 @@ def build_collect_context_block_stats(
 
     block = "\n".join(head + body)
 
-    # The pack this budget would have cut: the same rows, uncut, so
-    # chars_uncapped - chars is the ground the cut gave up. Only worth
-    # rendering twice when a budget was actually applied.
+    # The uncapped length, so the chars removed by the cut are known; rendered twice only when a budget applies.
     chars_uncapped = len(block)
     if budget is not None:
         uncapped_body, _uncapped_kept = _pack_body(head, full, rows, None)
@@ -936,8 +846,7 @@ def build_collect_context_block_stats(
         "chars": len(block),
         "chars_uncapped": chars_uncapped,
         "budget": budget,
-        # Read off the rendered body, not `full`: a path the cut dropped, or
-        # the dedupe above skipped, was never shown, so it cannot go stale.
+        # Paths are read from the rendered body, so a dropped or deduped path cannot go stale.
         "neighbours_paths": _neighbour_paths_in(body),
     }
 
@@ -966,15 +875,7 @@ def _pack_body(
     """
     head_len = len("\n".join(head))
     body: "list[str]" = []
-    # BUGFIX: `seen` used to be seeded with `head`'s own lines (the fixed
-    # `_COLLECT_HEADER` / `module: {path}` / `parse_error: {...}` lines that
-    # sit outside the row loop). Those aren't ranked content a row can ever
-    # legitimately restate — they exist purely so `seen` only ever holds
-    # facts *rows* already rendered, per the class docstring above. Seeding
-    # it with `head` meant a row whose own, genuinely distinct fact happened
-    # to render a line byte-identical to one of those — coincidence, not
-    # repetition — was silently dropped as a "duplicate" of the header
-    # rather than shown, and its row miscounted as cut instead of kept.
+    # Header lines are not seeded into "seen": a row's genuine fact must not be dropped as a header duplicate (BUGFIX).
     seen: "set[str]" = set()
     kept: "set[str]" = set()
     used = head_len
@@ -983,13 +884,7 @@ def _pack_body(
         if not row:
             continue
 
-        # V2.4: drop lines an earlier row already rendered, and duplicates
-        # inside this row — 24 of today's config_read lines are byte-identical
-        # duplicates of one already shown (the same (section, key) read through
-        # two code paths), and a block that repeats a fact spends budget on
-        # nothing. L6: nothing goes into `seen` here; a row the budget check
-        # below then skips must not suppress an identical line in a later row,
-        # so this row's own lines are tracked in `fresh_seen` instead.
+        # Drop duplicate lines (V2.4): lines already shown or repeated in this row; this row's lines go into fresh_seen so a skipped row cannot hide a later line.
         fresh: "list[str]" = []
         fresh_seen: "set[str]" = set()
         for line in row.split("\n"):
@@ -1001,10 +896,7 @@ def _pack_body(
             continue
 
         if budget is not None and used + len("\n".join(fresh)) + 1 > budget:
-            # Belt and braces: the cut above already fits the pack, and the
-            # dedupe above can only shorten it, so this is unreachable. It is
-            # kept because a row that fails a budget check must never leave its
-            # lines in `seen` and suppress an identical line in a later row.
+            # Unreachable in practice; kept so a row that fails the budget never leaves lines in seen.
             continue
 
         seen.update(fresh)
@@ -1072,14 +964,7 @@ class ContextAssembler:
         bible_path: str = "story_bible.md",
         bible_budget_chars: int = _DEFAULT_BIBLE_BUDGET_CHARS,
     ) -> None:
-        # Tolerate 0 / missing values (e.g. num_ctx=0 meaning "server
-        # default") with sane fallbacks rather than producing a zero or
-        # negative budget.
-        # AUTO-CTXASM-GUARD-1: a non-numeric string (an already-loose
-        # caller passing something other than 0/missing/a real number)
-        # raised a raw ValueError from int(...) — same "tolerate a bad
-        # value, don't crash" spirit as the 0/missing case right above,
-        # just for a different kind of bad value.
+        # A zero or missing budget falls back to a sane default; a non-numeric value does too instead of raising (AUTO-CTXASM-GUARD-1).
         try:
             self._num_ctx = int(num_ctx) if num_ctx else 4096
         except (ValueError, TypeError):
@@ -1132,13 +1017,7 @@ class ContextAssembler:
         a recognizable ``chapter_<N>`` filename, returns ``""`` — just the
         task framing, no errors.
         """
-        # Top-level guard: this method is documented ("never raises") to
-        # fail open on any missing/malformed input. The individual helpers
-        # below each guard their own file reads, but nothing previously
-        # guarded the assembly logic itself (chapter ordering, budget
-        # arithmetic, section merging) — an unexpected error there escaped
-        # as a raw exception, breaking the documented contract and aborting
-        # the whole chapter-generation task over a context-assembly nicety.
+        # Top-level guard: assembly failures degrade to no context instead of aborting the chapter (the documented fail-open contract).
         try:
             return self._build_creative_context_inner(target_file, all_chapter_files)
         except Exception:
@@ -1168,20 +1047,11 @@ class ContextAssembler:
 
         sections = self._read_synopsis_sections()
 
-        # AUTO-CR-23-2: reserve the bible's own budget FIRST — before the
-        # synopsis/previous-chapter budget below is computed — so the bible
-        # survives even when the window is tight enough to drop synopsis
-        # sections. One read, one prepend, one budget subtraction; if there
-        # is no bible file (or it's empty) this is a no-op.
+        # Reserve the bible's budget first, so it survives a tight window that drops synopsis sections (AUTO-CR-23-2).
         bible_block = self._read_bible_block()
         bible_cost = (len(bible_block) + 2) if bible_block else 0  # +2 = "\n\n" join
 
-        # Read the previous chapter once, up front: it doubles as the
-        # sample used to detect the chars-per-token ratio for the budget
-        # below (Cyrillic tokenizes far denser than the ~4 chars/token
-        # default — see chars_per_token()), and _assemble_core needs its
-        # text anyway. Falls back to the synopsis sections as the sample
-        # when there's no previous chapter text (e.g. unreadable file).
+        # The previous chapter is read once: it is also the sample for the chars-per-token ratio (Cyrillic is denser).
         prev_num, prev_file = prior[-1]
         prev_text = self._read_chapter_text(prev_file)
         sample_text = prev_text or "\n".join(sections.values())
@@ -1236,10 +1106,7 @@ class ContextAssembler:
         re-read here.
         """
         if budget_chars <= 0:
-            # Pathological config (max_tokens >= num_ctx) or the bible ate the
-            # whole budget. Degrade gracefully instead of returning no context:
-            # prefer the synopsis, falling back to a truncated tail of the
-            # previous chapter only if there's no synopsis yet.
+            # A pathological or exhausted budget degrades to the synopsis, or a tail of the previous chapter.
             prev_num, prev_file = prior[-1]
             logger.warning(
                 "ContextAssembler: zero/negative budget for %s "
@@ -1261,16 +1128,13 @@ class ContextAssembler:
         prev_block = self._format_prev_chapter_block(prev_file, prev_text)
 
         if prev_text and len(prev_block) <= budget_chars:
-            # Common path: previous chapter fits in full. Fill whatever
-            # budget remains with synopsis of everything older than it.
+            # The previous chapter fits, so the rest of the budget holds a synopsis of the older ones.
             remaining = budget_chars - len(prev_block) - 2  # joining newline
             synopsis_block = self._fit_synopsis(sections, prior[:-1], remaining)
             parts = [p for p in (synopsis_block, prev_block) if p]
             return "\n\n".join(parts)
 
-        # Degrade path: chapter N-1's full text alone exceeds the budget (or
-        # is unreadable). Fold it into the synopsis fill — using its synopsis
-        # section instead of full text — alongside everything older.
+        # The previous chapter alone exceeds the budget or is unreadable: fold its synopsis section in with the older ones.
         logger.warning(
             "ContextAssembler: previous chapter %s (%d chars) does not fit "
             "the %d-char budget for target %s — degrading to its synopsis "

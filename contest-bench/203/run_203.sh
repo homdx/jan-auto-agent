@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Round 203 (CLAIM-VOTE): run acceptance_203.py on each entry's committed code.
-#   run_203.sh OUT_DIR NAME=CHECKOUT[@REF] ...
-# Each entry is a `git archive` of REF (default HEAD) in OUT_DIR/NAME — the
-# checkout itself is only read — with the bench copied in and run there.
-# One line per entry in OUT_DIR/results.tsv: name, passed, failed, the FAILED ids.
+# Round 203 (CLAIM-VOTE): runs acceptance_203.py on each entry's committed code.
 set -euo pipefail
 OUT=$1; shift
 HERE=$(cd "$(dirname "$0")" && pwd)

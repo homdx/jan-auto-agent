@@ -9,9 +9,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional
 
 
-# ----------------------------
 # Generic helpers
-# ----------------------------
 
 def _normalize_ext(file_ext: str) -> str:
     ext = (file_ext or "").strip().lower()
@@ -23,9 +21,7 @@ def _normalize_ext(file_ext: str) -> str:
 
 
 def _split_lines_keepends(source: str) -> list[str]:
-    # the lines `ast` counts: \n, \r and \r\n only. str.splitlines also cuts at a form feed, \x1c-\x1e,
-    # \x85, U+2028 and U+2029, and a form feed between two functions put every later block one line early
-    # (the signature without its body)
+    # Lines are split the way ast counts them (\n, \r, \r\n only), so line numbers match across tools.
     return io.StringIO(source, newline="").readlines()
 
 
@@ -68,9 +64,7 @@ def _unique_preserve_order(items: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(item for item in items if item))
 
 
-# ----------------------------
 # Python strategy
-# ----------------------------
 
 @dataclass
 class _PythonTarget:
@@ -83,24 +77,7 @@ class _PythonTargetFinder(ast.NodeVisitor):
     def __init__(self, target_name: str):
         self.target_name = target_name
         self.found: Optional[_PythonTarget] = None
-        # BUGFIX: this class's only match rule used to be `node.name ==
-        # self.target_name` — a bare-name check. That correctly finds a
-        # nested def/class by its own short name (e.g. "cached_method"
-        # inside class Foo), but a *dotted*-qualified target — "Foo.
-        # cached_method", or "Outer.Inner.deep_async_method" for a
-        # doubly-nested class — never equals any single node's `.name`,
-        # so lookup silently returned "" (treated as "symbol not found"
-        # by every caller). Dotted symbols are exactly how a method is
-        # naturally referred to once its bare name is ambiguous (the same
-        # method name defined in two different classes) or how an
-        # upstream citation (gate1_filter's architect-proposed
-        # `cited_location.symbol`, context_broker's dependency resolution)
-        # is reasonably likely to spell it, so this was a real, silent
-        # "symbol not found" false negative, not just a theoretical gap.
-        # `_path_stack` tracks the enclosing def/class names on the walk
-        # down so a full dotted qualname can be compared, while the
-        # original bare-name behavior (first DFS match wins) is kept
-        # completely unchanged for every target that has no dot in it.
+        # Dotted names (Class.method) are matched by the full path, so a qualified citation is found; bare names keep the old behaviour (BUGFIX).
         self._path_stack: list[str] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
@@ -119,10 +96,7 @@ class _PythonTargetFinder(ast.NodeVisitor):
         is_match = (
             node.name == self.target_name
             or qualname == self.target_name
-            # A dotted target may also be a *suffix* of the full path
-            # ("Inner.method" should still resolve inside "Outer.Inner.
-            # method") — the same forgiving behavior a bare name already
-            # gets regardless of how deeply it's nested.
+            # A dotted target also matches as a suffix of a deeper path, as a bare name already does.
             or ("." in self.target_name and qualname.endswith("." + self.target_name))
         )
         if is_match:
@@ -236,9 +210,7 @@ def _extract_python_block_fallback(source: str, target_name: str) -> str:
     return "".join(lines[decorator_start:end_idx])
 
 
-# ----------------------------
 # Brace-based strategy
-# ----------------------------
 
 _LANG_OF_EXT = {
     ".rs": "rust",
@@ -395,11 +367,7 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
     return n
 
 
-# A real signature-to-brace gap (return types, throws/generic/implements
-# clauses, annotations) is always far shorter than this. Used to bound the
-# scan in _find_definition_open_brace so a false-positive match (a plain
-# call statement, or a brace-less single-expression arrow function) can't
-# walk arbitrarily far into the file looking for *some* "{" to latch onto.
+# Largest signature-to-brace gap: bounds the search so a false match cannot scan the whole file for a brace.
 _DEFINITION_SCAN_BOUND = 400
 
 
@@ -443,10 +411,7 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
     i = scan_from
 
     if has_arg_list:
-        # scan_from is right after the arg list's opening "(" (every
-        # pattern that matches a call-like signature ends in "\("): skip to
-        # ITS matching ")" first, so a default value or nested call inside
-        # the arg list can't be mistaken for the end of the signature.
+        # The argument list is skipped to its own closing parenthesis, so a default value cannot end the signature early.
         close_paren = _brace_scan_end(source, i - 1, "(", ")", lang)
         if close_paren >= n:
             return None
@@ -525,11 +490,7 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
 
 def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     name = re.escape(target_name)
-    # type parameters between the name and its "(": `identity<T>(`, `longest<'a>(`, Go's `Map[T, U any](`.
-    # Without them 25 of 55 common signatures were "not found" (TS/Rust/Go/Java generics, typed arrows,
-    # `char *dupstr`, `Foo::bar`, `unsigned long get`, `function*`, `exports.h = function`, `type X struct`)
-    # and Gate 1 removed real tasks of a non-Python target as hallucinated; a call site still never counts
-    # (`_find_definition_open_brace`), so the patterns can be loose
+    # Generic type parameters between the name and the parenthesis are allowed, so many languages' signatures are found.
     tp = r"(?:\s*<[^(){};]*>|\s*\[[^(){};]*\])?"
     word = r"[A-Za-z_$][\w$.]*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?(?:\[\s*\])*"
     return [
@@ -540,36 +501,9 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
         # const foo = (...) => { / let foo = async (...) => { / const f = <T>(x: T): T => {
         re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*(?::[^=;]+?)?=\s*(?:async\s*)?"
                    rf"(?:<[^(){{}};]*>\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}]+?)?\s*=>"),
-        # class method / constructor / free function-style defs in C-like syntax:
-        #   foo(...) {
-        #   async foo(...) {
-        #   static foo(...) {   *gen() {
+        # C-like method and function definitions without a return type (foo(...) {, static foo(...) {).
         re.compile(rf"(?m)^\s*(?:public|private|protected|static|async|final|export|default|\s)*\*?\s*{name}{tp}\s*\("),
-        # C-like method/function WITH a return type (Java/C/C++/Kotlin/etc.):
-        #   public String foo(    static int foo(    void foo(    List<X> foo(    int[] foo(
-        # Allows optional annotations + modifiers, then a return-type token
-        # (identifier with optional generics / array / dotted name), then `foo(`.
-        #
-        # BUGFIX: the generics group used to be a single, non-nesting
-        # `<[^>{}]*>` — fine for `List<X>`, but `[^>]*` stops at the FIRST
-        # `>` it meets, so a NESTED generic return type like
-        # `Map<String, List<Integer>>` (extremely common in real Java —
-        # any Map/Optional/List of a parameterized type) only consumed up
-        # through the INNER closing `>`, left the outer `>` unconsumed
-        # right before the required `\s+`, and the whole pattern failed to
-        # match — meaning `extract_block` couldn't find the method AT ALL
-        # (every other candidate pattern requires the method name to be
-        # the first token on the line, which it isn't when a return type
-        # precedes it). Reproduced: `Map<String, List<Integer>> getData()`
-        # returned "" from extract_block. Two explicit levels of nesting
-        # (a `<...>` whose contents may contain a `<...>` pair that may
-        # itself contain another `<...>` pair — e.g.
-        # Optional<Map<K, List<V>>>) covers the realistic depth ceiling
-        # for a method signature without needing a recursive regex engine.
-        #
-        # A Java method's own type parameters come first (`public <T> T first(`); the return type may be
-        # several words (`unsigned long get(`) or end in a pointer or a reference (`char *dupstr(`); the
-        # name may be qualified (`int Foo::bar(`); Rust's `fn` reads as the "type" before `longest<'a>(`.
+        # C-like definitions with a return type; nested generics are matched to two levels (BUGFIX).
         re.compile(
             rf"(?m)^\s*"
             rf"(?:@[\w.]+(?:\([^)]*\))?\s*)*"
@@ -577,9 +511,7 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
             rf"native|default|transient|volatile|strictfp|export|async|inline|"
             rf"virtual|const|extern|unsafe|suspend|open|override|fun|fn|pub)\s+)*"
             rf"(?:<[^(){{}};]*>\s+)?"
-            # the words of the type on the line (at most four, apart by blanks: `\s` took a newline too, and
-            # the words ran on through the file, 30 s on a long one), then before the name a newline as well
-            # (GNU style: `static int` on a line of its own, the name at the start of the next)
+            # The words of the return type are matched within a line, so a newline does not join them.
             rf"(?:{word}(?:[ \t]*[*&]+[ \t]*|[ \t]+)){{0,3}}{word}(?:\s*[*&]+\s*|\s+)"
             rf"(?:[\w$]+::)*{name}{tp}\s*\("
         ),
@@ -590,8 +522,7 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
                    rf"(?:async\s+)?function\s*\*?\s*[\w$]*\s*\("),
         # Go: type Server struct {   type Set[T comparable] interface {
         re.compile(rf"(?m)^\s*type\s+{name}{tp}\s+(?:struct|interface)\b"),
-        # type declarations in C-like / JVM / Rust syntax:
-        #   public class App {   interface Foo {   struct Bar {   enum E {   record R(   trait T {
+        # Type declarations in C-like, JVM and Rust syntax.
         re.compile(
             rf"(?m)^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:[A-Za-z_$][\w$]*\s+)*?"
             rf"(?:class|interface|struct|enum|trait|record|object|namespace)\s+{name}\b"
@@ -657,9 +588,7 @@ def _extract_brace_block(source: str, target_name: str, lang: str = "") -> str:
     return source[start:end]
 
 
-# Prose strategy (.md/.txt, AUTO-CR-6) locates "block named X" via heading
-# match, falling back to the first-mention paragraph. Fails open (returns ""
-# rather than raising, like extract_block).
+# Prose strategy: finds a block by heading or by its first mention; fails open, like the code strategy.
 
 _HEADING_RE = re.compile(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$")
 
@@ -689,8 +618,7 @@ def _extract_heading_section(source: str, query_norm: str) -> str:
         if text.lower() == query_norm:
             match_idx = i
             break
-    # ...fall back to a substring match either direction (query is a
-    # fragment of the heading, e.g. "the storm" vs "Chapter 3: The Storm").
+    # Falls back to a substring match in either direction, e.g. "the storm" and "Chapter 3: The Storm".
     if match_idx is None:
         for i, (_level, text, _start) in enumerate(headings):
             low = text.lower()
@@ -776,9 +704,7 @@ def extract_prose_section(
     return _extract_entity_paragraphs(source, query_norm, max_paragraphs)
 
 
-# ----------------------------
 # Public API
-# ----------------------------
 
 def extract_block(source: str, target_name: str, file_ext: str) -> str:
     """
@@ -901,10 +827,7 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
     if ext in {".js", ".jsx", ".ts", ".tsx"}:
         items: list[str] = []
 
-        # import defaultName, { a as b, c } from 'x'   import type { Props } from './p'
-        # One statement a match: the clause runs on past a newline only inside its braces. `[^;]+?` ran
-        # across lines, so a side-effect `import './polyfills'` with no semicolon swallowed the next import
-        # ("'./polyfills'\nimport React" for a name, React lost)
+        # An import statement ends at its semicolon or line end, so a bare side-effect import does not swallow the next one (bugfix).
         for m in re.finditer(r"(?m)^[ \t]*import\s+(?:type\s+)?((?:\{[^}]*\}|[^;'\"`{}\n])+?)\s+from\s+['\"`]"
                              r"[^'\"`\n]+['\"`]", source):
             clause = m.group(1).strip()
@@ -943,8 +866,7 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
             else:
                 items.append(path.rstrip("/").split("/")[-1])
 
-        # a group ends at a ")" that starts its line: the first ")" anywhere (one in a comment) cut it there,
-        # and the imports after it were lost
+        # A group ends at a ")" that starts its line, so a ")" inside a comment does not cut the block.
         for block in re.finditer(r"(?ms)^\s*import\s*\((.*?)^[ \t]*\)", source):
             inner = block.group(1)
             for line in inner.splitlines():
@@ -970,8 +892,7 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
             path = m.group(1)
             items.append(path.split(".")[-1])
 
-        # Rust use statements: the path's identifiers, and for `x as y` the name it binds (`as` was listed
-        # as an import, and so was the name it renames)
+        # Rust use: the path identifiers, and for "x as y" the bound name only, not the original.
         for m in re.finditer(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([^;]+);", source):
             inner = re.sub(r"\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)", r"\2", m.group(1).strip())
             parts = re.findall(r"[A-Za-z_][\w]*", inner)
@@ -1025,8 +946,7 @@ def find_references(block: str, file_ext: str) -> list[str]:
 
         return _unique_preserve_order(refs)
 
-    # Generic fallback for brace-based languages:
-    # collect identifiers or dotted names followed by "(" while avoiding keywords.
+    # Generic fallback for brace languages: identifiers or dotted names followed by "(", minus keywords.
     return _find_generic_references(block)
 
 
@@ -1124,19 +1044,7 @@ def _find_block_start_line_fallback(source: str, target_name: str, file_ext: str
                 return j
         return None
 
-    # AUTO-BUG: this used to be `for pat in patterns: m = pat.search(source);
-    # if m: return ...` — the first pattern (in a fixed list order) that
-    # matched ANYWHERE in the file, with no check that a "{" genuinely
-    # follows and no comparison across patterns for which match is actually
-    # earliest/real. A plain call to `target_name(...)` matches the same
-    # "(...)"-shaped patterns a real definition does (see
-    # _find_definition_open_brace's docstring), so a call site appearing
-    # before, after, or instead of the real definition could pre-empt it —
-    # get_context_lines() would then return the lines before the WRONG
-    # location (e.g. before a call site instead of before the actual
-    # definition), silently feeding an LLM misleading "what comes before
-    # this function" context. Reuse the same verified search
-    # _extract_brace_block uses so both agree on where the definition is.
+    # The earliest real definition is used, not the first pattern that matches, so a call site cannot pre-empt it (AUTO-BUG).
     found = _find_earliest_genuine_definition(source, target_name, _LANG_OF_EXT.get(ext, ""))
     if found is None:
         return None

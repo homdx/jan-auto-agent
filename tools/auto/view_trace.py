@@ -170,13 +170,7 @@ def find_trace_file(path_arg: str) -> Path:
     if p.is_file():
         return p
     if p.is_dir():
-        # BUGFIX (audit): f.stat() inside sorted()'s key= was unguarded —
-        # a broken symlink (or a file deleted between glob() and this
-        # stat() call) raised FileNotFoundError mid-sort and crashed this
-        # tool, which exists specifically to diagnose crashed runs. The
-        # sibling analyze_logs.py::find_trace_files fixed this the same
-        # way: fall back to 0 (sorts first/oldest, harmless) instead of
-        # raising.
+        # A deleted or broken-symlink file sorts with mtime 0 instead of crashing the tool.
         def _safe_mtime(f: Path) -> float:
             try:
                 return f.stat().st_mtime
@@ -193,11 +187,7 @@ def find_trace_file(path_arg: str) -> Path:
 
 def load_events(trace_file: Path) -> list[dict]:
     events = []
-    # BUGFIX: a trace file truncated mid-write (crashed/killed run) can end
-    # mid multi-byte UTF-8 character. `errors="replace"` decodes the rest of
-    # the file (substituting U+FFFD for the broken tail) instead of raising
-    # an uncaught UnicodeDecodeError that would discard every event already
-    # read — exactly the crashed-run scenario this tool exists to diagnose.
+    # Decode with errors="replace": a file truncated mid multi-byte character still yields its events.
     with trace_file.open(encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
@@ -208,10 +198,7 @@ def load_events(trace_file: Path) -> list[dict]:
             except json.JSONDecodeError as exc:
                 print(f"  [warn] line {lineno}: {exc}", file=sys.stderr)
                 continue
-            # AUTO-FIX: a line can be valid JSON but not an object (a bare
-            # string, number or array). apply_filters() calls .get() on
-            # every event, so it raised AttributeError deep inside filtering
-            # instead of being reported here, where the bad record is.
+            # Skip non-object JSON lines: apply_filters calls .get() on every event.
             if not isinstance(evt, dict):
                 print(
                     f"  [warn] line {lineno}: expected a JSON object, got "
@@ -240,9 +227,7 @@ def apply_filters(
     if sources:
         src_set = set(sources)
         events = [e for e in events if e.get("source") in src_set]
-    # AUTO-FIX: `if tail and tail > 0` treats 0 as falsy, so `--tail 0`
-    # fell through and returned every event. Test "was --tail given"
-    # separately from "is it positive".
+    # --tail 0 means zero events, not "no limit": test for presence, not positivity.
     if tail is not None:
         events = events[-tail:] if tail > 0 else []
     return events

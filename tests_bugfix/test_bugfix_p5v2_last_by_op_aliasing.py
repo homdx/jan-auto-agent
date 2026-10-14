@@ -73,8 +73,7 @@ def test_mutating_a_last_by_op_row_cannot_reach_the_probe() -> None:
     with pytest.raises((AttributeError, TypeError)):
         row.hits += 1  # would have been tally[0] += 1 under the old dict shape
 
-    # And regardless of the exception above, the probe's own count is
-    # unaffected by anything the caller tried.
+    # The probe's count is unaffected by anything the caller did.
     probe.execute([ProbeOp("facts", "good")])
     assert probe.last_by_op == (ProbeOpTally("facts", 1, 0),)
 
@@ -99,9 +98,7 @@ def test_last_by_op_is_an_ordered_tuple_of_rows() -> None:
     """The contract is a tuple of ProbeOpTally, not a dict — and it is
     ordered by op name, not by first-seen order."""
     probe = _probe(x="module: x\nsignature: x()")
-    # Ask for "read"-shaped, "module"-shaped and "facts"-shaped names in an
-    # order that would NOT be alphabetical if last_by_op merely preserved
-    # insertion order.
+    # Mixed op kinds in non-alphabetical order: results must not depend on insertion order.
     probe.execute([
         ProbeOp("facts", "zzz"),
         ProbeOp("facts", "x"),

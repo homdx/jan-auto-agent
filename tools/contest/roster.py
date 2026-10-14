@@ -54,9 +54,7 @@ from pathlib import Path
 from tools.auto.llm_profile import LlmSettings, resolve_llm_profile
 from tools.config_safe import safe_getfloat, safe_getint
 
-#: KC-41: a malformed on/off key is reported here and the default stands, so the
-#: round's intake never raises on a key that decides whether uncommitted work is
-#: committed for the model.
+#: A malformed on/off key is reported and the default is kept, so intake does not raise (KC-41).
 _log = logging.getLogger("tools.contest.roster")
 
 __all__ = [
@@ -77,8 +75,7 @@ __all__ = [
     "load_roster",
 ]
 
-#: The file that holds the secrets. It is git-ignored: the committed
-#: ``contest.ini`` references ``${CONTEST_GATE_API_KEY}`` instead.
+#: Holds the secrets and is git-ignored; the committed ini refers to ${CONTEST_GATE_API_KEY} instead.
 LOCAL_FILENAME = "contest.local.ini"
 
 #: ``[contest.agent.<name>]`` — the roster section.
@@ -166,20 +163,14 @@ CONTEST_KEYS = (
 #: Every key an agent section may carry.
 AGENT_KEYS = ("model", "kilo_agent", "variant")
 
-#: The three rules the probe sent in every session (PROBE.md): everything
-#: allowed, and the two permissions the contest answers itself. Kept as a tuple
-#: of dicts so a caller comparing against it sees exactly what was sent.
+#: The three permission rules the probe sends in every session (PROBE.md).
 BASE_RULES = (
     {"permission": "*", "pattern": "*", "action": "allow"},
     {"permission": "external_directory", "pattern": "*", "action": "ask"},
     {"permission": "doom_loop", "pattern": "*", "action": "ask"},
 )
 
-#: The gate's profile defaults. ``base_url`` / ``api_key`` / ``model`` are the
-#: fields ``resolve_llm_profile`` requires and never inherits, so they carry no
-#: usable value — a profile that omits one of them fails loudly at load time,
-#: which is what an empty default buys here. ``response_format`` is true, as
-#: the contest's gate profile needs it.
+#: Gate profile defaults; base_url, api_key and model are required and never inherited.
 DEFAULTS_GATE = LlmSettings(
     base_url="",
     api_key="",
@@ -193,12 +184,7 @@ DEFAULTS_GATE = LlmSettings(
 #: ``DEFAULTS_GATE`` under the name the ticket uses for the symbol.
 DEFAULTS = DEFAULTS_GATE
 
-#: The OpenRouter agents' own profile defaults, resolved the same way the gate'
-#: profile is: ``[contest] openrouter_llm_profile`` names an LlmSettings section in
-#: this file. Same shape as ``[contest_gate_llm]``, different taste — a coding
-#: agent wants a wide token budget and free-form output, not the gate's 256-token
-#: JSON verdict. ``model`` is empty on purpose: ``OpenRouterBackend`` gets its
-#: model id per agent from ``AgentSpec``, not from this section.
+#: OpenRouter agent profile defaults; the model id comes per agent, not from this section.
 DEFAULTS_OPENROUTER = LlmSettings(
     base_url="",
     api_key="",
@@ -209,12 +195,7 @@ DEFAULTS_OPENROUTER = LlmSettings(
     response_format=False,
 )
 
-#: KC-79: the draft model's own profile defaults. A ticket writer wants room
-#: for prose — the whole brief, the three collect maps and the ticket's own
-#: format in one reply — so ``max_tokens`` is wide and ``response_format`` is
-#: off: the answer is Markdown, not JSON. ``model`` is empty on purpose, so a
-#: profile section that omits its model fails at load time rather than
-#: silently inheriting the gate's or an agent's id.
+#: Draft model profile defaults: wide max_tokens, Markdown output, no JSON (KC-79).
 DEFAULTS_DRAFT = LlmSettings(
     base_url="",
     api_key="",
@@ -231,11 +212,7 @@ BACKENDS = ("kilo", "openrouter")
 #: ``[a-z0-9][a-z0-9_-]*`` — an agent name becomes a branch and a folder.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
-#: The values ``[contest] workspace_kind =`` accepts. ``clone`` is the default
-#: since KC-59: a local clone has its own ``refs/stash``, index, ``HEAD`` and
-#: branches, so one agent's ``git stash`` can never pop another agent's work
-#: off the stack the repo's worktrees share. ``worktree`` is the pre-KC-59
-#: behaviour, kept for anyone who needs it.
+#: Accepted [contest] workspace_kind values; clone is the default so agents do not share a stash (KC-59).
 WORKSPACE_KINDS = ("clone", "worktree")
 
 #: ``${NAME}`` in a value: expanded from the environment.
@@ -272,10 +249,7 @@ class AgentSpec:
     model_id: str
     kilo_agent: str | None = None
     variant: str | None = None
-    #: KC-56: the model's ``limit.context`` from ``GET /provider``, put here at
-    #: intake (never read from ``contest.ini``); ``None`` = unknown. The runner
-    #: tells a reply cut off by a full context window from one cut off by its
-    #: output budget with it.
+    #: The model's context limit from GET /provider, set at intake; None when unknown (KC-56).
     context_limit: int | None = None
 
     @property
@@ -284,8 +258,7 @@ class AgentSpec:
         return f"{self.provider_id}/{self.model_id}"
 
 
-#: Ticket 212: the bash patterns that must reach the permission handler for the
-#: test cache to see a pytest run at all.
+#: Ticket 212: the bash patterns that must reach the permission handler for the test cache.
 TEST_CACHE_ASK_PATTERNS = ("*pytest*", "*py.test*")
 
 
@@ -303,43 +276,21 @@ class ContestConfig:
     server: str = "spawn"
     max_parallel: int = 3
     max_rework: int = 2
-    #: KC-43: how many legs one round may run. A leg is one whole turn of the
-    #: round on a fresh session in the *same* worktree; the next leg starts only
-    #: for the agents whose leg ended without a READY entry. 1 is today's round,
-    #: byte for byte — no leg number in any path, log line or `state.json`.
+    #: Legs per round; 1 keeps the round exactly as it was (KC-43).
     legs: int = 1
-    #: KC-44: the legs a ticket's own `**Size:**` line gets its round, keyed by
-    #: the size upper-cased — `XS`, `S`, `M` or `L`. `{}` when `[contest]
-    #: legs_by_size` is absent or parses nothing, which is the fail-open rule:
-    #: without data a ticket's size decides nothing, and `[contest] legs`
-    #: — or the `--legs` flag — is what decides, as today. The committed
-    #: contest.ini's default, `XS=1, S=1, M=1, L=3`, changes nothing for the
-    #: sizes the epic actually runs: only L gets a relay.
+    #: Legs per ticket size, from the ticket's Size line; empty means [contest] legs decides (KC-44).
     legs_by_size: dict = field(default_factory=dict)
     max_continues_per_attempt: int = 2
-    #: KC-39: how many sessions one attempt may use in total — the first one and
-    #: every replacement (KC-39's reset for a repeated diff, KC-54's and KC-69's
-    #: swaps). The reset only fires below it; per attempt, not per run, so a
-    #: rework gets the allowance back. 0 turns the reset off, 1 means none.
+    #: Sessions one attempt may use in total; the reset fires below this, 0 turns it off (KC-39).
     max_sessions_per_attempt: int = 2
-    #: KC-42: seconds from a turn's prompt in which the worktree must show some
-    #: sign of life — a modified file or a commit. Past it the agent is nudged
-    #: once per `first_touch_nudges`; past the last nudge with the tree still
-    #: untouched it is reset into a fresh session, and failing that ends
-    #: `DEAD`. 0 turns the whole ticket off, which is today's behaviour byte for
-    #: byte.
+    #: Seconds a turn may run before the worktree must change; past that the agent is nudged or reset (KC-42).
     first_touch_sec: float = 420.0
-    #: KC-42: how many nudges one attempt may send before the escalation. 0
-    #: means the very first deadline is the last one.
+    #: Nudges one attempt may send before escalating; 0 means the first deadline is the last (KC-42).
     first_touch_nudges: int = 1
     turn_timeout_sec: int = 1800
-    #: KC-36: seconds a turn's deadline is pushed, per extension, when the
-    #: worktree's churn has grown since the last deadline. 0 = the turn clock
-    #: is a hard kill again: today's behaviour, no callback asked.
+    #: Seconds the turn deadline is pushed per extension while the worktree is changing; 0 is a hard kill (KC-36).
     turn_extend_sec: int = 600
-    #: KC-36: the hard ceiling for one turn, whatever the churn.
-    #: ``turn_timeout_sec`` plus every extension stops no later than this, so a
-    #: model in an infinite edit loop is bounded.
+    #: Hard ceiling for one turn, whatever the churn, so an endless edit loop is bounded (KC-36).
     turn_max_sec: int = 7200
     idle_event_timeout_sec: int = 300
     max_questions_per_turn: int = 3
@@ -347,172 +298,87 @@ class ContestConfig:
     error_retry_backoff_sec: int = 15
     #: the longest wait between two retries; 0 = no cap (the wait keeps doubling)
     error_retry_max_backoff_sec: int = 60
-    #: KC-75: empty replies in a row sent a continue again without spending
-    #: `max_continues_per_attempt`; 0 = off (an empty reply spends a continue)
+    #: Empty replies in a row that resend continue without spending it; 0 is off (KC-75).
     max_silent_retries: int = 0
     #: KC-75: the longest wait between two of them; 0 = no cap
     silent_retry_max_backoff_sec: int = 120
-    #: one agent's hard limit from its start, whatever the turns add up to; the
-    #: session is aborted as a stall and the tree is scored as it stands. 0 = off
+    #: One agent's hard limit from its start; the session is aborted as a stall. 0 is off.
     agent_max_sec: int = 0
-    #: KC-62: Kilo's own store errors ("Failed to execute statement"): retried in
-    #: the same session on this budget, which the provider's does not touch.
-    #: 0 turns it off — the pre-KC-62 path.
+    #: Retry budget for Kilo store errors in the same session; 0 is the pre-KC-62 path.
     max_local_store_retries: int = 5
     #: KC-62: base backoff for those retries, doubled per retry and jittered ±30 %.
     local_store_retry_backoff_sec: int = 10
-    #: KC-62: intake warns, and the heartbeat names them, when more than this many
-    #: other Kilo processes of the same user share the server's store.
+    #: Other Kilo processes sharing the store above which intake and the heartbeat warn (KC-62).
     neighbour_kilo_warn: int = 4
-    #: KC-64: Kilo retries in a row with no model output before the agent
-    #: ends ERROR provider_unavailable; 0 = off (wait for the turn deadline)
+    #: Retries with no model output before ERROR provider_unavailable; 0 waits for the deadline (KC-64).
     provider_retry_max_attempts: int = 10
-    #: KC-61: a ``session.status`` retry scheduled further out than this many
-    #: seconds is a quota reset, not a blip: the agent ends
-    #: ``ERROR provider_quota`` at once instead of sitting out the silence
-    #: clock. 0 turns it off — today's behaviour, for a provider that names no
-    #: reset time at all.
+    #: Retry delay above this many seconds is a quota reset, so the agent ends at once; 0 turns it off (KC-61).
     provider_retry_max_wait_sec: float = 300.0
-    #: KC-61: ``|``-separated quota phrases, case-insensitive literals, empty
-    #: when unset. Matched against a provider error's text when Kilo names no
-    #: retry time, and against every ``session.error``. Transient texts must
-    #: not live here — they belong to KC-19's retry path.
+    #: Quota phrases matched against provider errors when no retry time is named (KC-61).
     quota_patterns: str = ""
     progress_every_sec: int = 60
-    #: KC-81: seconds of *both* no live agent event and a still kilo-serve.log
-    #: before the heartbeat names the server as hung. 0 turns the check off.
+    #: Seconds with no event and no server log before the server is named hung; 0 is off (KC-81).
     kilo_silent_sec: float = 600.0
-    #: KC-57: the wall-clock budget for one harvest's pytest roots.
-    #: 0 turns it off, which keeps today's unbounded behaviour.
+    #: Wall-clock budget for one harvest's pytest roots (KC-57); 0 keeps it unbounded.
     harvest_budget_sec: int = 900
-    #: KC-41: a turn that ends STALLED/ERROR with a dirty tree and nothing
-    #: committed gets the work committed for it (the deadline commit) and is
-    #: harvested like any other entry. `false` restores the pre-KC-41 path
-    #: byte for byte: no commit, no row, no harvest.
+    #: Commit a dirty tree of a stalled or errored turn, so it is harvested like any other (KC-41).
     deadline_commit: bool = True
-    #: KC-58: how many whole pytest roots run at once, round-wide — an agent's
-    #: own `pytest tests -n 4` and the runner's harvest alike. 0 turns the
-    #: queue off: every reply is immediate and `_TEST_RUNS_LOCK` is the only
-    #: serialization, which is today's behaviour byte for byte.
+    #: Whole pytest roots that may run at once, round-wide; 0 turns the queue off (KC-58).
     agent_suite_slots: int = 1
-    #: ticket 212: a repeated pytest run on an unchanged tree is answered from the
-    #: round's own earlier run (a `reject` carrying one line). Off until a round
-    #: has judged it. `test_cache_share`: `round` = one agent's run serves any
-    #: other's on an identical tree, `agent` = only its own. `test_cache_llm`: a
-    #: command the parser cannot read is put to the gate model once.
+    #: Answer a repeated pytest run on an unchanged tree from the round's earlier run (ticket 212).
     test_cache: bool = False
     test_cache_share: str = "round"
     test_cache_llm: bool = True
-    #: KC-58: how long one holder may keep the next waiter out. Past it the
-    #: holder stops blocking and the next waiter goes in beside it — its
-    #: pytest is not killed, because the agent is still running. 0 is no
-    #: ceiling, which is how one slow suite blocks the round for its whole run.
+    #: Seconds one suite holder may block the next waiter; 0 means no ceiling (KC-58).
     agent_suite_max_sec: int = 900
-    #: KC-65: pytest-xdist workers each agent gets. 0 = by the agents that are
-    #: live: one alone gets every core, up to `pytest_workers_few_agents` get
-    #: `pytest_workers_few`, more get `pytest_workers_min` — always at most
-    #: `cpu_count`. A value above 0 is fixed for the round.
+    #: Pytest-xdist workers per agent; 0 scales with the live agents, capped at cpu_count (KC-65).
     pytest_workers_per_agent: int = 0
     #: KC-65: up to this many live agents each get `pytest_workers_few`.
     pytest_workers_few_agents: int = 4
     #: KC-65: the workers each of those gets.
     pytest_workers_few: int = 4
-    #: KC-65: the workers each gets above `pytest_workers_few_agents`; 1 is
-    #: allowed, 0 is rejected.
+    #: Workers for each agent above pytest_workers_few_agents; 1 is allowed, 0 is refused (KC-65).
     pytest_workers_min: int = 2
-    #: KC-65: temp dir for the agents' commands, `${VAR}` expanded; "" =
-    #: inherit TMPDIR. The round makes `<agent_tmpdir>/contest-<NN>` under it
-    #: mode 0700 before the server spawns, and removes that dir — never the
-    #: parent — when the round ends.
+    #: Temp dir for agent commands, expanded from ${VAR}; the round makes and removes its own subdir (KC-65).
     agent_tmpdir: str = ""
     tmp_roots: tuple[str, ...] = ()
     deny_commands: tuple[str, ...] = ()
     ask_commands: tuple[str, ...] = ()
     gate_llm_profile: str = ""
     gate_max_calls_per_session: int = 20
-    #: KC-55: how many times a gate call that hit a rate limit or a dropped
-    #: connection is retried by ``tools.llm_stream.request_completion``'s own
-    #: loop. 0 is today's fail-fast gate.
+    #: Retries of a rate-limited or dropped gate call; 0 is the fail-fast gate (KC-55).
     gate_retries: int = 4
-    #: KC-55: the wait between two of those retries when the server names no
-    #: ``Retry-After``. KC-66: 30 s, 5 tries in all — a free gate key shared
-    #: with eight agents needs more than 10 s to cool.
+    #: Wait between gate retries when the server gives no Retry-After (KC-55, KC-66).
     gate_retry_wait_sec: float = 30.0
-    #: KC-55: a ``Retry-After`` longer than this is a quota reset, not a blip:
-    #: the call fails at once rather than waiting it out.
+    #: A Retry-After longer than this is a quota reset, so the call fails at once (KC-55).
     gate_retry_max_wait_sec: float = 60.0
-    #: KC-55: one whole gate decision, every retry and re-ask, stops no later
-    #: than this many seconds in. ``policy.gate_worst_case_sec`` adds
-    #: ``GATE_TIMEOUT`` to it and intake compares that with
-    #: ``idle_event_timeout_sec``.
+    #: Hard stop for one whole gate decision, retries included (KC-55).
     gate_deadline_sec: float = 600.0
     out_dir: str = "contest-out"
     rounds_dir: str = "../rounds"
-    #: KC-67: the context overflow a model has already given, remembered for
-    #: ``context_memory_days`` so the next session of it compacts before it
-    #: overflows again. A path; ``""`` is the default next to the rounds' output
-    #: — ``<out_dir>/../context-memory.json``, shared by every round.
+    #: Remembered context overflows file; empty means next to the rounds output (KC-67).
     context_memory_file: str = ""
-    #: KC-67: how many days an overflow is remembered. 0 turns the memory off,
-    #: which is today's behaviour: every round overflows again the same way.
+    #: Days an overflow is remembered (KC-67); 0 turns the memory off.
     context_memory_days: float = 7.0
-    #: KC-67: the fill, as a percent of the remembered size, at which the runner
-    #: compacts a session whose model has no limit of its own. Kilo compacts
-    #: those on its own; 0 turns the runner's compact off.
+    #: Fill percent at which the runner compacts a session whose model has no known limit (KC-67).
     compact_at_percent: float = 80.0
-    #: KC-40: the fill, as a percent of a known size, at which the runner asks a
-    #: session that already holds an uncommitted diff to write a short summary of
-    #: it, before the compact that shrinks the history explaining the diff. 90 by
-    #: default — above ``compact_at_percent``, so at the default numbers the ask
-    #: only fires of a session the compact would take anyway, and it goes out
-    #: first. Lower it to ask of a session the compact has not reached yet. Read
-    #: from the ini with the same fail-open rule as ``compact_at_percent``.
+    #: Fill percent at which a session with an uncommitted diff is asked for a summary first (KC-40).
     summary_at_percent: float = 90.0
-    #: KC-10: the context window the runner assumes for a model the provider
-    #: declares no ``limit.context`` for — the free-tier custom providers, which
-    #: send only a name and their reasoning. The fill divides the last reply's
-    #: ``input`` plus ``cache.read`` by the Kilo limit, else the remembered one,
-    #: else this, so such a model still earns a compact instead of overflowing.
-    #: 0 = no number at all: the pre-KC-10 behaviour, every prompt goes out
-    #: unsized — and the default. The number is a guess the ticket wrote for
-    #: 32k free tiers; the ones without a limit today are ~250k windows (round
-    #: 49: agnes and mimo sessions at 220–284k), which a guess of 32 768 would
-    #: compact every ~26k tokens and whose asks KC-69 would refuse at the same
-    #: point. KC-67's memory sizes those from their own overflow instead; set
-    #: this only for a roster of models known to be that small.
+    #: Fallback context window for a model with no declared limit; 0 means unsized, the default (KC-10).
     context_limit_fallback: int = 0
-    #: Round 145: the smallest window a remembered ``last_ok`` may size a model
-    #: by, in tokens; a provider refusal of a session smaller than this is never
-    #: read as an overflow by size words alone. 0 = the floor off.
+    #: Smallest window a remembered size may be used for; smaller refusals are not read as overflow (round 145).
     context_min_window: int = 32000
-    #: Round 145/149: "close enough to the wall to be evidence", as a percent.
-    #: (1) a refusal with no words about a size is an overflow when the session
-    #: holds at least this percent of its window. (2) a loose memory record
-    #: sizes the model only when its last_ok is at least this percent of the
-    #: window Kilo declares (or of context_limit_fallback when Kilo declares
-    #: nothing). 0 = both readings off.
+    #: Percent of the window at which a refusal or a remembered size counts as full (round 145, 149).
     context_full_refusal_percent: float = 60.0
-    #: Round 145: seconds between two reads of a running turn's fill, for a
-    #: model sized by the memory or the fallback rather than by Kilo; at
-    #: ``compact_at_percent`` the turn is stopped and the next prompt compacts.
-    #: 0 = off. Both defaults stay: this dataclass default is 0, so a config
-    #: built in code is the watch off and the round is unchanged; the ini read
-    #: below and the shipped ``contest.ini`` both default to 10, so a loaded
-    #: round arms it.
+    #: Seconds between fill reads for a model sized by memory or fallback; 0 is off (round 145).
     context_watch_sec: float = 0.0
-    #: KC-59: how ``prepare_round`` builds each agent's checkout — one of
-    #: ``WORKSPACE_KINDS``. ``clone`` (the default) makes a fresh local clone
-    #: per agent, ``worktree`` keeps the pre-KC-59 worktree per agent.
+    #: Workspace kind for each agent's checkout, one of WORKSPACE_KINDS (KC-59).
     workspace_kind: str = "clone"
-    #: KC-49: the reasoning variant of every agent that names none — a name
-    #: (``high``, ``max``), ``highest`` (the top one that answers, probed at
-    #: intake) or ``default`` (no variant sent: the provider's own default).
+    #: Reasoning variant of agents that name none: a name, highest or default (KC-49).
     variant: str = "highest"
     #: KC-11: how many days a probe result is trusted before re-probing. 0 = always re-probe.
     probe_ttl_days: int = 7
-    #: KC-70: a named variant that answered intake's ``say: hello`` is not asked
-    #: again for ``probe_memory_hours``. A path; ``""`` is
-    #: ``<out_dir>/probe-memory.json``, next to KC-67's memory.
+    #: Path of the probe memory file; empty means next to the context memory (KC-70).
     probe_memory_file: str = ""
     #: KC-70: how long a named variant's answer is trusted. 0 = ask every time.
     probe_memory_hours: float = 24.0
@@ -520,45 +386,27 @@ class ContestConfig:
     probe_parallel: int = 8
     #: KC-70: of those, at most this many against one provider; 0 = no cap.
     probe_per_provider: int = 3
-    #: KC-70: a probe refused for a passing reason (timeout, 429, empty reply)
-    #: is asked this many more times; 0 = one ask, as before.
+    #: Re-asks of a probe refused for a passing reason; 0 is one ask only (KC-70).
     probe_retries: int = 2
-    #: KC-70: the wait before the first re-ask; the n-th waits n times this,
-    #: and twice that after a rate limit.
+    #: Wait before the first re-ask; each later one waits longer, and a rate limit doubles it (KC-70).
     probe_retry_wait_sec: float = 15.0
     agents: tuple[AgentSpec, ...] = ()
     gate_settings: LlmSettings = field(default_factory=lambda: DEFAULTS_GATE)
     #: The backend the round runs on: one of ``BACKENDS``, one value per round.
     backend: str = "kilo"
-    #: The OpenRouter agents' own credential, resolved from
-    #: ``[contest] openrouter_llm_profile``. ``None`` unless ``backend ==
-    #: "openrouter"``, where a profile that does not resolve is a
-    #: ``RosterError`` at load time — the gate profile above is the safety
-    #: gate's model, never the competing agents' credential, so the two are
-    #: read separately.
+    #: Credential of the OpenRouter agents; set only for the openrouter backend (separate from the gate).
     openrouter_settings: LlmSettings | None = None
     #: The profile name that ``openrouter_settings`` was resolved from.
     openrouter_llm_profile: str = ""
-    #: KC-79: the profile name behind ``[contest] draft_llm_profile`` — the
-    #: model ``contest draft`` writes tickets with. ``draft_settings`` is its
-    #: resolved form and ``None`` when the key is unset or the section cannot
-    #: be resolved: ``run`` never fails on it, only ``draft`` refuses.
+    #: Profile name for the ticket drafting model; the draft refuses when it is missing (KC-79).
     draft_llm_profile: str = ""
     draft_settings: LlmSettings | None = None
-    #: The profile behind ``[contest] draft_review_llm_profile`` — the model that
-    #: reviews a drafted ticket. Unset, the review stays on the gate's model; set,
-    #: tickets get their own writer/reviewer pair and the round's gate is not
-    #: touched. ``draft_review_settings`` is ``None`` when the key is unset or the
-    #: section cannot be resolved (fail-open, like the draft's own profile).
+    #: Profile of the model that reviews a drafted ticket; unset means the gate model reviews it.
     draft_review_llm_profile: str = ""
     draft_review_settings: LlmSettings | None = None
-    #: KC-79: the character budget each collect map gets in the draft's prompt.
-    #: A budget the operator sets, never a model window hard-coded in the code.
+    #: Character budget for each collect map in the draft prompt; an operator setting (KC-79).
     draft_map_budget: int = 8000
-    #: KC-80: the rework rounds the gate model's review may send the draft back
-    #: for. 3 = one review, then at most three rounds of problems -> rework ->
-    #: lint -> review; 0 = one review with no rework at all. Read fail-open the
-    #: way the map budget is: a typo keeps the default, it does not stop a draft.
+    #: Rework rounds the review may send a draft back for; 0 means one review only (KC-80).
     draft_review_rounds: int = 3
 
     def session_rules(self) -> list[dict]:
@@ -574,11 +422,7 @@ class ContestConfig:
         for pattern in self.ask_commands:
             rules.append({"permission": "bash", "pattern": pattern, "action": "ask"})
         if self.test_cache:
-            # Ticket 212: Kilo only asks for a bash command that matches an ask
-            # rule, so a plain `pytest tests -q` (no redirect, no `tee`) never
-            # reaches the permission handler — and the cache with it. Round 199
-            # showed 1 ask in 11 pytest runs. The policy answers these `once`
-            # as it does any command inside the worktree.
+            # Kilo asks only for bash commands that match an ask rule, so the test cache needs these patterns (ticket 212).
             for pattern in TEST_CACHE_ASK_PATTERNS:
                 if pattern not in self.ask_commands:
                     rules.append({"permission": "bash", "pattern": pattern, "action": "ask"})
@@ -587,9 +431,7 @@ class ContestConfig:
         return rules
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# reading
-# ─────────────────────────────────────────────────────────────────────────────
+# Reading
 
 def _new_parser() -> configparser.ConfigParser:
     """The parser shape for a roster file.
@@ -734,10 +576,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         backend = parser.get("contest", "backend", fallback="kilo").strip()
     gate_profile = parser.get("contest", "gate_llm_profile", fallback="").strip()
     openrouter_profile = parser.get("contest", "openrouter_llm_profile", fallback="").strip()
-    # The OpenRouter profile's own ${ENV} references are expanded only when the
-    # backend needs them: a kilo round must not fail to load the roster because
-    # an OpenRouter key is not exported, and the committed contest.ini carries
-    # the ${CONTEST_OPENROUTER_API_KEY} reference for a machine that has one.
+    # The OpenRouter profile's ${ENV} references are expanded only for the openrouter backend (CONTEST_OPENROUTER_API_KEY).
     profiles = [gate_profile]
     if backend == "openrouter":
         profiles.append(openrouter_profile)
@@ -864,8 +703,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         raise RosterError(f"[contest] turn_extend_sec must be >= 0, got {turn_extend}")
     if turn_max < 0:
         raise RosterError(f"[contest] turn_max_sec must be >= 0, got {turn_max}")
-    # KC-36: the ceiling cannot sit below the floor — an unextendable turn
-    # would be killed before it had existed.
+    # The ceiling cannot sit below the floor, or the turn would be killed before it could extend (KC-36).
     if turn_max < turn_timeout:
         raise RosterError(
             f"[contest] turn_max_sec must be >= turn_timeout_sec — got "
@@ -878,10 +716,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     except ValueError as exc:
         raise RosterError(f"[contest] gate_llm_profile: {exc}") from exc
 
-    # KC-65: a worker count that is zero would hand every agent's `-n auto` a
-    # number it cannot use, so the two bands that feed it refuse 0; `1` is
-    # allowed for `pytest_workers_min` (a crowded box beats a slow one) and
-    # negatives are refused for all four.
+    # Worker counts must be positive, except pytest_workers_min may be 1 (KC-65).
     pytest_workers_per_agent = limit("pytest_workers_per_agent", 0)
     pytest_workers_few_agents = limit("pytest_workers_few_agents", 4)
     pytest_workers_few = limit("pytest_workers_few", 4)
@@ -897,9 +732,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     if pytest_workers_min < 1:
         raise RosterError(f"[contest] pytest_workers_min must be >= 1, got {pytest_workers_min}")
 
-    # KC-67: the context memory — the two numbers a round reads before it prompts
-    # into a session it cannot size itself. Both fall back to the default, and 0
-    # is what either means when it is set to it: no memory, no compact.
+    # Memory settings read fail-open; 0 turns the memory or the compact off (KC-67).
     context_memory_days = num("context_memory_days", 7.0)
     # KC-70: the same fail-open read for the probe memory's age — 0 is off
     probe_memory_hours = num("probe_memory_hours", 24.0)
@@ -912,24 +745,16 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         if value < 0:
             raise RosterError(f"[contest] {key} must be >= 0, got {value}")
     compact_at_percent = num("compact_at_percent", 80.0)
-    # KC-40: the summary threshold rides with the compact's — same fail-open
-    # read, same default rule, 0 turns the summary off
+    # The summary threshold is read like the compact's: fail-open, with 0 turning the summary off (KC-40).
     summary_at_percent = num("summary_at_percent", 90.0)
-    # KC-10: the window the runner assumes for a model the provider declares no
-    # `limit.context` for. Read like the memory's numbers: 0 turns it off, and
-    # a typo is 0 too — the rule stands down rather than sizing every prompt
-    # against a nonsense number.
+    # Fallback window for models with no declared limit; a typo reads as 0, the rule off (KC-10).
     context_limit_fallback = int(num("context_limit_fallback", 0))
-    # Round 145: the two numbers that keep a plan's cap out of the memory — the
-    # same fail-open read; `context_memory.min_window` / `full_refusal_percent`
-    # apply the default rule to whatever comes through
+    # Memory floor and refusal percent for remembered sizes, read the same fail-open way (round 145).
     context_min_window = int(num("context_min_window", 32000))
     context_full_refusal_percent = num("context_full_refusal_percent", 60.0)
     context_watch_sec = num("context_watch_sec", 10.0)
 
-    # KC-58: 0 slots is "the queue is off", so a negative count is refused
-    # rather than read as 0; a negative ceiling would unblock every holder at
-    # once, which is also a typo rather than a setting.
+    # Suite slots: 0 means the queue is off; a negative count is refused (KC-58).
     agent_suite_slots = limit("agent_suite_slots", 1)
     test_cache_share = scalar("test_cache_share", "round")
     if test_cache_share not in ("round", "agent"):
@@ -942,9 +767,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
 
     openrouter_settings = None
     if backend == "openrouter":
-        # the agents' own credential: required only for that backend, resolved
-        # the same way the gate's is and only then, so a kilo round never needs
-        # an OpenRouter key to load the roster
+        # The OpenRouter credential is required only for that backend, so a kilo round never needs it (KC-79).
         if not openrouter_profile:
             raise RosterError(
                 "[contest] backend = openrouter needs openrouter_llm_profile — "
@@ -957,12 +780,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         except ValueError as exc:
             raise RosterError(f"[contest] openrouter_llm_profile: {exc}") from exc
 
-    # KC-79: the draft's own profile. Unlike the gate's and OpenRouter's, a
-    # typo here must not refuse a round that never drafts — the resolution is
-    # fail-open and `contest draft` is the one command that reports it,
-    # naming the key. The section's own ${ENV} references are expanded only
-    # when the key is set, so a ${CONTEST_DRAFT_API_KEY} nobody exported
-    # costs nothing to a kilo round.
+    # The draft profile is read fail-open, since only contest draft reports it (KC-79).
     draft_profile = scalar("draft_llm_profile", "")
     draft_settings = None
     if draft_profile:
@@ -974,8 +792,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         except (ValueError, RosterError) as exc:
             _log.warning("[contest] draft_llm_profile: %s — `contest draft` will refuse to run",
                          exc)
-    # The ticket reviewer's own profile, resolved the same fail-open way: a typo
-    # here stops `contest draft` only, never a round.
+    # The draft reviewer's profile is read fail-open, so a typo stops contest draft only (KC-79).
     draft_review_profile = scalar("draft_review_llm_profile", "")
     draft_review_settings = None
     if draft_review_profile:
@@ -990,9 +807,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     draft_map_budget = safe_getint(parser, "contest", "draft_map_budget", fallback=8000)
     if draft_map_budget <= 0:
         draft_map_budget = 8000
-    # KC-80: 0 is a real value — one review, no rework — so only a negative
-    # count is a typo, and the typo keeps the default rather than disabling the
-    # review. `draft` never refuses a round on either number.
+    # 0 is a real value (one review, no rework); a negative count keeps the default (KC-80).
     draft_review_rounds = safe_getint(parser, "contest", "draft_review_rounds", fallback=3)
     if draft_review_rounds < 0:
         draft_review_rounds = 3
@@ -1026,8 +841,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         provider_retry_max_wait_sec=seconds("provider_retry_max_wait_sec", 300.0),
         quota_patterns=scalar("quota_patterns", ""),
         progress_every_sec=limit("progress_every_sec", 60),
-        # KC-81: fail-open — absent is the 600 s default, a negative or a
-        # non-finite value is 0 (off), and a malformed key never raises.
+        # Absent is the 600 s default; negative or non-finite is 0 (off), and a bad key never raises (KC-81).
         kilo_silent_sec=_kilo_silent_sec(parser),
         harvest_budget_sec=max(0, limit("harvest_budget_sec", 900)),
         deadline_commit=flag("deadline_commit", True),
@@ -1109,8 +923,7 @@ def load_roster(path, *, overlay=None, backend=None) -> ContestConfig:
 
     parser = _new_parser()
     try:
-        # utf-8-sig: Notepad writes contest.local.ini with a BOM, which configparser read as
-        # "File contains no section headers" (and without an encoding, in the locale's codec)
+        # utf-8-sig, since Notepad writes a BOM that configparser would read as a missing section.
         read = set(parser.read([str(source) for source in sources], encoding="utf-8-sig"))
     except configparser.Error as exc:
         raise RosterError(f"{exc}") from exc

@@ -44,8 +44,7 @@ logger = logging.getLogger(__name__)
 
 COLLECTOR_VERSION = "2"  # V10: real parameter lists in `signature` — forces one full rebuild
 
-#: Default directories skipped when discovering files for a manifest —
-#: mirrors the spirit of `[search] skip_dirs` used elsewhere in this repo.
+#: Directories skipped when discovering manifest files, as [search] skip_dirs does elsewhere.
 DEFAULT_SKIP_DIRS = frozenset(
     {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv", ".collect"}
 )
@@ -69,8 +68,7 @@ def skip_dirs_from_config(
     if config is None:
         return frozenset(out)
     try:
-        # raw: a directory name may hold a `%`, which interpolation would refuse
-        # (`InterpolationSyntaxError` is a configparser.Error, not a ValueError)
+        # Raw, since a % in a directory name would fail interpolation.
         raw = config.get("collect", "skip_dirs", raw=True, fallback="")
     except (AttributeError, TypeError, ValueError, configparser.Error):
         return frozenset(out)
@@ -259,11 +257,7 @@ def is_dirty(root: Path, exclude_dir: Optional[Path] = None) -> bool:
     `capture_provenance`, which callers should use instead of calling
     `get_git_sha`/`is_dirty` directly, to make this ordering hard to get
     wrong."""
-    # --no-optional-locks: a plain `status` takes .git/index.lock to write back
-    # refreshed stat data, and the 10 s timeout above ends it with SIGKILL — no
-    # cleanup, so the lock stays and every later `git add` in the repo exits
-    # 128 (a 32-worker stress run: all four task commits of one controller test
-    # lost). With the flag, status never writes the index, so it never locks it.
+    # --no-optional-locks: status never writes .git/index.lock, so a timeout kill cannot leave it behind.
     status = _run_git(root, "--no-optional-locks", "status", "--porcelain")
     if not status:
         return False
@@ -272,14 +266,11 @@ def is_dirty(root: Path, exclude_dir: Optional[Path] = None) -> bool:
     try:
         rel = Path(exclude_dir).resolve().relative_to(Path(root).resolve())
     except ValueError:
-        # Collect dir configured outside the repo — nothing it writes can
-        # show up in this repo's porcelain output, so no filtering needed.
+        # A collect dir outside the repo cannot appear in its porcelain output, so no filter is needed.
         return True
     prefix = rel.as_posix().rstrip("/") + "/"
     for line in status.splitlines():
-        # Porcelain v1: 2-char status, space, then the path. Renames are
-        # `old -> new`; either side under the collect dir is the
-        # collector's own doing.
+        # Porcelain v1 line: two status chars, a space, then the path (rename: "old -> new").
         payload = line[3:] if len(line) > 3 else ""
         paths = payload.split(" -> ") if " -> " in payload else [payload]
         for p in paths:
@@ -322,14 +313,7 @@ class Manifest:
     git_sha: Optional[str]
     dirty: bool
     file_hashes: Dict[str, str] = field(default_factory=dict)
-    # CC-13: the effective `skip_dirs` in force when this manifest was built
-    # (`effective_skip_dirs`, i.e. DEFAULT_SKIP_DIRS plus `[collect] skip_dirs`).
-    # A manifest built with a different list hashes a different file set, so
-    # `is_fresh` reports the tree as stale the moment the setting changes —
-    # the change is visible in the manifest rather than buried in a
-    # thousand-file diff. An absent key is an older manifest, whose list was
-    # the default, so `from_dict` reads it back as exactly that: nothing
-    # about an existing artifact has to change for this.
+    # Effective skip_dirs when built; a changed list reads as stale, and old manifests read as default.
     skip_dirs: Tuple[str, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
@@ -343,33 +327,19 @@ class Manifest:
         }
 
     def to_json(self, *, indent: int = 2) -> str:
-        # sort_keys for the same reason Pass A JSON is canonicalized
-        # (COLLECT-3): a stable, diffable manifest.
+        # sort_keys keeps the manifest stable and diffable, as Pass A JSON is (COLLECT-3).
         return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Manifest":
-        # AUTO-MANIFEST-GUARD-2: d["collector_version"]/d["generated_at"]
-        # used to raise a raw KeyError on a truncated/malformed manifest.
-        # Every read_manifest() call site already catches (OSError,
-        # ValueError) and treats the manifest as stale/absent — KeyError
-        # isn't a ValueError subclass, so it slipped past that existing
-        # guard at 3 of 4 call sites and crashed instead. Raising
-        # ValueError here (json.JSONDecodeError from from_json() below is
-        # already a ValueError subclass, so that half was already covered)
-        # makes every existing call site's guard work as originally
-        # intended, with no call-site changes needed.
+        # Malformed manifests raise ValueError, which every read_manifest() call site already catches (AUTO-MANIFEST-GUARD-2).
         try:
             collector_version = d["collector_version"]
             generated_at = d["generated_at"]
         except KeyError as exc:
             raise ValueError(f"manifest is missing required field {exc}") from exc
         except TypeError as exc:
-            # BUGFIX (audit): a valid-JSON-but-non-dict payload (a list,
-            # null, a bare number) raises TypeError on d["..."], not
-            # KeyError — every call site's (OSError, ValueError) guard
-            # missed this the same way it missed KeyError before the fix
-            # above. Re-raise as ValueError so those guards work here too.
+            # A valid JSON non-object also raises ValueError, so the call-site guards catch it (BUGFIX).
             raise ValueError(f"manifest is not a JSON object: {exc}") from exc
         return cls(
             collector_version=collector_version,
@@ -377,9 +347,7 @@ class Manifest:
             git_sha=d.get("git_sha"),
             dirty=bool(d.get("dirty", False)),
             file_hashes=dict(d.get("file_hashes", {})),
-            # An older manifest has no key: its list was the default. Anything
-            # present but not a list of strings is left as the default too —
-            # a half-written manifest is stale, never an unreadable one.
+            # A missing or malformed skip_dirs key falls back to the default; the manifest is stale, not unreadable.
             skip_dirs=tuple(sorted(d["skip_dirs"]))
             if isinstance(d.get("skip_dirs"), (list, tuple))
             and all(isinstance(x, str) for x in d["skip_dirs"])
@@ -581,12 +549,5 @@ def refresh_manifest(root: Path, previous: Manifest) -> Manifest:
     discovered = set(discover_files(root))
     tracked = set(previous.file_hashes.keys())
     file_list = sorted(discovered | tracked)
-    # BUGFIX (audit): this stamped previous.collector_version instead of
-    # the current COLLECTOR_VERSION — since is_fresh() rejects any
-    # manifest whose collector_version != COLLECTOR_VERSION, a manifest
-    # refreshed after a collector-version bump was immediately stale
-    # again despite refresh_manifest's own purpose being to bring it
-    # up to date. build_manifest's own default already covers the normal
-    # case; passed explicitly here so this fix's intent isn't lost as
-    # implicit.
+    # Stamp the current COLLECTOR_VERSION, not the previous one, so a refreshed manifest is fresh (BUGFIX).
     return build_manifest(root, file_list, collector_version=COLLECTOR_VERSION)

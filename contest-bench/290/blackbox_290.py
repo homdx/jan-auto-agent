@@ -107,8 +107,7 @@ def main() -> int:
         try:
             import harvest_report
             truth = harvest_report.load_truth(str(out))
-            # a finding with one truth is read; one that two claims about one place settled REAL and FALSE is
-            # left unscored (review batch m: the last row was its truth, the order of the rows decided)
+            # A finding with one truth is read; one where two claims about the same place settled REAL and FALSE is left unscored (review batch m).
             said = {}
             for r in rows:
                 said.setdefault(r["finding"], set()).add(r["truth"])

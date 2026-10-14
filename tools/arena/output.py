@@ -29,22 +29,10 @@ SECRET_WORDS = frozenset({"key", "apikey", "token", "secret", "password", "passw
 _CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _SEPARATORS = re.compile(r"[_\-.]+")
 
-# `scheme://user:pass@host` — the whole userinfo part goes, user included, up to
-# the LAST `@` before the path: a password may hold an unencoded `@` (bug 171).
-# Bug 170: the scheme starts only where a scheme-character run starts — without
-# the look-behind every position of a long word was a new start, O(n²). The
-# userinfo class stops at `/`, `?`, `#` and whitespace, so a run is bounded by
-# the next `/` and the greedy match backtracks inside it only.
+# Strips user:pass from URLs up to the last @ before the path (bug 171); a scheme-start look-behind avoids O(n^2) (bug 170).
 _URL_USERINFO = re.compile(
     r"(?<![A-Za-z0-9+.\-])(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)[^/?#\s]+@")
-# `api_key=…`, `token=…` in a query string or a form-style line. The value runs
-# to the next separator, so `&x=1` after it survives. `apikey` and `passwd` are
-# here too, so a value `mask` hides by its key cannot leak by its text.
-# Bug 169: the secret word may be the last `_`/`-`/`.` part of a longer name
-# (`OPENAI_API_KEY=`, `access_token=`) — `\b` alone never fires after a `_`.
-# One flat character class for the name (no nested repetition: a long line is
-# linear, never a backtracking stall); `_kv_sub` then checks the name *ends* in
-# a secret word, so `monkey=` and `tokens=` stay as they are.
+# Masks key=value secrets by key name, including OPENAI_API_KEY-style names (bug 169); a value runs to the next separator.
 _KV_PAIR = re.compile(r"(?<![A-Za-z0-9_.\-])(?P<k>[A-Za-z0-9_.\-]+=)(?P<v>[^&\s;,]+)")
 _KV_SECRET_LAST = frozenset({"key", "apikey", "token", "secret", "password", "passwd"})
 
@@ -127,16 +115,13 @@ def refuse(msg: str) -> int:
     return 2
 
 
-# ── AR-14: the flow block — "you are here, the error is here" ─────────────────
-#: The three marks of a flow step: done, the step that failed, not reached.
+#: The three flow-step marks: done, failed, not reached.
 MARKS = {"ok": "[✓]", "fail": "[✗]", "todo": "[ ]"}
 
 #: A refusal line's width, so `where:` wraps and the continuation lines align.
 REFUSE_WIDTH = 78
 
-#: The label column's width: `ticket:` plus one space is the widest label, so
-#: `where:` takes two trailing spaces and `flow:` three — every value starts ten
-#: characters in, in the same column (spec 150 §7).
+#: Label column width: values start in the same column (spec 150 §7).
 LABEL_WIDTH = len("ticket:") + 1
 
 

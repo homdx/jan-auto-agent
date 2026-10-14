@@ -83,8 +83,7 @@ class TestDirectChatHistoryLoss:
         with patch("main.request_completion", side_effect=RuntimeError("API down")):
             orch.execute_direct_chat("C user")
 
-        # The failed turn must not appear in history, AND the messages
-        # that were trimmed during the append must be restored.
+        # The failed turn is not in history, and the trimmed messages are restored.
         assert orch._direct_chat_history == original, (
             "History after a failed API call should be the pre-append "
             f"state, got {orch._direct_chat_history}"

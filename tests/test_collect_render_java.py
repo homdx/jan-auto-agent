@@ -42,8 +42,7 @@ def test_module_map_renders_java_module_headers():
 
 def test_module_map_renders_java_method_signatures_not_python_syntax():
     md = render_module_map(_modules())
-    # Java's own signature shape (return type shown, Java params) —
-    # never the Python placeholder shape ast_facts.extract_symbols uses.
+    # Java signature shape (return type, Java params), not the Python placeholder.
     assert "`sum(): int`" in md
     assert "`greet(String name): String`" in md
     # never a Python-style "(...)" placeholder signature for a Java symbol
@@ -63,9 +62,7 @@ def test_module_map_renders_sealed_interface_permits_clause():
 
 def test_module_map_renders_java_private_flag_correctly():
     md = render_module_map(_modules())
-    # capitalize is private -> "yes" in the private column; greet is
-    # public -> "no". Both are plain table cells, checked via the
-    # qualname anchor immediately preceding them in the row.
+    # capitalize is private and greet is public; checked via the qualname anchor in each row.
     assert "`com/example/Greeter.java:Greeter.capitalize`" in md
     assert "`com/example/Greeter.java:Greeter.greet`" in md
 

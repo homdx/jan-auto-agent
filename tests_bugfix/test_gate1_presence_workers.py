@@ -158,11 +158,7 @@ class TestParallel:
         accepted, rejected = _run(_make_filter(presence_workers="3"), repo, prov, cands)
         elapsed = time.monotonic() - t0
         assert prov.peak == 3
-        # FL-1 (round 84): `peak == 3` above is the claim — three calls really
-        # were in flight at once. The wall-clock comparison was a second,
-        # weaker proof of the same thing with 0.6 s of slack, which a loaded
-        # box does not honour; keep it as a "did not serialise badly" guard
-        # with room, not as the evidence.
+        # Wall-clock is a loose guard: peak == 3 is the proof that calls ran concurrently.
         assert elapsed < 0.15 * 6 * 10
         # outcomes consumed in candidate order regardless of completion order
         assert [c.title for c in accepted] == [f"Add input validation {i}" for i in (0, 2, 4)]

@@ -149,8 +149,7 @@ def test_a_list_subject_clears_the_landed_without_commit_flag(repo, capsys):
 
 
 def test_a_file_named_like_the_branch_does_not_make_git_log_ambiguous(repo, capsys):
-    # This repo's own `./arena` script sits next to branch `arena`: a bare
-    # `git log arena` was "ambiguous argument" and `issue list` refused.
+    # The repo's own `./arena` script sits next to branch `arena`: a bare `git log arena` was ambiguous and `issue list` refused.
     _write(repo / "arena", "#!/bin/sh\n")
     _tracked(repo, "14-x.md", "X", "open")
     _commit(repo, "14: the work")
@@ -205,8 +204,7 @@ def test_view_refusals(repo, capsys):
 
 
 def test_land_is_implemented(capsys):
-    # `issue create` landed in round 145 (AR-7); `issue land` is AR-8, and it has
-    # a handler now — a missing NN is a usage error, not the placeholder's message.
+    # `issue land` has a handler now; a missing NN is a usage error, not the placeholder's message.
     code, _, err = _run(capsys, "issue", "land")
     assert code == 2 and "NN" in err and "not implemented" not in err
     code, out, _ = _run(capsys, "issue", "land", "--help")

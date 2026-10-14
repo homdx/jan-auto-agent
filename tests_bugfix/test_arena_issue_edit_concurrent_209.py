@@ -46,11 +46,7 @@ body of {NN}
 MINE = "\nedited by me\n"
 THEIRS = "\nother change\n"
 
-# The $EDITOR: first the competing change ($COMPETE), then the operator's own edit.
-#   commit — append THEIRS to $COMPETE_REL in the checkout and commit it there
-#   write  — append THEIRS to $COMPETE_REL in the checkout, nothing committed
-#   plumb  — one commit on $COMPETE_BRANCH that appends THEIRS to $COMPETE_REL
-#            (a temporary index: the branch is not checked out anywhere)
+# Fake $EDITOR: competing change first, then the operator's edit. The competing change is made by commit, write or plumb.
 EDITOR = f"""#!{sys.executable}
 import os, subprocess, sys, tempfile
 path, mode = sys.argv[1], os.environ.get("COMPETE", "")

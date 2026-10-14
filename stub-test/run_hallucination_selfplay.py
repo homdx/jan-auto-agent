@@ -63,9 +63,7 @@ def hallucinating_llm_call(system: str, user: str) -> str:
     can read the real facts block back out of it to target our lies at a
     real module -- exactly what a genuinely confused/creative local model
     would have in front of it when it started inventing things."""
-    # Recover which module this call is for from the facts block's
-    # "path: ..." line (first line of `facts` block, not first line of the
-    # whole prompt -- the prompt starts with a fixed intro sentence first).
+    # The module comes from the facts block's first "path: ..." line, not the prompt's first line (the prompt opens with a fixed intro).
     module_path = None
     for line in user.splitlines():
         if line.startswith("path: "):
@@ -74,8 +72,7 @@ def hallucinating_llm_call(system: str, user: str) -> str:
     module = by_path.get(module_path)
 
     sentences = [
-        # 1. HONEST-BUT-UNFALSIFIABLE generic sentence — no citation, so
-        #    Pass C has nothing to check; documents the accepted gap.
+        # First sentence: generic, no citation, so Pass C has nothing to check (accepted gap).
         "This module is part of the collect-mode ground-truth pipeline.",
         # 2. FAKE-SYMBOL — invented, exists nowhere.
         f"It relies on {module_path}:_totally_invented_helper_fn for caching.",
@@ -103,10 +100,7 @@ def hallucinating_llm_call(system: str, user: str) -> str:
     return reply
 
 
-# ── run the real pipeline, scoped to TARGET_SUBDIR via a throwaway root ────
-# action_collect scans the whole `root` tree, so to keep this self-play run
-# fast we point it at a tmp copy containing only tools/collect/*.py plus the
-# handful of modules the cross-module lie needs to resolve against.
+# Run the real pipeline, scoped to TARGET_SUBDIR via a throwaway root: action_collect scans the whole root, so point it at a tmp copy with only tools/collect/*.py and the modules the cross-module lie needs.
 import shutil
 import tempfile
 

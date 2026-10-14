@@ -73,11 +73,7 @@ def main():
     row = {c: str(a.get(c) or "").replace("\n", "; ").strip() for c in COLUMNS}
     out, t = a["out"], row["truth"].upper()
 
-    # Who wrote this row has to be trustworthy — it is how a disputed verdict
-    # gets traced back to whoever claimed a check they may not have run. Models
-    # leave it blank, or paste a neighbour's name from an example. The filename
-    # is the one reliable signal (truth-<name>.csv), so derive from it and warn
-    # loudly rather than silently accept a wrong attribution.
+    # The row's author must be trustworthy: it attributes a disputed verdict. Models leave it blank or copy a name from an example, so derive it from the filename (truth-<name>.csv) and warn rather than accept a wrong attribution.
     stem = os.path.basename(out).rsplit(".", 1)[0]
     from_name = stem[6:] if stem.lower().startswith("truth-") else ""
     if from_name:

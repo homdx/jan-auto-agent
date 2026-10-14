@@ -156,7 +156,5 @@ class TestLastMissingContextStringGuard:
             "approved": True,
             "missing_context": ["SomeSymbol"],
         })
-        # An approved verdict: last_missing_context should not matter to the
-        # caller, but the fix must not break the approved path either.
-        # The attribute exists and is a list.
+        # An approved verdict: the attribute exists and is a list, and the approved path still works.
         assert isinstance(v.last_missing_context, list)

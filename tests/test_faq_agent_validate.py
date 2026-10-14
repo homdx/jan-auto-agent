@@ -22,12 +22,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# We import the module under test.  llm_stream is a real module in the archive
-# copy; stub it so the tests run without a live model.
+# llm_stream is stubbed, so the tests run without a live model.
 import importlib, types
 
-# Build a minimal llm_stream stub if the real one is importable; otherwise
-# create a placeholder so FaqAgent can always be imported.
+# Uses a placeholder llm_stream when the real one is not importable, so FaqAgent always imports.
 try:
     from tools.llm_stream import strip_think          # noqa: F401 – real import OK
     _HAS_REAL_LLMSTREAM = True
@@ -60,9 +58,7 @@ import importlib.util
 
 _FAQ_AGENT_PATH = PROJECT_ROOT / "faq_agent.py"
 
-# Prefer the local copy of faq_agent.py (the modified one under test).
-# Register it in sys.modules under "faq_agent_mod" so patch() can resolve
-# the dotted path "faq_agent_mod.request_completion".
+# Load the local faq_agent.py under the name the patch targets (faq_agent_mod).
 if _FAQ_AGENT_PATH.exists():
     spec    = importlib.util.spec_from_file_location("faq_agent_mod", _FAQ_AGENT_PATH)
     faq_mod = importlib.util.module_from_spec(spec)
@@ -105,9 +101,7 @@ def _make_agent(
     return agent
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 1.  _ensure_model
-# ════════════════════════════════════════════════════════════════════════════
+# 1. _ensure_model
 
 class TestEnsureModel:
     """_ensure_model() hits /api/pull for ollama; is a no-op for openai."""
@@ -162,9 +156,7 @@ class TestEnsureModel:
         assert "api/api" not in req.full_url
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 2.  _validate_answer
-# ════════════════════════════════════════════════════════════════════════════
+# 2. _validate_answer
 
 _RC_PATH = "faq_agent_mod.request_completion" if _FAQ_AGENT_PATH.exists() else "tools.faq_agent.request_completion"
 
@@ -211,9 +203,7 @@ class TestValidateAnswer:
             assert agent._validate_answer("q?", "a", "c") is False
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 3.  answer() — full flow
-# ════════════════════════════════════════════════════════════════════════════
+# 3. answer(): full flow
 
 class TestAnswerFlow:
     """Integration-level tests for the rewritten answer() method."""
@@ -293,8 +283,7 @@ class TestAnswerFlow:
         )
         agent._ensure_model = MagicMock()
 
-        # Call 1: inference → answer text
-        # Call 2: validation → VALID
+        # Call 1 is the inference (an answer); call 2 is the validation (VALID).
         with self._patch_rc(["Go to Settings → Reset password.", "VALID"]):
             result = agent.answer("How do I reset my password?", stream=False)
 
@@ -340,9 +329,7 @@ class TestAnswerFlow:
         assert result == "NOPE"
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 4.  Ini / config wiring
-# ════════════════════════════════════════════════════════════════════════════
+# 4. Ini and config wiring
 
 class TestIniConfig:
     """Verify that agents.ini keys are wired up correctly in __init__."""
@@ -390,9 +377,7 @@ class TestIniConfig:
         assert agent.validate_max_tokens     == 64
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 5.  Recursive knowledge loading
-# ════════════════════════════════════════════════════════════════════════════
+# 5. Recursive knowledge loading
 
 class TestRecursiveKnowledge:
     """_load_knowledge() must walk sub-folders, not just the top level."""
@@ -515,9 +500,7 @@ class TestExtractKeywords:
         assert len(kw) > 0
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 7.  _rank_candidates
-# ════════════════════════════════════════════════════════════════════════════
+# 7. _rank_candidates
 
 class TestRankCandidates:
     """Coverage-first (unique keywords matched), then popularity (total hits)."""
@@ -547,8 +530,7 @@ class TestRankCandidates:
             ("node-exporter/README.txt", ""),
             ("other/README.txt",         "node exporter install"),
         ]
-        # file1: unique=2 (node,exporter in path), total=2  -> 200_002
-        # file2: unique=3 (node,exporter,install in content), total=3 -> 300_003
+        # The file with more unique keyword hits ranks first (scores 200_002 and 300_003).
         ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
         assert ranked[0][0] == "other/README.txt"
 
@@ -576,9 +558,7 @@ class TestRankCandidates:
             ("ops/file3.txt", "ansible-playbook prometheus.yml"),
         ]
         ranked = agent._rank_candidates(docs, ["ansible-playbook", "prometheus"])
-        # file3: unique=2, total=2  -> score 200_002
-        # file1: unique=1, total=3  -> score 100_003
-        # file2: unique=1, total=2  -> score 100_002
+        # Expected order: file3, file1, file2, by the unique and total scores.
         names = [n for n, _, _ in ranked]
         assert names[0] == "ops/file3.txt", (
             "Expected ops/file3.txt first (2 unique kw hits), "
@@ -666,9 +646,7 @@ class TestRankCandidates:
         assert score == agent._SCORE_MULTIPLIER + 1, f"blank keyword inflated score to {score}"
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# 8.  answer() smart-search flow
-# ════════════════════════════════════════════════════════════════════════════
+# 8. answer(): smart-search flow
 
 class TestSmartSearchFlow:
     _KB  = "Q: How install node exporter?\nA: Run: apt install prometheus-node-exporter"
@@ -690,8 +668,7 @@ class TestSmartSearchFlow:
 
     def test_smart_search_finds_nested_file(self, tmp_path):
         agent = self._agent(tmp_path)
-        # Call 1: keyword extraction  → keywords
-        # Call 2: per-candidate answer → answer text
+        # Call 1 extracts the keywords; call 2 answers the candidate.
         with patch(_RC_PATH, side_effect=['["node","exporter","install"]', self._ANS]):
             result = agent.answer("How install node exporter?", stream=False)
         assert result == self._ANS
@@ -710,9 +687,7 @@ class TestSmartSearchFlow:
         agent.smart_search  = True
         agent._ensure_model = MagicMock()
 
-        # "other.txt" scores 0 against keywords ["node","exporter"] and is
-        # never tried in Stage 1.  Only node-exporter.txt is tried; when it
-        # returns NOT FOUND the agent falls straight to the full-KB fallback.
+        # other.txt scores 0 and is never tried; only node-exporter.txt is, and NOT FOUND falls back to the full KB.
         with patch(_RC_PATH, side_effect=[
             '["node","exporter"]',   # keyword extraction
             "NOT FOUND",             # candidate (node-exporter.txt) fails
@@ -772,9 +747,7 @@ class TestSmartSearchFlow:
         assert result == self._ANS
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  Regression — review fixes (double-print, scoring, not-found, keywords)
-# ════════════════════════════════════════════════════════════════════════════
+# Regression: review fixes (double print, scoring, not-found, keywords)
 
 class TestReviewRegressions:
     def test_stream_false_emits_nothing_to_stdout(self, tmp_path, capsys):
@@ -875,9 +848,7 @@ if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
 
 
-# ════════════════════════════════════════════════════════════════════════════
-#  Regression — auto_pull / remote-endpoint pull handling (404 noise)
-# ════════════════════════════════════════════════════════════════════════════
+# Regression: auto_pull and remote-endpoint pull handling (404 noise)
 
 class TestAutoPull:
     """`_ensure_model` must not POST /api/pull to a remote/hosted gateway

@@ -93,10 +93,7 @@ def classify_delta(base: Optional[dict], head: Optional[dict], *, gone: bool = F
         if unanimous_true(head):
             return STILL
         return UNCLEAR
-    # NEW needs the base side to say FALSE (a plurality is enough, unanimity is not asked): a claim the
-    # voters could not settle at base (TRUE with a dissenter, UNSURE, SPLIT) is not "new" at head. Round
-    # 285's live run (10 free voters) labelled two claims that were true all along NEW under the looser
-    # "not unanimous TRUE"; over all 120 triples of those voters the rule below gave 0 wrong.
+    # NEW needs the base side to say FALSE; a claim the voters could not settle at base is not new (round 285 check).
     if unanimous_true(head) and base and base.get("verdict") == "FALSE":
         return NEW
     return UNCLEAR

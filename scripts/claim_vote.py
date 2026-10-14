@@ -70,8 +70,7 @@ KILO_CONFIG = Path.home() / ".config" / "kilo" / "kilo.jsonc"
 KILO_AUTH = Path.home() / ".local" / "share" / "kilo" / "auth.json"
 VERDICTS = ("TRUE", "FALSE", "UNSURE")
 
-# Same job, three wordings: the first sentence swaps its words around, so the
-# prompts differ from the very first token and no prefix cache can match.
+# Each opener is worded differently, so no prompt shares a prefix that a cache could match.
 _OPENERS = (
     "Judge each of the following claims as TRUE, FALSE or UNSURE.",
     "Each of the following claims must be judged by you: TRUE, FALSE or UNSURE.",
@@ -116,8 +115,7 @@ PACER = Pacer()
 
 
 SECTION = "claim_vote"
-# A header-less urllib request says "Python-urllib/3.x", which Cloudflare in front of some
-# free providers (publicai: HTTP 403, error code 1010) refuses before the model is reached.
+# A urllib request needs an explicit User-Agent, since some providers refuse the default one.
 USER_AGENT = "jan-auto-agent"
 
 
@@ -151,8 +149,7 @@ def strip_jsonc_comments(text: str) -> str:
     while i < n:
         ch = text[i]
         if ch == '"':
-            # a string literal, copied whole: a backslash escapes the next
-            # character (``\"`` does not end it), and nothing in it is a comment
+            # A string literal is copied whole, since a backslash escapes the next character.
             j = i + 1
             while j < n and text[j] != '"':
                 j += 2 if text[j] == "\\" else 1
@@ -189,14 +186,12 @@ def _kilo_settings(ref: str) -> LlmSettings:
     try:
         base = config["provider"][provider]["options"]["baseURL"]
     except (KeyError, TypeError, IndexError):
-        # `[]`, `{"provider": {}}` or a provider without options: one line too, a
-        # TypeError was the traceback `--add-profiles` still printed
+        # A malformed provider entry is a one-line refusal, not a traceback (--add-profiles).
         raise ValueError(f"{KILO_CONFIG}: no provider {provider!r} with "
                          "options.baseURL") from None
     if not isinstance(base, str):
         raise ValueError(f"{KILO_CONFIG}: provider {provider!r} options.baseURL is not a string")
-    # a plain-string entry ({"openrouter": "sk-…"}) was a TypeError traceback past --add-profiles'
-    # one-line refusal; the key itself is never named
+    # A plain-string entry is refused in one line too, without naming the key (--add-profiles).
     try:
         auth = json.loads(KILO_AUTH.read_text(encoding="utf-8"))
     except json.JSONDecodeError as err:
@@ -247,8 +242,7 @@ def add_profiles(refs: list[str], root: Path) -> list[str]:
     names, add, owner = [], "", {}
     for ref in refs:
         name = "claim_vote_llm." + re.sub(r"[^a-z0-9]+", "_", ref.lower()).strip("_")
-        # the check read only the file as it was before this call: one ref twice (or gpt-4.1
-        # and gpt-4-1) wrote the section twice, and read_ini then failed every later run
+        # The duplicate check reads the ini as it is after this call, so the section is not written twice.
         if owner.setdefault(name, ref) != ref:
             raise ValueError(f"{owner[name]!r} and {ref!r} both map to [{name}]; pass one of them")
         if name in names:
@@ -289,8 +283,7 @@ def build_prompt(claims: list[str], run: int, seed: int,
 def parse_votes(text: str, order: list[int]) -> dict[int, str]:
     """Model reply -> {original claim index: verdict}; garbage gives {}."""
     text = text or ""
-    # judge's bounded tries (the head and the tail of the reply, a work budget): the CLAIM-1 path
-    # had judge.py's RecursionError too, and lost an answer past its first 400 `[`
+    # The judge's bounded tries cover the head and tail of the reply, so no answer is lost (CLAIM-1).
     for rows in cc_judge.json_values(text, "[", strict=True):
         if not isinstance(rows, list):
             continue
@@ -397,16 +390,14 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
         finally:
             sem.release()
             calls[0] += 1
-            # a live run is minutes long and the report comes at the end: one line a request,
-            # so the log shows which voter is alive and how far it has got
+            # One progress line per request, so a live run shows which voter is alive.
             print(f"[progress] {ref} run{run} request {calls[0]} "
                   f"{time.monotonic() - started:.0f}s", file=sys.stderr, flush=True)
 
     calls, replies = [0], [0]
     got = cc_judge.ask_with_packs(items, run, seed, complete, batch=batch,
                                   code_batch=code_batch, fixed=fixed)
-    # requests: made with a pacer slot; replies: answered (garbage included). Gate 1's vote tells a
-    # voter that never replies from one whose request found no free slot (`Gate1Vote._note_voter`)
+    # Requests and replies are counted apart, so a voter that never replies is visible.
     out = {"model": ref, "run": run, "votes": got["votes"], "accepted": got["accepted"],
            "rejected": got["rejected"], "requests": calls[0], "replies": replies[0]}
     if got["errors"]:
@@ -417,10 +408,7 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
 
 
 MIN_COMMITTED = 3   # models that must commit (TRUE/FALSE) before a verdict stands
-#: CC-11: when a verdict is accepted (``unanimous``). ``all``: every voter of the run committed,
-#: to one verdict (the rule until CC-10's Gate 1 set says otherwise). ``committed``: at least the
-#: quorum committed and the committed agree; an abstainer (UNSURE, no vote on this claim, a quote
-#: the code rejected) does not block. A dissent among the committed blocks under both.
+#: CC-11 accept rules: "all" (every voter committed, one verdict) or "committed" (the quorum committed and agrees).
 ACCEPT_RULES = ("all", "committed")
 DEFAULT_ACCEPT = "all"
 
@@ -496,10 +484,7 @@ def tally(claims: list[dict], results: list[dict],
     results = [{**r, "votes": {int(k): v for k, v in r["votes"].items()},
                 **({"accepted": {int(k): v for k, v in r["accepted"].items()}}
                    if "accepted" in r else {})} for r in results]
-    # a model with no vote at all in any run (dead, out of its free plan, a 404) is not a voter:
-    # counted, it made "every voter committed" false for every claim, and a run with one dead
-    # model decided 0 of 80 (round 280, run B). A lost batch or a silent run of a live model
-    # still counts against unanimity: that model did vote elsewhere.
+    # A model with no vote in any run is not a voter, so it cannot block unanimity (round 280).
     voters = {r["model"] for r in results if r["votes"]} or {r["model"] for r in results}
     for i, c in enumerate(claims):
         per_model: dict[str, list[str]] = {}
@@ -516,12 +501,7 @@ def tally(claims: list[dict], results: list[dict],
             verdict = "SPLIT"
         else:
             verdict = decided[0][0]
-        # the acceptance rule of the runbook: every voter committed, all to one verdict.
-        # ``voters`` is every model that produced any result; a voter with no vote
-        # on this claim (silent, lost batch, unreadable reply) makes unanimous False.
-        # CC-11 `committed`: that last clause dropped — with five voters one UNSURE blocked the
-        # claim for all, so more voters settled fewer claims (132 of 150 at five, 91 at nine;
-        # 146 at both under this rule, 0 wrong). A dissent still blocks: len(decided) == 1.
+        # Accept rule: unanimous with a quorum; a dissent blocks, but an abstainer does not (CC-11 committed rule).
         unanimous = (len(decided) == 1 and committed >= quorum
                      and (accept == "committed" or committed == len(voters)))
         if meta is not None:
@@ -576,9 +556,7 @@ def prepare_target(claims: list[dict], target: Target, budget: PackBudget,
         pack = None
         if kind != "world":
             if collect and not model[1]:
-                # CC-3's collect facts (callers, contracts, risk) were never built on the voter's
-                # path: build_pack takes a model, nothing passed one. Target.collect never raises
-                # (a repository collect cannot model is a warning and an absent model).
+                # CC-3: collect facts reach the voter's pack; a repository collect cannot model is an absent model.
                 model[:] = [target.collect(), True]
             pack = build_pack(text, resolved, view, model=model[0], base=base,
                               head=target.sha if base else None, budget=budget)
@@ -659,8 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.add_profiles:
-        # Bug 210/48: Kilo's files unreadable, unparsable or without the
-        # provider is one refusal line on stderr and exit 2, not a traceback.
+        # Unreadable or unparsable Kilo files are a one-line refusal with exit 2 (bug 210/48).
         try:
             names = add_profiles(args.add_profiles, args.repo_root)
         except (ValueError, OSError, KeyError) as exc:
@@ -670,8 +647,7 @@ def main(argv: list[str] | None = None) -> int:
         for name in names:
             print(f"[{name}] in {roster.LOCAL_FILENAME}")
         return 0
-    # options that only mean something with --target were accepted and ignored without it;
-    # --expect-sha is a guard, so it silently guarded nothing
+    # Options that only mean something with --target are refused without it.
     if not args.target:
         given = [f"--{k.replace('_', '-')}" for k in TARGET_ONLY if getattr(args, k) not in (None, False)]
         if given:
@@ -684,8 +660,7 @@ def main(argv: list[str] | None = None) -> int:
     batch = given_or(args.batch, get("batch", int, 10))
     per_provider = given_or(args.per_provider, get("per_provider", int, 2))
     interval = given_or(args.interval, get("interval_sec", float, 4.0))
-    # check_counts saw the options only: `batch = 0` in the ini was range()'s ValueError on the
-    # CLAIM-1 path (the --target path clamps it), per_provider = 0 a pacer nothing passes
+    # Counts are checked as given: zero is refused where it would break range() or the pacer (CLAIM-1).
     for key, value, least in (("batch", batch, 1), ("per_provider", per_provider, 1),
                               ("interval_sec", interval, 0)):
         if value < least:
@@ -701,16 +676,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.claims or not voters:
         ap.error("need claims.json and voters: --profiles, --models, or [claim_vote] llm_profiles")
     if len(voters) < MIN_COMMITTED:
-        # Bug 210/46: below the quorum no claim can ever be accepted — `tally`
-        # needs MIN_COMMITTED committed models — and the table was all UNSURE
-        # with no word why. One line says so before the run; the run goes on
-        # (its votes are still worth reading) and the exit code is unchanged.
+        # Below the quorum no claim can be accepted; say so before the run, which goes on.
         print(f"claim_vote: {len(voters)} voters, quorum is {MIN_COMMITTED}: "
               "no claim can be accepted", file=sys.stderr)
 
     raw = json.loads(args.claims.read_text(encoding="utf-8"))
-    # the object form ({"claims": [...]}, claim_diff's and the benches') was iterated as a dict:
-    # its keys `set`, `base_sha`, `note`, `claims` were voted on as claims, exit 0
+    # The object form of the claims file is read as a list of claims, not as a dict.
     if isinstance(raw, dict) and isinstance(raw.get("claims"), list):
         raw = raw["claims"]
     if not isinstance(raw, list) or not all(
@@ -718,8 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"{args.claims}: not a claims file (a list of claims, or {{\"claims\": [...]}}, "
                  "each a string or an object with a \"claim\")")
     claims = [c if isinstance(c, dict) else {"claim": c, "truth": None} for c in raw]
-    # nothing to vote on is no vote: `[]` ran both runs and exited 0 ("verdicts: {}"), and a blank claim
-    # was sent to every voter as a real request, paid and UNSURE
+    # An empty claim list is refused, and a blank claim is never sent to a voter.
     if not claims:
         ap.error(f"{args.claims}: no claims in it")
     blank = [i for i, c in enumerate(claims, 1) if not c["claim"].strip()]
@@ -732,8 +702,7 @@ def main(argv: list[str] | None = None) -> int:
     with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
         results = list(pool.map(lambda j: ask(j[0], texts, j[1], args.seed, parser,
                                               args.timeout, batch, args.fixed_prompt), jobs))
-    # CC-1: --symbols-root names the repo the claims are about, so its anchors are
-    # resolved there; without it the old regex rule decides needs_code.
+    # With --symbols-root, anchors are resolved in that repo; otherwise the regex rule decides (CC-1).
     view = cc_anchors.PathRepoView(args.symbols_root) if args.symbols_root else None
     table = tally(claims, results, lf._repo_symbols(args.symbols_root or args.repo_root), view=view,
                   accept=args.accept)
@@ -750,9 +719,7 @@ def main(argv: list[str] | None = None) -> int:
     for t in table:
         print(f"[{t['verdict']:10}]{'*' if t['unanimous'] else ' '}truth={t['truth']} {t['all_votes']} {t['claim'][:90]}")
     if claims and results and all(r.get("error") and not r["votes"] for r in results):
-        # every voter failed (a wrong key, no network, a dead endpoint): votes.json says so, and
-        # the exit says so too — it was 0, and run_claim_check.sh went on to an all-UNSURE table.
-        # A voter that answered and said nothing usable is a result, not a failed run.
+        # Every voter failed (wrong key, no network, dead endpoint): reported, and the exit code says so.
         print(f"claim_vote: no voter returned a vote ({len(results)} runs, every one an ERROR)",
               file=sys.stderr)
         return 1
@@ -782,8 +749,7 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
     with target:
         for warning in target.warnings:
             print(f"claim_vote: warning: {warning}", file=sys.stderr)
-        # --base is resolved once, here, and the sha is what votes.json records: a ref name
-        # re-resolved by claimcheck_truth.py after the branch moved rebuilt another diff
+        # --base is resolved once, so the recorded sha is the one that voted (CC-1).
         base_sha = None
         if args.base:
             try:
@@ -824,9 +790,7 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
         print(f"[{t['verdict']:10}]{'*' if t['unanimous'] else ' '}{t['kind']:5} truth={t['truth']} "
               f"{t['all_votes']} {t['claim'][:90]}")
     if claims and results and all(r.get("error") and not r["votes"] for r in results):
-        # every voter failed (a wrong key, no network, a dead endpoint): votes.json says so, and
-        # the exit says so too — it was 0, and run_claim_check.sh went on to an all-UNSURE table.
-        # A voter that answered and said nothing usable is a result, not a failed run.
+        # Every voter failed (wrong key, no network, dead endpoint): reported, and the exit code says so.
         print(f"claim_vote: no voter returned a vote ({len(results)} runs, every one an ERROR)",
               file=sys.stderr)
         return 1

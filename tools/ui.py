@@ -31,10 +31,7 @@ class Spinner:
             sys.stdout.write(f"\r{self.frames[self.idx % len(self.frames)]} {self.message}...")
             sys.stdout.flush()
         except (BrokenPipeError, OSError):
-            # AUTO-UI-GUARD-1: stdout piped somewhere that closed early
-            # (`| head`, a disconnected terminal, ...) — every future call
-            # would fail identically, so stop the background thread
-            # instead of spinning forever on a dead pipe.
+            # Stdout closed early (e.g. | head): stop the thread instead of spinning on a dead pipe.
             self.running = False
             return
         self.idx += 1
@@ -97,10 +94,7 @@ def stream_tracker():
             sys.stdout.write(t)
             sys.stdout.flush()
         except (BrokenPipeError, OSError):
-            # AUTO-UI-GUARD-1: stdout piped somewhere that closed early —
-            # cosmetic streaming output only; the underlying LLM call and
-            # its accumulated result are unaffected, so swallow and keep
-            # tracking token stats rather than crashing mid-stream.
+            # Stdout closed early: streaming output is cosmetic, so keep tracking tokens and do not crash.
             pass
 
     def stats() -> str:

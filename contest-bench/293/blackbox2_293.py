@@ -57,8 +57,7 @@ def runs(spec: str) -> list:
     return list(spec)
 
 
-# case -> {model: per-run replies}.  Three runs each.  A model missing from a case answers T on every run.
-# (what each case is, and its expected outcome, is in EXPECT below)
+# case -> {model: per-run replies}, three runs each. A model missing from a case answers T on every run; EXPECT below gives each case's outcome.
 MATRIX = {
     1: {},                                                                      # everyone TRUE
     2: {"delta-4": "UUU", "eps-5": "UUU"},                                      # three TRUE, two abstain

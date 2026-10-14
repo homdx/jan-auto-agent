@@ -76,9 +76,7 @@ COMPLETE_JSON = json.dumps(
     {"files": [{"path": PATH, "content": "def f():\n    return 1\n"}]}
 )
 NO_JSON = "Sorry, I cannot produce that file — could you clarify the acceptance check?"
-# Unterminated string, no closing brace: the decode error is "Unterminated
-# string" and the text does not end with "}", so _parse_response calls it a
-# truncation — the shape that climbs the RUN-4 ladder.
+# Unterminated string with no closing brace: a truncation, which climbs the RUN-4 ladder.
 CUT_OFF_JSON = '{"files": [{"path": "pkg/mod.py", "content": "def f():\\n    return '
 
 TASK = {"id": "AUTO-T5", "title": "module", "instruction": "rewrite pkg/mod.py",
@@ -234,9 +232,7 @@ class ClockShim:
 
 @pytest.fixture(autouse=True)
 def no_sleep(monkeypatch):
-    # Autouse: [collect] error_retry_wait_sec defaults to 60 s and every
-    # transport retry sleeps it — with the real sleep this file took ~3
-    # minutes under xdist and a full minute per test standalone.
+    # Autouse: no real retry sleep; the default 60 s wait would take minutes under xdist.
     slept = []
     monkeypatch.setattr(inner_loop_mod.time, "sleep", lambda s: slept.append(s))
     return slept
@@ -609,9 +605,7 @@ class TestOuterLoopLeavesTodo:
     def test_the_shared_deadline_gets_the_seconds_back(self, tmp_path, monkeypatch):
         clock = FakeClock(0.0)
         monkeypatch.setattr(outer_loop_mod, "time", ClockShim(_real_time, clock))
-        # Round 1 spends 12 s inside a dead coder call and gives them back;
-        # round 2 then runs. Without the credit the 12 s would have hit the
-        # 10 s budget and blocked the task before round 2.
+        # Round 1 spends 12 s in a dead coder call and is credited back, so round 2 is not blocked by the 10 s budget.
         inner = FakeInnerLoop(
             [_failed_result("boom", deadline_credit_s=12.0),
              InnerLoopResult(task_id="AUTO-T5", passed=True, attempts_used=1)],
@@ -619,8 +613,7 @@ class TestOuterLoopLeavesTodo:
         )
         st = _state(tmp_path)
         res = OuterLoop(inner, st, max_rounds=5).run_task(TASK, tmp_path)
-        # 12 s per round × 2 rounds; the round-1 credit is what let round 2
-        # start (12 s of spend against a 10 s budget).
+        # 12 s per round over two rounds; the round-1 credit lets round 2 start.
         assert clock.now == 24.0
         assert res.passed is True and res.rounds_used == 2
         assert inner.calls == 2
@@ -630,11 +623,7 @@ class TestOuterLoopLeavesTodo:
 
     def test_the_persisted_ledger_does_not_keep_the_dead_socket_minutes(
             self, tmp_path, monkeypatch):
-        # The live case: 80 minutes on a silent socket, every retry dead, task
-        # left todo. RUN-2's ledger (deadline_started_at.txt) is fed from the
-        # session's wall clock, so without the credit the next run would open
-        # the task with its whole max_task_seconds already consumed and stop
-        # before a single call.
+        # Live case: 80 minutes on a silent socket. The session's wall clock must not charge the next run for it.
         clock = FakeClock(0.0)
         shim = ClockShim(_real_time, clock)
         shim.time = clock          # the ledger is wall clock, not monotonic

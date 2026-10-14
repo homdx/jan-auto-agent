@@ -59,8 +59,7 @@ _LINE_END = ("\r\n", "\n", "\r")
 
 # ------------------------------------------------------------------ keyword tokens
 
-# Every pattern below is linear: bounded or non-nested quantifiers, no alternation that
-# can re-match the same span (CC-1's lesson: extraction is run on hostile text).
+# Patterns are linear: bounded or non-nested quantifiers, no alternation that re-matches a span (CC-1).
 _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
 _BACKTICK = re.compile(r"`([^`\n]{1,80})`")
 _DQ = re.compile(r'"([^"\n]{1,%d})"' % MAX_LITERAL)
@@ -405,9 +404,7 @@ def _condensed(f: _File, start: int, end: int, head_end: int, claim: str, why: s
         for a, b in _windows(body, claim, budget, width):
             shown.append((h + 2 + a, h + 2 + b))
         if len(shown) == 1:
-            # no window: the claim names nothing in particular here (or only a token on every
-            # line, dropped as noise). A 220-line body was shown as its signature alone, so the
-            # voter judged the function without one line of it; show its first and last lines.
+            # No window and nothing shown: a 220-line body would show its signature alone, so show the first and last lines.
             shown += [(h + 2 + a, h + 2 + b) for a, b in _ends(body, budget, width)]
     return _piece(f, start, end, shown, why, index)
 

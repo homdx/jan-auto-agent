@@ -128,14 +128,7 @@ class TestGate1ForwardsFlagToBuildChatRequest:
         assert "response_format" not in payload
 
 
-# ── Regression: unguarded config reads crash on malformed values ──────────────
-#
-# Gate1Filter.__init__ wraps most config reads in try/except ValueError, but
-# three were left unguarded:
-#   * [api_{active}] num_ctx (getint)          — ValueError on non-numeric
-#   * [api] response_format (getboolean)      — ValueError on non-boolean
-#   * [api] think_effort_enabled (getboolean)  — ValueError on non-boolean
-# Each must fall back to its default instead of crashing Gate1Filter.__init__.
+# Regression: malformed num_ctx, response_format and think_effort_enabled fall back to defaults.
 
 
 class TestGate1MalformedConfigDefaults:

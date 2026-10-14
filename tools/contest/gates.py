@@ -51,23 +51,16 @@ __all__ = [
 #: The gate-1 file the round is scored on — `_shrink` must stay byte-identical.
 BRIDGE = "tools/auto/collect_bridge.py"
 
-#: The committer email of the runner's own deadline commit (KC-41). Here, the
-#: module both `runner.py` and `harvest.py` import, so the harvest can tell that
-#: commit from the agent's by the commit itself — on a `--resume`, in a replay
-#: or by hand — without importing the runner, which imports the harvest.
+#: Committer email of the runner's deadline commit, so harvest can tell it from the agent's (KC-41).
 DEADLINE_COMMIT_EMAIL = "contest@localhost"
 
 #: Four separate invocations — combining the roots collides in conftest.
 TEST_ROOTS = ["tests", "tests_bugfix", ".smoke_tests", ".regression_tests"]
 
-#: FL-8: the root a tier directory can be a pure symlink view onto. A tier root
-#: whose every entry links into it is the same files `tests` just ran — pytest
-#: is not run a second time, and the token says `links-to-tests`.
+#: Tier root that is only a symlink view of tests/, so pytest is not run on it twice.
 _REAL_ROOT = "tests"
 
-#: FL-8: the tier-sync check a skipped tier root is traded for. When the tree
-#: carries it, `--check` proves every test in `tests/` has its one link, which
-#: is what running the tiers could never show (a missing link cannot fail).
+#: Tier-sync check that runs in place of the skipped tier root (FL-8).
 TIER_CHECK = os.path.join("scripts", "sync_test_tiers.py")
 
 #: How many lines of pytest output `run_tests_detail` keeps for a failure.
@@ -82,8 +75,7 @@ def git(cwd, *args, check=False):
     git cannot answer after the ladder — that is their contract, and
     `judge_worktree` is written on it.
     """
-    # core.quotepath=false: a non-ASCII path is written as it is, not C-quoted ('"tests/caf\\303\\251.py"'
-    # matched no test root, and `git show HEAD:<that>` failed)
+    # core.quotepath=false keeps non-ASCII paths readable, so they match a test root and git show works.
     r = run_git(["git", "-c", "core.quotepath=false", *args], cwd=cwd, errors="replace")
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} in {cwd}: {r.stderr.strip()}")
@@ -113,9 +105,7 @@ def extract_shrink(cwd, rev):
     return "\n".join(body).rstrip()
 
 
-#: What a backticked span on a `**File:**` / `**Also touches:**` line must
-#: look like to count as a path — the lines also carry symbols
-#: (`` (`_is_ancestor`, `harvest`) ``) and config keys, which are not.
+#: What a backticked span must look like to count as a path (not a symbol or a config key).
 _PATH_ENDINGS = (".py", ".md", ".ini", ".sh", ".json", ".txt", ".gitignore", "/")
 
 
@@ -179,8 +169,7 @@ def run_tests(cwd, budget_sec: float = 0.0):
     return run_tests_detail(cwd, budget_sec=budget_sec)[0]
 
 
-#: A `FAILED` / `ERROR` line of pytest's short test summary: the node id, with
-#: xdist's `@group` suffix (`--dist=loadgroup`) and the ` - message` dropped.
+#: A FAILED or ERROR line of pytest's short summary: the node id, without the xdist group and message.
 _SUMMARY_LINE = re.compile(r"^(?:FAILED|ERROR) (\S+?)(?:@[^\s\[]+)?(?: - .*)?$")
 
 
@@ -336,10 +325,7 @@ def _end_group_members(pgid: int) -> None:
 #: pytest's `--durations=10` row: `<time> <phase> <nodeid>`, printed last.
 _DURATIONS_ROW = re.compile(r"^\s*\d+(?:\.\d+)?[smh]?\s+(?:call|setup|teardown)\s+(\S+)")
 
-#: pytest's `-v` progress row: `<nodeid> <result> [ <pct>%]`, one per test, with
-#: an optional xdist worker prefix. The node id is printed *before* the test
-#: runs and the result only after, so a suite ended mid-test still names the
-#: test it was inside of — which is where the budget hit.
+#: Matches one pytest -v progress row: node id, result and percentage (the node id comes first).
 _VERBOSE_ROW = re.compile(
     r"^\s*(?:\[gw\d+\]\s*)?(\S+::\S+?)(?:\s+"
     r"(?:PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS(?:\(strict\))?|RERUN|UNDECIDED))?"
@@ -444,18 +430,14 @@ def run_tests_detail(cwd, budget_sec: float = 0.0) -> tuple[str, list[str]]:
             continue
         lines = (r.stdout or "").strip().splitlines()
         if r.returncode == 124:
-            # The budget, not the tree: name where it hit and stop spending time
-            # on this root — no flake rerun, no more roots.
+            # The budget is spent: the root is named and no flake rerun or more roots run.
             out.append(f"{d}:budget✗")
             tail.extend(_budget_tail(f"--- {d}: ended after the harvest budget", r))
             continue
         bad, ids = _failures(lines)
         rerun = None
         if bad and ids:
-            # The flake rerun spends the same budget. What is left of it is
-            # checked here, not handed over as-is: `budget=0` is "no bound",
-            # so a budget spent to the last millisecond would otherwise rerun
-            # unbounded. A rerun the budget ended is the budget, not a red tree.
+            # The flake rerun spends the same budget; a budget spent to zero is not an unbounded rerun.
             left = max(0.0, budget_sec - (time.monotonic() - start)) if budget_sec > 0 else 0.0
             if budget_sec > 0 and left <= 0:
                 out.append(f"{d}:budget✗")
@@ -468,9 +450,7 @@ def run_tests_detail(cwd, budget_sec: float = 0.0) -> tuple[str, list[str]]:
                     f"--- {d}: the flake rerun ended after the harvest budget", rerun))
                 continue
         if rerun is not None and rerun.returncode == 0 and len(ids) == bad:
-            # KC-26: only a rerun that covered every failure is a flake — when
-            # a node id did not parse (`len(ids) < bad`), the rerun never saw
-            # the lost failure, so a real red must not be marked `PASS*`.
+            # Only a rerun that covered every failure counts as a flake (KC-26).
             out.append(f"{d}:PASS*{bad}")
             tail.append(f"--- {d}: {bad} test(s) failed under the full run and passed "
                         f"alone on rerun (flaky, not counted): {' '.join(ids)}")
@@ -527,20 +507,14 @@ def judge_worktree(name, path, base, declared, want_tests):
     else:
         row["shrink"] = "same" if before == after else "CHANGED"
 
-    # ── hard gate 2: nothing pushed ──────────────────────────────────────
-    # KC-20: with no agent commit HEAD *is* the base, and the base is on
-    # `origin` in every real round — only the agent's own commits can have
-    # been pushed, so a zero-commit worktree is never "pushed".
+    # Hard gate 2: a zero-commit worktree is never "pushed", since the base is on origin (KC-20).
     if not commits:
         row["pushed"] = "no"
     else:
         remotes = git(path, "branch", "-r", "--contains", "HEAD")
         row["pushed"] = "yes" if remotes.strip() else "no"
 
-    # ── diff shape ───────────────────────────────────────────────────────
-    # KC-5: `--no-renames` so a rename is a plain deletion + plain addition
-    # under its real paths — `old => new` / `dir/{a => b}.py` never match
-    # `declared`, and `git show HEAD:<that>` fails on the composite name.
+    # Renames are off in the diff, so a rename is a delete plus an add under real paths (KC-5).
     stat = git(path, "diff", "--numstat", "--no-renames", f"{merge_base}..HEAD")
     files, add, dele = [], 0, 0
     for l in stat.splitlines():
@@ -558,17 +532,14 @@ def judge_worktree(name, path, base, declared, want_tests):
     row["test_files"] = len(tests)
     new_tests = 0
     for f in tests:
-        # the scorecard counts `def test_` lines: a fixture's or a Latin-1 byte
-        # is a replacement character, never a traceback out of `harvest`
+        # The scorecard counts test lines as text, so a non-UTF-8 byte cannot crash harvest.
         blob = subprocess.run(["git", "show", f"HEAD:{f}"], cwd=path,
                               capture_output=True, text=True, errors="replace")
         if blob.returncode == 0:
             new_tests += len(re.findall(r"^\s*def test_", blob.stdout, re.M))
     row["test_funcs"] = new_tests
 
-    # KC-5: with rename detection on, `R<score>\told\tnew` names the deleted
-    # side of a rename — it is not a change of its own, so it is never
-    # off-ticket even when `--no-renames` listed it as a deletion.
+    # A rename's old side is not an off-ticket change, even when it shows as a deletion (KC-5).
     renamed_away = set()
     for l in git(path, "diff", "--name-status", f"{merge_base}..HEAD").splitlines():
         parts = l.split("\t")

@@ -40,8 +40,7 @@ __all__ = [
     "write_summary",
 ]
 
-#: The two files the round's folder gains. `contest-bench` reads the first, the
-#: operator reads the second.
+#: The two files a round folder gains: contest-bench reads entrants.json, the operator reads SUMMARY.md.
 ENTRANTS_FILE = "entrants.json"
 SUMMARY_FILE = "SUMMARY.md"
 
@@ -51,30 +50,21 @@ _PATCH_EXTENSIONS = (".patch", ".diff")
 #: The terminal states whose file name carries them, `<agent>.<STATE>.patch`.
 _STATED_SUFFIXES = ("GAVE_UP", "STALLED", "ERROR")
 
-#: `From <sha> <date>` — the first line of every `git format-patch` commit, and
-#: the one that differs between two agents that made the same commit.
+#: The From-sha line that starts every format-patch commit, the same for agents that made one commit.
 _FROM_SHA_RE = re.compile(r"^From [0-9a-fA-F]{7,40}(?:\s|$)")
 
 #: `Date: <rfc2822>` — the same commit's author date, formatted by git.
 _DATE_RE = re.compile(r"^Date:\s")
 
-#: The `decisions.jsonl` layers SUMMARY's "Decisions worth a look" reads: the
-#: gate's own verdicts, the allowed ones and the failed ones alike, because the
-#: operator reads the section to see whether the gate blocked what the ticket
-#: needed. `mechanical` never gets here — the mechanical layer is policy, not
-#: judgement.
+#: Gate verdicts that SUMMARY's "Decisions worth a look" reads (allowed and failed alike).
 _GATE_LAYERS = ("gate", "gate-failed")
 
-#: The two commands SUMMARY ends with — `contest-bench`'s own entry point and
-#: the scorer that reads the worktrees it builds. `scripts/contest_reset.sh` is
-#: deliberately absent: it prepares a round's worktrees and cleans nothing up.
+#: The two commands SUMMARY ends with; contest_reset.sh is not one of them.
 _SETUP_WORKTREES = "python3 contest-bench/harness/setup_worktrees.py"
 _JUDGE = "python3 scripts/judge_epic_round.py"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the paths
-# ─────────────────────────────────────────────────────────────────────────────
+# The paths
 
 def _repo_root(out_dir, repo=None) -> Path:
     """The repo root *out_dir* sits under: *repo* when given, else walked up.
@@ -210,9 +200,7 @@ def _files_by_agent(paths) -> dict:
     return files
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # entrants.json
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _read_text(path: Path):
     """The text of *path*, or `None` when it cannot be read.
@@ -285,9 +273,7 @@ def write_entrants(out_dir, base_sha, state, paths, *, repo=None) -> Path | None
     return target
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # SUMMARY.md
-# ─────────────────────────────────────────────────────────────────────────────
 
 #: The table's columns, in order: `state.table_rows()`'s keys, one per cell.
 _TABLE_COLUMNS = (
@@ -346,9 +332,7 @@ def _fill_cell(fill) -> str:
     return "-"
 
 
-#: KC-40: how much of a run's summary a SUMMARY cell holds — one line of it, so
-#: the row says which agent wrote one and what it started with, and the rest
-#: stays in `<agent>.summary.md` where the whole chain is.
+#: Characters of an agent's summary shown in a SUMMARY cell; the rest stays in the summary file (KC-40).
 _SUMMARY_CELL_CHARS = 60
 
 

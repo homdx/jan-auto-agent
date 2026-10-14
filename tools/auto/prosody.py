@@ -214,9 +214,7 @@ def detect_scheme(stanza: list[str]) -> str:
     return "NONE"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CR-21-2 — Prosody report + verdict + keyword gate
-# ═══════════════════════════════════════════════════════════════════════════════
+# CR-21-2: prosody report, verdict and keyword gate
 
 # ── Keyword activation gate ───────────────────────────────────────────────────
 
@@ -268,10 +266,7 @@ _VERSE_STEMS: tuple[str, ...] = (
     "стихотворен", "четверостиш", "двустиш", "верлибр", "сонет", "поэм",
 )
 
-# Whole-word forms of стих / стиш — word-boundary anchored so the shared
-# "стих" prefix in стихия/стихать/etc. never matches. The suffix group is
-# required (not optional) because bare "стих" is also a verb ("died down");
-# only inflected noun forms (стихи, стиха, ...) should trigger the gate.
+# Whole-word forms of стих/стиш; a bare "стих" is a verb, so only inflected noun forms trigger the gate.
 _VERSE_WORD_RE = re.compile(r"\bстих(и|а|у|ов|ам|ах|е)\b")
 _VERSE_DIM_RE  = re.compile(r"\bстиш(ок|ки|ка)\b")
 
@@ -371,8 +366,7 @@ def analyze_ru(text: str, *, syllable_tolerance: int = 2) -> ProsodyReport:
         scheme = detect_scheme(lines)
         stanza_infos.append(StanzaInfo(index=idx, lines=lines, syllables=syllables, scheme=scheme))
 
-    # Positional syllable regularity check
-    # Use the first stanza as reference for each line position
+    # Positional syllable regularity: the first stanza is the reference for each line position.
     syllable_regular = True
     ref = stanza_infos[0].syllables
     for info in stanza_infos[1:]:
@@ -530,10 +524,7 @@ def _check_prosody_inner(
                 )
                 return ProsodyVerdict(approved=False, reason=reason)
 
-    # ── Rule 3: syllable regularity (AUTO-CR-22-2: skipped when rhythm not
-    # required; with a single stanza there's nothing to compare against, so
-    # it's treated as satisfied — analyze_ru already leaves
-    # syllable_regular=True in that case). ──────────────────────────────────
+    # Rule 3: syllable regularity (AUTO-CR-22-2). Skipped when rhythm is not required; a single stanza counts as satisfied.
     if require_rhythm and not report.syllable_regular:
         ref = report.stanzas[0].syllables
         for info in report.stanzas[1:]:
@@ -549,9 +540,7 @@ def _check_prosody_inner(
     return ProsodyVerdict(approved=True, reason="")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CR-21-3 — ProsodyValidator wrapper + config factory (inner-loop wiring)
-# ═══════════════════════════════════════════════════════════════════════════════
+# CR-21-3: ProsodyValidator wrapper and config factory (inner-loop wiring)
 
 class ProsodyValidator:
     """Thin wrapper exposing the Gate-3-style ``.check()`` contract.
@@ -630,11 +619,7 @@ def make_prosody_validator(config) -> "ProsodyValidator | None":
     if not enabled:
         return None
 
-    # BUGFIX (audit): unguarded — the `enabled` read above (and every other
-    # config read in this codebase's config.getint/getboolean call sites,
-    # per the audit's "key patterns" note) tolerates malformed values; these
-    # two didn't, so a bad max_prosody_revisions/prosody_syllable_tolerance
-    # crashed the whole function instead of falling back to its default.
+    # Malformed numeric config values fall back to the defaults instead of crashing the function.
     try:
         max_rev = config.getint("validator_agent", "max_prosody_revisions", fallback=2)
     except ValueError as exc:

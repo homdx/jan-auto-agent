@@ -33,16 +33,12 @@ from typing import Callable, Optional
 
 from . import basecheck, judging, merge, models, output, profile, rounds, tickets
 
-# ── exit codes ───────────────────────────────────────────────────────────────
-#: The one exit-code table every `arena` command returns from.
+#: Exit codes returned by every arena command.
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_NOTHING = 3
-# `4` exists because the old `run` command exits 2 both when a round ran and no
-# agent came back READY and on an argparse error (a mistyped flag after `--`).
-# Passing that `2` through would read as an arena refusal, so AR-3 maps a
-# child's `2` to `4` only when the round actually ran, and to `1` otherwise.
+# 4: a round ran and no agent came back READY; mapped from a child's 2 so it is not read as an arena refusal.
 EXIT_NO_READY = 4
 
 EXIT_CODES = {
@@ -61,9 +57,7 @@ class Verb:
 
     help: str
     ticket: str
-    # Declares the verb's own arguments on its sub-parser. None: AR-1 accepts
-    # anything after an unimplemented verb, so the message below is what the
-    # operator sees instead of a parse error about arguments nobody defined yet.
+    # Declares the verb's own arguments; None accepts anything, so the placeholder message is shown instead of a parse error.
     add_arguments: Optional[Callable[[argparse.ArgumentParser], None]] = None
     # Runs the verb; returns an exit code from the table above. None: not yet.
     handler: Optional[Callable[[argparse.Namespace], int]] = None
@@ -75,9 +69,7 @@ class Object:
     verbs: dict[str, Verb]
 
 
-# ── AR-2: profile list / view ────────────────────────────────────────────────
-#: The checkout `arena` runs from: the directory that holds `tools/`, the same
-#: root the launcher puts on `sys.path` — never the caller's cwd. Tests patch it.
+#: The checkout arena runs from (the root with tools/), never the caller's cwd. Tests patch it.
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
@@ -146,10 +138,7 @@ def _profile_view(args: argparse.Namespace) -> int:
         flags = shlex.join(profile.profile_flags(chosen))
     except profile.ProfileError as err:
         return output.refuse(str(err))
-    # The rows are SETTING/VALUE pairs, so `emit`'s mask-by-key sees `SETTING`,
-    # not the profile key: mask each value by its own key here, `emit` still
-    # scrubs. The column is not called `KEY`: `key` is a secret word, and `emit`
-    # would mask the whole column.
+    # Rows are SETTING/VALUE pairs; each value is masked by its own key here, since emit would mask the whole column otherwise.
     rows = [
         {"SETTING": k, "VALUE": output.mask({k: v})[k]} for k, v in chosen.items()
     ]
@@ -166,18 +155,11 @@ def _profile_set_arguments(p: argparse.ArgumentParser) -> None:
     _late_globals(p, "y")
 
 
-#: What the runner's own parser takes: `--legs`/`--max-parallel` are `type=int` that
-#: intake refuses under 1, `--backend` has `choices`. ASCII digits only — `²` is
-#: `isdigit()` and not an `int`.
+#: Runner-compatible positive-integer pattern (ASCII digits only; `²` passes isdigit but is not an int).
 _POSITIVE_INT = re.compile(r"[1-9][0-9]*")
 _BACKENDS = ("kilo", "openrouter")
 
-#: Bug 183: roster's parser has `inline_comment_prefixes=(";", "#")`, which cut a
-#: value at a `;` or `#` that starts it or follows whitespace (`str.isspace()`, a
-#: no-break space too). `write_profile_keys` writes `key = value`, so such a value
-#: went to disk whole and came back truncated — `extra = --note "a ; b"` read as
-#: `--note "a`, and the profile no longer loaded. There is no way to escape it in
-#: the ini, so the value is refused.
+#: Values with ';' or '#' after whitespace would be cut by roster's ini parser (bug 183), so they are refused.
 _INLINE_COMMENT = re.compile(r"(?:^|\s)[;#]")
 
 
@@ -200,8 +182,7 @@ def _set_values(pairs: list[str]) -> dict[str, Optional[str]]:
             known = ", ".join(k for k in profile.KNOWN_KEYS
                               if k not in ("models", "writer", "reviewer"))
             raise profile.ProfileError(f"unknown key {key!r} (known: {known})")
-        # one line, no control character: a newline would start a new key or
-        # section in contest.local.ini, which `write_profile_keys` edits as text
+        # One line, no control characters: a newline would start a new key or section in contest.local.ini.
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
             raise profile.ProfileError(f"{key}: the value holds a control character or a newline")
         if _INLINE_COMMENT.search(value):

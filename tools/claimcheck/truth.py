@@ -63,8 +63,7 @@ def settled(row: dict, models: Optional[dict] = None) -> Optional[str]:
         return None
     truth = TRUTH_OF.get(row.get("verdict"))
     if truth is not None and families_behind(row, models) < MIN_FAMILIES:
-        # three agnes-* voters agreeing wrote a REAL row "checked_by: claimcheck:agnes": one family
-        # unanimous is one opinion asked three times (the runbook's rule counts families)
+        # Three voters from one family count as one opinion, since the rule counts families.
         return None
     return truth
 
@@ -176,9 +175,7 @@ def finding_key(claim: str, resolved=None, evidence=()) -> str:
             return f"{r.path}::{r.qualname}"
     files = [r.path for r in resolved if r.anchor.kind == "path" and r.found and r.path]
     for r in resolved:
-        # a symbol the file does not define (`missing_fn` in `pkg/rows.py`): its row was keyed by the file
-        # alone, so a reviewer's `pkg/rows.py::missing_fn` finding never matched it, and the file's real
-        # claims shared its key (REAL and FALSE of one key, "0 conflicts")
+        # A symbol the file does not define is keyed by file and name, so it does not merge with the file's real claims.
         if r.anchor.kind == "symbol" and not r.found:
             name = r.anchor.text.split("::")[-1].strip("`")
             if name.split(".")[0] in _OUTSIDE:
@@ -357,9 +354,7 @@ def read_truth(path: Path) -> list:
     path = Path(path)
     if not path.exists():
         return []
-    # utf-8-sig: Excel's "CSV UTF-8" starts the file with a BOM, and the RUNBOOK has the operator
-    # settle rows here by hand; read as utf-8 the first column was "\ufefffinding", every row's
-    # finding '' — the rows lost, --append adding them again
+    # utf-8-sig: Excel's CSV UTF-8 starts with a BOM; read as utf-8 the first column (finding) was lost.
     with path.open(newline="", encoding="utf-8-sig") as fh:
         return list(csv.DictReader(fh))
 
@@ -372,8 +367,7 @@ def merge_rows(existing: list, rows: list) -> tuple:
     known = {f for f, _ in have}
     add, conflicts = [], []
     for r in rows:
-        # Normalize the incoming row the same way as ``existing`` above, so a padded
-        # ``finding`` or a lowercase ``truth`` is not seen as new (duplicate) or conflicting.
+        # The incoming row is normalised like existing rows, so padding or case does not make it new.
         finding = (r["finding"] or "").strip()
         truth = (r["truth"] or "").strip().upper()
         key = (finding, truth)
@@ -431,8 +425,7 @@ def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        # mkstemp's file is 0600, and the rename put that over a shared 644 truth.csv: other users
-        # and CI lost the scoring key. The old file's mode, else what open() would have given
+        # The temp file takes the old file's mode, so CI and other users keep read access to truth.csv.
         os.chmod(tmp, path.stat().st_mode & 0o7777 if path.exists() else 0o666 & ~_umask())
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
@@ -508,21 +501,18 @@ def _write_truth(path: Path, rows: list, append: bool) -> tuple:
     add, conflicts = merge_rows(existing, rows)
     if not add and path.exists():
         return [], conflicts
-    # bytes, not read_text: a spreadsheet's CRLF stays as the operator saved it. A BOM is dropped
-    # (CC review fixes 13: the file is written without one, every reader takes it either way)
+    # Bytes are read, not text, so CRLF is kept as saved; a BOM is dropped (CC review fixes 13).
     old = path.read_bytes().decode("utf-8") if path.exists() else ""
     old = old[1:] if old.startswith("\ufeff") else old
     raw = list(csv.reader(io.StringIO(old, newline="")))
     header = raw[0] if raw else []
     if header and all(k in header for k in TRUTH_HEADER):
-        # nothing of the file is rewritten: the rows are added after it. Rewritten from DictReader
-        # rows, a hand-edited row's cells past the header ("see issue #4", "and the PR") were lost
+        # Rows are appended after the old text, so hand-edited cells past the header survive.
         eol = "\r\n" if "\r\n" in old else "\n"
         body = _csv_text(header, add).split("\n", 1)[1].replace("\n", eol)
         atomic_write(path, old + ("" if old.endswith("\n") else eol) + body)
         return add, conflicts
-    # our columns are missing (an older file) or there is no header yet (an empty file): the header
-    # gains them at its end and every row keeps its own cells, the ones past its header too
+    # Missing columns are added to the end of the header; each row keeps all of its own cells.
     grown = header + [k for k in TRUTH_HEADER if k not in header]
     gap = len(grown) - len(header)
     buf = io.StringIO()

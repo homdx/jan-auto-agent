@@ -88,8 +88,7 @@ def main():
 
     paths, unmatched = [], []
     for pat in a.csvs:
-        # a file of that name is that file: `truth[1].csv` is no pattern of itself (it opened before the
-        # unmatched-pattern check, and was refused by it)
+        # A file with that name is that file; glob patterns apply only when no file matches.
         hits = [pat] if os.path.isfile(pat) else sorted(glob.glob(pat))
         paths += hits
         if not hits:
@@ -115,9 +114,7 @@ def main():
 
     settled, disputed, arbitrated, torn = {}, {}, {}, {}
     for k, rs in g.items():
-        # one adjudicator's verdicts on the finding: two different ones (claimcheck_truth writes REAL and
-        # FALSE when two claims about one place disagree) are UNDECIDED, said in the report — the last row
-        # was the vote, and the order of the rows settled the finding
+        # Two verdicts from one adjudicator (REAL and FALSE on one place) are UNDECIDED and reported; row order must not decide.
         said: dict = defaultdict(set)
         for r in rs:
             if r["truth"] != "UNDECIDED":
@@ -131,13 +128,10 @@ def main():
         distinct = {v for v in votes.values() if v != "UNDECIDED"}
         if len(distinct) == 1:
             verdict = distinct.pop()
-            # only who said it: an UNDECIDED adjudicator was listed under "agreed by" and in
-            # checked_by, and its own `how` could be the one the report quoted
+            # Only the adjudicators who said it are listed; an UNDECIDED one is not shown as agreeing.
             settled[k] = (verdict, [r for r in rs if r["truth"] == verdict and votes[r["_adj"]] == verdict])
         elif distinct:
-            # An arbiter breaks the tie rather than the count doing it. Two
-            # models agreeing is not evidence when both applied the same wrong
-            # rule — which is exactly how a split usually arises.
+            # An arbiter breaks ties: two models agreeing is not evidence when both applied the same wrong rule.
             if a.arbiter and a.arbiter in votes and votes[a.arbiter] != "UNDECIDED":
                 settled[k] = (votes[a.arbiter], [r for r in rs if r["truth"] == votes[a.arbiter]
                                                  and votes[r["_adj"]] == votes[a.arbiter]])
@@ -145,8 +139,7 @@ def main():
             else:
                 disputed[k] = (votes, rs)
         else:
-            # every vote is UNDECIDED: nobody decided it, so it is left open for a human —
-            # neither settled nor dropped from the report
+            # Every vote UNDECIDED: left open for a human, neither settled nor dropped from the report.
             disputed[k] = (votes, rs)
 
     L = ["# Adjudication\n",
@@ -240,9 +233,7 @@ def main():
              "together. It only flags an adjudicator that is reliably out of step, "
              "which is worth reading before trusting it.\n")
 
-    # the ground truth is written from the adjudicators' files alone: a row of the file that no
-    # adjudicator settles this time (a machine row of claimcheck_truth --append, a finding settled before and
-    # disputed now) was deleted without a word, and the columns the run does not write (duplicate_of) with it
+    # The truth file is rebuilt from the adjudicators' files only; rows no adjudicator settles this run, and columns this run does not write, are kept.
     old_rows, old_cols = {}, []
     if a.truth and os.path.isfile(a.truth):
         with open(a.truth, newline="", encoding="utf-8-sig") as fh:

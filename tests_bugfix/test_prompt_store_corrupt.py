@@ -103,10 +103,7 @@ class TestWrongShapeNoLongerCrashes:
         sp = tmp_path / "prompts.json"
         sp.write_text("[]", encoding="utf-8")
         store = PromptStore(store_path=sp)
-        # "validator_agent" is one of the two names _get_hardcoded actually
-        # recognises — an unregistered name raises ValueError regardless of
-        # this fix, which is a separate, pre-existing contract and not what
-        # this test is checking.
+        # 'validator_agent' is a recognised name; an unregistered one raises ValueError, a separate contract.
         result = store.get_current("validator_agent")
         assert isinstance(result, str)
 

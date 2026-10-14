@@ -62,8 +62,7 @@ def _architect(task_mode):
 
 def test_creative_remaps_nonexistent_cited_file_to_existing_chapter():
     arch = _architect("creative")
-    # Model cited chapter_2.txt (the new target, does not exist) — must be
-    # remapped to chapter_1.txt (the only existing file in the cluster).
+    # Cited chapter_2.txt (missing) is remapped to chapter_1.txt, the only existing file.
     payload = json.dumps([
         {
             "title": "Write chapter 2",

@@ -70,9 +70,7 @@ def validator() -> DeltaValidator:
     return DeltaValidator()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stub doubles: one for the HEAD read, one for the git invocation
-# ─────────────────────────────────────────────────────────────────────────────
+# Stub doubles: HEAD read and git invocation
 
 class ReadStub:
     """Stand-in for `DeltaValidator._read_at_head`.
@@ -143,9 +141,7 @@ def _cfg(text: str = "") -> configparser.ConfigParser:
     return cfg
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DeltaVerdict / feedback — the shape gate_registry reads
-# ─────────────────────────────────────────────────────────────────────────────
+# DeltaVerdict and feedback: the shape gate_registry reads
 
 class TestDeltaVerdict:
     def test_defaults(self):
@@ -189,9 +185,7 @@ class TestDeltaVerdict:
         assert a != DeltaVerdict(approved=True, rel_path="a.md", reason="unchanged")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# check() — the six branches, all of which return a DeltaVerdict
-# ─────────────────────────────────────────────────────────────────────────────
+# check(): the six branches, each returning a DeltaVerdict
 
 class TestCheckBranches:
     def test_missing_base_dir_is_approved_and_skips_git(self, validator, tmp_path, monkeypatch):
@@ -297,9 +291,7 @@ class TestCheckBranches:
         assert rel_path == "CHANGELOG.md"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# _read_at_head — the git seam
-# ─────────────────────────────────────────────────────────────────────────────
+# _read_at_head: the git seam
 
 class TestReadAtHead:
     def test_invokes_git_show_with_a_cwd_relative_pathspec(self, repo, monkeypatch):
@@ -373,9 +365,7 @@ class TestReadAtHead:
         assert caplog.records == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# _read_at_head against a real repository — the shapes the gate meets in the wild
-# ─────────────────────────────────────────────────────────────────────────────
+# _read_at_head against a real repository
 
 class TestReadAtHeadRealRepo:
     def test_tracked_file_returns_the_committed_bytes(self, repo):
@@ -415,9 +405,7 @@ class TestReadAtHeadRealRepo:
         assert DeltaValidator._read_at_head(tmp_path, "CHANGELOG.md") is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# check() end to end, against a real repository
-# ─────────────────────────────────────────────────────────────────────────────
+# check() end to end against a real repository
 
 class TestCheckRealRepo:
     def test_verbatim_echo_of_the_committed_file_is_rejected(self, validator, repo):
@@ -482,9 +470,7 @@ class TestCheckRealRepo:
         assert validator.check("new content entirely", repo, rel_path="new_file.md").feedback() == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# make_delta_validator — config keys, fallbacks, and the unused task_mode
-# ─────────────────────────────────────────────────────────────────────────────
+# make_delta_validator: config keys, fallbacks, and the unused task_mode
 
 class TestMakeDeltaValidator:
     def test_enabled_by_default_with_a_one_revision_cap(self):

@@ -106,15 +106,12 @@ from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# ── the block under test ──────────────────────────────────────────────────────
-# Must match tools/auto/context_assembler._COLLECT_HEADER byte for byte; the
-# assembler ends the block with one empty line, which is where the cut stops.
+# The block under test: must match context_assembler._COLLECT_HEADER byte for byte.
 COLLECT_HEADER = "COLLECT MODEL (static facts, do not contradict):"
 _COLLECT_BLOCK_RE = re.compile(
     re.escape(COLLECT_HEADER) + r"\n(?:[^\n]*\n)*?\n"
 )
-# The rows V3–V5 added on top of the V2 baseline — the rows `pack_enabled`
-# switches. Arm A must show none of them, arm B at least one.
+# Rows added in V3-V5, switched by pack_enabled: arm A shows none, arm B at least one.
 PACK_ROW_PREFIXES = ("callers: ", "calls_into: ", "tests: ", "neighbours: ")
 
 DEFAULT_BUDGET = 1200            # [collect] max_context_chars_auto default
@@ -328,8 +325,7 @@ _TASK_ID_RE = re.compile(r"^TASK ID:\s*(\S+)", re.M)
 _LISTED_PY_RE = re.compile(r"^### (\S+\.py)$", re.M)
 
 
-# Where a "### <path>" file section ends in a coder / architect prompt: the
-# next section, or the coder template's feedback / closing text.
+# Where a "### <path>" file section ends in a coder or architect prompt.
 _SECTION_END_MARKERS = ("\n### ", "\nPRIOR ROUND FEEDBACK", "\nProduce the corrected files now",
                         "\nNow output the COMPLETE")
 _STUB_TOUCH = "# collect_ab stub touch\n"
@@ -351,8 +347,7 @@ def canned_answer(role: str, system: str, user: str) -> str:
     if role == "plan_reviewer":
         return "APPROVED"
     if role == "architect":
-        # one task per prompt, on the first non-test module that defines
-        # something — gate-1's existence check wants a real symbol to anchor to
+        # Architect: one task per prompt, on the first non-test module that defines something, so gate 1 has a real symbol to anchor to.
         paths = _LISTED_PY_RE.findall(user)
         code = [p for p in paths if not Path(p).name.startswith("test_")
                 and "/tests/" not in p and not p.startswith("tests/")]
@@ -364,8 +359,7 @@ def canned_answer(role: str, system: str, user: str) -> str:
                 break
         if target is None:
             return "[]"
-        # the coder may only write target_files, and the tests mandate wants a
-        # test among them — an existing test module from the listing, if any
+        # Coder: may write only target_files; a test module from the listing is included if any exists.
         tests = [p for p in paths if p not in code]
         return json.dumps([{
             "title": f"Touch {Path(target).name} (collect_ab stub task)",
@@ -697,11 +691,7 @@ def counters_from_events(events: Iterable[dict]) -> Dict[str, Any]:
                 c["collect_blocks"] += blocks
                 c["collect_pack_rows"] += rows
         elif kind == "collect_block":  # M4
-            # One event per coder request that received a block (memo hits
-            # included). `rows_kept` counts the whole selected row set — the
-            # three V2 rows too — so it cannot stand in for "pack rows": that
-            # stays a grep of the prompt itself, which is where the A=0 / B>0
-            # check needs it anyway.
+            # One event per coder request that got a block; rows_kept counts all rows (V2 included), so pack rows are still checked by grep of the prompt.
             raw["has_block_events"] = True
             raw["has_m4_events"] = True
             raw["blocks_from_events"] += 1
@@ -781,10 +771,7 @@ def diff_arms(off: Dict[str, Any], on: Dict[str, Any], *, budget: int) -> Dict[s
                        "(a --dry-run, a plan with no .py task, or a stub that refused)")
     else:
         verdict = "pass"
-        # M5 acceptance: "uses M4's events; fails loudly if a trace has none".
-        # Both arms run the same code, so an arm that reached the coder yet
-        # wrote no collect_* event at all is a trace from before M4 or a bridge
-        # that never ran — its block row is a header grep, not a measurement.
+        # M5 acceptance: an arm that reached the coder but emitted no collect_* event is a stale trace, not a measurement.
         for name, arm in (("A", off), ("B", on)):
             if not arm.get("m4_events", False):
                 verdict = "fail"

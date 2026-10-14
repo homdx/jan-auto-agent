@@ -141,8 +141,7 @@ def _res(variant, removed, opts=(), **extra):
 
 
 def test_a_collect_variant_is_judged_against_the_baselines_that_had_the_model(tmp_path):
-    # the reader alone does better without the model (0 false positives through) than with it (1): the
-    # +collect variant (1) is as good as its own kind, the plain one (1) is worse than its own
+    # The reader alone is compared with the plain baseline, and each variant with its own kind (CC-13).
     results = [
         _res("off", ["AUTO-T2", "AUTO-T3", "AUTO-T4"]),
         _res("off-2", ["AUTO-T2", "AUTO-T3", "AUTO-T4"]),
@@ -206,8 +205,7 @@ def test_check_collect_refuses_an_artifact_of_another_collector(tmp_path):
 
 
 def test_check_collect_walks_the_tree_the_way_the_collector_does(tmp_path):
-    # the collector's walk (`scan_repo`) leaves `build/` out; a walk of its own called a tracked
-    # build/x.py "the clone has it and the manifest does not" and refused the right artifact
+    # The walk uses scan_repo, so build/ is left out and a tracked build/x.py is not refused (CC-13).
     tree = _tree(tmp_path)
     (tree / "build").mkdir()
     (tree / "build" / "gen.py").write_text("X = 1\n", encoding="utf-8")

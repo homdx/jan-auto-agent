@@ -68,26 +68,22 @@ def test_unguarded_last_item_is_flagged():
 
 
 def test_real_prompt_store_get_current_is_guarded_via_alias():
-    # Real `tools/prompt_store.py::get_current`: the guard checks
-    # `entry`/`entry.get("stack")`, and `stack = entry["stack"]` aliases
-    # the checked key — `stack[-1]` must still resolve to GUARDED.
+    # Real get_current: stack = entry["stack"] aliases the checked key, so stack[-1] is GUARDED.
     source = (REPO_ROOT / "tools" / "prompt_store.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "tools/prompt_store.py")
     by_access = {(a.location, a.access): a for a in accesses}
-    # NOTE: line number tracks the real tools/prompt_store.py::get_current
-    # source — update if that method's line position shifts.
-    site = by_access[("tools/prompt_store.py:91", "stack[-1]")]
+    # Line number follows tools/prompt_store.py::get_current; update it if that method moves.
+    site = by_access[("tools/prompt_store.py:78", "stack[-1]")]
     assert site.status == "GUARDED"
     assert site.guard
 
 
 def test_real_view_trace_find_trace_file_is_guarded_via_sys_exit():
-    # Real `tools/auto/view_trace.py::find_trace_file`: the guard body ends
-    # in `sys.exit(...)`, not `return` — must still count as terminating.
+    # view_trace.find_trace_file ends its guard in sys.exit, which still counts as terminating.
     source = (REPO_ROOT / "tools" / "auto" / "view_trace.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "tools/auto/view_trace.py")
     by_access = {(a.location, a.access): a for a in accesses}
-    site = by_access[("tools/auto/view_trace.py:188", "candidates[-1]")]
+    site = by_access[("tools/auto/view_trace.py:182", "candidates[-1]")]
     assert site.status == "GUARDED"
     assert site.guard
 
@@ -96,16 +92,7 @@ def test_real_view_trace_find_trace_file_is_guarded_via_sys_exit():
 
 
 def test_reassigned_name_loses_its_guard():
-    # BUGFIX (found via self-play collect-mode session on this repo):
-    # `if not x: return` proves the *original* x truthy; rebinding x to a
-    # fresh value afterward (`x = other_func()`) must drop that guarantee
-    # for x, not carry it forward to a completely different object that
-    # could well be empty. Before the fix this was recorded GUARDED,
-    # citing the now-irrelevant early return, and Pass C's
-    # contradiction_check (COLLECT-17) would use that stale GUARDED
-    # record to auto-drop a correct "this crashes" claim about the site
-    # as `dropped:contradicts-guard` — turning a real bug report into a
-    # suppressed false positive.
+    # Regression: rebinding a checked name drops its guard, so a stale GUARDED cannot suppress a real crash claim.
     source = (
         "def f(entry):\n"
         "    if not entry or not entry.get('queue'):\n"
@@ -122,10 +109,7 @@ def test_reassigned_name_loses_its_guard():
 
 
 def test_reassigned_name_end_to_end_survives_verification():
-    # Same scenario, run through the full Pass A -> Pass C chain (not just
-    # dataflow.py in isolation): a Pass B claim that the reassigned access
-    # crashes must survive `verify_claims` rather than being dropped as
-    # `contradicts-guard`, since the crash claim is actually true.
+    # End to end: a crash claim on a reassigned access survives verification (not dropped as contradicts-guard).
     from tools.collect.scanner import scan_module
     from tools.collect.verifier import extract_claims, verify_claims
 
@@ -157,9 +141,7 @@ def test_reassigned_name_end_to_end_survives_verification():
 
 
 def test_if_x_is_none_does_not_guard_subscript_access():
-    # Bugfix (dataflow audit): `x is None` proves non-None-ness, not
-    # non-emptiness — `x = []` passes the guard and `x[0]` still raises.
-    # Was GUARDED; `not x` / `len(x) == 0` stay GUARDED and still do.
+    # x is None proves non-None, not non-empty: x[0] is still unguarded; not x and len(x) == 0 still guard (bug fix).
     source = (
         "def f(x):\n"
         "    if x is None:\n"
@@ -171,8 +153,7 @@ def test_if_x_is_none_does_not_guard_subscript_access():
 
 
 def test_guard_scoped_to_its_own_function_only():
-    # A guard in one function must never cover an access in a different,
-    # unrelated function — dataflow is per-function, not module-wide.
+    # A guard covers only its own function, since dataflow is per function.
     source = (
         "def guarded(x):\n"
         "    if not x:\n"
@@ -189,8 +170,7 @@ def test_guard_scoped_to_its_own_function_only():
 
 
 def test_guard_inside_if_branch_does_not_leak_to_else_branch():
-    # The guard only holds on the path where it actually executed; the
-    # access in the else-branch must not inherit it.
+    # A guard holds only on the path where it ran, so the else branch does not inherit it.
     source = (
         "def f(x, flag):\n"
         "    if flag:\n"
@@ -225,32 +205,11 @@ def test_variable_index_access_is_recorded():
     assert accesses[0].status == "GUARDED"
 
 
-# ── no-duplicate-record regression ──────────────────────────────────────────
-#
-# `_record_accesses_in_stmt` used to be called with a full `ast.walk(stmt)`
-# even when `stmt` was itself a block-owning statement (`if`/`for`/`while`/
-# `with`/`try`) — so every access nested inside such a block got recorded
-# twice: once prematurely, by that full walk, *before* any guard introduced
-# inside the block had been applied (always UNGUARDED), and once more,
-# correctly, by the recursive per-statement re-walk that runs right after.
-# When the guarded block sits inside an unrelated outer block (exactly
-# `view_trace.find_trace_file`'s shape: `if p.is_dir(): ... if not
-# candidates: sys.exit() ... return candidates[-1]`), those two records
-# don't just duplicate each other — they *contradict* each other: one
-# GUARDED, one UNGUARDED, for the identical site. `test_real_view_trace_
-# find_trace_file_is_guarded_via_sys_exit` above didn't catch this because
-# it looks the site up through a `{(location, access): a for a in
-# accesses}` dict comprehension, which silently keeps only the
-# last-inserted (correct) entry and discards the earlier (spurious) one.
-# These tests check the raw list directly instead, so a reappearance of
-# either the duplication or the contradiction fails immediately.
+# Regression: a block-owning statement's accesses were recorded twice, once before the guard, causing a GUARDED/UNGUARDED conflict.
 
 
 def test_no_duplicate_or_conflicting_records_anywhere_in_module():
-    # Minimal reproduction of the exact shape that produced a real
-    # GUARDED/UNGUARDED contradiction: a guard-and-use pair nested inside
-    # an unrelated outer `if` whose own test has nothing to do with the
-    # guard.
+    # Minimal reproduction of the duplicate-and-conflict shape: a guard inside an unrelated outer if.
     source = (
         "def f(p, candidates_src):\n"
         "    if p:\n"
@@ -272,45 +231,22 @@ def test_no_duplicate_or_conflicting_records_anywhere_in_module():
 def test_real_view_trace_site_appears_exactly_once():
     source = (REPO_ROOT / "tools" / "auto" / "view_trace.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "tools/auto/view_trace.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("tools/auto/view_trace.py:188", "candidates[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("tools/auto/view_trace.py:182", "candidates[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 
 
 def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
-    # A second real instance of the same shape, found while regression-
-    # testing the fix above: `done[-1]`, guarded by `if not done: continue`
-    # a couple of lines above it, nested inside an unrelated outer block.
-    # NOTE: line number tracks the real analyze_logs.py source — update if
-    # that function's line position shifts.
-    # BUGFIX: pinned at 1635 when this test was written; two later commits
-    # (AUTO-F4 Part 1 / Part 2) added ~90 lines earlier in analyze_logs.py,
-    # shifting this site down to 1725 with no code-shape change at all —
-    # confirmed via `git blame`, the guard/access pair is byte-identical.
-    # Re-pin to the current real line so this test tracks the site instead
-    # of a stale snapshot of it.
-    # L2: +1 more line in analyze_logs.py (the `stale_artifact` label in
-    # render_run_summary's probe_config reasons) moved this site to 1726,
-    # again with no code-shape change.
-    # M4: +172 lines (the runtime counter block in render_run_summary, the
-    # collect/gate1 event handlers in analyze() and the `_flag` / `_mapping`
-    # wire-shape decoders) moved it to 1904 — same guard/access pair, same
-    # shape.
-    # RUN-9: +12 lines (the `unknown` / `empty … transport / … exhausted`
-    # suffix of the gate1 line in render_run_summary) moved it to 1916 —
-    # same guard/access pair, same shape.
+    # Real analyze_logs.py site: the guard/access pair must be recorded exactly once (the line pin is updated as the file grows).
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1916", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1695", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 
 
 def test_no_conflicting_status_for_same_site_across_whole_real_repo():
-    # Repo-wide defense in depth: whatever the exact duplicate count, no
-    # (location, access) site may ever carry both GUARDED and UNGUARDED at
-    # once — that directly contradicts the anti-hallucination guarantee
-    # this epic exists for.
+    # No site may carry both GUARDED and UNGUARDED anywhere in the real repo.
     from tools.collect.scanner import scan_repo
 
     modules = scan_repo(REPO_ROOT)
@@ -375,16 +311,7 @@ def test_accesses_sorted_by_line_then_access():
     assert linenos == sorted(linenos)
 
 
-# ── regression: non-numeric constant under unary minus ─────────────────────
-#
-# `x[-<constant>]` is syntactically valid for *any* constant, not just
-# numbers — `x[-"a"]`, `x[-None]`, `x[-b"a"]` all parse fine even though
-# they'd raise TypeError if actually executed. Since collect only parses
-# (never executes) the scanned repo's source, a file containing one of
-# these was enough to crash the whole scan: `_subscript_key` unconditionally
-# computed `-slice_node.operand.value`, so on a non-numeric constant that
-# raised TypeError with nothing upstream (`scan_module` only catches
-# SyntaxError) to stop it taking down the entire collect pass.
+# Regression: a non-numeric constant under unary minus must not crash the scan (parse-only, never executed).
 
 
 def test_scan_module_survives_negated_string_subscript():
@@ -414,17 +341,7 @@ def test_negated_numeric_subscript_still_works():
     assert reprs == {"x[-1]", "x[-1.5]"}
 
 
-# ── BUGFIX regression: `and`-combined falsy guards must not be treated ─────
-# ── the same as `or`-combined ones ──────────────────────────────────────
-#
-# `if not a and not b: raise` only guarantees "a or b truthy" once past
-# it (De Morgan), never that `a` specifically is safe — `a=[]`, `b=[1]`
-# makes the guard's test False (so it doesn't fire) while `a` is still
-# empty. `_falsy_guard_targets` used to recurse into `ast.BoolOp`
-# regardless of whether it was `and` or `or`, so it wrongly marked both
-# names guaranteed-truthy for an `and`-combined test too — this is the
-# exact "wrongly claimed guard poisons the antihallucination guarantee"
-# failure mode COLLECT-7's own module docstring warns against.
+# Regression: an and-combined falsy guard only proves "a or b truthy", never "a truthy" (COLLECT-7).
 
 
 def test_and_combined_falsy_guard_does_not_mark_either_name_guarded():
@@ -442,10 +359,7 @@ def test_and_combined_falsy_guard_does_not_mark_either_name_guarded():
 
 
 def test_and_combined_falsy_guard_actually_unsafe_at_runtime():
-    # Ground truth for the test above: a=[] (falsy), b=[1] (truthy) makes
-    # `not a and not b` False, so the guard doesn't fire, and `a[0]` does
-    # raise — confirming UNGUARDED is the correct classification, not an
-    # overcautious one.
+    # Ground truth: a=[] and b=[1] pass the guard but a[0] still raises, so UNGUARDED is correct.
     def f(a, b):
         if not a and not b:
             raise ValueError("both missing")
@@ -456,9 +370,7 @@ def test_and_combined_falsy_guard_actually_unsafe_at_runtime():
 
 
 def test_or_combined_falsy_guard_still_marks_both_names_guarded():
-    # The correct, pre-existing behavior this fix must not regress:
-    # `if not a or not b: raise` genuinely does guarantee both `a` and
-    # `b` truthy afterward (De Morgan on a falsified `or`).
+    # Must not regress: "not a or not b" guarantees both names truthy after the raise.
     source = (
         "def f(a, b):\n"
         "    if not a or not b:\n"
@@ -473,10 +385,7 @@ def test_or_combined_falsy_guard_still_marks_both_names_guarded():
 
 
 def test_and_nested_inside_or_does_not_leak_names_out():
-    # `not a or (not b and not c)`: `a` is individually refuted (top-level
-    # `or` operand), but `b`/`c` are not — they're inside a nested `and`,
-    # so no per-name guarantee can be derived for either of them even
-    # though the whole expression is reached via `or`.
+    # Names under a nested and inside or are not guaranteed: no leak out of the nested expression.
     source = (
         "def f(a, b, c):\n"
         "    if not a or (not b and not c):\n"
@@ -491,12 +400,7 @@ def test_and_nested_inside_or_does_not_leak_names_out():
     }
 
 
-# ── BUGFIX regression: x.get(k, truthy_default) does not guard k ─────────────
-# ── a truthy default means the guard `not x.get(k, default)` is False when ──
-# ── k is missing (the default is returned), so the guard body does NOT run  ──
-# ── and the code after the if executes with k absent — x[k] raises KeyError. ──
-# ── Before the fix, (x, k) was added to guarded_pairs unconditionally, so an ──
-# ── alias `y = x[k]; y[-1]` was wrongly marked GUARDED.                         ──
+# Regression: x.get(k, truthy_default) does not guard k, since the default skips the guard body.
 
 
 def test_get_with_truthy_default_not_guarded():
@@ -588,10 +492,7 @@ def test_get_with_non_constant_default_not_guarded():
 
 
 def test_mutating_pop_after_guard_invalidates_it():
-    # Bug reproduction: `if not stack: return None` proves `stack` truthy,
-    # but `stack.pop()` right after can empty it again with no reassignment
-    # to trigger `_invalidate_reassigned` — before the fix, `stack[-1]`
-    # here was wrongly reported GUARDED, citing the now-stale early-return.
+    # Regression: stack.pop() after the guard can empty it again; the guard is invalidated.
     source = (
         "def rollback(stack):\n"
         "    if not stack:\n"
@@ -617,9 +518,7 @@ def test_del_after_guard_invalidates_it():
 
 
 def test_pop_before_guard_is_unaffected():
-    # Sanity: mutation *before* the guard must not spuriously invalidate
-    # anything (there's nothing to invalidate yet), and the guard still
-    # applies normally to what follows it.
+    # Sanity: a mutation before the guard invalidates nothing, and the guard applies after it.
     source = (
         "def f(stack):\n"
         "    stack.append(1)\n"
@@ -632,13 +531,7 @@ def test_pop_before_guard_is_unaffected():
 
 
 def test_pairs_only_guard_alias_does_not_crash_and_is_guarded():
-    # Bug reproduction: a guard that is *only* a pairs-shaped test (e.g.
-    # `if not entry.get("stack"):` with no bare `not entry` alongside it,
-    # unlike the real prompt_store.get_current, which combines both) used
-    # to crash the whole collect run with an unhandled ValueError, because
-    # `_propagate_alias` added the alias to `guarded_names` without ever
-    # giving it a `guard_desc` entry — violating GuardedAccess's own
-    # invariant that GUARDED requires a description.
+    # Regression: a pairs-only guard must not crash the run; its alias is recorded with a guard description.
     source = (
         "def rollback(entry):\n"
         "    if not entry.get('stack'):\n"
@@ -653,9 +546,7 @@ def test_pairs_only_guard_alias_does_not_crash_and_is_guarded():
 
 
 def test_pairs_and_names_combined_guard_still_works():
-    # The real prompt_store.get_current shape: combining a bare-name check
-    # with a pairs check in the same `or` must keep working exactly as
-    # before this fix.
+    # The real get_current shape (bare-name and pairs checks in one or) must keep working.
     source = (
         "def get_current(entry):\n"
         "    if not entry or not entry.get('stack'):\n"

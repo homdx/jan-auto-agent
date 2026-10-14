@@ -72,8 +72,7 @@ class Spawn:
 
             def wait(self, *a, **k):
                 if outer.touch is not None:
-                    # the runner's rewrite, stamped clearly after the start (a
-                    # real runner writes minutes later; file clocks are coarse)
+                    # The runner's rewrite is stamped after the start; real runners write minutes later, and file clocks are coarse.
                     outer.touch.write_text(outer.touch.read_text())
                     later = time.time() + 5
                     os.utime(outer.touch, (later, later))
@@ -372,8 +371,7 @@ def test_exit_2_rewritten_is_4(repo, capsys, monkeypatch):
 
 
 def test_exit_2_untouched_is_1(repo, capsys, monkeypatch):
-    # the rerun writes state.json itself just before the start; only the
-    # runner's own rewrite after the start makes an exit 2 "no agent ready"
+    # Only the runner's own rewrite after the start makes exit 2 "no agent ready"; the rerun writes state.json just before the start.
     mix_state(repo)
     monkeypatch.setattr(rounds, "SPAWN", Spawn(code=2))
     rc, _, _ = run(capsys, "run", "rerun", "7", "--failed")

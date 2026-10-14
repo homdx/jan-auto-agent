@@ -51,10 +51,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # ── the reply shapes the live runs produced ───────────────────────────────────
 
 PATH = "pkg/mod.py"
-# Unterminated string, no closing brace: the decode error is
-# "Unterminated string" and the text does not end with "}", so
-# _parse_response classifies it as a truncation — the shape AUTO-T30 actually
-# produced at 1200 tokens.
+# Unterminated string with no closing brace: classified as a truncation (the AUTO-T30 shape).
 CUT_OFF_JSON = '{"files": [{"path": "pkg/mod.py", "content": "def f():\\n    return '
 
 
@@ -64,8 +61,7 @@ def _complete(path: str = PATH) -> str:
 
 COMPLETE_JSON = _complete()
 NO_JSON = "Sorry, I cannot produce that file — could you clarify the acceptance check?"
-# Has a "{" but the object is closed: "Expecting property name" yet the text
-# ends with "}", so this is the malformed-JSON case, not a truncation.
+# Has an open brace and the text ends with "}", so this is malformed JSON, not truncation.
 MALFORMED_JSON = '{"files": [}'
 
 TASK = {"id": "AUTO-T30", "title": "module", "instruction": "rewrite pkg/mod.py",
@@ -171,8 +167,7 @@ def test_always_cut_off_climbs_to_the_cap_then_exhausts(tmp_path):
     assert stub.budgets == [3000, 6000, 12000, 12000, 12000]
     assert result.passed is False
     assert result.attempts_used == 5
-    # At the cap there is no more room, so this is the real "shorten it" case
-    # and the feedback keeps the existing sentence.
+    # At the cap there is no room, so the existing "shorten it" feedback is kept.
     assert "or raise [coder] max_tokens" in result.last_feedback
     assert "output budget was raised" not in result.last_feedback
 
@@ -212,8 +207,7 @@ def test_explicit_cap_stops_the_ladder(tmp_path):
 
 
 def test_truncation_feedback_shape_is_unchanged_at_the_cap(tmp_path):
-    # The message the model sees today, byte for byte: the ticket keeps it for
-    # the at-cap case because that IS the real "shorten it" case.
+    # The message is byte for byte today's text, since the at-cap case is the real shorten case.
     coder = _make_coder(extra_coder={"max_tokens_cap": "3000"})
     _files, err = coder._parse_response(CUT_OFF_JSON, "t", [PATH])
     assert err.startswith(_TRUNCATION_HEAD)
@@ -298,8 +292,7 @@ def test_same_task_keeps_the_climbed_budget_across_calls(tmp_path):
         coder.generate(TASK, tmp_path)
         coder.generate(TASK, tmp_path)
         coder.generate(TASK, tmp_path)
-        # A different task on the same instance starts at config, not 12 000:
-        # the climb is per task, the learning is not.
+        # A different task starts at config, not at 12 000: the climb is per task.
         coder.generate(TASK_B, tmp_path)
 
     assert stub.budgets == [3000, 6000, 12000, 3000]
@@ -327,16 +320,14 @@ def test_non_integer_cap_is_a_warning_and_the_default(caplog):
 
 
 def test_empty_cap_is_unset_not_malformed(caplog):
-    # _cfg_mode treats a blank value as "not set" (same as max_tokens itself):
-    # the 4x default applies without a warning.
+    # A blank max_tokens_cap counts as unset, so the 4x default applies silently.
     coder = _make_coder(extra_coder={"max_tokens_cap": ""})
     assert coder._max_tokens_cap == 12000
     assert not any("max_tokens_cap" in m for m in caplog.messages)
 
 
 def test_cap_is_resolved_per_mode_like_max_tokens():
-    # max_tokens_cap_creative beats max_tokens_cap in creative mode; the
-    # default is 4x the mode-resolved max_tokens.
+    # max_tokens_cap_creative beats max_tokens_cap in creative mode; the default is 4x.
     coder = _make_coder(
         extra_coder={"max_tokens_creative": "2000", "max_tokens_cap": "5000",
                      "max_tokens_cap_creative": "7000"},
@@ -350,8 +341,7 @@ def test_cap_is_resolved_per_mode_like_max_tokens():
 
 
 def test_cap_below_max_tokens_is_clamped_up(caplog):
-    # A cap below the base budget would cap the FIRST attempt down; the ladder
-    # exists to grow, never to shrink.
+    # A cap below the base budget would cut the first attempt, but the ladder only grows.
     coder = _make_coder(extra_coder={"max_tokens_cap": "1000"})
     assert coder._max_tokens_cap == 3000
     assert coder._start_task_budget() == 3000
@@ -478,9 +468,7 @@ def test_snapshot_counts_ladder_escalations_and_budgets():
 # ── 6. reviewer additions (round 32 acceptance) ──────────────────────────────
 
 def test_exhausted_task_does_not_teach_the_next_one(tmp_path):
-    # T30 is cut off at every rung (12 000 never parsed): nothing was learned,
-    # so T31 starts at the configured 3 000 — a budget that never produced a
-    # reply is not a tier that "worked".
+    # Nothing was learned from an exhausted task, so the next task starts at the configured budget.
     coder = _make_coder()
     loop = InnerLoop(coder, PassingExecutor(), ApprovingValidator(), max_attempts=5)
     never = BudgetStub(cut_off_below=10**9)
@@ -495,9 +483,7 @@ def test_exhausted_task_does_not_teach_the_next_one(tmp_path):
 
 
 def test_next_round_of_the_same_task_keeps_the_climbed_budget(tmp_path):
-    # The outer loop reopens an EXHAUSTED task with the same id: the evidence
-    # that 3 000 is too small is about this task, so the ladder is not
-    # re-climbed from the floor (AUTO-T30 spent 8 rounds doing exactly that).
+    # An exhausted task reopened with the same id keeps its climbed budget instead of re-climbing from the floor.
     coder = _make_coder()
     loop = InnerLoop(coder, PassingExecutor(), ApprovingValidator(), max_attempts=2)
     stub = BudgetStub(cut_off_below=12000)
@@ -508,10 +494,7 @@ def test_next_round_of_the_same_task_keeps_the_climbed_budget(tmp_path):
 
 
 def test_creative_cut_off_chapter_climbs_the_same_ladder(tmp_path):
-    # A chapter that stops mid-sentence at the budget is the same cut-off as
-    # a mid-JSON reply: the next attempt gets double the budget and the
-    # feedback says so. At 100 tokens (~400 chars) a 450-char body that ends
-    # mid-word trips the guard; at 200 the same body is a finished chapter.
+    # A creative chapter cut off at the budget counts as a truncation, like a cut-off JSON reply.
     coder = _make_coder(max_tokens=100, task_mode="creative")
     chapter = {"id": "AUTO-T40", "title": "ch", "instruction": "write chapter 1",
                "target_files": ["chapter_01.md"]}
@@ -528,8 +511,7 @@ def test_creative_cut_off_chapter_climbs_the_same_ladder(tmp_path):
 
 
 def test_parse_response_is_still_pure():
-    # tests/test_theme_validator.py builds a Coder with __new__ and calls the
-    # parser directly: the ladder lives in generate(), never in the parser.
+    # The ladder lives in generate(), never in the parser, which theme_validator calls directly.
     coder = Coder.__new__(Coder)
     coder._task_mode = "code"
     files, msg = coder._parse_response(CUT_OFF_JSON, "t")

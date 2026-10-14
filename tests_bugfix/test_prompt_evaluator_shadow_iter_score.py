@@ -67,8 +67,7 @@ class TestIterScoreExcludesApiError:
             {"status": "needs_fix"},
         ]
         score = _evaluator(_agent(results))._shadow_score("validator_agent", "prompt")
-        # avg_iter = (1+1+2)/3 = 4/3; iter_score = 1-((4/3-1)/2) = 5/6
-        # json_ok_rate = 1.0; approved_rate = 2/3
+        # avg_iter 4/3 gives iter_score 5/6; json_ok_rate 1.0; approved_rate 2/3.
         expected = round(0.40 * (5 / 6) + 0.35 * 1.0 + 0.25 * (2 / 3), 4)
         assert score == expected
 
@@ -110,10 +109,7 @@ class TestIterScoreExcludesApiError:
             {"status": "needs_fix", "_api_error": True},
         ]
         score = _evaluator(_agent(results))._shadow_score("validator_agent", "prompt")
-        # _judged = [approved, unparseable] (api_error excluded) → n=2
-        # avg_iter = (1+2)/2 = 1.5 → iter_score = 1-((0.5)/2) = 0.75
-        # json_ok_rate = 1/2 (the unparseable one fails it) = 0.5
-        # approved_rate = 1/2 = 0.5
+        # _judged = approved and unparseable (api_error excluded): iter 1.5 gives 0.75; json 0.5; approved 0.5.
         expected = round(0.40 * 0.75 + 0.35 * 0.5 + 0.25 * 0.5, 4)
         assert score == expected
 
@@ -140,10 +136,7 @@ class TestIterScoreExcludesApiError:
 
         evaluator = _evaluator(_agent(results), metrics_collector=metrics_collector)
         expected = evaluator._projected_score()
-        # A fresh, identically-configured evaluator (metrics_collector is
-        # a MagicMock, safe to call load_recent() again — it's not
-        # exhausted like the validate() side_effect list) confirms the
-        # fallback path returns exactly what direct projection returns.
+        # A fresh evaluator reads load_recent() again, so the fallback returns what direct projection gives.
         score = evaluator._shadow_score("validator_agent", "prompt")
         assert score == expected
         assert score == 1.0  # single healthy baseline record → perfect projection
@@ -158,9 +151,6 @@ class TestIterScoreExcludesApiError:
 
         evaluator = _evaluator(_agent(results), metrics_collector=metrics_collector)
         score = evaluator._shadow_score("validator_agent", "prompt")
-        # With no baseline runs either, projection itself is 0.0 — but the
-        # important assertion is *why*: load_recent must actually have
-        # been consulted (i.e. the fallback path ran), not that 0.0 is
-        # incidentally correct.
+        # Projection is 0.0 with no baseline; the point is that load_recent was consulted.
         metrics_collector.load_recent.assert_called_once_with(5)
         assert score == 0.0

@@ -28,10 +28,7 @@ def test_ch1_cold_start_never_defaults_to_english_from_placeholder():
     detection sample — regardless of caller, this string must not
     resolve to 'English'."""
     placeholder = "(new chapter — no prior content to continue from)"
-    # Old (buggy) call site: resolve_creative_language(None, "" or placeholder, ...)
-    # would have detected English. The fixed coder.py no longer ever passes
-    # placeholder text here; verify the detector's own behaviour is inert on
-    # an empty detection sample instead (the fix's actual contract).
+    # The fixed coder never passes placeholder text; an empty detection sample must stay inert.
     assert resolve_creative_language(None, "", task_mode="creative") is None
 
 
@@ -60,8 +57,7 @@ def test_coder_prompt_ch1_locks_russian_from_instruction_not_placeholder(tmp_pat
         model="llama3.1:8b", api_format="ollama", task_mode="creative",
     )
 
-    # True cold start: no target file exists yet, no predecessor chapters —
-    # _build_creative_file_contents legitimately returns the English placeholder.
+    # Cold start (no target, no predecessors): the English placeholder is expected.
     task = {
         "id": "AUTO-T1",
         "title": "Глава 1",

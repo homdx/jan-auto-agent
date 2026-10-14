@@ -56,9 +56,7 @@ _HEAD_SHARE = 0.4                # of a cut hunk's budget, at most, for its head
 _MARK = 40                       # chars a cut marker takes, budgeted up front
 LONG_LINE = 400                  # chars kept of one diff line that alone is longer than a chunk
 
-#: the diff's text must not depend on the repository's config: rename detection on,
-#: the standard prefixes, no colour; a patch also three lines of context and one algorithm
-#: (`--unified` turns the patch on, so `--numstat` / `--stat` calls leave those out).
+#: Diff text is independent of user git config: rename detection, standard prefixes, no colour, fixed context.
 _DIFF_OPTS = ("--no-color", "-M", "--src-prefix=a/", "--dst-prefix=b/", "--no-relative")
 _PATCH_OPTS = ("--unified=3", "--diff-algorithm=myers", "--indent-heuristic")
 _HISTORY = re.compile(r"\b(?:fix(?:es|ed|ing)?|chang(?:e|es|ed|ing)|introduc(?:e|es|ed|ing)"
@@ -426,9 +424,7 @@ def _commit_chunks(r, view, resolved, keys: list, max_chars: int) -> list:
     head = _git(view, "show", "-s", "--no-color", "--no-show-signature",
                 "--format=%H%x00%an <%ae>%x00%aI%x00%s%x00%b", sha)
     full, author, date, subject, body = (head.split("\0") + [""] * 5)[:5]
-    # A newer Git writes a zero UTC offset of its strict ISO date as ``Z`` where an older one
-    # wrote ``+00:00``. Evidence text is persisted in golden fixtures and must be the same
-    # whichever Git inspects the repository.
+    # Newer Git writes a zero UTC offset as Z, older as +00:00; normalise so golden fixtures match either way.
     if date.endswith("Z"):
         date = date[:-1] + "+00:00"
     body = body.strip("\n")

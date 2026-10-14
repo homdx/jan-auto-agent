@@ -61,8 +61,7 @@ from tools.collect.java_parser import parse_java
 from tools.collect.lang import Language
 from tools.collect.model import ModuleRecord
 
-#: Dict[module_path, frozenset[module_path]] — the shape every graph in
-#: this module produces and consumes: adjacency by relative file path.
+#: Graph shape: adjacency from module path to the set of module paths it links to.
 Graph = Dict[str, FrozenSet[str]]
 
 
@@ -166,9 +165,7 @@ def resolve_import(
         candidate = ".".join(full_parts)
         if candidate and candidate in index:
             return index[candidate]
-        # `from . import NAME` where NAME is a symbol in the package
-        # `__init__`, not a submodule: drop one trailing part and try the
-        # package itself (exactly one step, see docstring).
+        # `from . import NAME` where NAME is a symbol, not a submodule: retry once with the package itself.
         if len(full_parts) > 1:
             parent = ".".join(full_parts[:-1])
             if parent in index:
@@ -287,12 +284,7 @@ def _unambiguous_symbol_owners(modules: Iterable[ModuleRecord]) -> Dict[str, str
     return {name: next(iter(paths)) for name, paths in owners.items() if len(paths) == 1}
 
 
-#: tree-sitter-java node types that name-call something: an ordinary
-#: method call (`foo()` / `obj.foo()` — only the `name` field is read,
-#: the receiver is ignored, the same "final attribute only" convention
-#: `_called_name` uses for Python's `obj.foo()`) and a constructor call
-#: (`new Circle(...)`), whose "called name" is the type being
-#: instantiated rather than a method identifier.
+#: Java call nodes: method calls (name field only, receiver ignored, as _called_name does for Python) and constructor calls (the type named).
 _JAVA_CALL_NODE_TYPES = frozenset({"method_invocation", "object_creation_expression"})
 
 
@@ -374,38 +366,14 @@ def build_call_edges(root: Path, modules: Iterable[ModuleRecord]) -> Graph:
             continue
 
         if m.language == Language.JAVA:
-            # COLLECT-29: same "re-read, re-parse, walk, look up in
-            # owners, skip anything that doesn't cleanly resolve"
-            # structure as the Python branch below, just against a
-            # tree-sitter tree instead of `ast`. A module that fails to
-            # read, or that tree-sitter can't hand back a usable tree
-            # for (library not installed, a hard parser error), is
-            # silently skipped for call-edge purposes — the same "one
-            # broken/unavailable file can't take down the scan" contract
-            # COLLECT-25 established for `scan_java_module`.
+            # Same structure as the Python branch, on a tree-sitter tree. A module that fails to read or parse is skipped for call edges (COLLECT-25).
             try:
                 source = (root / m.path).read_text(encoding="utf-8-sig")
             except (OSError, UnicodeDecodeError):
-                # BUGFIX: this used to catch only OSError — a `.java` file
-                # that simply isn't valid UTF-8 raised a bare
-                # UnicodeDecodeError straight out of build_call_edges,
-                # contradicting this branch's own comment ("one broken/
-                # unavailable file can't take down the scan") and the
-                # Python branch below, which already catches both. Same
-                # fix, same reasoning.
+                # Unreadable or non-UTF-8 .java files are skipped, as in the Python branch.
                 continue
             result = parse_java(source, m.path)
-            # BUGFIX: check has_error too — tree-sitter recovers a tree with
-            # ERROR/MISSING nodes for a syntactically broken .java file,
-            # returning error=None, tree=<recovered>, has_error=True.
-            # scan_java_module (scanner.py:100) treats has_error=True as a
-            # parse error and sets ModuleRecord.parse_error, which the
-            # m.parse_error check above (line 352) skips. But this re-parse
-            # is independent of scan_repo — a file that was valid during
-            # scan but corrupted before build_call_edges (or any non-deterministic
-            # tree-sitter recovery) would walk the broken tree and extract
-            # garbage call names. Checking has_error here mirrors the Python
-            # branch's SyntaxError guard and scan_java_module's contract.
+            # Reject recovered trees with error nodes: a file corrupted after the scan must not yield garbage call names.
             if result.error is not None or result.tree is None or result.has_error:
                 continue
             for name in _java_call_names(result.tree):

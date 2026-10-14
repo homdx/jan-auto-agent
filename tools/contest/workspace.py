@@ -80,22 +80,18 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-#: The runbook's reason, repeated verbatim when ``epic-tasks/`` is not clean at
-#: the base — an untracked ``epic-tasks/`` is invisible inside a worktree.
+#: The runbook's reason for an unclean epic-tasks/ at the base; untracked files are invisible in a worktree.
 _EPIC_TASKS_DIRTY_REASON = (
     "epic-tasks/ has uncommitted or untracked changes at the base commit — an "
     "untracked epic-tasks/ is invisible inside a worktree, so the runbook forbids "
     "it; commit epic-tasks/ at the base before running a round"
 )
 
-#: The roster's ``rounds_dir`` is resolved against the repo when relative, the
-#: same way the runbook's ``git worktree add ../round-$a`` sits next to the repo.
+#: rounds_dir is resolved against the repo when relative, as the runbook's worktree path is.
 _KIND_WORKTREE: Literal["worktree", "clone"] = "worktree"
 _KIND_CLONE: Literal["worktree", "clone"] = "clone"
 
-#: How many dirty paths a refusal names before it says there are more — a
-#: worktree can hold a whole round of edits, and the operator only needs enough
-#: to see that the reset is not safe.
+#: How many dirty paths a refusal names before it says there are more.
 _DIRTY_NAMED = 5
 
 
@@ -145,9 +141,7 @@ class LegCarry:
     workspaces: tuple[Workspace, ...]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# git plumbing
-# ─────────────────────────────────────────────────────────────────────────────
+# Git plumbing
 
 
 def _resolve_rounds_dir(repo: Path, rounds_dir: str) -> Path:
@@ -237,9 +231,7 @@ def _empty_runs_dir(worktree: Path, agent: str) -> None:
         runs.mkdir(parents=True, exist_ok=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# base validation
-# ─────────────────────────────────────────────────────────────────────────────
+# Base validation
 
 
 def _check_base_and_epic_tasks(repo: Path, base_ref: str) -> str:
@@ -276,9 +268,7 @@ def _check_base_and_epic_tasks(repo: Path, base_ref: str) -> str:
     return base_sha
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# worktree prep
-# ─────────────────────────────────────────────────────────────────────────────
+# Worktree prep
 
 
 def _commits_above(worktree: Path, base_sha: str) -> int:
@@ -401,16 +391,11 @@ def reset_worktree(
 
     if not path.exists():
         if path.resolve() in owned:
-            # The folder went away without git being told (``rm -rf`` of a round
-            # directory, a wiped scratch disk): the worktree stays registered and
-            # ``git worktree add`` refuses with "is a missing but already
-            # registered worktree". Prune drops exactly those missing
-            # registrations and touches no worktree that still has its folder.
+            # Prune drops registrations of folders that were removed, so git worktree add can run again.
             _git(repo, ["worktree", "prune"])
             owned = _worktree_paths(repo)
         if _rev_parse(repo, branch) is not None:
-            # A stale branch without its worktree: recreate the worktree, then move
-            # the branch onto the base.
+            # A stale branch without its worktree: the worktree is recreated, then the branch moved to base.
             _git(repo, ["worktree", "add", str(path), base_sha])
             _git(path, ["checkout", "-B", branch, base_sha])
         else:
@@ -421,10 +406,7 @@ def reset_worktree(
                 f"{path} exists but is not a worktree of {repo} — refusing to "
                 f"delete a folder this module did not create"
             )
-        # KC-23's guard, and the two reads it needs. Under ``--fresh`` neither
-        # runs: the reset is already agreed to discard everything they would
-        # report, and a ``rev-list`` or ``status`` that cannot be answered would
-        # raise instead of being read as an empty count or a clean tree (FL-2).
+        # Under --fresh the counts are not read, since the reset discards them anyway (KC-23, FL-2).
         commits = 0
         dirty: list[str] = []
         if not force:
@@ -432,9 +414,7 @@ def reset_worktree(
             dirty = _dirty_outside_runs(path)
         if (commits or dirty) and not force:
             raise _refuse_to_reset(path.resolve(), branch, round_no, commits, dirty)
-        # ``--fresh`` has already agreed to drop the edits; without
-        # ``-f`` a plain checkout keeps them and refuses outright when the new
-        # base changes the same file ("would be overwritten by checkout").
+        # --fresh drops the edits; without -f a checkout keeps them and refuses on a conflicting file.
         _git(path, ["checkout", *(["-f"] if force else []), "-B", branch, base_sha])
 
     _git(path, ["clean", "-fdx", "-e", "runs/"])
@@ -539,8 +519,7 @@ def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
     if path.exists():
         origin = _clone_origin(path)
         if origin is None:
-            # not a clone: an empty folder a crashed clone left behind is ours to
-            # replace, anything else is refused rather than deleted
+            # An empty folder a crashed clone left is replaced; anything else is refused, not deleted.
             if any(path.iterdir()):
                 raise WorkspaceError(
                     f"{path} exists but is not a git clone — refusing to delete a "
@@ -557,10 +536,7 @@ def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
                     f"{path} is a clone of {origin}, not of {repo_path} — refusing "
                     f"to reset a checkout this module did not create"
                 )
-            # the clone's objects are a copy, not a live link: a base the operator
-            # moved on to after the clone was made is not in it yet, so fetch
-            # before deciding what the clone carries — ``--local`` hard-links what
-            # is already there, so this is a handful of new objects at most
+            # A clone is fetched first, since it is a copy and may lack a newer base.
             _git(path, ["fetch", "-q", "origin"])
             if _rev_parse(path, f"{base_sha}^{{commit}}") is None:
                 raise WorkspaceError(
@@ -568,10 +544,7 @@ def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
                     f"after fetching origin — the base is not on any branch of "
                     f"{repo_path}"
                 )
-            # KC-23's guard, and the two reads it needs. Same as
-            # :func:`reset_worktree`: under ``--fresh`` neither runs, so a
-            # ``rev-list`` or ``status`` that cannot be answered raises rather
-            # than being read as an empty count or a clean tree (FL-2).
+            # Same as reset_worktree: under --fresh the counts are not read (KC-23, FL-2).
             commits = 0
             dirty: list[str] = []
             if not force:
@@ -579,9 +552,7 @@ def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
                 dirty = _dirty_outside_runs(path)
             if (commits or dirty) and not force:
                 raise _refuse_to_reset(path.resolve(), branch, round_no, commits, dirty)
-            # ``--fresh`` has already agreed to drop the edits; without ``-f`` a
-            # plain checkout keeps them and refuses outright when the new base
-            # changes the same file ("would be overwritten by checkout").
+            # --fresh drops the edits; without -f a checkout refuses on a conflicting file.
             _git(path, ["checkout", *(["-f"] if force else []), "-B", branch, base_sha])
     if not path.exists():
         _git(repo_path, ["clone", "--local", "--no-checkout", "-q", str(repo_path),
@@ -602,9 +573,7 @@ def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the per-agent scratch dir
-# ─────────────────────────────────────────────────────────────────────────────
+# Per-agent scratch dir
 
 
 def tmp_root_dirs(tmp_roots) -> tuple[Path, ...]:
@@ -727,9 +696,7 @@ def attach_clone(clone_path, agent: str, base_sha: str, branch: str, *, force: b
     """
     clone = Path(clone_path).resolve()
     if not (clone / ".git").is_dir():
-        # a worktree's ``.git`` is a file, not a directory: attaching one would
-        # report ``kind == "clone"`` for a checkout that still shares its repo's
-        # single ``refs/stash`` — exactly what KC-59 is about
+        # A worktree's .git is a file, so only a real clone is accepted as kind "clone" (KC-59).
         raise WorkspaceError(
             f"{clone} is not a git repository (a worktree's .git is a file, and a "
             f"worktree shares its repo's refs/stash — clone the repo instead)"
@@ -837,9 +804,7 @@ def _carry_workspaces(config: ContestConfig, round_no: int, leg: int,
         head = _git(Path(ws.path), ["rev-parse", "--abbrev-ref", "HEAD"],
                     check=False).stdout.strip()
         if head != branch and _reattach(Path(ws.path), branch):
-            # KC-78: round 119 — the agent made its own branch on top of the
-            # round's and committed there; its work is a descendant of the
-            # round's branch, so the branch is moved to it, not the leg dropped
+            # The agent's own branch on top of the round's is moved to its HEAD, not dropped (KC-78, round 119).
             _log.warning("%s: %s was on %s — %s moved to its HEAD for leg %d",
                            agent.name, ws.path, head or "no branch", branch, leg)
             head = branch
@@ -959,9 +924,7 @@ def remove_round(repo, config: ContestConfig, round_no: int) -> None:
             raise WorkspaceError(f"could not remove the clone {path}: {exc}") from exc
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# operator CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# Operator CLI
 
 
 def _main(argv: list[str] | None = None) -> int:

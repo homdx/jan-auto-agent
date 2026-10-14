@@ -14,19 +14,7 @@ if TYPE_CHECKING:  # avoid circular imports at runtime
 logger = logging.getLogger(__name__)
 
 
-# AUTO-FIX (medium-priority audit, DeepSeek-plan findings T69/T70): every
-# call site below used to access controller.progress_display /
-# controller.run_trace directly. Both start out (or can be explicitly set
-# to, e.g. by a test constructing a partial controller) None, and there
-# was no guard anywhere in this module — the very first
-# ``controller.progress_display.arch_total = ...``-style access raised a
-# bare AttributeError, aborting _run_plan_phase/_run_task_loop entirely.
-# These two tiny null-object stand-ins let every call site below keep its
-# original, readable form (``_pd(controller).refresh()`` reads the same as
-# ``controller.progress_display.refresh()`` did) while degrading to a
-# harmless no-op whenever the real object isn't wired in, rather than
-# crashing the whole plan/task loop over what is purely diagnostic/UI
-# bookkeeping.
+# Null-object stand-ins for the progress display and run trace: a missing object is a no-op, not a crash (DeepSeek audit T69/T70).
 class _NullProgressDisplay:
     """No-op stand-in for a missing/None ProgressDisplay."""
     code_done = 0
@@ -64,9 +52,7 @@ def _rt(controller: "AutoController"):
     return controller.run_trace if controller.run_trace is not None else _NULL_RUN_TRACE
 
 
-# ── PLAN phase module imports ─────────────────────────────────────────────────
-# Imported at module level so test suites can patch via
-# ``patch("tools.auto.pipeline.<name>")``.
+# Plan-phase imports at module level, so tests can patch them by module path.
 from tools.auto.repo_ingest import ingest_repo
 from tools.auto.architect import review_clusters, ClusterReviewer, ConfigValueError
 from tools.auto.gate1_filter import filter_candidates, format_gate1_split
@@ -74,9 +60,7 @@ from tools.auto.backlog_prioritiser import build_backlog, to_improvements_md
 from tools.auto.plan_emitter import PlanEmitter, IMPROVEMENTS_FILENAME
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-CR-20-4: Plan-validator factory
-# ─────────────────────────────────────────────────────────────────────────────
+# Plan-validator factory (AUTO-CR-20-4)
 
 def _build_plan_validator(
     cfg: configparser.ConfigParser,
@@ -90,14 +74,7 @@ def _build_plan_validator(
     if task_mode != "creative":
         return None
 
-    # BUGFIX: getboolean and cfg.get for the [api] section used to be
-    # outside the try/except below. A malformed validate_plan_creative
-    # (e.g. "maybe") raised ValueError, a missing [architect] section
-    # raised NoSectionError — both uncaught, crashing the entire --auto
-    # run instead of degrading to "no plan validator" as the docstring
-    # promises. Moving them inside the guard makes the "never block the
-    # run on setup" contract cover ALL config reads, not just the
-    # ClusterReviewer constructor.
+    # All config reads sit inside the guard, so a malformed value degrades to no plan validator instead of crashing (BUGFIX).
     try:
         if not cfg.getboolean("architect", "validate_plan_creative", fallback=False):
             return None
@@ -117,11 +94,7 @@ def _build_plan_validator(
             task_mode=task_mode,
         )
     except ConfigValueError:
-        # A value the operator explicitly set and ClusterReviewer refuses
-        # (today: max_files_per_review <= 0). Returning None here would run
-        # the whole creative plan phase WITHOUT plan validation behind a
-        # single warning line. The architect review path aborts on the same
-        # value, so both paths now agree.
+        # A value the operator set and the reviewer refuses is raised, so the plan phase does not run without validation.
         raise
     except Exception as exc:  # noqa: BLE001 — never block the run on setup
         logger.warning("_build_plan_validator: could not build reviewer — %s", exc)
@@ -153,10 +126,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
     # ── PLAN phase ────────────────────────────────────────────────────────────
     _run_plan_phase(controller, cfg)
 
-    # ── Emit plan size into trace now that tasks are loaded ───────────────────
-    # Emitted after _run_plan_phase so all_tasks() is populated regardless of
-    # whether this is a fresh run or a resume.  analyze_logs.py reads this
-    # event to show the correct total in the banner (plan=N).
+    # The plan size is emitted after the plan phase, so the trace shows the right total on a fresh run and a resume (analyze_logs).
     if controller.run_trace:
         from tools.agent_trace import tracer as _tracer
         _tracer.event(
@@ -169,9 +139,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
             },
         )
 
-    # ── DRY-RUN: plan only, no code execution, no commits ─────────────────────
-    # AUTO-G10: --dry-run exits here after writing IMPROVEMENTS.md + plan.json.
-    # The return value mirrors _run_task_loop so the finalise block is unchanged.
+    # Dry run: plan only, then return in the same shape as the task loop, so the finish block is shared (AUTO-G10).
     if getattr(controller, "dry_run", False):
         logger.info("run_pipeline: dry-run mode — skipping execution phase")
         controller.state.log("dry-run: plan phase complete; execution skipped")
@@ -179,9 +147,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
             _rt(controller).log_phase("execute", "skipped (dry-run)")
         return None, 0  # clean finish, zero tasks executed
 
-    # ── Pre-seed progress counters for resume runs ────────────────────────────
-    # If this is a resume (plan phase was skipped), code_done must reflect tasks
-    # that were already DONE in a previous session so the banner is correct.
+    # On resume, tasks already done count toward the progress banner.
     if controller.progress_display:
         from tools.auto.state import STATUS_DONE as _STATUS_DONE
         already_done = sum(
@@ -196,9 +162,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
     return controller._run_task_loop(task_mode=getattr(controller, "task_mode", "code"), cfg=cfg)  # AUTO-DM-1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PLAN phase — AUTO-G1
-# ─────────────────────────────────────────────────────────────────────────────
+# PLAN phase (AUTO-G1)
 
 
 def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser) -> None:
@@ -247,10 +211,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     # ── Step 2: Architect review ──────────────────────────────────────────────
     logger.info("plan_phase: architect reviewing %d cluster(s)", len(clusters))
 
-    # Use PlanEmitter early so we can call changed_clusters() — skip clusters
-    # whose file-lists haven't changed since the last emit (re-plan cheapness).
-    # On a fresh first run the hash file doesn't exist yet, so all clusters are
-    # returned unchanged.
+    # Clusters whose file lists did not change since the last emit are skipped on re-plan.
     if controller.git is not None:
         _early_emitter = PlanEmitter(
             base_dir=controller.base_dir,
@@ -286,46 +247,23 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     logger.info("plan_phase: architect produced %d candidate(s)", len(candidates))
     controller.state.log(f"plan phase: architect produced {len(candidates)} candidate(s)")
 
-    # ── Step 2b: AUTO-CR-20-4 plan-validator (creative mode only) ─────────────
-    # After the architect emits candidates and before Gate-1, check the plan
-    # against the goal for contradictions / missing required facts.  Bounded by
-    # plan_max_revisions; fail-open on any error.
+    # Plan validator (creative mode only): checks the plan against the goal before Gate 1; bounded and fail-open (AUTO-CR-20-4).
     task_mode = getattr(controller, "task_mode", "code")
     _plan_validator = _build_plan_validator(cfg, task_mode)
     if _plan_validator is not None:
-        # BUGFIX: the nested cfg.getint("architect", "max_rewrites",
-        # fallback=1) used to be evaluated eagerly as the fallback=
-        # argument to the outer getint. If max_rewrites was present but
-        # non-numeric, the inner getint raised ValueError before the
-        # outer call could use its fallback=1. Read max_rewrites
-        # separately with its own try/except so a malformed value
-        # degrades to 1 instead of crashing the pipeline.
+        # max_rewrites is read on its own, so a malformed value degrades to 1 instead of crashing the plan phase (BUGFIX).
         try:
             _max_rewrites = cfg.getint("architect", "max_rewrites", fallback=1)
         except ValueError:
             _max_rewrites = 1
-        # BUG-1 FIX: this outer read had the same problem as the nested one
-        # above. configparser's fallback= only applies when the key is
-        # *missing*; a key that is present but non-numeric ("abc", "3x")
-        # makes getint raise ValueError straight out of the call, which
-        # nothing on the path up to --auto caught. One malformed
-        # plan_max_revisions value crashed the entire plan phase before any
-        # task ran. Guard it the same way as max_rewrites: degrade to the
-        # already-sanitised _max_rewrites instead of propagating.
+        # A malformed plan_max_revisions falls back to the sanitised value instead of crashing the plan phase (BUG-1).
         try:
             _plan_max_rev = cfg.getint(
                 "architect", "plan_max_revisions",
                 fallback=_max_rewrites,
             )
         except ValueError as exc:
-            # Logged, not silent: the run continues on the fallback, but a
-            # malformed agents.ini key is an operator mistake they can only
-            # correct if something says so -- the visible symptom (fewer
-            # plan revisions than configured) is indistinguishable from
-            # normal operation. This matches the reporting the sibling
-            # config guards in this batch already do (max_tasks_creative,
-            # and each of TaskRewriter's five reads); plan_max_revisions
-            # was the one guard that degraded without a word.
+            # The fallback is logged, so the run continues visibly rather than silently.
             logger.warning(
                 "config [architect] plan_max_revisions is malformed (%s) — "
                 "using max_rewrites (%d)", exc, _max_rewrites,
@@ -349,10 +287,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
             controller.state.log(
                 f"plan phase: architect plan REVISE ({_plan_revisions}/{_plan_max_rev}): {reason}"
             )
-            # Re-run the architect with the feedback appended to the goal so
-            # it can correct the offending task.  Skip the checkpoint on
-            # feedback re-runs (pass None) — the corrected result should not
-            # overwrite the original cache entry.
+            # A feedback re-run does not overwrite the cached result, so the original entry stays intact.
             augmented_goal = controller.goal + f"\n\nPLAN FEEDBACK: {reason}"
             try:
                 revised = review_clusters(
@@ -367,14 +302,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
                     "plan_phase: review_clusters re-run raised — %s; keeping previous candidates.", exc
                 )
                 break
-            # AUTO-FIX (plan-revision): an EMPTY revision must not wipe the
-            # plan. The exception path above already keeps the previous
-            # candidates; assigning unconditionally here meant the *empty*
-            # path did the opposite, and that asymmetry cost a whole run.
-            # Observed: two candidates, validate_plan said REVISE "Duplicate
-            # task", the architect answered "[]", and the run finished with
-            # zero tasks in twelve seconds. Deduplicating two identical tasks
-            # should leave one, never none.
+            # An empty revision must not wipe the plan: deduplication should leave one task, not none (AUTO-FIX).
             if not revised and candidates:
                 logger.warning(
                     "plan_phase: plan revision returned an EMPTY plan — keeping "
@@ -414,13 +342,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
         collect_bridge=collect_bridge,  # GATE1-CTX-1
         counters=_g1_counters,          # M4
     )
-    # M4: the per-stage split. Every field is always printed, zero when the
-    # mode does not produce it, so log parsing is stable across
-    # unparseable_retry_mode and across L1 landing. The counters are filled
-    # by Gate1Filter.filter() itself, where all_results — the only place a
-    # result for an accepted candidate exists — is in scope; an empty dict
-    # here (a stubbed filter_candidates) prints zeros, which is the honest
-    # reading of "this pass reported nothing".
+    # The Gate-1 stage split is always printed, zero where a mode does not produce it, so log parsing stays stable (M4).
     _g1_split_line = format_gate1_split(_g1_counters)
     logger.info(
         "plan_phase: gate1 accepted=%d rejected=%d %s",
@@ -430,10 +352,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
         f"plan phase: gate1 accepted={len(accepted)} rejected={len(rejected)} "
         f"{_g1_split_line}"
     )
-    # Trace it as well: run.log is where a human reads the line, the trace is
-    # where a later analyze run would look for it. The trace event carries
-    # accepted/rejected too, because it does not sit next to the log line and
-    # would otherwise have no denominator for the split.
+    # The split is also traced, with accepted and rejected counts, since the trace has no other denominator (M4).
     _g1_counters["accepted"] = len(accepted)
     _g1_counters["rejected"] = len(rejected)
     if controller.run_trace:
@@ -464,8 +383,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
 
     # ── Step 5: Plan emit + git commit ────────────────────────────────────────
     if controller.git is None:
-        # Git not available — still upsert tasks and write IMPROVEMENTS.md
-        # but skip the commit step.  A subsequent run with git will commit.
+        # Without git, tasks and IMPROVEMENTS.md are still written, and the commit waits for a later run.
         logger.warning("plan_phase: git not available — emitting without commit")
         _emit_without_git(controller, backlog, clusters)
     else:
@@ -507,9 +425,7 @@ def _emit_without_git(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _load_config(controller: "AutoController") -> configparser.ConfigParser:

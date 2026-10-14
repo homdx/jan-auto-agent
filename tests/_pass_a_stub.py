@@ -39,8 +39,7 @@ def _extract_symbols(tree: ast.Module, module_path: str) -> List[FunctionRecord]
                     is_private=node.name.startswith("_"),
                 )
             )
-    # Stable order independent of AST traversal quirks: by source position,
-    # then name as a tiebreaker.
+    # Stable order, independent of AST traversal quirks: by source position, then name as tiebreaker.
     return sorted(symbols, key=lambda s: (s.lineno, s.qualname))
 
 

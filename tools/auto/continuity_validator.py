@@ -47,9 +47,7 @@ logger = logging.getLogger(__name__)
 # llm_call(system, user) -> str   (same callable contract used everywhere)
 LlmCall = Callable[[str, str], str]
 
-# Matches "chapter_07", "chapter_7", "Chapter_07.md", etc. — mirrors
-# context_assembler.py / canon_validator.py so "chapter index" means the
-# same thing everywhere in the creative pipeline.
+# Matches chapter_07, chapter_7 and similar, same as context_assembler and canon_validator.
 _CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
 
 _DEFAULT_BIBLE_PATH = "story_bible.md"
@@ -168,12 +166,7 @@ class ContinuityValidator:
         lang_instr = language_instruction(detect_language(new_text))
         system = _CONTINUITY_SYSTEM + (("\n" + lang_instr) if lang_instr else "")
         if lang_instr:
-            # The LANGUAGE lock above can swallow the verdict token itself —
-            # observed as a Russian chapter producing "НЕОБХОДИМО ИЗМЕНИТЬ:"
-            # instead of "REVISE:", which _parse_verdict_soft can't recognize
-            # and silently lets a real contradiction through. So carve the
-            # verdict word out of the lock explicitly, stated last so it isn't
-            # overridden by the broader rule.
+            # The language lock could swallow the verdict word; carve it out explicitly, stated last.
             system += (
                 "\nEXCEPTION TO THE LANGUAGE RULE ABOVE: the verdict word "
                 "itself — APPROVED or REVISE — must always be written in "
@@ -301,8 +294,7 @@ def make_continuity_validator(config, *, settings=None) -> "ContinuityValidator 
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-        # GATE3-PROFILE-2: only pass settings= when a profile was actually
-        # resolved — see the identical comment in canon_validator.py.
+        # Pass settings= only when a profile was resolved (as in canon_validator.py).
         llm_call = (
             _make_llm_call(config, task_mode="creative", settings=settings)
             if settings is not None

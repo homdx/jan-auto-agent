@@ -193,35 +193,7 @@ def main():
     return 0
 
 
-# ── the --csv output ─────────────────────────────────────────────────────────
-# The on-screen report is grouped and scannable but you cannot sort or pivot it.
-# --csv writes the same thing as a spreadsheet: ONE ROW PER FINDING, with every
-# reviewer as its own column holding that reviewer's verdict. Read a row left to
-# right to see who said what; sort by `severity`, filter `agreement == SPLIT`.
-#
-#   finding     the grouping key — "path::symbol", or the task_id when the row
-#               named no file. One finding = one row here.
-#   severity    worst severity anyone gave it (CRITICAL > HIGH > MEDIUM > LOW > NONE).
-#   agreement   SPLIT     — reviewers gave 2+ distinct verdicts. Read these.
-#               UNANIMOUS — everyone who looked gave the same verdict.
-#               SOLO      — only one reviewer judged it (a NEW-* discovery, or a
-#                           list entry nobody else reached).
-#   reviewers   how many distinct reviewers judged this finding.
-#   confirmed / dismissed / fixed
-#               vote tally. dismissed = FALSE_POSITIVE + OUT_OF_SCOPE +
-#               UNVERIFIABLE; fixed = ALREADY_FIXED. confirmed+dismissed+fixed
-#               can exceed `reviewers` when the source list carried the same
-#               symbol under two task-ids and a reviewer judged both.
-#   task_ids    the IMPROVEMENTS.md id(s) that map onto this finding.
-#   title       the longest title any reviewer gave it.
-#   <one column per reviewer>
-#               that reviewer's verdict, or blank if they never judged it.
-#               "A|B" means they judged it twice (two task-ids) and disagreed
-#               with themselves — that is also what makes the tallies exceed
-#               `reviewers`.
-#
-# Rows are ordered: severity, then SPLIT before SOLO before UNANIMOUS, then
-# finding — so the contested, high-severity findings are at the top.
+# --csv: one row per finding, one column per reviewer. agreement: SPLIT (2+ verdicts), UNANIMOUS, SOLO (one reviewer).
 MERGED_META = ["finding", "severity", "agreement", "reviewers",
                "confirmed", "dismissed", "fixed", "task_ids", "title"]
 _DISMISS_VERDICTS = {"FALSE_POSITIVE", "OUT_OF_SCOPE", "UNVERIFIABLE"}

@@ -171,10 +171,7 @@ class TestParseResponseDeleteBranch:
         parsed, err = self._parse({"files": [
             {"path": "f.py", "delete": "false"},
         ]})
-        # No content provided, no delete branch taken → empty parse
-        # with a parse-error message (model said "do not delete" but
-        # also gave no content). The point is: we must NOT silently
-        # treat "false" as a delete.
+        # No content and no delete: the parse fails, and "false" is never treated as a delete.
         assert parsed == [], (
             f"string 'false' must NOT trigger the delete branch, "
             f"got parsed={parsed!r}"

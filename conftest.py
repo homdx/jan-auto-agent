@@ -32,68 +32,19 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# ── 1a. Keep .pyc cache out of the checkout ─────────────────────────────────────
-#
-# Without this, every module pytest imports (tools/*, tests/*, and whatever
-# test_story_*.py's subprocess imports) writes its .pyc next to the source
-# inside this checkout. That's `git status` noise (masked only by
-# .gitignore) and, on repos checked out on a slow/networked filesystem,
-# real per-file write overhead on every run. Redirect both this process and
-# any subprocess it spawns (test_story_*.py scripts run via
-# `python main.py ...`, ScriptTestItem.runtest above) to a prefix under the
-# system temp dir, keyed by this repo's folder name so it doesn't collide
-# with a sibling checkout.
+# Keep .pyc files out of the checkout: bytecode goes to the temp dir (per repo folder), for this process and its subprocesses.
 _PYCACHE_PREFIX = str(Path(tempfile.gettempdir()) / ROOT.name)
 sys.pycache_prefix = _PYCACHE_PREFIX
 os.environ.setdefault("PYTHONPYCACHEPREFIX", _PYCACHE_PREFIX)
 
 
-# ── 1b. Cache scan_repo(REPO_ROOT) across the test session ─────────────────────
-#
-# ~30 tests across tests/test_collect_*.py call scan_repo(REPO_ROOT) (this
-# repo's own source tree) with no config= override, each re-walking and
-# re-parsing every file from scratch -- 2-8s per call, ~100s+ of the
-# suite's wall time in aggregate. That specific call is safe to cache:
-# this checked-out repo doesn't change mid-run, and scan_repo has no side
-# effects (ModuleRecord is a frozen dataclass of tuples; verified no test
-# or library call in this suite mutates the returned list in place).
-#
-# The cache is scoped tightly on purpose -- a blanket
-# functools.lru_cache(scan_repo) was tried and reverted, because it broke
-# two other things: (1) ConfigParser isn't hashable, so any call passing
-# config=<a real ConfigParser> (e.g. tools/collect/loader.py's staleness
-# path) raised TypeError; (2) several tests scan a tmp_path repo, mutate
-# a file, and scan the *same* tmp_path again expecting the change to show
-# up -- caching that call would silently return stale results and defeat
-# the test. So this only ever caches root == this repo's own ROOT with
-# config is None; every other call (tmp_path roots, explicit configs)
-# goes straight to the real, uncached scan_repo (an explicit config on
-# ROOT itself reuses the default scan's per-file records, 1b-4).
-#
-# Only this test session's imported reference is wrapped -- the on-disk
-# tools/collect/scanner.py is untouched, so `collect` CLI runs are unaffected.
+# Cache scan_repo(REPO_ROOT) per test session: only this exact root with no config; tmp_path trees and explicit configs always rescan.
 from tools.collect import scanner as _scanner
 
 _real_scan_repo = _scanner.scan_repo
 _repo_scan_cache: dict = {}
 
-# ── 1b-2. ...and share that one scan between the xdist workers ────────────────
-#
-# The per-process cache above is per *process*: under `-n N` every worker
-# re-walks and re-parses the whole tree once (~9 s on a quiet core, several
-# times that on a loaded one), so a run pays N scans where it needs one --
-# and with `--dist=loadgroup` a file's tests scatter over all N workers, so
-# no worker can be spared it. The first worker to need the scan now writes it
-# to a pickle under the system temp dir and the others load it (0.04 s).
-#
-# The cache is only ever a *hit* when the scan's inputs are provably
-# unchanged, so it cannot serve a stale result (the failure mode the block
-# above warns about): the key is a fingerprint of (relpath, size, mtime_ns)
-# for every file in the tree outside .git and the caches, plus the
-# interpreter and the optional Java-parser versions, which change what
-# `scan_repo` returns. Any edit -- source or test -- is a new key and a fresh
-# scan. A flock serialises the writers so N workers starting together do one
-# scan, not N; an unreadable or truncated pickle is treated as a miss.
+# Share that cached scan between xdist workers through a pickle in the temp dir, keyed by a fingerprint of the tree.
 _SCAN_SKIP_DIRS = frozenset({".git", "__pycache__", ".pytest_cache", "contest-out",
                              "node_modules", ".venv", "venv"})
 
@@ -200,19 +151,7 @@ def _cached_scan_repo(root, *, config=None):
     return _repo_scan_cache[resolved]
 
 
-# ── 1b-4. ...and a config scan of this tree reuses the default scan's files ───
-#
-# A scan of ROOT with an explicit config (test_collect_config_languages reads
-# the shipped agents.ini) walks its own file set -- the config's languages and
-# limits decide which files -- but every Python file it shares with the
-# default scan gets the same record: `scan_module(source, path)` is a pure
-# function of the file's text and path, and the text is the tree 1b pins. So
-# for the length of that one scan `scan_module` answers those files from the
-# default scan and parses only the rest -- the one uncached ~7 s scan of the
-# suite (~20 s under `-n 8`) down to the handful of files the default scan
-# does not have. The walk, the language filters and every record the config
-# scan adds or drops are still the real scan_repo's. A test that patches
-# `scan_module` itself replaces this for its own duration.
+# A config scan of this tree reuses the default scan's records for the files both scans share.
 _real_scan_module = _scanner.scan_module
 _module_seed: dict = {}
 
@@ -237,18 +176,7 @@ _scanner.scan_repo = _cached_scan_repo
 _scanner.scan_module = _seeded_scan_module
 
 
-# ── 1b-3. ...and the tables the live-tree tests derive from that scan ─────────
-#
-# The scan is not the only answer this suite rebuilds from scratch file after
-# file: nine files' live fixtures build `build_test_map(ROOT, scan)`, five
-# build `build_fail_open_registry(scan, root=ROOT)`, and every in-process
-# `main.main()` with a config re-parses tools/ for its typed-config call sites
-# (`_scan_typed_config_call_sites`, 33 times a full run) -- 0.5-1 s each on a
-# quiet core, two to three times that under `-n 8`, the same answer every
-# time. They go through 1b-2's per-tree pickle: one worker builds, the rest
-# load. Scoped like 1b: only ROOT, only the session's own scan list (checked
-# by identity -- a filtered or rebuilt list is another question and goes to
-# the real function), and every caller gets its own copy of the container.
+# Live-tree tables derived from the cached scan, built once per session.
 from tools.collect import registries as _registries
 from tools.collect import test_map as _test_map
 
@@ -300,22 +228,7 @@ def _share_main_call_sites() -> None:
     main._scan_typed_config_call_sites = _cached_typed_config_call_sites
 
 
-# ── 1c. Cache gates._repo_defined_names(modules, ROOT) across the session ──────
-#
-# tests/test_collect_gates.py builds GATES against this repo's own real
-# scan several times over (the session-scoped `gates_entries` fixture,
-# plus test_bad_module_citation_raises / test_bad_parser_citation_raises,
-# each with their own one-entry seed). Every one of those calls, after
-# the gates.py fix that turned build_gates_map's per-seed-entry re-parse
-# into a single per-call `_repo_defined_names` pass, still does that one
-# full-repo ast.parse pass again from scratch -- ~3-4s each, on the same
-# modules list (scan_repo(ROOT) above already returns the same cached
-# list object every time) and the same root. Same safe-to-cache
-# reasoning as 1b: this checked-out repo doesn't change mid-run, and
-# `_repo_defined_names` returns a fresh, unshared set with no side
-# effects. Scoped the same way -- only root == this repo's own ROOT is
-# cached; a tmp_path repo (e.g. test_foreign_repo_skips_seed_instead_of_raising)
-# always goes to the real, uncached function.
+# Cache gates._repo_defined_names for this repo's own tree across the session, with the same reasoning as the scan cache.
 from tools.collect import gates as _gates
 
 _real_repo_defined_names = _gates._repo_defined_names
@@ -326,12 +239,7 @@ def _cached_repo_defined_names(modules, root):
     resolved = Path(root).resolve()
     if resolved != ROOT:
         return _real_repo_defined_names(modules, root)
-    # Keyed on `resolved` alone (not the `modules` object's identity):
-    # `build_gates_map` passes its own `list(modules)` copy on every
-    # call, a fresh object each time even for the same underlying scan,
-    # so an id()-based key never hit. Safe the same way 1b's scan_repo
-    # cache is: this repo's own tree doesn't change mid-run, so every
-    # call for `resolved == ROOT` answers the same question.
+    # Key on the resolved root only: each call passes a new list, so an id()-based key never hit.
     if resolved not in _gates_defined_names_cache:
         _gates_defined_names_cache[resolved] = _real_repo_defined_names(modules, root)
     return _gates_defined_names_cache[resolved]
@@ -340,17 +248,7 @@ def _cached_repo_defined_names(modules, root):
 _gates._repo_defined_names = _cached_repo_defined_names
 
 
-# ── 1d. A live CollectModel answers from indexes built once ───────────────────
-#
-# `CollectModel` rebuilds `_modules_by_path()` / `_test_paths()` on every query
-# on purpose (loader.py: a frozen dataclass kept free of a mutable cache). That
-# costs nothing in a round and dominates a sweep: the live-tree tests render
-# every module of this repo at up to seven budgets, ~10^5 queries over one
-# model, and spent ~40 % of their time rebuilding those two indexes. A fixture
-# that builds such a model once and never changes it takes its class from
-# `live_collect_model`: the same fields and the same answers, the two indexes
-# kept per instance -- outside it, so `vars(model)` is still exactly the
-# dataclass's fields (a test spreads it into a new model).
+# CollectModel indexes are built once per live-tree fixture; the model stays a plain dataclass.
 _live_indexes: dict = {}
 
 
@@ -422,15 +320,7 @@ class ScriptTestItem(pytest.Item):
     """Runs the script in a subprocess; maps exit code to PASSED / FAILED."""
 
     def runtest(self):
-        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): no
-        # timeout= was passed to subprocess.run — a hung test_story_*.py
-        # script (an infinite loop, a stuck network call inside the
-        # script) blocked the entire test suite indefinitely with no way
-        # to recover short of killing the process manually. 300s covers
-        # every legitimate script test currently in the suite with room to
-        # spare; TimeoutExpired is reported the same way a non-zero exit
-        # already is, via ScriptTestFailed, so repr_failure's existing
-        # stdout/stderr/exit-code formatting handles it without changes.
+        # Script tests time out after 300 s and are reported like a non-zero exit.
         try:
             result = subprocess.run(
                 [sys.executable, str(self.fspath)],
@@ -439,12 +329,7 @@ class ScriptTestItem(pytest.Item):
                 timeout=300,
             )
         except subprocess.TimeoutExpired as exc:
-            # BUGFIX: with text=True, TimeoutExpired.stdout/stderr are
-            # documented as str — but can still be None (no output captured
-            # before the kill) or, on Python builds older than 3.7.10, bytes
-            # on a partial-read boundary. Decode defensively so a slow
-            # script is reported as a clean timeout instead of crashing the
-            # whole pytest run with an uncaught TypeError (str + bytes).
+            # Decode partial output defensively: it may be None or bytes, so the timeout is reported cleanly.
             def _as_text(b):
                 if isinstance(b, (bytes, bytearray)):
                     return b.decode("utf-8", "replace")
@@ -489,19 +374,7 @@ class ScriptTestFailed(Exception):
         self.stderr = stderr
 
 
-# ── 4. `-n auto` sizes the pool for waiting, not for CPUs ──────────────────────
-#
-# pytest.ini asks for `-n auto`, which xdist resolves to the CPU count. This
-# suite is not CPU-bound: the contest tests deliberately sit out real silence
-# windows (a 3 s `idle_event_timeout_sec`, FL-1, kept wide so a loaded box does
-# not flake), and ~40 % of the wall time of a run is a process asleep. With one
-# worker per core those sleeps queue up behind each other; with more workers
-# than cores they overlap. Measured on ONE core, full suite: 580 s at -n 0 /
-# `-n auto`, 353 s at -n 6 -- no flake attributable to the load.
-#
-# The floor is 4 (the hook only affects `-n auto`; an explicit `-n N` or
-# `-n 0` is honoured exactly). JAN_TEST_WORKERS overrides it for a machine
-# that wants fewer (a shared CI runner) or more.
+# Pool size: -n auto waits on sleeps more than CPU, so the floor is 4; JAN_TEST_WORKERS overrides it.
 def pytest_xdist_auto_num_workers(config):
     forced = os.environ.get("JAN_TEST_WORKERS", "").strip()
     if forced.isdigit() and int(forced) > 0:
@@ -509,17 +382,7 @@ def pytest_xdist_auto_num_workers(config):
     return max(4, os.cpu_count() or 1)
 
 
-# ── 5. Under xdist the heavy tier is queued first ──────────────────────────────
-#
-# xdist hands a worker its next test once it has two or fewer left, in the
-# collection order (after the xdist groups, which its --loadscope-reorder
-# queues first). A long test met near the end of that queue lands on a worker
-# the others no longer wait with: at -n 8, three 6-7 s runner tests queued on
-# one worker at the end finished it 7 s after the rest. The files
-# tests/SLOW_TESTS.txt names -- the heavy tier sync_test_tiers.py keeps -- are
-# queued first, so their long tests start early and the fast files fill in at
-# the end. Only the queue's order changes, and only on xdist workers: a plain
-# `pytest` keeps pytest's own order.
+# Heavy tier (tests/SLOW_TESTS.txt) is queued first under xdist, so its long tests start early.
 def _heavy_tier_files() -> frozenset:
     try:
         lines = (ROOT / "tests" / "SLOW_TESTS.txt").read_text(encoding="utf-8").splitlines()

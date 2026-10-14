@@ -144,8 +144,7 @@ def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
     one tally row per claim (``None`` at base for a world claim, which is judged at head only).
     *accept* (CC-11) is the one acceptance rule of both sides."""
     sides = prepare_sides(claims, base, head, budget, collect)
-    # a world claim is judged once, at head: its change is always n/a, so an expect on it is a
-    # gate that can never be met — refused here, before a single request is made
+    # A world claim is judged once, at head, so its change is always n/a; an expect on it can never be met, so it is refused before any request is made.
     odd = [str(c.get("id") or i + 1) for i, c in enumerate(claims) if c.get("expect") and sides["world"][i]]
     if odd:
         raise ValueError(f"expect on a world claim ({', '.join(odd)}): it is judged once, at head; "
@@ -224,8 +223,7 @@ def write_outputs(out: Path, base: Target, head: Target, got: dict, *, budget: "
     out.mkdir(parents=True, exist_ok=True)
     deltas = got["deltas"]
     accept = got.get("accept", cv.DEFAULT_ACCEPT)
-    # the rule both sides were tallied under, so a delta table read later says which one it is;
-    # `all` writes the file as before (no key: an old delta.json is read as `all`)
+    # The rule both sides were tallied under, so a later delta table says which one it is; `all` writes as before (no key: old delta.json reads as `all`).
     data = cc_compare.delta_json(base.sha, head.sha, deltas)
     if accept != cv.DEFAULT_ACCEPT:
         data["accept"] = accept

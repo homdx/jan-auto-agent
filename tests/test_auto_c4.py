@@ -126,8 +126,7 @@ class TestFreshContext:
         OuterLoop(inner, st, max_rounds=4).run_task(TASK, tmp_path)
         # round 1 seeded with 0, round 2 with 1, round 3 with 2, round 4 with 3
         assert [len(p) for p in inner.seen_prior] == [0, 1, 2, 3]
-        # bounded-context guarantee: grows by ONE compact entry per round,
-        # never by the number of attempts (5) per round.
+        # Bounded context: it grows by ONE compact entry per round, never by the number of attempts (5) per round.
         assert len(inner.seen_prior[-1]) == 3          # not 15
 
     def test_each_round_sees_only_compact_summaries(self, tmp_path):
@@ -135,8 +134,7 @@ class TestFreshContext:
         inner = FakeInnerLoop([FakeInnerResult(passed=False, attempts_used=5,
                                                last_feedback="X" * 5000)] * 2)
         OuterLoop(inner, st, max_rounds=2).run_task(TASK, tmp_path)
-        # round 2's single prior entry is the compact (truncated) round-1 file,
-        # not the full 5000-char attempt log.
+        # Round 2's single prior entry is the compact (truncated) round-1 file, not the full 5000-char attempt log.
         seed = inner.seen_prior[1][0]
         assert len(seed) < 2000
         assert "Round 1" in seed

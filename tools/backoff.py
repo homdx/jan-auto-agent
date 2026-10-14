@@ -62,19 +62,7 @@ def _now() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ── retry helpers ─────────────────────────────────────────────────────────────
-#
-# Two shared helpers that used to be copy-pasted at every call site:
-#
-#   retry_with_backoff  — the bounded "call / on exception sleep
-#                         backoff_seconds(n) / retry" loop (run_search's
-#                         single-file and per-chunk paths, FaqAgent's
-#                         _answer_legacy, collect's summarize_repo).
-#   api_error_pause     — the Issue-7 "consecutive API error" block
-#                         (milestone table once, backoff_seconds(n-1),
-#                         sleep_with_interrupt_save with a checkpoint) used
-#                         by main.py's run_pipeline and actions.py's
-#                         run_text_qa / run_edit.
+# Shared retry helpers: retry_with_backoff (bounded retry loop) and api_error_pause (consecutive API error block).
 
 
 def retry_with_backoff(call, attempts: int = 3, sleep_fn=None,
@@ -192,19 +180,9 @@ def load_state(path: Path = STATE_FILE) -> Optional[Dict[str, Any]]:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
-        # AUTO-BACKOFF-GUARD-1: UnicodeDecodeError (raised when the file's
-        # bytes aren't valid UTF-8 — e.g. a checkpoint truncated mid-write
-        # inside a multi-byte character) is a ValueError subclass, NOT an
-        # OSError, so it wasn't caught here despite this function's own
-        # documented "corrupt -> None" contract.
+        # A file that is not valid UTF-8 (e.g. truncated mid-character) is a ValueError, so catch it here too.
         return None
-    # Hardening: a checkpoint is always written as a JSON object by
-    # save_state(). A file that parses cleanly but holds a JSON list / string
-    # / number / null (hand-edited or truncated-then-rewritten) used to be
-    # returned as-is, and every consumer immediately calls ``.get(...)`` on
-    # it — so main.py's resume path would crash with AttributeError on a
-    # non-dict instead of treating the state as absent/corrupt (which is the
-    # documented contract: "None if the file is absent / corrupt").
+    # A checkpoint that parses but is not a JSON object counts as corrupt: return None instead of crashing the resume.
     if not isinstance(data, dict):
         return None
     return data
@@ -237,23 +215,11 @@ def sleep_with_interrupt_save(
     except KeyboardInterrupt:
         print(f"\n  💾 [{_now()}] Interrupted — "
               f"saving checkpoint to '{path}'")
-        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): a
-        # save_state() failure here (disk full, permission error — exactly
-        # the kind of thing more likely mid-interrupt, e.g. a Ctrl-C
-        # during a full-disk condition) used to raise a brand-new exception
-        # from inside the KeyboardInterrupt handler, replacing the original
-        # interrupt with a confusing secondary traceback and skipping the
-        # resume-hint message and clean sys.exit(0) below. Best-effort: if
-        # the checkpoint can't be saved, say so plainly and still exit
-        # cleanly — the interrupt itself must always win.
+        # Best-effort checkpoint save: if it fails, say so and still exit cleanly, so the interrupt wins.
         try:
             save_state(state, path)
         except (OSError, TypeError, ValueError) as exc:
-            # AUTO-FIX: save_state() json.dumps a caller-supplied dict, so
-            # a non-serializable value (a set, a datetime) raises TypeError
-            # and some edge cases ValueError — neither was caught, which is
-            # exactly the "new exception inside a KeyboardInterrupt handler"
-            # the comment above exists to prevent.
+            # A non-serialisable value raises TypeError or ValueError; report it instead of replacing the interrupt.
             print(f"  ⚠  Could not save checkpoint: {exc}")
             print("  ▶  Restart will NOT be able to resume from this point.")
             sys.exit(0)

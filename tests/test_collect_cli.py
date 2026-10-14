@@ -41,10 +41,7 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def _init_repo(root: Path) -> None:
-    # .collect/ is a build artifact directory (same category as .agent/)
-    # and is git-ignored in the real project — mirrored here so these
-    # fixtures match real-world dirty-tree behavior rather than treating
-    # collect's own untracked output as an uncommitted source change.
+    # .collect/ is git-ignored in the real project; mirror that here.
     (root / ".gitignore").write_text(".collect/\n")
     _git(root, "init", "-q")
     _git(root, "config", "user.email", "test@example.com")
@@ -166,10 +163,7 @@ def test_collect_rebuilds_when_stale(mini_repo):
     assert result.fresh is True
 
 
-# ── manifest dirty flag must reflect the tracked tree, not collect's own
-#    output (`.collect/` isn't git-ignored, so a check running *after* the
-#    write would see the write's own untracked files and misreport dirty)
-#    ─────────────────────────────────────────────────────────────────────
+# Manifest dirty flag reflects the tracked tree, not collect's own output.
 
 
 def _manifest_dirty(collect_dir: Path) -> bool:
@@ -276,13 +270,7 @@ def test_module_raises_clean_error_on_undecodable_file(mini_repo):
         action_module(mini_repo, "pkg/a.py")
 
 
-# ── COLLECT-28: --module dispatches by language, not just Python ───────────
-#
-# action_module used to call scan_module (the Python-only, ast.parse-based
-# path) directly, so `--module Foo.java` would `ast.parse` valid Java
-# source, get a SyntaxError, and record a perfectly valid Java file as
-# broken *Python*. Fixed by routing through scan_file (the same
-# language-dispatching entry point scan_repo's own loop uses).
+# --module dispatches by language (scan_file), not only Python (scan_module).
 
 
 def test_module_on_java_file_is_parsed_as_java_not_broken_python(mini_repo):
@@ -374,14 +362,7 @@ def test_parse_collect_args_module_missing_path_raises():
         parse_collect_args(["--module"])
 
 
-# ── RUN-11: a Ctrl-C mid-Pass B costs one module ─────────────────────────────
-#
-# Nothing touches `.collect/` until Pass C, the registries, the test map and
-# the risk index have run, so an interrupt anywhere in a six-hour batch used
-# to leave `.collect/` exactly as it was — the next `--collect` or `--auto`
-# start took the same decision and paid for the same summaries again. The
-# two batch calls now checkpoint every landed summary into
-# `<collect dir>/collect_summarize_state.json`.
+# RUN-11: a Ctrl-C mid Pass B costs one module; batch calls checkpoint each summary.
 
 
 def _interrupting_llm(after: int):
@@ -495,8 +476,7 @@ def test_refresh_resumes_the_interrupted_incremental_batch(mini_repo_six, capsys
     for entry in state["modules"].values():
         assert set(entry) == {"purpose", "notes", "sha"}
         assert entry["sha"]
-    # The interrupted run wrote nothing else: the previous artifact stands,
-    # with every summary still null (Pass B never ran in run 1).
+    # The interrupted run wrote nothing else: the old artifact stands, with summaries still null.
     before = json.loads((collect_dir / ARTIFACT_FILENAME).read_text(encoding="utf-8"))
     assert len(before["modules"]) == 6
     assert all(m["summary"] is None for m in before["modules"])

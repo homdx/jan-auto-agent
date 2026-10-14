@@ -176,10 +176,7 @@ def _read(view, path: str) -> Optional[str]:
 def _has_gutter(chunk: Chunk) -> bool:
     """A file chunk, a git hunk or a ticket: its lines carry a `NNN|` number. Header, stat,
     log, note and collect chunks are plain text."""
-    # ticket_chunk prints ` 6| text` rows: with the gutter kept, a quote of two ticket lines
-    # never matched ("a b" against "a 4| b") and a correct verdict on a ticket claim was UNSURE
-    # a deleted file's hunk is `+0,0` (start 0) and still prints `  | -line` rows: a quote of two
-    # of its lines never matched, as with tickets above
+    # Ticket and git chunks with a gutter or a zero start must still match a quote, so the gutter is handled per kind.
     return (chunk.kind == "source" or (chunk.kind in ("git", "ticket") and chunk.start > 0)
             or (chunk.kind == "git" and re.search(r"(?m)^@@ ", chunk.text) is not None))
 
@@ -265,9 +262,7 @@ def find_all_quote(pack: Pack, quote: str) -> list:
     """
     if not isinstance(quote, str):
         return []
-    # a code line that itself starts with `  |` (`    | b)` of a continued expression) lost its
-    # text to the blank-gutter rule and the verbatim quote was rejected: the quote is also tried
-    # with the numbered gutter stripped only
+    # A code line that starts with "  |" loses its text to the blank-gutter rule; also try the quote with only the numbered gutter stripped.
     needles = {n for n in (normalise_quote(quote), normalise_quote(quote, _QUOTE_NUMBER))
                if len(n) >= MIN_QUOTE}
     if not needles:
@@ -636,8 +631,7 @@ def _dangling_notes(resolved: list, sha: str, chunks: list, view) -> list:
     for ra in resolved:
         kind = ra.anchor.kind
         if ra.found and kind == "path" and ra.lines and ra.lines[0] > 0:
-            # `a.py:900` of a 120-line file gave no chunk and no word: an empty pack, where
-            # "the file ends at line 120" is itself what decides the claim
+            # A line past the end of the file gives an empty pack; "the file ends at line N" is itself the evidence.
             body = reader.text(ra.path)
             n = len(_split(body)) if body is not None else None
             if n is not None and min(ra.lines) > n:
@@ -648,8 +642,7 @@ def _dangling_notes(resolved: list, sha: str, chunks: list, view) -> list:
                                           "the claim cites is not in it.", ra.anchor.text))
             continue
         if not ra.found and kind == "ticket" and ra.path:
-            # a ticket of ours (`CC-77`) with no file: the pack was empty, and no vote could stand on
-            # "there is no such ticket" — the one thing the evidence says
+            # A ticket with no file is a dangling note: no vote may stand on "there is no such ticket".
             cid = f"note:dangling:{ra.anchor.text}"
             if cid not in seen:
                 seen.add(cid)
@@ -665,8 +658,7 @@ def _dangling_notes(resolved: list, sha: str, chunks: list, view) -> list:
             text = (f"`{ra.anchor.text}` is ambiguous: it fits several files ({names}); "
                     f"the claim does not say which.")
         elif ra.path or kind == "path":
-            # a file written out in the claim that is not there, nor is its directory: the claim
-            # is about code the repository does not have, and a voter must be told so
+            # A missing path (and its directory) is a dangling note, so voters are told.
             cid = f"note:dangling:{ra.anchor.text}"
             text = _dangling_text(ra if ra.path else replace(ra, path="."), sha, chunks, reader)
         else:

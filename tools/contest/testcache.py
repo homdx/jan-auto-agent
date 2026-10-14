@@ -241,8 +241,7 @@ _VALUE_OPTIONS = frozenset({
 #: Short options of that set that glue a value on (``-nauto``, ``-k expr``).
 _SHORT_VALUE = frozenset("kmnpWcorC")
 
-#: ``--opt`` forms that may carry their value with ``=`` only when optional
-#: (``--durations 10`` is the two-word form; ``--tb`` too).
+#: --opt forms that take their value only with `=` when optional (--durations 10 is two words).
 
 #: The roots that are all "the tests directory".
 _TEST_ROOTS = {".smoke_tests", ".regression_tests", "tests"}
@@ -296,8 +295,7 @@ def _pytest_run(args: list) -> PytestRun:
             name, eq, value = token.partition("=")
             if name in _VALUE_OPTIONS and not eq and i < len(args):
                 nxt = args[i]
-                # `--durations 10`/`--tb short`/`--maxfail 2` take a word; a
-                # flag-looking next word is not a value
+                # --durations, --tb and --maxfail take a word; -k and -m accept any word, even a flag-looking one.
                 if not nxt.startswith("-") or name in ("-k", "-m"):
                     value = nxt
                     i += 1

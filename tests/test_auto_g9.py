@@ -39,12 +39,9 @@ from tools.auto.controller import AutoController
 from tools.auto.state import STATUS_DONE
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Sample repo content
-# ─────────────────────────────────────────────────────────────────────────────
 
-# Initial source file — two functions so gate1's symbol-existence check passes
-# for both candidate tasks.
+# Two functions, so the gate1 symbol-existence check passes for both candidate tasks.
 _HELLO_PY_INITIAL = """\
 def greet():
     return "hello"
@@ -100,9 +97,7 @@ _CANDIDATES_2 = [
 _CANDIDATES_1 = _CANDIDATES_2[:1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _git_init(path: Path) -> None:
@@ -174,8 +169,7 @@ def _make_fake_llm(candidates: list) -> callable:
             return json.dumps(candidates)
 
         if "static code reviewer" in system:
-            # Gate-1 LLM stage — always confirm, grounded in a real line
-            # from the code block shown so AUTO-H3's evidence check passes.
+            # The gate-1 call always confirms, grounded in a real line the AUTO-H3 evidence check accepts.
             user_msg = next(
                 (m["content"] for m in messages if m.get("role") == "user"), ""
             )
@@ -234,9 +228,7 @@ def _agent_dir(ctrl: AutoController) -> Path:
     return Path(ctrl.agent_dir)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-FULL — plan.json populated → ≥1 task executed → ≥1 commit → files written
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-FULL: plan.json populated, at least one task executed, commits made, files written
 
 class TestFullPipeline:
     """Full end-to-end run with a single improvement task and a real git repo."""
@@ -328,9 +320,7 @@ class TestFullPipeline:
         assert (ctrl.base_dir / "IMPROVEMENTS.md").exists()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-RESUME — kill after plan, restart, finish
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-RESUME: kill after the plan, restart, finish
 
 class TestResume:
     """Simulate an interrupted run: plan committed, process killed, then resumed."""
@@ -349,8 +339,7 @@ class TestResume:
         ini = _write_ini(tmp)
         candidates = _CANDIDATES_1
 
-        # Patch _run_task_loop to return immediately — simulates process killed
-        # right after the plan phase completed.
+        # Patches _run_task_loop to return at once, as if the process were killed after planning.
         def _no_execute(self_ctrl, **kwargs):
             return None, 0
 
@@ -456,9 +445,7 @@ class TestResume:
         assert prog["status"] == "idle"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-CAP — task cap stops the loop gracefully
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-CAP: the task cap stops the loop gracefully
 
 class TestCap:
     """Task cap fires mid-loop; progress.json records stop_reason; run resumable."""
@@ -525,9 +512,7 @@ class TestCap:
         assert len(done) == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Sanity: run() returns 0 on both clean and capped runs
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestExitCodes:
     def test_clean_run_exits_zero(self, tmp_path):

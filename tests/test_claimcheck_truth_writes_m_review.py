@@ -51,8 +51,7 @@ def test_four_processes_appending_keep_every_row(tmp_path):
 
 # ── №81: append_verdict's first writers ──────────────────────────────────────────────────────
 
-#: append_verdict.main, started once the file *go* exists: the eight writers are imported and waiting, then
-#: race (started one by one, most of them came after the first had written)
+#: Eight writers start together, so they race for the file.
 VERDICT = ("import os, sys, time; sys.path.insert(0, sys.argv[1]); import append_verdict as av\n"
            "while not os.path.exists(sys.argv[2]): time.sleep(0.001)\n"
            "sys.argv = ['append_verdict.py'] + sys.argv[3:]; sys.exit(av.main())")

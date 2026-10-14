@@ -289,8 +289,7 @@ class TestCollectStaleIsIncremental:
 
         llm2 = _counting_llm_call()
         action_collect(mini_repo, llm_call=llm2)
-        # a *different* second edit — writing the same bytes again would
-        # leave the manifest hash untouched and cost zero calls
+        # A different second edit: the same bytes again would leave the hash untouched and cost zero calls.
         (mini_repo / "pkg" / "a.py").write_text(
             "def a():\n    return 42\n\ndef extra():\n    pass\n\ndef extra2():\n    pass\n"
         )
@@ -380,8 +379,7 @@ class TestRebuildIsUnconditionalFullBuild:
         re-summarized."""
         action_collect(mini_repo, llm_call=_counting_llm_call())
 
-        # V8: `--drop-summaries` is the build that ends with no summaries; a
-        # plain `--no-llm` rebuild carries the previous ones forward.
+        # V8: --drop-summaries ends with no summaries; a plain --no-llm rebuild carries the previous ones forward.
         result = action_rebuild(mini_repo, drop_summaries=True)  # llm_call=None
 
         assert f"{_module_count(mini_repo)} module(s) re-scanned (Pass B skipped" in result.message
@@ -400,8 +398,7 @@ class TestRebuildIsUnconditionalFullBuild:
 
         assert len(llm.calls) == n
         user_msgs = [user for _system, user in llm.calls]
-        # the untouched module got re-summarized too — that is the whole
-        # difference between --rebuild and the incremental path
+        # The untouched module is re-summarised too: that is the difference from the incremental path.
         for path in before:
             assert any(path in user for user in user_msgs), f"{path} was not re-summarized"
 
@@ -655,10 +652,7 @@ class TestStaleTreeCostsOneScanAndOneHashPass:
         op_counts.update(scan_repo=0, hash_tree=0)
 
         modules = scanner_mod.scan_repo(mini_repo)
-        # `_hash_tree_unpatched` is bound at import time, before the
-        # fixture's monkeypatch, so this is the real function — calling
-        # `cli_mod.manifest_mod.hash_tree` here would hit the counter and
-        # spoil the assertion below.
+        # _hash_tree_unpatched is bound before the monkeypatch, so it is the real function and does not touch the counter.
         hashes = _hash_tree_unpatched(mini_repo, [m.path for m in modules])
 
         result = action_refresh(mini_repo, llm_call=_counting_llm_call(),
@@ -777,8 +771,7 @@ class TestNoSummaryWithoutASource:
 
         assert result.wrote is True
         modules = _artifact_modules(result.collect_dir)
-        # the file was still re-scanned structurally, so the change is picked
-        # up — just without invented prose for it
+        # The changed file is still re-scanned structurally, just without invented prose.
         assert "pkg/a.py:extra" in {
             s["qualname"] for s in modules["pkg/a.py"]["public_symbols"]
         }
@@ -824,9 +817,7 @@ class TestNoStaleVerificationReport:
         assert report.exists()
         assert any(m["summary"] is not None for m in _artifact_modules(first.collect_dir).values())
 
-        # V8: a plain `--no-llm` rebuild now carries the summaries forward and
-        # Pass C still verifies them, so the report is legitimately rewritten;
-        # `--drop-summaries` is the build with nothing left for it to describe.
+        # Plain --no-llm carries summaries forward and Pass C still verifies them; --drop-summaries leaves nothing to describe.
         result = action_rebuild(mini_repo, drop_summaries=True)  # llm_call=None -> Pass B/C skipped
 
         assert not report.exists()

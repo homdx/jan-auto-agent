@@ -52,17 +52,14 @@ from tools.contest import cli, export  # noqa: E402
 from tools.contest.kilo_client import KiloServer  # noqa: E402
 from tools.contest.runner import RoundState  # noqa: E402
 
-# the intake tests start `kilo serve` (the stub) on the port
-# kilo_client._free_port picked and let go of — see test_contest_cli.py
+# The intake tests start the stub kilo serve on the port kilo_client._free_port released (test_contest_cli.py).
 pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 TICKET_01_BODY = _ticket("01", "first")
 TICKET_01_BODY_QUEUED = _ticket("01", "first", "queued")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
 
 def _git_check(args, cwd=None) -> subprocess.CompletedProcess:
     """One subprocess, unchecked: the caller reads its exit code and its output."""
@@ -96,9 +93,7 @@ def _no_server(monkeypatch) -> None:
     monkeypatch.setattr("tools.llm_stream.request_completion", refuse)
 
 
-#: The KC-16 ready/gave-up scenario plus one permission ask on the first turn:
-#: the ask is recorded as a `gate-failed` decision, so SUMMARY's gate section
-#: has a line to read.
+#: KC-16 ready/gave-up scenario plus one permission ask, so SUMMARY's gate section has a line.
 SCENARIO_ONE_READY_AND_AN_ASK = {
     "turns": [
         {"on_prompt": _one_ready_turn, "events": ["busy", "idle"],
@@ -108,9 +103,7 @@ SCENARIO_ONE_READY_AND_AN_ASK = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # run --dry-run
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_dry_run_prints_the_plan_and_the_first_prompt_without_a_server(
         tmp_path, monkeypatch, capsys):
@@ -136,8 +129,7 @@ def test_dry_run_prints_the_plan_and_the_first_prompt_without_a_server(
     assert plan["gate"] == "test/gate @ 127.0.0.1"
     assert plan["out"] == str(sb.out())
 
-    # the prompt the runner would send the first agent: the runbook's text, the
-    # round's own base sha, and the agent's own scratch dir under `tmp_roots`
+    # The first agent's prompt carries the runbook text, the base sha, and its scratch dir.
     assert "prompt (agent-a):" in captured.out
     assert "prompt (agent-b):" not in captured.out
     assert f"Your starting tree is commit {sb.base}" in captured.out
@@ -189,9 +181,7 @@ def test_dry_run_still_runs_the_checks_that_need_no_server(tmp_path, monkeypatch
     assert not (sb.rounds / "01-agent-a").exists()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# intake: **File:** and **Symbol:**
-# ─────────────────────────────────────────────────────────────────────────────
+# Intake: **File:** and **Symbol:**
 
 def test_intake_refuses_a_ticket_without_a_file_line(sandbox, capsys):
     sandbox.commit_ticket(TICKET_01, TICKET_01_BODY.replace("**File:** `pkg/thing.py`\n", ""))
@@ -243,9 +233,7 @@ def test_intake_reads_the_missing_field_from_the_base_not_the_checkout(tmp_path,
     assert any(TICKET_01 in line and "**Symbol:**" in line for line in lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # run: entrants.json and SUMMARY.md
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_a_run_writes_entrants_and_a_summary(sandbox, capsys, spawn_holder):
     """One READY and one GAVE_UP with a commit: exit 0, the two patches, an
@@ -322,9 +310,7 @@ def test_a_stalled_agent_with_only_a_diff_is_an_entrant(sandbox, capsys, spawn_h
     """A `STALLED` turn that died with edits and no commit exports only a KC-31
     `.diff`, and that `.diff` is the entrant's `source`, with its state beside it."""
     ini = sandbox.repo / "contest.ini"
-    # KC-41 off: otherwise the runner commits the work for agent-b and it is a
-    # `.STALLED.patch`, not a `.diff`. KC-9: a silence under the deadline is a
-    # `continue` now; this test is about the stall's export, so no budget.
+    # KC-41 is off so the stall exports as .STALLED.patch; no budget, since the stall is what is tested (KC-9).
     ini.write_text(ini.read_text(encoding="utf-8").replace(
         "idle_event_timeout_sec = 900",
         "idle_event_timeout_sec = 5\ndeadline_commit = false\nmax_continues_per_attempt = 0"),
@@ -486,9 +472,7 @@ def test_the_summary_names_the_rounds_own_ticket_and_an_edits_path(sandbox, caps
     assert "- agent-a: gate-failed — reject — `AGENTS.md` — gate unavailable" in summary
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # status
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_status_prints_the_same_table_as_the_summary(sandbox, capsys, spawn_holder):
     run_fake(sandbox, SCENARIO_ONE_READY_AND_AN_ASK,

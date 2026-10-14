@@ -89,10 +89,7 @@ class TestExtractContentNullMessage:
         ) == "hi"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# End to end: the call must die with a clean, catchable parse error rather
-# than a raw TypeError leaking out of the hot path.
-# ─────────────────────────────────────────────────────────────────────────────
+# End to end: a null message raises a clean, catchable parse error, not a TypeError.
 
 class _OnceHandler(http.server.BaseHTTPRequestHandler):
     body = _NULL_MESSAGE_OPENAI

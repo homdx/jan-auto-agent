@@ -40,9 +40,7 @@ from tools.collect.test_paths import is_test_path
 
 # ------------------------------------------------------------------ extraction
 
-# any case (`Tests.MD`), and the other languages a target may hold: `App.java`, `run.js` gave no
-# anchor, so a claim about the file went to the voters as a world claim with no evidence. A bare
-# name of a suffix the repository has no file of still resolves to nothing (`Node.js`: world).
+#: Suffixes matched in any case; a file the repository lacks still resolves to nothing, so the claim is a world claim.
 _SUFFIXES = ("(?i:py|pyi|md|rst|ini|cfg|conf|json|jsonl|csv|sh|bash|toml|yaml|yml|txt|xml|html|css|"
              "js|jsx|ts|tsx|mjs|java|kt|kts|gradle|go|rs|c|h|cc|cpp|hpp|rb|php|cs|swift|scala|sql|"
              "proto|properties|lock|ipynb|bat|ps1|mk|cmake)")
@@ -70,8 +68,7 @@ _REF_HEAD = re.compile(r"(?<![\w/.\-])HEAD(?:[~^]\d*)*(?![\w/.\-])")   # HEAD~1 
 _NOT_BRANCH_NAMES = frozenset((
     "the a an of is was has had and or that this it to in on by with for as not than "
     "name names point points protection can will does do are were be been which").split())
-# What a backticked word is that is NOT a name from our code: the language, the
-# standard library, and the tools every report mentions.
+# Backticked words that are not our code: the language, the stdlib, and the tools reports mention.
 _STDLIB = frozenset(sys.stdlib_module_names)
 _BUILTINS = frozenset(dir(builtins))
 _NOT_SYMBOLS = (frozenset(keyword.kwlist) | _BUILTINS | _STDLIB
@@ -96,8 +93,7 @@ def _is_sha(text: str) -> bool:
 def _commit_spans(claim: str):
     for rx in (_HEX_CUE, _HEX_TICKS):
         for m in rx.finditer(claim):
-            # a hash with no letter a-f is a number unless the claim says it is a commit:
-            # one real prefix in forty is all digits ("Commit 480164324 ...")
+            # A hash with no a-f letter is a number, unless the claim says it is a commit.
             said = m.group(0).lstrip("@ ").lower().startswith(("commit", "sha")) or m.group(0).startswith("@")
             if said or _is_sha(m.group("h")):
                 yield "commit", m.start("h"), m.end("h")
@@ -132,8 +128,7 @@ def _is_rename(claim: str, start: int, end: int) -> bool:
             or claim[end:end + 4].lstrip().startswith("=>"))
 
 
-#: a quoted path with a space in it: `dir with space/a b.py`, "a b.py" — the quotes are its ends (a single
-#: quote is not one: "the file's config.py's" would be a path "s config.py")
+#: A quoted path with a space in it; the quotes mark its ends, and an apostrophe does not.
 _QUOTED_SPACED_PATH = re.compile(
     r"(?P<q>[`\"])(?P<p>(?:[\w.\- ]+/)*[\w\-][\w.\- ]*\.(?:" + _SUFFIXES + r"))(?::\d+(?:-\d+)?)?(?P=q)")
 
@@ -153,9 +148,7 @@ def _spaced_path(text: str) -> bool:
 
 
 def _path_spans(claim: str):
-    # first: bare, `dir with space/a b.py` was anchored as `b.py`, which does not exist, and the
-    # voter was told so — a confident FALSE on a file that is there. Only a quoted one: unquoted,
-    # where a path with spaces starts is anyone's guess
+    # Only a quoted path with spaces is anchored; an unquoted one cannot be told apart from the words around it (CC-1).
     for m in _QUOTED_SPACED_PATH.finditer(claim):
         if _spaced_path(m.group("p")):
             yield "path", m.start("p"), m.end("p")
@@ -238,8 +231,7 @@ def _with_wider(claim: str, a: Anchor) -> Anchor:
     reading is exactly the text between a pair of backticks or double quotes."""
     out, s = [], a.start
     for _ in range(MAX_WIDER_WORDS):
-        # a longer reading is a word and one space before: no space, nothing to search (the window
-        # search for each of 32,000 `a.py:` took twice what extracting them did)
+        # A longer reading is a word, so with no space before it there is nothing to search for.
         if s < 2 or claim[s - 1] != " ":
             break
         m = _WORD_BEFORE.search(claim, max(0, s - 200), s)
@@ -324,8 +316,7 @@ class _Index:
                 if len(text.encode("utf-8", "surrogateescape")) > MAX_PY_BYTES:
                     continue
                 self.line_count[path] = text.count("\n") + 1
-                # bytes that were not UTF-8 reach us as surrogates (read_utf8), which `ast` refuses:
-                # parse them as U+FFFD, line numbers are the same
+                # Non-UTF-8 bytes are read as U+FFFD for ast, so line numbers stay the same.
                 defs = _definitions(text.encode("utf-8", "surrogateescape").decode("utf-8", "replace"), path)
             except (OSError, ValueError, SyntaxError, RecursionError, MemoryError, UnicodeError):
                 continue
@@ -348,8 +339,7 @@ class _Index:
         return sorted(p for p, parts in self.module_of.items() if parts[-n:] == dotted)
 
 
-#: one index build at a time: Gate 1's presence workers share one view of the target (CC-10), and
-#: four threads that each missed the cache built the same five-second index four times
+#: One index build at a time, since the presence workers share one view of the target (CC-10).
 _INDEX_LOCK = threading.Lock()
 
 
@@ -516,9 +506,7 @@ def _resolve_ticket(anchor: Anchor, view: RepoView, index: _Index) -> ResolvedAn
     return ResolvedAnchor(anchor, False, path="epic-tasks" if ours else "")
 
 
-#: an identifier written without backticks: snake_case or UPPER_SNAKE (a `_` between two parts), or a
-#: private name (`_flush`, `_check_presence`: no English word starts with `_`), outside a path, a call, a
-#: dotted name and backticks — `retry_call never raises`. A dunder (`__init__`) names no one definition
+#: A bare identifier (snake_case, UPPER_SNAKE or private name) outside paths, calls, dotted names and backticks.
 _BARE_IDENT = re.compile(r"(?<![\w.`/$@\-])(_+[A-Za-z][A-Za-z0-9_]*|[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+)"
                          r"(?![\w`(/\-])")
 
@@ -527,8 +515,7 @@ _BARE_IDENT = re.compile(r"(?<![\w.`/$@\-])(_+[A-Za-z][A-Za-z0-9_]*|[A-Za-z][A-Z
 _BENCH_DIRS = frozenset(("contest-bench", "fixtures", "fixture", "testdata", "test_data", "test-data"))
 
 
-#: a word before a one-part private name that makes it a noun of the sentence: "The _state is set", "every
-#: _cache entry" — prose about a state or a cache, the underscore or not; "_flush drops the last line" names code
+#: A word before a one-part private name marks it as a noun of the sentence, not as code.
 _DETERMINER = re.compile(r"(?:^|\s)(?:the|a|an|this|that|these|those|its|their|our|his|her|my|your|every|each|"
                          r"any|no|some|all|both|either|neither)\s+$", re.I)
 
@@ -625,11 +612,7 @@ def _prefer_named_file(out: list, index: _Index) -> list:
 
 _CODE_KINDS = frozenset(("path", "symbol", "test", "commit", "ticket"))
 
-# A claim is `mixed` when, besides naming our code, it ASSERTS something about the
-# outside world: a clause that goes on about a library ("..., which returns -1"),
-# a flag's meaning, an exit code. Mentioning a library call in passing ("uses
-# `time.time` as its default clock") is still a claim about our code, so a world
-# fact counts only inside such a clause and only when it names an outside API.
+# A claim is mixed when it also asserts an outside fact (a library's return, an exit code); a passing mention is still about our code (CC-1).
 _CLAUSE = re.compile(r",\s*(?:which|whose|so|and|because|since|while|whereas)\b|\b(?:because|whereas)\b",
                      re.I)
 _WORLD_WORDS = re.compile(
@@ -687,18 +670,14 @@ _FORBIDDEN_GIT_ARGS = ("--output", "--ext-diff", "--textconv", "--open-files-in-
                        "--git-dir", "--work-tree", "--config-env",
                        "--contents",   # blame --contents reads a file outside the repository
                        "--no-index")   # diff/grep --no-index read any path on disk, not the repository
-#: a diff driver is named by the commit's .gitattributes and defined in the operator's config;
-#: git runs its textconv / external diff by default, so the view turns both off for these.
+#: Diff drivers from .gitattributes are turned off for these git commands, so the view is plain text.
 _NO_FILTERS_GIT = frozenset(("show", "diff", "diff-tree", "log", "blame"))   # blame runs textconv too
 
 
-#: directories of a plain tree (not a git checkout) that are not the project's own code. A virtualenv is
-#: known by what it holds (`_VENV_MARKERS`), not by its name: `venv`/`.venv` in this list left out a real
-#: package of that name (CPython's `Lib/venv`, a project's `tool/venv/builder.py`)
+#: Vendored directories are skipped by what they hold, not by name, so a real package with a venv name is kept.
 _VENDORED = frozenset((".git", "node_modules", "__pycache__", "site-packages", ".tox",
                        ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".eggs"))
-#: a file only a virtualenv has, relative to its root: `python -m venv` and virtualenv 20+ write pyvenv.cfg,
-#: an older virtualenv only its activate script
+#: Marker files that show a virtualenv, relative to its root (pyvenv.cfg and the older activate script).
 _VENV_MARKERS = ("pyvenv.cfg", "bin/activate", "Scripts/activate")
 
 
@@ -755,9 +734,7 @@ class PathRepoView:
         except gitref.GitRefError:
             return None
         names = [n for n in dict.fromkeys(out.split("\0")) if n]
-        # a committed node_modules or virtualenv is still not the project's code. A venv made in the root
-        # itself (`python -m venv .`) is not one to leave out: its prefix "" left out every file of the
-        # project (an empty index, every claim a world claim); its packages are under site-packages
+        # A virtualenv made in the project root is excluded by its markers, not all of the project's files.
         venvs = tuple(n[:-len(m)] for n in names for m in _VENV_MARKERS if n.endswith("/" + m))
         return [n for n in names if os.path.isfile(os.path.join(self.root, n))
                 and not _VENDORED.intersection(n.split("/")[:-1])
@@ -817,15 +794,12 @@ class PathRepoView:
         if "-" not in ticket_id:
             return by_number[0] if by_number else None
         slug = "-?".join(re.escape(part) for part in ticket_id.lower().split("-"))   # kc76 and cc-1
-        # the epic's own ticket folders too: CC-9 is docs/claim-check/tickets/291-cc-9-….md, and
-        # looked up in epic-tasks/ alone it fell back to 09-v6-… — an unrelated ticket, shown to
-        # the voter as CC-9, whose verbatim quote then verified
+        # Ticket lookup covers the epic's own ticket folders too, so an id is not matched to an unrelated ticket.
         tickets = [p for p in self.files() if re.fullmatch(r"docs/[^/]+/tickets/[^/]+\.md", p)]
         by_slug = [p for p in names + tickets if re.search(rf"(?<![a-z0-9]){slug}(?![0-9])", p.lower())]
         if by_slug:
             return by_slug[0]
-        # by its number alone only when the file names the id (`07-x.md` holding `# KC-7`): for a
-        # prefixed id the number in a file name is the file's (AUTO-3 is not 03-…)
+        # A bare number matches only when the file names the id, since a prefixed id uses its own number.
         named = re.compile(rf"(?<![A-Za-z0-9]){slug}(?![0-9])", re.I)
         for p in by_number:
             try:
@@ -846,8 +820,7 @@ class PathRepoView:
                 raise ValueError(f"git {args[0]} {arg}: refused, it writes or runs a program")
         if args[0] in _NO_FILTERS_GIT:
             args = (args[0], "--no-textconv", "--no-ext-diff", *args[1:])
-        # the operator's global and system config are not read: `color.ui=always` or
-        # `diff.noprefix` there changed the text a voter is shown (CC-4)
+        # The operator's global and system git config is not read, so the voter sees plain text (CC-4).
         env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat",
                "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
         return gitref.git(self.root, *args, env=env, strip=False, timeout=GIT_TIMEOUT)

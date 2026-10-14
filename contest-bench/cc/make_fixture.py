@@ -61,15 +61,7 @@ class Fixture(NamedTuple):
     head_sha: str
 
 
-# ── the seeded behaviours and the claims about them ─────────────────────────
-#
-# One row per claim. ``probe`` is (path, text) for a claim about a file: true at
-# a commit iff the file exists there and contains *text*. ``world`` is the truth
-# of a claim's world part (a world claim is only that; a mixed claim is the probe
-# AND the world part). ``git`` is (args, text) for a claim about a commit: true
-# iff ``git <args>`` prints *text*. ``fact`` marks the row as a seeded behaviour
-# (listed in fixture_facts.json). ``gone``: the symbol that no longer exists at
-# head — the claim is undecided there (truth_head None).
+# One row per claim: probe, world, git, fact and gone fields.
 
 def _c(id, claim, kind, anchors, *, probe=None, world=None, git=None,
        expect=None, fact=None, gone=None, how=None):

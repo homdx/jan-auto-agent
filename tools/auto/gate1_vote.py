@@ -105,15 +105,11 @@ LOCAL_FILES = ("contest.ini", "contest.local.ini")
 
 #: [gate1] vote_confirm when the ini does not set it (on, as CC-10 landed; off = the vote only vetoes)
 DEFAULT_CONFIRM = True
-#: CC-13: `[gate1] vote_collect` — `off` (the default, every pack is what it is) or `auto`
-#: (the pack carries the collect model's facts when the artifact of the run's base directory is
-#: fresh, or stale and `[collect] staleness = warn` allows a stale one)
+#: The vote's collect switch: off by default; auto puts the collect facts in the pack when the artifact is fresh or allowed stale (CC-13).
 DEFAULT_VOTE_COLLECT = "off"
 VOTE_COLLECT_MODES = ("off", "auto")
 
-#: The vote's own counters of the collect model (CC-13): `collect_chunks` is how many
-#: chunks of kind `collect` the run's packs carried, `collect_state` is what the artifact
-#: said (`off`, `absent`, `stale`, `fresh`) — a result then says what it had.
+#: Counters for the collect model: chunks carried, and the artifact state (off, absent, stale, fresh) (CC-13).
 COUNTER_COLLECT_CHUNKS = "collect_chunks"
 COUNTER_COLLECT_STATE = "collect_state"
 
@@ -207,8 +203,7 @@ class VoteConfig:
             logger.warning("config [gate1] vote_profiles names %d voter(s), the vote needs %d — it stays off",
                            len(profiles), QUORUM)
             return cls(profiles=profiles, why=f"vote_profiles names {len(profiles)} voter(s), needs {QUORUM}")
-        # the family is the model's: three sections vote_a/b/c that all name agnes models were three
-        # "families" and confirmed a candidate on one model's opinion; llm1/2/3 of three vendors were one
+        # Sections naming the same model family are one voter family, not three opinions.
         ini = voter_ini(config, profiles)
         models = tuple((p, model_of(p, ini)) for p in profiles)
         families = {cc_truth.family_of(p, m) for p, m in models}
@@ -225,8 +220,7 @@ class VoteConfig:
                 value = cast(text)
             except ValueError:
                 value = None
-            # float() takes "inf" and "nan", which int() refused: inf overflowed the vote's wait on every
-            # candidate, and nan made it return at once, every voter "missing" it
+            # float() accepts inf and nan, which int() refused; both are rejected here.
             if value is None or not math.isfinite(value) or value < low:
                 logger.warning("config [gate1] %s = %r is malformed — using %s", key, text, default)
                 return default
@@ -244,8 +238,7 @@ class VoteConfig:
         if accept not in ("all", "committed"):
             logger.warning("config [gate1] vote_accept = %r is not all/committed — using all", accept)
             accept = "all"
-        # CC-13: a malformed value is `off`, never an error — a wrong key must degrade to
-        # today's pack rather than keep the vote from running
+        # CC-13: a malformed value means off, so a wrong key keeps today's pack instead of an error.
         vote_collect = get("vote_collect", DEFAULT_VOTE_COLLECT).lower() or DEFAULT_VOTE_COLLECT
         if vote_collect not in VOTE_COLLECT_MODES:
             logger.warning("config [gate1] vote_collect = %r is not off/auto — using off", vote_collect)
@@ -330,10 +323,7 @@ def _load_claim_vote():
     return claim_vote
 
 
-#: CC-13: the collect model read once per tree, shared by the vote and by Gate 1's own line
-#: about it. The read is a full scan and hash of the tree, so it is cached here rather than
-#: re-done per candidate or per consumer; `main.py` is one process per run, so nothing of one
-#: run leaks into the next.
+#: The collect model is read once per tree and shared by the vote and Gate 1's line; main.py is one process per run (CC-13).
 _COLLECT_READS: dict = {}
 _COLLECT_READS_LOCK = threading.Lock()
 
@@ -496,12 +486,7 @@ class Gate1Vote:
         self._inflight: Counter = Counter()  # host -> requests of this run's votes not returned yet
         self._turns = _Turns()               # their order in each host's queue
         self._resolve_lock = threading.Lock()   # held for the whole resolution: a second presence
-                                                # worker waits for it instead of voting with all refs
-        # votes_skipped: candidates that reached the vote and were not voted on (nothing in the tree
-        # to quote, the cap, the vote stopped) — votes_asked alone hid them. CC-13 adds the collect
-        # side: collect_chunks counts the chunks of kind `collect` the run's packs carried, and
-        # collect_state says what the artifact was (off = the switch, absent/stale/fresh = the read),
-        # so a result says what its judges had.
+                                                # Skipped candidates are counted, and the collect state is recorded, so a result says what its judges had (CC-13).
         self.counters = {"votes_asked": 0, "votes_decided": 0, "votes_overridden": 0,
                          "votes_requests": 0, "votes_skipped": 0,
                          COUNTER_COLLECT_CHUNKS: 0, COUNTER_COLLECT_STATE: DEFAULT_VOTE_COLLECT}
@@ -549,10 +534,7 @@ class Gate1Vote:
             return self._ask_fn(ref, items, 0, 0, timeout)
         cv = _load_claim_vote()
         parser = self._voter_parser(cv)
-        # code_batch = 1: a Gate 1 candidate is one claim, so a voter costs one request. The timeout
-        # is passed as it was set (1.9 was cut to 1). *deadline* bounds the wait for a pacer slot,
-        # and once the request has its slot it has 2 x timeout of its own (budget), retries included;
-        # *turn* is its place in the host's queue (passed only when set: a stub of ask_v2 still fits)
+        # One claim is one request per voter; the timeout is passed as set, and the deadline bounds only the wait for a pacer slot.
         return cv.ask_v2(ref, items, 0, 0, parser, timeout, batch=1, code_batch=1, deadline=deadline,
                          budget=timeout * 2, **({"pacer": turn} if turn is not None else {}))
 
@@ -655,9 +637,7 @@ class Gate1Vote:
         pacer = None if self._ask_fn is not None else _load_claim_vote().PACER
         turns: dict = {}
         with self._lock:
-            # the bound on the whole vote, the pacer's queue included: the requests of the other votes
-            # still in flight on the same hosts are served first (`_Turns` keeps that order), and this
-            # vote's join them
+            # The bound covers the whole vote, including the pacer queue, after the other votes already in flight.
             bound = self._bound(refs, self._inflight)
             for ref in refs:
                 host = self._host(ref)
@@ -775,28 +755,22 @@ class Gate1Vote:
             return self._skip()       # a claim about a test is "the test lacks X": true and no reason for a task
         where, instruction = claim_parts(candidate)
         if not instruction:
-            # a hand-edited plan.json reaches Gate 1 through --validate-plan with no instruction:
-            # "`f` in `x.py` has the problem: " was three requests about nothing
+            # A hand-edited plan.json reaches Gate 1 with no instruction, so such a candidate is skipped.
             return self._skip()
         claim = claim_of(candidate)
         resolved = cc_anchors.resolve_claim(claim, view)
         kind = cc_anchors.classify(claim, resolved)
-        # dangling is judged on the cited file and symbol only: an instruction that names the file
-        # it will create ("add a test in tests/test_new.py") made every such candidate "dangling",
-        # and the vote skipped it without a word
+        # Dangling is judged on the cited file and symbol only, so an instruction that names a new file is not skipped.
         cited = [r for r in resolved if r.anchor.start < len(where)]
         if kind == "world" or cc_anchors.is_dangling(cited):
             return self._skip()       # nothing to quote: the single reader as today
-        # CC-13: `vote_collect = auto` and a fresh (or `staleness = warn` stale) artifact add the
-        # collect facts about the cited module to the pack the voters read; `off` and every failure
-        # give None and the pack is byte for byte what it was
+        # With vote_collect auto and a usable artifact, the collect facts join the pack; otherwise the pack is unchanged (CC-13).
         pack = build_pack(claim, resolved, view, model=self.collect_model(view), budget=self._budget)
         if not pack.chunks:
             return self._skip()
         if not self._admit():
             return self._skip()       # past [gate1] vote_max_per_run: the single reader answers
-        # the pack's own record of what the voters read: counted once it is put to them, so a pack past the
-        # cap (never sent) does not count, and a collect chunk of zero is "no collect data"
+        # Counted once the pack is put to the voters, so a pack past the cap does not count (CC-13).
         self._bump(COUNTER_COLLECT_CHUNKS, sum(1 for c in pack.chunks if c.kind == "collect"))
         with self._lock:
             refs = list(self._voters)
@@ -806,24 +780,20 @@ class Gate1Vote:
         requests = len(results)
         self._bump("votes_requests", requests)
         if self.cfg.accept == "all" and any(not r["votes"] for r in results):
-            # `tally` leaves a voter with no vote out of the voters (CC-6: a model dead for the whole
-            # run is not one), and a Gate 1 tally is one candidate: with four profiles a voter that
-            # timed out on this one did not block three TRUEs. Under `all` every voter answers
+            # A voter with no vote in this run is out of the tally, so a dead model does not block the candidate (CC-6).
             return VoteOutcome(requests=requests)
         cv = self._tally_fn_module()
         row = cv.tally([{"claim": claim}], results, quorum=QUORUM,
                        meta=[{"kind": kind, "dangling": False, "sha": pack.sha}],
                        accept=self.cfg.accept)[0]
-        # truth.settled: unanimous, TRUE/FALSE, and three families behind it (CC-8) — of the models
-        # the profiles name, not of the profile names
+        # truth.settled needs unanimity and three families behind it (CC-8), counted by model.
         if cc_truth.settled(row, self.cfg.model_map) is None:
             return VoteOutcome(requests=requests)
         quotes = tuple(row.get("quotes") or ())
         by = ", ".join(sorted(m for m, v in row["by_model"].items() if v == row["verdict"]))
         shown = "; ".join(f"“{q[:100]}”" for q in quotes[:2])
         if row["verdict"] == "TRUE" and not self.cfg.confirm:
-            # veto only: the reader decides what the vote would confirm; the line is what layer 2
-            # reads back to score the vote's own TRUEs
+            # A veto-only vote leaves the decision to the reader; the log line is what layer 2 reads back.
             logger.info("Gate1[vote] %r: claim vote: TRUE by %s (%s) — vote_confirm = off, the single "
                         "reader decides", getattr(candidate, "title", "?"), by, shown)
             return VoteOutcome(requests=requests)

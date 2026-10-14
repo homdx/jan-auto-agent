@@ -36,9 +36,7 @@ from analyze_logs import analyze, render_run_summary
 from tools.auto.arch_probe import ArchProbe, PROBE_INSTRUCTIONS, ProbeOp
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _FakeBridge:
     """Same shape as test_auto_f1_miss_memo.py's double — `module_symbols`
@@ -75,9 +73,7 @@ def _facts_ops(*names: str) -> list[ProbeOp]:
     return [ProbeOp("facts", n) for n in names]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AC-F4-1: instructions
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestInstructions:
 
@@ -86,9 +82,7 @@ class TestInstructions:
         assert "then ask `facts`" in PROBE_INSTRUCTIONS
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-F4-4 / AC-F4-5: informed vs. blind, at the ArchProbe level
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-F4-4 / AC-F4-5: informed vs blind, at the ArchProbe level
 
 class TestInformedVsBlind:
 
@@ -188,10 +182,7 @@ class TestInformedVsBlind:
         assert probe.informed_facts == (0, 0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-F4-2 test plan item: "split survives across rounds within a batch and
-# resets between batches"
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-F4-2: the informed split survives across rounds in a batch and resets between batches
 
 class TestBatchScoping:
 
@@ -206,8 +197,7 @@ class TestBatchScoping:
         probe.execute([ProbeOp("module", "tools/x.py")])
         # Round 2: one informed ask, one blind ask.
         probe.execute(_facts_ops("helper"))
-        # Round 3 (still the same batch — no reset() in between): another
-        # informed ask must still be recognised.
+        # A later round in the same batch is still recognised as informed.
         probe.execute(_facts_ops("helper", "retry"))
 
         assert probe.informed_facts == (2, 2), "both 'helper' asks across rounds"
@@ -228,8 +218,7 @@ class TestBatchScoping:
         assert probe.informed_facts == (0, 0)
         assert probe.blind_facts == (0, 0)
 
-        # "helper" was learned in the PREVIOUS batch — a fresh batch must
-        # not remember it, or "resets between batches" is not actually true.
+        # A fresh batch must not remember "helper" from the previous batch.
         probe.execute(_facts_ops("helper"))
         assert probe.blind_facts == (1, 1), (
             "a name learned in an earlier batch must not carry over"
@@ -257,9 +246,7 @@ class TestBatchScoping:
         assert probe.facts_informed_str() == "informed=1/1 blind=0/1"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AC-F4-3 / AC-F4-4: analyze_logs renders the split, and omits it cleanly
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _evt(kind: str, params: dict | None = None, run_id: str = "run1", **kw) -> dict:
     return {
@@ -372,9 +359,7 @@ class TestAnalyzeLogsRendering:
             }, source="probe", target="architect"),
         ]
         runs = analyze(events)
-        # c1's final (latest-round) total: informed 1/1, blind 1/1.
-        # c2's total: blind 0/1. Correct grand total: informed 1/1,
-        # blind 1/2 — NOT c1's 1/1 blind plus a double-counted round 1.
+        # Latest total per cluster only: c1 informed 1/1, blind 1/1; c2 blind 0/1; grand total blind 1/2.
         text = _capture_summary(runs["run1"])
         assert "informed" in text and "100% (1/1)" in text
         assert "blind" in text and "50% (1/2)" in text

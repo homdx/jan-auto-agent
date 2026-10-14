@@ -111,8 +111,7 @@ def test_goal_injected_into_prosody_check(tmp_path):
         "target_files": ["chapter_01.md"],
     }
 
-    # Spy on check() to confirm it actually evaluated prosody (i.e. the gate
-    # was active) rather than short-circuiting as a non-verse no-op.
+    # Spy on check() to confirm prosody actually ran (the gate was active, not a no-op).
     real_check = prosody_validator.check
     calls = []
 

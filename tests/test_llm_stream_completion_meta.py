@@ -62,9 +62,7 @@ OLLAMA_URL = "http://stub.local:11434/api/chat"
 HEADERS = {"Content-Type": "application/json"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fake transport
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _payload(**over) -> dict:
     p = {"model": "test-model", "messages": [{"role": "user", "content": "hi"}],
@@ -152,9 +150,7 @@ REASONING_ONLY = _sse([_chunk({"role": "assistant"}), _chunk({"reasoning_content
                        _chunk({"reasoning_content": "about it"}), _chunk({}, "length"), _usage_chunk(4096)])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-1: the plain return value is byte-identical
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-1: plain return value is byte-identical
 
 class TestPlainReturnUnchanged:
 
@@ -191,9 +187,7 @@ class TestPlainReturnUnchanged:
         assert isinstance(meta, CompletionMeta)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-1: what the metadata says
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-1: metadata content
 
 def _meta(fake, body, **kw) -> CompletionMeta:
     fake(body)
@@ -365,9 +359,7 @@ class TestRequestCompletionEx:
         assert text and meta.content_chunks == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AC-6: stream_options.include_usage and its per-(url, model) memory
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _build(**over):
     kw = dict(base_url="http://stub.local:1337/v1", api_key="k", model="test-model", api_format="openai",

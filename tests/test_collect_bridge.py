@@ -227,8 +227,7 @@ def test_context_for_withholds_a_dirty_neighbours_purpose():
     bridge.invalidate(["pkg/caller_a.py"])
     after = bridge.context_for("pkg/a.py")
     assert "Calls into the hub." not in after
-    # the caller can still appear in the static `callers:` fact row — only
-    # its LLM-derived purpose in `neighbours:` must be withheld
+    # The static `callers:` row may still name the caller; its LLM purpose in `neighbours:` must not.
     assert not any(line.startswith("neighbours:") for line in after.split("\n"))
 
 

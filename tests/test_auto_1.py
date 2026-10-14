@@ -20,12 +20,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-# FL-1 (round 84): a hang guard, not an assertion. One of these runs takes
-# ~1.5 s on an idle box, and the old 15 s looked like a 10x margin — but the
-# operator's stress run (four `pytest -n 8` invocations at once on 8 cores)
-# blew straight through it, and `subprocess.TimeoutExpired` is a far worse
-# diagnostic than the `--timeout` stack dump that would have followed. Let
-# pytest-timeout be the one that calls a hang a hang.
+# FL-1 (round 84): hang guard, not an assertion; pytest-timeout reports a hang better than TimeoutExpired.
 _MAIN_PY_TIMEOUT_S = 120
 
 
@@ -43,9 +38,7 @@ def _run(*args, input_text: str | None = None,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — --auto exits cleanly (exit code 0) and prints the start banner
-# ─────────────────────────────────────────────────────────────────────────────
+# --auto exits cleanly (exit 0) and prints the start banner
 
 def test_auto_flag_exits_zero():
     """--auto with a valid goal and an existing --base must exit 0."""
@@ -84,9 +77,7 @@ def test_auto_missing_base_exits_nonzero():
     assert result.returncode != 0, "Non-existent base_dir should not exit 0"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — existing modes are untouched (no regressions)
-# ─────────────────────────────────────────────────────────────────────────────
+# Existing modes are untouched
 
 def test_help_flag_unaffected():
     """--help must still list --auto without breaking."""
@@ -102,9 +93,7 @@ def test_once_mode_unaffected():
     assert result.returncode == 1, "--once '' should still exit 1"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC4 — AutoController unit tests (no subprocess needed)
-# ─────────────────────────────────────────────────────────────────────────────
+# AutoController unit tests (no subprocess)
 
 def test_controller_raises_on_empty_goal():
     import sys

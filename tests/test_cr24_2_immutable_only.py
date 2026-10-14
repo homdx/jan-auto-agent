@@ -45,10 +45,7 @@ class TestStateLikeFactsNotKept:
     """
 
     def test_mixed_extract_reply_is_merged_as_returned(self, tmp_path: Path) -> None:
-        # Simulates a (non-compliant) model mixing one immutable fact with one
-        # stateful one, to document current behaviour: StoryBible does not
-        # post-filter — it relies on the prompt (tested above) to keep state
-        # out in the first place.
+        # A non-compliant model mixes an immutable and a stateful fact; StoryBible does not filter, the prompt does.
         mixed_reply = (
             "• Аделина — КМС по плаванию\n"
             "• Аделина сейчас стоит на мостике\n"
@@ -61,9 +58,6 @@ class TestStateLikeFactsNotKept:
         bible.update("chapter text")
 
         content = bible.load()
-        # Documented current behaviour: both lines persist because filtering
-        # is the prompt's job, not the code's. If this ever changes (e.g. a
-        # deterministic state-detector is added), update this test alongside
-        # the spec change.
+        # Both lines persist, because filtering is the prompt's job (update this test if that changes).
         assert "Аделина — КМС по плаванию" in content
         assert "Аделина сейчас стоит на мостике" in content

@@ -26,11 +26,7 @@ import sys
 
 TICKET_RE = re.compile(r"^(\d+)-.*\.md$")
 
-# A ticket whose **Status:** line starts with one of these is not on offer:
-# `landed` — merged, the round is over; `queued` — written, but not this
-# round (INDEX.md "Next rounds" says when); `closed` — no longer wanted at all
-# (AR-14 `arena issue close`), its `**Closed:**` line says why. Everything else
-# (`open`, no status line at all — the tasks/ tickets have none) is handed out.
+# Skips tickets whose Status is landed, queued or closed; open or no-status tickets are handed out.
 SKIP_STATUS = ("landed", "queued", "closed")
 
 
@@ -72,8 +68,7 @@ def _field(body, label):
 def recorded(progress_path):
     if not os.path.exists(progress_path) or os.path.getsize(progress_path) == 0:
         return {}
-    # a file that will not decode, a field past the csv limit or a NUL byte reads
-    # as an empty file, the way `run start`'s intake and the harvest read it
+    # A file that will not decode, has an over-limit csv field, or contains a NUL byte reads as empty, as `run start`'s intake and the harvest read it.
     try:
         with open(progress_path, newline="", encoding="utf-8") as fh:
             text = fh.read()

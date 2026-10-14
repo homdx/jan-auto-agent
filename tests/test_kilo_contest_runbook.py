@@ -68,9 +68,7 @@ def _runbook_text() -> str:
     return RUNBOOK.read_text(encoding="utf-8")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the page and its sections
-# ─────────────────────────────────────────────────────────────────────────────
+# The page and its sections
 
 def test_runbook_page_exists():
     assert RUNBOOK.is_file(), f"{RUNBOOK} is missing — the KC-8 deliverable"
@@ -106,13 +104,10 @@ def test_every_referenced_file_exists():
             assert (REPO_ROOT / rel).exists(), f"runbook names missing {rel!r}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the documented flags are still flags of the CLIs they belong to
-# ─────────────────────────────────────────────────────────────────────────────
+# Documented flags are still flags of the CLIs they belong to
 
 def _documented_flags() -> set[str]:
-    # The recorded SUMMARY.md quotes the agents' own commands verbatim; those
-    # are not the page's instructions, so their dashes are not flags.
+    # Quoted agent commands in SUMMARY.md are not the page's instructions, so their dashes are not flags.
     text = re.sub(r"^````markdown\n.*?^````", "", _runbook_text(),
                   flags=re.MULTILINE | re.DOTALL)
     return set(_FLAG_RE.findall(text))
@@ -135,9 +130,7 @@ def test_documented_flags_are_recognised_by_their_clis():
         f"the runbook documents flags no CLI recognises: {sorted(unknown)}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the cross-references the ticket asked for
-# ─────────────────────────────────────────────────────────────────────────────
+# The cross-references the ticket asked for
 
 def _text(rel: str) -> str:
     return (REPO_ROOT / rel).read_text(encoding="utf-8")
@@ -163,9 +156,7 @@ def test_probe_links_the_runbook():
     assert "RUN-THE-KILO-CONTEST.md" in _text("docs/kilo-contest/PROBE.md")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the first round on record
-# ─────────────────────────────────────────────────────────────────────────────
+# The first round on record
 
 def _recorded_block() -> str:
     """The fenced block the 'First round on record' section holds verbatim."""

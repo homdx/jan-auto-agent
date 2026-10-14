@@ -46,12 +46,7 @@ def extract_block(filepath: str, target_name: str) -> Optional[str]:
             source = fh.read()
         result = _extract_block_from_source(source, target_name, ext)
         if not result:
-            # BUGFIX: this branch used to be indistinguishable from a read
-            # failure below (both returned bare None). It also fires for a
-            # file with no extension — ext="" degrades extract_block to a
-            # brace-based scan instead of an AST parse, which is a real,
-            # silent quality drop, not just "not found". Logged at debug so
-            # the cause is visible without changing the return contract.
+            # A file without an extension is logged at debug, since it falls back to a brace scan (BUGFIX).
             logger.debug(
                 "search_agent.extract_block: %r not found in %s (ext=%r%s)",
                 target_name, filepath, ext,
@@ -88,13 +83,10 @@ class SearchAgent:
         ssl_context=None,
     ):
         self.max_file_kb = max_file_kb
-        # None  → use the project-wide defaults
-        # []    → skip nothing (caller explicitly wants no exclusions)
-        # [...]  → use exactly what the caller passed
+        # None uses the defaults, [] skips nothing, and a list is used as given.
         self.skip_dirs: List[str] = list(_DEFAULT_SKIP_DIRS) if skip_dirs is None else skip_dirs
         self.max_depth = max_depth
-        # LLM noise-filter config. When model/base_url are absent the filter is
-        # disabled and every reference is approved (backward-compatible no-LLM mode).
+        # With no model or base_url the noise filter is off and every reference is approved.
         self.model = model
         self.base_url = base_url.rstrip("/") if base_url else None
         self.api_key = api_key
@@ -183,9 +175,7 @@ class SearchAgent:
             approved = json.loads(cleaned)
             if not isinstance(approved, list):
                 raise ValueError(f"expected a JSON list, got {type(approved).__name__}")
-            # An empty list ("[]") is valid JSON, so it skipped the
-            # except-block's fail-open path — treat it the same way, per
-            # this method's own documented fail-open contract.
+            # An empty JSON list is valid, so it takes the same fail-open path (per the method contract).
             if not approved:
                 logger.warning(
                     "_evaluate_with_llm: LLM returned an empty list — "
@@ -193,8 +183,7 @@ class SearchAgent:
                     "ref(s) [fail-open]", len(all_names),
                 )
                 return all_names
-            # Keep only names that were actually in the input (guard against
-            # the model inventing names), preserving the original order.
+            # Only names that were in the input are kept, so the model cannot invent one; order is kept.
             approved_set = {str(a) for a in approved}
             result = [n for n in all_names if n in approved_set]
             tracer.event("llm", "search_agent", "llm_response",
@@ -251,9 +240,7 @@ class SearchAgent:
                 result["not_found"] = references
                 return result
 
-            # Gather candidate files across all supported source languages.
-            # If file_ext_hint is set, preferred-extension files come first so
-            # the most likely match is found quickly; others follow.
+            # Source files are gathered for all languages; the hinted extension is tried first.
             raw_candidates = list_source_files(base_dir, skip_dirs=self.skip_dirs)
             if file_ext_hint:
                 preferred = [f for f in raw_candidates if Path(f).suffix == file_ext_hint]
@@ -277,10 +264,7 @@ class SearchAgent:
             found_raw: Dict[str, Dict[str, str]] = {}
             searched_this_run: Set[str] = set()
 
-            # Intra-run source cache: each candidate file is read from disk at
-            # most once per run() call, regardless of how many references are
-            # searched. Key = absolute file path, value = file text (empty
-            # string marks a file that failed to read — skipped on all refs).
+            # Each candidate file is read at most once per run (empty text marks a failed read).
             _source_cache: Dict[str, str] = {}
 
             for ref in refs_to_search:
@@ -366,10 +350,7 @@ def make_search_agent(config, base_dir="."):
     active  = config.get("api", "active", fallback="local")
     section = f"api_{active}"
 
-    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
-    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
-    # the literal config.getX(...) call shape — see RunLimits.from_config's
-    # comment for the full reasoning.
+    # Wrapped per call, so extract_config_reads still sees the literal config.getX calls (AUTO-FIX).
     try:
         verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
     except ValueError as exc:

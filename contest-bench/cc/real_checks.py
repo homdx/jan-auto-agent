@@ -31,9 +31,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
-# In scope for every ``python`` check. ``src`` and ``git`` read the repository at
-# the pinned sha, never the export's neighbours; ``decide`` asks the contest
-# policy with contest.ini's own deny_commands, the way kc-bug-report.md did.
+# Runs in scope for every `python` check. `src` and `git` read the repo at the pinned sha; `decide` asks the contest policy with contest.ini's deny_commands, as kc-bug-report.md did.
 PRELUDE = r'''
 import importlib, inspect, os, subprocess, sys, tempfile
 from pathlib import Path

@@ -48,15 +48,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Tuple
 
-#: Directory prefixes under which every path is test-suite code, not shipped
-#: source. Repo-relative POSIX paths; each entry ends in `/`.
+#: Directory prefixes whose paths are test code, not shipped source (POSIX, each ends in /).
 TEST_PATH_PREFIXES: Tuple[str, ...] = (
     "tests/", "tests_bugfix/", "tests_slow/", "stub-test/",
     ".smoke_tests/", ".regression_tests/",
 )
 
-#: File names that mark test scaffolding wherever they sit — pytest's hook
-#: file lives at this repo's root, not inside a test root.
+#: Test scaffolding file names, wherever they sit (pytest's hook file is at the repo root).
 TEST_FILE_NAMES: Tuple[str, ...] = ("conftest.py",)
 
 #: pytest's discovery shape; the naming half of `is_test_module`.
@@ -108,8 +106,7 @@ def canonical_test_path(root: Path, path: str) -> str:
         link = root / path
         if not link.is_symlink():
             return path
-        # strict: a dangling link must come back as itself, not as the
-        # name it points at — that name is not a file and would never be read.
+        # strict=True: a dangling link fails here and is returned as itself.
         return link.resolve(strict=True).relative_to(root.resolve()).as_posix()
     except (OSError, ValueError):
         return path

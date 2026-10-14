@@ -88,16 +88,14 @@ from tools.contest.runner import (  # noqa: E402
 )
 from tools.contest.workspace import Workspace  # noqa: E402
 
-# Hermetic: the committed contest.ini alone, copied where no contest.local.ini sits next to
-# it, so an operator's local overrides never change what these tests see.
+# Hermetic: the committed contest.ini alone, so operator overrides never change these tests.
 _COMMITTED_DIR = Path(tempfile.mkdtemp(prefix="committed-ini-"))
 atexit.register(shutil.rmtree, _COMMITTED_DIR, ignore_errors=True)
 shutil.copy(REPO_ROOT / "contest.ini", _COMMITTED_DIR / "contest.ini")
 COMMITTED = _COMMITTED_DIR / "contest.ini"
 MODEL_CHECK = REPO_ROOT / "scripts" / "py_model_test.py"
 
-#: The wordings Kilo's own store uses, from round 107's kilo-serve.log and from
-#: the model check's own stderr on the same day.
+#: Store error wordings, from round 107's kilo-serve.log and the model check's stderr.
 STORE_MESSAGES = (
     "Failed to execute statement",
     'Failed query: insert into "project" (id) values (?)',
@@ -106,8 +104,7 @@ STORE_MESSAGES = (
     "SQLITE_BUSY: database is locked",
     "disk I/O error",
 )
-#: Not a store: the provider's transients keep KC-19's rule, and a model that
-#: cannot be found is a refusal.
+#: Not a store error: provider transients keep KC-19's rule, and a missing model is a refusal.
 NOT_STORE_MESSAGES = (
     "the model's provider interrupted the response stream",
     "upstream unavailable for model x",
@@ -328,8 +325,7 @@ def test_a_store_error_is_retried_in_the_same_session(tmp_path, message):
     retry_text = backend.prompts[1]
     assert RETRY_PROMPT.split("{reason}")[0] in retry_text
     assert "kilo store error" in retry_text
-    # and the turn that hit the store is recorded with its cause, so the next
-    # reader does not have to dig into the server log
+    # The turn that hit the store is recorded with its cause, for the next reader.
     turns = _jsonl(out_dir / "hy3" / "turns.jsonl")
     assert turns[0]["cause"] == "local_store"
     assert turns[0]["idle_status"] == "error"
@@ -573,8 +569,7 @@ def test_plan_restarts_a_resumable_error_that_has_a_commit(tmp_path):
     runs = _plan(_config(), [ws], _ticket(tmp_path), resume)
 
     run = runs[0]
-    # the verdict decides: no claim row yet, so the turn is not READY and the
-    # agent is restarted rather than scored done
+    # No claim row yet: the turn is not READY, so the agent restarts rather than being scored done.
     assert run.state is AgentState.CREATED
     assert run.resumable is False
     # the paragraph is for uncommitted work, and a commit is not that
@@ -729,8 +724,7 @@ def test_the_intake_warns_above_the_threshold_and_stays_silent_below(
     assert cli._kilo_neighbour_note(_config(), _FakeServer(None),
                                     proc_root=str(root)) is None
 
-    # a `/proc` that cannot be read, and one whose scan raises: no line and no
-    # exception, so intake starts the round either way
+    # An unreadable /proc, or one whose scan raises: no note and no exception, so intake starts the round.
     assert cli._kilo_neighbour_note(_config(), _FakeServer(100),
                                     proc_root=str(tmp_path / "no-such-proc")) is None
     monkeypatch.setattr(cli, "kilo_neighbours",

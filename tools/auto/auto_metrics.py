@@ -70,12 +70,7 @@ class AutoMetricsStream:
     """
 
     def __init__(self, agent_dir: Path) -> None:
-        # Auto-create the directory (mirroring the draft's _load() behaviour).
-        # Guarded: a permission error, a read-only filesystem, or agent_dir
-        # colliding with an existing file all raise OSError here. Left
-        # unguarded, construction dies with a bare traceback pointing at
-        # pathlib internals instead of naming the directory that couldn't
-        # be created — surface a clear, actionable error instead.
+        # Create the directory; permission, read-only and name-collision errors name the directory (guarded).
         try:
             Path(agent_dir).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -96,27 +91,17 @@ class AutoMetricsStream:
                     f"Pass a proper .agent/ directory, not the project root."
                 )
         except OSError as exc:
-            # resolve() can fail on non-existent paths on some OSes — safe to
-            # skip; the path-collision check is best-effort anyway. BUGFIX:
-            # this used to swallow the exception entirely, which also hid
-            # the case of a real permission error making the metrics path
-            # unreadable — the operator would end up with a metrics file
-            # that silently collides with the interactive one and no clue
-            # why the collision check didn't catch it.
+            # A path that cannot be resolved is skipped; a debug line keeps this from failing silently (BUGFIX).
             logger.debug(
                 "AutoMetricsStream: could not resolve %s for the "
                 "interactive-path collision check: %s", metrics_path, exc,
             )
 
-        # FL-1 (round 84): no lock needed — MetricsCollector.record() now
-        # serialises its own writes; _warn_if_contaminated/.collector stay
-        # freely callable from another thread.
+        # No lock here: MetricsCollector.record() serialises its own writes.
         self._collector = MetricsCollector(metrics_path=metrics_path)
         self._warn_if_contaminated()
 
-    # ------------------------------------------------------------------ #
-    # Properties                                                           #
-    # ------------------------------------------------------------------ #
+    # Properties
 
     @property
     def collector(self) -> MetricsCollector:
@@ -128,9 +113,7 @@ class AutoMetricsStream:
         """Absolute path of the auto-run metrics file."""
         return self._collector.metrics_path
 
-    # ------------------------------------------------------------------ #
-    # Write API                                                            #
-    # ------------------------------------------------------------------ #
+    # Write API
 
     def record_gate2(
         self,
@@ -170,14 +153,10 @@ class AutoMetricsStream:
             Use ``attempts_used=N``.  The old ``attempts=N`` keyword is kept
             for backward compatibility but will be removed in a future release.
         """
-        # Support legacy callers that pass attempts= instead of attempts_used=.
-        # Use ``is not None`` so ``attempts_used=0`` (a valid value meaning
-        # "zero attempts were used") is kept rather than falling through to
-        # the legacy ``attempts`` parameter.
+        # attempts_used=0 is a real value; only a missing attempts_used falls back to the legacy attempts argument.
         effective_attempts = attempts_used if attempts_used is not None else attempts
         try:
-            # No lock here (FL-1, round 84): MetricsCollector.record() now
-            # serialises itself; nothing above this call is shared state.
+            # No lock here: MetricsCollector.record() serialises itself (FL-1).
             _record_gate2_locked(
                 self._collector,
                 task_id,
@@ -203,18 +182,14 @@ class AutoMetricsStream:
         """
         self._collector.flush()
 
-    # ------------------------------------------------------------------ #
-    # Factory                                                              #
-    # ------------------------------------------------------------------ #
+    # Factory
 
     @classmethod
     def from_agent_dir(cls, agent_dir: Path) -> "AutoMetricsStream":
         """Canonical factory — directory creation is now also in __init__."""
         return cls(agent_dir)
 
-    # ------------------------------------------------------------------ #
-    # Internal helpers                                                     #
-    # ------------------------------------------------------------------ #
+    # Internal helpers
 
     def _warn_if_contaminated(self) -> None:
         """
@@ -235,9 +210,7 @@ class AutoMetricsStream:
             with path.open("r", encoding="utf-8") as fh:
                 records = json.load(fh)
             if not isinstance(records, list):
-                # Unexpected format — could be an old interactive store or
-                # unrelated file.  Log and leave intact; the MetricsCollector
-                # will treat unreadable JSON as an empty list.
+                # Unexpected format (an old or unrelated file): logged and left intact.
                 logger.warning(
                     "AUTO-E2 contamination guard: %s is not a JSON array "
                     "(found %s).  Auto-run records may be unreliable.",
@@ -261,12 +234,7 @@ class AutoMetricsStream:
                     path,
                 )
         except (json.JSONDecodeError, UnicodeDecodeError, OSError):
-            # Corrupt or unreadable — MetricsCollector already handles this
-            # gracefully (returns [] from _load_all). Nothing to do.
-            # BUGFIX (audit): UnicodeDecodeError (raised by the implicit
-            # decode inside fh.read()/json.load() for a non-UTF-8 file)
-            # wasn't caught here, unlike the sibling metrics_collector.py's
-            # equivalent guard.
+            # A corrupt or unreadable file reads as empty; decode errors are handled too (BUGFIX).
             pass
 
 
@@ -290,24 +258,16 @@ def _record_gate2_locked(
     if prompt_store is not None:
         try:
             v = prompt_store.get_version_label("validator")
-            # Coerce to str so MagicMocks/non-string values don't break JSON
-            # serialisation when tests pass a mock prompt_store.
+            # Values are coerced to str, so mock prompt versions do not break the JSON.
             prompt_version = str(v) if v is not None else "auto"
         except Exception as exc:
-            # BUGFIX: was a bare `except Exception: pass` — the metric
-            # record then silently carries "auto" as its prompt_version
-            # whether the run genuinely is on auto mode or the version-label
-            # lookup crashed. Logging here lets an operator debugging a
-            # regression tell those two cases apart (with --verbose).
+            # A failed version lookup is logged, so an operator can tell it from a real auto run (BUGFIX).
             logger.warning(
                 "auto_metrics: get_version_label('validator') failed — "
                 "recording prompt_version='auto': %s", exc,
             )
 
-    # RUN-7: "unavailable" wins over approved/rejected — a validator that
-    # never reached a verdict is neither. Checked first so a caller that
-    # (incorrectly) also passes approved=True/False alongside unavailable=True
-    # can't produce a misleading "approved"/"rejected" status.
+    # unavailable beats approved and rejected: a validator with no verdict is neither (RUN-7).
     if unavailable:
         _status = "unavailable"
     else:

@@ -27,21 +27,7 @@ def check(label, condition):
         print(f"  {FAIL}: {label}")
         _failures.append(label)
 
-# FL-1 (round 84, round 7): a scratch file, in a private temp directory.
-#
-# This used to be `_root / "test_story_2_3_prompts.json"` — one fixed path in
-# the repo root, shared by every process that runs this script. The operator's
-# stress command runs `pytest tests -n 8` **twice at once**, so two copies of
-# this script run concurrently against that one file, and `fresh_store()`
-# unlinks it. Interleave one process's `fresh_store()` with another's second
-# `push()` and the second push reloads an empty store, numbers itself v1, and
-# `get_version_label` returns "v1" where the script asserts "v2".
-#
-# Nothing about that is a timing margin: it is two processes sharing mutable
-# state. Which is worth stating, because running the same suite twice at once
-# is not only *load* — it is a concurrency test of the suite against itself,
-# and any test that writes a fixed path outside a per-process directory fails
-# it.
+# Scratch file in a private temp dir: a fixed repo-root path collides when two runs go in parallel.
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="story_2_3_")) / "prompts.json"
 
 def fresh_store(**kw):

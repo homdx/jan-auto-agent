@@ -76,8 +76,7 @@ def test_source_module_with_three_homonyms_extracts_exactly_one_claim():
 
 
 def test_a_source_module_is_not_widened_to_its_imports():
-    # V11's widening is for tests only: a shipped module importing pkg/b may
-    # not cite pkg/b.py:load_events just because b defines a homonym.
+    # V11 widening applies to tests only: shipped code must not cite a homonym via its imports.
     a = _module("pkg/a.py", "import pkg.b\n" + SRC_A, A_PURPOSE)
     purposes, report = _run([a, _module("pkg/b.py", SRC_B)])
     assert purposes["pkg/a.py"] == A_PURPOSE
@@ -117,8 +116,7 @@ def test_source_module_citing_a_path_qualified_foreign_symbol_still_drops():
 
 
 def test_a_wrong_citation_in_a_source_summary_still_sinks_the_sentence():
-    # Sink-or-swim is untouched: a real own-module citation in a sentence
-    # that also names a foreign symbol drops the whole sentence.
+    # Sink-or-swim: a foreign symbol in a sentence drops the whole sentence.
     a = _module("pkg/a.py", SRC_A, "other_event_loader and load_events both read the trace.")
     purposes, report = _run([a, _module("pkg/b.py", SRC_B)])
     assert purposes["pkg/a.py"] == ""
@@ -129,9 +127,7 @@ def test_a_wrong_citation_in_a_source_summary_still_sinks_the_sentence():
 
 
 def test_a_bare_single_word_is_still_not_a_citation():
-    # `_symbol_patterns`' callers skip a plain single lowercase word, so a
-    # three-way homonym on the name `load` produces one uncheckable generic
-    # claim, not three — unchanged by giving source modules a citable set.
+    # A plain lowercase word is not a citation: a three-way homonym yields one generic claim.
     known = frozenset({"pkg/a.py:load", "pkg/b.py:load", "pkg/c.py:load"})
     claims = extract_claims(
         "load reads the trace.", "pkg/a.py", known, citable_modules=frozenset({"pkg/a.py"}),
@@ -175,9 +171,7 @@ def test_source_and_test_modules_in_the_same_run_do_not_interfere():
     test = _module("tests/test_events.py", "import pkg.a\n",
                    "Covers load_events. Also pkg/b.py:other_event_loader.")
     purposes, combined = _run(source + [test])
-    # Every claim of the source modules is still counted the same way once a
-    # test module joins the run — the per-module kept/dropped bookkeeping is
-    # additive, so `kept_count == total_claims - dropped_count` per module.
+    # Per-module kept/dropped counts stay additive when a test module joins the run.
     assert source_report["kept_count"] == 1
     assert source_report["dropped_count"] == 0
     assert combined["kept_count"] == source_report["kept_count"] + 1

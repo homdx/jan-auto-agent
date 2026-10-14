@@ -76,16 +76,7 @@ STATUS_ABSENT = "absent"
 STATUS_STALE = "stale"
 STATUS_FRESH = "fresh"
 
-#: Which paths are test code is `tools.collect.test_paths`'s call (L5) — the
-#: same list `test_map.build_test_map` splits the scan by, so the producer
-#: and this reader cannot disagree about a directory again (this reader used
-#: to keep its own six roots while `test_map` knew one, `tests/`). `callers_of`
-#: still pairs that rule with the test paths the artifact itself recorded in
-#: `test_map`'s values: the artifact's own list is authoritative but indexes
-#: coverage rather than the test tree, and a stale artifact can omit whole
-#: test directories, so the path rule is the fallback for anything it did not
-#: record. `tools/collect/test_map.py` matches neither signal: it is shipped
-#: code whose name merely contains "test".
+#: Test-code paths come from tools.collect.test_paths, the same rule test_map uses, so producer and reader agree. tools/collect/test_map.py is shipped code.
 
 
 def _staleness_policy(config: Optional[configparser.ConfigParser]) -> str:
@@ -118,14 +109,7 @@ class CollectModel:
     thin_coverage_list: Tuple[str, ...] = ()
     risk_index: Tuple[RiskEntry, ...] = ()
     config_map: Tuple[ConfigMapEntry, ...] = ()
-    # V1: the import graph the producer has always written (13 artifact keys,
-    # this was the first batch dropped on read). Both tables are keyed by
-    # relative module path: `import_edges` is first-party only — `graph.
-    # import_edges` resolves names against the scanned module set and drops
-    # anything outside the repo — and `imported_by` is its reverse index.
-    # `entry_points` is a denormalised copy of "keys of `imported_by` with an
-    # empty value"; kept because the artifact carries it, so a caller does not
-    # have to rebuild it. Empty containers, never `None`.
+    # V1: the import graph the producer always wrote. import_edges is first-party only; imported_by is its reverse index; entry_points is the keys with no importer. Empty containers, never None.
     import_edges: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     imported_by: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     entry_points: Tuple[str, ...] = ()
@@ -406,11 +390,7 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
             )
             for g in payload.get("gates", [])
         )
-        # V1: the three graph tables the producer has always written but this
-        # reader dropped. Each is normalised through a helper that raises
-        # TypeError on a wrong shape — the guard below already turns that into
-        # an absent model — while a missing or null key yields an empty
-        # container, so an older artifact still loads with the rest of its data.
+        # V1: the three graph tables; a wrong shape counts as absent, a missing key as an empty container.
         test_map = _test_map_table(payload.get("test_map"))
         zero_coverage_list = _string_tuple(payload.get("zero_coverage"), "zero_coverage")
         thin_coverage_list = _string_tuple(payload.get("thin_coverage"), "thin_coverage")
@@ -435,9 +415,7 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
             for c in payload.get("config_map", [])
         )
     except (AttributeError, KeyError, TypeError, ValueError):
-        # Bugfix: a valid-JSON-but-non-dict artifact.json made
-        # payload.get(...) raise AttributeError, which this tuple missed —
-        # breaking the docstring's "must never raise out of the loader".
+        # A valid JSON non-dict (e.g. a list) must not escape the loader; it is treated as absent.
         return _absent(collect_dir, "artifact has an unexpected shape — treated as absent")
 
     return CollectModel(
@@ -485,8 +463,7 @@ def load(
         return _absent(collect_dir, "manifest is unreadable — treated as absent")
 
     current_paths = [m.path for m in scan_repo(root, config=config)]
-    # CC-13: the effective `[collect] skip_dirs` list, so a change of the
-    # setting alone reports stale rather than drifting on the hashes alone.
+    # The effective skip_dirs list is recorded, so changing only that setting reports stale.
     fresh = manifest_mod.is_fresh(existing_manifest, root, files=current_paths,
                                  skip_dirs=manifest_mod.skip_dirs_from_config(config))
     if fresh:
@@ -594,8 +571,7 @@ def load_readonly(
 
         diff = manifest_mod.diff_files(man.file_hashes, hashes)
         changed = len(diff.added | diff.modified | diff.removed)
-        # what else is_fresh refused: the reason named "a tracked file changed" for a manifest whose
-        # files had not moved at all (another skip_dirs list), and a count of 0 said nothing either
+        # Names every cause of staleness, not only the changed files (CC-13).
         causes = []
         if man.collector_version != manifest_mod.COLLECTOR_VERSION:
             causes.append("collector version")
@@ -611,8 +587,7 @@ def load_readonly(
 
         policy = _staleness_policy(config)
         if policy == "ignore":
-            # the artifact is there and stale: say so (a log that says "absent" would send the
-            # operator looking for a build that exists), and give no model, as `load` does
+            # The artifact is there and stale: say so (not absent), and give no model, as load does.
             return CollectRead(status=STATUS_STALE, changed=changed, causes=causes,
                                reason=f"{reason}, staleness=ignore — not used")
         if policy == "refresh":

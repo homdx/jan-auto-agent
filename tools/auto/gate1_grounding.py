@@ -52,22 +52,7 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, Optional
 
-# ── AUTO-H2-6: cited-location / target-file mismatch ───────────────────────────
-#
-# Confirmed in production, not hypothesized: across two real folders (31 and
-# 35 candidates), every single candidate whose Location field named a
-# different file than its own target_files was rejected — 26 out of 26.
-# The mechanism: plan_emitter's "Location:" field is a direct rendering of
-# ``cited_location.file`` (see tools/auto/backlog_prioritiser.py:
-# ``loc_str = loc.file``), and that is the exact field
-# ``Gate1Filter._check_existence`` reads and extracts a code block from —
-# never ``target_files``. When they diverge, Stage B is shown the cited
-# evidence file (sometimes a cluster-seed config file, a test file, or an
-# unrelated module) while being asked whether a problem exists in a
-# completely different file — the one that would actually get edited. Every
-# rejection reason observed says some version of "the code shown is X, not
-# Y, so the claimed problem is not present" — the LLM was entirely correct
-# given what it saw; what it saw just wasn't the target.
+# Grounding check: the cited file must be the target file, since the model judges only the file it is shown (AUTO-H2-6).
 
 _INSTRUCTION_SYMBOL_RE = re.compile(
     r"\b[A-Za-z_][A-Za-z0-9_]*\.([a-z_][A-Za-z0-9_]*)\b|\b([a-z_][a-z0-9_]{3,})\("
@@ -119,23 +104,12 @@ def target_file_context(
             source = path.read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             continue
-        # FIX-2 #13: an extensionless file is not a Python file. The old
-        # `or ".py"` default asserted a language the path never claimed, so
-        # Makefile / Dockerfile / Jenkinsfile / .gitignore content was handed
-        # to the AST-based Python strategy. An empty extension is the honest
-        # answer: block_extractor then assumes no language and uses its
-        # language-neutral brace search, and extract_module_docstring returns
-        # "" rather than parsing a non-Python file as Python.
+        # An extensionless file is not treated as Python; its block is read with the language-neutral search (FIX-2 #13).
         file_ext = Path(tf).suffix
 
         block = ""
         for symbol in ([cited_symbol] if cited_symbol else []) + _instruction_symbol_candidates(instruction):
-            # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): same
-            # unguarded extract_block() call as ContextBroker.resolve() —
-            # one problematic file/symbol pair shouldn't abort Gate 1
-            # grounding for the whole candidate. Fail-open by skipping this
-            # symbol, matching the loop's own fallback-to-head-of-file
-            # behavior a few lines below when nothing resolves.
+            # Symbols to look up are the cited symbol and the ones named in the instruction (same audit fix as above).
             try:
                 block = extract_block(source, symbol, file_ext)
             except Exception:
@@ -145,12 +119,7 @@ def target_file_context(
         if not block:
             lines = source.splitlines()
             block = "\n".join(lines[:40])
-            # Nothing named in the instruction resolved to a real symbol —
-            # a plain head-of-file slice on a well-documented module is
-            # often just its module docstring, never reaching actual code.
-            # Skip ahead to the first def/class so Stage B sees something
-            # concrete to compare the claim against, not just a description
-            # of what the module is for.
+            # With no symbol resolved, skip the module docstring and start at the first def or class, so Stage B sees code.
             if "def " not in block and "class " not in block:
                 for i, ln in enumerate(lines):
                     if ln.startswith(("def ", "class ")):
@@ -171,23 +140,7 @@ def target_file_context(
     return None
 
 
-# ── AUTO-H2-6b: instruction names a file the citation never mentions ──────────
-#
-# AUTO-H2-6 above catches cited_location.file disagreeing with the
-# candidate's own target_files. It has nothing to say when those two
-# fields agree with EACH OTHER and are both wrong relative to what the
-# instruction is actually about — confirmed in production on a real run
-# (agents_128k.ini, architect model deepseek-v4-flash): cluster "support"
-# (legal citations: CHANGELOG.md, README.md, RUNBOOK.md only) was reviewed
-# against the run goal "Harden main.py: docstrings, type hints, a pytest
-# test". Three candidates came back with instruction text entirely about
-# main.py — a file outside that cluster, and therefore not a legal
-# citation for this call — while cited_location.file AND target_files
-# both landed on CHANGELOG.md: a legal-but-topically-wrong citation, not a
-# hallucinated path. target_file_context() found cited_file already IN
-# target_files, so it added no note; Stage B was shown only CHANGELOG.md's
-# prose and correctly rejected all three, including the one candidate
-# proposing the exact fix this run needed: a new ``tests/test_main.py``.
+# Instruction names a file the citation never mentions: the note adds it, so a legal but off-topic citation is caught (AUTO-H2-6b).
 _FILENAME_TOKEN_RE = re.compile(r"\b[\w][\w./-]*\.[A-Za-z][A-Za-z0-9]{0,8}\b")
 
 
@@ -238,11 +191,7 @@ def instruction_file_context(
         seen.add(token)
 
         path = base_dir / token
-        # BUGFIX (audit): no containment check — _FILENAME_TOKEN_RE allows
-        # "/" and "." in a token, so an instruction containing something
-        # like "a/../../etc/passwd.txt" matches and reads outside
-        # base_dir, unlike every other base_dir-relative read in this
-        # codebase's Gate 1 stage (see gate1_filter.py's same fix).
+        # A filename from the instruction is contained in base_dir before it is read (BUGFIX).
         try:
             path.resolve().relative_to(base_dir.resolve())
         except ValueError:
@@ -279,9 +228,7 @@ _SECTION_ERROR_CUES = re.compile(
     re.IGNORECASE,
 )
 
-# Matches e.g. config.getint("auto", "max_rounds_per_task", fallback=X)
-# Captures (section, key, rest-of-call) so we can check "fallback" is in
-# *that specific call*, not just somewhere else in the block.
+# Matches a config.getint call with a key, so the fallback can be checked in that same call.
 _CONFIG_GET_RE = re.compile(
     r"""\.get(?:int|boolean|float)?\(\s*
         ["'](?P<section>[^"']+)["']\s*,\s*
@@ -291,33 +238,13 @@ _CONFIG_GET_RE = re.compile(
     re.VERBOSE,
 )
 
-# AUTO-H2-7: one-hop wrapper resolution for config_fallback_note. Confirmed
-# in production: AUTO-T3's __init__ calls self._read_int('max_depth', 2) —
-# a wrapper method — not config.getint(...) directly. The fallback= lives
-# inside _read_int's own body, one call-hop away from what's extracted for
-# __init__, so the direct check below never sees it. Same class of gap as
-# callee_context's documented one-hop limit, just for this check instead.
+# One-hop wrapper resolution: a self._read_int call hides its fallback, so the check follows the wrapper (AUTO-H2-7).
 _WRAPPER_CALL_RE = re.compile(r"\bself\.([a-z_][a-z0-9_]*)\(")
 
 
-# FIX-2 #12: the wrapper's ``def`` used to be located with a bare
-# ``re.search`` over the entire file, which has no notion of which class the
-# call site is in. Two classes defining a same-named private helper --
-# routine for ``_read_int`` / ``_config`` / ``_open`` -- made the match a
-# file-position lottery: the note could be built from a body the call site
-# can never reach, and this note's whole purpose is to tell Stage B "your
-# claimed crash is impossible", so a wrong body means a *correct* finding is
-# argued away with a fabricated fact. Resolution is AST-based and scoped to
-# the class the call site actually lives in.
-#
-# The AST also retires the old body boundary ``(?=\n    def |\nclass |\Z)``,
-# which assumed exactly four-space indentation and a column-0 ``class``: in a
-# file indented any other way it never fired, so the "body" ran to end of
-# file and swallowed later methods -- another route to reading a
-# ``fallback=`` that belongs to something else entirely.
+# A wrapper definition is found in the class the call site lives in, via the AST, so the same helper name in another class is not used (FIX-2 #12).
 
-# The first ``def`` in an extracted block is the method the call site is in
-# (``extract_block`` returns the cited symbol including its def line).
+# The first def in an extracted block is the method the call site is in.
 _BLOCK_DEF_RE = re.compile(r"^\s*def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
 
 
@@ -391,8 +318,7 @@ def _calling_class(full_source: str, code_block: str):
 
     owners = [c for c in classes if _direct_method(c, caller) is not None]
     if len(owners) > 1:
-        # Same method name in several classes — fall back to where the block
-        # physically sits in the file to separate them.
+        # The same method name can repeat in several classes, so the file position tells them apart.
         idx = full_source.find(code_block)
         if idx >= 0:
             line = full_source.count("\n", 0, idx) + 1
@@ -502,9 +428,7 @@ def _referenced_call_names(code_block: str) -> list[str]:
     try:
         tree = ast.parse(code_block)
     except SyntaxError:
-        # code_block is often a partial excerpt (e.g. one method, dedented
-        # oddly, or a line-range slice) — not always independently parseable.
-        # Fall back to a light textual scan for `name(` / `obj.name(`.
+        # A partial excerpt may not parse, so names are found with a light textual scan instead.
         return list(dict.fromkeys(re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(", code_block)))
 
     names: list[str] = []
@@ -518,31 +442,7 @@ def _referenced_call_names(code_block: str) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-# ── FL-9: the repo walk must not be a filesystem-order lottery ───────────
-#
-# _find_def_in_repo's job is to point Stage B at a definition, and every
-# wrong answer it can give is worse than no answer at all: a definition from
-# a nested work tree is somebody else's revision, a copied fixture is a
-# different program, and "not found" on a definition that is sitting in the
-# repo costs the claim its only chance at a counter-fact. The old walk had
-# three sources of error:
-#
-#   * it read whatever ``Path.rglob`` handed it first, and rglob's order is
-#     directory-entry order, so a checkout that also holds nested work trees
-#     (``rounds/``), vendored output or copied fixtures could hand back a
-#     foreign definition — the machine that happened to list those first;
-#   * it ignored whether a file was tracked, so an untracked copy of a module
-#     was a first-class candidate;
-#   * max_files could be spent entirely on files the search should never have
-#     read, leaving "not found" for a definition that was in the repo (FIX-2
-#     #11 cut this for .agent/ and node_modules/; FL-9 closes it for
-#     everything git already told us to ignore).
-#
-# The result is now an ordered preference list — the cited file, then its
-# package outward, then the tracked repo in sorted order — so two runs and
-# two machines agree. Every shortcut here is optional and fail-open: no git,
-# git failing, or a malformed answer just drops that stage and the plain
-# walk below still runs.
+# The definition search follows a fixed preference (cited file, its package, then the tracked repo in sorted order), so runs agree (FL-9).
 
 def _resolve_cited(base_dir: Path, cited_file: Optional[str]) -> Optional[Path]:
     """*cited_file* as an absolute path inside *base_dir*, else ``None``.
@@ -599,20 +499,11 @@ def _display_path(found_path: Path, base_dir: Path) -> Path:
         return found_path.name
 
 
-#: Tracked-file lookups are not cached across calls: an --auto run makes
-#: several Gate 1 passes against a tree its Coder keeps committing to, and a
-#: process-wide cache would hand a later pass the index of an earlier one.
-#: ``callee_context`` reads the list once per call and passes it to every
-#: name it tries, which is the one place the repeat cost was.
+#: Tracked-file lookups are not cached across calls, since the tree changes between Gate 1 passes; the list is read once per call.
 _TRACKED_FILES_TIMEOUT_SECONDS = 10
 
 
-#: FIX-2 #11's original exclusions: the run's own state and the vendored
-#: pile. Applied to every walk, tracked or not — a definition inside them
-#: is not a result even when it matches. FL-9 deliberately keeps this list
-#: unchanged: the tracked walk already drops build/ output, site-packages
-#: and virtualenvs by virtue of not being tracked, and widening the list
-#: here would hide a real definition in a checkout that has no git at all.
+#: Directories never searched: the run's own state and vendored output, tracked or not (FIX-2 #11).
 _EXCLUDED_SEGMENTS: tuple[str, ...] = (".agent", "node_modules")
 
 
@@ -670,9 +561,7 @@ def _tracked_python_files(base_dir: Path) -> Optional[list[Path]]:
     top = _git(["rev-parse", "--show-toplevel"])
     if top is None or not top.strip():
         return None
-    # --full-name: without it ls-files answers relative to cwd, and joining
-    # that to the root below loses every file when base_dir is a
-    # subdirectory of the work tree.
+    # The git listing is relative to the work tree root, so it is requested that way and joined correctly.
     raw = _git(
         ["ls-files", "-z", "--full-name", "*.py"],
         timeout=_TRACKED_FILES_TIMEOUT_SECONDS,
@@ -686,19 +575,14 @@ def _tracked_python_files(base_dir: Path) -> Optional[list[Path]]:
     except (OSError, ValueError):
         return None
 
-    # ls-files answers relative to the work tree root, so both ends have to
-    # be resolved before the containment test — the root may be a symlink,
-    # and a base_dir outside the tree must not be read as a relative path.
+    # Both ends are resolved before the containment test, so symlinks and out-of-tree paths are handled.
     out: list[Path] = []
     for rel in raw.split(b"\x00"):
         rel_s = rel.decode("utf-8", "replace").strip()
         if not rel_s:
             continue
         candidate = root_abs / rel_s
-        # Both ends are resolved already, so a plain relative_to usually
-        # settles it without a second resolve per file. The resolve exists
-        # for the one case it matters — base_dir reached through a symlink,
-        # where the tracked path still names the link and not its target.
+        # A plain relative_to settles containment; resolve() is only needed when base_dir is reached through a symlink.
         try:
             candidate.relative_to(base_abs)
         except ValueError:
@@ -709,16 +593,7 @@ def _tracked_python_files(base_dir: Path) -> Optional[list[Path]]:
         if candidate.suffix == ".py" and candidate.exists():
             out.append(candidate)
 
-    # An empty list is a real answer, not "no git": the index loaded and
-    # simply holds no tracked python under *base_dir*, so the search should
-    # find nothing rather than fall back to a walk that would happily cite
-    # somebody's untracked scratch files. Only rc != 0 / a missing binary /
-    # a timeout above mean "git could not tell us".
-    #
-    # That holds only when base_dir IS the work tree. A base_dir below the
-    # root with nothing tracked under it is a tree git does not own at all —
-    # a target cloned or copied into an ignored directory of some other
-    # checkout — and git's "nothing" says nothing about it: walk it.
+    # An empty tracked list is a real answer under the work tree; below it, git knows nothing, so the directory is walked.
     if not out and base_abs != root_abs:
         return None
     out.sort(key=lambda p: str(p).replace(os.sep, "/"))
@@ -790,9 +665,7 @@ def _scan_for_def(
     return None
 
 
-#: `_find_def_in_repo`'s default for *tracked*: read the index itself. A
-#: caller that looks up several names in one tree reads it once and passes
-#: the list (or ``None``, "no git") to each lookup.
+#: Default for tracked files: read the index; a caller looking up several names reads it once and passes it in.
 _READ_TRACKED = object()
 
 
@@ -825,8 +698,7 @@ def _find_def_in_repo(
     queue: list[tuple[Path, int]] = []
     cited_abs = _resolve_cited(base_dir, cited_file)
     if cited_abs is not None and cited_abs.suffix == ".py":
-        # _resolve_cited already resolved base_dir successfully, so it cannot
-        # fail a second time here.
+        # base_dir was resolved already, so it cannot fail a second time here.
         root_abs = Path(base_dir).resolve()
         queue.append((cited_abs, 0))
         current = cited_abs.parent
@@ -845,9 +717,7 @@ def _find_def_in_repo(
             if depth == 0:
                 candidates = [path] if path.is_file() else []
             elif tracked is not None:
-                # The package tiers draw from the index too: an untracked
-                # scratch copy next to the cited file (`x_old.py`, a pasted
-                # backup) must not outrank the tracked module it copies.
+                # Package candidates come from the index too, so an untracked scratch copy cannot outrank the tracked module.
                 candidates = [c for c in tracked if c.parent == path]
             else:
                 candidates = sorted(
@@ -858,12 +728,7 @@ def _find_def_in_repo(
             if hit is not None:
                 return hit
         return _scan_for_def(_ordered_python_files(base_dir, tracked), pattern, budget, seen)
-    # OSError is the original contract (a vanished file mid-walk). The wider
-    # net is the same fail-open stance: *base_dir* may be a stand-in object
-    # that only supports rglob, a path whose type surprises Path, or a
-    # filesystem that refuses a read — Stage B loses one optional note, it
-    # does not lose a run. gate1_filter also catches this call site, but
-    # that safety net must not be the only one.
+    # Any failure while scanning is non-fatal: Stage B loses one optional note, not the run.
     except (OSError, TypeError, AttributeError, ValueError, RuntimeError):
         return None
 
@@ -981,9 +846,7 @@ def existing_test_coverage_note(collect_bridge, cited_file: str) -> Optional[str
 
 # ── GATE1-CTX-3: truncation-safety note ─────────────────────────────────────
 
-# Mirrors gate1_filter.py's own _truncate() marker text exactly — kept as a
-# separate constant here (not imported) so this module has no import-time
-# dependency on gate1_filter.py, matching every other function in this file.
+# Same truncation marker as gate1_filter; kept local so this module does not import gate1_filter.
 _TRUNCATION_MARKER = "... [truncated"
 
 
@@ -1017,28 +880,7 @@ def truncation_safety_note(code_block: str) -> Optional[str]:
     )
 
 
-# ── AUTO-H3-1: documented-intentional-design cue scan ──────────────────────
-#
-# Motivated by a distinct false-positive class from AUTO-H2's: not "the
-# crash is prevented elsewhere" (callee_context) or "the config call is
-# already safe" (config_fallback_note), but "the code's own comments say
-# this exact shape is deliberate" — a ``# noqa: BLE001`` next to a broad
-# ``except Exception:``, a docstring line explaining a clamp is there on
-# purpose, etc.
-#
-# Same non-rejecting pattern as the rest of this module: flag it, let
-# Stage B weigh it. A keyword match is not proof the specific claim is
-# wrong — only that the surrounding code asserts its own shape is
-# intentional, which the LLM should read before agreeing to change it.
-#
-# Negation-aware on purpose: "not intentional", "unintentional",
-# "no longer deliberate" etc. are the OPPOSITE signal (the comment is
-# actively disclaiming design intent, often flagging a known bug), and
-# firing this note on that phrasing would push the LLM to reject a
-# genuine, author-acknowledged bug report — the exact false positive this
-# module exists to avoid, just inverted. ``_NEGATION_RE`` looks a short
-# window before the cue for a negating word and, if found, treats it as
-# not a match.
+# Intentional-design cue: a comment saying a shape is deliberate is flagged for Stage B; negated phrases are not (AUTO-H3-1).
 _INTENTIONAL_DESIGN_CUES = re.compile(
     r"\b(deliberate(?:ly)?|intentional(?:ly)?|on purpose|noqa|hardening|"
     r"negative case|toy module|not meant to run as real code|control case)\b",
@@ -1071,10 +913,7 @@ def intentional_design_note(code_block: str) -> Optional[str]:
     for m in _INTENTIONAL_DESIGN_CUES.finditer(code_block):
         window_start = max(0, m.start() - _NEGATION_WINDOW_CHARS)
         preceding = code_block[window_start:m.start()]
-        # "un" is checked as a tight prefix (e.g. "unintentional") rather
-        # than via the windowed search used for the other negators, since
-        # it attaches directly to the word instead of preceding it with
-        # whitespace.
+        # "un" attaches directly to the word, so it is checked as a tight prefix (e.g. unintentional).
         word = m.group(0)
         if word.lower().startswith("intentional") and code_block[
             max(0, m.start() - 2):m.start()
@@ -1092,26 +931,7 @@ def intentional_design_note(code_block: str) -> Optional[str]:
     return None
 
 
-# ── AUTO-H3-2: test-support-helper detection (Python-specific) ─────────────
-#
-# A recurring false-positive shape found in review: candidates proposing to
-# add try/except or input validation to a *private helper inside a test
-# file* (``_git_init``, ``_make_candidate``, ``_run_with_fakes`` — anything
-# ``tests/**`` whose own name isn't ``test_*``). These already fail loudly
-# by design (e.g. ``subprocess.run(..., check=True)``, a bare dict index)
-# so a broken fixture points at the exact failing setup step. Swallowing
-# that into a try/except or a custom validation error trades a precise
-# traceback for a vaguer one.
-#
-# This heuristic is deliberately Python-only. It leans on two Python-
-# specific conventions that don't hold in other languages: a leading
-# underscore marking "not part of the public surface" (meaningless in,
-# say, Go or Java, where visibility is structural, not name-based) and
-# dotted module.symbol citations. Applying it outside Python risks
-# misreading an unrelated naming convention as this exact signal, so it
-# explicitly checks the file extension and says nothing for anything else
-# — silence, not a guess, is the safe default for a language this
-# heuristic wasn't designed for.
+# Test-helper detection (Python only): a private helper in a test file is not flagged for try/except, since its failures should stay loud (AUTO-H3-2).
 _TEST_PATH_RE = re.compile(r"(^|/)tests?/")
 _PYTHON_FILE_RE = re.compile(r"\.pyi?$")
 
@@ -1132,8 +952,7 @@ def test_helper_note(cited_file: str, cited_symbol: "str | None") -> Optional[st
         return None
     leaf = cited_symbol.rsplit(".", 1)[-1]
     if leaf.startswith("test_") or not leaf.startswith("_"):
-        # A test case itself, or a public (non-underscore) helper — outside
-        # this heuristic's scope; say nothing rather than guess.
+        # A test case or a public helper is outside this heuristic, so nothing is guessed.
         return None
     return (
         "NOTE (automated): this is a private helper function inside a Python "

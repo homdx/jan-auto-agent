@@ -124,22 +124,16 @@ SECTIONS = ("Why", "What to build", "Acceptance", "Rules")
 #: The `**Status:**` the lint wants on a ticket that has just been written.
 OPEN = "open"
 
-#: The character budget a map gets when `[contest] draft_map_budget` is unset.
-#: A budget the operator may raise or lower; it is never a model window.
+#: Character budget for a map when draft_map_budget is unset; an operator knob, not a model window.
 DEFAULT_MAP_BUDGET = 8000
 
-#: The rework rounds the review may send a draft back for when
-#: `[contest] draft_review_rounds` is unset. 3 = one review, then at most three
-#: rounds of problems -> rework -> lint -> review; 0 = one review, no rework.
+#: Default number of rework rounds after a review that finds problems (0 = review only).
 DEFAULT_REVIEW_ROUNDS = 3
 
-#: The branch a drafted ticket is committed to: the same branch
-#: `2legs/prepare_task.sh` commits onto, so a drafted round and a hand-made one
-#: start from the same place.
+#: Branch that drafted tickets are committed to, the same one prepare_task.sh uses.
 LEG_BRANCH = "contest-legs"
 
-#: The two scripts the agents' prompt runs in their clone; the commit copies
-#: them in when the target repo does not have them yet.
+#: The two scripts the agents' prompt runs; the commit copies them in when the target lacks them.
 CONTEST_SCRIPTS = ("scripts/next_task.py", "scripts/append_task.py")
 
 #: Where the two scripts above come from: this repo's own `scripts/`.
@@ -151,8 +145,7 @@ DRAFT_TIMEOUT = 300.0
 #: One draft, one rework. A second problem list is not asked, only printed.
 MAX_ATTEMPTS = 2
 
-#: `python3 -m tools.contest draft …` prints a path on success; this is the
-#: line it prints when a brief was drafted but never passed the lint.
+#: The line printed when a brief was drafted but did not pass the lint.
 REJECTED_SUFFIX = ".rejected.md"
 
 #: The system prompt of the draft call. It names the job, not a model.
@@ -168,9 +161,7 @@ DRAFT_SYSTEM_PROMPT = (
     "brief is not a case."
 )
 
-#: The system prompt of the review call. It names the job and the shape of the
-#: answer, not a model: the reviewer is the gate's, and `[contest] gate_llm_profile`
-#: is what resolves it.
+#: System prompt of the review call; the reviewer comes from the gate profile.
 REVIEW_SYSTEM_PROMPT = (
     "You are the reviewer of one ticket for an autonomous model contest. Decide "
     "whether it is worth an agent's hour, against the brief it was drafted from "
@@ -180,9 +171,7 @@ REVIEW_SYSTEM_PROMPT = (
     "per failing item in \"problems\" — each one something the drafter can act on."
 )
 
-#: The checklist the review verdict is against, one line per item. KC-79's lint
-#: can only check that the ticket is well formed; these four are what a second
-#: model can see that the lint cannot.
+#: Checklist the review verdict is checked against; the lint cannot check these four.
 REVIEW_CHECKLIST = (
     "- the acceptance can be checked by running commands, not by opinion;\n"
     "- the task cannot be met by deleting, skipping or weakening tests;\n"
@@ -249,9 +238,7 @@ class DraftResult:
     commit: Optional[CommitResult] = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# reading the collect output
-# ─────────────────────────────────────────────────────────────────────────────
+# Reading the collect output
 
 def load_artifact(collect_dir) -> Optional[dict]:
     """The `artifact.json` in *collect_dir*, or `None` when it is not one.
@@ -347,9 +334,7 @@ def symbols_by_path(artifact) -> dict:
             qual = symbol.get("qualname")
             if not isinstance(qual, str) or not qual:
                 continue
-            # collect writes `pkg/a.py:a` — the path and the name separated by a
-            # colon — so the short name is the part after the last `:`, and a
-            # dotted one keeps the last component as well.
+            # Short name: the part after the last colon, as collect writes it (path:name).
             short = qual.split(":")[-1]
             names.add(qual)
             names.add(short)
@@ -357,9 +342,7 @@ def symbols_by_path(artifact) -> dict:
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the ticket's own shape
-# ─────────────────────────────────────────────────────────────────────────────
+# The ticket's shape
 
 def _fields(text: str) -> dict:
     """`{label: value}` off every `**Label:** value` line, first one wins."""
@@ -489,8 +472,7 @@ def ticket_format_spec() -> str:
     return "\n".join(lines)
 
 
-#: The least a named file's source is cut to in the draft prompt, whatever the
-#: map budget: a ticket must not name cases from half a file.
+#: The least a named file's source is cut to in the draft prompt, whatever the map budget.
 SOURCE_BUDGET = 40000
 
 
@@ -505,9 +487,7 @@ def brief_sources(repo, brief: str, budget) -> list:
     test file the brief asks for does not exist yet and is skipped. The maps say
     where things are; this is what the drafter needs to name the cases.
     """
-    # The map budget is for maps: a source cut at it lost round 129's last line
-    # (`return validator`, 47 characters past 8000) and the drafter invented a
-    # `return val` NameError to fix. Sources get their own, larger floor.
+    # Source excerpts get their own, larger floor than the map budget (round 129).
     budget = max(_as_budget(budget), SOURCE_BUDGET)
     repo = Path(repo)
     pairs, seen = [], set()
@@ -638,9 +618,7 @@ def _as_rounds(value) -> int:
     return count if count >= 0 else DEFAULT_REVIEW_ROUNDS
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the lint
-# ─────────────────────────────────────────────────────────────────────────────
+# The lint
 
 def _safe_rel(rel: str) -> bool:
     """Whether *rel* is a repo-relative path worth resolving: no absolute, no `..`."""
@@ -747,9 +725,7 @@ def lint_ticket(text, artifact, *, repo=None, tasks_dir=None, round_no=None) -> 
     return problems
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the round number and the file name
-# ─────────────────────────────────────────────────────────────────────────────
+# Round number and file name
 
 def round_taken(tasks_dir, number) -> bool:
     """Whether `<tasks_dir>/<NN>-*.md` exists for *number* — `False` for no folder."""
@@ -774,9 +750,7 @@ def next_round(tasks_dir, start: int = 1) -> int:
     return number
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the review: the gate model's verdict on the draft
-# ─────────────────────────────────────────────────────────────────────────────
+# The review: the gate model's verdict on the draft
 
 def build_review_prompt(brief: str, ticket_text: str, checklist: str = None) -> str:
     """The one prompt the review call gets: the brief, the ticket, the checklist.
@@ -902,9 +876,7 @@ def _review_rounds(text, brief, *, prompt, llm_call, review_call, rounds,
     return text, ("the review refused the ticket on every round",)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the draft
-# ─────────────────────────────────────────────────────────────────────────────
+# The draft
 
 def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
                  collect_fn: Optional[Callable] = None, write: bool = True,
@@ -947,15 +919,13 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
     if not isinstance(brief, str) or not brief.strip():
         raise ValueError("draft_ticket: the brief is empty")
     if out_dir is not None and commit:
-        # A draft outside `epic-tasks/` is a draft, not a ticket: the commit would
-        # add it to the leg branch where the round reads it from.
+        # A draft outside epic-tasks/ is not a ticket, so committing it to the leg branch is refused.
         raise ValueError("draft_ticket: commit=True with out_dir — a draft outside "
                          f"{TASKS_DIR}/ is never committed")
 
     repo = Path(repo)
     tasks_dir = repo / TASKS_DIR
-    # Where the ticket is written; `epic-tasks/` keeps its role for the lint's
-    # taken-round check and for nothing else.
+    # The ticket is written here; epic-tasks/ matters only for the lint's taken-round check.
     write_dir = Path(out_dir) if out_dir is not None else tasks_dir
     collect_dir = repo / COLLECT_DIR
     budget = _as_budget(getattr(config, "draft_map_budget", DEFAULT_MAP_BUDGET)
@@ -968,10 +938,7 @@ def draft_ticket(brief, *, repo, llm_call, config=None, round_no=None, out=None,
         review_rounds = _as_rounds(review_rounds)
     number = int(round_no) if round_no is not None else None
 
-    # The commit is what refuses a dirty repo, so the refusal is here and not at
-    # the end: nothing is drafted and nothing is dialed for a repo the commit
-    # cannot touch. Untracked files do not count — the ticket about to be written
-    # is one, and so is everything the collect run left behind.
+    # The commit refuses a dirty repo first, so nothing is drafted for a repo it cannot touch.
     if commit:
         refusal = _clean_refusal(repo)
         if refusal is not None:
@@ -1082,9 +1049,7 @@ def llm_call_for(settings, system: str = DRAFT_SYSTEM_PROMPT,
     return ask
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the commit: the ticket on contest-legs, nothing else
-# ─────────────────────────────────────────────────────────────────────────────
+# The commit: the ticket on contest-legs only
 
 def _git(repo, *args) -> tuple:
     """`git <args>` in *repo* as `(returncode, stdout, stderr)` — never raises.
@@ -1165,13 +1130,7 @@ def commit_ticket(repo, ticket_path, *, message=None, branch: str = LEG_BRANCH,
     if refusal is not None:
         return CommitResult(False, refusal)
 
-    # Check out the leg branch first: the `target.exists()` test inside the copy
-    # loop below must see the leg branch's tree, not the operator's current branch.
-    # When it ran after the copy, a target whose own branch lacked the scripts
-    # copied them in as untracked files, and the later `checkout` then failed with
-    # "untracked working tree files would be overwritten", leaving the scripts in
-    # the operator's tree and the ticket uncommitted. A failed checkout now leaves
-    # nothing copied behind, because nothing has been copied yet.
+    # Check out the leg branch first, so the copy test sees its tree; a failed checkout copies nothing.
     code, _out, err = _git(repo, "rev-parse", "--verify", "--quiet",
                            f"refs/heads/{branch}")
     if code == 0:

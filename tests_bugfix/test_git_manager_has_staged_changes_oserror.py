@@ -92,18 +92,7 @@ def test_normal_operation_unaffected_with_staged_changes(tmp_path):
     assert gm.has_staged_changes() is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FL-1 (round 84) — `.git/index.lock` contention is a transient, not a failure
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# git takes `.git/index.lock` for the whole of any command that writes the
-# index, and a second git that finds it there exits 128 without waiting.
-# GitManager named stale locks in its error text but never waited for a held
-# one, so a single collision cost a task its commit: the operator's
-# 32-worker stress run surfaced it as `CommitOnSuccess: git error for task
-# T1 — git add -u failed` in
-# tests_bugfix/test_collect_bridge_stale_after_task_commit.py, and in a real
-# autonomous run the same collision loses the agent's work.
+# FL-1 (round 84): .git/index.lock contention is transient: retry with backoff, not a failure.
 
 def _repo_with_a_commit(tmp_path: Path):
     """A one-commit repo and a GitManager over it."""
@@ -173,9 +162,7 @@ def test_a_stale_index_lock_still_raises_with_the_original_message(tmp_path, mon
 
     assert "git add -u failed" in str(exc.value)
     assert "index.lock" in str(exc.value)
-    # it gave up rather than hanging, and the ladder is counted rather than
-    # timed — the real sleeps are stood in for, so a loaded box changes
-    # nothing about what this asserts (FL-1, round 84)
+    # Gives up after the retry ladder instead of hanging; the ladder is counted, not timed.
     assert len(backoffs) == gm._LOCK_RETRIES - 1
 
 

@@ -229,9 +229,7 @@ class RunTrace:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Gate 1 corpus AUTO-T2 grades `setup_run_trace` live: tests/test_gate1_corpus_precision.py
 def setup_run_trace(
@@ -261,10 +259,7 @@ def setup_run_trace(
     agent_dir  = Path(state.agent_dir)
     trace_path = agent_dir / f"trace_{run_id}.jsonl"
 
-    # ── 3–4. Configure the tracer singleton ───────────────────────────────
-    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
-    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
-    # the literal config.getX(...) call shape.
+    # Each config read is wrapped, so extract_config_reads still sees config.getX(...).
     try:
         enabled = config.getboolean("trace", "enabled", fallback=True)
     except ValueError as exc:

@@ -62,40 +62,23 @@ from tools.contest.gates import (  # noqa: E402
     ticket_for_round,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# The cross phase (158)
-#
-# P's changed test files are copied into a scratch copy of I's tree and run
-# there, then the copy and its basetemp are deleted again. No entry's
-# worktree is ever written to — `git archive` reads — and nothing is left on
-# disk: round 151 ran the box out of inodes before the copies were cleaned up.
-# ─────────────────────────────────────────────────────────────────────────────
+# The cross phase: P's test files run in a scratch copy of I's tree, deleted afterwards; no worktree is written.
 
-#: The three kinds of failure a cell can hold, in the order the operator
-#: reads them — the first two are not bugs in the code under test.
+#: The three kinds of failure a cell can hold, in the order the operator reads them.
 API = "api"               # a name or signature P has and I does not have
 BASE = "base"             # the test fails on the base too: no one asked for it
 BEHAVIOUR = "behaviour"   # a candidate bug in I, to be reproduced by hand
 
-#: A cell is P's test, run on I's code: `tests/_xcross_<P>_<file>`. Named that
-#: way so pytest still collects it when it is passed on the command line, and
-#: so it can never be mistaken for a test of I's own tree.
+#: A cross cell is P's test on I's code, named _xcross_<P>_<file> so pytest still collects it.
 _CROSS_NAME = "_xcross_"
 
-#: The test roots an entry may put its tests in. `tests/` is the ordinary one;
-#: a round that fixes a historical bug ships its tests in `tests_bugfix/`
-#: instead, and a judge that looked in one root only scored round 198's six
-#: entries as zero cells (bug 16). A path in neither root is not a test.
+#: Test roots an entry may use: tests/ and tests_bugfix/ (a judge that looked in one only scored zero cells, bug 16).
 TEST_ROOTS = ("tests/", "tests_bugfix/")
 
-#: The first root, the one every matrix before 202 knew. Kept as the fallback
-#: for a path that names neither root, and as the name callers still use.
+#: The first test root, kept as the fallback for paths that name neither root.
 TEST_ROOT = TEST_ROOTS[0]
 
-#: What a matrix with no cells says, in place of "no cell failed": the two
-#: sentences read the same at the end of the output and the second judged
-#: nothing. On stdout, in cross.md and in SUMMARY.md, once at the top and
-#: once at the bottom, and behind the exit code below.
+#: Text for a matrix with no cells, printed in place of "no cell failed" and behind the exit code.
 NOTHING_CROSSED = (
     f"cross: no entry changed a test under {' or '.join(TEST_ROOTS)} — nothing was crossed"
 )
@@ -109,14 +92,10 @@ CROSS_WORKERS = 4
 #: Seconds of wall clock one cell may spend before it is ended by group.
 CROSS_CELL_TIMEOUT = 300.0
 
-#: pytest's short-summary line: the node id, then ` - message`. xdist's
-#: `@group` suffix and the message are both dropped — the node id is enough.
+#: Node id from pytest's short-summary line; the xdist group and the message are dropped.
 _SUMMARY_FAIL = re.compile(r"^(?:FAILED|ERROR) (\S+?)(?:@[^\s\[]+)?(?: - .*)?$")
 
-#: pytest's section header between a run's sections: `_____ name _____` — and a
-#: name too long for the line gets one `_` on each side, `_ ERROR at setup of
-#: test_a_very_long_name _`, which still has to be a header (an indented source
-#: line never starts with `_`; the spaces around the name are the format's own).
+#: pytest's section header, including the single-underscore form for long names.
 _SECTION = re.compile(r"^_+ (.+?) _+\s*$")
 
 #: The first `E ` line of a traceback is the failure; the rest is context.
@@ -125,25 +104,17 @@ _E_LINE = re.compile(r"^E\s")
 #: …unless it is a frame (`E     File "x.py", line 3`): the failure comes last.
 _E_FRAME = re.compile(r'^E\s+File "')
 
-#: ImportError / ModuleNotFoundError / AttributeError / TypeError, the ticket's own
-#: four: P's code has a name or a signature that I's does not. That is a different
-#: implementation, not a bug in I. Every TypeError counts, not only the ones that
-#: name a keyword or an argument count: `'int' object is not iterable` is what a
-#: call with another implementation's argument shape raises, and calling it a
-#: `behaviour` lead sent the operator after a bug that was only a different API.
+#: Import and signature errors (ImportError, AttributeError, TypeError) mean a different implementation, not a bug in I.
 _API_ERR = re.compile(
     r"\b(?:ImportError|ModuleNotFoundError|AttributeError|TypeError)\b"
-    # a test that runs another entry's CLI with its own flags: `assert rc == 0` fails
-    # on argparse's banner, `AssertionError: usage: judge_epic_round.py [-h] --round ...`
+    # A test that runs another entry's CLI fails on argparse's usage banner, so the pattern is kept.
     r"|\busage: \S+ \[-h\]",
     re.I)
 
-#: pytest's stats line, the last line that carries a count and a duration:
-#: `1 failed, 1 passed in 0.02s`.
+#: Pytest's stats line, the last line with a count and a duration.
 _STATS = re.compile(r"(\d+) (passed|failed|errors?|skipped)")
 
-#: pytest's stats line ends in `====================`, so the duration is only
-#: searched for, never anchored: `1 failed in 0.55s ====`.
+#: The stats line ends in ====; the duration is searched for, never anchored.
 _HAS_DURATION = re.compile(r"\d+(?:\.\d+)?\s*[smh]")
 
 
@@ -271,17 +242,10 @@ def _copy_tests(entry, files, dest, label):
             continue  # the diff named a file the worktree does not carry
         root, rest = next(((r, rel[len(r):]) for r in TEST_ROOTS if rel.startswith(r)),
                           (TEST_ROOT, rel))
-        # the path below the root stays in the module name: `tests/a/test_x.py` and
-        # `tests/b/test_x.py` are two files, and one name for both is an
-        # `import file mismatch` — a false 0/1 on the entry's own code
+        # Keep the path below the root in the module name, so tests/a/test_x.py and tests/b/test_x.py stay distinct.
         stem = rest
         tag = _root_tag(root)
-        # a module name: pytest imports the file by its basename, and a `.` or
-        # a `/` in it is a package path — `_xcross_agnes-2.5-flash_test_x` is
-        # `ModuleNotFoundError: No module named '_xcross_agnes-2'`, which would
-        # read as `api` for every cell of an entry named like a model or a
-        # judge folder (`apertus-v1-5-8b.GAVE_UP`). The root goes in too, when
-        # the root is not the one the file sits in.
+        # Module names must be valid identifiers (no "." or "/"); the root is included when it is not the file's own.
         name = (f"{_CROSS_NAME}{_modname(label)}"
                 + (f"_{tag}_" if tag else "_")
                 + f"{_modname(os.path.splitext(stem)[0])}.py")
@@ -361,10 +325,7 @@ def _run_pytest(code_root, files, basetemp, timeout, workers=CROSS_WORKERS):
     if importlib.util.find_spec("pytest_timeout") is not None:
         cmd += ["--timeout", str(max(1, int(timeout)))]
     cmd += list(files)
-    # The cell's temp files live inside the cell: a test that makes a dir with
-    # `tempfile` and leaves it, or sweeps `<tmp>/xcross-*` like round 158's
-    # agnes-2-5-flash does at the end of one of its tests, touches nothing of
-    # the judge's and nothing outlives the scratch copy.
+    # The cell's temp files live inside the cell, so nothing outlives the scratch copy.
     cell_tmp = os.path.join(code_root, ".cell_tmp")
     os.makedirs(cell_tmp, exist_ok=True)
     return _run(cmd, code_root, timeout, env={**os.environ, "TMPDIR": cell_tmp})
@@ -411,15 +372,12 @@ def _sections(out):
         lines = [l.strip() for l in b if _E_LINE.match(l)]
         if not lines:
             continue
-        # the first `E ` line is the failure — except when the code under test did
-        # not even import: a SyntaxError opens with `E   File "…", line N` and a
-        # source line, and the error itself is the last `E ` line
+        # On an import failure the error is the last E line; otherwise it is the first.
         keep.append((n, lines[-1] if _E_FRAME.match(lines[0]) else lines[0]))
     return keep
 
 
-#: What pytest prints before the name in the header of a section that is not a
-#: plain test failure: `ERROR at setup of test_x`, `ERROR collecting tests/x.py`.
+#: Section header kinds that pytest prints before a test name, other than a plain failure.
 _SECTION_KIND = re.compile(r"^ERROR (?:at (?:setup|teardown) of|collecting)\s+")
 
 
@@ -491,8 +449,7 @@ def _cross_cell(p_name, p_path, files, i_name, i_ref, i_repo, cell_timeout, work
     which. Those read as `n/a` and are not classified, because there was no
     run to classify.
     """
-    # not `xcross-…`: that is the name a test of another entry may sweep (a cell
-    # of `--jobs 3` lost its scratch dir to such a test, `rc 127`, `no tests ran`)
+    # The scratch dir name avoids xcross-, which a test of another entry may sweep (rc 127).
     scratch = tempfile.mkdtemp(prefix=f"judgecell-{_slug(p_name)}-{_slug(i_name)}-")
     basetemp = os.path.join(scratch, ".pytest_basetemp")
     try:
@@ -507,10 +464,7 @@ def _cross_cell(p_name, p_path, files, i_name, i_ref, i_repo, cell_timeout, work
         passed, total = _counts(out)
         fails = _pair(_fails(out), out)
         if passed is None and not fails and rc not in (124, 127):
-            # no verdict at all (`no tests ran`, rc 5): under load an xdist worker
-            # can die before it collects. Once more, in a clean basetemp, before
-            # the cell is called `n/a` — a ninety-cell matrix with one hole in it
-            # is a matrix to run again by hand
+            # No verdict (e.g. a worker died before collecting): retry once in a clean basetemp before calling the cell n/a.
             shutil.rmtree(basetemp, ignore_errors=True)
             rc, out, err = _run_pytest(scratch, copied, basetemp, cell_timeout, workers)
             passed, total = _counts(out)
@@ -674,8 +628,7 @@ def _render_markdown(providers, impls, by, base, ideal, ticket=None, round_no=No
                  if ideal else "- ideal: —")
     lines.append("")
     if not rows:
-        # A matrix with no rows is not a quiet one: nothing was run, so the
-        # table, the leads and "no cell failed" would all say "all is well".
+        # A matrix with no rows is not a quiet one; nothing ran, so it says so.
         lines.append(NOTHING_CROSSED)
         lines.append("")
         return "\n".join(lines)
@@ -799,14 +752,9 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
             providers.append((name, str(path), files))
 
     impls = [(name, "HEAD", str(path)) for name, path in trees]
-    # `setup_worktrees.py` makes a `base` and an `ideal` worktree of its own: a
-    # tree with that name IS the column, and the ref is not archived a second
-    # time under the same name (two `base` columns shared one cell dict)
+    # A worktree with the same name is the column itself; the ref is not archived again under that name.
     named = {name for name, _ in trees}
-    # 191: a ref is looked for in the entries' checkouts first, then in the one
-    # the judge runs from — a round of separate clones has its ideal only here —
-    # and a ref found nowhere is said, not dropped: a matrix without its ideal
-    # column looked complete (round 146's first run, "9 × 13", no word).
+    # Refs are looked up in the entries' checkouts, then the judge's own repo; a ref found nowhere is reported, not dropped.
     homes = list(repos)
     if os.path.isdir(REPO_ROOT) and not any(
             os.path.realpath(str(r)) == os.path.realpath(REPO_ROOT) for r in homes):
@@ -828,8 +776,7 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
     if not providers:
         return _cross_empty(impls, skipped, base, ideal, out_dir, round_no, ticket, log)
 
-    # one line per finished cell: a real round is some ninety cells and minutes
-    # long, and a judge that says nothing until the end looks hung
+    # One line per finished cell, so a long run does not look hung.
     total = len(providers) * len(impls)
     cells = []
 
@@ -880,8 +827,7 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
             "tests": [p[0] for p in providers],
             "impls": [i[0] for i in impls],
             "leads": leads,
-            # the count the lists add up to: a reader of cross.json must never
-            # have to work one out, and never be handed a number that is not it
+            # The counts in cross.json are the lengths of the lists, so they always agree.
             "leads_count": len(leads["behaviour"]) + len(leads["discriminating"]),
             "nothing_crossed": False,
             "cells": [{"tests": pn, "code": in_, "passed": c["passed"], "total": c["total"],
@@ -969,8 +915,7 @@ def main():
 
     crossed = True
     if a.cross:
-        # zero-padded like `contest-out/<NN>` of the runner (`_round_out_dir`),
-        # so cross.json / cross.md land next to SUMMARY.md also for round 7
+        # Zero-padded like contest-out/<NN>, so cross.json sits next to SUMMARY.md.
         out_dir = a.cross_out or os.path.join("contest-out", f"{a.round:02d}")
         data = cross_tests(trees, a.base, ideal=a.ideal, jobs=a.jobs,
                            cell_timeout=a.cell_timeout, out_dir=out_dir,

@@ -110,10 +110,7 @@ def test_map_is_total_over_source_modules_even_with_zero_coverage(tmp_path):
 
 
 def test_from_package_import_submodule_style_is_matched(tmp_path):
-    # AC: the real repo reaches tools/backoff.py via `from tools import
-    # backoff`, not `import tools.backoff` — ModuleRecord.imports alone
-    # would collapse this to just "tools" and silently zero-list the
-    # submodule. build_test_map must still match it.
+    # `from tools import backoff` must match the submodule, not collapse to "tools".
     _write(tmp_path, "pkg/__init__.py", "")
     _write(tmp_path, "pkg/sub.py", "def run():\n    return 1\n")
     _write(tmp_path, "tests/test_sub.py", "from pkg import sub\n")
@@ -123,9 +120,7 @@ def test_from_package_import_submodule_style_is_matched(tmp_path):
 
 
 def test_relative_import_from_dot_module_is_matched(tmp_path):
-    # Bugfix regression: `from .helper import run` dropped node.level, so
-    # it was recorded as bare "helper" — either losing the edge or matching
-    # an unrelated top-level helper.py. Needs the dot AND importer_path.
+    # Bugfix: `from .helper import run` must keep the dot (level) and the importer path.
     _write(tmp_path, "tests/helper.py", "def run():\n    return 1\n")
     _write(tmp_path, "tests/test_uses_helper.py", "from .helper import run\n")
     modules = scan_repo(tmp_path)
@@ -134,8 +129,7 @@ def test_relative_import_from_dot_module_is_matched(tmp_path):
 
 
 def test_relative_import_bare_dot_form_is_matched(tmp_path):
-    # Bugfix regression: `from . import helper` has node.module is None, so
-    # the old `... and node.module` guard skipped it entirely.
+    # Bugfix: `from . import helper` (module is None) was skipped; it must match now.
     _write(tmp_path, "tests/helper.py", "def run():\n    return 1\n")
     _write(tmp_path, "tests/test_uses_helper2.py", "from . import helper\n")
     modules = scan_repo(tmp_path)

@@ -43,8 +43,7 @@ MANIFEST = TESTS_DIR / "SLOW_TESTS.txt"
 SMOKE_DIR = REPO_ROOT / ".smoke_tests"
 REGRESSION_DIR = REPO_ROOT / ".regression_tests"
 
-#: Non-test files each tier needs to import the suite (conftest helpers,
-#: shared fixture trees). Linked into BOTH tiers.
+#: Non-test files every tier needs to import the suite (conftest helpers, shared fixture trees). Linked into BOTH tiers.
 SHARED_ENTRIES = ("_pass_a_stub.py", "_kilo_fake.py", "fixtures")
 
 

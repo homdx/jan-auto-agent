@@ -22,11 +22,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
-# AUTO-RATE-1 / RUN-10: the HTTP retry budget every auto-mode caller passes
-# through. These three are request_completion()'s signature defaults (below)
-# and the numbers retry_kwargs_from_config() falls back to when a .ini has no
-# [loop] error_retries / error_retry_wait_sec / max_retry_after_sec — so a
-# config without the keys still gets byte-for-byte AUTO-RATE-1 behaviour.
+# HTTP retry defaults; the same numbers are the fallback when the .ini has no [loop] retry keys (AUTO-RATE-1).
 DEFAULT_ERROR_RETRIES = 60
 DEFAULT_ERROR_RETRY_WAIT_SEC = 10.0
 DEFAULT_MAX_RETRY_AFTER_SEC = 180.0
@@ -74,26 +70,7 @@ class CompletionMeta:
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
-# AUTO-REASONING-2 / GATE1-PROVIDER-1: process-lifetime memory of which
-# (endpoint, model) pairs have already told us (via HTTP 400) that they
-# don't recognise the `reasoning` field build_chat_request() sends for
-# think=False.
-#
-# Keyed by (url, model), NOT url alone. Many of this project's free-tier
-# gateways (kenari.id, bynara.id, NaraRouter, ...) route several different
-# *models* through the exact same `{base_url}/chat/completions` endpoint.
-# Keying by url alone means one model's 400 would incorrectly poison every
-# other model behind that same router — e.g. `deepseek-r1` on kenari.id
-# rejects `reasoning` but `llama-3.3` on the SAME kenari.id URL might
-# accept it fine. The reverse (same model, different provider/URL,
-# different support) was already handled correctly before this change
-# since url was part of the key — this extends that same "don't assume,
-# remember per-endpoint" principle to also cover "don't assume, remember
-# per-model-at-that-endpoint". `model` is whatever string identifies the
-# model to that endpoint (the payload's "model" field) — an empty/None
-# model still works as an ordinary dict key, it just means "no model info
-# available", which never collides with a real model name that happens to
-# be the empty string.
+# Per (url, model) memory: a model that rejects the reasoning field is not sent it again (AUTO-REASONING-2).
 _REASONING_UNSUPPORTED_KEYS: set = set()
 
 
@@ -115,24 +92,7 @@ def reasoning_field_is_supported(url: str, model=None) -> bool:
     return (url, model) not in _REASONING_UNSUPPORTED_KEYS
 
 
-# AUTO-THINKDEPTH-2 / GATE1-PROVIDER-1: process-lifetime memory, mirroring
-# _REASONING_UNSUPPORTED_KEYS above, but for the top-level
-# `reasoning_effort` string field — the actual OpenAI/Gemini-compat
-# Chat Completions standard (flat `"reasoning_effort": "low"`), which is
-# DIFFERENT from OpenRouter's nested `"reasoning": {"effort": "low"}`
-# shape that `_REASONING_UNSUPPORTED_KEYS` already tracks. This is tier 1
-# of a three-tier cascade for `think_effort` on the openai branch:
-#   1. top-level `reasoning_effort` (OpenAI/Gemini standard) — tried first
-#   2. nested `reasoning: {"effort": ...}` (OpenRouter) — fallback if (1)
-#      is rejected
-#   3. no depth field at all, plain `think`-only mode — fallback if both
-#      (1) and (2) are rejected
-# Each tier has its own per-(url, model) "stop asking" memory (see
-# GATE1-PROVIDER-1 note above — same router-sharing concern applies here)
-# so a provider that rejects tier 1 but accepts tier 2 keeps getting tier
-# 2 forever, without re-paying for a guaranteed-to-fail tier-1 round trip
-# on every call, and without one model's rejection poisoning a sibling
-# model on the same URL.
+# Per (url, model) memory for the flat reasoning_effort field; the three-tier cascade falls back on rejection (AUTO-THINKDEPTH-2).
 _REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_KEYS: set = set()
 
 
@@ -151,20 +111,7 @@ def reasoning_effort_toplevel_is_supported(url: str, model=None) -> bool:
     return (url, model) not in _REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_KEYS
 
 
-# AUTO-JSONMODE-1 / GATE1-PROVIDER-1: same per-process, per-(url, model)
-# "stop asking" memory as AUTO-REASONING-2 above, but for the
-# *response_format* / Ollama "format" JSON-mode field driven by the
-# global `[api] response_format = true` ini switch (see
-# build_chat_request's *response_format* parameter), or by a
-# presence_llm_profile's own override. Once a given (endpoint, model)
-# pair has rejected the field with HTTP 400, every subsequent
-# build_chat_request() call targeting that exact pair stops sending it
-# for the rest of the process — matching the reasoning-field fallback so
-# a provider/model combination that doesn't support enforced JSON mode
-# never repeats a guaranteed-to-fail round trip, and the rest of the run
-# falls back to the existing best-effort JSON parsing/salvage path
-# unchanged, without affecting a different model sharing the same router
-# URL.
+# Per (url, model) memory for the JSON-mode field; a rejected field is dropped for the rest of the process (AUTO-JSONMODE-1).
 _RESPONSE_FORMAT_UNSUPPORTED_KEYS: set = set()
 
 
@@ -183,21 +130,7 @@ def response_format_is_supported(url: str, model=None) -> bool:
     return (url, model) not in _RESPONSE_FORMAT_UNSUPPORTED_KEYS
 
 
-# AUTO-THINKDEPTH-1 / GATE1-PROVIDER-1: per-process, per-(url, model)
-# "stop asking" memory for the Ollama branch's *think_effort* depth
-# string (e.g. "low"/"medium"/"high" — gpt-oss-style models), mirroring
-# AUTO-JSONMODE-1 above but scoped to Ollama's own top-level "think"
-# field specifically. NOT reused for the openai branch: there, a depth
-# request rides inside the SAME "reasoning" object that think=False's
-# suppression already uses, so a single rejection of that object already
-# means "this endpoint+model doesn't recognise reasoning at all" and the
-# existing _REASONING_UNSUPPORTED_KEYS cache already covers both
-# directions. Ollama's plain boolean "think" field, by contrast, is
-# separate from the depth-string variant and known-good on its own — so a
-# depth-string rejection here degrades to the plain boolean, not to
-# omitting "think" altogether. Keyed by (url, model) for the same reason
-# as the other three caches above — a multi-model Ollama-compatible proxy
-# behind one URL should get independent verdicts per model.
+# Per (url, model) memory for the Ollama think depth, the same way as the other memories (AUTO-THINKDEPTH-1).
 _THINK_DEPTH_UNSUPPORTED_KEYS: set = set()
 
 
@@ -216,26 +149,7 @@ def think_depth_is_supported(url: str, model=None) -> bool:
     return (url, model) not in _THINK_DEPTH_UNSUPPORTED_KEYS
 
 
-# AUTO-ZAITHINK-1: per-process, per-(url, model) "stop asking" memory for
-# Z.ai/GLM's own top-level ``thinking: {"type": "enabled" | "disabled"}``
-# object — a THIRD, distinct thinking-control convention alongside
-# OpenRouter's nested ``reasoning: {"effort": ..., "exclude": ...}``
-# (AUTO-REASONING-1) and the OpenAI/Gemini-compat flat ``reasoning_effort``
-# string (AUTO-THINKDEPTH-2). Confirmed live: a GLM-5.2 endpoint ignored
-# both existing fields outright (neither is Z.ai's documented shape) and
-# defaulted to its own "Max" reasoning effort, exhausting a modest
-# max_tokens budget on <think> alone and leaving `content` genuinely
-# empty — the same failure signature AUTO-REASONING-1 exists to prevent,
-# just via a field this codebase didn't send yet.
-#
-# Sent ADDITIVELY alongside the existing reasoning/reasoning_effort
-# fields (never instead of them) — a provider that doesn't recognise
-# `thinking` is expected to silently ignore the unknown field, same
-# assumption the other three fields already rely on, so trying all three
-# conventions costs nothing extra against a provider that only speaks
-# one of them. Keyed by (url, model) from the start, matching the other
-# four caches — a router fronting several models must give each an
-# independent verdict.
+# Per (url, model) memory for Z.ai's top-level thinking field; sent additively, dropped on rejection (AUTO-ZAITHINK-1).
 _ZAI_THINKING_UNSUPPORTED_KEYS: set = set()
 
 
@@ -254,15 +168,7 @@ def zai_thinking_is_supported(url: str, model=None) -> bool:
     return (url, model) not in _ZAI_THINKING_UNSUPPORTED_KEYS
 
 
-# RUN-9: the same per-process, per-(url, model) "stop asking" memory as
-# AUTO-JSONMODE-1 above, for OpenAI's `stream_options: {"include_usage":
-# true}` — the only way a STREAMED reply carries `usage.completion_tokens`,
-# which is what tells an empty reply that exhausted its budget from one that
-# never got to answer. Some strict-schema gateways 400 on the field; keyed by
-# (url, model) like the other caches so one model's rejection does not poison
-# a sibling behind the same router, and so a gateway that chokes on it costs
-# one failed call per (url, model) per run — after that the caller simply
-# gets `completion_tokens = None`, a legal value.
+# Per (url, model) memory for stream_options include_usage; a rejection costs one call per run (RUN-9).
 _STREAM_OPTIONS_UNSUPPORTED_KEYS: set = set()
 
 
@@ -280,14 +186,7 @@ def stream_options_is_supported(url: str, model=None) -> bool:
     return (url, model) not in _STREAM_OPTIONS_UNSUPPORTED_KEYS
 
 
-# MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line,
-# including comment-prefixed variants such as `### api_key = ...` or
-# `; api_key = ...` (any leading whitespace, optional comment chars
-# [#;]+ before the key name; case-insensitive key name) so a real or
-# test secret pasted/read into a prompt (agents.ini contents, a config
-# dump, etc.) never reaches the LLM verbatim. Captures the prefix
-# (indent + optional comment + "api_key = ") separately so the value
-# alone is swapped for the placeholder.
+# Matches an api_key line, commented or not, so a pasted secret is masked before the LLM sees it (MASK-KEY-1).
 _API_KEY_LINE_RE = re.compile(
     r'(?im)^([ \t]*(?:[#;]+[ \t]*)?api_key[ \t]*=[ \t]*)(\S+)([ \t]*)$'
 )
@@ -365,10 +264,7 @@ def _content_to_text(content, subject: str) -> str:
     if isinstance(content, str):
         return content.strip()
     if isinstance(content, list):
-        # OpenAI's multimodal shape, which some gateways relay verbatim:
-        # [{"type": "text", "text": "..."}, {"type": "image_url", ...}].
-        # It is a VALID reply, so join the text parts rather than rejecting
-        # it; only a list with no text part at all is unusable.
+        # A list of text and image parts is a valid reply; its text parts are joined (OpenAI multimodal).
         parts = [
             block["text"]
             for block in content
@@ -405,19 +301,7 @@ def _extract_content(raw: dict, api_format: str) -> str:
     Both dict accesses now isinstance-check the `message` field first and
     raise the same ValueError.
     """
-    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): both
-    # dict-key accesses below (`raw["message"]`, `choices[0]["message"]`)
-    # already handle a `content` of `null` (the BUGFIX above) and an empty
-    # `choices` list (the BUGFIX below), but a genuinely malformed reply
-    # from a non-standard OpenAI-compatible backend — one missing
-    # "message" entirely, not just a null/empty content/choices field —
-    # still raised a bare KeyError with no diagnostic content. Surface the
-    # same kind of descriptive ValueError the empty-choices case already
-    # uses, rather than letting a raw KeyError propagate.
-    # A body that json.loads() accepted but that is a JSON *array* (or any
-    # other non-object) made both branches below raise AttributeError while
-    # calling .get()/.keys() — including while BUILDING their own error
-    # message. Guard once, up front, with the same error class.
+    # A reply without a message key raises a descriptive ValueError, not a bare KeyError (AUTO-FIX).
     if not isinstance(raw, dict):
         preview = repr(raw)
         if len(preview) > 120:
@@ -430,8 +314,7 @@ def _extract_content(raw: dict, api_format: str) -> str:
         message = raw.get("message")
         if not isinstance(message, dict):
             if "message" in raw:
-                # Present but null (or a string/list): `None["content"]` raises
-                # TypeError, which is NOT a KeyError and escaped the guard below.
+                # A present but null message (or a string or list) is a malformed reply, not a KeyError.
                 raise _not_an_object_error("message", message,
                                            f"raw keys: {list(raw.keys())}")
             raise ValueError(
@@ -445,17 +328,7 @@ def _extract_content(raw: dict, api_format: str) -> str:
                 f"LLM response missing expected key {exc} — raw response "
                 f"shape was unexpected (raw keys: {list(raw.keys())})"
             ) from exc
-    # openai (default)
-    # BUGFIX: mirror the streaming path's empty-choices guard (introduced in
-    # the "Fix llm stream" commit).  Some OpenAI-compatible backends — Jan,
-    # LiteLLM, vLLM, Azure proxy wrappers — return a non-streaming response
-    # with `"choices": []` when the request is filtered/blocked instead of
-    # returning an HTTP error.  The raw `raw["choices"][0]` access raises
-    # IndexError in that case, which callers that only catch broad
-    # `except Exception` misclassify as a generic API failure rather than a
-    # distinct "response arrived but was empty/filtered" outcome.
-    # Raising a descriptive ValueError keeps the failure distinguishable for
-    # logging and for the AUTO-BUG pattern in validator_agent.py.
+    # A non-streaming reply with an empty choices list raises a ValueError, not an IndexError (BUGFIX).
     choices = raw.get("choices") or []
     if not choices:
         raise ValueError(
@@ -603,53 +476,28 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
         if "temperature" in body:
             options["temperature"] = body.pop("temperature")
         if "max_tokens" in body:
-            # AUTO-BUG: this key used to be left untouched here, so a
-            # caller that builds its own OpenAI-shaped payload directly
-            # (ImprovementAgent.process, OrchestratorActions._edit_file_
-            # content when [file_editor] max_tokens is set, and several
-            # call sites in FAQAgent — everyone who calls
-            # request_completion() themselves instead of going through
-            # build_chat_request(), which already handles this correctly)
-            # had "max_tokens" sent as a stray TOP-LEVEL field. Ollama's
-            # /api/chat does not recognize a top-level "max_tokens" — it
-            # silently ignores unknown fields — so the configured cap was
-            # never enforced at all against an Ollama backend, which is
-            # this project's *default* profile (agents.ini's shipped
-            # [api_local] section: api_format = ollama). Confirmed with a
-            # direct call: max_tokens stayed in the body but never reached
-            # options.num_predict. Renaming/moving it here fixes every
-            # affected caller at once, the same way build_chat_request
-            # already does for its own payload-construction path.
+            # max_tokens is moved to the Ollama option it means, since /api/chat ignores the top-level key (AUTO-BUG).
             _mt = body.pop("max_tokens")
             if _mt:
                 options["num_predict"] = _mt
         if "num_ctx" in body:
-            # 0 / falsy means "use server default" everywhere in this
-            # project — never forward it, or Ollama would treat it as a
-            # literal zero-token context window.
+            # num_ctx of 0 or less means the server default, so it is never forwarded.
             _nc = body.pop("num_ctx")
             if _nc:
                 options["num_ctx"] = _nc
         if options:
             body["options"] = options
         body["stream"] = stream
-        # RUN-9: an OpenAI-only field; Ollama reports eval_count on its final
-        # NDJSON line unconditionally and does not recognise this one.
+        # stream_options is OpenAI-only; Ollama reports its usage without it and does not know the field.
         body.pop("stream_options", None)
-        # /api/chat does not use a separate system message list entry —
-        # system content is passed as a messages entry with role "system",
-        # which is already the format callers use, so nothing extra needed.
+        # The Ollama chat format needs no extra system-message handling.
     else:
-        # num_ctx is an Ollama-only concept; OpenAI-compatible servers
-        # reject or ignore unknown fields — drop it rather than leak it.
+        # num_ctx is Ollama-only, so it is dropped for OpenAI-compatible servers that reject unknown fields.
         body.pop("num_ctx", None)
         if stream:
             body["stream"] = True
         else:
-            # RUN-9: OpenAI rejects `stream_options` on a blocking request
-            # ("only allowed when stream is true"), so a payload built for
-            # streaming and then sent blocking is trimmed here rather than
-            # 400ed.
+            # stream_options is dropped on a blocking request, since OpenAI rejects it there (RUN-9).
             body.pop("stream_options", None)
     return body
 
@@ -722,15 +570,7 @@ def ollama_chat_url(base_url: str) -> str:
 _JSON_FENCE_OPEN_RE = re.compile(
     r"`{3,}json[A-Za-z0-9_+\-#.,]*(?=\s|$|[{\[\"])", re.IGNORECASE
 )
-# The label on a NON-``json`` opening fence: anything up to the next
-# whitespace/backtick, so ```python, ```text, ```json5, ```c++, ```c# and a
-# bare ``` all behave the same way. Deliberately not "rest of the line" —
-# a model that puts its body on the same line as the marker
-# (```json {"a": 1}) must keep that body.
-# A label is markdown's info string, which ends the opening line — so it is
-# only a label when whitespace, a newline or the end of the text follows it.
-# Without that lookahead "```123```" parsed as label "123" + empty body, and
-# the body of a fence holding a bare JSON number was silently swallowed.
+# A fence label is the word after the opening backticks, ended by whitespace or the end of the line.
 _FENCE_LABEL_RE = re.compile(
     r"`{3,}(?:[ \t]*[A-Za-z0-9_+\-#.,]*(?=\s|$|[{\[\"]))?"
 )
@@ -738,49 +578,21 @@ _FENCE_LABEL_RE = re.compile(
 
 def strip_json_fence(text: str) -> str:
     """Strip a ```json ... ``` or ``` ... ``` fence wrapping a JSON blob, if present."""
-    # BUGFIX (audit): only lowercase ```json was special-cased — a
-    # capitalized fence (```JSON, ```Json) fell through to the generic
-    # "```" branch below, which doesn't skip past the "JSON" label, so it
-    # leaked into the returned content and broke every caller's
-    # json.loads. Match case-insensitively but split the *original* text
-    # at the matched span so casing elsewhere in the content is untouched.
+    # The JSON fence is matched case-insensitively, and only the matched span is cut (BUGFIX).
     m = _JSON_FENCE_OPEN_RE.search(text)
     if m:
         rest = text[m.end():]
-        # AUTO-FIX: a lone opening fence (output truncated mid-stream) fell
-        # through to split("```")[0], which returns `rest` unchanged and
-        # silently discards everything before the fence. Require a
-        # confirmed closer before treating it as a fenced block.
+        # A lone opening fence is not a block; a closing fence is required first (AUTO-FIX).
         if "```" in rest:
             return rest.split("```")[0].strip()
-        # BUGFIX (audit): an unclosed fence used to fall back to returning
-        # the ORIGINAL `text` — opening marker and all — instead of `rest`
-        # (the content actually inside the fence). That's harmless when the
-        # JSON body is itself incomplete (json.loads fails either way), but
-        # when the model's JSON is complete and only the closing ``` was
-        # never emitted (truncation, or the model just omitted it), leaving
-        # the leading "```json" attached broke every caller's json.loads on
-        # otherwise-valid content. `rest` already excludes everything
-        # BEFORE the opening marker — the exact thing the AUTO-FIX above
-        # guards against discarding — so returning `rest.strip()` here
-        # loses nothing that returning `text` didn't equally risk losing,
-        # while giving complete-but-unclosed JSON a real chance to parse.
+        # An unclosed fence returns the content after the marker, so complete JSON still parses (BUGFIX).
         return rest.strip()
     if "```" in text:
-        # BUGFIX (audit): only the ```json branch above knew its fence had a
-        # label. A block labelled anything else (```python, ```text, ```js)
-        # fell through here and the label was left glued to the body —
-        # "python\n{\"a\": 1}" — so every caller's json.loads failed on
-        # content that was perfectly valid JSON, burning a retry on a format
-        # slip the parser could have recovered from. Consume whatever label
-        # the opening fence carries, not just the literal "json".
+        # Any fence label is removed, not just json, so the body parses as JSON (BUGFIX).
         rest = text[_FENCE_LABEL_RE.search(text).end():]
         if "```" in rest:
             return rest.split("```")[0].strip()
-        # Only a single, unmatched "```" — not a real fence pair. Same
-        # reasoning as the ```json branch above: return what follows the
-        # marker (not the untouched original) so a complete JSON body with
-        # just a missing closing fence still parses.
+        # A single unmatched fence returns what follows it, for the same reason (BUGFIX).
         return rest.strip()
     return text
 
@@ -793,37 +605,11 @@ def make_unverified_context() -> ssl.SSLContext:
     return ctx
 
 
-# ── AUTO-RATE-1: rate-limit / transient-error retry ──────────────────────────
-#
-# request_completion() previously raised on the very first non-2xx response,
-# with no concept of a rate limit being a "wait and try again" situation
-# rather than a hard failure. Confirmed real-world impact: Gate1Filter's
-# presence check (tools/auto/gate1_filter.py) fails a candidate CLOSED on
-# ANY exception from this function — so a single transient HTTP 429 from a
-# free-tier gateway (e.g. kenari.id: "free_quota_rpm ... slow down and
-# retry") was silently indistinguishable from "the LLM confirmed this task
-# is already fixed", and a real, still-needed task could be wrongly dropped
-# from an --auto plan or --validate-plan pass purely because the gateway
-# was rate-limiting a burst of calls, not because anything was actually
-# wrong with the task.
-#
-# _parse_retry_after / the retry loop below are ported from the sibling
-# learn-in-play1 project's llm_client.py (its own docstring: "Логика и
-# формат payload'ов взяты ... из tools/llm_stream.py проекта jan-auto-agent"
-# — llm_client.py started as a simplified copy of THIS file and was
-# hardened independently against real Groq/Gemini/HuggingFace 429s; this
-# brings that hardening back to its origin).
+# Retry on rate limits and transient errors; a valid task is not dropped by a 429 (AUTO-RATE-1).
 _RETRY_AFTER_MS_RE = re.compile(r"(?:try again|retry)\s+in\s+([\d.]+)\s*ms", re.IGNORECASE)
 _RETRY_AFTER_S_RE = re.compile(r"(?:try again|retry)\s+in\s+([\d.]+)\s*s(?:econds?)?\b", re.IGNORECASE)
 
-# Status codes worth waiting and retrying: 429 (rate limit) and 402
-# ("payment required" — several gateways, e.g. HuggingFace's router, use
-# this for a transient billing hiccup, not just a genuinely exhausted
-# quota) and 5xx (server-side, plausibly transient). Deliberately NOT
-# other 4xx codes (400 bad request, 401/403 auth, 404 not found, ...) —
-# those describe something wrong with THIS request that a wait can't fix;
-# retrying them only wastes error_retry_wait_sec for a guaranteed repeat
-# failure.
+# Retry on 429, 402 and 5xx only; other 4xx codes cannot be fixed by waiting.
 def _is_retryable_status(code: int) -> bool:
     return code == 429 or code == 402 or 500 <= code < 600
 
@@ -874,20 +660,12 @@ class LLMClientBase:
     TaskRewriter: the connection fields and SSL context are identical
     across all four; each subclass adds its own model/prompt settings."""
 
-    # RUN-10: the [loop] retry budget, resolved in __init__ below. The class
-    # default is empty on purpose: an object built with object.__new__() (a
-    # couple of tests bypass __init__) keeps calling request_completion() with
-    # no retry kwargs at all, which is byte-identical to the pre-RUN-10
-    # behaviour, instead of losing the call to an AttributeError.
+    # Retry budget from [loop]; empty by default, so an object built without __init__ keeps the old behaviour (RUN-10).
     _retry_kwargs: dict = {}
 
     def __init__(self, config, base_url: str, api_key: str, model: str,
                  api_format: str = "openai", verify_ssl: bool = True) -> None:
-        # RUN-10: the [loop] HTTP retry budget, resolved once here so every
-        # request_completion() call in Coder, Gate1Filter, ClusterReviewer
-        # and TaskRewriter passes the same error_retries /
-        # error_retry_wait_sec / max_retry_after_sec instead of silently
-        # inheriting request_completion()'s built-ins.
+        # The [loop] retry budget is resolved once here and passed to every request_completion call (RUN-10).
         self._retry_kwargs = retry_kwargs_from_config(config)
         self._config     = config
         self._base_url   = base_url.rstrip("/")
@@ -1039,11 +817,7 @@ def build_chat_request(
         "Content-Type":  "application/json",
         "Authorization": f"Bearer {api_key}",
     }
-    # MASK-KEY-1: mask any `api_key = ...` line that ended up inside the
-    # system/user text itself (e.g. agents.ini contents pulled into
-    # context) — NOT *api_key* the parameter above, which is the caller's
-    # own credential for THIS request and is used as-is in the
-    # Authorization header.
+    # Masks any api_key line in the messages, but not the api_key parameter that authenticates the call (MASK-KEY-1).
     messages = [
         {"role": "system", "content": mask_api_key(system)},
         {"role": "user",   "content": mask_api_key(user_msg)},
@@ -1062,94 +836,29 @@ def build_chat_request(
         if response_format and response_format_is_supported(url, model):
             payload["format"] = "json"
     else:
-        # AUTO-URL-1: normalize a trailing slash on base_url before
-        # concatenating — without this, `base_url = ".../v1beta/openai/"`
-        # (trailing slash) produced `".../v1beta/openai//chat/completions"`
-        # (double slash), which strict routers (confirmed live: Gemini's
-        # openai-compat endpoint) 404 on rather than normalizing away.
-        # ollama_chat_url() above already does the equivalent `.rstrip("/")`
-        # for the Ollama branch — this brings the openai branch to the same
-        # standard instead of trusting every caller's base_url to be
-        # slash-free.
+        # A trailing slash on base_url is removed, so the endpoint path has no double slash (AUTO-URL-1).
         url = f"{base_url.rstrip('/')}/chat/completions"
         payload = {
             "model": model, "temperature": temperature, "max_tokens": max_tokens,
             "messages": messages,
         }
-        # AUTO-THINK-1: *think* used to be read by every caller
-        # (Gate1Filter / Coder / ClusterReviewer / TaskRewriter — each
-        # defaults its own [section] think = false out of the box, no user
-        # action needed) but only ever forwarded into the payload above,
-        # in the Ollama branch. Against any OpenAI-compatible remote
-        # gateway (api_format=openai) fronting a reasoning model, the
-        # think=False request was silently dropped: the model still
-        # emitted its hidden chain-of-thought, which can consume most or
-        # all of a tight max_tokens budget (Gate 1 wants a tiny,
-        # deterministic JSON verdict, e.g. 512 tokens) before any usable
-        # answer is written — the reply comes back empty, or truncated
-        # mid-JSON. Confirmed directly: a real kenari.id / deepseek 429-
-        # free-tier run produced `{"verdict": "confirmed", "reason` — a
-        # genuine, otherwise-valid answer cut off mid-string by the token
-        # cap, not a network or parsing bug.
-        #
-        # `reasoning` (OpenRouter's own unified reasoning-control object)
-        # is deliberately the ONLY field sent here, not the fuller set the
-        # sibling learn-in-play1 project's llm_client.py sends (which also
-        # tries `reasoning_effort` and a vLLM/SGLang-specific
-        # `chat_template_kwargs`): that project found `chat_template_kwargs`
-        # produces a hard HTTP 400 on at least one real gateway (Groq), and
-        # recovering from that needs a per-server "this field is rejected,
-        # stop sending it" memory this stateless function doesn't have. A
-        # provider that doesn't recognise `reasoning` is expected to
-        # silently ignore the unknown field rather than reject the whole
-        # request — keeping this a plain, best-effort addition with no new
-        # failure mode of its own.
+        # reasoning (OpenRouter) is the only field sent here; a provider that rejects it is kept per (url, model).
         if think is False and reasoning_field_is_supported(url, model):
             payload["reasoning"] = {"effort": "low", "exclude": True}
         elif think is True and think_effort:
-            # AUTO-THINKDEPTH-2: three-tier cascade, each tier gated by
-            # its own per-URL memory so a provider that has already
-            # rejected a tier doesn't pay for that guaranteed-to-fail
-            # round trip again:
-            #   1. top-level `reasoning_effort` — OpenAI/Gemini-compat
-            #      standard flat string field. Tried first; this is what
-            #      Gemini's own OpenAI-compatibility layer documents
-            #      (https://ai.google.dev/gemini-api/docs/openai#thinking)
-            #      and what real OpenAI accepts too.
-            #   2. nested `reasoning: {"effort": ...}` — OpenRouter's
-            #      unified reasoning-control shape. Tried only once tier 1
-            #      has been marked unsupported for this URL (via a real
-            #      HTTP 400 — see request_completion below).
-            #   3. neither field sent at all — falls through to whatever
-            #      `think`'s own on/off handling already put in the
-            #      payload (or nothing, if `think` is None/unset): the
-            #      model still thinks, just at its own default depth, no
-            #      crash, no manual intervention. Reached once BOTH tier 1
-            #      and tier 2 have been marked unsupported for this URL.
+            # Reasoning effort is tried as reasoning_effort, then as reasoning, then not at all (AUTO-THINKDEPTH-2).
             if reasoning_effort_toplevel_is_supported(url, model):
                 payload["reasoning_effort"] = think_effort
             elif reasoning_field_is_supported(url, model):
                 payload["reasoning"] = {"effort": think_effort}
-            # else: both tiers exhausted for this URL — send nothing,
-            # plain thinking mode, no depth hint (tier 3).
+            # Both tiers rejected for this URL: nothing is sent, so the model uses plain thinking (tier 3).
         if think is not None and zai_thinking_is_supported(url, model):
-            # AUTO-ZAITHINK-1: Z.ai/GLM's own thinking-control convention
-            # — a top-level `thinking: {"type": "enabled"|"disabled"}`
-            # object, distinct from both fields above. Sent ADDITIONALLY,
-            # never instead of them: a provider that doesn't recognise
-            # this exact shape is expected to silently ignore it, same
-            # assumption `reasoning`/`reasoning_effort` already rely on.
-            # Confirmed live: without this, a GLM-5.2 endpoint ignored
-            # both existing fields, defaulted to its own "Max" reasoning
-            # effort, and exhausted a modest max_tokens budget on <think>
-            # alone before any JSON was written — `content` came back
-            # genuinely empty every attempt.
+            # Z.ai thinking is sent in addition to the others, and a provider that ignores it is not harmed (AUTO-ZAITHINK-1).
             payload["thinking"] = {"type": "enabled" if think else "disabled"}
         if response_format and response_format_is_supported(url, model):
             payload["response_format"] = {"type": "json_object"}
         if stream and stream_options_is_supported(url, model):
-            # RUN-9: see the docstring — a trailing usage chunk on a streamed
-            # reply, or `completion_tokens = None` once this endpoint said no.
+            # A trailing usage chunk is requested on streams, unless this endpoint has refused it (RUN-9).
             payload["stream_options"] = {"include_usage": True}
     return url, headers, payload
 
@@ -1185,8 +894,7 @@ def _retry_value(config, section: str, key: str, default, cast):
             section, key, exc, default,
         )
         return default
-    # A type-matched floor: max(0, 0.0) returns the int 0, which would turn a
-    # float knob into an int silently.
+    # A type-matched floor: max(0, 0.0) returns the int 0, which would silently turn a float knob into an int.
     return max(0 if cast is int else 0.0, value)
 
 
@@ -1293,10 +1001,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     budget as a retryable HTTP status, instead of propagating as a raw,
     context-free exception on the first transient network hiccup.
     """
-    # MASK-KEY-1: mask any `api_key = ...` line in the outgoing message
-    # content *last*, right before the body is shaped/serialized — this is
-    # the one point every caller passes through, regardless of how its
-    # payload/messages were assembled upstream.
+    # Secrets are masked last, right before the body is serialised (MASK-KEY-1).
     payload = _mask_payload_secrets(payload)
     body = _build_payload(payload, api_format, stream)
 
@@ -1320,8 +1025,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         _sleep(wait_s)
 
     def retry_after(msg: str, wait_s: float) -> None:
-        # the deadline before the log line: "waiting 100.0s and retrying" was logged (and sent to
-        # on_retry), then the retry was refused at once
+        # The deadline is checked before the log line, so a retry refused at once is not logged as waiting.
         left = _left()
         if left is not None and left <= wait_s:
             sleep(wait_s)                       # raises: the deadline line is the one logged
@@ -1331,9 +1035,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         sleep(wait_s)
 
     def _check_deadline(what: str) -> None:
-        # the deadline bounds the reply too: the socket timeout is only the gap between two reads, and a
-        # provider that keeps a stream open with keep-alive comments, or trickles the body, held the
-        # call (and the caller's worker and pacer slot) far past it
+        # The deadline bounds the whole reply, not only the gap between reads.
         left = _left()
         if left is not None and left <= 0:
             raise RuntimeError(f"deadline reached reading {what} from {url}: stopped after "
@@ -1360,25 +1062,10 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         if left <= 0:
             raise RuntimeError(f"deadline reached before calling {url}")
         return min(timeout, left) if timeout else left
-    # RUN-9: CompletionMeta.elapsed counts from before the first attempt, so
-    # a caller sees the whole cost of the call, retries included.
+    # CompletionMeta.elapsed counts from before the first attempt, so retries are included (RUN-9).
     _started = time.monotonic()
 
-    # AUTO-REASONING-1: `build_chat_request`'s think=False path sends an
-    # OpenRouter-style `reasoning: {"effort": "low", "exclude": true}`
-    # field, documented there as "expected to be silently ignored by a
-    # provider that doesn't recognise it" — true for OpenRouter/kenari-style
-    # aggregators, false for strict OpenAI-schema validators. Confirmed
-    # live: Gemini's openai-compat endpoint
-    # (generativelanguage.googleapis.com/v1beta/openai/chat/completions)
-    # rejects it outright with HTTP 400 "Unknown name \"reasoning\": Cannot
-    # find field.", which is NOT in `_is_retryable_status` and would
-    # otherwise fail the whole call closed on every single request to a
-    # strict provider. `_reasoning_stripped` tracks whether this one-time,
-    # no-budget-cost fallback (drop the field, rebuild the body, retry
-    # immediately) has already fired for this call — it's a payload-shape
-    # fix, not a transient error, so it must never repeat or consume
-    # `error_retries`.
+    # Strict endpoints reject the reasoning field with HTTP 400, so it is dropped once and the call is retried (AUTO-REASONING-1).
     _reasoning_stripped = False
 
     def _looks_like_unknown_reasoning_field(detail: str) -> bool:
@@ -1387,15 +1074,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                                         or "unrecognized" in low or "not supported" in low or "unsupported" in low
                                         or "invalid" in low)
 
-    # AUTO-THINKDEPTH-2: tier 1 of the three-tier think_effort cascade —
-    # payload-shape fix (this endpoint doesn't accept the top-level
-    # `reasoning_effort` string field), not a transient error, fires ONCE
-    # per call, immediately, without touching error_retries/backoff. On
-    # rejection this does NOT give up on depth entirely — it downgrades to
-    # tier 2 (nested `reasoning: {"effort": ...}`, OpenRouter's shape) in
-    # the SAME retry, which the existing tier-2 block below then handles
-    # exactly like it always has (including its own further fallback to
-    # tier 3 if tier 2 also gets rejected).
+    # A rejected top-level reasoning_effort is dropped once and the call retried with the nested form (AUTO-THINKDEPTH-2).
     _reasoning_effort_toplevel_stripped = False
 
     def _looks_like_unknown_reasoning_effort_field(detail: str) -> bool:
@@ -1406,9 +1085,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
             or "invalid" in low or "unexpected" in low
         )
 
-    # AUTO-THINKDEPTH-1: mirrors _reasoning_stripped/_response_format_stripped
-    # — a payload-shape fix (the endpoint doesn't accept a string depth in
-    # Ollama's "think" field), not a transient error, fires ONCE per call.
+    # A rejected string think depth is dropped once per call, without using the retry budget (AUTO-THINKDEPTH-1).
     _think_depth_stripped = False
 
     def _looks_like_unknown_think_depth_value(detail: str) -> bool:
@@ -1419,21 +1096,12 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
             or "invalid" in low or "unexpected" in low or "boolean" in low
         )
 
-    # AUTO-JSONMODE-1: mirrors _reasoning_stripped above — a payload-shape
-    # fix (the provider doesn't support enforced JSON mode), not a
-    # transient error, so it fires ONCE per call, immediately, without
-    # touching error_retries/backoff.
+    # A rejected JSON-mode field is dropped once per call, without using the retry budget (AUTO-JSONMODE-1).
     _response_format_stripped = False
 
     def _looks_like_unknown_response_format_field(detail: str) -> bool:
         low = detail.lower()
-        # Match "format" as a mention of the field name loosely — error
-        # bodies quote it in inconsistent ways (`"format"`, `\"format\"`
-        # inside a JSON-encoded message string, unquoted, ...) — so check
-        # the bare word rather than a specific quoting style. Combined
-        # with the caller's _has_rf_field check (the outgoing payload
-        # actually had the field) and the rejection-keyword check below,
-        # this stays specific enough not to misfire on unrelated 400s.
+        # A 400 that names the format field is read as a rejection of that field, not as another error (AUTO-JSONMODE-1).
         has_field_name = "response_format" in low or "format" in low
         return has_field_name and (
             "unknown name" in low or "cannot find field" in low
@@ -1441,27 +1109,15 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
             or "invalid" in low or "unexpected" in low
         )
 
-    # AUTO-ZAITHINK-1: mirrors _reasoning_stripped above — a payload-shape
-    # fix (this endpoint rejects the top-level `thinking: {"type": ...}`
-    # object outright, rather than silently ignoring it), not a transient
-    # error, so it fires ONCE per call, immediately, without touching
-    # error_retries/backoff. Sent additively alongside `reasoning`/
-    # `reasoning_effort`, so stripping it never removes those — a strict
-    # provider that rejects `thinking` but still accepts one of the other
-    # two keeps working exactly as it did before this field existed.
+    # A rejected thinking object is dropped once per call; the other reasoning keys stay (AUTO-ZAITHINK-1).
     _zai_thinking_stripped = False
 
-    # RUN-9: mirrors _response_format_stripped above — a payload-shape fix
-    # (this gateway does not accept OpenAI's stream_options field), not a
-    # transient error, so it fires ONCE per call, immediately, without
-    # touching error_retries/backoff.
+    # A rejected stream_options is dropped once per call, without using the retry budget (RUN-9).
     _stream_options_stripped = False
 
     def _looks_like_unknown_stream_options_field(detail: str) -> bool:
         low = detail.lower()
-        # Gateways echo the field name in different ways — the whole field,
-        # only the option inside it, or the words with a space. Any mention
-        # next to a 400 is the field being rejected, not a transient error.
+        # Any mention of the stream option next to a 400 is a rejection of that option.
         return ("stream_options" in low or "include_usage" in low
                 or "stream options" in low)
 
@@ -1486,23 +1142,12 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 except Exception:
                     pass
 
-                # AUTO-THINKDEPTH-2: tier 1 — strict-schema provider
-                # rejected the top-level `reasoning_effort` string field
-                # outright. Strip it and downgrade to tier 2 (nested
-                # `reasoning: {"effort": ...}`) in the SAME retry, rather
-                # than giving up on depth entirely — a provider that
-                # doesn't speak the OpenAI-standard flat field (e.g. an
-                # OpenRouter-style aggregator) may still understand the
-                # nested shape, so tier 2 gets a real chance before
-                # falling through to plain thinking mode.
+                # Tier 1 rejected: drop reasoning_effort and retry with the nested reasoning form (AUTO-THINKDEPTH-2).
                 if (e.code == 400 and not _reasoning_effort_toplevel_stripped
                         and isinstance(body, dict) and "reasoning_effort" in body
                         and _looks_like_unknown_reasoning_effort_field(detail)):
                     _reasoning_effort_toplevel_stripped = True
-                    # Remember this endpoint for the rest of the process —
-                    # every future build_chat_request() call against the
-                    # same URL now goes straight to tier 2 instead of
-                    # repeating this exact 400.
+                    # The rejection is remembered per URL, so later calls skip tier 1 (AUTO-THINKDEPTH-2).
                     mark_reasoning_effort_toplevel_unsupported(url, body.get("model"))
                     _depth = body.get("reasoning_effort")
                     body = {k: v for k, v in body.items() if k != "reasoning_effort"}
@@ -1525,26 +1170,14 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         on_retry(msg)
                     continue
 
-                # AUTO-REASONING-1: strict-schema provider rejected the
-                # `reasoning` field outright — strip it and retry ONCE,
-                # immediately, without touching error_retries/backoff (this
-                # isn't a rate limit or a transient server error).
+                # A strict provider's rejection of reasoning is dropped once, with no backoff (AUTO-REASONING-1).
                 if (e.code == 400 and not _reasoning_stripped
                         and isinstance(body, dict) and "reasoning" in body
                         and _looks_like_unknown_reasoning_field(detail)):
                     _reasoning_stripped = True
-                    # AUTO-REASONING-2: remember this endpoint for the rest
-                    # of the process — every future build_chat_request()
-                    # call against the same URL now skips the field
-                    # outright instead of repeating this exact 400.
+                    # The rejection is remembered per URL, so later calls skip the field (AUTO-REASONING-2).
                     mark_reasoning_field_unsupported(url, body.get("model"))
-                    # Distinguish which caller put "reasoning" in the
-                    # payload — AUTO-REASONING-1's think=false suppression
-                    # (`{"effort": "low", "exclude": True}`) vs
-                    # AUTO-THINKDEPTH-1's think_effort depth hint
-                    # (`{"effort": <configured depth>}`, no "exclude") —
-                    # purely for an accurate log message; both share the
-                    # same field name, cache, and strip/retry mechanics.
+                    # Logs which caller sent the reasoning field: think=false suppression or the depth hint.
                     _rf = body.get("reasoning")
                     _is_effort_mode = isinstance(_rf, dict) and "exclude" not in _rf
                     body = {k: v for k, v in body.items() if k != "reasoning"}
@@ -1574,15 +1207,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         on_retry(msg)
                     continue
 
-                # AUTO-JSONMODE-1: provider rejected enforced-JSON-mode
-                # field ("response_format" on openai-format, "format" on
-                # ollama) outright — strip it and retry ONCE, immediately,
-                # same shape as the reasoning-field fallback above. Then
-                # remember this endpoint for the rest of the process (via
-                # mark_response_format_unsupported) and fall back to the
-                # existing best-effort JSON parsing/salvage path for every
-                # subsequent call — this provider simply doesn't support
-                # engine-level JSON enforcement.
+                # A rejected JSON-mode field is dropped once; the endpoint is remembered and JSON is salvaged (AUTO-JSONMODE-1).
                 _has_rf_field = (
                     isinstance(body, dict)
                     and ("response_format" in body or body.get("format") == "json")
@@ -1613,12 +1238,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         on_retry(msg)
                     continue
 
-                # RUN-9: provider rejected OpenAI's `stream_options` field
-                # outright — strip ONLY that field, remember the (url,
-                # model) pair so build_chat_request() stops asking for the
-                # rest of the process, and retry ONCE, immediately. The
-                # reply then just carries no usage chunk (completion_tokens
-                # = None, a legal value) instead of a 400 on every call.
+                # A rejected stream_options is dropped once; the reply simply has no usage (RUN-9).
                 _has_stream_options_field = (
                     isinstance(body, dict) and "stream_options" in body
                 )
@@ -1645,14 +1265,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         on_retry(msg)
                     continue
 
-                # AUTO-ZAITHINK-1: provider rejected the top-level
-                # `thinking: {"type": ...}` object outright — strip ONLY
-                # that field and retry ONCE, immediately, same shape as
-                # the other payload-shape fixes above. The `reasoning`/
-                # `reasoning_effort` fields (if either was also sent)
-                # stay untouched — this is purely "this one extra field
-                # isn't recognised", not a rejection of thinking-control
-                # in general.
+                # A rejected thinking object is dropped once; the other reasoning fields are kept (AUTO-ZAITHINK-1).
                 _has_zai_thinking_field = (
                     isinstance(body, dict) and "thinking" in body
                 )
@@ -1678,14 +1291,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         on_retry(msg)
                     continue
 
-                # AUTO-THINKDEPTH-1: endpoint rejected a string depth value
-                # in Ollama's "think" field ([api] think_effort_enabled =
-                # true) — degrade to the plain boolean, which is
-                # independently known-good (this is NOT a rejection of
-                # thinking-control itself, just of the depth-string
-                # variant), retry ONCE immediately, remember the endpoint
-                # so future build_chat_request() calls send the boolean
-                # straight away, and warn loudly.
+                # A rejected string think depth is degraded to the boolean once, and remembered (AUTO-THINKDEPTH-1).
                 _think_val = isinstance(body, dict) and body.get("think")
                 _has_think_depth_field = isinstance(_think_val, str)
                 if (e.code == 400 and not _think_depth_stripped
@@ -1741,16 +1347,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 retry_after(msg, wait_s)
                 attempt += 1
             except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
-                # AUTO-FIX (medium-priority audit): these previously had no
-                # explicit handling at all and propagated as a raw,
-                # low-level exception with no indication of which provider/
-                # URL was involved or how many attempts were made — easy to
-                # misread as a bug in this module rather than a flaky
-                # provider. Given several configured providers are free-tier
-                # aggregators known to drop connections under load, this
-                # reuses the same retry/backoff budget as the HTTP-status
-                # path above rather than introducing a second, divergent
-                # retry mechanism.
+                # Connection-level errors reuse the HTTP retry budget, and are reported with the provider (AUTO-FIX).
                 if attempt >= error_retries:
                     raise RuntimeError(
                         f"{type(e).__name__} calling {url}: {e} "
@@ -1765,26 +1362,16 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 attempt += 1
 
     if not stream:
-        # BUGFIX (audit): _open()'s retry loop only wraps urlopen() itself —
-        # response.read() below was outside it, so a transient network
-        # error while downloading the body (as opposed to connecting) was
-        # not retried. Safe to retry the whole open+read here since no
-        # partial result has been returned to the caller yet.
+        # The whole open and read is retried, since no partial result has reached the caller yet (BUGFIX).
         _read_attempt = 0
         while True:
             try:
                 with _open() as response:
-                    # utf-8-sig: a UTF-8 BOM at the head of the body makes
-                    # json.loads fail on "not a valid JSON text" even though
-                    # the payload itself is fine. utf-8-sig is identical for
-                    # BOM-free bodies.
+                    # A UTF-8 BOM is dropped before parsing, so json.loads does not fail on it (utf-8-sig).
                     raw = json.loads(_read_body(response).decode("utf-8-sig"))
             except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError,
                     ValueError) as e:
-                # ValueError covers json.JSONDecodeError (a subclass): a
-                # truncated or garbled body from a flaky proxy is as retryable
-                # as a dropped connection, and it used to escape this loop as
-                # an uncaught exception instead of taking the ladder below.
+                # A truncated or garbled body is retried like a dropped connection (BUGFIX).
                 if _read_attempt >= error_retries:
                     raise RuntimeError(
                         f"{type(e).__name__} reading response body from {url}: {e} "
@@ -1798,14 +1385,9 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 retry_after(msg, error_retry_wait_sec)
                 _read_attempt += 1
             else:
-                # Only the read+parse is retried. A ValueError from
-                # _extract_content means the response DID arrive and is a
-                # distinct outcome the caller must see right away — feeding
-                # it back into this loop would retry a deterministic shape
-                # mismatch error_retries times instead of surfacing it.
+                # Only read and parse are retried; a content-shape error reaches the caller at once.
                 text = _extract_content(raw, api_format)
-                # RUN-9: a blocking reply carries its own finish_reason and
-                # usage, so an empty non-streamed reply is classifiable too.
+                # A blocking reply carries finish_reason and usage, so an empty reply is classifiable (RUN-9).
                 _notify_meta(on_meta, _response_meta(
                     raw, api_format, content=text,
                     elapsed=time.monotonic() - _started,
@@ -1814,42 +1396,22 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
 
     # ── Streaming ────────────────────────────────────────────────────────
     parts = []
-    # RUN-9: what this stream actually did, folded in chunk by chunk below.
-    # An untouched CompletionMeta() — nothing seen — is a legal result: a
-    # stream with no finish reason, no usage and no content is exactly the
-    # degraded-provider shape the caller needs to see, not an error.
+    # What the stream did, collected chunk by chunk; an empty result is a legal outcome (RUN-9).
     meta = CompletionMeta()
-    # BUGFIX (audit): same gap as the non-streaming path above — the
-    # `for raw_line in response:` iteration was outside _open()'s retry
-    # loop. Unlike the non-streaming path, tokens may already have been
-    # handed to on_token() by the time a transient error hits, and
-    # reopening the connection would re-fetch from the start — duplicating
-    # output the caller already received. Only retry while nothing has
-    # been emitted yet; once `parts` is non-empty, surface the failure
-    # like before rather than risk corrupting the stream.
+    # The streaming read is retried too, but only before any token has been passed on (BUGFIX).
     _stream_attempt = 0
     while True:
         try:
             with _open() as response:
                 for raw_line in response:
                     _check_deadline("the stream")
-                    # utf-8-sig: a BOM on the first line of the stream would
-                    # otherwise drop that chunk via the JSONDecodeError
-                    # `continue` below.
+                    # A BOM on the first stream line is stripped, so that chunk is not dropped (utf-8-sig).
                     line = raw_line.decode("utf-8-sig").strip()
                     if not line:
                         continue
 
                     if api_format == "ollama":
-                        # Ollama streams newline-delimited JSON objects
-                        # {"message": {"role": "assistant", "content": "tok"}, "done": false}
-                        # BUGFIX: chunk.get("message", {}) returns the default {}
-                        # only when the key is ABSENT — a present-but-null
-                        # "message" (e.g. a keep-alive or role-only chunk from
-                        # a non-standard Ollama-compatible server) returns None,
-                        # and None.get("content", "") raises AttributeError,
-                        # which is NOT caught by the except json.JSONDecodeError
-                        # below. Use `or {}` to handle both absent and null.
+                        # Ollama chunks may carry a null message; the null is treated as empty (BUGFIX).
                         try:
                             chunk = json.loads(line)
                             token = (chunk.get("message") or {}).get("content", "")
@@ -1866,33 +1428,9 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             break
                         try:
                             chunk = json.loads(data)
-                            # BUGFIX: some OpenAI-COMPATIBLE backends (this branch
-                            # supports any base_url speaking the openai format, not
-                            # just literal OpenAI) send an SSE chunk with an EMPTY
-                            # choices array — a real usage-reporting chunk shape
-                            # OpenAI itself sends when stream_options.include_usage
-                            # is set, and also seen from various proxy/gateway
-                            # wrappers regardless of client request options.
-                            # `chunk["choices"][0]` on an empty list raises
-                            # IndexError, which the except clause below did NOT
-                            # catch (only JSONDecodeError/KeyError) — so this chunk
-                            # crashed the WHOLE streaming request with an unhandled
-                            # exception, losing every token already accumulated in
-                            # `parts`, rather than just being skipped like any other
-                            # unparseable chunk. Reproduced directly:
-                            #
-                            #   lines = [..normal tokens.., '{"choices": [],
-                            #            "usage": {...}}', "[DONE]"]
-                            #   -> IndexError: list index out of range
-                            #      (uncaught, propagates out of request_completion)
+                            # An empty choices list is skipped, not an IndexError that loses the reply (BUGFIX).
                             choices = chunk.get("choices") or []
-                            # BUGFIX: choices[0]["delta"] can be None (a
-                            # role-only or usage-reporting chunk from some
-                            # OpenAI-compatible servers), and
-                            # None.get("content", "") raises AttributeError
-                            # which is NOT caught by the except clause below
-                            # (only JSONDecodeError/KeyError). Use `or {}` to
-                            # handle both a missing and a null delta.
+                            # A null delta is treated as empty, so it does not raise AttributeError (BUGFIX).
                             token = (choices[0].get("delta") or {}).get("content", "") if choices else ""
                             done  = False
                         except (json.JSONDecodeError, KeyError):
@@ -1901,8 +1439,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
 
                     if token:
                         parts.append(token)
-                        # RUN-9: a chunk that carried content, as opposed to
-                        # a role-only, reasoning or usage chunk.
+                        # Counts only chunks that carry content, not role-only, reasoning or usage chunks (RUN-9).
                         meta.content_chunks += 1
                         if on_token is not None:
                             on_token(token)

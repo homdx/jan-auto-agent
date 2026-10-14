@@ -118,8 +118,7 @@ class TestStartupResetClearsDeadline:
 
         _real_startup_reset(state)
 
-        # The parked fix task is skipped entirely, so its budget file must be
-        # left alone too.
+        # The parked fix task is skipped entirely, so its budget file stays too.
         assert state.get_task(fix_id)["status"] == STATUS_BLOCKED
         assert _deadline_path(state, fix_id).exists()
         # ...while the resettable task next to it does get a clean budget.
@@ -170,8 +169,7 @@ class TestBaselineWithoutReset:
 
         state = _store_with_blocked_task(tmp_path)
         _write_stale_deadline(state, 999_999)
-        # RUN-2: "already exhausted" is now a consumed total, not an old clock
-        # reading — a bare timestamp no longer reads as an exhausted budget.
+        # RUN-2: "already exhausted" is a consumed total; a bare timestamp is not an exhausted budget.
         state.write_task_file(TASK_ID, "deadline_started_at.txt",
                               json.dumps({"consumed_s": 999_999.0}))
         # Deliberately NO _real_startup_reset here.

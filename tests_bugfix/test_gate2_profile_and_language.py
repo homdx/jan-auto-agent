@@ -44,9 +44,7 @@ def _cfg(text: str) -> configparser.ConfigParser:
     return cfg
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Language leak
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize(
     "prompt", [_GATE2_SYSTEM_CREATIVE, _GATE2_SYSTEM_CODE],
@@ -85,9 +83,7 @@ def test_creative_prompt_still_has_three_format_examples():
 
 
 class _Result:
-    # `files_written`, not `files`: CoderResult has never had a `files`
-    # attribute, so the production read returned None and the directive was
-    # always empty on real runs. The stub matched the bug, hiding it.
+    # Use files_written: CoderResult has no files attribute, so the stub must match production.
     def __init__(self, files):
         self.files_written = files
 
@@ -153,9 +149,7 @@ def test_language_directive_never_raises(tmp_path):
     assert _validator()._language_directive(object(), tmp_path) == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # validator_llm_profile
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_no_profile_keeps_every_shared_value():
     """A config without the key must behave byte for byte as before."""

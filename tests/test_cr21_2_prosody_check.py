@@ -23,8 +23,7 @@ from tools.auto.prosody import (
 
 # ── Helper poems ──────────────────────────────────────────────────────────────
 
-# Clean AABB quatrain with regular syllables (9-8-9-8 pattern repeated)
-# Line 1&2 rhyme on "зима"/"прима"; line 3&4 rhyme on "луна"/"волна"
+# Clean AABB quatrain: regular syllables, lines 1-2 and 3-4 rhyme
 _CLEAN_AABB = """\
 Трещит январский холод — зима
 Явилась в город наша прима
@@ -37,8 +36,7 @@ _CLEAN_AABB = """\
 В ночи шумит морская волна
 """
 
-# ABAB quatrain: lines 1&3 rhyme, 2&4 rhyme
-# "зима"/"прима" on positions 1&3, "луна"/"волна" on positions 2&4
+# ABAB quatrain: lines 1 and 3 rhyme, 2 and 4 rhyme
 _CLEAN_ABAB = """\
 Трещит январский холод — зима
 Горит вдали ночная луна
@@ -255,15 +253,10 @@ class TestCheckProsodyApproved:
         assert v.approved is True
 
     def test_latin_text_approved(self):
-        # Non-Russian text — no Cyrillic vowels, no rhyme detectable
-        # With require_quatrains=False, split_stanzas may return stanzas but NONE rhyme
-        # However split_stanzas requires >=2 lines; single-line stanzas dropped.
-        # Let's test with require_quatrains=False to avoid stanza-count rejection
+        # Non-Russian text has no rhymes; with require_quatrains=False, short stanzas may be dropped.
         v = check_prosody("hello world\ngoodbye world\n\nhow are you\ni am fine",
                           require_quatrains=False)
-        # Latin text produces no Cyrillic rhymes → scheme=NONE → REVISE
-        # OR stanza_count=0 if filtered out → APPROVED
-        # Either outcome is acceptable; what matters is no exception
+        # Latin text gives scheme NONE (REVISE) or no stanzas (APPROVED); both are fine: no exception.
         assert isinstance(v, ProsodyVerdict)
 
     def test_require_quatrains_false_allows_non_four_line(self):
@@ -345,9 +338,7 @@ class TestCheckProsodyFailOpen:
         assert v.approved is True
 
     def test_only_digits(self):
-        # Digits produce no Cyrillic vowels/rhymes; with require_quatrains=False
-        # the stanza has 0-syllable lines and NONE scheme → REVISE on rhyme
-        # OR stanza_count=0 → APPROVED.  What matters: no exception ever raised.
+        # Digits: no rhymes, so REVISE or APPROVED; the point is that nothing raises.
         v = check_prosody("123 456\n789 000", require_quatrains=False)
         assert isinstance(v, ProsodyVerdict)
 

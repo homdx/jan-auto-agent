@@ -39,9 +39,7 @@ def main():
     a = ap.parse_args()
 
     outcome = a.outcome.strip().upper()
-    # The epic-round prompt (docs/collect-epics/RUN-THE-EPIC-COMPETITION.md)
-    # says `--outcome DONE`; it means FIXED. Rejecting it left the agent's
-    # ticket unrecorded and next_task.py handing it out again.
+    # The epic-round prompt (docs/collect-epics/RUN-THE-EPIC-COMPETITION.md) says `--outcome DONE`; it means FIXED. Rejecting it left the ticket unrecorded.
     if outcome == "DONE":
         outcome = "FIXED"
     row = {
@@ -79,10 +77,7 @@ def main():
     d = os.path.dirname(a.progress)
     if d:
         os.makedirs(d, exist_ok=True)
-    # csv writes where the file ends: a PROGRESS.csv an editor or a hand left
-    # without its final newline got the new row glued onto its last line, so
-    # next_task.py read one row and handed the new ticket out again. The file's
-    # own line ending ends that line first, and the row keeps that ending too.
+    # csv writes at the end of the file; if the last line has no final newline, the new row would be glued onto it. Use the file's own line ending first.
     eol, tail = "\r\n", ""
     if existed:
         with open(a.progress, "rb") as fh:

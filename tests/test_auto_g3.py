@@ -41,9 +41,7 @@ from tools.auto.outer_loop import OuterLoopResult
 from tools.auto.state import StateStore, STATUS_DONE
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 _AGENT_USER  = "auto-agent-test"
 _AGENT_EMAIL = "auto-agent-test@localhost"
@@ -142,9 +140,7 @@ def _git_log(repo: Path, fmt: str, n: int = 20) -> list[str]:
     return [line for line in r.stdout.splitlines() if line.strip()]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — N tasks → N commits with hashes stored
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: N tasks give N commits with stored hashes
 
 class TestG3CommitCount:
     def _run_n_tasks(self, tmp_path: Path, n: int):
@@ -217,9 +213,7 @@ class TestG3CommitCount:
         assert len(set(hashes)) == 3, "Expected 3 distinct commit hashes"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — Commit message format: auto(<task-id>): <title>
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: commit message format auto(<task-id>): <title>
 
 class TestG3CommitMessageFormat:
     def test_message_format_single_task(self, tmp_path):
@@ -270,9 +264,7 @@ class TestG3CommitMessageFormat:
         assert "auto(G3-2): Add type hints" in auto_msgs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC3 — Commit author identity matches agent config
-# ─────────────────────────────────────────────────────────────────────────────
+# AC3: commit author matches the agent config
 
 class TestG3AuthorIdentity:
     def test_author_name_and_email_on_commit(self, tmp_path):
@@ -322,9 +314,7 @@ class TestG3AuthorIdentity:
         assert author_names[0] == "auto-agent"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC4 — No-git path: tasks end DONE, no crash
-# ─────────────────────────────────────────────────────────────────────────────
+# AC4: no-git path: tasks end DONE, no crash
 
 class TestG3NoGitPath:
     def test_no_git_task_marked_done(self, tmp_path):
@@ -381,9 +371,7 @@ class TestG3NoGitPath:
         assert "completed" in log
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Nothing-to-stage edge case
-# ─────────────────────────────────────────────────────────────────────────────
+# Nothing to stage
 
 class TestG3NothingToStage:
     def test_task_done_when_nothing_staged(self, tmp_path):

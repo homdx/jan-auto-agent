@@ -331,9 +331,7 @@ def test_fit_pack_is_monotone_in_budget():
     renderers = _allowing(model, TARGET)
     head_len = len("COLLECT MODEL (static facts, do not contradict):\nmodule: pkg/hub.py")
 
-    # Sweep across the budget range and check that the set of rendered rows
-    # is monotone (a row that is absent at a smaller budget may appear at a
-    # larger one, but never the reverse).
+    # Rendered rows are monotone: absent at a small budget may appear at a larger one, never the reverse.
     previous_rendered: set[str] = set()
     for budget in range(head_len, head_len + 2000, 3):
         result = _fit_pack_to_budget(renderers, full, head_len, budget)

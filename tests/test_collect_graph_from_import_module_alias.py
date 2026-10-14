@@ -70,8 +70,7 @@ def test_from_pkg_import_module_alias_edges_to_the_module(tmp_path, statement):
     _, edges, reverse = _graph(tmp_path)
     assert "pkg/b.py" in edges["pkg/a.py"]
     assert "pkg/a.py" in reverse["pkg/b.py"]
-    # The package edge is kept, not replaced: `from pkg import b` really
-    # does import `pkg/__init__.py` first.
+    # from pkg import b still imports pkg/__init__.py first; the package edge is kept.
     assert edges["pkg/a.py"] == frozenset({"pkg/__init__.py", "pkg/b.py"})
 
 

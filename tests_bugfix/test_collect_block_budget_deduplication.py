@@ -52,9 +52,7 @@ def test_deduplication_before_budget_cut():
     ]
     model = _model([_module(symbols=[_symbol("alpha")], config_reads=reads)])
 
-    # With a budget that only fits one line after dedup
-    # Without deduplication, we'd have 3 lines, but with dedup, we have 1
-    # The budget check should pass after dedup
+    # Budget fits one line after dedup (3 lines before, 1 after).
     block = build_collect_context_block(model, "pkg/a.py", budget=150)
     # The line should be present (deduplication worked)
     assert "config_read [coder] num_ctx (fallback=8192)" in block
@@ -69,8 +67,7 @@ def test_deduplication_saves_budget():
     ]
     model = _model([_module(symbols=[_symbol("alpha")], config_reads=reads)])
 
-    # Without dedup, 3 lines would be much longer
-    # With dedup, only 1 line
+    # Without dedup the block is much longer; with dedup it is one line.
     block = build_collect_context_block(model, "pkg/a.py", budget=200)
     assert "config_read [coder] num_ctx (fallback=8192)" in block
     assert len(block.split("\n")) <= 4  # Header + module + 1 deduped line

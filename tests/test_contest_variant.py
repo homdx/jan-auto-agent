@@ -37,8 +37,7 @@ from tools.contest.variant import (
 
 RULES = [{"permission": "*", "pattern": "*", "action": "allow"}]
 
-#: What glm-4-7-flash:free's provider answered `max` with, trimmed to the
-#: fields the runner reads.
+#: Provider's reply to `max`, trimmed to the fields the runner reads.
 REJECTED = {"name": "APIError",
             "data": {"message": "the model's provider rejected the request. check the "
                                 "model id, request fields, and context length",
@@ -346,9 +345,7 @@ def test_hello_probe_walks_down_past_the_variants_the_provider_rejects(tmp_path)
 
     assert pick.variant == "high" and pick.usable
     assert [rung for rung, _ in pick.tried] == ["max", "xhigh"]
-    # the reasons in the message: a stress-run red here once showed only
-    # `all(<generator>)`, which cannot say whether the error event was lost
-    # (`no answer (timeout)`) or the HTTP call failed (`HTTP …`)
+    # Failure reasons must name the cause (timeout or HTTP error), not just all(<generator>).
     assert all("rejected the request" in reason for _, reason in pick.tried), pick.tried
     created = fake.calls(method="POST", path="/session")
     assert [c["body"]["model"].get("variant") for c in created] == ["max", "xhigh", "high"]

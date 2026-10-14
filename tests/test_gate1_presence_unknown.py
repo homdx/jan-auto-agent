@@ -60,9 +60,7 @@ from tools.auto.gate1_filter import (
 from tools.auto.run_trace import RunTrace
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures and helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _config(*, presence_unknown: str | None = None,
             unparseable_max_retries: str = "2") -> configparser.ConfigParser:
@@ -71,8 +69,7 @@ def _config(*, presence_unknown: str | None = None,
     gate1: dict[str, str] = {
         "temperature": "0.0", "max_tokens": "64", "skip_llm": "false",
         "unparseable_max_retries": unparseable_max_retries,
-        # No wait: these tests are about the verdict, not the retry timing
-        # (see tests_bugfix/test_gate1_log_levels.py for the same split).
+        # No wait here: these tests are about the verdict, not the retry timing.
         "llm_call_retry_wait_sec": "0",
     }
     if presence_unknown is not None:
@@ -206,9 +203,7 @@ def _trace_event(kind: str, params: dict, run_id: str = "r1") -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Config: the new [gate1] key
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPresenceUnknownConfig:
 
@@ -236,9 +231,7 @@ class TestPresenceUnknownConfig:
         assert any("presence_unknown is malformed" in r.message for r in caplog.records)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # The classifier: an unknown reason is a technical failure, not a verdict
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestUnknownReasonClassification:
 
@@ -268,9 +261,7 @@ class TestUnknownReasonClassification:
         ) == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Policy: keep is the default, reject is today's behaviour
-# ─────────────────────────────────────────────────────────────────────────────
+# Policy: keep is the default; reject is today's behaviour
 
 class TestEmptyReplyIsUnknown:
     """Acceptance: a stub that returns "" for every attempt."""
@@ -285,12 +276,10 @@ class TestEmptyReplyIsUnknown:
 
         assert len(accepted) == 3
         assert rejected == []
-        # The ladder ran out, so the counter says how many candidates never
-        # got a verdict.
+        # The counter says how many candidates never got a verdict when the ladder ran out.
         assert filt.presence_unknown == 3
         assert all(len(v) == 3 for v in calls.values())
-        # The reason travels with the candidate: the KEPT line carries it,
-        # and it names both the absence of a verdict and the cause behind it.
+        # The KEPT line carries the reason, naming the missing verdict and its cause.
         kept = [r for r in caplog.records if "KEPT (presence_unknown = keep)" in r.message]
         assert len(kept) == 3
         for record in kept:
@@ -331,8 +320,7 @@ class TestUnknownReasonTravelsWithTheTask:
             assert c.instruction.count(UNKNOWN_PRESENCE_REASON) == 1
             assert "JSON decode failed" in c.instruction
             assert "before changing code" in c.instruction
-        # A second pass that ends unknown again (a --validate-plan re-check)
-        # does not stack a second note.
+        # A second pass that is unknown again does not stack a second note.
         fake2, _ = _make_provider(plans)
         with patch("tools.llm_stream.request_completion", side_effect=fake2):
             accepted2, _ = _filter(_config()).filter(accepted, tmp_path)
@@ -408,9 +396,7 @@ class TestLadderStillGivesModelVerdicts:
         assert accepted[0].title == "candidate 0"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging: UNKNOWN is a warning, and REJECTED is reserved for the model
-# ─────────────────────────────────────────────────────────────────────────────
+# Logging: UNKNOWN is a warning; REJECTED is reserved for the model
 
 class TestUnknownLogsAsUnknown:
 
@@ -452,9 +438,7 @@ class TestUnknownLogsAsUnknown:
         assert rejected[0].levelno == logging.INFO
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# M4: the counter, the split, and the two readers
-# ─────────────────────────────────────────────────────────────────────────────
+# M4: the counter, the split and the two readers
 
 class TestPresenceUnknownCounter:
 
@@ -530,9 +514,7 @@ class TestPresenceUnknownCounter:
         assert "_uncounted" not in event["params"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # presence_workers > 1: the third outcome travels through the pool in order
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPresenceWorkersCarryUnknown:
 
@@ -559,9 +541,7 @@ class TestPresenceWorkersCarryUnknown:
         assert counts["presence_rejected"] == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # scripts/trace_round_snapshot.py: unknown is its own column
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestTraceRoundSnapshotUnknownColumn:
 
@@ -586,14 +566,12 @@ class TestTraceRoundSnapshotUnknownColumn:
         assert snap["gate1"]["unknown"] == 2
         # Its own column, not folded into the per-response `unparsed` count.
         assert snap["gate1"]["unparsed"] == 0
-        # The per-candidate verdicts are still read from the gate1_split
-        # event, not invented from the per-response counts above.
+        # Per-candidate verdicts come from the gate1_split event, not from the response counts.
         assert snap["gate1_split"]["presence_rejected"] == 1
 
     def test_main_prints_the_unknown_column(self, monkeypatch, tmp_path):
         module = _load_trace_round_snapshot()
-        # The run name is the base dir's basename, and it is printed in a
-        # 12-char column — keep it short or the row shifts under the header.
+        # The run name is printed in a 12-char column, so it is kept short.
         base = tmp_path / "r1"
         agent = base / ".agent"
         agent.mkdir(parents=True)
@@ -614,8 +592,7 @@ class TestTraceRoundSnapshotUnknownColumn:
 
         assert "unk" in out
         rows = [ln for ln in out.splitlines() if not ln.startswith("-")]
-        # Columns are fixed-width and the TOTAL row has empty fields, so read
-        # the field by character offset rather than by splitting on spaces.
+        # Columns are fixed-width, so the field is read by character offset, not by spaces.
         start = rows[0].index("unk")
         assert [ln[start:start + 4].strip() for ln in rows[1:]] == ["2", "2"]
         assert "TOTAL" in rows[2]

@@ -47,9 +47,7 @@ from tools.auto.architect import ClusterReviewer, review_clusters
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def cfg() -> configparser.ConfigParser:
@@ -115,8 +113,7 @@ def _truncated_payload(*titles: str) -> str:
     objects; the last is deliberately unterminated."""
     complete = ",\n".join(json.dumps(_task(t)) for t in titles[:-1])
     tail_title = titles[-1]
-    # Cut the JSON string for the final object's title mid-value, and
-    # never close the array — mirrors a real max_tokens cutoff.
+    # Cuts the title mid-value and never closes the array, as a real max_tokens cutoff does.
     truncated_tail = (
         '{"title": "' + tail_title[: max(1, len(tail_title) // 2)]
     )
@@ -143,9 +140,7 @@ def _user_messages(mock_llm) -> list[str]:
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H4-1 / AC-H4-2 — truncated → shrink-retry → clean second response wins
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H4-1 / AC-H4-2: truncated, shrink-retry, and a clean second response wins
 
 class TestShrinkRetryOnTruncation:
 
@@ -164,8 +159,7 @@ class TestShrinkRetryOnTruncation:
             results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
         assert mock_llm.call_count == 2
-        # AC-H4-2: second attempt's candidates are used, not merged with
-        # the first (truncated) attempt's salvaged prefix.
+        # The second attempt's candidates are used, not merged with the truncated prefix (AC-H4-2).
         assert [r.title for r in results] == ["Task A only"]
 
     def test_second_attempt_uses_smaller_max_tasks(
@@ -245,9 +239,7 @@ class TestShrinkRetryOnTruncation:
         assert "up to 2 concrete tasks" in msgs[1]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H4-3 / AC-H4-4 — retries exhausted, or disabled
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H4-3 / AC-H4-4: retries exhausted, or disabled
 
 class TestRetryExhaustionAndDisable:
 
@@ -329,9 +321,7 @@ class TestRetryExhaustionAndDisable:
         assert [r.title for r in results] == ["Task C1"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H4-5 / AC-H4-6 — shrink-retry does NOT fire for other failure modes
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H4-5 / AC-H4-6: shrink-retry does not fire for other failure modes
 
 class TestShrinkRetryDoesNotOverfire:
 
@@ -388,16 +378,12 @@ class TestShrinkRetryDoesNotOverfire:
         # AUTO-H5's default retry budget: 1 initial + 6 retries.
         assert mock_llm.call_count == 7
         assert results == []
-        # The actual AC-H4-6 claim: max_tasks must stay fixed across all
-        # attempts — this is what distinguishes "unsalvageable, plain
-        # retry" from AUTO-H4's shrink-retry, not merely the call count.
+        # max_tasks stays fixed across attempts; that is what separates a plain retry from the shrink-retry.
         msgs = _user_messages(mock_llm)
         assert all("up to 5 concrete tasks" in m for m in msgs)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H4-9 — interaction with the existing transient-error retry loop
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H4-9: interaction with the transient-error retry loop
 
 class TestInteractionWithTransientErrorRetry:
 
@@ -424,16 +410,12 @@ class TestInteractionWithTransientErrorRetry:
         ):
             results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
-        # review_clusters treats a None batch result as "skip it" (not
-        # checkpointed, not merged into results) — see review_clusters'
-        # `if batch_results is None: continue`.
+        # A None batch result is skipped: not checkpointed, not merged into results.
         assert results == []
         assert mock_llm.call_count == 5
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H4-10 — checkpointing only records the final result
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H4-10: checkpointing records only the final result
 
 class TestCheckpointRecordsFinalResultOnly:
 

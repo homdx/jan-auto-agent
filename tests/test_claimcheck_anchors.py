@@ -47,8 +47,7 @@ FILES = {
 }
 
 
-# Fixed dates: the fixture's HEAD is one sha everywhere. A random one was all digits
-# about one run in forty, and "at 87577327" is no anchor by design (all-digit only after "commit").
+# Fixed dates keep the fixture's HEAD sha stable.
 _DATES = {"GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z", "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
           "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
 
@@ -407,8 +406,7 @@ def test_model_types_have_the_epic_shape():
     assert (r.qualname, r.lines, r.sha, r.candidates) == ("", (0, 0), "", ())
     pack = Pack("c", "sha", (Chunk("src:a.py:1-2", "source", "a.py", 1, 2, "x = 1", "why"),
                              Chunk("note:1", "note", "", 0, 0, "second", "why")), False)
-    # CC-5 owns what `render` prints and what `find` accepts (tests/test_claimcheck_pack.py);
-    # here only that the methods exist on the type and the counters default to "nothing trimmed".
+    # Methods exist on the type; counters default to zero.
     assert pack.render().startswith("EVIDENCE for the claim, at commit sha")
     assert pack.find("second chunk text") is None and pack.find("") is None
     assert (pack.omitted, pack.cut) == (0, 0)

@@ -72,9 +72,7 @@ from tools.auto.state import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 _HELLO_PY_INITIAL = """\
 def greet():
@@ -112,9 +110,7 @@ def main():
 
 _HELLO_PY_IMPROVED = _HELLO_PY_IMPROVED_T2  # alias for fixtures that only need one variant
 
-# T1 and T2 have acceptance_checks that always pass.
-# T3's acceptance_check always exits 1 → executor fails every attempt →
-# inner_loop returns passed=False → outer_loop exhausts the task.
+# T1 and T2 always pass; T3 always fails, so the outer loop exhausts it.
 _CANDIDATES_3 = [
     {
         "title": "Add module docstring to hello.py",
@@ -251,9 +247,7 @@ def _make_standard_llm(candidates: list | None = None):
     return _fake
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-MIXED — 2 passing tasks + 1 exhausted task
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-MIXED: 2 passing tasks and 1 exhausted task
 
 class TestMixedOutcomes:
     """Two tasks pass; one task is exhausted via a permanently failing acceptance_check."""
@@ -331,9 +325,7 @@ class TestMixedOutcomes:
         assert prog.get("done_count", 0) == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-DEPS — dependency-blocked tasks are skipped; resolved deps unblock them
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-DEPS: dependency-blocked tasks are skipped; resolved deps unblock them
 
 class TestDependencyBlocking:
     """Dependent tasks stay BLOCKED when their prerequisite is missing."""
@@ -412,9 +404,7 @@ class TestDependencyBlocking:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-TRACE — run_trace emits a complete, valid lifecycle in the trace file
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-TRACE: run_trace writes a complete, valid lifecycle to the trace file
 
 class TestTraceObservability:
     """Trace JSONL uses the key 'kind' for event type; lifecycle is complete."""
@@ -514,9 +504,7 @@ class TestTraceObservability:
         assert log_path.stat().st_size > 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-PROGRESS — progress_display counters are coherent at run end
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-PROGRESS: progress_display counters are coherent at run end
 
 class TestProgressCounters:
     """code_done and code_total are consistent after a clean run."""
@@ -584,9 +572,7 @@ class TestProgressCounters:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-AUDIT — run.log is a sufficient audit trail
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-AUDIT: run.log is a sufficient audit trail
 
 class TestAuditTrail:
     """run.log captures enough for a human to reconstruct what happened."""

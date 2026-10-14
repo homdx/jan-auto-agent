@@ -51,14 +51,7 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-gate check adapters
-# ─────────────────────────────────────────────────────────────────────────────
-# Each adapter receives the shared per-file context and returns the
-# validator's verdict object. They exist because the five validators do
-# NOT share a check() signature (a deliberate non-goal here: unifying the
-# signatures would mean touching five validator modules and their tests,
-# which is a much larger blast radius than unifying the *loop*).
+# Per-gate check adapters: each takes the shared context and returns that validator's verdict; the signatures differ by design.
 
 def _check_canon(validator, *, text, rel_path, task, loop, base_dir_path):
     return validator.check(text, rel_path, base_dir=base_dir_path)
@@ -96,21 +89,7 @@ def _check_prosody(validator, *, text, rel_path, task, loop, base_dir_path):
     return validator.check(loop._task_with_goal(task), text)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Verdict predicate
-# ─────────────────────────────────────────────────────────────────────────────
-# Before the unified :class:`~tools.auto.gate_verdict.GateVerdict` interface,
-# each gate's verdict had its own shape — ``CanonResult`` exposed
-# ``has_conflict`` (inverted: ``True`` = rejected) while every other verdict
-# exposed ``approved``. Two per-gate predicates (``_rejected_by_conflict``
-# for canon, ``_rejected_by_approved`` for the rest) bridged that split so
-# the shared loop body did not need to know which shape a given gate had.
-#
-# Every verdict now honours the one interface: ``verdict.approved`` is True
-# when the gate accepts the attempt, False when it rejects it. A single
-# predicate — :func:`_gate_rejected` — reads ``not verdict.approved`` for
-# every gate. The old per-gate predicates are kept as thin aliases below
-# for any external caller that imported them directly.
+# Verdict predicates: each gate's verdict shape is adapted to a common approved/rejected test (canon's flag is inverted).
 
 
 def _gate_rejected(verdict) -> bool:
@@ -128,9 +107,7 @@ def _gate_rejected(verdict) -> bool:
     return not verdict.approved
 
 
-# Backward-compat aliases — external code that imported the old
-# per-shape predicates keeps working. Both now delegate to the single
-# unified predicate.
+# Backward-compatible aliases: old per-shape predicate names delegate to the unified predicate.
 
 def _rejected_by_conflict(verdict) -> bool:
     """CanonResult exposed ``has_conflict``; now aliased to the unified check."""
@@ -142,9 +119,7 @@ def _rejected_by_approved(verdict) -> bool:
     return _gate_rejected(verdict)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # GateSpec
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class GateSpec:
@@ -218,8 +193,7 @@ class GateSpec:
     profile_key: Optional[str] = None
 
 
-#: Gate execution order. This list is the pipeline — reorder it to reorder
-#: the gates. Each entry's ``modes`` says which task modes it applies to.
+#: Gate execution order; reorder this list to reorder the gates. modes says which task modes each applies to.
 GATES: tuple[GateSpec, ...] = (
     GateSpec(
         name="delta",
@@ -237,22 +211,7 @@ GATES: tuple[GateSpec, ...] = (
         factory_module="tools.auto.delta_validator",
         factory_name="make_delta_validator",
         modes=("creative",),
-        # Runs first deliberately: the cheapest, most unambiguous Gate-3
-        # check (no LLM call — see _check_delta) should reject an
-        # unchanged file before canon/fact/continuity/theme/prosody spend
-        # LLM calls reviewing prose that turns out to be a no-op. Scoped
-        # to creative only, where acceptance_check is routinely trivial
-        # ("true") and so provides no independent evidence real work
-        # happened — see delta_validator.py's module docstring for the
-        # production run that motivated this. Deliberately NOT "docs":
-        # the existing test suite hard-asserts docs mode's Gate-3 list is
-        # exactly ["existence"] across every agents*.ini profile, which
-        # reads as an intentional invariant, and the observed failure was
-        # creative-mode specific — extend to docs later if the same
-        # no-op pattern actually shows up there. Not "code": a code
-        # task's acceptance_check is normally a real test command, which
-        # already fails on a no-op coder response through a different,
-        # pre-existing path.
+        # The delta check runs first in creative mode: it is cheap and rejects an unchanged file before any LLM gate runs.
     ),
     GateSpec(
         name="canon",
@@ -357,13 +316,7 @@ GATES: tuple[GateSpec, ...] = (
         ),
         factory_module="tools.auto.prosody",
         factory_name="make_prosody_validator",
-        # GATE3-PROFILE-2: no profile_key. ProsodyValidator.check is pure
-        # syllable/rhyme-scheme arithmetic — make_prosody_validator never
-        # calls _make_llm_call — so there is no request to redirect. A
-        # prosody_llm_profile key would resolve and log but bind to
-        # nothing, which is worse than not offering it. Add profile_key
-        # here (and a settings= passthrough in make_prosody_validator)
-        # if prosody ever grows an LLM-backed check.
+        # Prosody has no LLM call, so it has no profile key; a key would resolve but bind to nothing.
     ),
 )
 
@@ -471,18 +424,10 @@ def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
     Returns a dict keyed by :attr:`GateSpec.attr`, ready to splat into
     ``InnerLoop(...)`` as keyword arguments.
     """
-    # GATES-2: only build validators for gates the config actually enables.
-    # Every other gate's attr is set to None, which run_gates reads as
-    # "off" — so a disabled gate costs nothing at construction time
-    # either (no LLM client, no story-bible read, and — GATE3-PROFILE-2 —
-    # no profile resolution or log line either).
+    # Only enabled gates build a validator; a disabled gate costs nothing at construction, not even a profile lookup.
     enabled = {s.name for s in resolve_gate_order(config, task_mode)}
 
-    # Resolved lazily and once: only computed if some enabled gate actually
-    # has a profile_key, and shared across every such gate as the middle
-    # link of the <gate> → validator_llm_profile → [api_*] chain — so a
-    # config with e.g. only canon_llm_profile set doesn't re-resolve
-    # validator_llm_profile from scratch (and re-log it) once per gate.
+    # The shared validator profile is resolved once, lazily, and only if some enabled gate needs it.
     _validator_settings = None
 
     def _validator_llm_settings():
@@ -514,9 +459,7 @@ def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
 
             module = __import__(spec.factory_module, fromlist=[spec.factory_name])
             factory = getattr(module, spec.factory_name)
-            # The factories don't share a signature either; pass only what
-            # each declares. Introspection here is cheaper and far less
-            # invasive than rewriting five factories and their test suites.
+            # Factories take different arguments, so only what each declares is passed; introspection is less invasive than rewriting them.
             import inspect  # noqa: PLC0415
             params = inspect.signature(factory).parameters
             kwargs: dict = {}
@@ -563,13 +506,7 @@ def run_gates(
     if not target_files:
         return None
 
-    # GATES-2: the loop carries its resolved order when make_inner_loop
-    # built it. Falling back to the mode-filtered registry keeps every
-    # directly-constructed InnerLoop (tests, embedders) working unchanged.
-    # ``is None``, not truthiness: an EMPTY order means "every gate is
-    # switched off" (config `creative =`) and must NOT fall back to the
-    # registry default. Testing `if not order` here silently re-enabled
-    # every gate for exactly the config that asked for none.
+    # The loop uses its resolved gate order; an empty order means all gates are off and must not fall back to the default.
     order = getattr(loop, "gate_order", None)
     if order is None:
         order = tuple(s for s in GATES if loop.task_mode in s.modes)
@@ -596,15 +533,7 @@ def run_gates(
 
         problem_blocks: list[str] = []
         for rel_path in files:
-            # BUGFIX (FIX-1 #4): is_rejection()/verdict.feedback() used to
-            # run *after* this try/except, so a rejecting verdict whose
-            # feedback() raised (verdicts assemble coder-visible prose from
-            # LLM-authored fields — conflict lists, missing-fact lists —
-            # that can hold None or non-string entries) escaped run_gates
-            # and broke the fail-open contract documented above. The whole
-            # per-file gate pass is guarded now: a raise from check() OR
-            # from feedback() approves that one file; sibling files in the
-            # same gate are still judged on their own iteration.
+            # A raise from check() or feedback() approves only that file; sibling files are still judged (FIX-1 #4).
             try:
                 text = (base_dir_path / rel_path).read_text(
                     encoding="utf-8", errors="replace"
@@ -655,8 +584,7 @@ def run_gates(
                 record_text=full if spec.record_prefixed_feedback else blob,
             )
 
-        # Cap spent and the text still fails — accept with a warning rather
-        # than ping-ponging the loop forever.
+        # Cap spent and the text still fails: accept with a warning, so the loop does not ping-pong.
         if spec.skip_check_when_capped:
             logger.warning(spec.cap_log, cap, files)
         else:

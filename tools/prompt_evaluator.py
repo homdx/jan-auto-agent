@@ -34,9 +34,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Sentinel used to detect when max_iter is not explicitly passed by the caller.
-# Using a sentinel instead of a plain default means callers that omit max_iter
-# get a loud warning rather than silently scoring against the wrong ceiling.
+# Sentinel for "max_iter not passed"; the caller then gets a warning, not a silent wrong ceiling.
 _MAX_ITER_ASSUMED = 3
 _UNSET = object()
 
@@ -55,8 +53,7 @@ def scoreable_records(records: List[RunRecord]) -> List[RunRecord]:
         if str(getattr(r, "validator_status", "") or "") != "unavailable"
     ]
 
-# Synthetic payloads for shadow evaluation.
-# These exercise the full validator prompt format without needing stored inputs.
+# Synthetic payloads for shadow evaluation; they exercise the full validator prompt without stored inputs.
 _SHADOW_PAYLOADS: List[dict] = [
     {
         "task": "Validate import resolution for a utility module",
@@ -142,9 +139,7 @@ class PromptEvaluator:
         else:
             self.max_iter = max_iter  # used for iter_score normalisation
 
-    # ------------------------------------------------------------------ #
-    # Public API                                                           #
-    # ------------------------------------------------------------------ #
+    # Public API
 
     def evaluate(self, agent_name: str, candidate_prompt: str) -> EvalResult:
         """
@@ -168,9 +163,7 @@ class PromptEvaluator:
                 score=0.0,
             )
 
-        # RUN-7: filtered here as well as in _score_from_records so a batch
-        # of pure outages is the honest "no baseline runs" refusal below,
-        # not "5 baseline runs" scoring 0.0.
+        # Outage-only runs are filtered out, so the baseline refusal says so (RUN-7).
         recent: List[RunRecord] = scoreable_records(
             self.metrics_collector.load_recent(5)
         )
@@ -194,11 +187,7 @@ class PromptEvaluator:
 
         delta = candidate_score - current_score
 
-        # AUTO-FIX (low-priority audit): docstring and module header both
-        # document a strict threshold ("candidate_score > current_score +
-        # 0.05"), but the check used >=, silently promoting a candidate
-        # whose improvement lands exactly on the boundary instead of
-        # requiring it to exceed the threshold as documented.
+        # The promotion check is strictly greater than the threshold, as documented (AUTO-FIX).
         if delta > 0.05:
             reason = (
                 f"Score improved by {delta:+.2f} "
@@ -212,9 +201,7 @@ class PromptEvaluator:
         )
         return EvalResult(promoted=False, reason=reason, score=candidate_score)
 
-    # ------------------------------------------------------------------ #
-    # Scoring helpers                                                      #
-    # ------------------------------------------------------------------ #
+    # Scoring helpers
 
     def _score_from_records(self, records: List[RunRecord]) -> float:
         """
@@ -233,8 +220,7 @@ class PromptEvaluator:
         # 1 iteration → 1.0; self.max_iter iterations → 0.0
         iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, self.max_iter - 1))
 
-        # Exclude records where improvement_json_ok is None (auto-mode records)
-        # so the denominator matches MetricsCollector.summarize_failures behaviour.
+        # Records with improvement_json_ok None are excluded, so the denominator matches summarize_failures.
         json_applicable = [r for r in records if r.improvement_json_ok is not None]
         json_ok_rate = (
             sum(1 for r in json_applicable if r.improvement_json_ok) / len(json_applicable)
@@ -296,44 +282,11 @@ class PromptEvaluator:
             )
             return self._projected_score()
 
-        # AUTO-BUG (follow-up 2 / follow-up 3): the previous fix correctly
-        # excluded _api_error from the NUMERATOR of json_ok_rate (so an
-        # all-network-failure candidate can't score a false 1.0), but still
-        # divided by the full `n`, including _api_error results in the
-        # DENOMINATOR. _score_from_records (the production-run scorer just
-        # above) excludes not-applicable records from BOTH numerator and
-        # denominator — an _api_error result is the shadow-run equivalent
-        # of "not applicable" (no reply arrived to judge at all, unlike
-        # _unparseable where a reply DID arrive and failed the exact thing
-        # json_ok_rate measures). Counting _api_error in the denominator
-        # means a candidate shadow-tested during network jitter scores
-        # lower than the identical candidate tested on a stable connection
-        # purely by chance — 5 good replies + 5 _api_error = 0.5, vs. 5
-        # good + 0 errors = 1.0 — for reasons entirely unrelated to prompt
-        # quality. json_ok_rate and approved_rate below both apply this
-        # exclusion already (approved_rate: three-bugfixes.patch). iter_score
-        # is the third and last of the three sub-scores with the same bug:
-        # an _api_error result has status="needs_fix" (the dict default),
-        # so it fell into the `else: 2` branch below and was scored as a
-        # genuine full second revision iteration, even though no iteration
-        # happened at all — the call simply never reached the model. This
-        # is the highest-weighted (40%) of the three terms, so it distorts
-        # the final score more per affected call than either of the other
-        # two. Compute the exclusion filter once, up front, and use it for
-        # all three terms so an infra failure is treated identically
-        # everywhere: not a verdict, so not counted in either the
-        # numerator or the denominator of any of them.
+        # API errors are left out of both the numerator and the denominator of json_ok_rate (AUTO-BUG).
         _json_judged = [r for r in results if not r.get("_api_error")]
 
         if not _json_judged:
-            # Fully-degenerate case: every shadow call returned _api_error.
-            # There is no reply here to judge at all (unlike _unparseable,
-            # where a reply DID arrive) — this is the shadow-mode analogue
-            # of "all shadow validate() calls raised" above, just returned
-            # as a result instead of raised as an exception. Fall back to
-            # the same projection heuristic for consistency, rather than
-            # building a score entirely out of results that never reached
-            # judgment.
+            # Every shadow call failed, so there is no reply to judge; the projection heuristic is used (AUTO-BUG).
             logger.warning(
                 "PromptEvaluator: all shadow calls returned _api_error — "
                 "falling back to projection"
@@ -376,8 +329,7 @@ class PromptEvaluator:
         while still allowing the candidate to pass the 0.05 gate when
         the current prompt is clearly struggling.
         """
-        # RUN-7: the same exclusion _score_from_records applies, so the
-        # uplift heuristic's own n / approved_rate agree with `base`.
+        # The same exclusion as _score_from_records, so the uplift heuristic agrees with base (RUN-7).
         recent = scoreable_records(self.metrics_collector.load_recent(5))
         if not recent:
             return 0.0
@@ -385,23 +337,7 @@ class PromptEvaluator:
         base = self._score_from_records(recent)
         n = len(recent)
 
-        # BUGFIX: RunRecord.improvement_json_ok's own docstring says
-        # "None = not applicable (show/show_imports); excluded from rate",
-        # and _score_from_records (just above) honors that by excluding
-        # not-applicable records from both the numerator AND denominator.
-        # This line only excluded them from the numerator (`if r.improvement_
-        # json_ok` is falsy for None) but still divided by the full `n` —
-        # the exact same "asymmetric" measurement bug the AUTO-BUG comment
-        # in _shadow_score, below, already documents and fixes for the
-        # shadow-mode path. In projection mode this meant: a batch of
-        # otherwise-healthy runs padded with a few show/show_imports calls
-        # reads as a low json_ok_rate purely from dilution, triggers the
-        # +0.07 "JSON failures are fixable" uplift for no real reason, and
-        # can push a candidate over the 0.05 promotion threshold and into
-        # production based on a counting artifact rather than genuine
-        # prompt quality. Reproduced: 5 records (3 N/A + 2 real successes,
-        # i.e. a real 100% success rate) evaluated as promoted=True purely
-        # from this miscount, when the correct rate gives promoted=False.
+        # Not-applicable records are left out of the numerator and the denominator alike (BUGFIX).
         json_applicable = [r for r in recent if r.improvement_json_ok is not None]
         json_ok_rate = (
             sum(1 for r in json_applicable if r.improvement_json_ok) / len(json_applicable)
@@ -455,9 +391,7 @@ def _validate_candidate_placeholders(candidate: str) -> Optional[str]:
     return None
 
 
-# ------------------------------------------------------------------ #
-# Internal helper                                                      #
-# ------------------------------------------------------------------ #
+# Internal helper
 
 class _FixedPromptStore:
     """

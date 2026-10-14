@@ -70,9 +70,7 @@ import tools.llm_stream as llm_stream_mod
 
 POLICY_FILE = REPO_ROOT / "tools" / "contest" / "policy.py"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the recorded payloads (PROBE.md, "The permission payloads, verbatim")
-# ─────────────────────────────────────────────────────────────────────────────
+# The recorded permission payloads (PROBE.md)
 
 EXTERNAL_DIRECTORY_EVENT = {
     "type": "permission.asked",
@@ -132,9 +130,7 @@ ALLOW = {"verdict": "allow", "reason": "scratch path under tmp_roots"}
 REJECT = {"verdict": "reject", "reason": "writes outside the worktree"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
 
 _UNSET = object()
 
@@ -246,9 +242,7 @@ def decide(policy: Policy, event: dict, worktree: Path, **overrides) -> Decision
     return policy.decide(event, make_ctx(worktree, **overrides))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# layer 1: geometry, on the recorded payloads
-# ─────────────────────────────────────────────────────────────────────────────
+# Layer 1: geometry, on the recorded payloads
 
 def test_external_directory_outside_tmp_roots_asks_the_gate(tmp_path):
     gate = StubGate(json.dumps(ALLOW))
@@ -399,9 +393,7 @@ def test_forbidden_beats_the_worktree(tmp_path):
     assert gate.calls == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# reading the event
-# ─────────────────────────────────────────────────────────────────────────────
+# Reading the event
 
 def test_paths_are_extracted_deduped_and_trailing_star_stripped():
     pairs = policy_mod._extract_paths(EXTERNAL_DIRECTORY_EVENT["properties"])
@@ -433,9 +425,7 @@ def test_command_text_with_a_star_is_still_command_text():
     ) == [(Path("/tmp"), ("/tmp/*",))]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-13: command path scanning for bash permissions
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_command_scans_paths_outside_tmp_roots_to_the_gate(tmp_path):
     """Live event verbatim: patterns name /tmp/contest/notes/* but the
@@ -580,8 +570,7 @@ def test_extract_paths_without_base_is_today_s_behaviour(tmp_path):
     relative token against the caller's cwd, exactly as before the change."""
     event = make_event(
         permission="bash", patterns=[], command="cat ./scripts/x.py")
-    # no base passed; pairs are relative to the test's own cwd (tmp_path),
-    # matching the legacy (pre-KC-51) resolution against the caller.
+    # Pairs are relative to the test's cwd, matching the pre-KC-51 resolution.
     pairs = policy_mod._extract_paths(event["properties"])
     assert pairs == [(Path.cwd() / "scripts" / "x.py", ("./scripts/x.py",))]
 
@@ -672,9 +661,7 @@ def test_command_scan_deduplicates_paths(tmp_path):
     assert "/tmp/contest/out.txt" in originals
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-52: a lone `/` in a command is an operator, not the filesystem root
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-52: a lone / in a command is an operator, not the filesystem root
 
 def test_heredoc_division_operator_is_not_the_root(tmp_path):
     """KC-52: the round 86 reject — the heredoc body held ``x = tmp_path / "logs"``,
@@ -831,9 +818,7 @@ def test_root_and_home_match_on_identity_alone():
     assert policy_mod._forbidden_match(REPO_ROOT / "tests", HARD_DENYLIST) is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-15: bash ask for redirect/tee/cp outside the worktree; no-path bash is free
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-15: bash asks for redirect, tee or cp outside the worktree; no-path bash is free
 
 def test_live_redirect_outside_worktree_to_gate(tmp_path):
     """`echo x > /tmp/kc6-outside-a.txt` has no path in patterns but the
@@ -964,11 +949,7 @@ def test_bash_deny_beats_no_path_rule(tmp_path):
     assert gate.calls == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-13: relative-only bash commands still hit deny_commands, and $HOME/$PWD
-# expand to their real paths — no mechanical allow on a command the layer
-# cannot see
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-13: relative-only bash commands still hit deny_commands; $HOME and $PWD expand to real paths.
 
 _KC13_DENY = ("git push*", "sudo *", "rm -rf /*", "curl * | sh", "wget * | sh")
 
@@ -1129,13 +1110,7 @@ def test_bash_ls_relative_in_worktree_is_still_once(tmp_path):
     assert gate.calls == []
 
 
-#: KC-28/KC-119: the ``*>*`` ask fires on every ``2>&1`` and ``>/dev/null``,
-#: but geometry settles them without the gate — ``&1`` is no path and
-#: ``/dev/null`` is not scanned as one — so no allow rule is needed in the
-#: session rules. A proposal to add ``*2>&1`` allows after the deny rules
-#: would have let Kilo's last match wave ``git push … 2>&1`` through; these
-#: pin both halves: the harmless tail costs no gate call, and the tail never
-#: launders the head of the command.
+#: KC-28/KC-119: the *>* ask fires on every 2>&1 and >/dev/null, settled by geometry; the tail never launders the head of a command.
 _ROUND_ROOTS = ("/tmp/kilo/*",)
 
 
@@ -1303,9 +1278,7 @@ def test_gate_without_a_gate_model_fails_closed(tmp_path):
     assert gate.calls == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# what the gate is shown
-# ─────────────────────────────────────────────────────────────────────────────
+# What the gate is shown
 
 def test_gate_user_message_carries_the_context(tmp_path):
     gate = StubGate(json.dumps(ALLOW))
@@ -1391,15 +1364,13 @@ def test_default_completion_builds_the_call_from_gate_settings(tmp_path, monkeyp
     assert seen["timeout"] == GATE_TIMEOUT == 60.0
     assert seen["stream"] is False
     assert seen["api_format"] == "openai"
-    # KC-55: the gate retries its transport failures with the [contest] budget,
-    # so a 429 on kenari.id is a wait, not a reject
+    # The gate retries transport failures with the [contest] budget, so a 429 is a wait (KC-55).
     assert seen["error_retries"] == 4
     assert seen["error_retry_wait_sec"] == 30.0
     assert seen["max_retry_after_sec"] == 60.0
     assert seen["ssl_context"] is None
     assert seen["headers"]["Authorization"].startswith("Bearer ")
-    # and the sleep it waits on is the policy's own, checked against the
-    # deadline before it is spent — a test never waits it for real
+    # The policy's own sleep is used and checked against the deadline, so a test never waits for real.
     assert callable(seen["_sleep_fn"])
     assert callable(seen["on_retry"])
     assert slept == [], "an allow on the first call spends no wait"
@@ -1430,9 +1401,7 @@ def test_default_completion_builds_an_ollama_call(tmp_path, monkeypatch):
     assert "response_format" not in seen["payload"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the invariants
-# ─────────────────────────────────────────────────────────────────────────────
+# The invariants
 
 def test_always_occurs_once_and_only_in_the_module_docstring():
     """grep -c '"always"' counts one line — the module docstring's."""
@@ -1483,9 +1452,7 @@ def test_gate_prompt_is_bounded_and_ends_with_the_closing_line():
         assert phrase in GATE_SYSTEM_PROMPT
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the audit trail
-# ─────────────────────────────────────────────────────────────────────────────
+# The audit trail
 
 def test_record_appends_one_line_per_decision(tmp_path):
     log = tmp_path / "out" / "decisions.jsonl"
@@ -1566,9 +1533,7 @@ def test_record_never_raises_on_a_broken_artifact(tmp_path):
     policy.record(decision, EXTERNAL_DIRECTORY_EVENT, tmp_path / "decisions.jsonl" / "deeper")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# fail open: decide never raises
-# ─────────────────────────────────────────────────────────────────────────────
+# Fail open: decide never raises
 
 @pytest.mark.parametrize("event,ctx_extra", [
     ("not a mapping", {}),
@@ -1669,9 +1634,7 @@ def test_tilde_in_patterns_meets_the_home_denylist(tmp_path):
     assert gate.calls == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-28: a null device is not a place — no gate call for `2>/dev/null`
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-28: a null device is not a place: no gate call for 2>/dev/null
 
 def test_redirect_into_dev_null_is_mechanical(tmp_path):
     """`pytest -q > /dev/null 2>&1` has no path outside the worktree."""
@@ -1741,9 +1704,7 @@ def test_dev_shm_is_a_place_and_still_goes_to_the_gate(tmp_path):
     assert "/dev/shm" not in NULL_DEVICES
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-58: a whole pytest root holds a round-wide suite slot
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("command", [
     "pytest tests",
@@ -1810,14 +1771,12 @@ def test_non_suite_commands_are_not_suite_runs():
     assert is_full_suite_command("git push origin main") is False
     assert is_full_suite_command("python3 -m pytestx tests") is False
     assert is_full_suite_command("python3 -c \"import pytest\" tests") is False
-    # a shell wrapper is not a pytest invocation: the suite inside it runs
-    # beside the round, which is today's behaviour and not a whole root
+    # A shell wrapper is not a pytest invocation, so the suite inside it is not a whole root.
     assert is_full_suite_command("bash -lc 'pytest tests -n 4'") is False
     assert is_full_suite_command("echo pytest tests") is False
     assert is_full_suite_command("grep -rn pytest tests") is False
     assert is_full_suite_command("timeout 60 grep -rn pytest tests") is False
-    # `python3 -m pytest` with nothing after it *is* a whole root: no path, no
-    # selector, so pytest's own default collection is what runs.
+    # Bare python3 -m pytest is a whole root: no path and no selector.
     assert is_full_suite_command("python3 -m pytest") is True
     # a flag with no value collects everything too
     assert is_full_suite_command("pytest -n") is True
@@ -1842,9 +1801,7 @@ def test_the_parser_reads_the_shape_not_the_filesystem(tmp_path):
     assert is_full_suite_command("pytest /no/such/dir/at/all/test_x.py") is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-46: the rounds folder is forbidden, the agent's own worktree in it is not
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _rounds(tmp_path):
     """``<tmp>/rounds`` with this agent's ``86-a``, a sibling ``86-b`` and an
@@ -1954,12 +1911,9 @@ def test_an_own_worktree_spelling_that_lands_on_a_sibling_stays_forbidden(tmp_pa
     assert gate.calls == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-55: the gate rides out a rate limit inside a bounded wait
-# ─────────────────────────────────────────────────────────────────────────────
 
-#: The body the fake opener returns when it answers: one allow verdict, the way
-#: the wire carries it.
+#: The body the fake opener answers with: one allow verdict, as the wire carries it.
 ALLOW_BODY = {"choices": [{"message": {"role": "assistant", "content": json.dumps(ALLOW)}}]}
 
 #: The sentence a gate-failed reason ends with after a 429 or a 5xx.
@@ -2305,9 +2259,7 @@ def test_a_garbled_body_still_stops_at_the_deadline(tmp_path, monkeypatch):
     assert sum(slept.calls) <= 15.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-66: the gate waits out a 429, and the turn gets the time back
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_gate_time_back_is_one_minute_per_two_tries():
     """1-2 tries buy a minute, 3-4 buy two, and so on — one try buys nothing.

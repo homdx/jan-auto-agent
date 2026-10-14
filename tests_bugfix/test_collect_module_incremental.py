@@ -180,8 +180,7 @@ class TestModuleIncrementalSummaryContent:
         llm = _counting_llm_call(purpose_prefix="INITIAL")
         action_collect(multi_module_repo, llm_call=llm)
 
-        # Switch to a different prefix so we can tell which run produced
-        # the summary in the final artifact.
+        # Different prefix, so the final artifact shows which run produced the summary.
         llm2 = _counting_llm_call(purpose_prefix="PATCHED")
         (multi_module_repo / "pkg" / "a.py").write_text(
             "def a():\n    return 42\n"

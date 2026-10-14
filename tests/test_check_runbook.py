@@ -35,19 +35,14 @@ BASELINE = REPO_ROOT / "examples" / "hello-world"
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fixtures — a sandbox that looks like a finished run
-# ─────────────────────────────────────────────────────────────────────────────
+# Fixtures: a sandbox that looks like a finished run
 
 def _make_sandbox(tmp_path: Path, task: int, *, plan_targets: list[str]) -> Path:
     """Build examples/task<N>/hello-world inside a fake repo root."""
     root = tmp_path / "repo"
     sandbox = root / "examples" / f"task{task}" / "hello-world"
     sandbox.mkdir(parents=True)
-    # Seed from git HEAD, exactly as scripts/run_flows.sh does. Copying from
-    # the WORKING TREE instead would silently diverge whenever a baseline file
-    # has uncommitted edits, and the checker compares against HEAD — so the
-    # sandbox would look "modified" before the flow had done anything.
+    # Seed from git HEAD, as run_flows.sh does; a working-tree copy would look modified before the flow ran.
     for name in ("main.py", "README.md", "CHANGELOG.md"):
         blob = subprocess.run(
             ["git", "show", f"HEAD:examples/hello-world/{name}"],
@@ -80,9 +75,7 @@ def _report(task: int, sandbox: Path):
     return check_runbook.CHECKS[task](sandbox)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Sandbox resolution
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_falls_back_to_the_shared_sandbox(tmp_path):
     import check_runbook
@@ -117,9 +110,7 @@ def test_each_task_resolves_independently(tmp_path, task):
             assert f"task{other}" not in resolved
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # "Was it even run?"
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("task", [1, 2, 3, 4])
 def test_missing_agent_dir_is_a_failure(tmp_path, task):
@@ -138,9 +129,7 @@ def test_absent_sandbox_is_a_failure(tmp_path, task):
     assert not _report(task, tmp_path / "nope").passed
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Task 2 — the real observed failure
-# ─────────────────────────────────────────────────────────────────────────────
+# Task 2: the real observed failure
 
 def test_docs_run_that_wrote_a_py_file_is_rejected(tmp_path):
     """Verbatim reproduction of the observed run.
@@ -196,9 +185,7 @@ def test_invented_file_reference_is_detected(tmp_path):
     assert "test_main.py" in finding.detail
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Task 3 — creative
-# ─────────────────────────────────────────────────────────────────────────────
+# Task 3: creative
 
 def _changelog(sandbox: Path, text: str) -> None:
     (sandbox / "CHANGELOG.md").write_text(text, encoding="utf-8")
@@ -230,11 +217,7 @@ code itself.
 
 A reader can now run the program and see it greet them.
 """
-# ^ the seed entry's prose is copied VERBATIM from
-# examples/hello-world/CHANGELOG.md@HEAD, not paraphrased — the new
-# "seed entry text unchanged" check (added alongside the heading-only
-# "seed entry preserved") diffs against that real baseline, so a fixture
-# claiming to be "good" has to actually match it.
+# The seed entry's prose is copied verbatim from examples/hello-world/CHANGELOG.md@HEAD, since the seed-text check diffs against it.
 
 
 def test_good_changelog_passes(tmp_path):
@@ -307,9 +290,7 @@ def test_lost_canon_fact_is_detected(tmp_path):
     assert _check(3, sandbox)["canon fact intact"].ok is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Task 4 — creative, canon/continuity on a second provider (GATE3-PROFILE-5)
-# ─────────────────────────────────────────────────────────────────────────────
+# Task 4: creative, with canon and continuity on a second provider (GATE3-PROFILE-5)
 
 _SHARED_LINE = (
     "validator_agent.validator_llm_profile: provider = https://a.example/v1 "
@@ -437,9 +418,7 @@ def test_task4_makes_no_network_call(monkeypatch, tmp_path):
     _report(4, sandbox)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Task 1 — code
-# ─────────────────────────────────────────────────────────────────────────────
+# Task 1: code
 
 _HARDENED = '''"""Print a greeting."""
 
@@ -505,9 +484,7 @@ def test_syntax_error_is_reported_not_raised(tmp_path):
     assert any(f.label == "main.py parses" for f in report.failed)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CLI surface
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cli(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -553,9 +530,7 @@ def test_checker_makes_no_network_call(monkeypatch, tmp_path):
     _report(3, sandbox)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # run_flows.sh
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_runner_exists_and_is_executable():
     assert RUNNER.is_file()
@@ -620,11 +595,7 @@ def test_runner_documents_the_isolation_rationale():
     assert "OWN sandbox" in text or "own sandbox" in text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Reporting defects found by the first full live run
-# ─────────────────────────────────────────────────────────────────────────────
-# All three were in the CHECKER, not the flows, and all three made a failing
-# run read as a healthier one than it was.
+# Reporting defects from the first full live run: all three were in the checker and made a failing run look healthier.
 
 def test_hint_is_hidden_on_passing_findings():
     """The worst of the three: a failure explanation printed beside PASS.

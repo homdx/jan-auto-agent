@@ -67,12 +67,7 @@ from typing import Callable
 
 from tools.auto.utils import atomic_write_text, chars_per_token
 
-# Bugfix: "LlmSettings" is used in annotations here but was only imported
-# inside _default_llm_settings's body. Under `from __future__ import
-# annotations` that stayed dormant until typing.get_type_hints() resolved
-# the string against module globals and raised NameError. A module-level
-# import is safe (llm_profile.py imports nothing from this package) and a
-# TYPE_CHECKING-gated one would not fix it — that block never executes.
+# Module-level import of LlmSettings, so type hints resolve under postponed evaluation (bugfix).
 from tools.auto.llm_profile import LlmSettings
 from tools.config_safe import safe_getboolean, safe_getfloat, safe_getint
 
@@ -82,8 +77,7 @@ logger = logging.getLogger(__name__)
 
 _INSTRUCTION_OVERHEAD_TOKENS = 300
 
-# Reserved headroom inside the summarisation budget for the system prompt and
-# the "summarise these chunk-summaries" wrapper prompt in pass 2.
+# Headroom in the summary budget for the system prompt and the pass-2 wrapper.
 _SUMMARISE_OVERHEAD_TOKENS = 200
 
 # Synopsis section marker format — must match ContextAssembler._SECTION_RE.
@@ -290,12 +284,7 @@ class SummaryFidelityVerifier:
         lang_instr = language_instruction(detect_language(chapter_text))
         system = _SYSTEM_FIDELITY + (("\n" + lang_instr) if lang_instr else "")
         if lang_instr:
-            # Same class of bug as the continuity validator: "output
-            # {language} only, do not translate" also swallows the literal
-            # "OK" sentinel on rounds where no correction is needed, so the
-            # early-exit branch below can never fire for non-English books —
-            # every round looks like it "needed a fix" and the loop always
-            # bleeds out via max_fidelity_rounds instead of a genuine pass.
+            # The language instruction swallows the literal OK sentinel, so the early exit never fires; the check is kept in the language-neutral form (same bug class as the continuity validator).
             system += (
                 "\nEXCEPTION TO THE LANGUAGE RULE ABOVE: if no correction is "
                 "needed, reply with exactly the English word OK — do not "
@@ -415,13 +404,7 @@ class SummaryMemory:
         self._verifier = SummaryFidelityVerifier(
             llm_call, max_fidelity_rounds=max_fidelity_rounds,
         )
-        # Budget for *input* to a single summarisation LLM call.
-        # Reserve output budget + overhead; leave _SUMMARISE_OVERHEAD_TOKENS
-        # of headroom for the system prompt and wrapper text.
-        # Stored as a token count, not a fixed char count: the char budget
-        # depends on the text being chunked (Cyrillic tokenizes ~2x denser
-        # than Latin — see chars_per_token()), so it's computed per-call in
-        # _chunk_budget_chars() rather than fixed at construction time.
+        # Budget for the input of one summary call: output and overhead are reserved first.
         self._input_tokens = max(
             0,
             (int(num_ctx) if num_ctx else 4096)
@@ -464,12 +447,7 @@ class SummaryMemory:
         """
         _base = Path(base_dir) if base_dir is not None else self._base_dir
         chapter_path = _base / chapter_file
-        # BUGFIX (audit): no validation — an absolute chapter_file discards
-        # _base entirely (pathlib's `/` operator returns the right side
-        # unchanged when it's absolute), and a relative one containing
-        # ".." can escape _base the same way the other base_dir-relative
-        # reads in this codebase's Gate 1 stage did before their own fix
-        # (see gate1_filter.py / context_broker.py / gate1_grounding.py).
+        # A chapter path outside the base directory is refused before it is read (BUGFIX).
         try:
             chapter_path.resolve().relative_to(_base.resolve())
         except ValueError:
@@ -495,33 +473,14 @@ class SummaryMemory:
 
         summary = self.summarize_chapter(chapter_text)
         verified = self._verifier.verify_and_fix(chapter_text, summary)
-        # AUTO-CR-16: final cleanup — strip any residual meta-commentary
-        # parentheticals / non-bullet noise. Keep the verified text if cleaning
-        # would empty it (fail-safe).
+        # Residual meta-commentary is stripped, and the verified text is kept if the cleanup would empty it (AUTO-CR-16).
         cleaned = _clean_bullet_list(verified)
         body = cleaned or verified
 
-        # AUTO-BUG-6 fix: previously `cleaned or verified` would happily
-        # persist whatever `verified` was even when it was obviously not a
-        # summary at all (observed in practice: the literal grader verdict
-        # "APPROVED" ended up written into synopsis.md as a chapter's
-        # "durable fact summary"). Refuse to write anything that looks like
-        # a bare verdict word or is implausibly short for a summary, and
-        # leave the previous section (if any) untouched instead.
+        # A bare verdict word or an implausibly short summary is never written as a chapter summary (AUTO-BUG-6).
         _stripped = body.strip()
         _is_bare_verdict = _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}
-        # BUGFIX (audit, generalizes the fix above): the previous version of
-        # this guard only rejected UNCLEAN content when it was a single
-        # line — but _clean_bullet_list() itself already fails open
-        # ("") for ANY reply that doesn't look like a fact list, single-
-        # line or not (e.g. >20 lines, or a line >220 chars — its own
-        # "looks like narrative prose" checks; see its docstring). When
-        # the summarizer/verifier failed and `verified` was raw or
-        # truncated multi-line chapter text, `cleaned` was correctly ""
-        # but this guard let it through anyway because it had more than
-        # one line, polluting synopsis.md with un-summarized chapter
-        # text. `cleaned` being "" is _clean_bullet_list's own considered
-        # verdict that the content isn't usable, regardless of line count.
+        # A reply the cleaner rejects is not written, even when it has several lines (BUGFIX).
         _unclean = not cleaned
         if not _stripped or _is_bare_verdict or _unclean:
             logger.warning(
@@ -623,26 +582,7 @@ class SummaryMemory:
             rf"<!--\s*BEGIN\s+{re.escape(chapter_file)}\s*-->.*?<!--\s*END\s+{re.escape(chapter_file)}\s*-->",
             re.DOTALL,
         )
-        #
-        # Bugfix: this used to be `pattern.sub(section_text, existing)` —
-        # passing section_text (which embeds the LLM-generated chapter
-        # summary) as re.sub's REPLACEMENT argument. re.sub interprets
-        # backslash sequences in a *string* replacement as backreferences
-        # (\1, \g<name>, ...); this pattern has no capture groups, so any
-        # summary containing an ordinary backslash — a footnote marker, a
-        # Windows path, dialogue about a regex or LaTeX expression, even
-        # just "...found it at 221\1 Baker Street." — raised
-        # `re.error: invalid group reference`. Only the *replace an existing
-        # section* path was affected (a fresh section is plain string
-        # concatenation, below); commit_on_success.py catches the exception
-        # so it doesn't crash the run, but because it fires before the file
-        # write, that chapter's section was silently left at its FIRST-DRAFT
-        # summary forever — exactly the staleness this file exists to
-        # prevent — with only one logger.error to show for it.
-        #
-        # A callable replacement sidesteps this entirely: re.sub never
-        # interprets backslash escapes in a function's return value, no
-        # matter what it contains.
+        # Section text is inserted as a plain string, so backslashes in a summary are not read as group references (bugfix).
         if pattern.search(existing):
             new_content = pattern.sub(lambda _m: section_text, existing)
         else:
@@ -651,12 +591,7 @@ class SummaryMemory:
 
         try:
             self._synopsis_path.parent.mkdir(parents=True, exist_ok=True)
-            # Bugfix: was plain write_text() — same class as the story_bible.md
-            # fix.  synopsis.md is rewritten wholesale each update (pattern.sub
-            # produces a full new string, not an append), so a kill mid-write
-            # truncates it silently.  The next chapter's coder then receives an
-            # incomplete continuity context with no error anywhere.
-            # atomic_write_text (temp-file + os.replace) is the one-line fix.
+            # The synopsis is written atomically, so a kill mid-write cannot leave an incomplete continuity context (bugfix).
             atomic_write_text(self._synopsis_path, new_content)
             logger.info(
                 "SummaryMemory: wrote synopsis section for %s → %s",
@@ -711,33 +646,10 @@ def _default_llm_settings(
     max_tokens = int(max_tokens_str)
 
     temperature = safe_getfloat(config, "inner_loop", "temperature", fallback=0.2)
-    # AUTO-FIX (fable follow-up 3): thinking models (qwen3) prepend a
-    # <think> block; if it truncates against num_predict the synopsis update
-    # comes back empty, and if it doesn't, the reasoning text is WRITTEN
-    # INTO synopsis.md — a long-lived artifact re-injected into every later
-    # prompt, so one polluted call poisons the whole run. Same toggle as
-    # gate1/architect/coder: default off, [summary_memory] think = true
-    # re-enables it.
+    # Thinking output is off by default for the synopsis, so reasoning text is not written into it (fable follow-up 3).
     think = safe_getboolean(config, "summary_memory", "think", fallback=False)
 
-    # AUTO-FIX (GATE3-PROFILE audit): think_effort was absent here, so every
-    # LlmSettings this function produced carried the dataclass default (None)
-    # rather than what [api] says, and a named profile appeared to "override"
-    # a value the default had never read. Reasoning depth is a cost/quality
-    # knob that does not change the shape of the reply, so the global [api]
-    # switch is safe to honour.
-    #
-    # response_format is deliberately NOT read from [api] here. That switch
-    # forces the server to emit a JSON object, which is right for Gate 1, the
-    # Coder and the Architect — and wrong for every caller of this function.
-    # The Gate-3 validators (canon/fact/continuity/theme) and SummaryMemory
-    # all parse FREE TEXT: an "APPROVED" / "REVISE: ..." verdict, or a prose
-    # synopsis. Honouring `[api] response_format = true` here would hand them
-    # a JSON object instead and break every one of them at once — and
-    # agents_128k.ini already ships with that key set to true, so this would
-    # have gone straight into a live profile. A caller that genuinely wants
-    # JSON mode can still set response_format in its own *_llm_profile, which
-    # is an explicit, per-caller opt-in rather than a global one.
+    # Reasoning depth is honoured from [api]; response_format is not, since the summary and verdict callers parse free text (GATE3-PROFILE).
     think_effort_enabled = safe_getboolean(
         config, "api", "think_effort_enabled", fallback=False)
     think_effort = (
@@ -800,59 +712,23 @@ def _make_llm_call(
     think_effort    = settings.think_effort
 
     timeout = safe_getint(config, "loop", "timeout_seconds", fallback=300)
-    # RUN-10: the [loop] HTTP retry budget, read the same way as the timeout
-    # above — one reader for every auto-mode caller, request_completion()'s
-    # built-in defaults when the keys are absent.
+    # The [loop] retry budget is read the same way as the timeout, with the request defaults when keys are absent (RUN-10).
     retry_kwargs = _llm_stream.retry_kwargs_from_config(config)
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
     def _call(system: str, user: str) -> str:
-        # AUTO-FIX (GATE3-PROFILE audit): this used to hand-roll its own
-        # payload, alone among the callers — Coder, Gate1Filter, Architect
-        # and TaskRewriter all go through build_chat_request. Two settings
-        # were silently dropped as a result:
-        #
-        #   * response_format / think_effort — resolve_llm_profile read them
-        #     faithfully from a <gate>_llm_profile and logged the profile as
-        #     applied, and then nothing used them. The same key worked in
-        #     [gate1] presence_llm_profile, so an operator could verify it
-        #     there and get silence here.
-        #   * think = false on api_format = openai — the hand-built openai
-        #     branch had no think handling at all, so suppression only ever
-        #     worked for ollama. build_chat_request sends the reasoning /
-        #     thinking fields both branches need.
-        #
-        # Verified byte-for-byte identical to the old payload for
-        # (ollama, think on/off) and (openai, think on); the openai +
-        # think=false case is the bug fix and is the only intended change.
-        # The one further payload difference: think=True now sends an
-        # explicit think:true (ollama) / thinking:enabled (openai) where the
-        # old code omitted the field. That restates the server default rather
-        # than changing it, and it is what makes think_effort reachable at
-        # all — the builder applies effort only when thinking is enabled.
-        #
-        # Going through the shared builder also picks up the per-(url, model)
-        # unsupported-field memoization: a provider that rejects `reasoning`
-        # or `response_format` once is not asked again.
+        # The call goes through build_chat_request like every other caller, so the same settings apply (GATE3-PROFILE audit).
         url, headers, payload = _llm_stream.build_chat_request(
             base_url=base_url, api_key=api_key, model=model,
             api_format=api_format, temperature=temperature,
             max_tokens=max_tokens, system=system, user_msg=user,
             num_ctx=num_ctx,
-            # think is passed as a real bool, never None. `None` would omit
-            # the field entirely, which preserved the old ollama payload
-            # byte-for-byte when think=True — but build_chat_request only
-            # applies think_effort when thinking is explicitly ENABLED, so
-            # `None` left think_effort dead on arrival. Keeping a
-            # configurable key working beats preserving one payload key that
-            # only ever restated the server default; every other caller
-            # (Gate1Filter, Coder, Architect) already passes a bool here.
+            # think is passed as a real bool, so think_effort is not dead when thinking is on; every other caller passes a bool too.
             think=think,
             response_format=response_format, think_effort=think_effort,
         )
-        # AUTO-FIX (fable follow-up 3): strip <think> BEFORE the synopsis
-        # parser — reasoning text must never be persisted into synopsis.md.
+        # <think> is stripped before the synopsis parser, so reasoning is never saved (AUTO-FIX).
         return _llm_stream.strip_think(
             _llm_stream.request_completion(
                 url=url,

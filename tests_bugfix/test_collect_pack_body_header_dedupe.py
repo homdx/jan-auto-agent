@@ -81,8 +81,7 @@ class TestDedupStillWorksBetweenRows:
         rows = _make_rows(("f1", "shared line\nfirst row"), ("f2", "shared line\nsecond row"))
         body, kept = _pack_body(_HEAD, {"f1": "shared line\nfirst row", "f2": "shared line\nsecond row"}, rows, None)
 
-        # f2 is processed after f1; "shared line" is already in seen
-        # from f1, so it must be skipped in f2
+        # f2 reprocesses "shared line", already seen from f1, so it must be skipped.
         assert body.count("shared line") == 1
         assert "second row" in body
         assert "first row" in body

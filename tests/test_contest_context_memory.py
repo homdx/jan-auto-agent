@@ -66,8 +66,7 @@ KENARY_OVERFLOW = {
     "data": {"message": "the request exceeds the model's maximum context length"},
 }
 
-#: The size the compact scenarios remember: ``200 000``, so 81 % is
-#: ``162 000`` and 79 % is ``158 000``, both read out of a reply's ``tokens``.
+#: The compact scenarios remember 200 000, so 81 % and 79 % are the two reply sizes used.
 SIZE = 200_000
 FULL_81 = 162_000
 FULL_79 = 158_000
@@ -115,9 +114,7 @@ def _prompt_texts(fake) -> list:
             for path, body in _posts(fake) if path.endswith("/prompt_async")]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the provider's words
-# ─────────────────────────────────────────────────────────────────────────────
+# The provider's wording for a too-large request
 
 def test_parse_overflow_reads_the_named_limit_and_the_named_prompt():
     assert cm.parse_overflow(SENSENOVA_OVERFLOW["data"]["message"]) == (262_144, 262_514)
@@ -134,9 +131,7 @@ def test_parse_overflow_names_nothing_when_the_provider_names_nothing():
     assert cm.parse_overflow("262144 tokens") == (None, None)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the file: one overflow, one line, kept 7 days
-# ─────────────────────────────────────────────────────────────────────────────
+# One overflow, one line in the file, kept 7 days
 
 def test_add_writes_one_record_atomically_and_load_reads_it_back(tmp_path):
     path = tmp_path / "memory" / "context-memory.json"
@@ -170,8 +165,7 @@ def test_add_drops_the_records_past_the_age_cut(tmp_path):
     assert [record.agent for record in records] == ["agent-a", "young"]
     assert (records[0].at, records[0].agent) == (fresh.at, "agent-a")
 
-    # on read the same cut applies, so a file an older runner left behind ages
-    # out on its own, without a write at all
+    # A file older than the cut ages out on read, without any write.
     assert cm.load(path, now=time.time() + 8 * DAY) == []
     assert cm.load(path, days=1) == []
 
@@ -191,8 +185,7 @@ def test_load_of_a_broken_or_missing_file_is_no_memory(tmp_path):
     (tmp_path / "dir-memory").mkdir()
     assert cm.load(tmp_path / "dir-memory") == []
 
-    # and neither read nor write raises: a record that cannot be aged is kept by
-    # nobody, a path that cannot be written is a warning for the runner
+    # Neither a read nor a write raises: an unageable record is dropped, an unwritable path only warns.
     assert cm.load(broken, days=0) == []
     assert cm.load(broken, days=None) == []
     assert cm.load(broken, days=float("nan")) == []
@@ -221,12 +214,10 @@ def test_smallest_size_is_the_smallest_the_model_has_ever_given(tmp_path):
     cm.add(path, _record(at=time.time() - 1 * DAY, limit=None, last_ok=None))
 
     records = cm.load(path)
-    # the named limit wins over the last OK of the same record, but the smallest
-    # record still wins over it: hy3's 104 065 in the ticket's table
+    # The named limit wins over the last OK of the same record, but the smallest record still wins.
     assert cm.smallest_size(records, "kenary", "agent-a:free") == 104_065
     assert cm.size_of(_record(limit=500, last_ok=900)) == 500
-    # round 145: a last_ok under context_min_window sizes nothing; with the
-    # floor off (0) it is what it always was
+    # A last_ok under context_min_window sizes nothing; with the floor off it sizes as before (round 145).
     assert cm.size_of(_record(limit=None, last_ok=999), 0) == 999
     assert cm.size_of(_record(limit=None, last_ok=999)) is None
     assert cm.size_of(_record(limit=None, last_ok=None)) is None
@@ -307,9 +298,7 @@ def test_plan_lines_is_one_line_per_model_with_a_remembered_size(tmp_path):
         [f"context memory: kenary/agent-a:free = {SIZE} (compact at 0 %)"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the config keys
-# ─────────────────────────────────────────────────────────────────────────────
+# Config keys
 
 _ROSTER = """\
 [contest]
@@ -350,8 +339,7 @@ def test_the_roster_reads_the_three_keys_and_a_typo_is_the_default(tmp_path):
             config.compact_at_percent) == ("/tmp/kilo/memory.json", 30.0, 60.0)
     assert cm.memory_path(config, out_dir) == Path("/tmp/kilo/memory.json")
 
-    # a typo is the default, and a nonsense value is the mechanism off: the round
-    # runs rather than refusing to start because context_memory_days has letters
+    # A typo falls back to the default, so the round still runs.
     for days, percent, want_days, want_percent in (("seven", "eighty", 7.0, 80.0),
                                                    ("0", "0", 0.0, 0.0),
                                                    ("-2", "400", 0.0, 400.0)):
@@ -364,9 +352,7 @@ def test_the_roster_reads_the_three_keys_and_a_typo_is_the_default(tmp_path):
         assert cm.compact_at_percent(config) == (want_percent if want_percent <= 100 else 80.0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the overflow: one line in the shared file
-# ─────────────────────────────────────────────────────────────────────────────
+# The overflow: one line in the shared file
 
 def _overflow_scenario(error, last_ok_input):
     """A first reply that reports a size and goes through, then the overflow.
@@ -418,9 +404,7 @@ def test_an_overflow_that_names_no_limit_is_remembered_with_only_the_last_ok(tmp
     assert cm.size_of(record) == 110_000
 
 
-#: Round 146: Kilo's own end of a compaction that could not get a session under
-#: the wall Kilo holds. The provider named nothing; the number it would leave in
-#: the memory is only where the session stood when Kilo gave up.
+#: Round 146: Kilo's own overflow when no session could fit under Kilo's wall; the number left in memory is only where the session stood.
 KILO_WALL_OVERFLOW = {
     "name": "ContextOverflowError",
     "data": {"message": "Compaction exhausted: context still exceeds model limits "
@@ -597,8 +581,7 @@ def test_a_memory_the_runner_cannot_write_ends_the_overflow_the_way_it_does_toda
     and the failure is a warning, not a raise into the round."""
     caplog.set_level("WARNING", logger="tools.contest.runner")
     memory = tmp_path / "read-only" / "context-memory.json"
-    # a FILE where the folder should be: the write fails for every user — a
-    # chmod 0o500 folder is writable for root, which is who a container runs as
+    # A file where the folder should be makes the write fail for every user, root included.
     memory.parent.write_text("not a folder", encoding="utf-8")
     _sb, _fake, _h, run, _ = _run(tmp_path, _overflow_scenario(SENSENOVA_OVERFLOW, 260_000),
                                    memory=memory, max_continues_per_attempt=0)
@@ -635,9 +618,7 @@ def test_a_broken_memory_file_falls_back_to_the_fallback_window(tmp_path):
     assert turn["fill"] == 0.0 and turn["compacted"] is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the compact: summarize before the prompt, at 80 % of the remembered size
-# ─────────────────────────────────────────────────────────────────────────────
+# The compact: summarise before the prompt, at 80% of the remembered size
 
 def _rework_scenario(full):
     """A commit with no test file, so the harvest sends a rework prompt into the
@@ -895,8 +876,7 @@ def test_an_overflow_is_remembered_and_the_next_session_compacts_in_time(tmp_pat
     assert record.output == 32_000
     assert cm.smallest_size([record], "kenary", "agent-a:free") == 230_144
 
-    # 215 000 of a remembered 230 144 budget (262 144 - 32 000) is 93.4 %:
-    # past the 80 % the runner compacts at
+    # 215 000 of a 230 144 budget is 93.4 %, past the 80 % that the runner compacts at.
     sb, fake, _h, run, _ = _run(tmp_path / "round-2", _rework_scenario(215_000), memory=memory)
     tr._assert_ready(run, sb.ws("agent-a"))
     posts = [path for path, _ in _posts(fake)]
@@ -906,9 +886,7 @@ def test_an_overflow_is_remembered_and_the_next_session_compacts_in_time(tmp_pat
     assert second["context_size"] == 230_144 and second["fill"] == 93.4
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the plan: one line per model the round knows the size of
-# ─────────────────────────────────────────────────────────────────────────────
+# The plan: one line per model whose size is known
 
 def _plan(tmp_path, capsys, memory=None, **over) -> str:
     """The round's start plan, with the memory at *memory*."""
@@ -938,12 +916,9 @@ def test_the_start_plan_prints_one_line_per_model_with_a_remembered_size(tmp_pat
     assert "context memory:" not in _plan(tmp_path, capsys, memory=broken)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-69: the remembered size reaches Kilo as `limit.context`
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-69: the remembered size reaches Kilo as limit.context
 
-#: kenary's overflow, word for word from laguna-s-2-1:free on 2026-09-26: no
-#: number in it, so only the last reply that went through is remembered
+#: kenary's overflow text from laguna-s-2-1:free has no number, so only the last good reply is kept.
 KENARY_MESSAGE = ("the request exceeds the model's maximum context length. "
                   "reduce the input or max_tokens")
 
@@ -982,8 +957,7 @@ def test_kilo_limit_is_the_real_window_and_input_is_the_compact_point():
     the budget plus Kilo's 20 000 reserve, where Kilo compacts after a step."""
     assert cm.kilo_limit(230_144, 32_000) == {"context": 262_144, "input": 204_115,
                                                "output": 32_000}
-    # no output named: Kilo's own 32 000 — a `limit` without `output` is a
-    # ConfigInvalidError that skips the whole KILO_CONFIG_CONTENT (live, 7.6.2)
+    # With no output named, Kilo's own 32 000 applies; a limit without output is a ConfigInvalidError.
     assert cm.kilo_limit(149_359, None) == {"context": 181_359, "input": 139_487,
                                              "output": 32_000}
     # 0 % is the runner's compact off: Kilo's own at the full budget
@@ -1246,9 +1220,7 @@ def test_the_fill_after_a_compact_is_the_summary_not_the_reply_before_it():
     assert runner_mod._context_tokens(backend, None) == 11_050
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# round 149: a loose remembered window must not lock a model small
-# ─────────────────────────────────────────────────────────────────────────────
+# Round 149: a loose remembered window must not lock a model small
 
 def _loose_record(**over) -> cm.OverflowRecord:
     """A loose record — KC-73's pattern: last_ok far below what grew past it."""
@@ -1324,8 +1296,7 @@ def test_a_fallback_window_lowers_the_floor_for_a_tight_record_with_no_declared(
     config = replace(tr.make_config(["agent-a"]), context_limit_fallback=32_768)
     assert runner_mod._context_budget(config.agents[0], [record.to_dict()], config) == (
         28_000, "remembered")
-    # a declared window above context_min_window lowers the floor not at all,
-    # so the fallback is the only wall that saves this record
+    # A declared window above context_min_window does not lower the floor, so the fallback saves the record.
     assert cm.size_of(record, 32_000, declared=131_072) is None
 
 

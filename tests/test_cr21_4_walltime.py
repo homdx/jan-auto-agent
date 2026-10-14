@@ -75,8 +75,7 @@ class TestWalltimeExceeded:
         """Clock jumps past the limit before attempt 1 → loop stops, not passed."""
         import tools.auto.inner_loop as inner_loop_mod
 
-        # First call establishes _start_time = 0; second call (top of attempt 1)
-        # reports elapsed = 5000s, well past max_task_seconds=10.
+        # First call sets _start_time = 0; the next reports 5000 s, past max_task_seconds=10.
         clock = _FakeClock(start=0.0, step=5000.0)
         monkeypatch.setattr(inner_loop_mod.time, "monotonic", clock)
 

@@ -81,17 +81,13 @@ def _ops(*names: str) -> list[ProbeOp]:
     return [ProbeOp("facts", n) for n in names]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Dropped-op reporting
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestDroppedOps:
 
     def test_dropped_ops_are_recorded(self) -> None:
         """AC-P8-1"""
-        # Arithmetic, not luck: each block is ~420 chars, the cap is 600, so
-        # op 1 fits, op 2 takes the running total past the cap, and op 3 is
-        # dropped. The dropped list must name it exactly.
+        # Arithmetic: ~420-char blocks against a 600 cap, so op 3 is the one dropped.
         p = ArchProbe(_Bridge(400), max_chars=600, max_total_chars=600)
         p.execute(_ops("a", "b", "c"))
         assert [str(o) for o in p.last_dropped] == ["facts c"]
@@ -147,9 +143,7 @@ class TestBudgetArithmetic:
         assert p._max_total_chars == 1000
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # The ladder, end to end
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(**over: str) -> configparser.ConfigParser:
     arch = {"temperature": "0.2", "max_tokens": "512", "probe_enabled": "true",
@@ -239,20 +233,13 @@ class TestEscalationLadder:
         r = _reviewer(_cfg(probe_budget_escalations="2"))
         with patch(
             "tools.llm_stream.request_completion",
-            # Enough stubborn rounds to drive BOTH ladder steps. One
-            # escalation is often enough in practice — the wider cap serves
-            # the dropped ops and the batch moves on — so a shorter script
-            # would silently only exercise step 1.
+            # Enough stubborn rounds to drive both ladder steps; a shorter script would only exercise step 1.
             side_effect=[_BIG] * 6 + [_good("G")],
         ) as mock_llm:
             r.review_clusters([cluster], base_dir, goal="g")
 
         temps = _temps(mock_llm)
-        # Asserted as an ordered subsequence rather than at fixed indices: the
-        # first budget-truncated round is only detected on the NEXT pass of
-        # the loop, so an ordinary re-ask sits between the initial call and
-        # the first escalation. Pinning indices would encode that spacing and
-        # break on any unrelated change to the loop.
+        # Assert an ordered subsequence, not fixed indices: a re-ask sits between the first call and the first escalation.
         assert temps[0] == pytest.approx(0.2), "first call uses the configured temperature"
         ladder = [t for _, t in _BUDGET_ESCALATION_LADDER[:2]]
         seen, want = [], list(ladder)
@@ -292,9 +279,7 @@ class TestEscalationLadder:
             "after the ladder is spent the batch declines on budget exactly "
             "as it did before this ticket"
         )
-        # The last decline is `post_forced`: this stub model probes on the
-        # forced call too, which AUTO-P4b already handles. Asserting on the
-        # LAST reason would be asserting about the stub, not about the ladder.
+        # The last decline is post_forced (the stub probes on the forced call too); assert the first reason instead.
         assert reasons[0] == "digest_budget"
 
     def test_zero_escalations_restores_old_behaviour(
@@ -367,9 +352,7 @@ class TestEscalationLadder:
             rec.getMessage() for rec in caplog.records
             if "escalation 1/" in rec.getMessage()
         )
-        # configured cap is 600 (see _cfg); the first ladder rung is 2.0x,
-        # so the escalation raises it to 1200 — and 600, the cap that was
-        # ACTUALLY exceeded, must be what's printed as the denominator.
+        # The printed denominator is 600, the cap that was actually exceeded, not the raised cap.
         assert "cap raised to 1200" in msg
         assert "/600 chars)" in msg, (
             f"the exceeded-cap slot must show 600 (the cap in force before "
@@ -396,16 +379,7 @@ class TestEscalationLadder:
         assert mock_llm.call_count == 3  # probe, re-ask, forced — no extra
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-P13: per-profile ladder scale
-# ─────────────────────────────────────────────────────────────────────────────
-#
-#   AC-P13-1  Unset probe_budget_ladder_scale ⇒ the ladder's rungs are
-#             byte-identical to AUTO-P8 (new_cap == configured x 2.0).
-#   AC-P13-2  probe_budget_ladder_scale > 1.0 widens the rung by that extra
-#             factor, on top of the ladder's own multiplier.
-#   AC-P13-3  A malformed value logs a warning and falls back to 1.0 (noop)
-#             instead of crashing construction.
+# AUTO-P13: per-profile ladder scale (unset matches AUTO-P8; above 1.0 widens rungs; malformed falls back to 1.0).
 
 class TestLadderScale:
 

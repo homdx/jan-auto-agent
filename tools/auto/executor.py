@@ -73,18 +73,7 @@ from tools.auto.utils import is_pytest_command, is_xdist_flag, pytest_piece_span
 
 logger = logging.getLogger(__name__)
 
-# Environment variables that could give a subprocess network access that we
-# want to suppress.  We clear these rather than block at the OS level.
-#
-# BUGFIX: no_proxy/NO_PROXY are NOT proxy servers — they are bypass lists
-# (e.g. "localhost,.internal") telling an HTTP client which hosts to reach
-# DIRECTLY, without a proxy. Clearing them alongside the actual proxy vars
-# had the opposite of the intended effect: on a host that relies on
-# no_proxy to keep intranet/local traffic off the proxy, removing it made
-# every subprocess spawned by the executor (pytest, linters, scripts) route
-# local-domain requests through a real proxy (or fail/slow down) instead of
-# going direct. Only the actual proxy-server vars are cleared; no_proxy is
-# left untouched.
+# Proxy server variables are cleared for subprocesses; no_proxy is a bypass list and stays.
 _PROXY_SERVER_VARS = (
     "http_proxy", "HTTP_PROXY",
     "https_proxy", "HTTPS_PROXY",
@@ -92,45 +81,26 @@ _PROXY_SERVER_VARS = (
     "all_proxy",  "ALL_PROXY",
 )
 
-# Maximum number of characters captured from stdout / stderr before truncation.
-# Prevents runaway output from filling memory.
+# Output captured from stdout and stderr is capped, so runaway output cannot fill memory.
 _MAX_OUTPUT_CHARS = 64_000
 
 # Maximum traceback snippet length returned in ExecutionResult.traceback.
 _MAX_TRACEBACK_CHARS = 4_000
 
-# RUN-3: appended to a workspace pytest run when ``[executor] pytest_serial``
-# is on and the project's own pytest config asks for an xdist pool. A task
-# workspace holds one changed file, so xdist has nothing to distribute — yet
-# the workspace inherits the project's ``pytest.ini`` (``addopts = -n auto
-# --dist=loadgroup`` in this repo) and every attempt spawned a worker per CPU,
-# paid the "bringing up nodes..." startup twice, and interleaved the output.
-# ``-n 0`` is xdist's own in-process switch and, given on the command line,
-# overrides the earlier ``-n auto`` from addopts. ``-p no:xdist`` is NOT safe
-# here: it unregisters the plugin that defines ``-n``/``--dist``, so addopts'
-# ``-n auto`` becomes "unrecognized arguments" and every workspace run exits 4
-# before collecting a test (reproduced on pytest 8.3.5 / xdist 3.8.0).
+# RUN-3: serial pytest flag: "-n 0" overrides the project's xdist addopts; disabling the plugin would break the run.
 _PYTEST_SERIAL_FLAG = "-n 0"
 
-# The config files pytest reads for ``addopts``, in pytest's own precedence
-# order; the first one present wins — pytest never merges a second file.
+# Config files pytest reads for addopts, in its precedence order; the first one present wins.
 _PYTEST_CONFIG_FILES = ("pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg")
 
-# Directories excluded when mirroring base_dir into a task workspace (see
-# _prepare_workspace / AUTO-FIX-1): VCS metadata, the agent's own
-# state/workspace tree — workspace_root defaults to base_dir/.agent/workspace,
-# so excluding ".agent" also prevents shutil.copytree from recursing into its
-# own destination — and common cache/dependency dirs that are large,
-# irrelevant to acceptance checks, and safe to leave out (regenerable).
+# Directories left out when mirroring base_dir into a task workspace (VCS, the agent's own state, caches).
 _MIRROR_IGNORE = shutil.ignore_patterns(
     ".git", ".agent", "__pycache__", ".pytest_cache", ".mypy_cache",
     ".venv", "venv", "node_modules", ".tox", "*.egg-info",
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Result dataclass
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ExecutionResult:
@@ -193,9 +163,7 @@ class ExecutionResult:
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Executor
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Executor:
     """Sandboxed runner for autonomous task acceptance checks.
@@ -258,9 +226,7 @@ class Executor:
         self._python_bin  = python_bin or sys.executable
         self._max_retained_workspaces = max(0, int(max_retained_workspaces))
         self._pytest_serial = bool(pytest_serial)
-        # RUN-3: the addopts scan is one file read per repo; cached so the
-        # AUTO-G5 regression loop, which re-runs the executor for every DONE
-        # task after each commit, pays it once.
+        # The addopts scan is cached per repo, since the regression loop re-runs the executor after each commit (RUN-3).
         self._xdist_pool_requested: Optional[bool] = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -291,12 +257,7 @@ class Executor:
             If *task* is missing the ``id`` field (programming error by
             the caller).
         """
-        # AUTO-FIX (low-priority audit): the "" default only covers a
-        # missing 'id' key — a task dict with an explicit `"id": None`
-        # made .get() return None, and None.strip() raised a raw
-        # AttributeError instead of the documented, catchable ValueError
-        # below. The sibling acceptance_check read right after this
-        # already uses `(x or "").strip()` for exactly this reason.
+        # A task id of None is treated as empty, so the documented ValueError is raised instead of an AttributeError (audit).
         task_id = (task.get("id") or "").strip()
         if not task_id:
             raise ValueError("Executor.run(): task dict must have a non-empty 'id' field")
@@ -310,17 +271,10 @@ class Executor:
         # Resolve the command to run.
         command = self._resolve_command(acceptance_check, target_files, workspace)
 
-        # RUN-3: one file per workspace, so xdist here is startup cost and
-        # interleaved output only. Applied after _resolve_command so the
-        # resolved (and safety-checked) command is what gets the flag.
+        # Serial pytest is applied after the command is resolved and checked, so the checked command gets the flag (RUN-3).
         command = self._serialise_pytest(command)
 
-        # AUTO-CR-12: cross-platform no-op acceptance — creative/docs tasks
-        # default acceptance_check to "true" (a Unix builtin), but on Windows
-        # `true`/`false`/`:` aren't commands, so cmd.exe returns rc=1 and every
-        # such task fails. Recognise only these Unix builtins and resolve them
-        # without spawning a shell ("exit 0"/"exit 1" are valid everywhere and
-        # run normally).
+        # Unix no-op builtins run without a shell, so creative and docs tasks with the default check work on Windows too (AUTO-CR-12).
         _norm = (command or "").strip().lower().rstrip(";")
         if _norm in ("true", ":"):
             logger.info("executor run: task=%s no-op acceptance (%r) → pass", task_id, command)
@@ -394,25 +348,12 @@ class Executor:
             shutil.rmtree(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
 
-        # AUTO-FIX-1: mirror the whole repo into the workspace *before*
-        # overlaying target_files. Previously only target_files were copied,
-        # so an acceptance_check referencing a file that exists in base_dir
-        # but wasn't listed in target_files (a pre-existing test file,
-        # conftest.py, a fixture, a sibling module the target imports) would
-        # fail with a spurious "file or directory not found" — a false
-        # negative unrelated to whether the Coder's change was correct, and
-        # one that (via TaskRewriter's failure-pattern handling) could lead
-        # to acceptance_check being silently replaced with a no-op. Best
-        # effort: mirroring failures are logged, not raised, so the run
-        # continues with the pre-existing target-files-only behaviour below
-        # rather than aborting the task outright.
+        # The whole repo is mirrored into the workspace before target files are overlaid, so checks can see helpers (AUTO-FIX-1).
         try:
             shutil.copytree(
                 self._base_dir, workspace,
                 ignore=_MIRROR_IGNORE, dirs_exist_ok=True,
-                # SECURITY: copy symlink *targets*, not the links — a repo
-                # symlink pointing outside base_dir stayed live and
-                # traversable from inside the sandbox workspace.
+                # Symlinks are copied as their targets, so a link out of base_dir cannot reach outside the sandbox (SECURITY).
                 symlinks=False,
             )
         except (OSError, shutil.Error) as exc:
@@ -440,11 +381,7 @@ class Executor:
         base_resolved = self._base_dir.resolve()
         workspace_resolved = workspace.resolve()
         for rel in target_files:
-            # SECURITY: an absolute `rel` silently discards the left operand
-            # of the "/" join (pathlib), and a "../" one is only resolved by
-            # the OS — either lets a crafted target_files entry read from and
-            # write to arbitrary paths. Require the join to stay inside both
-            # base_dir and workspace.
+            # A target path must stay inside base_dir and the workspace; absolute or ../ paths are refused (SECURITY).
             src = self._base_dir / rel
             dst = workspace / rel
             try:
@@ -464,10 +401,7 @@ class Executor:
                 missing.append(rel)
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
-            # AUTO-FIX: a target_files entry naming a directory made
-            # copy2() raise IsADirectoryError uncaught, aborting the copy of
-            # every remaining file. Skip just the bad one, fail-open like
-            # the "not found" branch above.
+            # A target that is a directory is skipped instead of aborting the copy of the remaining files (AUTO-FIX).
             try:
                 shutil.copy2(src, dst)
             except (IsADirectoryError, OSError) as exc:
@@ -495,15 +429,7 @@ class Executor:
             },
         )
 
-        # AUTO-FIX-2: shutil.copytree's default copy_function (copy2) copies
-        # *metadata* — including mtime — from base_dir onto the workspace
-        # directory itself. Every task's workspace therefore inherits
-        # base_dir's (static) mtime instead of getting a fresh one, so
-        # _prune_old_workspaces' "oldest mtime first" sort is meaningless
-        # (all workspaces compare equal) and evicts an effectively random
-        # sibling rather than the actually-oldest one. Stamp the workspace
-        # with the current time after population so pruning below — and any
-        # future caller — sees a real, monotonically increasing recency.
+        # The workspace is stamped with the current time, so pruning by mtime is meaningful (AUTO-FIX-2).
         try:
             os.utime(workspace, None)
         except OSError as exc:
@@ -535,19 +461,14 @@ class Executor:
             ]
         except (OSError, FileNotFoundError):
             return
-        # Oldest first among the *other* task workspaces.
-        # BUGFIX (audit): p.stat() ran outside the try/except that wraps
-        # iterdir() above — if a sibling is removed by a concurrent
-        # process between the .exists() check and this .stat() call
-        # (TOCTOU), the resulting OSError/FileNotFoundError was uncaught.
+        # Oldest first among the other task workspaces; a sibling removed mid-scan must not raise (BUGFIX).
         def _safe_mtime(p: Path) -> float:
             try:
                 return p.stat().st_mtime
             except OSError:
                 return 0.0
         siblings.sort(key=_safe_mtime)
-        # "keep" always survives, so the other siblings we may retain is
-        # (limit - 1); anything beyond that, starting with the oldest, goes.
+        # The keep sibling is always kept, so the rest are trimmed to limit - 1, oldest first.
         excess = len(siblings) - max(self._max_retained_workspaces - 1, 0)
         for old in siblings[:max(excess, 0)]:
             try:
@@ -560,9 +481,7 @@ class Executor:
 
     # ── Command resolution ────────────────────────────────────────────────────
 
-    # Shell tokens that are never safe in an LLM-generated acceptance_check.
-    # This is a defence-in-depth blocklist, not a complete sandbox — the check
-    # catches obvious mistakes/injections from a hallucinating model.
+    # Shell tokens never safe in an LLM-generated acceptance_check: a defence-in-depth blocklist, not a sandbox.
     _BLOCKED_COMMAND_PATTERNS: tuple[str, ...] = (
         "rm ",  "rm\t",              # file deletion (rm -rf /, rm -rf ~, …)
         "rmdir",                     # directory removal
@@ -609,19 +528,14 @@ class Executor:
         for pattern in Executor._BLOCKED_COMMAND_PATTERNS:
             token = pattern.strip().lower()
             if token.isalpha():
-                # Whole-word match (mirrors coder.py's _check_content_safety):
-                # plain substring containment falsely flagged ordinary commands
-                # — 'rm ' matched 'terrafo[rm ]', 'nc ' matched 'rsy[nc ]',
-                # 'rm ' matched 'confi[rm ]'.  Python \b treats '_' as a word
-                # char, so identifier-style checks stay safe too.
+                # Whole-word matches only, so ordinary commands such as terraform are not flagged (as in coder.py).
                 if (
                     _re.search(r"\b" + _re.escape(token) + r"\b", lower)
                     or _re.search(r"\b" + _re.escape(token) + r"\b", dequoted)
                 ):
                     return False, f"blocked pattern {pattern!r} in acceptance_check"
             elif pattern in lower or pattern in dequoted:
-                # Non-word tokens (shell metachars: '> /', '>/', fork bomb) have
-                # no word boundary to anchor on — keep the substring check.
+                # Shell metacharacters have no word boundary, so they keep the substring check.
                 return False, f"blocked pattern {pattern!r} in acceptance_check"
         return True, ""
 
@@ -653,20 +567,7 @@ class Executor:
         if acceptance_check:
             safe, reason = self._check_command_safety(acceptance_check)
             if not safe:
-                # AUTO-BUG: this used to fall back to bare "pytest" — but
-                # _prepare_workspace mirrors the WHOLE base_dir into the
-                # workspace (AUTO-FIX-1 above), so bare "pytest" collects
-                # and runs every OTHER pre-existing test in the repo too.
-                # In any repo with a healthy existing test suite (this one
-                # included — 2000+ passing tests), that reliably exits 0
-                # regardless of whether the current task's actual goal was
-                # ever met. Reproduced: a task whose real check would have
-                # caught a function still raising NotImplementedError was
-                # marked passed and committed, because an unrelated
-                # existing test happened to pass. A blocked acceptance_check
-                # must fail its task, not risk a spurious pass from
-                # whatever else happens to already be green — "false"
-                # always exits 1, with no dependency on repo contents.
+                # A blocked check fails the task with "false" rather than falling back to pytest, which would run the whole repo's tests (AUTO-BUG).
                 logger.error(
                     "_resolve_command: [SAFETY] %s — acceptance_check "
                     "blocked; failing the check rather than substituting "
@@ -678,15 +579,7 @@ class Executor:
 
         py_files = [f for f in target_files if f.endswith(".py")]
         if len(py_files) == 1:
-            # SECURITY: unlike the acceptance_check branch above, this fallback
-            # builds a command straight from an unvalidated target_files entry.
-            # _prepare_workspace refuses to *copy* an escaping path (see its
-            # resolve()/relative_to() guard), but the command still runs with
-            # cwd=workspace, so an absolute or "../.." entry would execute a
-            # file outside the workspace — the unmodified base_dir original at
-            # best (defeating "run the Coder's version"), an arbitrary host
-            # file at worst. Fail closed, exactly like a blocked
-            # acceptance_check does above.
+            # The fallback does not run an unvalidated target path; the refusal is checked first (SECURITY).
             try:
                 (workspace / py_files[0]).resolve().relative_to(workspace.resolve())
             except ValueError:
@@ -696,15 +589,7 @@ class Executor:
                     py_files[0],
                 )
                 return "false"
-            # AUTO-FIX: this f-string goes straight into
-            # subprocess.run(shell=True); an unquoted space in _python_bin
-            # ("/Users/Jane Doe/.venv/bin/python") or in the file name was
-            # word-split into two bogus arguments.
-            #
-            # Quoting must be per-platform: shell=True runs cmd.exe on
-            # Windows (which this executor supports — see the AUTO-CR-12 fix
-            # above), and cmd.exe ignores shlex.quote()'s single quotes, so
-            # a POSIX-only quote would reintroduce the bug there.
+            # Quoting is per platform: cmd.exe ignores single quotes, so a POSIX-only quote would break Windows (AUTO-FIX).
             def _quote(s: str) -> str:
                 if os.name == "nt":
                     return subprocess.list2cmdline([s])
@@ -741,19 +626,9 @@ class Executor:
         except ValueError:
             return command  # un-parseable shell quoting — leave untouched
 
-        # Walk parts to find the first *argument* token that looks like a plain
-        # filename (not a flag and not already path-qualified).  idx==0 is the
-        # executable itself (bash, python, …) — always skip it.
+        # The first filename-like argument (not a flag, not path-qualified) is the rewrite candidate; the executable is skipped.
         _SHELL_OPS = frozenset({"&&", "||", ";", "|", "&"})
-        # Every shell metacharacter whose presence in the RAW command string
-        # forces the word-boundary substitution rewrite rather than a
-        # rebuild via shlex.join() — shlex.join shell-quotes any token that
-        # is not a lone safe word, so `>`/`<` redirects and `2>&1`/`|&`
-        # forms would turn into literal argv (see the route-comment in the
-        # match branch below). Superset of `_SHELL_OPS`, deliberately: a
-        # `>` glued to a word (`2>&1`) never appears as its own split
-        # element, so the token scan cannot stop on it — the string-level
-        # check is the only place it can be seen.
+        # Any shell metacharacter in the raw command forces the word-boundary rewrite, so redirects survive intact.
         _REWRITE_PRESERVE_OPS = frozenset({"&&", "||", ";", "|", "&", ">", "<"})
         for idx, part in enumerate(parts):
             if idx == 0:
@@ -761,63 +636,18 @@ class Executor:
             if part.startswith("-"):
                 continue  # flag — skip
             if "/" in part or "\\" in part:
-                # BUGFIX: this used to be `return command` — aborting the
-                # ENTIRE scan the moment ANY earlier non-flag token happened
-                # to already be path-qualified, even when that token has
-                # nothing to do with the rewrite and a genuine bare-filename
-                # match exists later in the command. E.g.
-                # "python tests/run_report.py generateAllureReport.sh" would
-                # never rewrite generateAllureReport.sh, because the
-                # already-qualified "tests/run_report.py" token came first —
-                # reproducing the exact "file not found" failure this
-                # function exists to prevent (see its own docstring
-                # example). This token just isn't a rewrite candidate;
-                # treat it the same as the "zero/multiple matches" case
-                # below and keep scanning, rather than as a hard stop like
-                # a genuine shell operator.
+                # An already path-qualified token is not a candidate; keep scanning for a bare filename (BUGFIX).
                 continue  # already path-qualified — not a candidate, keep scanning
             if part in _SHELL_OPS:
                 return command  # compound command — stop scanning; no safe rewrite
-            # `part` is a bare argument token.  Check whether its basename
-            # matches exactly one target file.
+            # A bare argument token is checked by basename against exactly one target file.
             basename = part
             matches = [tf for tf in target_files if Path(tf).name == basename]
             if len(matches) == 1:
                 full_path = matches[0]
-                # BUGFIX: the route decision used to look for only
-                # `&&`/`||`/`;`. Every OTHER shell metacharacter a command
-                # can contain — `|`, `&`, and especially redirections
-                # `>`/`<`, `>>`, `2>&1` — went to the `shlex.join` branch
-                # below, which re-quotes every non-identifier token into
-                # literal arguments. A realistic acceptance check like
-                #   python gen_report.py > /tmp/report.html
-                # was therefore executed as
-                #   python tools/gen_report.py '>' /tmp/report.html
-                # — the redirection silently vanished, the shell passed
-                # `>` and the filename as argv entries, and any subsequent
-                # "does the output file exist" check failed spuriously.
-                # Route to the word-boundary substitution whenever the
-                # ORIGINAL string contains any metacharacter shlex.join
-                # would quote, so every non-target token survives verbatim
-                # (including inside `2>&1`, where `&` is glued to the
-                # digits and could not appear as its own token anyway).
+                # Route to the word-boundary rewrite when the command has any metacharacter, so redirects are not turned into argv (BUGFIX).
                 if any(op in command for op in _REWRITE_PRESERVE_OPS):
-                    # The original command contains shell metacharacters;
-                    # shlex.join would misquote them.  Do a safe
-                    # word-boundary string substitution on the original
-                    # command string instead.
-                    #
-                    # Bugfix: full_path must NOT be passed as re.sub's string
-                    # replacement argument — re.sub interprets backslash
-                    # sequences in a *string* replacement as backreferences
-                    # (\1, \g<n>, ...). This pattern has no capture groups, so
-                    # a target path containing an ordinary backslash (a
-                    # Windows-style path, or any oddly-named file) would raise
-                    # `re.error: invalid group reference` instead of
-                    # substituting cleanly. Same root cause already fixed in
-                    # tools/auto/summary_memory.py — a callable replacement
-                    # sidesteps this entirely, since re.sub never interprets
-                    # backslash escapes in a function's return value.
+                    # re.sub gets a callable replacement, so backslashes in a path are not read as group references (bugfix).
                     import re as _re_local
                     rewritten = _re_local.sub(
                         r"(?<!\S)" + _re_local.escape(basename) + r"(?!\S)",
@@ -857,8 +687,7 @@ class Executor:
         command = command.rstrip()
         if not self._pytest_config_requests_pool():
             return command
-        # the flag goes at the end of each pytest run, not of the line: what
-        # follows a `|` or `&&` is another command's argument list
+        # The flag goes at the end of each pytest run, not at the end of the line.
         for start, end in reversed(pytest_piece_spans(command)):
             parts = shlex.split(command[start:end], posix=(os.name != "nt"))
             if any(is_xdist_flag(p) for p in parts[1:]):
@@ -907,16 +736,9 @@ class Executor:
             and mapped to the result fields.
         """
         env = self._build_env()
-        # Use explicit comparison instead of `or None` — 0.0 is falsy in Python,
-        # so `0.0 or None` would silently mean "no timeout" instead of
-        # "immediate timeout," tricking anyone who sets exec_timeout_sec = 0
-        # expecting one behavior into getting the other with no warning. The
-        # explicit form below makes the intent unmistakable.
+        # An explicit timeout check: a zero timeout means an immediate timeout, not "no timeout" (0.0 is falsy).
         timeout = self._timeout_sec if self._timeout_sec > 0 else None
-        # BUGFIX: computed once and reused for every branch below — see
-        # _redact_command's docstring. The real, un-redacted `command` is
-        # still what's actually executed just below; only what gets stored
-        # on ExecutionResult and logged is redacted.
+        # The command is redacted only for storing and logging; the real command is what runs (BUGFIX).
         _logged_command = _redact_command(command)
 
         try:
@@ -991,10 +813,7 @@ class Executor:
             env.pop(var, None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
-        # Force UTF-8 for all child processes — Windows' default cp1252 codec
-        # can't decode bytes like 0x81. PYTHONUTF8=1 enables UTF-8 mode (PEP
-        # 540, Python >= 3.7); PYTHONIOENCODING is the legacy fallback for
-        # older builds.
+        # Children run in UTF-8 mode: the Windows default codec cannot decode every byte (PEP 540).
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         
@@ -1008,9 +827,7 @@ class Executor:
         return env
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _safe_dir_name(name: str) -> str:
     """Strip path-traversal characters from *name* before use as a directory component.
@@ -1079,9 +896,7 @@ def pytest_config_requests_pool(base_dir: "str | Path") -> bool:
     return any(is_xdist_flag(t) for t in tokens)
 
 
-# Matches a likely-secret CLI option (--api-key, --token, etc.) followed by
-# a single-token value, so the value can be redacted while the option name
-# — useful for debugging what the command was doing — stays visible.
+# Matches a likely-secret CLI option followed by a single-token value; the option name stays visible for debugging.
 _SECRET_OPT_RE = re.compile(
     r"(--(?:api[-_]?key|token|secret|password|passwd|pwd|auth|"
     r"access[-_]?key|client[-_]?secret|private[-_]?key))"
@@ -1089,10 +904,7 @@ _SECRET_OPT_RE = re.compile(
     r"(\S+)"
 )
 
-# Authorization header values are commonly two words ("Bearer <token>",
-# "Basic <base64>") — matched separately and greedily up to the next quote
-# or shell-flag boundary, since the single-token pattern above would redact
-# only the scheme word ("Bearer") and leave the actual token exposed.
+# Authorization values are two words (Bearer token); matched up to the next quote or flag so the token is hidden too.
 _SECRET_AUTH_RE = re.compile(
     r"(Authorization)([=:]\s*|\s+)([^\"'\n]+?)(?=\s+--|[\"'\n]|$)"
 )
@@ -1120,8 +932,7 @@ def _redact_command(command: str) -> str:
         return command
 
 
-# Match a Python traceback block: "Traceback (most recent call last):" through
-# the final exception line.
+# Matches a Python traceback, from its first line through the final exception line.
 _TRACEBACK_START = re.compile(r"^Traceback \(most recent call last\):", re.MULTILINE)
 
 
@@ -1147,9 +958,7 @@ def _extract_traceback(stderr: str) -> str:
     return _truncate(snippet.rstrip(), _MAX_TRACEBACK_CHARS)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience factory — used by AutoController (AUTO-C3)
-# ─────────────────────────────────────────────────────────────────────────────
+# Convenience factory used by AutoController (AUTO-C3)
 
 def make_executor(
     base_dir:       str | Path,

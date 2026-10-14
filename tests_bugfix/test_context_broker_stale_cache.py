@@ -41,11 +41,7 @@ class TestWholeFilePassNeverCachesATargetFile:
         ch2.write_text("REWRITTEN content", encoding="utf-8")   # coder edits it
         result = broker.resolve(["chapter_2"], target_files, tmp_path)  # attempt 2
 
-        # The bug returned "ORIGINAL content" here. The fix's chosen
-        # behaviour is to not resolve a target file via this path at all
-        # (the model already has direct access to its own target files),
-        # rather than resolve-but-not-cache — either way, STALE content must
-        # never come back.
+        # Stale content must never come back: the target is not resolved via this path at all.
         assert "ORIGINAL content" not in result.get("chapter_2", "")
 
     def test_target_file_is_not_cached_even_on_a_single_call(self, tmp_path):

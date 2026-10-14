@@ -68,10 +68,7 @@ from tools.contest.runner import (  # noqa: E402
 DECLARED = 131_072
 REFUSED_AT = 98_777
 
-#: The share the runner waits for, as a fraction. Read from `context_memory` —
-#: the one source (`[contest] context_full_refusal_percent`), not the runner's
-#: own constant: `runner.FULL_REFUSAL_SHARE` is only the default for a caller
-#: with no config, and a test that reads it cannot see a config that disagrees.
+#: The share the runner waits for, read from context_memory (the one source of the percentage).
 SHARE = cm.full_refusal_percent(None) / 100.0
 
 #: The payloads round 144/145 got back, as `session.error` carried them.
@@ -88,15 +85,12 @@ WALLET = {"name": "APIError", "data": {
 #: A refusal that says nothing about why.
 BARE_400 = {"name": "APIError", "data": {"message": "Bad Request", "statusCode": 400,
                                          "isRetryable": False}}
-#: Round 152: xAI names its own wall with both numbers, in a word order
-#: `_SIZE_REFUSAL_RE` did not know — `maximum prompt length` rather than
-#: `maximum context length`, which is why `_OVERFLOW_RE` never matched it.
+#: Round 152: xAI's word order, "maximum prompt length", which the overflow regex did not match before.
 XAI = {"name": "APIError", "data": {
     "message": ("This model's maximum prompt length is 131072 but the request "
                 "contains 150000 tokens"),
     "statusCode": 400, "isRetryable": False}}
-#: Round 152: TGI states the same wall as an inequality over the sum of its two
-#: budgets — a 400 the `_REQUEST_FAULT_RE` comment always called an overflow.
+#: TGI states the wall as an inequality over its two budgets; a 400 that _REQUEST_FAULT_RE must not veto (round 152).
 TGI = {"name": "APIError", "data": {
     "message": "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 4096",
     "statusCode": 400, "isRetryable": False}}
@@ -117,9 +111,7 @@ def _committed_quota_re():
     return _quota_re(SimpleNamespace(quota_patterns=_committed_quota_text()))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. the wording
-# ─────────────────────────────────────────────────────────────────────────────
+# 1. The wording
 
 @pytest.mark.parametrize("message", [
     "Prompt exceeds max length",                                          # zai
@@ -154,9 +146,7 @@ def test_money_a_plan_a_key_a_rate_or_anything_else_is_not(message):
                             _committed_quota_re())
 
 
-#: Round 148 part A1: the refusals the wording path read as an overflow that are
-#: not about a size at all — a rate cap, a body, a timeout, an output cap, an
-#: attachment, a plan. The message and the status it really came with.
+#: Round 148 A1: refusals that are not about a size (rate cap, body, timeout, output cap, plan) and must not read as overflow.
 NOT_A_SIZE_REFUSAL = [
     ("Request too large for gpt-4o on tokens per min (TPM): Limit 30000, Requested 45000", 429),
     ("Request too large for model on tokens per minute (TPM): Limit 10000, Requested 12000",
@@ -225,9 +215,7 @@ def test_the_round_s_quota_patterns_veto_a_size_refusal():
     assert _is_overflow(error) and not _is_overflow(error, quota)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. a refusal with no words, of a session that is already full
-# ─────────────────────────────────────────────────────────────────────────────
+# 2. A refusal with no words, from a session that is already full
 
 def test_a_bare_refusal_of_a_full_session_is_an_overflow():
     full = int(SHARE * DECLARED) + 1
@@ -271,9 +259,7 @@ def test_a_bare_refusal_that_is_not_about_the_size_stays_an_error(error, last_ok
     assert not _is_full_refusal(error, last_ok, size, _committed_quota_re())
 
 
-#: Round 148: the payloads a refusal at 81 % of the window must not be read as an
-#: overflow with — Kilo shutting down, a dropped socket, a key, a request the
-#: provider would not take at all.
+#: Round 148: payloads at 81% that must not be read as overflow (shutdown, dropped socket, key, unsupported request).
 ROUND_148_REFUSALS = [
     {"name": "MessageAbortedError", "data": {"message": "The message was aborted"}},
     {"name": "APIError", "data": {"message": "read ECONNRESET", "statusCode": 400,
@@ -315,9 +301,7 @@ def test_the_a1_refusals_are_not_overflows_in_a_run(tmp_path, message, status):
     assert cm.load(memory) == []
 
 
-# A wording the overflow path does match, so only the run can keep it out: a
-# 429 and a 5xx are round 146's rate path, and an ``isRetryable`` refusal is
-# round 63's retry. Neither sizes the model.
+# Wordings the overflow path matches, but a 429, a 5xx or an isRetryable refusal must not size as overflow (rounds 146 and 63).
 @pytest.mark.parametrize("status,retryable", [(429, False), (503, False), (400, True)],
                          ids=["429", "5xx", "retryable"])
 def test_a_status_a_rate_or_a_retry_with_size_words_is_not_an_overflow(
@@ -360,9 +344,7 @@ def test_a_worded_refusal_at_seventy_percent_is_remembered(tmp_path):
     assert record.last_ok == int(0.70 * DECLARED)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. the run: remembered and compacted, not ERROR
-# ─────────────────────────────────────────────────────────────────────────────
+# 3. The run: remembered and compacted, not ERROR
 
 def _declared(config, limit=DECLARED):
     """*config* whose agent carries Kilo's declared window, as intake puts it."""
@@ -565,9 +547,7 @@ def test_a_plan_s_cap_is_a_quota_and_nothing_is_remembered(tmp_path, error):
     assert not memory.exists() or cm.load(memory) == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. the next session and the next round use the smaller size
-# ─────────────────────────────────────────────────────────────────────────────
+# 4. The next session and the next round use the smaller size
 
 def _remembered(tmp_path, last_ok=REFUSED_AT) -> Path:
     return ctm._memory(tmp_path, limit=None, last_ok=last_ok, prompt=None)
@@ -624,9 +604,7 @@ def test_full_refusal_share_is_a_share(tmp_path):
     assert cm.full_refusal_percent(config) / 100.0 == 0.7
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. a plan's cap and a loop never get into the memory
-# ─────────────────────────────────────────────────────────────────────────────
+# 5. A plan's cap and a loop never get into the memory
 
 def test_a_size_refusal_of_a_small_session_is_an_error_and_writes_nothing(tmp_path):
     """A provider that turns a 20 000-token session away in size words is a
@@ -712,9 +690,7 @@ def test_the_three_keys_are_read_from_the_ini(tmp_path):
         assert f"\n{key}" in text, key
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. inside a turn: the watch stops a session Kilo cannot size
-# ─────────────────────────────────────────────────────────────────────────────
+# 6. Inside a turn: the watch stops a session Kilo cannot size
 
 def test_the_watch_stops_a_turn_at_80_percent_of_a_remembered_size(tmp_path, monkeypatch):
     """Kilo was told 131 072 and compacts only there; the memory says 98 777.
@@ -824,9 +800,7 @@ def test_a_watch_that_reads_after_the_turn_ended_does_nothing(tmp_path, monkeypa
     assert all("context_watch_stop" not in turn for turn in run.turns)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. the remembered window goes to the running Kilo at once
-# ─────────────────────────────────────────────────────────────────────────────
+# 7. The remembered window goes to the running Kilo at once
 
 def _patches(fake) -> list:
     return [(r["query"].get("directory"), r["body"]) for r in fake.calls("PATCH")]
@@ -864,10 +838,7 @@ def test_an_overflow_below_kilo_s_window_is_handed_to_kilo_before_the_next_promp
     summarize_at = max(i for i, c in enumerate(calls) if c[1].endswith("/summarize"))
     continue_at = max(i for i, c in enumerate(calls) if c[1].endswith("/prompt_async"))
     assert summarize_at < patch_at < continue_at
-    # round 151: the push writes nothing to git's own exclude — a linked worktree's
-    # `--git-path info/exclude` is the repository's shared file, the operator's
-    # checkout included. `.kilo/.gitignore` in the workspace carries the same
-    # rules, and it goes with the file it hides, so nothing of ours survives.
+    # Round 151: the push writes nothing to git's shared exclude; .kilo/.gitignore goes with the file it hides.
     exclude = tmp_path / "repo" / ".git" / "info" / "exclude"
     exclude_text = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
     assert ".kilo" not in exclude_text
@@ -910,9 +881,7 @@ def test_the_window_is_handed_over_when_the_watch_is_off(tmp_path):
     assert len(_patches(fake)) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. `.kilo/` does not outlive a turn
-# ─────────────────────────────────────────────────────────────────────────────
+# 8. .kilo/ does not outlive a turn
 
 def test_a_tracked_kilo_jsonc_keeps_the_window_out_of_the_agent_s_tree(tmp_path, caplog):
     """Round 148 part B4: `info/exclude` does nothing when the checkout already
@@ -1019,14 +988,11 @@ def test_an_untracked_project_file_is_dropped_and_a_tracked_one_is_kept(tmp_path
     (wt / ".kilo").mkdir()
     (wt / ".kilo" / "kilo.jsonc").write_text("{}\n", encoding="utf-8")
     assert backend_mod.tracked_kilo_files(wt) == []
-    # Round 151: untracked is not the same as this round's, so the pre-spawn
-    # drop says so with `assume_stale`; the runner's own `finish` passes the
-    # limit it pushed and only that file goes.
+    # Round 151: untracked is not this round's file, so the pre-spawn drop uses assume_stale; finish drops only the pushed file.
     assert backend_mod.drop_stale_kilo_file(wt) is False
     assert backend_mod.drop_stale_kilo_file(wt, assume_stale=True) is True
     assert not (wt / ".kilo" / "kilo.jsonc").exists()
-    # the guard deleted its file and the empty `.kilo/` it came in, so the agent's
-    # directory starts over
+    # The guard deletes its file and the empty .kilo/, so the agent's directory starts over.
     (wt / ".kilo").mkdir()
     (wt / ".kilo" / "kilo.jsonc").write_text("{}\n", encoding="utf-8")
     subprocess.run(["git", "-C", str(wt), "add", ".kilo/kilo.jsonc"], check=True)
@@ -1051,9 +1017,7 @@ def test_a_directory_that_is_not_a_checkout_is_left_alone(tmp_path):
     assert (d / ".kilo" / "kilo.jsonc").exists()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. the watch interval
-# ─────────────────────────────────────────────────────────────────────────────
+# 9. The watch interval
 
 def test_the_watch_interval_is_read_fail_open():
     def cfg(value):
@@ -1081,9 +1045,7 @@ def test_the_ini_watches_every_ten_seconds_and_a_code_config_does_not(tmp_path):
         encoding="utf-8")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10. round 152: the wording gaps, the closed status list, the guard's unit
-# ─────────────────────────────────────────────────────────────────────────────
+# 10. Round 152: wording gaps, the closed status list and the guard's unit
 
 def test_xai_s_named_prompt_length_is_a_worded_overflow_that_is_remembered(
         tmp_path, caplog):
@@ -1113,8 +1075,7 @@ def test_xai_s_named_prompt_length_is_a_worded_overflow_that_is_remembered(
                                   context_min_window=32_000)
     assert run.state is tr.AgentState.ERROR
     (record,) = cm.load(memory)
-    # xAI names a limit but not in the shape `parse_overflow` reads, so the
-    # record is the reply that went through — the number the provider proved
+    # xAI names a limit in a shape parse_overflow does not read, so the reply that went through is recorded.
     assert record.limit is None and record.last_ok == REFUSED_AT
     assert cm.size_of(record) == REFUSED_AT
     assert any("not the window again" in r.getMessage() for r in caplog.records)

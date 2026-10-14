@@ -141,8 +141,7 @@ class TestDeclineTallies:
         not collect, so recording the ops as misses would unfairly blame the
         collect artifact."""
         cluster, base_dir = cluster_and_base
-        # "fn" resolves (round 1 succeeds); "unknown_fn" does not, so the
-        # AUTO-P12 unbounded attempt at the cap also returns "" → decline.
+        # "fn" resolves, "unknown_fn" does not, so the unbounded attempt also declines.
         r = _reviewer(_cfg(probe_max_rounds="1"), _FakeBridge({"fn": "module: x"}))
         ev = _run(r, cluster, base_dir, tmp_path,
                   ["ARCH_PROBE: facts fn", "ARCH_PROBE: facts unknown_fn",
@@ -165,9 +164,7 @@ class TestDeclineTallies:
         assert d[0]["params"]["by_op"] == "facts=0/0 module=0/0"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Reporting
-# ─────────────────────────────────────────────────────────────────────────────
 
 _RUN_START = {"run_id": "r1", "kind": "run_start", "ts": "2026-01-01T00:00:00Z",
               "source": "controller", "target": "auto", "params": {"goal": "g"}}

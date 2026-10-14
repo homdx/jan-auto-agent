@@ -83,9 +83,7 @@ class TestCallSiteBeforeDefinition:
         assert blk.strip().startswith("function helper")
 
     def test_call_immediately_before_real_definition_extracts_tight_block(self):
-        # Regression fixture for the exact scenario in
-        # test_block_extractor_brace_langs.py::test_no_false_positive_on_call_site,
-        # asserted more precisely here (see TestExistingCallSiteTestNowExact).
+        # Regression fixture for the call-site case in test_block_extractor_brace_langs.py.
         src = (
             "class X {\n"
             "    void caller() {\n"
@@ -204,9 +202,7 @@ class TestExistingCallSiteTestNowExact:
             "}\n"
         )
         blk = extract_block(src, "helper", ".java")
-        # Before the fix, this started with "        helper(1);" (the call
-        # site) and included caller()'s closing brace before ever reaching
-        # the real definition.
+        # The call site must not start the block: the real definition is found.
         assert blk.strip().startswith("int helper(int n) {")
         assert blk.strip().endswith("}")
         assert "void caller" not in blk
@@ -235,10 +231,7 @@ class TestGetContextLinesUsesRealDefinition:
             "}\n"
         )
         ctx = get_context_lines(src, "getName", before=2, file_ext=".java")
-        # The 2 lines immediately before the REAL definition are setup()'s
-        # closing brace and the blank line after it — not anything from
-        # *inside* setup(), which is what the call-site false positive
-        # returned instead.
+        # The two lines before the real definition are setup()'s closing brace and a blank line.
         assert "public void setup() {" not in ctx
         assert "getName();" not in ctx
         assert ctx == "    }\n\n"

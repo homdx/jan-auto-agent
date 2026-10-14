@@ -44,14 +44,7 @@ from tools.collect.model import ModuleRecord, Provenance
 #: Fail-mode vocabulary `GateEntry.fail_mode` is restricted to.
 FAIL_MODES = frozenset({"open", "closed"})
 
-#: The repo `_GATE_SEED` actually documents — this package's own source
-#: tree (`tools/collect/gates.py` -> `tools/collect` -> `tools` -> repo
-#: root). Used by `build_gates_map` the same way
-#: `registries._SEED_REPO_ROOT` is used for CONTRACTS: to tell a self-scan
-#: (where the seed's citations are meaningful) apart from
-#: `collect --base <some other repo>` (where `_GATE_SEED` names gates
-#: this codebase's `auto` pipeline has and a foreign repo, by definition,
-#: does not).
+#: Repo root of this package, used to tell a self-scan from a scan of another repo.
 _SEED_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -140,14 +133,7 @@ class GateEntry:
         }
 
 
-# ── Hand-curated seed (data, not logic — cf. contracts_seed.yaml) ──────────
-#
-# Kept as a Python literal rather than a sibling YAML file: unlike
-# CONTRACTS, GATES is a closed, small, code-structural registry (exactly
-# the gates this pipeline has today) rather than an open-ended list of
-# invariants an operator might want to extend by hand without touching
-# code — so the extra indirection of a separate data file buys nothing
-# COLLECT-10 needed it for.
+# Gates are a closed, small code-structural registry, so they live in Python, not in YAML.
 
 _GATE_SEED: Dict[str, Dict[str, object]] = {
     "gate1": {
@@ -170,9 +156,7 @@ _GATE_SEED: Dict[str, Dict[str, object]] = {
             "recognized too"
         ),
         "fail_mode": "open",
-        # This *is* the base Gate-2 validator call the inner loop always
-        # makes once per attempt — not an addition on top of anything, so
-        # it doesn't count as "extra" the way the opt-in gates below do.
+        # The base Gate-2 call always runs once per attempt, so it is not counted as extra.
         "extra_llm_call": False,
         "config_switch": "",
         "config_default": "",
@@ -210,8 +194,7 @@ _GATE_SEED: Dict[str, Dict[str, object]] = {
         "protocol": "line verdict: DIRECT | INDIRECT | NONE | CONFLICT: <reason>",
         "fail_mode": "open",
         "extra_llm_call": True,
-        # Not a boolean switch: a claim-check cadence in chapters.
-        # `canon_check_every <= 0` disables the gate entirely.
+        # The cadence is in chapters, not a switch; canon_check_every <= 0 disables the gate.
         "config_switch": "[auto] canon_check_every",
         "config_default": "3",
     },
@@ -219,27 +202,9 @@ _GATE_SEED: Dict[str, Dict[str, object]] = {
         "module": "tools/auto/coder.py",
         "parser": "_find_non_ascii_identifiers",
         "protocol": "deterministic: tokenize written identifiers, reject any containing a non-ASCII character",
-        # Measured, not assumed: _find_non_ascii_identifiers catches
-        # TokenError/IndentationError/SyntaxError/ValueError and returns an
-        # EMPTY SET, which its caller (coder._write_files) reads as "no bad
-        # identifiers found" and passes the file.  So content this gate cannot
-        # tokenize is ACCEPTED, not rejected:
-        #
-        #   parseable, non-ASCII idents : {'привет'} -> gate REJECTS
-        #   syntax error, same idents   : set()      -> gate PASSES
-        #
-        # That behaviour is defensible for a style gate — do not block on a
-        # file you were unable to analyse, and invalid syntax is caught by the
-        # acceptance check and the other write guards anyway — so the code is
-        # right and this entry was wrong.  It read "closed", which is the one
-        # claim in this table build_gates_map cannot verify: `module` and
-        # `parser` are citation-checked against a real Pass A scan, but no
-        # amount of name resolution reveals how a caller treats a parse
-        # failure.  A consumer of the gates map trusting "closed" would have
-        # believed unanalysable content was rejected.
+        # Non-ASCII identifiers are not checked when the file does not parse; the entry says "open" (BUGFIX).
         "fail_mode": "open",
-        # Pure AST/tokenize check on already-generated content — no LLM
-        # call of its own.
+        # A pure AST and tokenize check on generated content, with no LLM call.
         "extra_llm_call": False,
         "config_switch": "[coder] ascii_identifiers_only",
         "config_default": "false",
@@ -351,9 +316,7 @@ def build_gates_map(
     scanned. True for this repo at any location, false for a genuinely
     different one.
     """
-    # AUTO-FIX: `modules` is typed Iterable and consumed twice here, so a
-    # one-shot generator would be exhausted by the first pass and the second
-    # would silently see nothing. Snapshot once.
+    # Snapshot the iterable once, since it is read twice below (AUTO-FIX).
     modules_list = list(modules) if modules is not None else []
     module_paths = {m.path for m in modules_list}
 
@@ -362,9 +325,7 @@ def build_gates_map(
             return []
 
     verify = modules is not None and root is not None
-    # PERF: one full-repo parse for the whole call, not one per seed
-    # entry — see `_repo_defined_names`. `seed` is typically ~7 entries,
-    # so this turns ~7 repo-wide re-parses into 1.
+    # One repo-wide parse for the whole call, not one per seed entry (PERF).
     defined_names = _repo_defined_names(modules_list, root) if verify else set()  # type: ignore[arg-type]
 
     entries: List[GateEntry] = []

@@ -27,19 +27,13 @@ import sys
 from collections import Counter, defaultdict
 
 SEV = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 4, "": 5}
-#: A verdict is only "right" against something. --truth supplies that: a CSV of
-#: finding,truth where truth is REAL (the defect is genuinely there), FALSE (it
-#: is not) or FIXED (was real, now guarded). Only findings a human actually
-#: checked belong in it — an unscored finding is left out of the accuracy maths
-#: rather than counted as a pass, so a reviewer cannot gain by guessing.
+#: Truth values for --truth (REAL, FALSE, FIXED): only human-checked findings count, so guessing gains nothing.
 TRUTH_VALUES = {"REAL", "FALSE", "FIXED"}
 CONFIRMING = {"CONFIRMED"}
 DISMISSING = {"FALSE_POSITIVE", "OUT_OF_SCOPE", "UNVERIFIABLE"}
 
 
-#: A reviewer CSV must have these. Anything else in the directory — the truth
-#: file, an exported action list, a previous report — is skipped rather than
-#: mistaken for a sixth reviewer, which is what a bare *.csv glob would do.
+#: Reviewer CSVs need these columns; other CSVs in the directory are skipped, not counted as reviewers.
 REQUIRED_COLS = {"task_id", "verdict", "severity", "file"}
 
 
@@ -80,8 +74,7 @@ def load_truth(path):
     if not path:
         return {}
     said = defaultdict(set)
-    # utf-8-sig: a truth.csv saved by a spreadsheet starts with a BOM; read as utf-8 every row
-    # was keyed '' and all but the last were lost without a word
+    # utf-8-sig: a BOM from a spreadsheet would key every row as '' and lose all but the last.
     with open(path, newline="", encoding="utf-8-sig") as fh:
         for r in csv.DictReader(fh):
             t = (r.get("truth") or "").strip().upper()
@@ -129,12 +122,7 @@ def classify(rs):
     if conf >= 2 or (conf and is_new):
         return "ACT"
     if conf == 1:
-        # A lone CONFIRMED that is not a NEW-* find is not actionable: nobody
-        # else reached the entry, so one vote is all there is. That is a
-        # question for a human (and the verification queue), not the action
-        # list — routing it to ACT lets a single rubber-stamp reviewer put an
-        # unreviewed finding in front of the fixer. NEW-* solo confirms are
-        # handled above, where a discovery with evidence is the point.
+        # A lone CONFIRMED that is not a NEW-* find is a question for a human, not an action: one vote is all there is.
         return "DISPUTED"
     if fixed:
         return "FIXED"
@@ -265,13 +253,7 @@ def main():
                     L.append(f"- **{label}:** {val[:400]}")
             L.append("")
 
-    # ── solo findings ────────────────────────────────────────────────────────
-    # A finding only one reviewer recorded. Two very different things live here
-    # and they must not be averaged: a NEW-* nobody else was looking for (the
-    # discovery this whole exercise is for) and a list entry nobody else got to
-    # (a coverage gap, which says nothing about anyone's judgement). One
-    # reviewer seeing something is weak evidence about the finding, but strong
-    # evidence about the reviewer — so this table is read per model, not summed.
+    # Solo findings (one reviewer only): weak evidence about the finding, strong evidence about the reviewer, so read per model.
     solo = [(k, rs[0]) for k, rs in groups.items() if len(rs) == 1]
     solo_new = [(k, r) for k, r in solo if (r.get("task_id") or "").startswith("NEW-")]
     solo_list = [(k, r) for k, r in solo
@@ -354,12 +336,7 @@ def main():
                 })
         print(f"action list -> {a.actions}")
 
-    # ── the verification queue ───────────────────────────────────────────────
-    # A finding one reviewer confirmed and nobody contradicted is not a result.
-    # It is a question: real bug, or plausible-sounding false positive? Nothing
-    # in the run can answer that — only reading the code can. This file is that
-    # question list, written to stand alone so it can be carried into a separate
-    # session with no CSVs, no reviewer names to weigh, and no report to re-read.
+    # Verification queue: a single confirmation is a question for a human, written standalone so it can go to a new session.
     if a.pending:
         pend = []
         for k, rs in groups.items():

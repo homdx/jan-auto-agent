@@ -12,10 +12,7 @@ LOCKED = ("fatal: Unable to create '/repo/.git/index.lock': File exists.\n\n"
           "Another git process seems to be running in this repository.")
 
 
-# ── bug: `retry_with_backoff(attempts=None)` raised TypeError ────────────────
-# The docstring: "A falsy ``attempts`` means one try with no retry (still raises on
-# failure, never sleeps)". `int(None)` is a TypeError, so a caller passing a
-# missing config value got a crash instead of one try.
+# Regression: retry_with_backoff(attempts=None) raised TypeError instead of making one try.
 
 @pytest.mark.parametrize("attempts", [None, 0, False, ""])
 def test_a_falsy_attempts_is_one_try_that_raises_the_calls_own_error(attempts):
@@ -48,10 +45,7 @@ def test_attempts_three_still_retries_twice():
     assert len(sleeps) == 2
 
 
-# ── bug: `run_git(retries=0)` still slept once ───────────────────────────────
-# "retries=1 is a single attempt with no waiting at all" — but the loop ran
-# `range(max(1, retries))` while the last-attempt test compared the raw `retries`,
-# so 0 (or a negative) never matched and a held index cost one useless backoff.
+# Regression: run_git(retries=0) still slept once; the last-attempt check compared the raw value.
 
 class _Runs:
     def __init__(self, monkeypatch):

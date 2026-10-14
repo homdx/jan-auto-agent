@@ -51,8 +51,7 @@ _SHARED_SECTIONS = {
     },
 }
 
-#: Per-gate config needed just to make build_validators construct it,
-#: keyed the same way ConfigParser.read_dict wants: {section: {key: val}}.
+#: Per-gate config needed for build_validators to construct the gate: {section: {key: value}}.
 _GATE_ENABLE = {
     "canon": {"auto": {"canon_check_every": "1"}},
     "fact": {"validator_agent": {"fact_check_creative": "true"}},
@@ -128,9 +127,7 @@ def _build_one(monkeypatch, tmp_path, sections: dict, gate_name: str, capture: d
     return validator
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Default path — no profile configured anywhere
-# ─────────────────────────────────────────────────────────────────────────────
+# Default path: no profile configured anywhere
 
 @pytest.mark.parametrize("gate_name", GATE_NAMES)
 def test_default_path_uses_shared_provider(monkeypatch, tmp_path, gate_name):
@@ -142,9 +139,7 @@ def test_default_path_uses_shared_provider(monkeypatch, tmp_path, gate_name):
     assert model == "shared-model"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Own-profile path — <gate>_llm_profile set directly
-# ─────────────────────────────────────────────────────────────────────────────
+# Own profile: <gate>_llm_profile set directly
 
 @pytest.mark.parametrize("gate_name", GATE_NAMES)
 def test_own_profile_path_uses_that_providers_url_and_model(monkeypatch, tmp_path, gate_name):
@@ -159,10 +154,7 @@ def test_own_profile_path_uses_that_providers_url_and_model(monkeypatch, tmp_pat
     assert model == "own-model"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Inherit-from-validator_llm_profile path — no gate-specific key, but the
-# shared [validator_agent] validator_llm_profile is set
-# ─────────────────────────────────────────────────────────────────────────────
+# Inherits validator_llm_profile when the gate has no key of its own
 
 @pytest.mark.parametrize("gate_name", GATE_NAMES)
 def test_inherits_validator_llm_profile_when_own_key_unset(monkeypatch, tmp_path, gate_name):
@@ -209,9 +201,7 @@ def test_own_profile_overrides_validator_llm_profile(monkeypatch, tmp_path, gate
     assert model == "own-model"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Empty-value path — <gate>_llm_profile = (blank) is unset, not "" profile
-# ─────────────────────────────────────────────────────────────────────────────
+# An empty <gate>_llm_profile is unset, not an empty profile name
 
 @pytest.mark.parametrize("gate_name", GATE_NAMES)
 def test_empty_profile_value_treated_as_unset(monkeypatch, tmp_path, gate_name):
@@ -227,9 +217,7 @@ def test_empty_profile_value_treated_as_unset(monkeypatch, tmp_path, gate_name):
     assert model == "shared-model"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Error paths — malformed profile disables only the affected gate (fail-open)
-# ─────────────────────────────────────────────────────────────────────────────
+# A malformed profile disables only the affected gate (fail open)
 
 @pytest.mark.parametrize("gate_name", GATE_NAMES)
 def test_profile_naming_missing_section_disables_only_that_gate(tmp_path, gate_name):
@@ -283,9 +271,7 @@ def test_broken_shared_validator_llm_profile_disables_gates_not_builder(tmp_path
         assert out[GATES_BY_NAME[other].attr] is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Startup logging — one line per enabled gate naming its resolved provider
-# ─────────────────────────────────────────────────────────────────────────────
+# Startup logs one line per enabled gate with its resolved provider
 
 @pytest.mark.parametrize("gate_name", GATE_NAMES)
 def test_startup_logs_resolved_provider_and_model(tmp_path, gate_name, caplog):
@@ -303,9 +289,7 @@ def test_startup_logs_resolved_provider_and_model(tmp_path, gate_name, caplog):
     ), msgs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Default behaviour unchanged — the byte-for-byte requirement
-# ─────────────────────────────────────────────────────────────────────────────
+# Default behaviour is unchanged, byte for byte
 
 def test_no_new_keys_present_every_gate_still_hits_shared_provider(monkeypatch, tmp_path):
     """A config with NONE of the new keys must send every request to the

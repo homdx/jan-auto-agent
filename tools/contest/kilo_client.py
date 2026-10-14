@@ -79,14 +79,10 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-#: The only replies this module will send. `always` is refused: under
-#: `external_directory` it would whitelist the pattern for the rest of the
-#: session (PROBE.md, §Facts 4).
+#: Replies this module sends; "always" is refused, since it would whitelist the pattern (PROBE.md).
 _REPLIES = ("once", "reject")
 
-#: Session events a wait has to look at, all of which carry a
-#: `properties.sessionID`. `session.next.tool.*` is deliberately absent —
-#: see the module docstring.
+#: Session events a wait looks at; session.next.tool.* is left out on purpose.
 _SESSION_EVENTS = (
     "session.idle",
     "session.error",
@@ -97,9 +93,7 @@ _SESSION_EVENTS = (
 )
 
 
-#: KC-71: what a subagent's session asks that only the runner can answer. Its
-#: other events are the agent at work — they reset the silence clock — and its
-#: own `session.idle` / `session.error` are the subagent's, never the turn's.
+#: Asks from a subagent that only the runner can answer; its idle and error events are its own (KC-71).
 _CHILD_ASKS = (
     "permission.asked",
     "permission.v2.asked",
@@ -127,12 +121,7 @@ def _child_session(event: dict, parents) -> str | None:
     return None
 
 
-#: Round 146: Kilo doubles the delay of a retry it repeats on its own, so any
-#: error a provider keeps answering — a 400 that is never going to pass included
-#: — crosses `max_retry_wait` without the provider ever naming a time. The
-#: crossing is at most about twice the bound (the delay doubles, with jitter and
-#: a beat skipped now and then), so a delay past this many times the bound is a
-#: time the provider stated, whichever attempt it comes on.
+#: Multiple of max_retry_wait past which a retry delay is a time the provider stated (round 146).
 _BACKOFF_CROSSING_FACTOR = 4.0
 
 
@@ -204,36 +193,23 @@ def _skip_stale(tap: "EventTap", session_id: str, since: int) -> int:
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
 
-#: How long one read of the event stream may block. The stream never ends on
-#: its own, and a session can sit idle for minutes, so this is generous: the
-#: stream is closed by `stop()` or by the server, not by a timeout.
+#: Max time one read of the event stream may block; the stream closes only on stop or server end.
 _STREAM_READ_TIMEOUT = 3600.0
 
-# FL-1 (round 84): how often EventTap forces its event log to disk. It used
-# to be every single event, on the reader thread — see EventTap._write_log.
+# Log flushes happen at most every 0.5 s, not per event, to keep the reader thread fast (FL-1).
 _LOG_FLUSH_INTERVAL_S = 0.5
 
-# KC-47: how long Kilo's `bash` tool lets a command run when the model names
-# no `timeout` of its own. Read off the tool's schema in the build the contest
-# runs — Kilo 7.x: "Optional timeout in milliseconds. If not specified,
-# commands will time out after 120000ms." Kept as a constant rather than read
-# from a live session, so a `bash` part that omits the key is bounded instead
-# of "forever".
+#: Kilo bash default timeout, read off the tool schema (KC-47), so an omitted timeout is bounded.
 _KILO_BASH_DEFAULT_TIMEOUT_MS = 120000
 
-# KC-47 §5: the `timeout` the round's prompt tells the agent to give its own
-# test run, in milliseconds — the number `runner._PROMPT` formats in. It must
-# stay below the round's `turn_timeout_sec`: the turn's deadline bounds every
-# `bash` call, whichever it asks for.
+#: Timeout the round's prompt tells the agent to use for its tests; must stay below turn_timeout_sec (KC-47).
 AGENT_TEST_TIMEOUT_MS = 1_200_000
 
 # KC-47 §4: how much of a running command's text a silence stall reports.
 _OPEN_TOOL_COMMAND_CHARS = 120
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# errors
-# ─────────────────────────────────────────────────────────────────────────────
+# Errors
 
 class KiloHttpError(Exception):
     """A Kilo HTTP call answered with a non-2xx status.
@@ -270,9 +246,7 @@ class KiloServerError(Exception):
         super().__init__(message)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# results
-# ─────────────────────────────────────────────────────────────────────────────
+# Results
 
 @dataclass(frozen=True)
 class SessionRef:
@@ -328,26 +302,17 @@ class IdleResult:
     questions: list = field(default_factory=list)
     elapsed: float = 0.0
     open_tool: dict | None = None
-    #: KC-63: this session's idle/error/permission/question events that the
-    #: ``since`` mark skipped (0 without one)
+    #: Events this session's since mark skipped (0 without a mark) (KC-63).
     stale_skipped: int = 0
     #: KC-73: a ``session.compacted`` of this session was read in this wait
     compacted: bool = False
-    #: KC-75: how many of this session's ``session.status`` ``retry`` events —
-    #: Kilo retrying a provider 4xx/5xx (429 rate limit, 502, 503) — this wait
-    #: read, output or not. A turn that went idle empty after one is the
-    #: provider's doing, not the model's.
+    #: Count of provider retry statuses (429, 502, 503) seen in this wait (KC-75).
     provider_errors: int = 0
-    #: Round 146: the seconds of this wait that were a streak of ``retry``
-    #: statuses — Kilo waiting to try a failing provider again — and that a wait
-    #: armed with ``on_deadline`` therefore added to its own deadline. ``0.0`` for
-    #: a wait with no turn clock, and for a turn the provider never failed in.
+    #: Seconds of a retry streak that the wait added to its own deadline (round 146).
     retry_waited: float = 0.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# transport helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Transport helpers
 
 def _decode(raw: bytes | None):
     """A response body as a JSON object when it is one, else raw text, else None."""
@@ -415,9 +380,7 @@ def _terminate(proc: subprocess.Popen, grace: float = 5.0) -> None:
             pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# binary lookup
-# ─────────────────────────────────────────────────────────────────────────────
+# Binary lookup
 
 def _version_key(path: str) -> tuple:
     """Sort key for an extension install path: the version in its folder name.
@@ -449,8 +412,7 @@ def find_kilo_binary(explicit: str | None = None) -> str:
         looked.append(explicit)
 
     ext_glob = "~/.vscode/extensions/kilocode.kilo-code-*/bin/kilo"
-    # newest first: the probe took the last of a lexical sort, which is how
-    # "7.6.2" beats "7.10.0" in its hands
+    # Newest first: a lexical sort would put 7.10.0 below 7.6.2.
     for path in sorted(glob.glob(os.path.expanduser(ext_glob)),
                        key=_version_key, reverse=True):
         if os.path.isfile(path):
@@ -467,9 +429,7 @@ def find_kilo_binary(explicit: str | None = None) -> str:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the server
-# ─────────────────────────────────────────────────────────────────────────────
+# The server
 
 class KiloServer:
     """A ``kilo serve`` process (spawned or attached to) plus its base URL.
@@ -733,9 +693,7 @@ def kilo_neighbours(server_pid: int, *, proc_root: str = "/proc") -> tuple[int, 
     return count, data_dir
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the event tap
-# ─────────────────────────────────────────────────────────────────────────────
+# The event tap
 
 def _response_socket(resp):
     """The socket under an SSE response, if it can be reached.
@@ -748,9 +706,7 @@ def _response_socket(resp):
     return sock if hasattr(sock, "shutdown") else None
 
 
-#: KC-69: how long ``compact`` waits for ``POST /session/{id}/summarize`` to
-#: answer — the summary is written inside that call, over a context of up to
-#: the model's whole window.
+#: Timeout for compact (POST summarize), which writes the whole summary before it answers (KC-69).
 COMPACT_TIMEOUT_SEC = 900.0
 
 
@@ -781,8 +737,7 @@ class EventTap:
         self.events: list[dict] = []
         self.cursor: int = 0
         self.lock = threading.Lock()
-        # FL-1 (round 84): waiters sleep on this instead of polling, so an
-        # event reaches wait() the moment the reader records it. See wait().
+        # Waiters sleep on a condition, not a poll, so an event reaches wait() as soon as it is recorded (FL-1).
         self._cond = threading.Condition(self.lock)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -807,8 +762,7 @@ class EventTap:
         req = urllib.request.Request(self.url, headers={"Accept": "text/event-stream"})
         try:
             with urllib.request.urlopen(req, timeout=_STREAM_READ_TIMEOUT) as resp:
-                # this thread owns the connection, so it is the only one that
-                # may close it; stop() wakes the recv below by another route
+                # This thread owns the connection, so only it closes it; stop() wakes the read another way.
                 self._socket = _response_socket(resp)
                 buffer = ""
                 while True:
@@ -821,14 +775,10 @@ class EventTap:
                         self._close_with(f"stream ended: {type(e).__name__}: {e}")
                         return
                     if not chunk:
-                        # EOF: the server closed the stream, or stop() shut the
-                        # read side down to wake us
+                        # EOF: the server closed the stream, or stop() shut it to wake the reader.
                         self._close_with("stopped" if self._stop.is_set() else "stream ended")
                         return
-                    # readline() is not one line here: http.client feeds it a
-                    # chunk, so one call can hand back several `data:` lines.
-                    # Splitting is what keeps an event from being dropped with
-                    # its neighbour.
+                    # Split the chunk into lines, so no event is lost to its neighbour.
                     buffer += chunk.decode("utf-8", "replace")
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
@@ -926,16 +876,10 @@ class EventTap:
                     left = deadline - time.monotonic()
                     if left <= 0:
                         return None
-                    # FL-1 (round 84): woken by _record, not by a 0.2 s poll.
-                    # The poll put up to 200 ms between an event arriving and
-                    # the caller seeing it, on top of whatever the box was
-                    # already charging — and a caller's silence clock is
-                    # measured from when it *sees* an event, so that latency
-                    # counted as the session being quiet.
+                    # Wake on each recorded event, not on a poll, so the silence clock is not inflated (FL-1).
                     self._cond.wait(left)
                     continue
-            # pred runs outside the lock: it is the caller's code, and the
-            # reader thread must not wait on it to record the next event.
+            # The predicate is the caller's code, so it runs outside the lock.
             if pred(event):
                 return event
 
@@ -1000,9 +944,7 @@ class EventTap:
         return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-47 — the open `bash` parts the silence clock waits for
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-47: the open bash parts the silence clock waits for
 
 def _number(value) -> float | None:
     """``value`` as a float when it is a number, else None. Never raises.
@@ -1072,8 +1014,7 @@ def _track_open_part(open_parts: dict, part: dict | None, at: float) -> None:
     if part.get("type") == "tool" and part.get("tool") == "bash" \
             and status in ("running", "pending"):
         known = open_parts.get(part_id)
-        # the bound runs from the call's `running` event: a later update of
-        # the same running call (its output streaming in) does not restart it
+        # The bound runs from the call's first running event; later updates do not restart it.
         if known is not None and known["status"] == "running":
             at = known["at"]
         open_parts[part_id] = {"tool": "bash", "command": _part_command(part),
@@ -1114,9 +1055,7 @@ def _open_tool_report(open_parts: dict, now: float) -> dict | None:
             "running_for": now - info["at"]}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the client
-# ─────────────────────────────────────────────────────────────────────────────
+# The client
 
 def _deadline_grant(on_deadline: Callable[[float], float | None],
                     elapsed: float) -> float | None:
@@ -1202,10 +1141,7 @@ class KiloClient:
         self.server = server
         self.directory = os.path.abspath(str(directory))
         self._query = "?directory=" + urllib.parse.quote(self.directory, safe="")
-        # KC-10: a model's ``limit.context`` by ``(provider_id, model_id)``.
-        # The offer does not change inside a round, so one read of
-        # ``GET /provider`` serves every prompt — the roster asks it once per
-        # agent, and a fill must not pay for it on each of them.
+        # Model context limits are read once per round, not once per prompt (KC-10).
         self._model_limits: dict = {}
 
     def _url(self, path: str) -> str:
@@ -1399,16 +1335,7 @@ class KiloClient:
             "modelID": session.model_id,
             "auto": False,
         }
-        # KC-69: `auto: true` is Kilo's own overflow compact — it goes on with
-        # the agent loop after the summary, so the model's next tool call asks
-        # a permission while this very call still waits for its answer, and
-        # nothing answers it: sensenova-6.7 asked `read all.py` right after its
-        # summary and the call hung for the whole timeout. `false` is the
-        # summary alone; the runner sends the next prompt itself.
-        # KC-69: 7.6.2 answers `summarize` only once the summary is written, so
-        # the call lasts as long as the model does — laguna 24 s, sensenova past
-        # the 30 s every other call gets, and the timeout turned a compact that
-        # was still running into a failed one
+        # auto:true runs Kilo's own overflow compact, so the next call hangs; the summary alone is used (KC-69).
         status, resp = self._request("POST", path, body, timeout=COMPACT_TIMEOUT_SEC)
         self._check(status, resp, "POST", path)
         return None
@@ -1714,10 +1641,7 @@ class KiloClient:
         A ``session.compacted`` read on the way sets ``IdleResult.compacted``.
         Omitted — every other caller — the loop is byte for byte KC-64's.
         """
-        # KC-63: events recorded before the prompt this wait belongs to are
-        # an earlier turn's. Kilo sends two session.idle after a
-        # session.error (round 106, mimo-v2-5), and the next turn read them
-        # as its own end.
+        # Events from before this prompt are an earlier turn's, so they are skipped (KC-63).
         stale = _skip_stale(tap, session.id, since) if since is not None else 0
         # KC-63, diagnostic only: did this session go busy in this wait?
         saw_busy = False
@@ -1726,31 +1650,20 @@ class KiloClient:
         provider_errors = 0
         started = time.monotonic()
         deadline = started + float(timeout)
-        # Round 146: a streak of retries — the first ``retry`` status since the
-        # model last produced anything — is time the provider took, not the
-        # agent's, and with a turn clock armed (``on_deadline``) every second of
-        # it moves the deadline. ``retry_mark`` is where the streak was last
-        # counted up to (``None`` outside one), ``retry_waited`` what it has
-        # added so far, bounded by the turn's own ``timeout``: the retry count
-        # (KC-64) and the delay bound (KC-61) end a provider that never answers,
-        # and this keeps a quiet one from holding the deadline for good.
+        # A provider retry streak counts as the provider's time, so it moves the turn deadline (round 146).
         retry_mark: float | None = None
         retry_waited = 0.0
         retry_streak = 0.0
         retry_cap = max(0.0, float(timeout))
         session_id = session.id
-        # KC-12: the silence clock. None (or a non-positive number) is off,
-        # and then the loop below is KC-1's, event for event.
+        # KC-12: a None or non-positive silence clock is off, and the loop is then KC-1's.
         silence = float(idle_event_timeout) if idle_event_timeout is not None else None
         if silence is not None and silence <= 0:
             silence = None
         last_seen = started
-        # KC-47: this session's open `bash` parts, part id -> the call's own
-        # deadline. Empty, the loop below is KC-12's, event for event.
+        # KC-47: open bash parts map to their own deadlines; empty, the loop is KC-12's.
         open_parts: dict = {}
-        # KC-64: a limit that is not a positive count is no limit — the caller
-        # arms it from a config value, and a value that is not a number
-        # turns the rule off rather than raising a TypeError out of a wait.
+        # A limit that is not a positive count turns the rule off, rather than raising (KC-64).
         try:
             retries_limit = int(max_retry_attempts)
         except (TypeError, ValueError):
@@ -1763,11 +1676,7 @@ class KiloClient:
         quiet_window = float(quiet_after) if quiet_after is not None else None
         heard = False
         compacted = False
-        # KC-71: the sessions this one started with Kilo's `task` tool, and
-        # theirs. Round 87: mimo-v2-5's subagent asked `external_directory` at
-        # 301 s, nobody answered a session that was not the agent's own, the
-        # subagent waited, the agent waited on it, and at 1010 s the silence
-        # clock called the agent STALLED — 0 files, 0 permissions counted.
+        # Child sessions started by the task tool are tracked too, so their asks are answered (KC-71, round 87).
         children: set = set()
 
         def settle_retries(now: float, *, ended: bool = False) -> None:
@@ -1794,30 +1703,20 @@ class KiloClient:
             nonlocal saw_busy
             etype = event.get("type")
             if etype == "tap.closed":
-                # a tap-level event: it has no sessionID, and it applies to
-                # whatever stream this tap is reading
+                # A tap-level event has no session id, and applies to whatever stream is read.
                 return True
             child = _child_session(event, children | {session_id})
             if child is not None:
                 children.add(child)
             event_session = (event.get("properties") or {}).get("sessionID")
             if event_session != session_id:
-                # KC-71: a subagent's ask is answered as the agent's own, and
-                # with the silence clock on its work is the agent's work
+                # KC-71: a subagent's ask is answered as the agent's own (the clock counts its work too).
                 return event_session in children and (
                     etype in _CHILD_ASKS or silence is not None or quiet_window is not None)
             if not saw_busy and _is_busy(event):
-                # KC-63: noted here, before the filter, so it is seen with the
-                # silence clock off too; it changes no result
+                # KC-63: noted before the filter, so it is seen even with the clock off.
                 saw_busy = True
-            # with the silence clock on, every event of this session wakes the
-            # wait: the ones acted on below are handled, the rest only reset
-            # the clock — a `session.status busy` or a `file.edited` is the
-            # session working, not stalled
-            # KC-61: a `retry` status is acted on below when `max_retry_wait`
-            # is armed, so it must reach the loop even with the silence clock
-            # off — the probe has no clock, and it must not spend its timeout
-            # on a quota that resets in fourteen hours.
+            # With the silence clock on, each event of this session wakes the wait, handled or not.
             if (silence is not None or quiet_window is not None or etype in _SESSION_EVENTS
                     or (max_retry_wait is not None and etype == "session.status")
                     or (on_deadline is not None and etype == "session.status")
@@ -1832,15 +1731,13 @@ class KiloClient:
             overall_left = deadline - now
             silence_left = None
             if silence is not None:
-                # the two bounds race: whichever runs out first ends the wait.
-                # An open `bash` call holds the silence one wider (KC-47).
+                # Whichever bound runs out first ends the wait; an open bash call widens the silence bound (KC-47).
                 silence_left = _silence_left(silence, last_seen, open_parts, now)
                 left = min(overall_left, silence_left)
             else:
                 left = overall_left
             if quiet_window is not None and not heard:
-                # KC-73: nothing from the session yet — Kilo is not working in
-                # it. Not a stall: the session is left as it is.
+                # KC-73: nothing has come from the session yet, so it is not a stall and is left as it is.
                 quiet_left = started + quiet_window - now
                 if quiet_left <= 0:
                     return IdleResult(status="quiet", elapsed=now - started,
@@ -1848,21 +1745,16 @@ class KiloClient:
                                       stale_skipped=stale)
                 left = min(left, quiet_left)
             if left <= 0:
-                # KC-36: the turn deadline asks first. The silence clock never
-                # does — a session that went quiet is quiet whatever the
-                # worktree says, and no extension resurrects it.
+                # The turn deadline is checked first; the silence clock is not extended by the worktree (KC-36).
                 quiet = silence_left is not None and silence_left <= 0
                 if not quiet and overall_left <= 0 and on_deadline is not None:
                     grant = _deadline_grant(on_deadline, time.monotonic() - started)
-                    # a grant that leaves the deadline in the past would just
-                    # ask again in a hot loop of churn reads — abort instead
+                    # A grant that leaves the deadline in the past aborts, rather than re-asking in a hot loop.
                     if grant is not None and deadline + grant > time.monotonic():
                         deadline += grant
                         continue
                 self._abort_quietly(session)
-                # only the silence bound carries the tool: when the overall
-                # deadline won, the answer is "the turn never idled", not
-                # "the bash call was slow".
+                # Only the silence bound reports the open tool; a turn-deadline stop says the turn never idled.
                 open_tool = _open_tool_report(open_parts, now) if quiet else None
                 return IdleResult(status="timeout", elapsed=time.monotonic() - started,
                                   permissions=permissions, questions=questions,
@@ -1877,26 +1769,20 @@ class KiloClient:
 
             etype = event.get("type")
             props = event.get("properties") or {}
-            # KC-71: an event of a subagent's session — its asks are answered
-            # below like the agent's own, on the subagent's session
+            # KC-71: a subagent's event has its asks answered below, on the subagent's session.
             asker = session
             if props.get("sessionID") in children:
                 if etype not in _CHILD_ASKS:
-                    # the subagent working: the clock was reset above, and a
-                    # `bash` it runs holds the clock open as the agent's would
+                    # The subagent is working, so the clock was reset, and its bash holds it open.
                     if etype == "message.part.updated":
                         _track_open_part(open_parts, props.get("part"), last_seen)
                     continue
                 asker = replace(session, id=props["sessionID"])
 
             if etype == "message.part.updated":
-                # KC-47: an open `bash` part widens the silence bound, and the
-                # event that reset the clock is the one that opened the call.
+                # KC-47: an open bash part widens the silence bound; the event that opened it reset the clock.
                 _track_open_part(open_parts, props.get("part"), last_seen)
-                # KC-64: any assistant-side part (a step-start, reasoning, a tool,
-                # a step-finish) is the model answering. A `text` part does not
-                # reset it: our own prompt comes back as `text` parts, and round
-                # 106's laguna had nine of them with zero tokens out.
+                # Any assistant-side part resets the silence clock; a plain text part does not (KC-64).
                 part = props.get("part")
                 if isinstance(part, dict) and \
                         part.get("type") in ("step-start", "reasoning", "tool", "step-finish"):
@@ -1907,19 +1793,14 @@ class KiloClient:
                 try:
                     reply, message, granted = _permission_answer(on_permission(event))
                     self.reply_permission(asker, props.get("id"), reply, message)
-                    # KC-66: the gate's own waits are the agent's time, not the
-                    # gate's — grant them back before the loop re-measures the
-                    # deadline on the pass that follows. KC-58: so is a
-                    # whole-root suite's wait for its round-wide slot.
+                    # Gate waits are the agent's time, so they are granted back to the deadline (KC-66, KC-58).
                     if granted > 0:
                         deadline += granted
                         _log.info("%s: gate/suite waits granted +%gs to the turn",
                                   session_id, granted)
                 except (KiloHttpError, ValueError, TypeError) as e:
                     _log.warning("permission %s not answered: %s", props.get("id"), e)
-                # KC-58: the session cannot have been silent while the runner
-                # held its permission — a suite slot can hold it for longer
-                # than the silence window — so the clock runs from the reply.
+                # The silence clock runs from the reply, since a suite slot can outlast the window (KC-58).
                 last_seen = time.monotonic()
                 permissions.append(event)
                 continue
@@ -1943,9 +1824,7 @@ class KiloClient:
                     if retry_mark is None:
                         retry_mark = last_seen
             if etype == "session.status" and max_retry_wait is not None:
-                # KC-61: Kilo's own retry, and how long before it retries. `next`
-                # is epoch milliseconds, so it is the wall clock the wait is
-                # compared with — `time.time()`, never `time.monotonic()`.
+                # Kilo's own retry time is epoch milliseconds, compared with the wall clock (KC-61).
                 status = props.get("status") or {}
                 if isinstance(status, dict) and status.get("type") == "retry":
                     message = str(status.get("message") or "")
@@ -1959,9 +1838,7 @@ class KiloClient:
                         quota_re is not None and quota_re.search(message) is not None,
                         float(max_retry_wait))
                     if far == "quota":
-                        # a quota reset, not a blip: stop Kilo's own
-                        # sleep-and-retry and hand the provider's text back, so
-                        # the round never waits for the silence clock to name it
+                        # A quota reset ends the wait at once, with the provider's text (KC-61).
                         self._abort_quietly(session)
                         return IdleResult(
                             status="error",
@@ -1970,11 +1847,7 @@ class KiloClient:
                             elapsed=elapsed, permissions=permissions,
                             questions=questions, stale_skipped=stale)
                     if far == "backoff":
-                        # round 146: the same error again and again, and Kilo's
-                        # own doubling took the next try past the bound. The
-                        # wait ends here as KC-61 always ended it — but the
-                        # provider named no reset, so the agent is not a quota:
-                        # `ProviderUnavailable`, with the attempt it came to.
+                        # A backoff the provider did not name ends as ProviderUnavailable, not a quota (round 146).
                         self._abort_quietly(session)
                         return IdleResult(
                             status="error",
@@ -1983,9 +1856,7 @@ class KiloClient:
                             elapsed=elapsed, permissions=permissions,
                             questions=questions, stale_skipped=stale)
             if etype == "session.status" and retries_limit:
-                # KC-64: a retry *nearby* in time, as often as the provider lets
-                # it. KC-61's quota check above ran first: a retry scheduled
-                # fourteen hours out ends at attempt 1, never at attempt 10.
+                # A nearby retry is counted per attempt; the quota check above runs first (KC-64).
                 status = props.get("status")
                 if isinstance(status, dict) and status.get("type") == "retry":
                     retries_without_output += 1
@@ -1994,8 +1865,7 @@ class KiloClient:
                              and not isinstance(attempt, bool)
                              else retries_without_output)
                     if min(count, retries_without_output) >= retries_limit:
-                        # stop Kilo's endless retry: its `session.status busy`
-                        # beats would otherwise reset the silence clock forever
+                        # Kilo's endless retry is stopped, since its busy beats would reset the clock forever.
                         self._abort_quietly(session)
                         return IdleResult(
                             status="error",
@@ -2019,12 +1889,10 @@ class KiloClient:
                                   elapsed=elapsed, permissions=permissions,
                                   questions=questions, stale_skipped=stale)
             if etype != "session.idle":
-                # only with the silence clock on: an event of this session
-                # that reset it and asks for nothing
+                # Only with the silence clock on: an event of this session that reset it and asks nothing.
                 continue
             if not saw_busy:
-                # KC-63, diagnostic only: how the next variant of a stale idle
-                # gets noticed. The result does not change.
+                # KC-63, diagnostic only: notes how a stale idle is noticed; the result does not change.
                 _log.warning("%s: idle without busy after %.1fs", session_id, elapsed)
             settle_retries(last_seen, ended=True)
             return IdleResult(status="idle", elapsed=elapsed,

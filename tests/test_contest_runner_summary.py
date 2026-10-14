@@ -66,15 +66,13 @@ from tools.contest.runner import (  # noqa: E402
 FALLBACK = 32_768
 #: 24 000 of 32 768 is 73.2 % — at the summary's 70 %, below the compact's 80 %.
 SUMMARY_FILL = 24_000
-#: 27 000 of 32 768 is 82.4 % — at both, so the ask comes first and the compact
-#: right after it.
+#: 27 000 of 32 768 is 82.4 %: above both thresholds, so the ask comes first, then the compact.
 BOTH_FILL = 27_000
 #: 30 000 of 32 768 is 91.6 % — at the shipped 90 %, above the compact's 80 %.
 DEFAULT_FILL = 30_000
 #: 40 000 of 32 768 is 122 % — past the session's own size, where no ask can fit.
 OVER_FILL = 40_000
-#: What these tests set the knob to, so a fill under the compact's percent still
-#: earns an ask. The shipped default is 90, pinned by one test below.
+#: Knob used by these tests: a fill under the compact's percent still earns an ask. The default (90) is pinned by one test.
 SUMMARY_AT_PERCENT = 70
 
 REPLY_ONE = "I changed pkg/thing.py to return 7; the ticket still needs a test."
@@ -130,8 +128,7 @@ def test_a_dirty_tree_at_the_summary_percent_earns_its_own_summary_prompt(tmp_pa
 
     asks = _summary_asks(fake)
     assert len(asks) == 1
-    # the ask is its own prompt, sent before anything is compacted — and here the
-    # fill never reached the compact's percent, so the compact never ran at all
+    # The ask is its own prompt, sent before anything is compacted; here the fill never reached the compact's percent.
     assert _prompt_text(asks[0]).startswith(SUMMARY_PROMPT)
     assert run.compactions == 0
 
@@ -281,8 +278,7 @@ def test_a_fallback_after_a_reset_carries_the_captured_summary(tmp_path):
     """A summary captured in one session, then a KC-39 reset in the same
     attempt: the replacement's opening prompt carries the summary's text, not
     only the `git status` lines."""
-    # five turns of session 1: the ask, then the same bytes three times, which is
-    # the repeated diff KC-39 resets on. `turns_after` is the replacement's script.
+    # Session 1: the ask, then the same diff three times (what KC-39 resets on); turns_after is the replacement.
     scenario = {"turns": [
         {"on_prompt": tr.work_edit_same, "events": ["busy", "idle"],
          "message_info": tr._fill_tokens(SUMMARY_FILL)},
@@ -444,8 +440,7 @@ def test_a_tool_asked_during_the_summary_does_not_stop_the_prompt_after_it(tmp_p
          "message_info": tr._fill_tokens(DEFAULT_FILL)},
         {"assistant": REPLY_ONE, "events": ["busy", "idle"],
          "permission": _asked_permission()},
-        # the continue takes longer than the stop's delay, so a stop left armed
-        # lands in it
+        # The continue takes longer than the stop's delay, so a stop left armed lands in it.
         {"on_prompt": tr.work_ready, "events": ["busy", "idle"], "delay": 2.0},
     ], "summary_tokens": 3_000}
     sb, fake, _h, run, _ = tr._run_one(tmp_path, scenario,

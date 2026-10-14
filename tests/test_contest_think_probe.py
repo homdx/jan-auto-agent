@@ -365,8 +365,7 @@ def test_probe_model_roster_set_variant_low_is_checked_once_and_kept(tmp_path):
                          ["high", "medium", "low"],
                          cache={}, ttl_days=7)
 
-    # pick_variant walks the ladder high→medium→low→None; this stops at "low"
-    # (the first rung that answers after high and medium fail).
+    # Falls to "low": the first rung that answers after high and medium fail.
     assert result.variant == "low"
     assert result.usable
     assert ("high", "rejected") in result.tried
