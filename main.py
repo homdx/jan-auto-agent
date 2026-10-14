@@ -430,7 +430,9 @@ class Orchestrator(OrchestratorActions):
         context_lines = block_extractor.get_context_lines(source, parsed.target_name, file_ext=ext)
 
         iteration = 1
-        already_searched = [parsed.file_path]
+        # B3: the target file is seeded as (file, ref) pairs for the references of its own block, not as a whole file:
+        # a name the validator asks for later may well be defined in that same file, and it must stay reachable.
+        already_searched = [(parsed.file_path, ref) for ref in refs]
         search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
         validation: Dict[str, Any] = {}
 
@@ -504,7 +506,15 @@ class Orchestrator(OrchestratorActions):
                 if feedback:
                     print(f"❗ Validation – {feedback}")
 
-                # Adaptive Scope: Expand search for next iteration
+                # Adaptive Scope: Expand search for next iteration.
+                # B3: extend with the (file, ref) pairs the search actually
+                # looked at, NOT with the files it merely opened. Skipping whole
+                # files blacklisted every file the previous iteration scanned, so
+                # a name the validator asked for next could only be found in a
+                # file that had never been opened — a definition sitting beside
+                # an earlier one became unreachable, and a reference found
+                # before regressed to missing. The pair is the unit of work;
+                # SearchAgent's _source_cache already avoids re-reading.
                 already_searched.extend(search_result.get("searched_files", []))
                 new_suggestions = validation.get("suggested_searches", [])
                 if isinstance(new_suggestions, list):

@@ -69,6 +69,36 @@ _DEFAULT_SKIP_DIRS = [
 ]
 
 
+def _normalise_already_searched(
+    already_searched: Optional[List[Any]],
+) -> tuple[Set[str], Set[tuple]]:
+    """Split an ``already_searched`` list into a file-level blacklist and a
+    ``(file, ref)`` blacklist.
+
+    Two shapes are accepted, because both appear in the wild:
+
+    * a plain ``str`` entry — the legacy shape (and what a resume
+      checkpoint written by an older run still holds). It skips that file
+      for *every* reference, exactly as it always did.
+    * a two-element ``(file, ref)`` entry — what :meth:`SearchAgent.run`
+      now reports. It skips that file only for that one reference, so the
+      next iteration can still find a *different* name defined there.
+
+    Anything else is ignored rather than raising: a malformed entry costs a
+    redundant file read, never a failed search.
+    """
+    files: Set[str] = set()
+    pairs: Set[tuple] = set()
+    if not isinstance(already_searched, (list, tuple, set, frozenset)):
+        return files, pairs
+    for entry in already_searched:
+        if isinstance(entry, str):
+            files.add(entry)
+        elif isinstance(entry, (tuple, list)) and len(entry) == 2:
+            pairs.add((str(entry[0]), str(entry[1])))
+    return files, pairs
+
+
 class SearchAgent:
     def __init__(
         self,
@@ -200,7 +230,7 @@ class SearchAgent:
         self,
         references: List[str],
         base_dir: str,
-        already_searched: Optional[List[str]] = None,
+        already_searched: Optional[List[Any]] = None,
         file_ext_hint: str = "",
         visited_names: Optional[Set[str]] = None,
         current_depth: int = 0
@@ -213,8 +243,24 @@ class SearchAgent:
         used as a hard filter — all extensions in ``_SEARCHABLE_EXTS`` are
         searched so non-Python projects receive context too.  Pass a non-empty
         value to *prefer* files with that extension (they are scanned first).
+
+        B3: ``already_searched`` used to be a list of *files*, and a file the
+        run had merely looked in was skipped wholesale on the next iteration.
+        The next iteration's ``suggested_searches`` are new names, so a name
+        asked for afterwards could only ever be found in a file that had never
+        been opened — a definition sitting in a file scanned for the first name
+        was unreachable, and a reference found earlier regressed to missing.
+        Entries are therefore ``(file, ref)`` pairs, and a file is skipped only
+        for the references already looked up in it.  Plain-string entries (the
+        legacy shape, still what a resume checkpoint from an older run holds)
+        keep the old whole-file meaning — see
+        :func:`_normalise_already_searched`.  ``result["searched_files"]``
+        reports the same ``(file, ref)`` pairs back, so the caller can feed it
+        straight into the next iteration.
         """
-        already_searched_set = set(already_searched or [])
+        already_searched_files, already_searched_pairs = _normalise_already_searched(
+            already_searched
+        )
         visited_names = visited_names or set()
         
         result: Dict[str, Any] = {
@@ -250,7 +296,7 @@ class SearchAgent:
                 p = Path(file_path)
                 str_path = str(p)
 
-                if str_path in already_searched_set:
+                if str_path in already_searched_files:
                     continue
 
                 # Guard: File size limit
@@ -260,7 +306,9 @@ class SearchAgent:
             # 2. Scan for References
             refs_to_search = [r for r in references if r not in visited_names]
             found_raw: Dict[str, Dict[str, str]] = {}
-            searched_this_run: Set[str] = set()
+            # What this run actually looked at, as (file, ref) pairs (B3): the
+            # next iteration may skip a pair, never a whole file.
+            searched_this_run: Set[tuple] = set()
 
             # Each candidate file is read at most once per run (empty text marks a failed read).
             _source_cache: Dict[str, str] = {}
@@ -270,7 +318,11 @@ class SearchAgent:
                 ref_found = False
 
                 for candidate_file in valid_candidates:
-                    searched_this_run.add(candidate_file)
+                    # B3: only the (file, ref) pair is blacklisted, so a later
+                    # name can still be found in a file scanned for an earlier one.
+                    if (candidate_file, ref) in already_searched_pairs:
+                        continue
+                    searched_this_run.add((candidate_file, ref))
 
                     # Populate cache on first encounter of this file.
                     if candidate_file not in _source_cache:
@@ -301,7 +353,6 @@ class SearchAgent:
                     result["not_found"].append(ref)
 
             result["searched_files"] = list(searched_this_run)
-
             # 3. LLM Noise Filtering (Single Batch Call)
             if found_raw:
                 approved_refs = self._evaluate_with_llm(found_raw)

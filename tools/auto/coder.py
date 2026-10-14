@@ -87,6 +87,7 @@ from tools.block_extractor import extract_block as _block_extractor_extract_bloc
 # SearchAgent is imported lazily inside Coder._fetch_needed
 from tools.auto.utils import _cfg_mode, atomic_write_text, in_style_of
 from tools.auto.context_assembler import ContextAssembler
+from tools.ui import safe_print as _safe_print, safe_stdout_write as _safe_stdout_write
 
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
@@ -555,17 +556,17 @@ class Coder(_llm_stream.LLMClientBase):
                     "task_id": task_id},
         )
 
-        # The print is guarded like the probe's, so a closed stdout cannot break generate()'s no-raise contract (BUGFIX).
+        # The banner is guarded like the streaming writes below, so a closed stdout cannot break generate()'s no-raise contract (BUGFIX, B1).
         try:
-            print(f"\n💻 [LIVE CODER STREAMING — task: {task_id}]:")
+            _safe_print(f"\n💻 [LIVE CODER STREAMING — task: {task_id}]:")
         except OSError as exc:
             logger.warning("Coder: could not write streaming banner (%s) — continuing", exc)
         try:
             _coder_tokens: list[str] = []
 
             def _coder_on_token(t: str) -> None:
-                sys.stdout.write(t)
-                sys.stdout.flush()
+                # safe_stdout_write: a closed stdout must not look like a transport failure (B1).
+                _safe_stdout_write(t)
                 _coder_tokens.append(t)
 
             raw_text = _llm_stream.request_completion(
@@ -580,7 +581,7 @@ class Coder(_llm_stream.LLMClientBase):
                 **self._retry_kwargs,
             )
             raw_text = raw_text or "".join(_coder_tokens)
-            print("\n" + "═" * 80 + "\n")
+            _safe_print("\n" + "═" * 80 + "\n")
         except Exception as exc:
             # The call itself failed, so this is a transport failure, not a rejected answer (RUN-8).
             msg = f"LLM call failed: {exc}"
@@ -622,8 +623,7 @@ class Coder(_llm_stream.LLMClientBase):
                     _probe_tokens: list[str] = []
 
                     def _probe_on_token(t: str) -> None:
-                        sys.stdout.write(t)
-                        sys.stdout.flush()
+                        _safe_stdout_write(t)
                         _probe_tokens.append(t)
 
                     raw_text = _llm_stream.request_completion(
@@ -638,7 +638,7 @@ class Coder(_llm_stream.LLMClientBase):
                         **self._retry_kwargs,
                     )
                     raw_text = raw_text or "".join(_probe_tokens)
-                    print("\n" + "═" * 80 + "\n")
+                    _safe_print("\n" + "═" * 80 + "\n")
                     _probe_cleaned = strip_think(raw_text)
                     # A probe that succeeds but returns nothing must not discard the good first response (BUGFIX).
                     if _probe_cleaned.strip():

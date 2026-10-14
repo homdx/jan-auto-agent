@@ -1,6 +1,44 @@
+"""Terminal output helpers: a spinner and streamed-token writers.
+
+Everything here is *cosmetic* output. None of it may ever raise into the
+caller: the LLM reply it accompanies has already been paid for and, once the
+process's stdout is closed (a pipe to ``head``, a cron job with no terminal,
+``| tail -1``), ``sys.stdout.write`` raises ``BrokenPipeError`` on every
+subsequent call. A raised write inside a call's ``try`` therefore turns a
+received answer into a failed call — see :func:`safe_stdout_write`.
+"""
+
 import sys
 import time
 import threading
+
+__all__ = ["Spinner", "stream_tracker", "safe_stdout_write", "safe_print"]
+
+
+def safe_stdout_write(t: str) -> None:
+    """Write *t* to stdout, swallowing a closed/broken stdout.
+
+    When stdout is piped to a command that closes early (``| head``) or the
+    process is run without a terminal, ``sys.stdout.write`` raises
+    ``BrokenPipeError`` — and stays broken, so the second write raises too.
+    Streaming output is cosmetic: the token has already been received and is
+    appended to the caller's own buffer, so the only correct behaviour is to
+    drop the write and carry on.
+
+    Shared by every streaming call site (validator, improvement, architect,
+    coder) so a closed stdout can never be classified as an LLM failure.
+    """
+    try:
+        sys.stdout.write(t)
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def safe_print(line: str = "") -> None:
+    """``print(line)`` that cannot raise on a closed stdout — the same
+    contract as :func:`safe_stdout_write` for a whole line."""
+    safe_stdout_write(line + "\n")
 
 
 class Spinner:

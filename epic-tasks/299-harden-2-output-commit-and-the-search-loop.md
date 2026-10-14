@@ -1,10 +1,10 @@
 # HARDEN-2 — four defects around a call: a closed stdout becomes a transport failure, a failed commit is counted done, the adaptive search blacklists what it scanned, a creative run's own files refuse the next run
 
-**Status:** open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 299: step-5-preview as the base, with the target-file seeding of agnes-2-5-flash's entry; black box 299, 15 checks). Before: open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** MEDIUM (B3 changes the loop's behaviour; B1 and B2 lose a received answer or leave work in the tree)
 **File:** `tools/auto/coder.py`, `tools/auto/architect.py`, `tools/auto/controller.py`, `tools/auto/commit_on_success.py`, `tools/auto/git_manager.py`, `main.py`, `tools/search_agent.py`
 **Symbol:** `Coder.generate` / the Architect streaming callback, `Controller.run` (after `commit_helper.commit`), `CommitOnSuccess.commit`, `_update_synopsis` / `_update_story_bible`, `GitManager.user_changes` / `_OWN_OUTPUTS`, `already_searched` in `main.py`, `SearchAgent.search`
-**Round:** —
+**Round:** 299
 **Size:** M
 **Depends on:** CC review fixes 34–36 (landed, `c2ef95b`): this ticket starts from their code
 **Also touches:** `tests/test_auto_stdout_and_commit_failure.py` and one pinned test per defect in `tests_bugfix/`

@@ -29,7 +29,13 @@ from typing import Callable, Optional
 
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO
 from tools.auto.git_manager import make_git_manager, DirtyTreeError, GitError, GitManager
-from tools.auto.utils import highest_completed_round
+from tools.auto.commit_on_success import (
+    COMMIT_GIT_ERROR,
+    COMMIT_NOTHING_TO_COMMIT,
+    COMMIT_OK,
+    CommitResult,
+)
+from tools.auto.utils import highest_completed_round, safe_filename_component, atomic_write_text
 # make_outer_loop is imported inside _run_task_loop, so tests can patch it at its source module.
 
 # Epic G Integrations
@@ -678,38 +684,72 @@ class AutoController:
             if result.passed:
                 # ── AUTO-G3: commit on success ─────────────────────────────
                 commit_hash: Optional[str] = None
+                commit_result = None
                 if commit_helper is not None:
-                    commit_hash = commit_helper.commit(task, result)
+                    # B2: the classified outcome, not just the sha — a task whose
+                    # commit FAILED is not a task that was done, and its work must
+                    # be kept before anything resets the tree.
+                    commit_result = self._commit_outcome(commit_helper, task, result)
+                    commit_hash = commit_result.sha
                 else:
                     # No git: mark DONE manually
                     self.state.set_task_status(task["id"], STATUS_DONE)
 
-                tasks_done += 1
-                self.state.log(
-                    f"task {task['id']} completed — "
-                    f"rounds={result.rounds_used} "
-                    f"commit={commit_hash[:12] if commit_hash else 'none'}"
-                )
-                if self.run_trace:
-                    self.run_trace.log_task_done(task["id"], commit_hash)
-
-                # Post-commit regression check: guarded, so a failure cannot cost the tasks still pending (AUTO-G5, bugfix).
-                try:
-                    self._check_regressions(task["id"], executor, bug_fix_loop)
-                except Exception as exc:  # noqa: BLE001 — never abort the run
-                    logger.warning(
-                        "_check_regressions raised after commit of %s — %s; "
-                        "continuing with remaining tasks.",
-                        task["id"], exc,
-                    )
+                if commit_result is not None and commit_result.git_error:
+                    # git failed: the task is NOT counted done, its status stays
+                    # open-to-a-resume, and the received work is kept as a patch
+                    # before a later task's commit can sweep it in or a reset
+                    # can delete it. The regression check is skipped — there is
+                    # no commit to check a tree against.
+                    patch_path = self._save_uncommitted_patch(task, result)
                     self.state.log(
-                        f"regression checks failed after commit of "
-                        f"{task['id']} ({type(exc).__name__}: {exc}) — "
-                        f"continuing with remaining tasks"
+                        f"task {task['id']} NOT counted done — commit failed "
+                        f"({commit_result.error})"
+                        + (f"; work saved to {patch_path}" if patch_path
+                           else "; could not save the work as a patch")
                     )
+                    logger.error(
+                        "task %s: commit failed after a passing acceptance "
+                        "check (%s) — not counted done, work %s",
+                        task["id"], commit_result.error,
+                        f"saved to {patch_path}" if patch_path
+                        else "left in the working tree (patch failed)",
+                    )
+                    if self.run_trace:
+                        self.run_trace.log_task_failed(
+                            task["id"], commit_result.error or "commit failed")
+                    # The edit IS in the tree, uncommitted: the collect model
+                    # built before it describes a tree that no longer exists,
+                    # so its paths are marked dirty here too (V9). With no sha,
+                    # _invalidate_collect falls back to the task's target_files.
+                    self._invalidate_collect(task["id"], collect_bridge, None)
+                else:
+                    tasks_done += 1
+                    self.state.log(
+                        f"task {task['id']} completed — "
+                        f"rounds={result.rounds_used} "
+                        f"commit={commit_hash[:12] if commit_hash else 'none'}"
+                    )
+                    if self.run_trace:
+                        self.run_trace.log_task_done(task["id"], commit_hash)
 
-                # The collect artifact predates this commit: mark the paths dirty after the regression fixes, since HEAD moved (V9).
-                self._invalidate_collect(task["id"], collect_bridge, commit_hash)
+                    # Post-commit regression check: guarded, so a failure cannot cost the tasks still pending (AUTO-G5, bugfix).
+                    try:
+                        self._check_regressions(task["id"], executor, bug_fix_loop)
+                    except Exception as exc:  # noqa: BLE001 — never abort the run
+                        logger.warning(
+                            "_check_regressions raised after commit of %s — %s; "
+                            "continuing with remaining tasks.",
+                            task["id"], exc,
+                        )
+                        self.state.log(
+                            f"regression checks failed after commit of "
+                            f"{task['id']} ({type(exc).__name__}: {exc}) — "
+                            f"continuing with remaining tasks"
+                        )
+
+                    # The collect artifact predates this commit: mark the paths dirty after the regression fixes, since HEAD moved (V9).
+                    self._invalidate_collect(task["id"], collect_bridge, commit_hash)
 
             elif getattr(result, "unavailable", False) is True:
                 # A Gate-2 outage (or a coder call that died) is not an exhaustion: no knowledge note or ticket; the candidate is discarded (RUN-7, RUN-8).
@@ -780,6 +820,73 @@ class AutoController:
 
         self._log_collect_summary(collect_bridge)
         return None, tasks_done  # all tasks done / no tasks
+
+    def _save_uncommitted_patch(self, task: dict, result) -> str:
+        """Write the task's uncommitted work to ``.agent/uncommitted-<id>.patch``
+        (B2), returning its path, or ``""`` when it could not be written.
+
+        Called when a task passed its acceptance check but its commit failed.
+        The edits are then still in the working tree, where the next task's
+        ``stage_all()`` would sweep them in under another id — or an exhausted
+        task's ``discard_working_changes()`` would delete them outright. A
+        ``git diff`` of the whole tree is the only copy that survives both.
+
+        The patch is written into ``.agent/`` (the run's own state directory,
+        already gitignored) so it can never itself show up as a user change.
+        Best-effort by design: a failure to save is logged, never raised — the
+        run must keep going.
+        """
+        task_id = safe_filename_component(task.get("id") or "unknown")
+        patch_path = self.agent_dir / f"uncommitted-{task_id}.patch"
+        try:
+            patch_path.parent.mkdir(parents=True, exist_ok=True)
+            diff = self.git.diff_working_tree()
+        except (GitError, OSError) as exc:
+            logger.error(
+                "task %s: could not capture the uncommitted work as a patch "
+                "(%s) — it stays only in the working tree.",
+                task_id, exc,
+            )
+            return ""
+        try:
+            atomic_write_text(patch_path, diff)
+        except OSError as exc:
+            logger.error(
+                "task %s: could not write %s (%s) — the uncommitted work "
+                "stays only in the working tree.", task_id, patch_path, exc,
+            )
+            return ""
+        if diff.strip():
+            logger.warning(
+                "task %s: commit failed — uncommitted work saved to %s",
+                task_id, patch_path,
+            )
+        return str(patch_path)
+
+    def _commit_outcome(self, commit_helper, task: dict, result) -> "CommitResult":
+        """Commit *task* and return the classified :class:`CommitResult` (B2).
+
+        Falls back to a plain outcome for a commit helper that predates the
+        classification (a test double, or an older build): its ``commit()`` sha
+        is all there is, and treating a missing classification as a failure
+        would silently stop counting successful tasks as done. The check is
+        ``isinstance``, not ``getattr``: a ``MagicMock`` auto-creates any
+        attribute asked of it, so only a real :class:`CommitResult` is trusted.
+        """
+        commit_result = getattr(commit_helper, "commit_result", None)
+        if callable(commit_result):
+            try:
+                classified = commit_result(task, result)
+            except Exception as exc:  # noqa: BLE001 — a broken helper must not lose a passed task
+                logger.warning(
+                    "task %s: commit_result raised (%s) — falling back to "
+                    "commit()'s sha.", task.get("id"), exc,
+                )
+            else:
+                if isinstance(classified, CommitResult):
+                    return classified
+        sha = commit_helper.commit(task, result)
+        return CommitResult(sha, COMMIT_OK if sha else COMMIT_NOTHING_TO_COMMIT)
 
     def _discard_exhausted_residue(
         self, task_id: str, reason: str = "exhausted",

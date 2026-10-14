@@ -35,7 +35,6 @@ import json
 import logging
 import math
 import re as _re
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,6 +49,7 @@ from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
 from tools.config_safe import safe_getboolean
+from tools.ui import safe_print as _safe_print, safe_stdout_write as _safe_stdout_write
 
 logger = logging.getLogger(__name__)
 
@@ -1140,11 +1140,15 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     tokens_list: list[str] = []
 
                     def streaming_callback(token: str) -> None:
-                        sys.stdout.write(token)
-                        sys.stdout.flush()
+                        # B1: a closed stdout must not drop the batch. The write is
+                        # cosmetic; tokens_list is what the parse actually reads.
+                        _safe_stdout_write(token)
                         tokens_list.append(token)
 
-                    print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
+                    # B1: the banner, the token callback and the closing rule
+                    # are all cosmetic writes; none may reach the except below,
+                    # which means "the LLM call failed" and would drop the batch.
+                    _safe_print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
                     returned = _llm_stream.request_completion(
                         url=url,
                         headers=headers,
@@ -1158,7 +1162,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     )
                     # The full response is preferred, falling back to the streamed tokens when it is empty.
                     raw_text = returned or "".join(tokens_list)
-                    print("\n" + "═" * 80 + "\n")
+                    _safe_print("\n" + "═" * 80 + "\n")
                     last_exc = None
                     break  # success — exit retry loop
 

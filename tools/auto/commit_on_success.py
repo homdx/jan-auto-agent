@@ -7,7 +7,9 @@ Called by the controller (or outer_loop caller) immediately after
 
     cos = CommitOnSuccess(git_manager, state_store)
     commit_hash = cos.commit(task, outer_result)
-    # → "abc123def456…"  or  None if nothing was staged
+    # → "abc123def456…"  or  None if nothing was staged or git failed
+    outcome = cos.commit_result(task, outer_result).outcome
+    # → "committed" / "nothing_to_commit" / "git_error"  (B2)
 
 Responsibilities
 ----------------
@@ -45,10 +47,17 @@ Responsibilities
 4. Never raises on a git failure; wraps ``GitError`` and returns ``None``,
    leaving the task status unchanged so the caller can decide what to do.
 
+B2: a git failure and "nothing staged" are both a ``None`` sha, so
+:meth:`CommitOnSuccess.commit_result` reports which one happened
+(:class:`CommitResult`). The controller counts a task done only when a commit
+actually happened or the tree had nothing new; on a git failure it keeps the
+work as a patch, logs it, and marks the task so a resume sees it.
+
 Public surface
 --------------
     CommitOnSuccess(git_manager, state_store)
-        .commit(task, outer_result)   -> Optional[str]   # commit hash or None
+        .commit(task, outer_result)        -> Optional[str]   # commit hash or None
+        .commit_result(task, outer_result) -> CommitResult   # the same, classified (B2)
 
     make_commit_on_success(config, repo_dir, state_store) -> CommitOnSuccess
 
@@ -72,6 +81,45 @@ from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
 # SummaryMemory is imported lazily in commit() to keep the import graph acyclic and avoid the LLM stack in tests.
 
 logger = logging.getLogger(__name__)
+
+# B2: the two ways ``commit_task`` can hand back no sha, told apart. They used to
+# share one ``None``, so the controller counted a task whose commit *failed* as
+# done, ran the regression check on a tree that was never committed, and left the
+# received work in the tree to be swept into the next commit or wiped by a reset.
+COMMIT_OK = "committed"
+COMMIT_NOTHING_TO_COMMIT = "nothing_to_commit"
+COMMIT_GIT_ERROR = "git_error"
+
+
+class CommitResult:
+    """What one :meth:`CommitOnSuccess.commit` call actually did (B2).
+
+    ``sha`` keeps its historical meaning — the full commit hash, or ``None``
+    when no commit was made — so every existing caller is unchanged.
+    ``outcome`` is what a caller that must tell the two ``None`` cases apart
+    reads: :data:`COMMIT_NOTHING_TO_COMMIT` when the tree simply had nothing
+    new (a quiet success, exactly as before), :data:`COMMIT_GIT_ERROR` when
+    git failed and the work is still uncommitted.
+    """
+
+    __slots__ = ("sha", "outcome", "error")
+
+    def __init__(self, sha: Optional[str], outcome: str, error: str = "") -> None:
+        self.sha = sha
+        self.outcome = outcome
+        self.error = error
+
+    @property
+    def committed(self) -> bool:
+        return self.outcome == COMMIT_OK
+
+    @property
+    def git_error(self) -> bool:
+        """True only when git failed — the case the run must account for."""
+        return self.outcome == COMMIT_GIT_ERROR
+
+    def __repr__(self) -> str:  # pragma: no cover — diagnostics only
+        return f"CommitResult(sha={self.sha!r}, outcome={self.outcome!r})"
 
 
 class CommitOnSuccess:
@@ -123,6 +171,19 @@ class CommitOnSuccess:
         str or None
             The full SHA-1 commit hash on success, or ``None`` if the commit
             was skipped (nothing staged) or a :class:`GitError` was raised.
+
+        B2: the two ``None`` cases are no longer indistinguishable —
+        :meth:`commit_result` returns a :class:`CommitResult` naming which one
+        happened, and the controller does not count a task whose commit failed
+        as done.
+        """
+        return self.commit_result(task, outer_result).sha
+
+    def commit_result(self, task: dict, outer_result=None) -> CommitResult:
+        """Stage, commit, and report *what happened* (B2).
+
+        The same work as :meth:`commit`, but classified: see
+        :class:`CommitResult`. This is what the controller calls.
         """
         task_id = task.get("id", "UNKNOWN")
         title   = task.get("title", "")
@@ -144,7 +205,11 @@ class CommitOnSuccess:
                 params={"task": task_id},
                 content=str(exc),
             )
-            return None
+            # B2: the work is still in the tree and uncommitted. The task status
+            # is deliberately left unchanged here so every existing caller (and
+            # its tests) keeps the old behaviour; the controller is the one that
+            # marks it, from the outcome reported here.
+            return CommitResult(None, COMMIT_GIT_ERROR, str(exc))
 
         if sha:
             logger.info(
@@ -229,8 +294,9 @@ class CommitOnSuccess:
                     "commit_on_success", "controller", "nothing_staged",
                     params={"task": task_id},
                 )
+            return CommitResult(None, COMMIT_NOTHING_TO_COMMIT)
 
-        return sha
+        return CommitResult(sha, COMMIT_OK)
 
     @staticmethod
     def _is_trivial_acceptance_check(check: Optional[str]) -> bool:

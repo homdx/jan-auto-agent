@@ -1,4 +1,3 @@
-import sys
 import time
 import json
 import ssl
@@ -9,22 +8,9 @@ import logging
 
 from tools.agent_trace import tracer
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
+from tools.ui import safe_stdout_write as _safe_stdout_write
 
 logger = logging.getLogger(__name__)
-
-
-def _safe_stdout_write(t: str) -> None:
-    """Write a streaming token to stdout, swallowing BrokenPipeError.
-
-    When stdout is piped to a command that closes early (e.g. ``head``),
-    ``sys.stdout.write`` raises BrokenPipeError — swallow it so the LLM
-    call result is not lost.
-    """
-    try:
-        sys.stdout.write(t)
-        sys.stdout.flush()
-    except (BrokenPipeError, OSError):
-        pass
 
 # Hardcoded fallback prompt: PromptStore can always return to it. Values are injected via .format() in validate(), not an f-string.
 VALIDATOR_PROMPT_HARDCODED = (
