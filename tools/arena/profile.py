@@ -226,5 +226,10 @@ def dedupe_flags(words: list[str]) -> list[str]:
 
 
 def _one_line(err: Exception) -> str:
-    """configparser's messages span lines (file, line, text); keep the first."""
-    return str(err).splitlines()[0]
+    """configparser's messages span lines (file, line, text); keep the first.
+
+    An exception with no message at all has no lines, and its type name is the
+    one thing left to print instead of an `IndexError` out of the guard.
+    """
+    lines = str(err).splitlines()
+    return lines[0] if lines else type(err).__name__

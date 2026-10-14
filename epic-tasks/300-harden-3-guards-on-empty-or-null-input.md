@@ -1,10 +1,10 @@
 # HARDEN-3 — five guards on empty or null input: an empty ticket, a brace-form rename, an empty TARGET, a null timestamp, an empty exception message
 
-**Status:** open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 300: step-5-preview as the base, with the doubled slash of an emptied rename side fixed; black box 300, 20 checks). Before: open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** LOW (C2 is the only one that changes a result on a real input)
 **File:** `tools/contest/gates.py`, `tools/contest/runner.py`, `scripts/gate1_vote_layer2.py`, `tools/auto/view_trace.py`, `tools/arena/profile.py`
 **Symbol:** `ticket_for_round`, `_split_numstat`, the `TARGET` read in `gate1_vote_layer2.main`, `render_summary`, `_one_line`
-**Round:** —
+**Round:** 300
 **Size:** S
 **Depends on:** CC review fixes 34–36 (landed, `c2ef95b`): this ticket starts from their code
 **Also touches:** `tests/test_guards_empty_input.py` and one pinned test per row in `tests_bugfix/`

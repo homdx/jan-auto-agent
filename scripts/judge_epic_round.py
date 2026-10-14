@@ -1371,6 +1371,12 @@ def main():
     if not name:
         print(f"no ticket numbered {a.round} in {a.tasks}/", file=sys.stderr)
         return 1
+    if not title:
+        # An empty ticket file has no title: the round cannot be named, and its
+        # declared paths are empty, so it is refused here, naming the file.
+        print(f"{a.tasks}/{name} is empty — the round needs a ticket with a title",
+              file=sys.stderr)
+        return 1
 
     trees = []
     for spec in a.worktree:

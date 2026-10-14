@@ -1501,12 +1501,18 @@ def _commits_above(ws: Workspace) -> int:
     return int(count) if count.isdigit() else 0
 
 
+#: One `{old => new}` group of git's brace form for a rename, `{}`-free on both
+#: sides so two groups in one path (`a/{b => c}/{d => e}/f`) each stand alone.
+_RENAME_BRACE = re.compile(r"\{([^{}]*?)\s*=>\s*([^{}]*)\}")
+
+
 def _split_numstat(line: str) -> tuple[int, int, str]:
     """`(added, deleted, path)` of one `git diff --numstat` line.
 
     `(0, 0, "")` for anything that is not a numstat line: a binary file is a
     `-` where a number belongs, a rename arrives as `path => path`, and an
-    empty output has no lines at all.
+    empty output has no lines at all. A rename's path field is read by
+    `_rename_target`, which expands git's brace form of it (C2).
     """
     parts = line.split("\t")
     if len(parts) != 3:
@@ -1516,7 +1522,26 @@ def _split_numstat(line: str) -> tuple[int, int, str]:
         added, deleted = int(parts[0]), int(parts[1])
     except ValueError:
         added, deleted = 0, 0
-    return added, deleted, parts[2].strip().rsplit(" => ", 1)[-1]
+    return added, deleted, _rename_target(parts[2].strip())
+
+
+def _rename_target(path: str) -> str:
+    """The new side of one `--numstat` rename field (C2).
+
+    Git spells a rename two ways, and the brace form is the one it uses by
+    default: when the two paths share a head or a tail it writes
+    `a/{b => c}/d.txt` (and `{a => b}/x` for a rename in the root), and only a
+    rename with nothing shared comes out as the plain `old => new`. Taking the
+    last ` => ` of a brace field verbatim yields `c}/d.txt` — a path that exists
+    in no tree — so every `{old => new}` group is replaced by its own new side
+    first. A group with no ` => ` in it is not a rename and is left as it is.
+    """
+    expanded = _RENAME_BRACE.sub(lambda m: m.group(2), path)
+    if expanded != path:
+        # An emptied side leaves a doubled or a leading slash: `a/{b => }/c.txt` is `a//c.txt`, and `{b => }/c.txt`
+        # is `/c.txt` — a file lifted out of a directory is `a/c.txt`, `c.txt`.
+        return re.sub(r"/{2,}", "/", expanded).lstrip("/")
+    return path.rsplit(" => ", 1)[-1]
 
 
 def _line_count(path: Path) -> int:

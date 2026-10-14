@@ -612,7 +612,12 @@ def main(argv=None) -> int:
         print(f"{known / 'plan.json'}: candidates share a title ({twins[0]!r}): the run's log names a candidate "
               "by its title, so the set needs one title a candidate", file=sys.stderr)
         return 2
-    sha = (known / "TARGET").read_text(encoding="utf-8").split()[0]
+    target = known / "TARGET"
+    target_sha = target.read_text(encoding="utf-8").split()
+    if not target_sha:
+        print(f"{target} is empty — it names the target's sha", file=sys.stderr)
+        return 1
+    sha = target_sha[0]
     truth = load_truth(known)
 
     if args.dry_run:

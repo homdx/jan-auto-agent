@@ -154,12 +154,19 @@ def declared_files(ticket_path) -> tuple[str, ...]:
 
 
 def ticket_for_round(tasks_dir, n):
-    """`(filename, title, declared paths)` for the ticket numbered *n*, or None."""
+    """`(filename, title, declared paths)` for the ticket numbered *n*, or None.
+
+    A ticket file that is empty has no first line to take a title from, so its
+    title is `""` and its declared paths `[]` — the round that found it refuses
+    it with a message naming the file, rather than an `IndexError` out of the
+    read.
+    """
     for name in sorted(os.listdir(tasks_dir)):
         m = re.match(r"^0*(\d+)-.*\.md$", name)
         if m and int(m.group(1)) == n:
             body = Path(os.path.join(tasks_dir, name)).read_text(encoding="utf-8")
-            title = body.splitlines()[0].lstrip("# ").strip()
+            lines = body.splitlines()
+            title = lines[0].lstrip("# ").strip() if lines else ""
             return name, title, list(_declared_paths(body))
     return None, None, []
 

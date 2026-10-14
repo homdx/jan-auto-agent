@@ -152,7 +152,7 @@ def render_summary(events: list[dict], use_color: bool = True) -> str:
     rows = []
     for evt in events:
         seq  = str(evt.get("seq", "?")).rjust(4)
-        ts   = evt.get("ts", "")[:19]
+        ts   = (evt.get("ts") or "")[:19]
         src  = (evt.get("source") or "?")[:18].ljust(18)
         tgt  = (evt.get("target") or "?")[:18].ljust(18)
         kind = (evt.get("kind") or "?")[:18].ljust(18)
