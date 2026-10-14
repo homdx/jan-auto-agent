@@ -1,9 +1,9 @@
-# HARDEN-1 — six defects in what a model's reply can contain: the verdict parser, the stream chunk, the prompt store, a dotted reference, quadratic claim extraction and two digit regexes
+# HARDEN-1 — seven defects in what a model's reply can contain: the verdict parser, the stream chunk, the prompt store, a dotted reference, quadratic claim extraction, two digit regexes, and a code fence inside a JSON string
 
 **Status:** open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** MEDIUM (wrong answers on inputs nobody tested; none loses data on a normal run)
-**File:** `tools/auto/inner_loop.py`, `tools/llm_stream.py`, `tools/collect/verifier.py`, `tools/auto/story_bible.py`, `scripts/judge_epic_round.py`, `tools/prompt_store.py`, `tools/block_extractor.py`, `tools/search_agent.py`
-**Symbol:** `_parse_verdict_soft`, `request_completion` (the OpenAI SSE branch), `PromptStore.get_store_summary`, `extract_block` / `find_references`, `extract_claims` / `_iter_access_citations`, `_AGE_RE`, `_HAS_DURATION`
+**File:** `tools/auto/inner_loop.py`, `tools/llm_stream.py`, `tools/collect/summarizer.py`, `tools/collect/verifier.py`, `tools/auto/story_bible.py`, `scripts/judge_epic_round.py`, `tools/prompt_store.py`, `tools/block_extractor.py`, `tools/search_agent.py`
+**Symbol:** `_parse_verdict_soft`, `request_completion` (the OpenAI SSE branch), `PromptStore.get_store_summary`, `extract_block` / `find_references`, `extract_claims` / `_iter_access_citations`, `_AGE_RE`, `_HAS_DURATION`, Gate 2's fence split in `inner_loop.py`, `strip_json_fence`, `_parse_llm_summary`
 **Round:** —
 **Size:** M
 **Depends on:** CC review fixes 34–36 (landed, `c2ef95b`): this ticket starts from their code
@@ -115,9 +115,34 @@ unlikely, which is why this is low.
 **Fix:** anchor the start with `(?<!\d)` or cap the line length.
 **Test:** 20 000 digits on one line: under a second, and the matches on ordinary text are unchanged.
 
+### A7. A reply with a code fence inside a JSON string is discarded as unparseable — `run`
+
+**Where:** `tools/auto/inner_loop.py` (Gate 2's own copy: `raw.split("```json")[1].split("```")[0]` at lines 729 and 731), `tools/llm_stream.py` `strip_json_fence` (the **bare**
+JSON case), and the callers that take a reply through it: `tools/collect/summarizer.py` `_parse_llm_summary`, `tools/validator_agent.py`, `tools/actions.py`, `tools/improvement_agent.py`.
+Not a regression of fix 36: it predates it. Fix 36 repaired only the ```` ```json ````-wrapped body with a fence inside, and only in `strip_json_fence`.
+**Evidence (current code):** a valid reply `{"purpose": "Retry helper.", "notes": "Typical use:\n```python\nretry(fetch, 3)\n```"}`:
+
+| call | result |
+|---|---|
+| `strip_json_fence(bare)` | breaks: `JSONDecodeError`, the text is cut at the fence inside the string (`'python\nretry(fetch, 3)\n'`) |
+| `strip_json_fence("```json\n" + bare + "\n```")` | parses (fix 36) |
+| `_parse_llm_summary(bare)` | `('', '')`, no error: the "module left without a summary" case CC-15 (297) says collect never retries |
+| Gate 2 (`inner_loop.py:729/731`), bare or wrapped, a verdict whose hint quotes a code sample | cut at the inner fence: garbage |
+
+The reviewer's run of the real `LLMGate2Validator.approve()` with the model call stubbed (not repeated here): bare and wrapped rejections, and bare and wrapped **approvals**,
+all end `approved=False unavailable=True`; the control with no fence anywhere is fine. So an APPROVED verdict is read as "validator unavailable", `InnerLoop` re-runs Gate 2
+`validator_unavailable_retries` (default 2) times with a 60 s wait, and when the replies keep the fence the round ends unavailable; the controller resets the task to TODO and
+**discards the passing candidate**. A rejection that quotes a code sample (the most useful hint) never reaches the Coder. The next run sends the same prompt and usually gets the
+same shape of reply.
+**Fix:** parse the whole stripped reply first and return it if it is valid JSON; only then fall back to fence stripping. Replace the inline split in `inner_loop.py` with
+`strip_json_fence`, so Gate 2 gets fix 36's `_before_closing_fence` as well. The reviewer tested the wrapper on bare, wrapped, prose-plus-block, unclosed-fence, plain-fence and
+no-fence replies: all six parse, where the current code fails the bare-with-fence one.
+**Test:** the table's four rows return the object; the six reply shapes above all parse; Gate 2 with a stubbed model returns `approved=True` for a bare and a wrapped approval whose
+text quotes a fence, and a rejection's hint reaches the Coder intact; no-fence replies are unchanged.
+
 ## Contest
 
-One commit. Score by the shared tests in `contest-bench/298/` (each defect's reproduction as a script that exits non-zero on the bug), not by the entries' own tests; cross-test every entry's tests against every other's code. A1 and A5 are the ones that cost: A1 sends an approval to the Coder as a defect, A5 freezes `--collect`: an approval that begins with `NO…` goes to the Coder as a defect. Judge A1 by hand; A2–A4 by the pinned tests. Free models are enough for A2–A4 and A6; A1 and A5 want a strong one (A5 must match the old function on crossing brackets).
+One commit. Score by the shared tests in `contest-bench/298/` (each defect's reproduction as a script that exits non-zero on the bug), not by the entries' own tests; cross-test every entry's tests against every other's code. A1, A5 and A7 are the ones that cost: A1 sends an approval to the Coder as a defect, A5 freezes `--collect`, A7 throws away an approved candidate: an approval that begins with `NO…` goes to the Coder as a defect. Judge A1 by hand; A2–A4 by the pinned tests. Free models are enough for A2–A4 and A6; A1, A5 and A7 want a strong one (A5 must match the old function on crossing brackets).
 
 ## Refused (shared by HARDEN-1 … HARDEN-4, so they are not opened again)
 
