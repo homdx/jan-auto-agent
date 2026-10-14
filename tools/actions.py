@@ -12,6 +12,7 @@ import re
 import json
 import time
 import logging
+from typing import List, Tuple
 
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
 from tools.agent_trace import tracer
@@ -48,6 +49,135 @@ def _resolve_within_base(base_dir: str, file_path: str) -> "str | None":
     except ValueError:
         return None
     return target_real if inside else None
+
+
+def _edit_write_encodings(target: str) -> "Tuple[str, ...]":
+    """CC-16 (Part C): the encodings `/edit` may write *target* back in, most
+    faithful first — decided **once, from the file's own bytes, before the
+    model is asked**, so the whole run works from one decision instead of
+    re-deriving one at the write (where it is too late to matter).
+
+    Fix 34 chose the encoding at the write, by testing whether the bytes
+    decode as UTF-8 and otherwise falling back to `latin-1` — "write back
+    what it read". That is right while the model hands back what it was
+    shown (the file read as Latin-1, mojibake and all) and wrong the moment
+    it *fixes* the text, which is what it is asked to do for a legacy file:
+    a revision with real Cyrillic, or `“ ” — … → ✓`, cannot be encoded in
+    Latin-1, the write fails, and — because the failure is only discovered
+    after every LLM iteration has run — the whole edit is thrown away and
+    the user is told a codec could not encode, not that the file is not
+    UTF-8.
+
+    So: `utf-8` when the bytes decode as UTF-8 (unchanged, in every
+    respect — a UTF-8 BOM is valid UTF-8, so it stays on this path). Otherwise
+    the legacy encodings that both decode these bytes and can be written back,
+    tried in order — the file's own codec first (`cp1251` then `cp1252`, the
+    two this repository's creative pipeline actually holds, and whichever
+    round-trips wins), `latin-1` last since it decodes every byte and can
+    therefore always be written back to. A UTF-8 file returns exactly
+    `("utf-8",)`, so a UTF-8 edit is byte-identical to fix 34's.
+    """
+    try:
+        with open(target, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        # Unreadable here means unreadable at the write too, and run_edit
+        # already refused to read it before this point.
+        return ("utf-8",)
+
+    try:
+        raw.decode("utf-8")
+        return ("utf-8",)
+    except UnicodeDecodeError:
+        pass
+
+    candidates: List[str] = []
+    for legacy in ("cp1251", "cp1252"):
+        try:
+            text = raw.decode(legacy)
+        except UnicodeDecodeError:
+            continue
+        # The codec has to describe *this* file, not merely accept the bytes:
+        # cp1251 and cp1252 both decode every byte, so the test is that
+        # encoding the decoded text reproduces the original.
+        if text.encode(legacy) == raw:
+            candidates.append(legacy)
+    candidates.append("latin-1")  # decodes anything, so always writable
+    return tuple(candidates)
+
+
+def _pick_edit_encoding(encodings: "Tuple[str, ...]", revised: str) -> "Tuple[str | None, str]":
+    """CC-16 (Part C): the first of *encodings* that can hold *revised*, or
+    `(None, the characters that fit none of them)`.
+
+    The same list is walked in order at every revision, so one file has one
+    encoding for the whole run: a first attempt that fitted in cp1252 is
+    not followed by a retry that comes back in cp1251. The returned
+    characters are the reportable ones — printable, de-duplicated, in the
+    order they appear — so the refusal can name what is missing instead of
+    quoting a bare codec message.
+    """
+    for encoding in encodings:
+        try:
+            revised.encode(encoding)
+            return encoding, ""
+        except UnicodeEncodeError:
+            continue
+    # No candidate holds the revision: name the characters that fit none of
+    # them, so the message says what is missing rather than quoting a codec.
+    seen: List[str] = []
+    for ch in revised:
+        if ch in seen or not ch.isprintable():
+            continue
+        if all(_cannot_encode(ch, enc) for enc in encodings):
+            seen.append(ch)
+    return None, " ".join(seen[:12])
+
+
+def _cannot_encode(ch: str, encoding: str) -> bool:
+    """True when *ch* has no representation in *encoding*."""
+    try:
+        ch.encode(encoding)
+        return False
+    except UnicodeEncodeError:
+        return True
+
+
+def _remove_edit_backup(path: str) -> None:
+    """CC-16 (Part C): remove the `.bak` a failed `/edit` write made, so no backup of
+    an edit that did not happen is left behind.
+
+    Fail-open throughout — nothing here raises into a run. The interesting case is
+    the one where the *unlink* fails too: a write that failed because the directory
+    is not writable is blocked by the same permission from cleaning up after itself,
+    which is exactly when the stray backup matters most. The backup is this run's
+    own artifact and its name is known, so the directory's write bit is put back for
+    the single unlink and the original mode restored immediately afterwards.
+    """
+    try:
+        os.unlink(path)
+        return
+    except OSError:
+        pass
+
+    parent = os.path.dirname(path) or "."
+    try:
+        mode = os.stat(parent).st_mode & 0o7777
+    except OSError:
+        return
+    if mode & 0o200:
+        return  # writable, and the unlink still failed: nothing to gain here
+    try:
+        os.chmod(parent, mode | 0o700)
+        try:
+            os.unlink(path)
+        finally:
+            try:
+                os.chmod(parent, mode)
+            except OSError:
+                pass
+    except OSError as exc:
+        logger.warning("could not remove the backup of a failed edit %s: %s", path, exc)
 
 
 class _SearchChunkFailed(Exception):
@@ -851,6 +981,34 @@ class OrchestratorActions:
             print(f"[{_ts()}] Could not read {target}: {e}")
             return
 
+        # ── CC-16 (Part C): the write encoding, decided once ───────────────────────
+        # From the file's own bytes, before the model is asked, so the run has one
+        # decision rather than one derived at the write (where the edit is already
+        # spent). See `_edit_write_encodings`: a UTF-8 file is ("utf-8",), exactly
+        # what fix 34 chose; a legacy file gets the codecs it can be written back
+        # in, its own first and latin-1 last.
+        _edit_encodings = _edit_write_encodings(target)
+        _legacy_named = [e for e in _edit_encodings if e not in ("utf-8", "latin-1")]
+        _encoding = _edit_encodings[0] if len(_edit_encodings) == 1 else ""
+
+        def _refuse_unwritable(text: str) -> bool:
+            """True (after saying why) when *text* fits none of the file's write
+            encodings. Checked the moment a revision exists — so a legacy file
+            whose revision carries characters its codec cannot hold is refused
+            before the validator runs and long before a write is attempted,
+            instead of after every iteration has been spent."""
+            nonlocal _encoding
+            encoding, missing = _pick_edit_encoding(_edit_encodings, text)
+            if encoding is not None:
+                _encoding = encoding
+                return False
+            print(f"[{_ts()}] ❌ Cannot write {file_path}: the file is not UTF-8 "
+                  f"({_legacy_named[0] + '?' if _legacy_named else 'latin-1'}) and the "
+                  f"revised text has characters it cannot hold: {missing}. "
+                  f"Convert the file to UTF-8 first, or ask for a revision "
+                  f"without those characters — nothing was written.")
+            return True
+
         # ── prev-context window ─────────────────────────────────────────────────────────
         _prev_ctx_every   = 0
         _prev_ctx_max     = 0   # max chars for previous_revised; 0 = no limit
@@ -874,6 +1032,11 @@ class OrchestratorActions:
             _is_reset_iter    = resume_state.get("_is_reset_iter", False)
             print(f"[{_ts()}] ▶  Resuming run_edit from iteration {iteration} "
                   "(checkpoint restored).")
+            # A resumed revision is checked before anything else is asked for: it
+            # is already known to be unwritable, and re-deriving it would cost
+            # another round of model calls for the same refusal.
+            if revised.strip() and _refuse_unwritable(revised):
+                return
 
         # A while loop lets an API error retry without using up the iteration count.
         while iteration <= self.max_iterations:
@@ -932,6 +1095,14 @@ class OrchestratorActions:
             revised = _new_revised
             if not revised.strip():
                 print(f"[{_ts()}] No content produced — file left unchanged.")
+                return
+            # CC-16 (Part C): the revision is checked against the file's write
+            # encoding as soon as it exists, before the validator is called and
+            # before any backup is made. A legacy file the model has *fixed* —
+            # real Cyrillic, curly quotes, a dash — is written back in its own
+            # codec; a revision no codec here can hold is refused here, not after
+            # the last iteration has run and the whole edit is already spent.
+            if _refuse_unwritable(revised):
                 return
             print(f"[{_ts()}] ⏱  Edit generated in {time.time() - _step_start:.1f}s")
             print(f"[{_ts()}] 🤖 Validating edit ({iteration}/{self.max_iterations})...")
@@ -1010,15 +1181,17 @@ class OrchestratorActions:
             from pathlib import Path
             from tools.auto.utils import atomic_write_text, in_style_of
             shutil.copy2(target, backup)        # the original's bytes and mode
-            with open(target, "rb") as fh:
-                raw = fh.read()
-            try:
-                raw.decode("utf-8")
-                encoding = "utf-8"
-            except UnicodeDecodeError:
-                encoding = "latin-1"            # read_file's fallback: write back what it read
-            atomic_write_text(target, in_style_of(Path(target), revised), newline="", encoding=encoding)
+            atomic_write_text(
+                target, in_style_of(Path(target), revised), newline="", encoding=_encoding,
+            )
         except Exception as e:
+            # CC-16 (Part C): the backup was made for a write that never landed.
+            # `copy2` runs before anything can fail, so without this a refused or
+            # failed edit leaves a timestamped `.bak` behind — an artifact of an
+            # edit that did not happen, which is exactly the stray
+            # `note.txt.bak.135608` this part was filed over. A backup of a write
+            # that *succeeded* stays, as fix 34 left it.
+            _remove_edit_backup(backup)
             print(f"[{_ts()}] ❌ Failed to write {target}: {e}")
             return
 

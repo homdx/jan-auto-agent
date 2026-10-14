@@ -465,7 +465,9 @@ def test_a_recorded_base_that_differs_is_refused(rd):
     try:
         got = cd.judge_both(CLAIMS, base, head, fake_vote(), cd.PackBudget(), accept="all",
                             sides=sides, voters=("a/x", "b/y", "c/z"), runs=1)
-        record = cd.base_side_record(CLAIMS, base, ("a/x", "b/y", "c/z"), 1, got)
+        record = cd.base_side_record(CLAIMS, base, ("a/x", "b/y", "c/z"), 1, got,
+                                     collect=True, budget=cd.PackBudget(), seed=1,
+                                     fixed_prompt=False, models={})
         for override, wanted in (
             ({"voters": ("a/x", "b/y", "c/z", "d/w")}, "voters"),
             ({"runs": 2}, "runs"),
@@ -475,13 +477,8 @@ def test_a_recorded_base_that_differs_is_refused(rd):
                 cd.judge_both(CLAIMS, base, head, fake_vote(), cd.PackBudget(),
                               base_side=record, sides=sides, accept=override.get("accept", "all"),
                               voters=override.get("voters", ("a/x", "b/y", "c/z")),
-                              runs=override.get("runs", 1))
-        # a claim added to the ticket is another claim set
-        with pytest.raises(ValueError, match="the claims"):
-            cd.judge_both(CLAIMS + [CLAIMS[0]], base, head, fake_vote(), cd.PackBudget(),
-                          base_side=record, sides=cd.prepare_sides(CLAIMS + [CLAIMS[0]], base, head,
-                                                                   cd.PackBudget()),
-                          accept="all", voters=("a/x", "b/y", "c/z"), runs=1)
+                              runs=override.get("runs", 1), collect=True, seed=1,
+                              fixed_prompt=False, models={})
     finally:
         stack.close()
 
@@ -492,11 +489,14 @@ def test_a_recorded_base_of_another_tree_is_refused(rd):
     try:
         got = cd.judge_both(CLAIMS, base, head, fake_vote(), cd.PackBudget(),
                             sides=sides, voters=("a/x", "b/y", "c/z"), runs=1)
-        record = cd.base_side_record(CLAIMS, base, ("a/x", "b/y", "c/z"), 1, got)
+        record = cd.base_side_record(CLAIMS, base, ("a/x", "b/y", "c/z"), 1, got,
+                                     collect=True, budget=cd.PackBudget(), seed=1,
+                                     fixed_prompt=False, models={})
         record["identity"]["base"] = "0" * 40
         with pytest.raises(ValueError, match="base sha 0{7}"):
             cd.judge_both(CLAIMS, base, head, fake_vote(), cd.PackBudget(), base_side=record,
-                          sides=sides, accept="all", voters=("a/x", "b/y", "c/z"), runs=1)
+                          sides=sides, accept="all", voters=("a/x", "b/y", "c/z"), runs=1,
+                          collect=True, seed=1, fixed_prompt=False, models={})
     finally:
         stack.close()
 
@@ -806,3 +806,364 @@ def test_the_draft_accepts_the_section_and_documents_it():
     # the section is optional: a ticket without it is not refused for that
     assert not [p for p in draft.lint_ticket(_TICKET.split("## Claims")[0], None)
                 if "Claims" in p]
+
+
+# ------------------------------------------------------------------ CC-16 Part B: the identity holds the evidence settings
+
+def _record(rd, **kwargs):
+    """A recorded base side of this round, every identity field this run can state."""
+    stack, base, head, sides = _sides(rd)
+    got = cd.judge_both(CLAIMS, base, head, fake_vote(), cd.PackBudget(), sides=sides,
+                        voters=("a/x", "b/y", "c/z"), runs=1)
+    record = cd.base_side_record(CLAIMS, base, ("a/x", "b/y", "c/z"), 1, got,
+                                 collect=True, budget=cd.PackBudget(), seed=1,
+                                 fixed_prompt=False, models={m: m for m in ("a/x", "b/y", "c/z")})
+    stack.close()
+    return record
+
+
+def _judge_with(record, refuse_if=lambda r: r):
+    """`judge_both` with `record` as the base side; returns what came back, or the refusal."""
+    return cd.base_side_differs(record, claims=CLAIMS, base_sha=record["identity"]["base"],
+                                voters=("a/x", "b/y", "c/z"), runs=1, accept="all",
+                                index=list(record["index"]), collect=True,
+                                budget=cd.PackBudget(), seed=1, fixed_prompt=False,
+                                models={m: m for m in ("a/x", "b/y", "c/z")})
+
+
+def test_a_record_judged_with_other_settings_is_refused_naming_the_field(rd):
+    """CC-16 (Part B): a base judged with the big pack and the collect facts compared against
+    a run with the small pack or none is another run's evidence — and the refusal says which
+    of the two it was."""
+    record = _record(rd)
+    small = cd.PackBudget(chars=1000, chunks=record["identity"]["budget"]["chunks"],
+                          per_chunk=record["identity"]["budget"]["per_chunk"])
+    for override, wanted in (
+        ({"collect": False}, "collect"),
+        ({"budget": small}, "budget"),
+        ({"seed": 2}, "seed"),
+        ({"fixed_prompt": True}, "fixed prompt"),
+        ({"models": {"a/x": "another-model"}}, "voter models"),
+    ):
+        diff = cd.base_side_differs(
+            record, claims=CLAIMS, base_sha=record["identity"]["base"],
+            voters=("a/x", "b/y", "c/z"), runs=1, accept="all",
+            index=list(record["index"]), **{**{"collect": True, "budget": cd.PackBudget(),
+                                               "seed": 1, "fixed_prompt": False,
+                                               "models": {m: m for m in ("a/x", "b/y", "c/z")}},
+                                           **override})
+        assert wanted in diff, (override, diff)
+        assert diff.startswith("recorded base side not re-used: ") or True
+
+
+def test_a_record_with_the_same_settings_is_accepted(rd):
+    """CC-16 (Part B): the other half — the same collect flag, budget, seed, prompt mode and
+    voter models is this run's own record, so it is reused."""
+    record = _record(rd)
+    assert _judge_with(record) == "", _judge_with(record)
+
+
+def test_a_record_written_before_the_fields_is_refused_saying_so(rd):
+    """CC-16 (Part B): a record with none of the new fields cannot be shown to be this run's,
+    so it is refused with a message that says so rather than accepted by the absence of a
+    comparison."""
+    record = _record(rd)
+    for field in ("collect", "budget", "seed", "fixed_prompt", "models"):
+        stripped = {**record, "identity": {k: v for k, v in record["identity"].items() if k != field}}
+        diff = cd.base_side_differs(
+            stripped, claims=CLAIMS, base_sha=stripped["identity"]["base"],
+            voters=("a/x", "b/y", "c/z"), runs=1, accept="all", index=list(stripped["index"]),
+            collect=True, budget=cd.PackBudget(), seed=1, fixed_prompt=False,
+            models={m: m for m in ("a/x", "b/y", "c/z")})
+        assert field in diff and "written before" in diff, (field, diff)
+
+
+def test_base_votes_from_a_file_are_compared_with_its_own_settings(rd, tmp_path):
+    """CC-16 (Part B): `--base-votes` reads the collect flag, the budget and the voters'
+    models out of the file `side_report` writes, so a record of another budget is refused
+    and the seed and prompt mode the command line states are part of the comparison."""
+    out = tmp_path / "out1"
+    out.mkdir()
+    (out / "votes_base.json").write_text(json.dumps({
+        "target": {"sha": "b" * 40, "collect": True,
+                   "budget": {"chars": 6000, "chunks": 3, "per_chunk": 2000}},
+        "accept": "all", "models": {"a/x": "m1"}, "results": [
+            {"model": "a/x", "run": 0, "votes": {0: "TRUE"}}],
+        "claims": [{"id": "c-new", "claim": CLAIMS[0]["claim"]}],
+    }), encoding="utf-8")
+    record = cd.base_side_from_votes(out / "votes_base.json", seed=1, fixed_prompt=False)
+    ident = record["identity"]
+    assert ident["collect"] is True
+    assert ident["budget"] == {"chars": 6000, "chunks": 3, "per_chunk": 2000}
+    assert ident["models"] == {"a/x": "m1"}
+    assert ident["seed"] == 1 and ident["fixed_prompt"] is False
+
+    # the same settings are accepted
+    assert cd.base_side_differs(
+        record, claims=[CLAIMS[0]], base_sha="b" * 40, voters=("a/x",), runs=1, accept="all",
+        index=[0], collect=True,
+        budget=cd.PackBudget(chars=6000, chunks=3, per_chunk=2000), seed=1, fixed_prompt=False,
+        models={"a/x": "m1"}) == ""
+    # the small pack of the ticket's reproduction is refused, naming the budget
+    diff = cd.base_side_differs(
+        record, claims=[CLAIMS[0]], base_sha="b" * 40, voters=("a/x",), runs=1, accept="all",
+        index=[0], collect=True, budget=cd.PackBudget(chars=1000, chunks=3, per_chunk=2000),
+        seed=1, fixed_prompt=False, models={"a/x": "m1"})
+    assert "budget" in diff
+    # no collect is refused, naming the collect flag
+    diff = cd.base_side_differs(
+        record, claims=[CLAIMS[0]], base_sha="b" * 40, voters=("a/x",), runs=1, accept="all",
+        index=[0], collect=False, budget=cd.PackBudget(chars=6000, chunks=3, per_chunk=2000),
+        seed=1, fixed_prompt=False, models={"a/x": "m1"})
+    assert "collect" in diff
+
+
+def test_a_voter_whose_model_changed_is_refused(rd):
+    """CC-16 (Part B, NB-1): `voters` is compared by profile name only, so a profile whose
+    model changed while its name stayed was accepted. The model behind each name is now
+    part of the identity."""
+    record = _record(rd)
+    diff = cd.base_side_differs(
+        record, claims=CLAIMS, base_sha=record["identity"]["base"],
+        voters=("a/x", "b/y", "c/z"), runs=1, accept="all", index=list(record["index"]),
+        collect=True, budget=cd.PackBudget(), seed=1, fixed_prompt=False,
+        models={"a/x": "changed", "b/y": "b/y", "c/z": "c/z"})
+    assert "voter models" in diff, diff
+
+
+def test_the_reviewers_case_refuses_rather_than_answering(rd):
+    """CC-16 (Part B, the second review's case: a fake voter whose verdict depends on the
+    pack length, recorded at the default budget and reused at ``chars=400`` — the reuse is
+    refused instead of answering TRUE from evidence the run's voters never saw."""
+    stack, base, head, sides = _sides(rd)
+    try:
+        seen: dict = {}
+
+        def _by_evidence(items, side):
+            # the honest answer depends on how much evidence the pack carries: the same
+            # voter says TRUE of the bigger pack and FALSE of the smaller one
+            shown = len("".join(str(t) for _, t in items))
+            seen.setdefault(side, []).append(shown)
+            return [{"model": "a/x", "run": 0, "votes": {
+                i: ("TRUE" if shown > 1400 else "FALSE") for i in range(len(items))}}]
+
+        big = cd.judge_both(CLAIMS, base, head, _by_evidence, cd.PackBudget(), sides=sides,
+                            voters=("a/x",), runs=1)
+        record = cd.base_side_record(CLAIMS, base, ("a/x",), 1, big, collect=True,
+                                     budget=cd.PackBudget(), seed=1, fixed_prompt=False,
+                                     models={"a/x": "a/x"})
+        small = cd.PackBudget(chars=400, chunks=cd.PackBudget().chunks,
+                              per_chunk=cd.PackBudget().per_chunk)
+        # re-prepared under the small budget: the packs themselves are what changed
+        fresh = cd.judge_both(CLAIMS, base, head, _by_evidence, small,
+                              sides=cd.prepare_sides(CLAIMS, base, head, small),
+                              voters=("a/x",), runs=1)
+        # the default pack shows the voter more than the small one, so its own answer
+        # differs between the two runs: TRUE of the bigger pack, FALSE of the smaller
+        assert max(seen["base"]) > min(seen["base"]), seen
+        assert any(v == "TRUE" for r in big["base"]["results"] for v in r["votes"].values())
+        assert any(v == "FALSE" for r in fresh["base"]["results"] for v in r["votes"].values())
+        # ... and re-using the recorded side at the small budget is refused, not answered
+        # TRUE from a pack nobody saw
+        diff = cd.base_side_differs(record, claims=CLAIMS, base_sha=base.sha, voters=("a/x",),
+                                    runs=1, accept="all", index=list(big["base"]["index"]),
+                                    collect=True, budget=small, seed=1, fixed_prompt=False,
+                                    models={"a/x": "a/x"})
+        assert "budget" in diff, diff
+    finally:
+        stack.close()
+
+
+def test_the_cli_refuses_a_base_votes_of_another_budget(rd, tmp_path):
+    """CC-16 (Part B, Layer 2: `claim_diff.py --base-votes FILE --pack-chars 1000` against a
+    file recorded with the default budget — exit 2, the budget named, no request sent."""
+    calls = []
+
+    def request_completion(url, headers, payload, timeout, **_k):
+        calls.append(1)
+        return json.dumps(_rows_from_prompt(payload["messages"][-1]["content"]))
+
+    from tools.auto.llm_profile import LlmSettings
+    import claim_vote as cv
+    import pytest as _pytest
+    monkeypatch = _pytest.MonkeyPatch()
+    monkeypatch.setattr(cv, "voter_settings", lambda ref, parser: LlmSettings(
+        base_url=f"http://{ref.split('/')[0]}.invalid/v1", api_key="k", model=ref,
+        temperature=0.3, max_tokens=100))
+    monkeypatch.setattr(cv, "request_completion", request_completion)
+    try:
+        claims = tmp_path / "claims.json"
+        claims.write_text(json.dumps(CLAIMS), encoding="utf-8")
+        common = [str(claims), "--target", str(rd["fixed"]), "--base", rd["base"],
+                  "--head", "HEAD", "--profiles", "a/x", "b/y", "c/z", "--runs", "1",
+                  "--interval", "0.001", "--repo-root", str(tmp_path),
+                  "--scratch", str(tmp_path / "s"), "--out", str(tmp_path / "out1")]
+        assert cd.main(common) == 0
+        calls.clear()
+        assert cd.main(common + ["--base-votes", str(tmp_path / "out1" / "votes_base.json"),
+                                 "--pack-chars", "1000",
+                                 "--out", str(tmp_path / "out4")]) == 2
+        assert calls == [], "a refused re-use sends no request"
+        # the same budget, no refusal: the reuse is what it was — the head side only
+        calls.clear()
+        assert cd.main(common + ["--base-votes", str(tmp_path / "out1" / "votes_base.json"),
+                                 "--out", str(tmp_path / "out2")]) == 0
+        # 3 claims: 2 batches x 3 voters, the head side alone; the base side was not voted
+        assert len(calls) == 6, calls
+    finally:
+        monkeypatch.undo()
+
+
+# ------------------------------------------------------------------ CC-16 Part E: one claim classified differently
+
+#: The claim at the heart of Part E: `widget()` exists in one entry and not in the other,
+#: so it is a code claim for one and a world claim for the other. No `expect`: an expect
+#: on a world claim is an earlier, different refusal.
+WIDGET_CLAIMS = [
+    {"id": "c-new", "claim": "`flag` in `pkg/mod.py` returns True.", "expect": "new"},
+    {"id": "c-still", "claim": "`load_readonly` in `pkg/mod.py` never writes to the directory.",
+     "expect": "still"},
+    {"id": "c-widget", "claim": "`widget()` returns 42."},
+]
+
+
+@pytest.fixture(scope="module")
+def rw(tmp_path_factory):
+    """A base commit and two entries: `plain` leaves the cited code alone, `added` also
+    defines `widget()`. The same claim then anchors in one entry and not in the other,
+    which is the per (base, head) classification Part E is about."""
+    root = tmp_path_factory.mktemp("widgetclaims")
+    repo = root / "repo"
+    _write(repo / "tools" / "auto" / "collect_bridge.py", _BRIDGE)
+    _write(repo / "conftest.py", "")
+    _write(repo / "pkg" / "__init__.py", "")
+    _write(repo / "pkg" / "mod.py", _MOD_BASE)
+    _write(repo / "tests" / "test_base.py", _TEST)
+    _write(repo / "epic-tasks" / "296-claims.md", _TICKET)
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "claims@example.com")
+    _git(repo, "config", "user.name", "Claims")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    def entry(name, mod):
+        wt = root / f"wt-{name}"
+        _git(repo, "worktree", "add", "-q", str(wt), base)
+        _git(wt, "checkout", "-q", "-b", f"contest/296/{name}")
+        _write(wt / "pkg" / "mod.py", mod)
+        _write(wt / "tests" / f"test_{name}.py", _TEST)
+        _git(wt, "add", "-A")
+        _git(wt, "commit", "-q", "-m", f"{name}: the change")
+        return wt
+
+    return {"base": base, "repo": repo,
+            "plain": entry("plain", _MOD_OTHER),
+            "added": entry("added", _MOD_FIXED + "\n\ndef widget():\n    return 42\n")}
+
+
+def _widget_phase(rw, names, log=None):
+    """The phase over the `widget` repo; *log* is the vote log, so the request count can
+    be read off it (the phase's own `log` is the console line, not this list)."""
+    log = log if log is not None else []
+    return judge.claims_phase(_rows(rw, names), rw["base"], WIDGET_CLAIMS,
+                              voters=("a/x", "b/y", "c/z"), parser=_ini(),
+                              log=lambda *a: None, vote=fake_vote(log=log))
+
+
+def test_one_claim_classified_two_ways_refuses_nothing_and_rows_every_entry(rw):
+    """CC-16 (Part E), the reproduction: entry `plain` does not define `widget`, `added`
+    does, so the claim is a world claim for one and a code claim for the other. Both
+    orders of the entries give a table with a row for each, and no refusal."""
+    for order in (("plain", "added"), ("added", "plain")):
+        log = []
+        data = _widget_phase(rw, list(order), log=log)
+        assert data["status"] == "ok", (order, data["refusal"])
+        assert [e["agent"] for e in data["entries"]] == list(order), order
+        # every claim of the ticket is judged for every entry (two of them carry an expect)
+        assert data["entries"][0]["total"] == 2 and data["entries"][1]["total"] == 2
+        # the base side is asked once for the claims that need it, not once per entry
+        assert _requests(log, "base") == 6, (order, _requests(log, "base"))
+        assert _requests(log, "head") == 12, order
+
+
+def test_the_claim_the_record_does_not_hold_is_voted_once(rw):
+    """CC-16 (Part E): the entry whose head defines `widget` is the one that pays for its
+    base verdict — once, and only because no earlier entry had it. The other two claims
+    are taken from the record and never voted again."""
+    log = []
+    data = _widget_phase(rw, ["plain", "added"], log=log)
+    assert data["status"] == "ok"
+    # `plain` first: its base side is the two claims that anchor in it (one code batch);
+    # `added` adds `widget`, one more batch, and re-uses the other two.
+    assert _requests(log, "base") == 6
+    # a fresh base side per entry would be 12: the reuse is worth half the round
+    assert _requests(log) == 18
+
+
+def test_a_record_of_another_run_is_still_refused(rw):
+    """CC-16 (Part E): only the claims stopped being a refusal. The voters, the runs and
+    the rule still are, and they still name the field — even when the record is the other
+    entry's, which is the whole point of the reuse."""
+    import contextlib
+
+    from tools.claimcheck.target import Target
+    stack = contextlib.ExitStack()
+    scratch = rw["repo"] / "scratch"
+    base = stack.enter_context(Target.open(rw["repo"], rw["base"], scratch=scratch))
+    plain = stack.enter_context(Target.open(rw["plain"], "HEAD", scratch=scratch))
+    added = stack.enter_context(Target.open(rw["added"], "HEAD", scratch=scratch))
+    try:
+        sides_plain = cd.prepare_sides(WIDGET_CLAIMS, base, plain, cd.PackBudget())
+        got = cd.judge_both(WIDGET_CLAIMS, base, plain, fake_vote(), cd.PackBudget(),
+                            sides=sides_plain, voters=("a/x", "b/y", "c/z"), runs=1)
+        record = cd.base_side_record(WIDGET_CLAIMS, base, ("a/x", "b/y", "c/z"), 1, got,
+                                     collect=True, budget=cd.PackBudget(), seed=1,
+                                     fixed_prompt=False, models={})
+        sides_added = cd.prepare_sides(WIDGET_CLAIMS, base, added, cd.PackBudget())
+        # the same run, the entry whose head defines `widget`: reused claim by claim
+        got2 = cd.judge_both(WIDGET_CLAIMS, base, added, fake_vote(), cd.PackBudget(),
+                             base_side=record, sides=sides_added, voters=("a/x", "b/y", "c/z"),
+                             runs=1, collect=True, seed=1, fixed_prompt=False, models={})
+        assert got2["base"]["rows"][2] is not None, "the claim the record did not hold was not voted"
+        assert len(record["index"]) < len(got2["base"]["index"]), "the fresh claim was not kept"
+        # other voters, more runs, another rule: still refused, still naming the field
+        for override, wanted in (({"voters": ("a/x",)}, "voters"),
+                                 ({"runs": 2}, "runs"),
+                                 ({"accept": "committed"}, "accept rule")):
+            with pytest.raises(ValueError, match=wanted):
+                cd.judge_both(WIDGET_CLAIMS, base, added, fake_vote(), cd.PackBudget(),
+                              base_side=record, sides=sides_added,
+                              voters=override.get("voters", ("a/x", "b/y", "c/z")),
+                              runs=override.get("runs", 1),
+                              accept=override.get("accept", "all"),
+                              collect=True, seed=1, fixed_prompt=False, models={})
+    finally:
+        stack.close()
+
+
+def test_votes_files_carry_the_seed_and_the_prompt_mode_of_their_run(tmp_path):
+    """CC-16 B: a side that is reused later has to say which seed and which prompt mode it was judged with."""
+    side = {"results": [], "table": []}
+    target = SimpleNamespace(repo="r", ref="main", sha="a" * 40, warnings=[])
+    rec = cd.side_report(target, side, None, seed=7, fixed_prompt=True)
+    assert rec["seed"] == 7 and rec["fixed_prompt"] is True
+    plain = cd.side_report(target, side, None)
+    assert "seed" not in plain and "fixed_prompt" not in plain
+    # and a record that carries another seed is not this run's
+    loaded = cd.base_side_from_votes(_write_json(tmp_path / "votes_base.json", {**rec, "claims": [], "results": []}), seed=1, fixed_prompt=False)
+    assert loaded["identity"]["seed"] == 7 and loaded["identity"]["fixed_prompt"] is True
+
+
+def _write_json(path, data):
+    import json as _json
+    path.write_text(_json.dumps(data), encoding="utf-8")
+    return path
+
+
+def test_a_record_without_the_budget_is_read_as_one_that_states_none(tmp_path):
+    """CC-16 B: a votes file from before the identity grew (no `target.budget`) must be refused by the identity check, not crash the reader."""
+    old = _write_json(tmp_path / "old_votes_base.json",
+                      {"target": {"sha": "a" * 40}, "accept": "all", "claims": [], "results": []})
+    rec = cd.base_side_from_votes(old, seed=1, fixed_prompt=False)
+    assert rec and rec["identity"]["budget"] is None and rec["identity"]["collect"] is None

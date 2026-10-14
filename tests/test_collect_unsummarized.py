@@ -29,7 +29,7 @@ import pytest
 from tools.collect import cli as cli_mod
 from tools.collect import loader as loader_mod
 from tools.collect import manifest as manifest_mod
-from tools.collect.cli import action_check, action_collect, action_refresh, resolve_collect_dir
+from tools.collect.cli import action_check, action_collect, action_rebuild, action_refresh, resolve_collect_dir
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -86,6 +86,34 @@ def _stub_llm(refusing_paths=None):
         return json.dumps({"purpose": purpose, "notes": ""})
 
     return _call
+
+
+def _tracking_llm(inner, asked):
+    """Wrap `_stub_llm`'s stub, recording the module path of every prompt it sees
+    (`summarizer._prompt` starts the user message with `path: <module path>`), so a
+    test can assert *which* modules a refresh handed to Pass B."""
+    import re
+
+    def _call(system, user):
+        match = re.search(r"^path:\s*(\S+)", user, re.MULTILINE)
+        if match:
+            asked.append(match.group(1))
+        return inner(system, user)
+
+    return _call
+
+
+def _fail_store(root: Path) -> None:
+    """Drive the repo into the CC-15 state the CC-16 tests start from: a full build
+    with a healthy model, then a change of `pkg/store.py` that the model refuses, so
+    `pkg/store.py` is the one module listed in the manifest as without a summary."""
+    action_collect(root, llm_call=_stub_llm())
+    (root / "pkg" / "store.py").write_text("class BetaStore:\n    pass\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "rename AlphaStore -> BetaStore")
+    action_collect(root, llm_call=_stub_llm(refusing_paths=["store.py"]))
+    manifest = _read_manifest(resolve_collect_dir(root, None))
+    assert manifest.unsummarized == ("pkg/store.py",)
 
 
 # ── reproduction: step for step ───────────────────────────────────────────────
@@ -270,3 +298,153 @@ def test_progress_line_says_no_summary(mini_repo_two_modules, capsys):
     action_collect(mini_repo_two_modules, llm_call=llm)
     out = capsys.readouterr().out
     assert "no summary pkg/store.py" in out
+
+
+# ── CC-16 Part A: a refresh without Pass B keeps the list ─────────────────────
+
+def test_refresh_without_pass_b_keeps_the_unsummarized_list(mini_repo_two_modules):
+    """CC-16 (Part A), the ticket's reproduction: after a build whose Pass B refused
+    `pkg/store.py`, an edit of another module and a refresh that does not run Pass B
+    must not erase the list — it is the only record of which modules have no summary,
+    and the manifest is the only place it lives."""
+    root = mini_repo_two_modules
+    _fail_store(root)
+    collect_dir = resolve_collect_dir(root, None)
+
+    (root / "pkg" / "still.py").write_text("class StillEdited:\n    pass\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "edit still.py")
+
+    result = action_refresh(root, llm_call=None)
+    assert result.wrote is True
+    manifest = _read_manifest(collect_dir)
+    assert manifest.unsummarized == ("pkg/store.py",)
+    artifact = _read_artifact(collect_dir)
+    by_path = {m["path"]: m for m in artifact["modules"]}
+    assert by_path["pkg/store.py"]["summary"] is None
+    # The refresh attempted nothing, so the module is still owed, and --check says so.
+    check = action_check(root)
+    assert check.fresh is False
+    assert "1 module without a summary" in check.message
+
+
+def test_refresh_without_pass_b_then_a_refresh_with_the_model_retries_only_the_listed(mini_repo_two_modules):
+    """CC-16 (Part A): the module the no-Pass-B refresh could not retry is the one the
+    next refresh *with* the model asks about — and only it, so the carried list is what
+    cuts the requests, and it is cleared once the summary lands."""
+    root = mini_repo_two_modules
+    _fail_store(root)
+
+    action_refresh(root, llm_call=None)
+    asked: list = []
+    llm = _tracking_llm(_stub_llm(), asked)
+    result = action_refresh(root, llm_call=llm)
+    assert result.wrote is True
+    assert asked == ["pkg/store.py"]
+    assert "1 without a summary" not in result.message
+    manifest = _read_manifest(resolve_collect_dir(root, None))
+    assert manifest.unsummarized == ()
+    check = action_check(root)
+    assert check.fresh is True
+
+
+def test_unsummarized_list_carried_through_several_refreshes_without_pass_b(mini_repo_two_modules):
+    """CC-16 (Part A): the list survives any number of refreshes that cannot retry,
+    not just the first one."""
+    root = mini_repo_two_modules
+    _fail_store(root)
+    collect_dir = resolve_collect_dir(root, None)
+    for i in range(3):
+        (root / "pkg" / "still.py").write_text(f"class Still{i}:\n    pass\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", f"edit still.py {i}")
+        result = action_refresh(root, llm_call=None)
+        assert result.wrote is True
+        assert _read_manifest(collect_dir).unsummarized == ("pkg/store.py",)
+    assert action_check(root).fresh is False
+
+
+def test_listed_module_deleted_between_refreshes_is_dropped(mini_repo_two_modules):
+    """CC-16 (Part A): the carried list is restricted to what is still true of the
+    tree — a listed module that is gone drops out instead of being owed forever."""
+    root = mini_repo_two_modules
+    _fail_store(root)
+    collect_dir = resolve_collect_dir(root, None)
+
+    (root / "pkg" / "store.py").unlink()
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "delete store.py")
+    action_refresh(root, llm_call=None)
+    assert _read_manifest(collect_dir).unsummarized == ()
+
+
+def test_listed_module_moved_between_refreshes_is_dropped(mini_repo_two_modules):
+    """CC-16 (Part A): the same for a listed module that moved — its old path is not
+    in the tree any more, and the new one was never attempted."""
+    root = mini_repo_two_modules
+    _fail_store(root)
+    collect_dir = resolve_collect_dir(root, None)
+
+    (root / "pkg" / "store.py").rename(root / "pkg" / "moved.py")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "move store.py")
+    action_refresh(root, llm_call=None)
+    assert _read_manifest(collect_dir).unsummarized == ()
+
+
+def test_refresh_without_pass_b_changing_a_listed_module_keeps_it_listed(mini_repo_two_modules):
+    """CC-16 (Part A): a no-Pass-B refresh that changes a *listed* module edits the file,
+    still produces no summary for it (nothing ran), and leaves it listed."""
+    root = mini_repo_two_modules
+    _fail_store(root)
+    collect_dir = resolve_collect_dir(root, None)
+
+    (root / "pkg" / "store.py").write_text("class GammaStore:\n    pass\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "edit store.py again")
+    result = action_refresh(root, llm_call=None)
+    assert result.wrote is True
+    manifest = _read_manifest(collect_dir)
+    assert manifest.unsummarized == ("pkg/store.py",)
+    artifact = _read_artifact(collect_dir)
+    by_path = {m["path"]: m for m in artifact["modules"]}
+    assert by_path["pkg/store.py"]["summary"] is None
+    assert action_check(root).fresh is False
+
+
+def test_llm_summaries_false_keeps_the_list_like_no_llm_call(mini_repo_two_modules):
+    """CC-16 (Part A): `[collect] llm_summaries = false` is the same path as
+    `llm_call = None` — it runs no Pass B, so it keeps the list rather than clearing it."""
+    root = mini_repo_two_modules
+    _fail_store(root)
+    collect_dir = resolve_collect_dir(root, None)
+
+    cfg = configparser.ConfigParser()
+    cfg["collect"] = {"llm_summaries": "false"}
+    (root / "pkg" / "still.py").write_text("class StillEdited:\n    pass\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "-m", "edit still.py")
+    result = action_refresh(root, config=cfg, llm_call=_stub_llm())
+    assert result.wrote is True
+    assert _read_manifest(collect_dir).unsummarized == ("pkg/store.py",)
+    check = action_check(root, config=cfg)
+    assert check.fresh is False
+    assert "1 module without a summary" in check.message
+
+
+def test_full_no_llm_build_still_records_empty_unsummarized(mini_repo_two_modules):
+    """CC-16 (Part A): a *full* `--no-llm` build is unchanged — it rebuilds the list
+    from the modules it handed to Pass B, and it handed none, so it records `[]` even
+    when the previous manifest listed one."""
+    root = mini_repo_two_modules
+    _fail_store(root)
+    collect_dir = resolve_collect_dir(root, None)
+
+    result = action_collect(root, drop_summaries=True)  # no llm_call, and a stale tree -> full build? no: refresh
+    assert result.wrote is True
+    # An incremental refresh without Pass B carries the list (the Part A fix)...
+    assert _read_manifest(collect_dir).unsummarized == ("pkg/store.py",)
+    # ... while an explicit rebuild, which is a full build, records [] as before.
+    result = action_rebuild(root, llm_call=None, drop_summaries=True)
+    assert result.wrote is True
+    assert _read_manifest(collect_dir).unsummarized == ()

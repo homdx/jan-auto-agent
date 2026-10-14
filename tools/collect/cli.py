@@ -1042,10 +1042,30 @@ def action_refresh(
     # Only modules actually sent to Pass B this run count — unchanged modules carried forward
     # from a previous build keep whatever summary state they already had, and skipped batches
     # (no llm_call, llm_summaries=false) never attempted anything.
-    unsummarized = tuple(sorted(
+    #
+    # CC-16 (Part A): a refresh that does not run Pass B hands nothing to it, so the rule above
+    # alone would rebuild the list from an empty batch and *erase* the previous one — the list
+    # is the only record of which modules still have no summary, and the manifest is the only
+    # place it lives, so a `--no-llm` / `llm_summaries = false` refresh (or any caller that
+    # passes no `llm_call`: `loader.load` with `staleness = refresh`, claimcheck's target and
+    # contest's draft) silently re-marked the tree clean and the module was never retried.
+    # Such a refresh adds nothing — it attempted nothing — but it must *keep* the previous
+    # list, restricted to what is still true of the artifact it just wrote: the path is still
+    # in the tree (a deleted or moved module drops out) and its record still carries no
+    # summary. A refresh that does run Pass B keeps its own rule for the modules it handed
+    # over and takes the same restriction for the listed ones it did not (none, since CC-15
+    # hands them all) — one list either way. A full build is untouched: `_full_build` rebuilds
+    # the list from the modules it handed to Pass B, so a `--no-llm` full build records `[]`.
+    summarized_unsummarized = {
         m.path for m in ctx.modules
         if m.summary is None and m.parse_error is None and m.path in summarized_paths
-    ))
+    }
+    carried_unsummarized = {
+        p for p in previous_unsummarized
+        if p not in summarized_paths
+        and any(m.path == p and m.summary is None and m.parse_error is None for m in ctx.modules)
+    }
+    unsummarized = tuple(sorted(summarized_unsummarized | carried_unsummarized))
     _write_manifest(root, collect_dir, ctx.modules, provenance=provenance,
                     file_hashes=current_hashes, config=config, unsummarized=unsummarized)
     written = sorted(set(written) | {MANIFEST_FILENAME})
@@ -1064,11 +1084,10 @@ def action_refresh(
             suffix = " (Pass B produced no summary)"
         else:
             suffix = ""
-        # CC-15: name modules that still lack a summary after the batch.
-        n_unsummarized = sum(
-            1 for m in ctx.modules
-            if m.summary is None and m.parse_error is None and m.path in summarized_paths
-        )
+        # CC-15: name modules that still lack a summary after the batch. CC-16 (Part A): the
+        # count is the whole list the manifest now records, carried-over modules included, so
+        # the line and `--check` cannot disagree about what is still owed.
+        n_unsummarized = len(unsummarized)
         if n_unsummarized:
             suffix += f", {n_unsummarized} without a summary (tried again at the next --collect)"
         message = f"incrementally refreshed {scope} module(s){suffix}; wrote {len(written)} file(s) in {collect_dir}"

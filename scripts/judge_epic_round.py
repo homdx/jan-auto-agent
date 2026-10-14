@@ -901,6 +901,14 @@ CLAIMS_TIMEOUT = 240
 #: Voter calls in flight at once, both sides together.
 CLAIMS_PARALLEL = 4
 
+#: The seed and the prompt mode of the claims phase, fixed for the whole round: the same
+#: two settings `ask` below hands to `ask_v2`. CC-16 (Part B) put them in the identity of a
+#: recorded base side — they decide what the voters were shown, so a record judged under
+#: another seed or prompt mode is another run's evidence — which means the phase has to
+#: state them rather than leave them implicit.
+CLAIMS_SEED = 1
+CLAIMS_FIXED_PROMPT = False
+
 #: One line instead of an empty table: every entry failed a hard gate.
 CLAIMS_NOTHING = "claims: no entry passed the hard gates — nothing was judged"
 
@@ -1042,8 +1050,21 @@ def _claims_costs(sides_list, voters, runs, batch, code_batch):
 
     Every entry starts from the same base, so its base side is the same question asked again: the
     first entry pays for it and the rest pay for their head only. Adding up per claim would bill
-    the base once per entry, which is most of the requests of a round of eight."""
-    base = cd.requests_of(sides_list[0]["items_b"], len(voters), runs, batch, code_batch)
+    the base once per entry, which is most of the requests of a round of eight.
+
+    CC-16 (Part E): which claims are code claims is a per-entry answer, and a claim that is a
+    code claim for at least one entry is voted at the base once, whoever needs it — so the bill
+    is the union of the entries' non-world claims, not the first entry's alone (which billed
+    nothing for a claim only a later entry anchors)."""
+    seen = set()
+    union_items = []
+    for sides in sides_list:
+        for i, item in enumerate(sides["items_b"]):
+            if sides["world"][i] or i in seen:
+                continue
+            seen.add(i)
+            union_items.append(item)
+    base = cd.requests_of(union_items, len(voters), runs, batch, code_batch)
     heads = [cd.requests_of(s["items_h"], len(voters), runs, batch, code_batch) for s in sides_list]
     return base, heads, base + sum(heads)
 
@@ -1127,7 +1148,8 @@ def _write_claims_artifacts(out_dir, base, head, got, entry, *, budget, collect,
     try:
         dest = os.path.join(out_dir, "claims", _slug(entry))
         return cd.write_outputs(Path(dest), base, head, got, budget=budget, collect=collect,
-                                models=cv.voter_models(voters, parser))
+                                models=cv.voter_models(voters, parser), seed=CLAIMS_SEED,
+                                fixed_prompt=CLAIMS_FIXED_PROMPT)
     except (OSError, ValueError) as e:   # noqa: BLE001 — a model that does not resolve is no model row
         log(f"claims: could not write {dest} — {type(e).__name__}: {e} (the table above stands)")
         return ""
@@ -1284,21 +1306,39 @@ def _claims_phase(rows, base_ref, claims, *, voters, runs=1, repo_root=REPO_ROOT
                                       if skipped else ""))
 
             def ask(ref, items, run):
-                return cv.ask_v2(ref, items, run, 1, parser, timeout, batch, code_batch, False)
+                return cv.ask_v2(ref, items, run, CLAIMS_SEED, parser, timeout, batch, code_batch,
+                                 CLAIMS_FIXED_PROMPT)
 
             with ThreadPoolExecutor(max(1, CLAIMS_PARALLEL)) as pool:
                 voter = vote if vote is not None else cd.make_vote(voters, runs, pool, ask)
+                # CC-16 (Part B): the run's own settings, the same ones `ask` hands the
+                # voters, so the base side's record can be shown to be this round's.
+                # (`collect` and `budget` are `judge_both`'s own parameters, so they are
+                # named rather than folded into the dict it is splatted from.)
+                run_settings = dict(seed=CLAIMS_SEED,
+                                    fixed_prompt=CLAIMS_FIXED_PROMPT,
+                                    models=cv.voter_models(voters, parser))
                 record = None
                 entries = data["entries"]
                 for (name, head, sides), head_req in zip(prepared, head_reqs):
                     try:
                         got = cd.judge_both(claims, base, head, voter, budget, collect=collect,
                                             accept=accept, base_side=record, voters=voters,
-                                            runs=runs, sides=sides)
+                                            runs=runs, sides=sides, **run_settings)
                     except ValueError as e:
                         return _claims_refused(data, f"{name}: {e}")
                     if record is None:
-                        record = cd.base_side_record(claims, base, voters, runs, got)
+                        record = cd.base_side_record(claims, base, voters, runs, got,
+                                                     collect=collect, budget=budget,
+                                                     **run_settings)
+                    else:
+                        # CC-16 (Part E): the record keeps every claim already judged at the
+                        # base — `judge_both` hands them back under `voted`, keyed by
+                        # `index` — so the next entry pays only for what it adds.
+                        record = cd.base_side_record(
+                            claims, base, voters, runs, {**got, "base": {
+                                **got["base"], "results": got["base"]["voted"]}},
+                            collect=collect, budget=budget, **run_settings)
                     counts = Counter(d.change for d in got["deltas"])
                     deltas = [d for d in got["deltas"] if d.expect]
                     lines = [cc_compare.mismatch_line(d) for d in cc_compare.mismatches(got["deltas"])]

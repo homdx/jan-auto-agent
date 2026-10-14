@@ -762,17 +762,28 @@ class Executor:
             try:
                 out, err = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                if os.name != "nt":
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except OSError:
-                        pass
-                proc.kill()
+                _kill_process_group(proc)
                 try:
                     out, err = proc.communicate(timeout=5)
                 except subprocess.TimeoutExpired:
                     out, err = "", ""
                 raise subprocess.TimeoutExpired(command, timeout, output=out, stderr=err) from None
+            except BaseException:
+                # CC-16 (Part D): Ctrl-C. `subprocess.run` used to `except: process.kill(); raise`
+                # for *any* exception, KeyboardInterrupt included, and fix 35 dropped that when it
+                # moved the kill into the timeout branch; `start_new_session=True` also takes the
+                # child out of the terminal's foreground process group, so a terminal Ctrl-C no
+                # longer reaches it either. Nothing then took the interruption's place but the
+                # timeout — the command (typically the acceptance check, a `pytest` with workers,
+                # minutes long) lived on and kept writing into the worktree the next `--auto` run
+                # resets. Kill the whole group, reap it so no zombie is left, and let the
+                # exception go on unchanged: a KeyboardInterrupt stays a KeyboardInterrupt.
+                _kill_process_group(proc)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise
             stdout = _truncate(out, _MAX_OUTPUT_CHARS)
             stderr = _truncate(err, _MAX_OUTPUT_CHARS)
             return ExecutionResult(
@@ -882,6 +893,28 @@ def _truncate(text: str, max_chars: int) -> str:
         return text
     notice = f"\n... [truncated — {len(text) - max_chars} chars omitted]"
     return text[:max_chars] + notice
+
+
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """SIGKILL the command's whole process group — the shell fix 35 started in a session of
+    its own *and every grandchild it spawned* — then the process itself where there is no
+    group (`os.name == "nt"`, which never got `start_new_session`). Killing the shell alone
+    is what let `pytest` and its xdist workers outlive a timeout.
+
+    CC-16 (Part D): the `OSError` guards are the fail-open half — a child that already
+    exited (or a group already gone) makes `killpg`/`kill` raise `ProcessLookupError`, and
+    that must not turn an interruption into a second, unrelated failure. `reap` is left to
+    the caller (`communicate` on the timeout path, so it can still return the partial
+    output; `wait` on the interruption path)."""
+    if os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 def _pytest_addopts(root: Path) -> list:
