@@ -529,7 +529,11 @@ def apply_overlay(config: configparser.ConfigParser, overlay: SkillOverlay) -> N
     for section, key, value in overlay.entries:
         if not config.has_section(section):
             config.add_section(section)
-        config.set(section, key, value)
+        try:
+            config.set(section, key, value)
+        except ValueError:
+            # an interpolating parser (main.py's) refuses a bare % ("100% done"); %% reads back as %
+            config.set(section, key, value.replace("%", "%%"))
 
 
 def apply_skill(

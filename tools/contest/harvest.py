@@ -159,12 +159,16 @@ def _is_ancestor(path: Path, commit: str) -> bool:
     False both when the commit is on another line of history and when it does
     not resolve at all — an unknown sha is certainly not on the branch.
     """
-    r = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
-        cwd=str(path),
-        capture_output=True,
-        text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, "HEAD"],
+            cwd=str(path),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     return r.returncode == 0
 
 
@@ -174,8 +178,11 @@ def _at_or_under_base(ws: Workspace, commit: str) -> bool:
     base = getattr(ws, "base_sha", "") or ""
     if not base:
         return False
-    r = subprocess.run(["git", "merge-base", "--is-ancestor", commit, base],
-                       cwd=str(ws.path), capture_output=True, text=True)
+    try:
+        r = subprocess.run(["git", "merge-base", "--is-ancestor", commit, base],
+                           cwd=str(ws.path), capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
     return r.returncode == 0
 
 

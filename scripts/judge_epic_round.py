@@ -156,7 +156,7 @@ def _git(cwd, *args):
     try:
         # core.quotepath=false: a non-ASCII test path came back C-quoted and was no test of a root
         p = subprocess.run(["git", "-c", "core.quotepath=false", *args], cwd=cwd, capture_output=True,
-                           text=True, timeout=300)
+                           text=True, encoding="utf-8", errors="replace", timeout=300)
     except (OSError, subprocess.SubprocessError):
         return 1, ""
     return p.returncode, p.stdout.strip()

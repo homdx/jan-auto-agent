@@ -264,7 +264,7 @@ class GitManager:
 
         No-op before the first commit (no HEAD to reset to).
         """
-        if self.get_current_hash() is None:
+        if not self._has_head():
             return
         self._run(["git", "reset", "--hard", "HEAD"], "git reset --hard failed")
 
@@ -281,6 +281,19 @@ class GitManager:
         # an untracked collect artifact is an hour of Pass B, not a task's residue
         keep = ["-e", f"/{collect}"] if collect is not None else []
         self._run(["git", "clean", "-fd", *keep], "git clean failed")
+
+    def _has_head(self) -> bool:
+        """False only for a repository without a commit; any other failure raises ``GitError`` (a None from
+        get_current_hash skipped the reset, and the failed task's edits went into the next commit)."""
+        cmd = ["git", "rev-parse", "--verify", "-q", "HEAD"]
+        try:
+            proc = run_git(cmd, cwd=self.repo_dir, timeout=60, encoding="utf-8", errors="replace", retries=1)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise self._raise(cmd, "git rev-parse HEAD failed", exc) from exc
+        if proc.returncode == 1 and not proc.stdout.strip():
+            return False
+        self._decode(cmd, "git rev-parse HEAD failed", proc)
+        return True
 
     def _is_ignored(self, rel: str) -> bool:
         try:
@@ -427,7 +440,7 @@ class GitManager:
         try:
             # -z: names as written. Without it git C-quotes non-ASCII names, so their collect facts were never marked stale.
             out = self._run(
-                ["git", "diff-tree", "-z", "--no-commit-id", "--name-only", "-r", sha],
+                ["git", "diff-tree", "-z", "--root", "--no-commit-id", "--name-only", "-r", sha],
                 "git diff-tree failed",
             )
         except GitError:

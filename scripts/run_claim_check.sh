@@ -20,6 +20,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 out="claim-check-out/$(date -u +%Y%m%dT%H%M%SZ)"
+[ -e "$out" ] && out="$out-$$"   # two runs in one second shared a directory
 if [ -n "$truth" ] && [ "${truth#*/}" = "$truth" ]; then
     truth="$out/$truth"
 fi

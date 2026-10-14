@@ -76,6 +76,10 @@ def skip_dirs_from_config(
         return frozenset(out)
     for name in raw.split(","):
         name = name.strip()
+        if "/" in name or "\\" in name:
+            # the walk compares a directory's name: "rounds/sandbox" never matched and skipped nothing
+            logger.warning("[collect] skip_dirs: %r is a path, not a directory name — ignored", name)
+            continue
         if name:
             out.add(name)
     return frozenset(out)
@@ -214,6 +218,7 @@ def _run_git(root: Path, *args: str) -> Optional[str]:
             cwd=str(root),
             timeout=10,
             encoding="utf-8",
+            errors="surrogateescape",   # a name that is not UTF-8 is a name, as os.walk gives it
         )
     except subprocess.TimeoutExpired:
         # still "nothing to report", but not silently: the git was killed
@@ -223,7 +228,7 @@ def _run_git(root: Path, *args: str) -> Optional[str]:
         return None
     if proc.returncode != 0:
         return None
-    return proc.stdout.strip()
+    return proc.stdout.rstrip("\n")       # not strip(): porcelain's first " M path" lost its leading space
 
 
 def get_git_sha(root: Path) -> Optional[str]:

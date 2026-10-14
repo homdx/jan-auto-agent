@@ -6,6 +6,7 @@ REPO=$(dirname "$(git -C "$(dirname "$(realpath "$0")")" rev-parse --path-format
 BASE=${BASE:-kc}
 JOBS=${JOBS:-4}   # pytest -n; JOBS=8 when the box is free
 round=${1:?usage: judge_round.sh ROUND [extra.patch|dir/ ...]}; shift
+case $round in */*|*..*|"") echo "judge_round.sh: ROUND is a round name, not a path: $round" >&2; exit 2;; esac
 OUT=${OUT:-/tmp/judge-$round}
 mkdir -p "$OUT/wt"
 
@@ -35,7 +36,10 @@ for p in "${patches[@]}"; do
   [ -f "$p" ] || continue
   name=$(basename "$p" .patch); wt="$OUT/wt/$name"; log="$OUT/$name.log"
   git -C "$REPO" worktree remove --force "$wt" 2>/dev/null
-  git -C "$REPO" worktree add -q --detach "$wt" "$base_sha"
+  if ! git -C "$REPO" worktree add -q --detach "$wt" "$base_sha" >"$log" 2>&1; then
+    echo "$name | NO WORKTREE at $wt (see $log)" | tee -a "$OUT/summary.txt"; continue
+  fi
+  trap 'git -C "$REPO" worktree remove --force "$wt" 2>/dev/null; exit 130' INT TERM
   if ! git -C "$wt" am -q --whitespace=nowarn "$p" >"$log" 2>&1; then
     git -C "$wt" am --abort 2>/dev/null
     echo "$name | DOES NOT APPLY on ${base_sha:0:7} (see $log)" | tee -a "$OUT/summary.txt"

@@ -62,6 +62,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -708,11 +709,13 @@ class Executor:
         rather than whatever ``python`` resolves to in the PATH.
         """
         stripped = command.lstrip()
+        # quoted: a path with a space ("/Users/Jane Doe/.venv/bin/python") split into two words
+        python = subprocess.list2cmdline([self._python_bin]) if os.name == "nt" else shlex.quote(self._python_bin)
         for token in ("python3 ", "python "):
             if stripped.startswith(token):
-                return self._python_bin + " " + stripped[len(token):]
+                return python + " " + stripped[len(token):]
         if stripped in ("python", "python3"):
-            return self._python_bin
+            return python
         return command
 
     # ── Subprocess execution ──────────────────────────────────────────────────
@@ -742,19 +745,36 @@ class Executor:
         _logged_command = _redact_command(command)
 
         try:
-            proc = subprocess.run(
+            # a session of its own: on a timeout the whole group is killed, not the shell alone (pytest and
+            # its xdist workers lived on)
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=str(cwd),
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout,
+                start_new_session=os.name != "nt",
             )
-            stdout = _truncate(proc.stdout, _MAX_OUTPUT_CHARS)
-            stderr = _truncate(proc.stderr, _MAX_OUTPUT_CHARS)
+            try:
+                out, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if os.name != "nt":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                proc.kill()
+                try:
+                    out, err = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    out, err = "", ""
+                raise subprocess.TimeoutExpired(command, timeout, output=out, stderr=err) from None
+            stdout = _truncate(out, _MAX_OUTPUT_CHARS)
+            stderr = _truncate(err, _MAX_OUTPUT_CHARS)
             return ExecutionResult(
                 exit_code = proc.returncode,
                 stdout    = stdout,
@@ -864,6 +884,54 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + notice
 
 
+def _pytest_addopts(root: Path) -> list:
+    """The ``addopts`` tokens of the config file pytest uses: ``pytest.ini`` always, the others only with their
+    pytest section (a ``pyproject.toml`` without one hid a ``tox.ini``'s), continuation lines included."""
+    import configparser
+    sections = {"pytest.ini": "pytest", "tox.ini": "pytest", "setup.cfg": "tool:pytest"}
+    for name in _PYTEST_CONFIG_FILES:
+        try:
+            text = (root / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if name == "pyproject.toml":
+            value = _toml_addopts(text)
+            if value is None:
+                continue
+            return value.split()
+        parser = configparser.ConfigParser(interpolation=None, strict=False)
+        try:
+            parser.read_string(text)
+        except configparser.Error:
+            parser = None
+        if parser is None or not parser.has_section(sections[name]):
+            if name == "pytest.ini":
+                return []
+            continue
+        return parser.get(sections[name], "addopts", fallback="").split()
+    return []
+
+
+def _toml_addopts(text: str) -> "str | None":
+    """``[tool.pytest.ini_options] addopts`` of a pyproject.toml, a list joined; None without the table."""
+    try:
+        import tomllib
+    except ImportError:              # 3.10: the table and its addopts by hand
+        m = re.search(r"(?ms)^\[tool\.pytest\.ini_options\][ \t]*$(.*?)(?=^\[|\Z)", text)
+        if not m:
+            return None
+        a = re.search(r"(?ms)^addopts[ \t]*=[ \t]*(\[.*?\]|[^\n]*)", m.group(1))
+        return re.sub(r"[\[\],\"']", " ", a.group(1)) if a else ""
+    try:
+        table = tomllib.loads(text).get("tool", {}).get("pytest", {}).get("ini_options")
+    except (tomllib.TOMLDecodeError, AttributeError):
+        return None
+    if not isinstance(table, dict):
+        return None
+    value = table.get("addopts", "")
+    return " ".join(map(str, value)) if isinstance(value, list) else str(value)
+
+
 def pytest_config_requests_pool(base_dir: "str | Path") -> bool:
     """True when *base_dir*'s pytest ``addopts`` (or ``PYTEST_ADDOPTS``) name an xdist flag (RUN-3).
 
@@ -875,23 +943,7 @@ def pytest_config_requests_pool(base_dir: "str | Path") -> bool:
     files are skipped, never raised on — this runs before every acceptance
     check and must not be the reason one fails.
     """
-    tokens: list[str] = []
-    root = Path(base_dir)
-    for name in _PYTEST_CONFIG_FILES:
-        path = root / name
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("addopts"):
-                continue
-            _, _, value = stripped.partition("=")
-            # pyproject.toml quotes its value (and may use the list form).
-            tokens = value.replace(",", " ").replace("[", " ").replace("]", " ").split()
-            break
-        break
+    tokens = _pytest_addopts(Path(base_dir))
     tokens += os.environ.get("PYTEST_ADDOPTS", "").split()
     return any(is_xdist_flag(t) for t in tokens)
 

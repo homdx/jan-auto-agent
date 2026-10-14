@@ -166,7 +166,7 @@ def _read_ini(repo: Path) -> configparser.ConfigParser:
         if not path.is_file():
             continue
         try:
-            parser.read(path, encoding="utf-8")
+            parser.read(path, encoding="utf-8-sig")
         except (configparser.Error, OSError, UnicodeDecodeError):
             continue
     return parser
@@ -593,12 +593,12 @@ def _still_set(repo: Path, local_text: str, name: str, keys: list[str]) -> list[
     committed = repo / "contest.ini"
     if committed.is_file():
         try:
-            parser.read(committed, encoding="utf-8")
+            parser.read(committed, encoding="utf-8-sig")
         except (configparser.Error, OSError, UnicodeDecodeError):
             pass
     if local_text:
         try:
-            parser.read_string(local_text)
+            parser.read_string(local_text.lstrip("\ufeff"))
         except (configparser.Error, UnicodeDecodeError):
             pass
     section = f"{profile.SECTION_PREFIX}{name}"

@@ -531,7 +531,7 @@ class TestErrorHandling:
     def test_oserror_returns_result_no_raise(self, tmp_path: Path) -> None:
         _setup_repo(tmp_path)
         ex = _executor(tmp_path)
-        with patch("subprocess.run", side_effect=OSError("shell not found")):
+        with patch("subprocess.Popen", side_effect=OSError("shell not found")):
             result = ex.run(_task())
         assert result.exit_code == -1
         assert "shell not found" in result.stderr

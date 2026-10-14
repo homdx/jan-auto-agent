@@ -326,11 +326,9 @@ def _decode(raw: bytes | None):
 
 
 def _free_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def _http_status(url: str, timeout: float = 5.0) -> int:
@@ -487,12 +485,12 @@ class KiloServer:
         port = _free_port()
         url = f"http://{hostname}:{port}"
         log_file = open(log_path, "a", encoding="utf-8")
-        log_file.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} kilo serve --port {port}\n")
-        log_file.flush()
         child_env = None
         if env:
             child_env = {**os.environ, **env}
         try:
+            log_file.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} kilo serve --port {port}\n")
+            log_file.flush()
             proc = subprocess.Popen(
                 [str(binary), "serve", "--port", str(port),
                  "--hostname", hostname, "--print-logs"],
@@ -504,26 +502,31 @@ class KiloServer:
             log_file.close()
             raise
 
-        deadline = time.monotonic() + float(health_timeout)
-        while time.monotonic() < deadline:
-            status = _http_status(url + "/global/health", timeout=3.0)
-            if status == 200:
-                return cls(url, _process=proc, _log_file=log_file,
-                           _log_path=log_path)
-            if proc.poll() is not None and status != 200:
-                tail = _log_tail(log_path)
-                log_file.close()
-                _terminate(proc)
-                raise KiloServerError(
-                    f"kilo serve exited with code {proc.returncode} before "
-                    f"/global/health answered 200 at {url}",
-                    log_tail=tail,
-                )
-            time.sleep(0.2)
-
+        try:
+            deadline = time.monotonic() + float(health_timeout)
+            while time.monotonic() < deadline:
+                status = _http_status(url + "/global/health", timeout=3.0)
+                # a 200 from a server that is not ours (another one took the port) is no health of this child
+                if status == 200 and proc.poll() is None:
+                    return cls(url, _process=proc, _log_file=log_file,
+                               _log_path=log_path)
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.2)
+        except BaseException:
+            log_file.close()
+            _terminate(proc)
+            raise
         tail = _log_tail(log_path)
         log_file.close()
+        exited = proc.poll() is not None
         _terminate(proc)
+        if exited:
+            raise KiloServerError(
+                f"kilo serve exited with code {proc.returncode} before "
+                f"/global/health answered 200 at {url}",
+                log_tail=tail,
+            )
         raise KiloServerError(
             f"kilo serve did not report healthy at {url} within "
             f"{health_timeout:.1f}s; log: {log_path}",
@@ -755,7 +758,12 @@ class EventTap:
         self._stop.clear()
         thread = threading.Thread(target=self._run, name="kilo-event-tap", daemon=True)
         self._thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            self._log.close()
+            self._log, self._thread = None, None
+            raise
         return self
 
     def _run(self) -> None:
