@@ -60,7 +60,7 @@ TASK_HEADER = (
 )
 
 #: `# Title` to `###### Title`: a Markdown heading line.
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*)$")
 
 #: A fence is a run of 3+ backticks or tildes (CommonMark); tilde fences count too (bug 175).
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
@@ -163,7 +163,8 @@ def scan(repo: Path, config, branch: str, proc_root: str = rounds.PROC_ROOT) -> 
             if len(places[place].get(nn, [])) > 1 and flag not in flags:
                 flags.append(flag)
         if nn in places[WHERE_DRAFT] and where != WHERE_DRAFT:
-            flags.append(f"draft and {rounds.TASKS_DIR} both hold {nn}")
+            held = rounds.TASKS_DIR if where == WHERE_CHECKOUT else f"{branch}'s {rounds.TASKS_DIR}"
+            flags.append(f"draft and {held} both hold {nn}")
         if nn in committed and status not in ("landed", "closed"):
             flags.append(f"commit {nn}: on {branch} but status {status or 'none'}")
         if status == "landed" and nn not in committed:
@@ -448,7 +449,7 @@ def _chosen_number(repo: Path, config, branch: str, raw) -> int:
     if raw is None:
         return next_number(repo, config, branch)
     text = str(raw).strip()
-    if not re.fullmatch(r"\d+", text) or int(text) <= 0:
+    if not re.fullmatch(r"\d{1,18}", text) or int(text) <= 0:
         raise ValueError(f"--number {raw!r} is not a positive integer")
     number = int(text)
     taken = _held_by(repo, config, branch, number)
@@ -1105,7 +1106,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
     repo = Path(repo)
     out = getattr(args, "output", "table")
     raw = str(getattr(args, "number", "") or "")
-    if not re.fullmatch(r"\d+", raw) or int(raw) <= 0:
+    if not re.fullmatch(r"\d{1,18}", raw) or int(raw) <= 0:
         return output.refuse(f"issue {verb}: {raw!r} is not a ticket number")
     nn = int(raw)
     from_states, target = TRANSITIONS[verb]
@@ -1308,7 +1309,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
     repo = Path(repo)
     out = getattr(args, "output", "table")
     raw = str(getattr(args, "number", "") or "")
-    if not re.fullmatch(r"\d+", raw) or int(raw) <= 0:
+    if not re.fullmatch(r"\d{1,18}", raw) or int(raw) <= 0:
         return output.refuse(f"issue edit: {raw!r} is not a ticket number")
     nn = int(raw)
     verb = "edit"

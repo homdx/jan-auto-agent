@@ -353,7 +353,9 @@ def run_base_check(
     git checkout, `git worktree add` failing. No 3, no 4.
     """
     repo = Path(repo)
-    ref = getattr(args, "ref", None) or default_ref(profile)
+    ref = getattr(args, "ref", None)
+    if ref is None:
+        ref = default_ref(profile)       # an explicit --ref "" is refused below, not replaced
     if not isinstance(ref, str) or not ref.strip():
         return output.refuse("base check: --ref is empty")
     steps = list(steps) if steps else build_steps()

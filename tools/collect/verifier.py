@@ -125,12 +125,36 @@ class DroppedClaim:
 # ── claim extraction from Pass B prose ─────────────────────────────────────────
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
-_LOCATION_RE = re.compile(r"([\w./\\-]+\.py):(\d+)")
-# Matches a symbol citation (path.py:Name), so an invented name is caught too.
-_SYMBOL_CITATION_RE = re.compile(r"([\w./\\-]+\.py):([A-Za-z_]\w*)\b")
-# Matches only the start of an access citation (name[); the brackets are walked by hand.
-_ACCESS_START_RE = re.compile(r"[A-Za-z_][\w.]*(?=\[)")
-# Typing generics such as dict[str, int] are not variables, so they are not treated as accesses (BUGFIX).
+_LOCATION_RE = re.compile(r"(?<![\w./\\-])([\w./\\-]+\.py):(\d+)")   # (?<!…): starts where its run starts
+# A `path.py:identifier` citation — the same "file:thing" shape as
+# `_LOCATION_RE`, but naming a symbol instead of a line number (identifier
+# starts with a letter/underscore, so it can never collide with the
+# all-digit line-number form above). This is what lets `extract_claims`
+# recognize an *invented* symbol name as an attempted citation at all — see
+# the `known_names` guard where this is used below, which is what keeps
+# this pattern from also flagging a *real* name Pass A's narrower
+# `public_symbols` index just doesn't happen to track (a module-level
+# constant, a class method).
+_SYMBOL_CITATION_RE = re.compile(r"(?<![\w./\\-])([\w./\\-]+\.py):([A-Za-z_]\w*)\b")
+# Matches only the *start* of a candidate access citation — `name[` — so we
+# can then hand-walk the brackets with `_iter_access_citations` below
+# rather than trying to express "balanced, possibly-nested brackets" as a
+# single regex. (BUGFIX, see `_iter_access_citations`'s docstring for why
+# this replaced a plain single-pattern `_ACCESS_RE`.)
+_ACCESS_START_RE = re.compile(r"(?<![\w.])[A-Za-z_][\w.]*(?=\[)")
+# Base names that are typing/builtin generic containers, not variables —
+# BUGFIX (found via self-play): a sentence like "parse_config returns
+# dict[str, int] and raises ValueError on bad input" was previously read
+# by `_ACCESS_RE` as citing an access `dict[str, int]`; combined with
+# "raises...Error" tripping `_CRASH_WORDS_RE`, that turned an ordinary,
+# entirely correct type-annotation sentence into an `access_crash` claim
+# whose cited "access" can never appear in `known_accesses` (COLLECT-7's
+# catalog only ever holds real indexed-access sites, never type
+# expressions) — so `citation_check` dropped the whole sentence as a
+# fabrication, even though nothing in it was fabricated. Any candidate
+# citation whose base name is one of these is never treated as an access
+# citation at all, the same "nothing to check, so it survives" treatment
+# any other non-citation prose gets.
 _TYPING_BASE_NAMES = frozenset({
     "dict", "list", "set", "tuple", "frozenset", "type",
     "Dict", "List", "Set", "Tuple", "FrozenSet", "Type",

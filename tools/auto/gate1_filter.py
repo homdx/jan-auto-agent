@@ -1565,7 +1565,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                         else "presence_empty_exhausted"
                     )
                 if (empty_kind == _EMPTY_KIND_TRANSPORT
-                        and _empty_retry < self._presence_empty_retries):
+                        and _empty_retry < self._presence_empty_retries
+                        and (_deadline is None or time.monotonic() < _deadline)):
                     _empty_retry += 1
                     logger.info(
                         "Gate1._check_presence [%s]: empty (transport) — "

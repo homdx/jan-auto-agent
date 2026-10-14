@@ -326,6 +326,7 @@ def subject_of(mail: str) -> str:
 
 def body_of(mail: str) -> str:
     """The commit message in a mail's body: the text up to the diffstat, as it is."""
+    mail = mail.replace("\r\n", "\n")          # a CRLF patch has no "\n\n": its body came back empty
     text = mail.split("\n\n", 1)[1] if "\n\n" in mail else ""
     lines = text.split("\n")
     for index, line in enumerate(lines):

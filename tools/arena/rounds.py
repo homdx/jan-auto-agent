@@ -534,8 +534,12 @@ def list_rows(repo: Path, config, now: Optional[float] = None,
     out = repo / config.out_dir
     now = time.time() if now is None else now
     groups: dict[int, list[tuple[int, Path]]] = {}
-    if out.is_dir():
-        for entry in out.iterdir():
+    try:
+        entries = list(out.iterdir()) if out.is_dir() else []
+    except OSError:
+        entries = []                     # an unreadable rounds folder lists nothing, never a traceback
+    if entries:
+        for entry in entries:
             match = _ROUND_DIR.match(entry.name)
             if match and entry.is_dir():
                 leg = int(match.group(2)) if match.group(2) else 0
@@ -562,7 +566,7 @@ def list_rows(repo: Path, config, now: Optional[float] = None,
         try:
             data = json.loads(state.read_text(encoding="utf-8"))
             agents = data["agents"]
-            ready = sum(1 for a in agents if a.get("state") == "READY")
+            ready = sum(1 for a in agents if isinstance(a, dict) and a.get("state") == "READY")
             counts = f"{ready}/{len(agents)}"
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             data, counts = None, ""

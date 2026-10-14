@@ -31,7 +31,7 @@ TRUTH_COLUMNS = ["finding", "truth", "checked_by", "how"]
 def load(paths):
     """Every verdict row, its adjudicator in ``_adj``, its file and line in ``_at``. A blank truth is
     UNDECIDED: it settled as the verdict "" (two blank rows "agreed"); see `no_verdicts`."""
-    rows, skipped = [], []
+    rows, skipped, nameless = [], [], []
     for p in paths:
         name = os.path.basename(p).rsplit(".", 1)[0].lower()
         name = name[6:] if name.startswith("truth-") else name
@@ -40,12 +40,19 @@ def load(paths):
             if not NEEDED.issubset(set(rd.fieldnames or [])):
                 skipped.append(os.path.basename(p)); continue
             for r in rd:
+                if not (r.get("finding") or "").strip():
+                    # a verdict without a finding settled as the finding "" (truth.csv got ",REAL,a+b,x")
+                    if (r.get("truth") or "").strip():
+                        nameless.append(f"{p}:{rd.line_num}")
+                    continue
                 r["_adj"] = name
                 r["_at"] = f"{p}:{rd.line_num}"
                 r["truth"] = (r.get("truth") or "").strip().upper() or "UNDECIDED"
                 rows.append(r)
     if skipped:
         print(f"skipped (not verdict CSVs): {', '.join(skipped)}", file=sys.stderr)
+    if nameless:
+        print(f"skipped (a verdict with no finding): {', '.join(nameless)}", file=sys.stderr)
     return rows
 
 

@@ -102,11 +102,12 @@ class MockFileUtilities:
 try:
     from tools import file_reader as file_reader
     from tools import block_extractor as block_extractor
-    # sanity: the real block module must expose the analysis API
-    assert hasattr(block_extractor, "extract_block") and hasattr(file_reader, "read_file")
-except Exception:
-    logger.warning("tools.file_reader / tools.block_extractor unavailable — "
-                   "falling back to MockFileUtilities (block extraction disabled).")
+    # sanity: the real block module must expose the analysis API (not an assert: python -O drops it)
+    if not (hasattr(block_extractor, "extract_block") and hasattr(file_reader, "read_file")):
+        raise ImportError("tools.block_extractor / tools.file_reader lack extract_block / read_file")
+except Exception as _exc:
+    logger.warning("tools.file_reader / tools.block_extractor unavailable (%s: %s) — "
+                   "falling back to MockFileUtilities (block extraction disabled).", type(_exc).__name__, _exc)
     file_util = MockFileUtilities()
     file_reader = file_util
     block_extractor = file_util

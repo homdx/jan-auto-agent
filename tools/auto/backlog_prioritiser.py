@@ -401,8 +401,12 @@ class BacklogPrioritiser:
         name = re.escape(symbol_a)
         if _looks_like_code(symbol_a):
             return bool(re.search(rf"\b{name}\b", task_b.instruction))
-        # A name that is also an English word counts only where it is written as code (`run`, `Store`), not in prose.
-        return bool(re.search(rf"`[^`\n]*\b{name}\b[^`\n]*`|\b{name}\s*\(|\.{name}\b|\b{name}\.\w",
+        # A name that is also an English word (`run`, `parse`, `Store`) counts only where B writes it as
+        # code: "the loop will run only when enabled" made B depend on A, and the controller holds a task
+        # whose dependency is not done — one failed task blocked an unrelated one
+        # a call has no space before its parenthesis ("run (when enabled)" is prose), and "run.log" is a file
+        ext = r"(?:log|txt|md|rst|py|json|csv|ini|cfg|toml|ya?ml|sh|out|err|tmp|lock)\b"
+        return bool(re.search(rf"`[^`\n]*\b{name}\b[^`\n]*`|\b{name}\(|\.{name}\b|\b{name}\.(?!{ext})\w",
                               task_b.instruction))
 
 

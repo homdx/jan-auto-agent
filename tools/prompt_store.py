@@ -99,7 +99,8 @@ class PromptStore:
                     stack[-1],
                 )
                 label = f"v{current['version']}"
-                score_str = f"(score {current['score']:.2f})"
+                score = current.get("score")
+                score_str = f"(score {score:.2f})" if isinstance(score, (int, float)) else "(no score)"
             else:
                 label = "hardcoded"
                 score_str = ""
@@ -292,5 +293,16 @@ class PromptStore:
                 except OSError:
                     pass
             logger.error(f"PromptStore failed to write {self.store_path}: {e}")
-            # Re-raise a failed save, so the caller does not think the new state is durable (BUGFIX).
+            # 5. Re-raise so callers (push/rollback) know the save did not
+            # happen, instead of silently returning as if it succeeded —
+            # without this, the caller believes the new state is durable
+            # while the store still holds the stale/previous data on disk.
             raise RuntimeError(f"PromptStore failed to write {self.store_path}") from e
+        except BaseException:
+            # Ctrl-C mid-write: the temp file is not left behind either
+            if 'tmp_path' in locals():
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise

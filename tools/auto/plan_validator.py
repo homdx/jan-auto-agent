@@ -362,10 +362,91 @@ def validate_plan(
     )
 
 
-# IMPROVEMENTS.md: removing a false positive's section
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPROVEMENTS.md — strip the false positive's section
+# ─────────────────────────────────────────────────────────────────────────────
 
-# A whole task entry, from its heading to its separator, so it can be removed as one block (FIX-2 #8).
-_NEXT_ENTRY = r"(?:### (?=[\w.\-]*[\d.\-])[\w.\-]+: |## Manual Suggestions)"
+# Matches an entire task entry — from its "### <id>: ..." heading through
+# its own trailing "---" separator — so it can be deleted as one clean block.
+# DOTALL so it spans the whole multi-line entry (including fenced code
+# blocks).
+#
+# FIX-2 #8: the interior boundary used to be the bare "\n### ", which matches
+# ANY line starting with "### " — including one *inside* the task's own
+# instruction or acceptance_check (a markdown heading quoted in an example,
+# a "### Notes:" sub-section the author wrote, a "###"-style shell comment).
+# That truncated the removal at the interior heading and left the rest of
+# the entry behind as orphaned text. A colon-terminated variant ("### <x>:")
+# is not a fix: an interior sub-heading almost always carries a colon too
+# ("### Notes:", "### Example Usage:"), so it still gets treated as a task
+# boundary; hardcoding the id's alphabetic prefix ("### AUTO-T\d+:") isn't
+# either, since it stops matching the moment a differently-prefixed id
+# (a custom [auto] task_id_prefix, a "BUG-FIX-*" entry) is the very next
+# section.
+#
+# The fix instead keys off something a task's own body cannot forge by
+# accident: to_improvements_md() (backlog_prioritiser.py) always closes
+# every rendered task -- auto or last-in-file -- with a literal "\n---\n"
+# separator before the next heading or "## Manual Suggestions" begins. That
+# separator is matched and CONSUMED here (not just looked ahead to), so the
+# whole entry -- body and its own trailing "---" -- comes out as one unit
+# and nothing is left orphaned between the previous entry and the next
+# heading.
+#
+# The separator is only accepted as a terminator when the next thing after
+# it is the next task heading, the Manual Suggestions section, or end of
+# file. Without that trailing lookahead the separator alternative has the
+# very defect it replaces, only with a different trigger: an instruction
+# containing a markdown horizontal rule ("...\n\n---\n\nmore prose") ends the
+# lazy match at its own interior "---", leaving "more prose" behind as
+# orphaned text. A real entry terminator is always followed by a heading,
+# an interior rule never is, so the lookahead separates the two exactly.
+# Note "### " / "## Manual Suggestions" must NOT be added to the *fallback*
+# lookahead below for the same reason the bare "\n### " boundary was removed
+# in the first place.
+#
+# The lookahead alternatives ("\n## Manual Suggestions" / end-of-string) are
+# kept as a fallback for a plan.json that was hand-edited or produced
+# outside to_improvements_md's own renderer and so may be missing that
+# trailing separator; the exact literal (not a generic "\n## ") is
+# deliberate for the same reason as above -- a task's own text can
+# legitimately contain a line starting with "## ".
+#
+# FIX-2 H4: the body is ".*?" no longer, but "(?:_FENCE_BLOCK|.)*?" — an
+# alternation that consumes a whole fenced code block as ONE atomic unit
+# whenever one opens, and a single character otherwise. Without it the
+# separator rule above has the same defect it was written to remove, only
+# reached through a different door: an instruction that quotes markdown
+# inside a fence
+#
+#     ```markdown
+#     ---
+#     ### Example heading
+#     ```
+#
+# contains a "\n---\n" whose next line really does start with "### ", so the
+# terminator (and its lookahead) both fire on text that is a code sample, not
+# structure. The entry was cut off mid-fence and its tail left behind in
+# IMPROVEMENTS.md as orphaned text — the exact failure the separator rule
+# exists to prevent. Because the loop is lazy, the engine tries to END the
+# section before it tries either alternative, so a fence is only entered when
+# no terminator matches at its opening line; consuming it whole then skips
+# every position inside it, and no interior "---" or "### " is ever offered
+# as a boundary. An UNCLOSED fence matches no block and degrades to the
+# per-character path, i.e. to the pre-H4 behaviour, rather than swallowing
+# the rest of the file.
+#
+# The closer must repeat the opener's own character (CommonMark: ``` closes
+# ```, ~~~ closes ~~~), which is why the run is captured and back-referenced
+# instead of being written as a literal — a "~~~" line inside a ``` block is
+# body text, not a terminator.
+#
+# Review batch m: the next entry starts at a heading of a task, "### <id>: " with an id the way ids are
+# (`AUTO-T3`, `T-2`, `T.1`: a digit, a dash or a dot in it) — not at any "### " after a rule, which cut an
+# entry at its own "---" + "### Notes inside it" and left that tail behind. A fenced block does not run
+# past such a heading either: an unclosed fence in the removed entry paired with the NEXT entry's opening
+# fence, and that whole entry went with it (gone from IMPROVEMENTS.md, still in plan.json).
+_NEXT_ENTRY = r"(?:### (?=[\w.\-]*[\d._\-])[\w.\-]+: |## Manual Suggestions)"   # "task_b" is an id too
 _FENCE_BLOCK = (
     r"(?m:^ {0,3})(?P<fence>`{3,}|~{3,})[^\n]*\n"   # opening fence line
     r"(?:(?!\n-{3,}\n+" + _NEXT_ENTRY + r")[\s\S])*?"  # block body, verbatim, within its entry

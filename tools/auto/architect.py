@@ -653,6 +653,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     checkpoint = json.loads(
                         checkpoint_path.read_text(encoding="utf-8")
                     )
+                    if not isinstance(checkpoint, dict):
+                        raise ValueError(f"a JSON {type(checkpoint).__name__}, not an object")
                     logger.info(
                         "review_clusters: loaded architect checkpoint from %s "
                         "(%d batch key(s) cached)",

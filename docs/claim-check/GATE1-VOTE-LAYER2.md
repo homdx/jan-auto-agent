@@ -351,7 +351,46 @@ do not touch the reader's path). No voter was dropped, no candidate unresolved.
 
 Across the four runs the verdict is unchanged: `claim_vote` stays `off`; the veto half is correct and the confirm half is not.
 
-### Fifth run: the collect model, measured (2026-10-14, run `20261014T-newcode`, code 1a5f18a)
+### Fifth run: the same veto-only sets on fixes 29 to 33 (run `20261013T120948Z`, 2026-10-13)
+
+The fourth run repeated on `a0f0991`. `kenary` muse-spark-1-3 and mimo-v2-6 answered 503 all day, so the roster ran without them (5: step-5, nemotron-ultra, agnes-3,
+hy3, nemotron-super; 7: + ling, agnes-2-5); nemotron-ultra was dropped mid-run in both variants (two missed replies in a row), ling missed replies while the SOCKS tunnel
+flapped.
+
+| variant | false positives through | true bugs rejected | vote rejections (wrong) | overridden by the reader | verdict |
+|---|---|---|---|---|---|
+| off | 26 | 0 | — | — | baseline |
+| off-2 | 28 | 1 | — | — | baseline |
+| off-3 | 27 | 1 | — | — | baseline |
+| on-5-veto | 27 | 0 | 0 (0) | 2 | FAIL (27 against a baseline range of 26 to 28) |
+| on-7-veto | 31 | 1 | 0 (0) | 1 | FAIL (31 against 26 to 28) |
+
+* **The veto did not speak at all**: no unanimous FALSE in either variant. The real bug rejected in `on-7-veto` (`AUTO-T1`) was the reader's, as in `off-2` and `off-3`.
+* The baselines disagree on 13 of 56 candidates; both FAILs are the reader's spread, as in the fourth run. The verdict stands: `claim_vote` stays `off`.
+
+### Sixth run: the collect model for the judges (CC-13; the same directory, `--collect-from`, 2026-10-14)
+
+The fifth run resumed with `--collect-from` on fixes 34 to 36: the collect model of `4ff7d14` built on sensenova-6.8-flash-lite (573 modules, every one summarized;
+Pass C dropped 300 of 2244 claims), `skip_dirs = contest-out, rounds, claim-check-out` carried into the `+collect` inis, every `+collect` run's line
+`collect: fresh — reader: used` (and `vote pack: used`, 128 collect chunks, for the votes). `ling-3.1-flash-free` is gone from the gateway (404): the 7-set ran
+with six.
+
+| variant | false positives through | true bugs rejected | vote rejections (wrong) | decided | verdict |
+|---|---|---|---|---|---|
+| off / off-2 / off-3 | 26 / 28 / 27 | 0 / 1 / 1 | — | — | baseline |
+| off+collect / off-2+collect / off-3+collect | 25 / 21 / 27 | 0 / 1 / 0 | — | — | baseline with the collect model |
+| on-5-veto / on-7-veto | 27 / 31 | 0 / 1 | 0 (0) / 0 (0) | 3 / 2 | FAIL |
+| on-5-veto+collect / on-7-veto+collect | 22 / 23 | 0 / 1 | 0 (0) / 0 (0) | 5 / 2 | FAIL (22 and 23 against 21 to 27) |
+
+* **The reader alone does not get worse with the model**: 21 to 27 false positives through against 26 to 28 without, true bugs rejected 0 to 1 on both sides — the
+  first half of the option's rule holds; the shift (24.3 against 27 on average) is inside the baselines' own spread (11 to 13 candidates flip between two runs).
+  The reader is also faster with it: 1041 to 1234 s a baseline against 1866 to 2059 s without.
+* **The veto still does not speak**: no unanimous FALSE in either `+collect` variant; their counts are the reader's, and the one real bug rejected anywhere
+  (`AUTO-T1`) is the reader's in every run, with and without the model.
+* So `vote_collect` stays `off` until the vote has something to say (CC-12, callers in the pack); `[collect] use_in_auto` for the reader is the change worth
+  measuring next on its own.
+
+### Seventh run: the collect model, measured (2026-10-14, run `20261014T-newcode`, code 1a5f18a)
 
 The first `+collect` attempt (run `20261013T155106Z`, old code) measured nothing about collect: the artifact built with `skip_dirs = claim-check-out, contest-out, ...` was read as stale
 against an ini without them (`collect: stale (0 modules changed)`), so the reader did not use it; the tool called both `+collect` variants NO COLLECT. Patch 2 of CC-13 carries the artifact's

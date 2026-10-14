@@ -13,6 +13,7 @@ from tools.llm_stream import (
     request_completion as _request_completion,
     ollama_chat_url as _ollama_chat_url,
     strip_think as _strip_think,
+    strip_json_fence as _strip_json_fence,
 )
 
 _FILTER_SNIPPET_CHARS = 800
@@ -167,11 +168,8 @@ class SearchAgent:
                 url, headers, payload, self.timeout,
                 api_format=self.api_format, ssl_context=self.ssl_context,
             )
-            cleaned = _strip_think(raw or "").strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```", 2)[1]
-                if cleaned.lstrip().lower().startswith("json"):
-                    cleaned = cleaned.lstrip()[4:]
+            # any fence label (```text, ```jsonc): a label left on the body failed json.loads and approved all
+            cleaned = _strip_json_fence(_strip_think(raw or "").strip())
             approved = json.loads(cleaned)
             if not isinstance(approved, list):
                 raise ValueError(f"expected a JSON list, got {type(approved).__name__}")

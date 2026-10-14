@@ -55,7 +55,7 @@ class OutputFormatter:
         elif parsed.target_type == "class":
             target_prefix = "class "
             
-        target_display = f"{target_prefix}{parsed.target_name}".strip()
+        target_display = f"{target_prefix}{parsed.target_name}".strip() if parsed.target_name else ""
         if not target_display:
             target_display = "File Imports Only"
 

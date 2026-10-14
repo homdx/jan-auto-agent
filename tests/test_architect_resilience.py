@@ -450,6 +450,17 @@ class TestCheckpointWriteAndRead:
         mock_llm.assert_called_once()
         assert results[0].title == "After corrupt ckpt"
 
+    def test_a_checkpoint_that_is_not_an_object_falls_back(
+        self, reviewer: ClusterReviewer, cluster_and_base, tmp_path: Path
+    ) -> None:
+        cluster, base_dir = cluster_and_base
+        ckpt = tmp_path / "arch_ckpt.json"
+        ckpt.write_text("[1, 2]", encoding="utf-8")       # valid JSON, not an object: a TypeError on write
+        with patch("tools.llm_stream.request_completion", return_value=_good_payload("After a list ckpt")):
+            results = reviewer.review_clusters([cluster], base_dir, goal="improve code", checkpoint_path=ckpt)
+        assert results[0].title == "After a list ckpt"
+        assert isinstance(json.loads(ckpt.read_text(encoding="utf-8")), dict)
+
     # AC-C6: different goals do NOT share cache entries
     def test_different_goals_dont_share_cache(
         self, reviewer: ClusterReviewer, cluster_and_base, tmp_path: Path
