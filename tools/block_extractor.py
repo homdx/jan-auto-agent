@@ -235,6 +235,11 @@ def _lang_skip(source: str, i: int, lang: str) -> Optional[int]:
         return m.end() if m else i + 1
     if lang == "c" and ch == "#" and not source[_line_start_index(source, i):i].strip():
         nl = source.find("\n", i)
+        while nl >= 0 and source[_line_start_index(source, nl):nl].rstrip().endswith("\\"):
+            # A preprocessor line ending in `\` continues on the next line, so its whole body is
+            # one token: the `{`/`}` of a `#define X do { … } while (0)` belong to the macro, not to
+            # the block being counted (HARDEN-4 D4).
+            nl = source.find("\n", nl + 1)
         return len(source) if nl < 0 else nl
     if lang == "js" and ch == "/" and source[i + 1:i + 2] not in ("/", "*") and _js_regex_can_start(source, i):
         return _js_regex_end(source, i)
@@ -245,7 +250,15 @@ def _js_regex_can_start(source: str, i: int) -> bool:
     j = i - 1
     while j >= 0 and source[j] in " \t\r\n":
         j -= 1
-    if j < 0 or source[j] in "(,=:[!&|?{};+-*%<>~^":
+    if j < 0:
+        return True
+    if source[j] == "<":
+        # HARDEN-4 D1: `</li>`, `</p>` — a JSX closing tag's `/` follows `<`. Read as a regex it would
+        # swallow everything to the next `/` on the line, `}` included, and every following function
+        # came out as part of the target block. A `<` never starts a regex either (a comparison's `<`
+        # is followed by an operand, never by `/`), so this is safe for plain JS/TS too.
+        return False
+    if source[j] in "(,=:[!&|?{};+-*%>~^":
         return True
     k = j
     while k >= 0 and (source[k].isalnum() or source[k] in "_$"):
@@ -527,7 +540,160 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
             rf"(?m)^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:[A-Za-z_$][\w$]*\s+)*?"
             rf"(?:class|interface|struct|enum|trait|record|object|namespace)\s+{name}\b"
         ),
+        # HARDEN-4 D2: the heads below name a definition but carry no return type and no keyword of
+        # their own, so no pattern above reached them and every one of them answered "not found".
+        # They are anchored with [ \t]* on purpose (never \s*): a head that spans lines is not this
+        # form, and a multi-line `const x =\n  function y(` must keep resolving to `y`'s own line.
+        # const f = function (...) {   let f = async function (...) {
+        re.compile(rf"(?m)^[ \t]*(?:export[ \t]+)?(?:const|let|var)[ \t]+{name}[ \t]*=[ \t]*"
+                   rf"(?:async[ \t]+)?function[ \t]*\*?[ \t]*[\w$]*[ \t]*\("),
+        # module.exports = function m(...) {   (the plain `exports.m = function` form is the row above)
+        re.compile(rf"(?m)^[ \t]*module\.exports[ \t]*=[ \t]*(?:async[ \t]+)?function[ \t]*\*?[ \t]*"
+                   rf"{name}[ \t]*\("),
+        # Go: var F = func(...) {
+        re.compile(rf"(?m)^[ \t]*var[ \t]+{name}[ \t]*=[ \t]*func[ \t]*\("),
+        # Kotlin/Scala: fun ff() = 1   fun ff() { … }
+        re.compile(rf"(?m)^[ \t]*fun[ \t]+{name}{tp}[ \t]*\("),
     ]
+
+
+#: Signature-to-tail bound for the brace-less forms, same rationale as _DEFINITION_SCAN_BOUND.
+_BODYLESS_SCAN_BOUND = 400
+
+#: Characters a line may end on and still continue on the next line (`const clamp = (a, b) =>`,
+#: `const total = a +\n  b;`). Everything else ends the logical line.
+_CONTINUATION_TAIL = frozenset("=+-*/%&|^?:,.<>([{")
+
+
+def _bodyless_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
+    """The heads of a definition that has no `{ … }` body at all (HARDEN-4 D2).
+
+    Every one of them is a *declaration* by its own prefix (`const`/`let`/`var`, `module.exports`,
+    `var … = func`, `fun`), which is what makes it safe to answer with a block when no brace
+    follows: the bare `name(...)` patterns in `_brace_candidate_patterns` deliberately stay out of
+    this list, because there the same shape is an ordinary call site
+    (`tests_bugfix/test_block_extractor_call_site_vs_definition.py`).
+    """
+    name = re.escape(target_name)
+    tp = r"(?:\s*<[^(){};]*>|\s*\[[^(){};]*\])?"
+    return [
+        # const double = (x) => x * 2;   const clamp = (a, b) =>\n  a + b;   const f = <T>(x: T): T => x;
+        re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*(?::[^=;]+?)?=\s*(?:async\s*)?"
+                   rf"(?:<[^(){{}};]*>\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}]+?)?\s*=>"),
+        # class A { handle = (e) => e + 1; }   (a class field: no const/let/var, an optional modifier before the name)
+        re.compile(rf"(?m)^\s*(?:(?:public|private|protected|static|readonly|override|declare)\s+)*{name}\s*(?::[^=;]+?)?=\s*"
+                   rf"(?:async\s*)?(?:<[^(){{}};]*>\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}]+?)?\s*=>"),
+        # const f = function (a) ;   let f = async function () ;
+        re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*=\s*(?:async\s+)?function\s*\*?\s*"
+                   rf"[\w$]*\s*\("),
+        # module.exports = function m(a) ;
+        re.compile(rf"(?m)^\s*module\.exports\s*=\s*(?:async\s+)?function\s*\*?\s*{name}\s*\("),
+        # Go: var F = func(a) ;
+        re.compile(rf"(?m)^\s*var\s+{name}\s*=\s*func\s*\("),
+        # Kotlin/Scala: fun ff() = 1
+        re.compile(rf"(?m)^\s*fun\s+{name}{tp}\s*\("),
+    ]
+
+
+def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: bool, lang: str = "") -> Optional[int]:
+    """The end of a definition whose head matches but whose body has no `{ … }` (HARDEN-4 D2).
+
+    Returns the index just past the `;` that ends the statement, or the end of its last logical
+    line when there is none (`fun ff() = 1`), or None when nothing conclusive appears inside the
+    bound. A line that ends on an operator continues on the next one, so a wrapped arrow body
+    (`const clamp = (a, b) =>` / `  a + b;`) stays inside its own block.
+    """
+    n = len(source)
+    i = scan_from
+
+    if has_arg_list:
+        # Same skip as _find_definition_open_brace: a default value cannot end the signature early.
+        close_paren = _brace_scan_end(source, i - 1, "(", ")", lang)
+        if close_paren >= n:
+            return None
+        i = close_paren
+
+    state = "code"
+    escape = False
+    depth = 0
+    bound = min(n, i + _BODYLESS_SCAN_BOUND)
+
+    while i < bound:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+
+        if state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+            else:
+                i += 1
+            continue
+        if state in {"single", "double", "backtick", "char"}:
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            quote = {"single": "'", "double": '"', "backtick": "`", "char": "'"}[state]
+            if ch == quote:
+                state = "code"
+            i += 1
+            continue
+
+        if lang:
+            skip = _lang_skip(source, i, lang)
+            if skip is not None:
+                i = skip
+                continue
+        if ch == "/" and nxt == "/":
+            state = "line_comment"
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            state = "block_comment"
+            i += 2
+            continue
+        if ch == "'":
+            state = "single"
+            i += 1
+            continue
+        if ch == '"':
+            state = "double"
+            i += 1
+            continue
+        if ch == "`":
+            state = "backtick"
+            i += 1
+            continue
+
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                # A closer we never opened ends the statement: the definition ran into the block
+                # around it rather than continuing.
+                return i
+        elif ch == ";" and depth == 0:
+            return i + 1
+        elif ch == "\n" and depth == 0:
+            k = i - 1
+            while k >= scan_from and source[k] in " \t\r":
+                k -= 1
+            if k < 0 or source[k] not in _CONTINUATION_TAIL:
+                return i
+        i += 1
+
+    return None
 
 
 def _find_earliest_genuine_definition(source: str, target_name: str, lang: str = "") -> Optional[tuple]:
@@ -539,6 +705,12 @@ def _find_earliest_genuine_definition(source: str, target_name: str, lang: str =
     nearby, discarding call sites and brace-less arrow-function matches
     along the way. Returns None if no pattern yields a genuine definition
     anywhere in the source.
+
+    HARDEN-4 D2: when no braced definition exists anywhere in the file, the
+    brace-less heads are tried as a *second*, separate pass instead. Running
+    them only as a fallback is what keeps this a pure addition: every block
+    that is found today is still found, from the same place, because the
+    brace-less pass can never out-rank a braced definition that already won.
 
     Shared by _extract_brace_block (the block-extraction path) and
     _find_block_start_line_fallback (get_context_lines' fallback path) so
@@ -571,11 +743,42 @@ def _find_earliest_genuine_definition(source: str, target_name: str, lang: str =
                 best_match_start = effective_start
                 best_open_brace = open_idx
 
+    if best_start is not None:
+        end = _brace_scan_end(source, best_open_brace, lang=lang)
+        return (best_match_start, best_open_brace, end)
+
+    return _find_earliest_bodyless_definition(source, target_name, lang)
+
+
+def _find_earliest_bodyless_definition(source: str, target_name: str, lang: str = "") -> Optional[tuple]:
+    """The earliest definition of `target_name` that has no braced body (HARDEN-4 D2), as
+    `(match_start, None, end)` — the same tuple `_find_earliest_genuine_definition` returns, with
+    `None` in the open-brace slot because there is none.
+
+    Only reached when the braced search above found nothing at all, so it can only turn a "not
+    found" into a found block; it never changes a block that was already being returned.
+    """
+    best_start = None
+    best_match_start = None
+    best_end = None
+
+    for pat in _bodyless_candidate_patterns(target_name):
+        for match in pat.finditer(source):
+            has_arg_list = match.group(0).rstrip().endswith("(")
+            end = _find_definition_end_bodyless(source, match.end(), has_arg_list, lang)
+            if end is None:
+                continue
+
+            effective_start = _effective_match_start(source, match.start())
+            start = _line_start_index(source, effective_start)
+            if best_start is None or start < best_start:
+                best_start = start
+                best_match_start = effective_start
+                best_end = end
+
     if best_start is None:
         return None
-
-    end = _brace_scan_end(source, best_open_brace, lang=lang)
-    return (best_match_start, best_open_brace, end)
+    return (best_match_start, None, best_end)
 
 
 def _extract_brace_block(source: str, target_name: str, lang: str = "") -> str:

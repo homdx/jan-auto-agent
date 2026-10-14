@@ -1,10 +1,10 @@
 # HARDEN-4 — seven defects in what the model of a repository gets wrong: JSX, bodyless functions, src/ layouts, C macros, except rationales, is_safe root, dirty flag
 
-**Status:** open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 301: step-5-preview as the base, with the class-field arrow function added; black box 301, 29 checks). Before: open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** MEDIUM (D2 and D3 change what Gate 1 and the risk index see on a whole language or layout; D1 and D4 are regressions of fix 32)
 **File:** `tools/block_extractor.py`, `tools/auto/gate1_filter.py`, `tools/collect/graph.py`, `tools/collect/test_map.py`, `tools/collect/registries.py`, `tools/collect/loader.py`, `tools/collect/manifest.py`
 **Symbol:** `_js_regex_can_start` / `_lang_skip`, `_find_definition_open_brace`, `_module_dotted_name`, `_handler_rationale`, `CollectModel._already_safe_index`, `is_dirty`
-**Round:** —
+**Round:** 301
 **Size:** L
 **Depends on:** CC review fixes 34–36 (landed, `c2ef95b`): this ticket starts from their code
 **Also touches:** `tests/test_block_extractor_regressions.py`, `tests/test_collect_layouts.py` and one pinned test per defect in `tests_bugfix/`

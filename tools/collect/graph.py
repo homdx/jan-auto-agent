@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterable, List, Optional, Set
+from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from tools.collect.java_parser import parse_java
 from tools.collect.lang import Language
@@ -63,6 +63,81 @@ from tools.collect.model import ModuleRecord
 
 #: Graph shape: adjacency from module path to the set of module paths it links to.
 Graph = Dict[str, FrozenSet[str]]
+
+#: Directory names a source layout conventionally puts its packages under; a leading one is stripped
+#: from a module's dotted name exactly as a package root is (HARDEN-4 D3).
+_SOURCE_ROOT_DIRS = frozenset(("src", "lib"))
+
+
+def _package_dirs(paths: Iterable[str]) -> Set[str]:
+    """The directories of `paths` that are Python *packages*, i.e. hold an `__init__.py`.
+
+    Read off the module set itself rather than the filesystem, so `build_module_index` stays a pure
+    function of its input (the loader builds indexes over artifact records that may name files no
+    longer on disk) and costs no extra I/O.
+    """
+    out: Set[str] = set()
+    for p in paths:
+        if p == "__init__.py":
+            out.add("")
+        elif p.endswith("/__init__.py"):
+            out.add(p[: -len("/__init__.py")])
+    return out
+
+
+def _package_roots(packages: Set[str]) -> Set[str]:
+    """Every directory that has a package somewhere below it — the directories a `src/`/`lib/`
+    source root is recognised by (HARDEN-4 D3)."""
+    out: Set[str] = set()
+    for pkg in packages:
+        parts = pkg.split("/") if pkg else []
+        for i in range(len(parts)):
+            out.add("/".join(parts[:i]))
+    return out
+
+
+def _source_root_split(
+    parts: Tuple[str, ...], packages: Set[str], roots: Set[str]
+) -> Tuple[str, ...]:
+    """The leading directory components of *parts* that are not part of the module's dotted name.
+
+    Walks up from the file's own directory and stops at the first directory that is not a package
+    (holds no `__init__.py`) — that directory is the layout's source root, so everything under it is
+    the module's dotted name. `src/pkg/core.py` therefore stops at `src` and yields `pkg.core`
+    instead of `src.pkg.core`, which is what `import pkg.core` spells (HARDEN-4 D3);
+    `tools/collect/model.py` walks past `tools/collect` *and* `tools` (both are packages here) and
+    keeps its full name.
+
+    Only a directory that actually roots a package tree counts, so a plain directory of loose
+    scripts (`scripts/`, `tests/`) keeps the full path it always had; a leading `src`/`lib` counts
+    as a source root even where it holds no `__init__.py` of its own, since that is the only reason
+    it would be named that.
+    """
+    dirs = parts[:-1]
+    i = len(dirs)
+    while i > 0 and "/".join(dirs[:i]) in packages:
+        i -= 1
+    head = dirs[:i]
+    if not head:
+        return ()
+    if "/".join(head) not in roots and head[0] not in _SOURCE_ROOT_DIRS:
+        return ()
+    if head[0] in _SOURCE_ROOT_DIRS and len(head) > 1:
+        head = head[1:]
+    return head
+
+
+def _module_dotted_parts(path: str) -> Tuple[str, ...]:
+    """The dotted-name components of *path* with the file's own stem last (`__init__.py` dropped)."""
+    p = Path(path)
+    parts = list(p.parts)
+    if not parts:
+        return ()
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    elif parts:
+        parts[-1] = p.stem
+    return tuple(parts)
 
 
 def _module_dotted_name(path: str) -> str:
@@ -92,18 +167,38 @@ def _module_dotted_name(path: str) -> str:
     handles Python's `from x.y import z` coarsening — stripping one
     trailing component at a time until a real module matches.
     """
-    p = Path(path)
-    parts = list(p.parts)
-    if parts and parts[-1] == "__init__.py":
-        parts = parts[:-1]
-    elif parts:
-        parts[-1] = p.stem
-    return ".".join(parts)
+    return ".".join(_module_dotted_parts(path))
 
 
 def build_module_index(modules: Iterable[ModuleRecord]) -> Dict[str, str]:
-    """`{dotted_name: module_path}` for every module in `modules`."""
-    return {_module_dotted_name(m.path): m.path for m in modules}
+    """`{dotted_name: module_path}` for every module in `modules`.
+
+    HARDEN-4 D3: a module's own dotted name is keyed first and never displaced, so everything that
+    resolves today resolves exactly as it did — `src/pkg/core.py` still answers to `src.pkg.core`.
+    The layout-relative name (`pkg.core`) is added as a *second* key for the same path, and only
+    where nothing already owns it, so a `src/`-layout repository's internal imports resolve the same
+    way a flat copy's do instead of every module looking like an entry point with no importers. A
+    repo that has a real top-level package called `src` keeps resolving through the full path key.
+
+    Order is fixed by sorting on path, so two layouts colliding on one name resolve to the same
+    module on every run (COLLECT-3).
+    """
+    modules = sorted(modules, key=lambda m: m.path)
+    packages = _package_dirs(m.path for m in modules)
+    roots = _package_roots(packages)
+
+    index: Dict[str, str] = {}
+    for m in modules:
+        index.setdefault(_module_dotted_name(m.path), m.path)
+    for m in modules:
+        parts = _module_dotted_parts(m.path)
+        if not parts:
+            continue
+        head = _source_root_split(parts, packages, roots)
+        if not head:
+            continue  # the layout's root is the repo root: the name above is already the short one
+        index.setdefault(".".join(parts[len(head):]), m.path)
+    return index
 
 
 def resolve_import(

@@ -136,16 +136,27 @@ def _handler_rationale(
     except_lineno: int,
 ) -> Optional[str]:
     """Rationale comment for the `except` handler starting at
-    `except_lineno`, if one exists directly on that line or on the first
-    line of the handler's body (covers both `except X:  # why` and
-    `except X:\\n    pass  # why`). No other lines are considered — a
-    comment several lines away is not reliably *about* this site, so it's
-    left as `None` rather than guessed at.
+    `except_lineno`, if one exists directly on that line, on its own line
+    between the `except` and the handler's first statement, or on the first
+    line of the handler's body (covers `except X:  # why`,
+    `except X:` / `# why` / `pass`, and `except X:\\n    pass  # why`).
+
+    HARDEN-4 D5: the own-line shape was missed, which is the one most of
+    this repo's own documented handlers actually use — 7 of the 178
+    fail-open sites in `tools/` put the rationale on the line directly
+    under the `except`. Only the lines between the `except` and its first
+    body statement are added: a comment further down is not reliably
+    *about* this site, so it stays `None` rather than guessed at.
     """
     if except_lineno in comments:
         return comments[except_lineno]
     for node in ast.walk(tree):
         if isinstance(node, ast.ExceptHandler) and node.lineno == except_lineno:
+            first_body_line = node.body[0].lineno if node.body else None
+            if first_body_line is not None:
+                for lineno in range(except_lineno + 1, first_body_line):
+                    if lineno in comments:
+                        return comments[lineno]
             for stmt in node.body:
                 if stmt.lineno in comments:
                     return comments[stmt.lineno]

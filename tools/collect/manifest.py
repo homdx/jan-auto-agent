@@ -263,7 +263,11 @@ def is_dirty(root: Path, exclude_dir: Optional[Path] = None) -> bool:
     `get_git_sha`/`is_dirty` directly, to make this ordering hard to get
     wrong."""
     # --no-optional-locks: status never writes .git/index.lock, so a timeout kill cannot leave it behind.
-    status = _run_git(root, "--no-optional-locks", "status", "--porcelain")
+    # --untracked-files=all (HARDEN-4 D7): without it git collapses a whole untracked directory into
+    # one `?? out/` entry, which is not under `out/collect/`, so the exclusion below could not
+    # recognise the collector's own output and `dirty` was True on every build of a nested collect
+    # dir. With it every entry is a file, so the path filter works for any layout.
+    status = _run_git(root, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all")
     if not status:
         return False
     if exclude_dir is None:

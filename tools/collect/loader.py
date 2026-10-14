@@ -100,6 +100,11 @@ class CollectModel:
 
     status: str  # "absent" | "stale" | "fresh"
     collect_dir: Optional[Path] = None
+    # HARDEN-4 D6: the repo root this artifact was read for. `is_safe()` needs it to look a cited
+    # module's source up; before this the fallback was `collect_dir`, an artifact directory that
+    # holds no module files, so a query with no `root=` of its own could never narrow a
+    # method-level contract and answered "unknown".
+    repo_root: Optional[Path] = None
     modules: Tuple[ModuleRecord, ...] = ()
     contracts: Tuple[ContractRecord, ...] = ()
     fail_open_registry: Tuple[FailOpenEntry, ...] = ()
@@ -133,8 +138,12 @@ class CollectModel:
         return {m.path: m for m in self.modules}
 
     def _already_safe_index(self, root: Optional[Path] = None) -> registries_mod.AlreadySafeIndex:
+        # HARDEN-4 D6: the repo root, not the artifact directory, is where a cited module's source
+        # lives. An explicit root still wins; a model built by hand (no repo_root) keeps the old
+        # fallback rather than losing the narrowing it can still get.
         return registries_mod.build_already_safe_index(
-            self.modules, self.fail_open_registry, self.contracts, root=root or self.collect_dir,
+            self.modules, self.fail_open_registry, self.contracts,
+            root=root or self.repo_root or self.collect_dir,
         )
 
     # ── "запись модуля X" ────────────────────────────────────────────────
@@ -348,12 +357,14 @@ def _test_map_table(value: object) -> Dict[str, Tuple[str, ...]]:
     return out
 
 
-def _absent(collect_dir: Optional[Path], reason: str) -> CollectModel:
-    return CollectModel(status=STATUS_ABSENT, collect_dir=collect_dir, reason=reason)
+def _absent(collect_dir: Optional[Path], reason: str, root: Optional[Path] = None) -> CollectModel:
+    return CollectModel(status=STATUS_ABSENT, collect_dir=collect_dir, repo_root=root, reason=reason)
 
 
 # Gate 1 corpus AUTO-T12 grades `_load_from_dir` live: tests/test_gate1_corpus_precision.py
-def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> CollectModel:
+def _load_from_dir(
+    collect_dir: Path, *, status: str, reason: str = "", root: Optional[Path] = None
+) -> CollectModel:
     """Read `artifact.json` out of `collect_dir` into a `CollectModel`.
     Any missing file, unreadable JSON, or missing/malformed key is treated
     as "no model" — a half-written or corrupted artifact must never raise
@@ -421,6 +432,7 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
     return CollectModel(
         status=status,
         collect_dir=collect_dir,
+        repo_root=root,
         modules=modules,
         contracts=contracts,
         fail_open_registry=fail_open,
@@ -455,28 +467,29 @@ def load(
     artifact_path = collect_dir / cli_mod.ARTIFACT_FILENAME
 
     if not manifest_path.exists() or not artifact_path.exists():
-        return _absent(collect_dir, "no manifest/artifact — collect has never run")
+        return _absent(collect_dir, "no manifest/artifact — collect has never run", root=root)
 
     try:
         existing_manifest = manifest_mod.read_manifest(manifest_path)
     except (OSError, ValueError):
-        return _absent(collect_dir, "manifest is unreadable — treated as absent")
+        return _absent(collect_dir, "manifest is unreadable — treated as absent", root=root)
 
     current_paths = [m.path for m in scan_repo(root, config=config)]
     # The effective skip_dirs list is recorded, so changing only that setting reports stale.
     fresh = manifest_mod.is_fresh(existing_manifest, root, files=current_paths,
                                  skip_dirs=manifest_mod.skip_dirs_from_config(config))
     if fresh:
-        return _load_from_dir(collect_dir, status=STATUS_FRESH)
+        return _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
 
     policy = _staleness_policy(config)
     if policy == "ignore":
-        return _absent(collect_dir, "stale artifact, staleness=ignore — treated as absent")
+        return _absent(collect_dir, "stale artifact, staleness=ignore — treated as absent", root=root)
     if policy == "refresh":
         cli_mod.action_refresh(root, config=config, config_path=config_path)
-        return _load_from_dir(collect_dir, status=STATUS_FRESH)
+        return _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
     # policy == "warn" (default / fallback)
-    return _load_from_dir(collect_dir, status=STATUS_STALE, reason="artifact is stale (a tracked file changed)")
+    return _load_from_dir(collect_dir, status=STATUS_STALE,
+                          reason="artifact is stale (a tracked file changed)", root=root)
 
 
 @dataclass(frozen=True)
@@ -564,7 +577,7 @@ def load_readonly(
         hashes = manifest_mod.hash_tree(root, paths)
 
         if manifest_mod.is_fresh(man, root, files=paths, hashes=hashes, skip_dirs=skip):
-            model = _load_from_dir(collect_dir, status=STATUS_FRESH)
+            model = _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
             if not model.available:
                 return CollectRead(reason=model.reason or "artifact is unreadable — treated as absent")
             return CollectRead(status=STATUS_FRESH, model=model)
@@ -599,7 +612,7 @@ def load_readonly(
                                reason=f"{reason}, staleness=refresh: this reader does not "
                                       f"write, so the artifact was left alone")
         # policy == "warn" (default / fallback): the stale model is used and flagged
-        model = _load_from_dir(collect_dir, status=STATUS_STALE, reason=reason)
+        model = _load_from_dir(collect_dir, status=STATUS_STALE, reason=reason, root=root)
         if not model.available:
             return CollectRead(status=STATUS_ABSENT, changed=changed,
                                reason=model.reason or "artifact is unreadable — treated as absent")
