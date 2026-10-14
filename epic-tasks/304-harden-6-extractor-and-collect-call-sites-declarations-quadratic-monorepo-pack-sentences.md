@@ -60,7 +60,12 @@ HARDEN-4 D2 handled an expression body with no braces. A **declaration** that is
 | `declare function ambient(x: number): void;` (`.ts`) | `ambient` | `''` |
 | `int proto(int a);` (`.c`) | `proto` | `''` |
 | `abstract class A { abstract run(): void; … }` (`.ts`) | `run` | `''` |
+| `char *name_of(void);` (`.c`) | `name_of` | `''` |
+| `interface Store { reset(): void; }` (`.ts`) | `reset` | `''` |
 | `function real(): number { return 1; }` (`.ts`) | `real` | found (right) |
+
+A call is not a declaration and stays `""` (review v8): `ambient(1);`, `return ambient(1);`, `const x = ambient(1);`, `x.ambient(1);`, `export default ambient(1);`, `int y = proto(1);`. A declaration whose parameter list spans several lines
+(`declare function multi(⏎ a: number,⏎ b: string⏎ ): void;`) is also `''` today; it is wanted, but not required.
 
 ### What it does
 

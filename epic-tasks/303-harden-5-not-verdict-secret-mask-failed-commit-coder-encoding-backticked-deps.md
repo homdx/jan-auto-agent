@@ -72,20 +72,32 @@ On `1fa8599`:
 | `self.api_key = api_key`, `    token = fetch(api_key=token)` | kept (right) |
 | `self.api_key = None`, `self.api_key = key`, `API_KEY = DEFAULT_API_KEY` | **masked: `= here_your_key`**, code rewritten |
 
-HARDEN-1 A8 meant "an identifier is code, never a literal secret", but `_value_is_secret_literal` returns True for every identifier except the key's own name. End to end on a small `Client` class, a faithful model asked to change
+HARDEN-1 A8 meant "an identifier is code, never a literal secret", but `_value_is_secret_literal` returns True for every identifier except the key's own name. A value that says "no key here" is rewritten too
+(review v8, NEW-A; `mask_api_key` on `1fa8599`):
+
+| input | now |
+|---|---|
+| `api_key = ""`, `api_key = ''` | **masked** → `api_key = here_your_key` (`if not api_key:` then sees a non-empty fake key and authenticates with it) |
+| `api_key = None`, `api_key = null`, `api_key = true` | **masked** |
+| `api_key = your_key`, `api_key = changeme` | **masked** |
+| `api_key = ""  # set later`, `api_key = <your key>`, `api_key = here_your_key` | kept (right) |
+
+Once the key regex no longer needs the value to end the line, the comment form of the first row would be masked too: the unset-value rule is part of the fix, not an extra. End to end on a small `Client` class, a faithful model asked to change
 `timeout = 30` to `60` changes three lines: `self.api_key = None` and `self.api_key = key` come back as `here_your_key`, and importing the file raises `NameError: name 'here_your_key' is not defined`. A quoted default
 (`api_key = "x"`) comes back unquoted, which breaks the same way. The key leaks are the purpose of the function failing; they are the common way a key appears in a config file or a note.
 
 ### What it does
 
 * The secret is found **where it sits**, not only at the end of a line: a quoted string (`'…'` or `"…"`) or a run of non-space characters after `api_key =`, with any trailing `#` / `;` comment left alone; the line anchor goes.
-* A `Bearer <token>` and the known key prefixes (`sk-`, `sk-or-v1-`, `sk-proj-`, `AIza`, `xoxb-`) are masked wherever they appear.
+* A `Bearer <token>` is masked wherever it appears; a known key prefix (`sk-`, `sk-or-v1-`, `sk-proj-`, `AIza`, `xoxb-`) is masked in a key or token context (after `api_key =`, `token:`, `Authorization:`, `Bearer`), **not**
+  anywhere in a file: a string with that prefix inside code is code (the reviewers' own caution: masking it would rewrite working code).
+* An **unset value** is not a secret and is sent as it is: an empty quoted string, `None` / `null` / `nil` / `undefined` / `true` / `false`, and a template placeholder (`<…>`, `your_key`, `changeme`, `xxx`, `here_your_key`).
 * Every bare identifier or expression on the right-hand side is **code and is sent as it is** (`None`, `key`, `DEFAULT_API_KEY`, `os.environ[...]`, `self._key`); only a quoted string or a key-shaped token (long, no `.`, `(`, `[`, spaces) is masked, and a masked quoted string keeps its quotes.
 * Or, and acceptable if simpler and tested: replace each masked value with a unique placeholder, remember the mapping for the request, and put the original text back in the reply before `/edit` or the Coder writes it.
 
 ### Tests (sketch)
 
-`tests/test_mask_api_key_forms.py`: every row of the table with its expected output; a real key in a file the model rewrites faithfully is not in the outgoing request **and** the file on disk is byte-identical afterwards except the line asked
+`tests/test_mask_api_key_forms.py`: every row of both tables with its expected output (the unset values are kept, the comment form of an unset value too); a real key in a file the model rewrites faithfully is not in the outgoing request **and** the file on disk is byte-identical afterwards except the line asked
 for; the existing mask tests green unchanged.
 
 ---
