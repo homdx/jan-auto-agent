@@ -34,7 +34,7 @@ full text, `error_kind` is not `transport`; same for the Architect callback.
 **Evidence:** `commit` returns `None` on a `GitError` (and on "nothing staged"); the controller then does `tasks_done += 1`, logs `commit=none`, runs the
 regression check on a tree that was never committed, and moves on. The task's status is **not** set to `DONE` (that happens only with a sha), so the status
 file says the task is still open while the counter says it is done; the passed work stays uncommitted and the next task's commit sweeps it up under another
-id, or its exhaustion reset removes it.
+id, or an exhausted task's `git reset --hard HEAD` + `git clean -fd` (`GitManager`, the cleanup after a task that failed without a commit) removes it.
 **Fix:** tell the two `None`s apart (a `CommitResult` or an exception kind: `nothing_to_commit` vs `git_error`). On `git_error` the task is **not** counted
 done, the run logs it, the work is kept as a patch (`runs/…/uncommitted-<id>.patch`) before anything resets the tree, and the task is marked `FAILED_COMMIT`
 (or the nearest existing status) so a resume sees it. "Nothing to commit" stays a quiet success.

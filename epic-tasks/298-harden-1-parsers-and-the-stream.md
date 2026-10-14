@@ -186,6 +186,12 @@ One commit. The judge's own checks are not published and are written after the r
 | `append_finding` lock / `utf-8-sig` | **not worth it** | one reviewer, one file, written in turn; the tool writes no BOM |
 | dead `Coder._is_truthy_delete` drops `"1"` | **cosmetic** | no caller; delete the dead copy if a part touches `coder.py`, no test |
 | unreachable `HTTPError` handler in the validator | **not shown** | `request_completion` may well raise `RuntimeError`; not proved either way |
+| `inner_loop` silently drops a `None` code | **false** | a non-path entry in `files_written` gets its own visible note in the prompt (`inner_loop.py`, "B8") |
+| `configparser` not imported in `manifest.py` | **false** | `import configparser` is line 31; `typing.get_type_hints` on the four functions runs clean |
+| `_COLLECT_READS_LOCK` held across `load_readonly` | **by design** | every voter needs the same result; waiting for the first read is correct, and double-checked locking would not shorten the wait |
+| `/edit` corrupts CRLF, mode, encoding, symlink; guard ignores symlinks (N2, N3) | **already fixed** | fix 34: `atomic_write_text` + `copy2` backup, `_resolve_within_base` uses `realpath` |
+| concurrent exclusive writers both win without hard links (EX1-R) | **already fixed** | fix 34: `O_EXCL`; 0 of 300 trials with more than one winner |
+| a path in `[collect] skip_dirs` is silently ignored (CC13-4) | **now a warning** | the entry is still ignored (names only), but `[collect] skip_dirs: '…' is a path, not a directory name — ignored` is printed |
 
 ## Not in scope
 
