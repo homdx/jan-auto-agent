@@ -350,3 +350,22 @@ do not touch the reader's path). No voter was dropped, no candidate unresolved.
   collect facts is the variant to try first (`--sets 5+veto+collect,7+veto+collect` with `--collect-from`, after the artifact for the target sha is built).
 
 Across the four runs the verdict is unchanged: `claim_vote` stays `off`; the veto half is correct and the confirm half is not.
+
+### Fifth run: the collect model, measured (2026-10-14, run `20261014T-newcode`, code 1a5f18a)
+
+The first `+collect` attempt (run `20261013T155106Z`, old code) measured nothing about collect: the artifact built with `skip_dirs = claim-check-out, contest-out, ...` was read as stale
+against an ini without them (`collect: stale (0 modules changed)`), so the reader did not use it; the tool called both `+collect` variants NO COLLECT. Patch 2 of CC-13 carries the artifact's
+`skip_dirs` into the `+collect` ini; this run shows `collect: fresh`, reader used, vote pack used (128 chunks). One run of each variant, so the reader's noise (±2 of 56) applies.
+
+| variant | removed | false positives through | true bugs rejected | decided | unanimous TRUE wrong / all | unanimous FALSE wrong / all | verdict |
+|---|---|---|---|---|---|---|---|
+| off | 24 | 29 | 1 | — | — | — | baseline |
+| off+collect | 26 | 27 | 1 | — | — | — | baseline with the collect model |
+| on-3+collect | 26 | 26 | 0 | 9 of 53 | 6 / 7 | 0 / 2 | FAIL (needs decided >= 19) |
+| on-5-veto+collect | 30 | 22 | 0 | 3 of 53 | — | 0 / 3 | PASS (veto only: at least one veto) |
+
+* **Reader alone**: collect 27 false positives against 29 without it, true bugs rejected 1 against 1. Not more, but a difference of 2 is the size of the reader's own noise: it is not a proof.
+* **The vote's wrong unanimous TRUEs did not fall**: 6 of 7 wrong with collect (the old runs: 3 of 5 and 5 of 7). The pack with collect chunks does not teach three voters to say "absent" about a claim whose premise is false.
+* **The veto half stays right and quiet**: 3 rejections, 3 right, no real bug rejected; the PASS says only that, `on-5-veto+collect` decided 3 of 53.
+* **Verdict**: the CC-13 rule asks the vote's wrong unanimous TRUEs to be fewer; they are not. `[gate1] vote_collect` stays `off` (and `claim_vote` stays `off`). The reader-side gain is within noise; to see it a
+  repeat of `off+collect` and `off` (two or three each) on the same code is the one measurement left.
