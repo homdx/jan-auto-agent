@@ -1,9 +1,9 @@
-# HARDEN-2 — three defects around a call: a closed stdout becomes a transport failure, a failed commit is counted done, the adaptive search blacklists what it scanned
+# HARDEN-2 — four defects around a call: a closed stdout becomes a transport failure, a failed commit is counted done, the adaptive search blacklists what it scanned, a creative run's own files refuse the next run
 
 **Status:** open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** MEDIUM (B3 changes the loop's behaviour; B1 and B2 lose a received answer or leave work in the tree)
-**File:** `tools/auto/coder.py`, `tools/auto/architect.py`, `tools/auto/controller.py`, `tools/auto/commit_on_success.py`, `main.py`, `tools/search_agent.py`
-**Symbol:** `Coder.generate` / the Architect streaming callback, `Controller.run` (after `commit_helper.commit`), `CommitOnSuccess.commit`, `already_searched` in `main.py`, `SearchAgent.search`
+**File:** `tools/auto/coder.py`, `tools/auto/architect.py`, `tools/auto/controller.py`, `tools/auto/commit_on_success.py`, `tools/auto/git_manager.py`, `main.py`, `tools/search_agent.py`
+**Symbol:** `Coder.generate` / the Architect streaming callback, `Controller.run` (after `commit_helper.commit`), `CommitOnSuccess.commit`, `_update_synopsis` / `_update_story_bible`, `GitManager.user_changes` / `_OWN_OUTPUTS`, `already_searched` in `main.py`, `SearchAgent.search`
 **Round:** —
 **Size:** M
 **Depends on:** CC review fixes 34–36 (landed, `c2ef95b`): this ticket starts from their code
@@ -54,6 +54,31 @@ key must be `(file, name)`, not `file`.)
 numbers go into the commit message.
 
 ---
+
+### B4. A creative run leaves its own `synopsis.md` / `story_bible.md` uncommitted, and the next `--auto` on the folder is refused — `run`
+
+**Where:** `tools/auto/commit_on_success.py` (`commit`, `_update_synopsis`, `_update_story_bible`), `tools/auto/git_manager.py` (`_OWN_OUTPUTS`, `user_changes`),
+`tools/auto/controller.py` (`_setup_git`). Introduced by fix 34 (the "refuses a repository with uncommitted changes" guard).
+**Evidence:** `commit` calls `self._git.commit_task(...)` first and only then `_update_synopsis(task)` and `_update_story_bible(task)`, which write `synopsis.md` and
+`story_bible.md` into `base_dir`. No later commit stages them, so after the last task of a run both are untracked. The next `--auto` runs `_setup_git`, which calls
+`user_changes()`; that skips `.agent/`, `IMPROVEMENTS*.md`, `*.coder.bak` and the collect dir but **not** these files. On a git folder with one commit and the three
+files written where the real ones are written (`synopsis.md`, `story_bible.md`, `story_bible.md.pending.json`):
+
+```
+user_changes() -> ['story_bible.md', 'story_bible.md.pending.json', 'synopsis.md']
+```
+
+so the run raises `DirtyTreeError` ("--auto refused", exit 2), blaming the user for changes the agent made. In creative mode the second run on a folder is blocked as soon
+as one run has finished; code-mode tasks are not affected. The reviewer's own repro (`cr_repro.py`, an empty `cr/` folder) gave the same three names.
+**Fix (pick one, state the choice in the commit):**
+1. Add the synopsis, the story bible and its `.pending.json` to the agent's own outputs in `user_changes()`, with the names **taken from config/the objects** (`SummaryMemory`'s
+   path, `StoryBible._path` and its `.pending.json` suffix, as `story_bible.py:562` builds it), not hard-coded.
+2. Commit them: update the synopsis and bible **before** the task commit so they go in with it, or make a second small commit after (as `ensure_gitignore_committed` does for
+   `.gitignore`). Note the order after the commit is deliberate (a failing synopsis update must never block the commit): if the update goes first, it must stay guarded.
+3. Record the paths the agent wrote in `.agent/` state and have `user_changes()` exclude exactly those.
+The reviewer's pick is 1 or 2; 3 is the most exact but the most code.
+**Test:** a creative-mode run of two tasks on a fresh git folder, then `user_changes()`: empty (or the user's own file only); a user's own untracked `notes.md` next to them is still
+reported; the second `--auto` start does not raise `DirtyTreeError`; code mode is unchanged.
 
 ## Contest
 
