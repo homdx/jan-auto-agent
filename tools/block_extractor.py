@@ -553,8 +553,19 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
         # Go: var F = func(...) {
         re.compile(rf"(?m)^[ \t]*var[ \t]+{name}[ \t]*=[ \t]*func[ \t]*\("),
         # Kotlin/Scala: fun ff() = 1   fun ff() { … }
-        re.compile(rf"(?m)^[ \t]*fun[ \t]+{name}{tp}[ \t]*\("),
+        re.compile(rf"(?m)^[ \t]*fun[ \t]+{name}{tp}[ \t]*\("),        # Kotlin: modifiers, type parameters before the name and a receiver —
+        # `internal suspend inline fun <reified T : Any> load(`, `fun String.shout(`
+        re.compile(_kotlin_fun_head(name)),
     ]
+
+
+def _kotlin_fun_head(name: str) -> str:
+    """A Kotlin `fun` head whose type parameters stand before the name (`fun <T : Comparable<T>> max(`),
+    with modifiers and annotations ahead of `fun` and an optional receiver (`fun List<T>.second(`)."""
+    mods = (r"public|private|protected|internal|open|override|abstract|final|suspend|inline|"
+            r"tailrec|operator|infix|external|actual|expect")
+    return (rf"(?m)^[ \t]*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:(?:{mods})[ \t]+)*fun[ \t]+"
+            rf"(?:<[^(){{}};=]*>[ \t]*)?(?:[\w.]+(?:<[^(){{}};=]*>)?\??\.)?{name}[ \t]*\(")
 
 
 #: Signature-to-tail bound for the brace-less forms, same rationale as _DEFINITION_SCAN_BOUND.
@@ -591,7 +602,8 @@ def _bodyless_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
         # Go: var F = func(a) ;
         re.compile(rf"(?m)^\s*var\s+{name}\s*=\s*func\s*\("),
         # Kotlin/Scala: fun ff() = 1
-        re.compile(rf"(?m)^\s*fun\s+{name}{tp}\s*\("),
+        re.compile(rf"(?m)^\s*fun\s+{name}{tp}\s*\("),        # Kotlin: fun <T> T.id() = this
+        re.compile(_kotlin_fun_head(name)),
     ]
 
 

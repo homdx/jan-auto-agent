@@ -1967,6 +1967,20 @@ class Coder(_llm_stream.LLMClientBase):
                         first_error = msg
                     continue
 
+            # Guard 2.7: the model was shown a file that is not UTF-8 with U+FFFD for each byte it could not
+            # read; writing that text back replaced every such byte for good (a latin-1 caf\xe9 became EF BF BD).
+            try:
+                if "\ufffd" in content and dest.is_file():
+                    dest.read_bytes().decode("utf-8")
+            except UnicodeDecodeError:
+                msg = f"[SAFETY] {rel!r} is not UTF-8 — the edit would replace its undecodable bytes; write blocked"
+                logger.error("coder._write_files [%s]: %s", task_id, msg)
+                if not first_error:
+                    first_error = msg
+                continue
+            except OSError:
+                pass
+
             # ── Guard 3: scan file content for dangerous patterns ──────────
             _existing = None
             if self._allow_preexisting_patterns and dest.exists():

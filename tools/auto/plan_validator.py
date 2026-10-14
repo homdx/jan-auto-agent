@@ -468,13 +468,13 @@ def _without_section(text: str, task_id: str) -> str:
     """*text* without *task_id*'s entry; the blank lines where it was cut are made two at most. The whole
     file's runs of blank lines were collapsed, and every other entry's code sample lost its two blank lines
     (PEP 8's, before a def)."""
-    m = _task_section_pattern(task_id).search(text)
-    if m is None:
-        return text
-    head, tail = text[:m.start()], text[m.end():]
-    if head.endswith("\n\n") and tail.startswith("\n"):
-        tail = tail.lstrip("\n")
-    return head + tail
+    pattern = _task_section_pattern(task_id)
+    while (m := pattern.search(text)) is not None:   # every copy, as the re.sub before it did
+        head, tail = text[:m.start()], text[m.end():]
+        if head.endswith("\n\n") and tail.startswith("\n"):
+            tail = tail.lstrip("\n")
+        text = head + tail
+    return text
 
 
 _AUTO_SECTION_EMPTY_NOTE = (

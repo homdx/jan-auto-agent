@@ -92,7 +92,8 @@ _MAX_TRACEBACK_CHARS = 4_000
 _PYTEST_SERIAL_FLAG = "-n 0"
 
 # Config files pytest reads for addopts, in its precedence order; the first one present wins.
-_PYTEST_CONFIG_FILES = ("pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg")
+_PYTEST_CONFIG_FILES = ("pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini",
+                        "setup.cfg")
 
 # Directories left out when mirroring base_dir into a task workspace (VCS, the agent's own state, caches).
 _MIRROR_IGNORE = shutil.ignore_patterns(
@@ -921,12 +922,14 @@ def _pytest_addopts(root: Path) -> list:
     """The ``addopts`` tokens of the config file pytest uses: ``pytest.ini`` always, the others only with their
     pytest section (a ``pyproject.toml`` without one hid a ``tox.ini``'s), continuation lines included."""
     import configparser
-    sections = {"pytest.ini": "pytest", "tox.ini": "pytest", "setup.cfg": "tool:pytest"}
+    sections = {"pytest.ini": "pytest", ".pytest.ini": "pytest", "tox.ini": "pytest", "setup.cfg": "tool:pytest"}
     for name in _PYTEST_CONFIG_FILES:
         try:
             text = (root / name).read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        if name in ("pytest.toml", ".pytest.toml"):   # pytest 9: always this file, its own [pytest] table
+            return (_toml_addopts(text, ("pytest",)) or "").split()
         if name == "pyproject.toml":
             value = _toml_addopts(text)
             if value is None:
@@ -938,25 +941,29 @@ def _pytest_addopts(root: Path) -> list:
         except configparser.Error:
             parser = None
         if parser is None or not parser.has_section(sections[name]):
-            if name == "pytest.ini":
+            if name in ("pytest.ini", ".pytest.ini"):
                 return []
             continue
         return parser.get(sections[name], "addopts", fallback="").split()
     return []
 
 
-def _toml_addopts(text: str) -> "str | None":
-    """``[tool.pytest.ini_options] addopts`` of a pyproject.toml, a list joined; None without the table."""
+def _toml_addopts(text: str, keys: tuple = ("tool", "pytest", "ini_options")) -> "str | None":
+    """``[tool.pytest.ini_options] addopts`` of a pyproject.toml (``[pytest]`` of a pytest.toml with
+    *keys*), a list joined; None without the table."""
     try:
         import tomllib
     except ImportError:              # 3.10: the table and its addopts by hand
-        m = re.search(r"(?ms)^\[tool\.pytest\.ini_options\][ \t]*$(.*?)(?=^\[|\Z)", text)
+        head = re.escape("[" + ".".join(keys) + "]")
+        m = re.search(rf"(?ms)^{head}[ \t]*$(.*?)(?=^\[|\Z)", text)
         if not m:
             return None
         a = re.search(r"(?ms)^addopts[ \t]*=[ \t]*(\[.*?\]|[^\n]*)", m.group(1))
         return re.sub(r"[\[\],\"']", " ", a.group(1)) if a else ""
     try:
-        table = tomllib.loads(text).get("tool", {}).get("pytest", {}).get("ini_options")
+        table = tomllib.loads(text)
+        for key in keys:
+            table = table.get(key)
     except (tomllib.TOMLDecodeError, AttributeError):
         return None
     if not isinstance(table, dict):

@@ -300,6 +300,7 @@ class _Index:
 
     def __init__(self, view: RepoView) -> None:
         self.files = sorted(view.files())
+        self.mirrors = view.mirrors() if hasattr(view, "mirrors") else {}
         self.by_qualname: dict = {}
         self.by_last: dict = {}
         self.module_of: dict = {}   # path -> tuple of dotted parts, "x/__init__.py" -> ("x",)
@@ -426,6 +427,7 @@ def _resolve_path(anchor: Anchor, index: _Index) -> ResolvedAnchor:
 def _resolve_plain_path(anchor: Anchor, index: _Index) -> ResolvedAnchor:
     raw, lines = _split_lines(anchor.text)
     path = raw[2:] if raw.startswith("./") else raw
+    path = index.mirrors.get(path, path)
     if path in index.file_set or path in index.dirs:
         return ResolvedAnchor(anchor, True, path=path, lines=lines)
     if "/" in path:
@@ -690,6 +692,7 @@ class PathRepoView:
     def __init__(self, root) -> None:
         self.root = Path(root)
         self._files: Optional[list] = None
+        self._mirrors: dict = {}
 
     def _safe(self, path: str) -> Optional[Path]:
         """*path* under the root, or None when it names something outside it."""
@@ -759,16 +762,24 @@ class PathRepoView:
         `tests/x.py`): the same definition twice, and the mirror's path sorted first."""
         listed = set(paths)
         real_root = os.path.realpath(self.root)
+        self._mirrors = {}
         out = []
         for p in paths:
             full = os.path.join(self.root, p)
             if os.path.islink(full):
                 real = os.path.realpath(full)
-                if real.startswith(real_root + os.sep) and \
-                        os.path.relpath(real, real_root).replace(os.sep, "/") in listed:
+                target = os.path.relpath(real, real_root).replace(os.sep, "/")
+                if real.startswith(real_root + os.sep) and target in listed:
+                    self._mirrors[p] = target
                     continue
             out.append(p)
         return out
+
+    def mirrors(self) -> dict:
+        """Each symlink `files` left out, to the file it points at: a path cited through the mirror
+        (`.regression_tests/x.py`) is that file, not a path that does not exist."""
+        self.files()
+        return dict(self._mirrors)
 
     def rev_parse(self, rev: str) -> Optional[str]:
         if not rev or rev.startswith("-") or not (self.root / ".git").exists():

@@ -981,7 +981,7 @@ def ticket_claims(text, name=""):
         elif _LIST_ITEM.match(line) and line.strip():
             raise ValueError(f"{where}:{lineno}: a claim names its word in brackets — "
                              f"{', '.join('[' + w + ']' for w in CLAIM_WORDS)}")
-        elif line.strip() and claims:
+        elif line.strip() and claims and line[:1] in (" ", "\t"):   # only an indented line continues it
             claims[-1]["claim"] = (claims[-1]["claim"] + " " + line.strip()).strip()
     return claims
 
