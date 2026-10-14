@@ -1,6 +1,6 @@
 # HARDEN-1 — eight defects in what a model's reply can contain and what the request masks: the verdict parser, the stream chunk, the prompt store, a dotted reference, quadratic claim extraction, two digit regexes, a code fence inside a JSON string, and the secret mask over-reaching
 
-**Status:** open — FINAL, written 2026-10-14 against `e9e5d13`; every defect below was reproduced (`run`) or read in the code (`read`) on that commit. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** queued
 **Severity:** MEDIUM (wrong answers on inputs nobody tested; none loses data on a normal run)
 **File:** `tools/auto/inner_loop.py`, `tools/llm_stream.py`, `tools/collect/summarizer.py`, `tools/collect/verifier.py`, `tools/auto/story_bible.py`, `scripts/judge_epic_round.py`, `tools/prompt_store.py`, `tools/block_extractor.py`, `tools/search_agent.py`
 **Symbol:** `_parse_verdict_soft`, `request_completion` (the OpenAI SSE branch), `PromptStore.get_store_summary`, `extract_block` / `find_references`, `extract_claims` / `_iter_access_citations`, `_AGE_RE`, `_HAS_DURATION`, `_API_KEY_LINE_RE` / `mask_api_key`, Gate 2's fence split in `inner_loop.py`, `strip_json_fence`, `_parse_llm_summary`
