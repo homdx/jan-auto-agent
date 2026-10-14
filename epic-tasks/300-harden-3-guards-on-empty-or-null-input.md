@@ -33,7 +33,7 @@ under a path that does not exist. **Evidence:** a repo with `git mv a/b/d.txt a/
 
 ## Contest
 
-One commit. Score by the shared tests in `contest-bench/300/` (each defect's reproduction as a script that exits non-zero on the bug), not by the entries' own tests; cross-test every entry's tests against every other's code. Small; free models, any profile. The judge checks C2 with a real `git mv` repo.
+One commit. The judge's own checks are not published and are written after the round, from the entries, so nothing here can be written to pass them: the entries' own tests are cross-tested against every other entry's code, and the judge reads every diff. Small; free models, any profile. The judge checks C2 with a real `git mv` repo.
 
 ## Not in scope
 

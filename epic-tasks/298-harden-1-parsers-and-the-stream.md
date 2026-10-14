@@ -142,7 +142,7 @@ text quotes a fence, and a rejection's hint reaches the Coder intact; no-fence r
 
 ## Contest
 
-One commit. Score by the shared tests in `contest-bench/298/` (each defect's reproduction as a script that exits non-zero on the bug), not by the entries' own tests; cross-test every entry's tests against every other's code. A1, A5 and A7 are the ones that cost: A1 sends an approval to the Coder as a defect, A5 freezes `--collect`, A7 throws away an approved candidate: an approval that begins with `NO…` goes to the Coder as a defect. Judge A1 by hand; A2–A4 by the pinned tests. Free models are enough for A2–A4 and A6; A1, A5 and A7 want a strong one (A5 must match the old function on crossing brackets).
+One commit. The judge's own checks are not published and are written after the round, from the entries, so nothing here can be written to pass them: the entries' own tests are cross-tested against every other entry's code, and the judge reads every diff. A1, A5 and A7 are the ones that cost: A1 sends an approval to the Coder as a defect, A5 freezes `--collect`, A7 throws away an approved candidate: an approval that begins with `NO…` goes to the Coder as a defect. Judge A1 by hand; A2–A4 by the pinned tests. Free models are enough for A2–A4 and A6; A1, A5 and A7 want a strong one (A5 must match the old function on crossing brackets).
 
 ## Refused (shared by HARDEN-1 … HARDEN-4, so they are not opened again)
 

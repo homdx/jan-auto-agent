@@ -82,7 +82,7 @@ reported; the second `--auto` start does not raise `DirtyTreeError`; code mode i
 
 ## Contest
 
-One commit. Score by the shared tests in `contest-bench/299/` (each defect's reproduction as a script that exits non-zero on the bug), not by the entries' own tests; cross-test every entry's tests against every other's code. B3 changes behaviour: the judge runs the existing search tests **and** a live validation loop on the winner before accepting it. B2 needs the winner's status for a failed commit checked against the vocabulary of `state.py`. Strong models only; B2 touches the controller's accounting.
+One commit. The judge's own checks are not published and are written after the round, from the entries, so nothing here can be written to pass them: the entries' own tests are cross-tested against every other entry's code, and the judge reads every diff. B3 changes behaviour: the judge runs the existing search tests **and** a live validation loop on the winner before accepting it. B2 needs the winner's status for a failed commit checked against the vocabulary of `state.py`. Strong models only; B2 touches the controller's accounting.
 
 ## Not in scope
 

@@ -104,7 +104,7 @@ keeps it: `is_dirty` is `True` (run); with the plain `.collect` it is `False` (r
 
 ## Contest
 
-One commit. Score by the shared tests in `contest-bench/301/` (each defect's reproduction as a script that exits non-zero on the bug), not by the entries' own tests; cross-test every entry's tests against every other's code. D1 and D4 are one lexer (`_lang_skip`) and go together. D2 and D3 change a result on a whole class of repositories, so the judge runs Gate 1's `_check_existence` on the D2 table and builds a collect model of a `src/` repository for D3 before accepting. The black box also runs the extractor over this repository's own `.py`, `.js`, `.ts` and `.c` files before and after: the blocks it returns for names that were found must not change. D5–D7 are small.
+One commit. The judge's own checks are not published and are written after the round, from the entries, so nothing here can be written to pass them: the entries' own tests are cross-tested against every other entry's code, and the judge reads every diff. D1 and D4 are one lexer (`_lang_skip`) and go together. D2 and D3 change a result on a whole class of repositories, so the judge runs Gate 1's `_check_existence` on the D2 table and builds a collect model of a `src/` repository for D3 before accepting. The black box also runs the extractor over this repository's own `.py`, `.js`, `.ts` and `.c` files before and after: the blocks it returns for names that were found must not change. D5–D7 are small.
 
 ## Not in scope
 
