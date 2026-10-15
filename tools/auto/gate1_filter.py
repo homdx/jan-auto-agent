@@ -942,6 +942,21 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             except Exception:   # noqa: BLE001
                 state = "absent"
         state = state or "absent"
+        if state == "stale" and not changed and not causes:
+            # The state came from the reader's own bridge, which counts nothing; its model still
+            # says why it is stale, and a module Pass B left without a summary (CC-15) used to print
+            # as a bare `stale` (HARDEN-6 E).
+            try:
+                import re as _re
+                model = getattr(getattr(self, "_collect_bridge", None), "_model", None)
+                reason = str(getattr(model, "reason", "") or "")
+                if "unsummarized" in tuple(getattr(model, "stale_causes", ()) or ()):
+                    m_files = _re.search(r"(\d+) tracked file", reason)
+                    m_sum = _re.search(r"\d+ modules? without a summary", reason)
+                    changed = int(m_files.group(1)) if m_files else changed
+                    causes = (m_sum.group(0),) if m_sum else causes
+            except Exception:   # noqa: BLE001 — a diagnostic line, never a run blocker
+                pass
         # A version or skip_dirs change is stale with no file moved, so the line says so (CC-13).
         parts = ([f"{changed} module{'s' if changed != 1 else ''} changed"] if changed else []) + list(causes)
         head = f"stale ({', '.join(parts)})" if state == "stale" and parts else state

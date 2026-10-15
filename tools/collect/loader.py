@@ -56,7 +56,7 @@ import configparser
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from tools.collect import cli as cli_mod
 from tools.collect import manifest as manifest_mod
@@ -76,6 +76,14 @@ STATUS_ABSENT = "absent"
 STATUS_STALE = "stale"
 STATUS_FRESH = "fresh"
 
+#: Staleness cause codes (HARDEN-6 E). `unsummarized` is the only one that leaves every static fact
+#: in the artifact true — a module whose Pass B failed has no summary, not wrong facts — so it is the
+#: only cause a reader may keep serving the pack for (see `CollectModel.stale_causes`).
+STALE_CAUSE_FILES = "files"
+STALE_CAUSE_COLLECTOR = "collector_version"
+STALE_CAUSE_SKIP_DIRS = "skip_dirs"
+STALE_CAUSE_UNSUMMARIZED = "unsummarized"
+
 #: Test-code paths come from tools.collect.test_paths, the same rule test_map uses, so producer and reader agree. tools/collect/test_map.py is shipped code.
 
 
@@ -87,6 +95,55 @@ def _staleness_policy(config: Optional[configparser.ConfigParser]) -> str:
         return DEFAULT_STALENESS
     raw = config.get("collect", "staleness", fallback=DEFAULT_STALENESS).strip().lower()
     return raw if raw in VALID_STALENESS else DEFAULT_STALENESS
+
+
+def _stale_cause_labels(manifest, skip_dirs: Iterable[str]) -> Tuple[str, ...]:
+    """The causes a stale artifact has besides its files, in the words CC-13's operator line uses.
+    The wording is pinned by tests and out of scope for change; the codes `_stale_causes` returns are
+    what a consumer that can serve part of a stale artifact asks instead."""
+    labels: List[str] = []
+    if manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+        labels.append("collector version")
+    if tuple(sorted(skip_dirs)) != tuple(manifest.skip_dirs):
+        labels.append("skip_dirs changed")
+    if manifest.unsummarized:
+        n = len(manifest.unsummarized)
+        labels.append(f"{n} module{'' if n == 1 else 's'} without a summary")
+    return tuple(labels)
+
+
+def _stale_reason(manifest, changed: int, skip_dirs: Iterable[str]) -> str:
+    """The one-line reason a stale artifact is stale, naming every cause (CC-13).
+
+    HARDEN-6 E: shared by `load` and `load_readonly` so the operator sees the same line whichever
+    reader was used — and so the pack's own log line names the cause that actually kept it off. A
+    manifest whose only cause is a module without a summary says exactly that, instead of the
+    "a tracked file changed" `load` used to hard-code for every staleness.
+    """
+    reasons = [f"{changed} tracked file(s) changed"] if changed else []
+    reasons += [
+        f"manifest was built by collector_version={manifest.collector_version!r}, "
+        f"current is {manifest_mod.COLLECTOR_VERSION!r}" if c == "collector version" else
+        f"manifest recorded skip_dirs {list(manifest.skip_dirs)}, "
+        f"the config says {sorted(skip_dirs)}" if c == "skip_dirs changed" else c
+        for c in _stale_cause_labels(manifest, skip_dirs)
+    ]
+    return "artifact is stale (" + "; ".join(reasons or ["a tracked file changed"]) + ")"
+
+
+def _stale_causes(manifest, changed: int, skip_dirs: Iterable[str]) -> Tuple[str, ...]:
+    """Which causes a stale artifact has, as codes (HARDEN-6 E). `files` is appended when the tree
+    itself moved, since that is a cause of its own for every consumer."""
+    causes: List[str] = []
+    if manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+        causes.append(STALE_CAUSE_COLLECTOR)
+    if tuple(sorted(skip_dirs)) != tuple(manifest.skip_dirs):
+        causes.append(STALE_CAUSE_SKIP_DIRS)
+    if manifest.unsummarized:
+        causes.append(STALE_CAUSE_UNSUMMARIZED)
+    if changed:
+        causes.append(STALE_CAUSE_FILES)
+    return tuple(causes)
 
 
 @dataclass(frozen=True)
@@ -119,6 +176,11 @@ class CollectModel:
     imported_by: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     entry_points: Tuple[str, ...] = ()
     reason: str = ""
+    # HARDEN-6 E: why this model is stale, as `_stale_causes` codes. Empty on a fresh or absent
+    # model, and on a stale one whose only difference from the tree is its files — which the
+    # manifest's own hashes already say. A consumer that can serve part of a stale artifact asks
+    # this which part; one that cannot ignores it.
+    stale_causes: Tuple[str, ...] = ()
 
     # ── availability ────────────────────────────────────────────────────
 
@@ -363,7 +425,8 @@ def _absent(collect_dir: Optional[Path], reason: str, root: Optional[Path] = Non
 
 # Gate 1 corpus AUTO-T12 grades `_load_from_dir` live: tests/test_gate1_corpus_precision.py
 def _load_from_dir(
-    collect_dir: Path, *, status: str, reason: str = "", root: Optional[Path] = None
+    collect_dir: Path, *, status: str, reason: str = "", root: Optional[Path] = None,
+    stale_causes: Tuple[str, ...] = ()
 ) -> CollectModel:
     """Read `artifact.json` out of `collect_dir` into a `CollectModel`.
     Any missing file, unreadable JSON, or missing/malformed key is treated
@@ -446,6 +509,7 @@ def _load_from_dir(
         imported_by=imported_by,
         entry_points=entry_points,
         reason=reason,
+        stale_causes=stale_causes,
     )
 
 
@@ -476,10 +540,17 @@ def load(
 
     current_paths = [m.path for m in scan_repo(root, config=config)]
     # The effective skip_dirs list is recorded, so changing only that setting reports stale.
+    skip_dirs = manifest_mod.skip_dirs_from_config(config)
+    hashes = manifest_mod.hash_tree(root, current_paths)
     fresh = manifest_mod.is_fresh(existing_manifest, root, files=current_paths,
-                                 skip_dirs=manifest_mod.skip_dirs_from_config(config))
+                                  hashes=hashes, skip_dirs=skip_dirs)
     if fresh:
         return _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
+
+    diff = manifest_mod.diff_files(existing_manifest.file_hashes, hashes)
+    changed = len(diff.added | diff.modified | diff.removed)
+    causes = _stale_causes(existing_manifest, changed=changed, skip_dirs=skip_dirs)
+    reason = _stale_reason(existing_manifest, changed, skip_dirs)
 
     policy = _staleness_policy(config)
     if policy == "ignore":
@@ -488,8 +559,8 @@ def load(
         cli_mod.action_refresh(root, config=config, config_path=config_path)
         return _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
     # policy == "warn" (default / fallback)
-    return _load_from_dir(collect_dir, status=STATUS_STALE,
-                          reason="artifact is stale (a tracked file changed)", root=root)
+    return _load_from_dir(collect_dir, status=STATUS_STALE, reason=reason, root=root,
+                          stale_causes=causes)
 
 
 @dataclass(frozen=True)
@@ -585,22 +656,9 @@ def load_readonly(
         diff = manifest_mod.diff_files(man.file_hashes, hashes)
         changed = len(diff.added | diff.modified | diff.removed)
         # Names every cause of staleness, not only the changed files (CC-13).
-        causes = []
-        if man.collector_version != manifest_mod.COLLECTOR_VERSION:
-            causes.append("collector version")
-        if tuple(sorted(skip)) != tuple(man.skip_dirs):
-            causes.append("skip_dirs changed")
-        if man.unsummarized:
-            n = len(man.unsummarized)
-            causes.append(f"{n} module{'' if n == 1 else 's'} without a summary")
-        causes = tuple(causes)
-        reasons = ([f"{changed} tracked file(s) changed"] if changed else []) + [
-            f"manifest was built by collector_version={man.collector_version!r}, "
-            f"current is {manifest_mod.COLLECTOR_VERSION!r}" if c == "collector version" else
-            f"manifest recorded skip_dirs {list(man.skip_dirs)}, the config says {sorted(skip)}"
-            if c == "skip_dirs changed" else c
-            for c in causes]
-        reason = "artifact is stale (" + "; ".join(reasons or ["a tracked file changed"]) + ")"
+        causes = _stale_cause_labels(man, skip)
+        reason = _stale_reason(man, changed, skip)
+        stale_causes = _stale_causes(man, changed=changed, skip_dirs=skip)
 
         policy = _staleness_policy(config)
         if policy == "ignore":
@@ -612,7 +670,8 @@ def load_readonly(
                                reason=f"{reason}, staleness=refresh: this reader does not "
                                       f"write, so the artifact was left alone")
         # policy == "warn" (default / fallback): the stale model is used and flagged
-        model = _load_from_dir(collect_dir, status=STATUS_STALE, reason=reason, root=root)
+        model = _load_from_dir(collect_dir, status=STATUS_STALE, reason=reason, root=root,
+                               stale_causes=stale_causes)
         if not model.available:
             return CollectRead(status=STATUS_ABSENT, changed=changed,
                                reason=model.reason or "artifact is unreadable — treated as absent")

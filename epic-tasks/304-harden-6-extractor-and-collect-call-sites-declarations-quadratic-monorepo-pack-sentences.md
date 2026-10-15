@@ -1,14 +1,16 @@
 # HARDEN-6 — the extractor and the collect model: a call taken for the definition, declarations "not found", a quadratic pattern, a monorepo alias, one missing summary switching the pack off, long sentences deleted
 
-**Status:** open — FINAL, written 2026-10-14 against `1fa8599`. Six defects from outside reviews, each **reproduced by running the code** on that commit (the output is below). Parts C, D and F are gaps left by the landed fixes
-HARDEN-4 D2 and D3 and HARDEN-1 A5; Part E is a consequence of CC-15. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 304: step-5-preview as the base, with the collect line of Gate 1 naming the module without a summary when the state comes from the reader's own bridge; black box 304, 50 checks; the extractor over this repository's own sources gives the same block for every name the base finds, 26 671 of 35 246 cases). Before: open — FINAL, written 2026-10-14 against `1fa8599`. Six defects from outside reviews, each reproduced by running the code on that commit. Parts C, D and F are gaps left by the landed fixes HARDEN-4 D2 and D3 and HARDEN-1 A5; Part E is a consequence of CC-15.
 **Severity:** MEDIUM (A, B, D, E: the model is shown the wrong span, a task is dropped, or the pack is off); LOW–MEDIUM (C, F)
 **File:** `tools/block_extractor.py` (A, B, C), `tools/collect/graph.py` (D), `tools/auto/collect_bridge.py` and `tools/collect/loader.py` (E), `tools/collect/verifier.py` (F)
 **Symbol:** A/B: `extract_block`, `_find_definition_open_brace`, `_brace_candidate_patterns`. C: `_bodyless_candidate_patterns`. D: `build_module_index`, `resolve_import`. E: `CollectBridge.usable`, `load_readonly` / `is_fresh`. F: `extract_claims`, `_verify_text`
-**Round:** —
+**Round:** 304
 **Size:** M
 **Depends on:** HARDEN-1 (298), HARDEN-4 (301), CC-15 (297), all landed
 **Also touches:** `tools/auto/gate1_filter.py` (reads A and B), `tests/`, `tests_bugfix/`
+
+
+Why not the others: in a black box that drives each tree (50 checks: the extractor on calls before definitions, declarations and a hostile input, the import index on a monorepo, the real `action_collect` and `CollectBridge` over a model with one module without a summary, the verifier on a long sentence; the base passes 25) step-5-preview passes 50, sensenova-6-8-flash-lite-var1 50 (from its working tree), sensenova-6-8-flash-lite-var3 49 (working tree), sensenova-6-8-flash-lite-var4 47, agnes-2-5-flash 46, sensenova-6-8-flash-lite-var2 45 (working tree), nemotron-3-super-120b-a12b 43, laguna-s-2-1 34 (working tree), glm-4-7-flash 33. The cross matrix put step-5-preview's own 45 tests on every other entry at 37 to 42, and every other entry's tests on its code at 22 to 67 of their own, the failures being names only one entry has; the one real gap was the collect line, which printed a bare `stale` for a model stale only for a module without a summary (sensenova-6-8-flash-lite-var1 had it), closed in this commit. Tested three times: 8691 passed, 2 skipped, and 4267 passed, each time.
 
 ---
 

@@ -75,10 +75,25 @@ class TestUnbalancedBracketsAreLinear:
         extract_claims(text, "m.py")
         assert time.perf_counter() - started < 1.0
 
-    def test_a_sentence_longer_than_the_cap_yields_no_claims(self):
-        """The second line of defence: a 2 000+ character "sentence" is not a claim."""
+    def test_a_sentence_longer_than_the_cap_yields_no_citations(self):
+        """The second line of defence: a 2 000+ character "sentence" is parsed for nothing.
+
+        HARDEN-6 F: it used to yield *no claim at all*, and `_verify_text` rebuilds the summary
+        from the claims that were kept — so a true 2.5 KB run-on sentence of notes came out of the
+        summary as nothing, with `dropped_claims == 0` and no row in the verification report. The
+        sentence is now kept as one claim cut to the cap with a mark and with no citations, so
+        there is nothing in it to verify, nothing in it is dropped, and the per-claim work stays
+        bounded by the cap. What the cap still guarantees is what this test pins: no location,
+        symbol or access is ever extracted out of an over-length sentence.
+        """
         text = "a" * 2500 + " cache[0] crashes here."
-        assert extract_claims(text, "m.py") == []
+        claims = extract_claims(text, "m.py")
+        assert len(claims) == 1
+        assert claims[0].kind == "generic"
+        assert claims[0].access is None
+        assert claims[0].symbol is None
+        assert claims[0].location is None
+        assert len(claims[0].text) <= 2_100
 
     def test_a_claim_under_the_cap_is_still_extracted(self):
         claims = extract_claims("cache[0] crashes on an empty dict.", "m.py")

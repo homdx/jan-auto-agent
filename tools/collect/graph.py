@@ -69,6 +69,26 @@ Graph = Dict[str, FrozenSet[str]]
 _SOURCE_ROOT_DIRS = frozenset(("src", "lib"))
 
 
+class ModuleIndex(Dict[str, str]):
+    """`{dotted_name: module_path}`, plus what HARDEN-4 D3's layout-relative aliases need to be
+    resolved against the *importer* rather than against whichever module got there first.
+
+    * ``roots_by_path`` — for every module, the leading path components its own dotted name was cut
+      at (`svc_b` for `svc_b/app/views.py`). `()` when the module's root is the repo root.
+    * ``ambiguous_aliases`` — the aliases two or more modules claim (`app.models` in a
+      `svc_a/app/`, `svc_b/app/` layout). Such an alias is never resolved by picking the first
+      claimant.
+
+    A plain `dict` built by hand still works as an index — every accessor here degrades to
+    "no layout information" — so an older caller that passes one keeps resolving exactly as it did.
+    """
+
+    def __init__(self, mapping, roots_by_path=None, ambiguous_aliases=frozenset()):
+        super().__init__(mapping)
+        self.roots_by_path: Dict[str, Tuple[str, ...]] = dict(roots_by_path or {})
+        self.ambiguous_aliases: FrozenSet[str] = frozenset(ambiguous_aliases)
+
+
 def _package_dirs(paths: Iterable[str]) -> Set[str]:
     """The directories of `paths` that are Python *packages*, i.e. hold an `__init__.py`.
 
@@ -170,7 +190,7 @@ def _module_dotted_name(path: str) -> str:
     return ".".join(_module_dotted_parts(path))
 
 
-def build_module_index(modules: Iterable[ModuleRecord]) -> Dict[str, str]:
+def build_module_index(modules: Iterable[ModuleRecord]) -> ModuleIndex:
     """`{dotted_name: module_path}` for every module in `modules`.
 
     HARDEN-4 D3: a module's own dotted name is keyed first and never displaced, so everything that
@@ -179,6 +199,13 @@ def build_module_index(modules: Iterable[ModuleRecord]) -> Dict[str, str]:
     where nothing already owns it, so a `src/`-layout repository's internal imports resolve the same
     way a flat copy's do instead of every module looking like an entry point with no importers. A
     repo that has a real top-level package called `src` keeps resolving through the full path key.
+
+    HARDEN-6 D: in a monorepo two sub-projects claim the same alias (`svc_a/app/models.py` and
+    `svc_b/app/models.py` both answer to `app.models`), and the first by sorted path used to win for
+    *every* importer — so `svc_b/app/views.py`'s `import app.models` named `svc_a/app/models.py`,
+    the other service. The index now also records each module's own source root and which aliases are
+    claimed more than once; `resolve_import` resolves an alias against the importer's own root first
+    and leaves a contested one unresolved instead of picking a winner.
 
     Order is fixed by sorting on path, so two layouts colliding on one name resolve to the same
     module on every run (COLLECT-3).
@@ -190,15 +217,23 @@ def build_module_index(modules: Iterable[ModuleRecord]) -> Dict[str, str]:
     index: Dict[str, str] = {}
     for m in modules:
         index.setdefault(_module_dotted_name(m.path), m.path)
+
+    roots_by_path: Dict[str, Tuple[str, ...]] = {}
+    alias_owners: Dict[str, Set[str]] = {}
     for m in modules:
         parts = _module_dotted_parts(m.path)
         if not parts:
             continue
         head = _source_root_split(parts, packages, roots)
+        roots_by_path[m.path] = head
         if not head:
             continue  # the layout's root is the repo root: the name above is already the short one
-        index.setdefault(".".join(parts[len(head):]), m.path)
-    return index
+        alias = ".".join(parts[len(head):])
+        alias_owners.setdefault(alias, set()).add(m.path)
+        index.setdefault(alias, m.path)
+
+    ambiguous = {alias for alias, owners in alias_owners.items() if len(owners) > 1}
+    return ModuleIndex(index, roots_by_path=roots_by_path, ambiguous_aliases=ambiguous)
 
 
 def resolve_import(
@@ -266,14 +301,42 @@ def resolve_import(
             if parent in index:
                 return index[parent]
         return None
-    if dotted in index:
-        return index[dotted]
+
+    # HARDEN-6 D: an alias is resolved against the importer's own source root first. `svc_b/app/
+    # views.py` importing `app.models` is `svc_b/app/models.py`, not whichever sub-project's
+    # `app/models.py` came first by sorted path.
+    own_root = _importer_source_root(index, importer_path)
+    if own_root:
+        found = _lookup_index(f"{own_root}.{dotted}", index)
+        if found is not None:
+            return found
+
+    return _lookup_index(dotted, index)
+
+
+def _importer_source_root(index: Dict[str, str], importer_path: Optional[str]) -> str:
+    """The dotted prefix the *importer's* own dotted name was cut at (`svc_b` for
+    `svc_b/app/views.py`), or "" when it has no root of its own or the index carries no layout
+    information. Fail-open by design: an index built by hand resolves as it always did.
+    """
+    if not importer_path:
+        return ""
+    head = getattr(index, "roots_by_path", {}).get(importer_path)
+    return ".".join(head) if head else ""
+
+
+def _lookup_index(dotted: str, index: Dict[str, str]) -> Optional[str]:
+    """Exact match first, then the longest matching package prefix, skipping an alias two or more
+    modules claim (HARDEN-6 D): a contested alias is left unresolved rather than resolved to
+    whichever sub-project happened to sort first.
+    """
+    ambiguous = getattr(index, "ambiguous_aliases", frozenset())
     parts = dotted.split(".")
-    while len(parts) > 1:
-        parts.pop()
+    while parts:
         prefix = ".".join(parts)
-        if prefix in index:
+        if prefix not in ambiguous and prefix in index:
             return index[prefix]
+        parts.pop()
     return None
 
 

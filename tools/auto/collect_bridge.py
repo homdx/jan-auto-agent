@@ -38,6 +38,14 @@ Three responsibilities, all opt-in via `[collect] use_in_auto` /
    stale by construction, and the operator who turned V9 on has already
    said the pack is worth keeping fresh. Fail-open: a refresh that raises
    leaves the stale model, `usable` False, one WARNING, one stdout line.
+   HARDEN-6 E adds a second, narrower exception: a model stale **only**
+   because a module has no summary is usable. CC-15 made that manifest
+   stale, and the effect was that one failed Pass B switched the pack off
+   for the whole `--auto` session — for every module, although every file
+   was unchanged and every other fact in the artifact was right. The pack
+   now stays on for the modules that have their facts, and a module
+   without a summary is served without one; stale for any other cause is
+   still not usable at all.
 
 4. **V9: freshness within a run.** Item 3 only covers the artifact's
    status at load time. It says nothing about the middle of a run:
@@ -262,6 +270,20 @@ def _stale_provenance(base_dir, config) -> "tuple[str, str]":
     return artifact_sha, head_sha
 
 
+def _summary_only_stale(model) -> bool:
+    """True when the only thing stale about *model* is that a module has no summary (HARDEN-6 E).
+
+    The same test `CollectBridge._summary_only_stale` makes, for a model the bridge is about to be
+    built over. Fail-open: a model with no `stale_causes` of its own has unknown causes, which reads
+    as "not usable", exactly as it did before.
+    """
+    causes = getattr(model, "stale_causes", ()) or ()
+    try:
+        return bool(causes) and all(str(c) == "unsummarized" for c in causes)
+    except Exception:  # noqa: BLE001 — a malformed field is not a usable model
+        return False
+
+
 def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
     """RUN-6: the incremental refresh `staleness = refresh` would have run
     inside `load()`, run here instead because `[collect]
@@ -450,9 +472,34 @@ class CollectBridge:
 
     @property
     def usable(self) -> bool:
-        """`True` only when the model is FRESH. A stale artifact is treated
-        exactly like no artifact at all — see module docstring, item 3."""
-        return bool(self._model is not None and self.status == "fresh")
+        """`True` when the pack can be served from this model.
+
+        A fresh model always is. A stale one is too when its *only* cause is a module without a
+        summary (HARDEN-6 E): every static fact in the artifact is still true — the module whose
+        Pass B failed has no summary, not wrong facts — so the pack stays on for every module that
+        has one, and a module without a summary is simply served without one. Stale for any other
+        cause (a tracked file moved, another collector version, another `skip_dirs`) is not usable,
+        exactly as before: those put facts the model never knew about into the prompt.
+        """
+        if self._model is None:
+            return False
+        if self.status == "fresh":
+            return True
+        return self.status == "stale" and self._summary_only_stale()
+
+    def _summary_only_stale(self) -> bool:
+        """True when the only thing stale about this model is that some module has no summary.
+
+        Fail-open by construction: a model with no `stale_causes` of its own (built by hand, or
+        written by an older loader) has no causes at all, which is *not* "no cause" — it is
+        "unknown", so the conservative answer is False and the pack stays off, as it always did.
+        """
+        causes = getattr(self._model, "stale_causes", ()) or ()
+        try:
+            causes = tuple(str(c) for c in causes)
+        except Exception:  # noqa: BLE001 — a malformed field is not a usable model
+            return False
+        return bool(causes) and all(c == "unsummarized" for c in causes)
 
     # ── V9: invalidate on write ─────────────────────────────────────────
 
@@ -1354,6 +1401,16 @@ def make_collect_bridge(
         if refreshed is not None:
             # A repaired artifact is used for the whole session (RUN-6).
             model = refreshed
+        elif _summary_only_stale(model):
+            # HARDEN-6 E: one module without a summary is not a reason to switch the pack off for
+            # every module. The pack stays on and serves every module that has its facts; the
+            # listed one is served without a summary.
+            logger.warning(
+                "make_collect_bridge: collect artifact is stale (%s) — the pack stays ON for "
+                "the modules that have their facts; the module(s) without a summary are served "
+                "without one (rebuilt at the next --collect)",
+                getattr(model, "reason", ""),
+            )
         else:
             # Without auto_refresh the affected files fall back to plain --auto, said once on the log and on stdout.
             logger.warning(

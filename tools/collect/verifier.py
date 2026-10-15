@@ -385,7 +385,26 @@ def extract_claims(
         # such a sentence yields nothing rather than being parsed. The bracket
         # walk itself is linear now (`_pair_brackets`), so this cap bounds
         # prompt-sized prose, it is not the fix for the quadratic walk.
+        #
+        # HARDEN-6 F: "yields nothing" was itself the bug. `_verify_text`
+        # rebuilds the summary text from the claims that were *kept*, so a true
+        # 2.5 KB run-on sentence of notes came out of the summary as nothing at
+        # all — `dropped_claims == 0`, no row in the verification report, prose
+        # nobody had rejected gone without a trace. The sentence is kept as one
+        # claim cut to the cap with a mark, and with no citations: there is
+        # nothing in it to verify, nothing in it is dropped, and the downstream
+        # per-claim work stays bounded by the cap.
         if len(sentence) > _MAX_CLAIM_SENTENCE_CHARS:
+            claims.append(
+                Claim(
+                    text=(
+                        sentence[:_MAX_CLAIM_SENTENCE_CHARS].rstrip()
+                        + f"… [truncated by Pass C: {len(sentence)} characters]"
+                    ),
+                    module=module_path,
+                    kind="generic",
+                )
+            )
             continue
 
         # Every location, symbol and access citation in a sentence is extracted, not only the first (BUGFIX).

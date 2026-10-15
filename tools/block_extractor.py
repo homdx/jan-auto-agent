@@ -383,6 +383,35 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
 # Largest signature-to-brace gap: bounds the search so a false match cannot scan the whole file for a brace.
 _DEFINITION_SCAN_BOUND = 400
 
+#: Words that begin a statement, so a newline before one ends a signature that is still looking for
+#: its "{" (HARDEN-6 A). `throws`, `where`, `extends`, `implements` and the type words are
+#: deliberately absent: they continue a signature instead of ending it, and `{` is absent too because
+#: a body brace may legally start the line after the parameter list.
+_STATEMENT_START_WORDS = frozenset((
+    "function", "var", "let", "const", "if", "for", "while", "do", "switch", "return", "throw",
+    "try", "catch", "finally", "class", "import", "export", "new", "delete", "typeof", "void",
+    "yield", "await", "break", "continue", "debugger", "case", "default", "struct", "enum",
+    "interface", "typedef", "def", "fn", "func", "fun", "namespace", "package", "use", "pub",
+    "impl", "mod", "trait", "record", "object", "declare", "abstract", "static", "public",
+    "private", "protected", "internal", "sealed", "override", "inline", "suspend", "operator",
+    "type", "protocol", "extension", "data", "companion",
+))
+
+
+def _next_token_starts_statement(source: str, newline_index: int) -> bool:
+    """True when the token after the newline at *newline_index* begins a statement, so a definition
+    head still looking for its "{" has run past its own end (HARDEN-6 A)."""
+    i = newline_index + 1
+    n = len(source)
+    while i < n and source[i] in " \t\r":
+        i += 1
+    if i >= n:
+        return False
+    m = re.match(r"[A-Za-z_$][\w$]*", source[i:])
+    if m and m.group(0) in _STATEMENT_START_WORDS:
+        return True
+    return source[i] in "#@"
+
 
 def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool, lang: str = "") -> Optional[int]:
     """
@@ -419,6 +448,15 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
     or a body-less prototype declaration). So: skip the balanced arg list
     when there is one, then require the next significant character to be
     "{" and not ";", within a bounded window.
+
+    HARDEN-6 A: the same scan also stops at a "}" and at a statement boundary.
+    Without the first, a call written before the definition with no ";" after it
+    (`throw getError({ code: 1 })`) had its argument list skipped and then walked
+    straight past the rest of its caller — across the caller's own "}" — to the
+    real definition's "{", so the returned block started at the call and ran
+    through the definition. Without the second, a call at the top of the file
+    (`getError(1)` / `function getError(a) {`) walked past a whole statement
+    boundary to the same "{".
     """
     n = len(source)
     i = scan_from
@@ -494,6 +532,12 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
         if ch == "{":
             return i
         if ch == ";":
+            return None
+        if ch == "}":
+            # HARDEN-6 A: a closer the head never opened means the head sits inside a block that is
+            # already closing — the tail of a caller, not the start of a definition.
+            return None
+        if ch == "\n" and _next_token_starts_statement(source, i):
             return None
 
         i += 1
@@ -571,6 +615,98 @@ def _kotlin_fun_head(name: str) -> str:
 #: Signature-to-tail bound for the brace-less forms, same rationale as _DEFINITION_SCAN_BOUND.
 _BODYLESS_SCAN_BOUND = 400
 
+#: Words that may stand before a definition's name without being its type (a modifier, a declaration
+#: keyword). A head whose prefix holds nothing but these names no type, so it declares nothing and is
+#: a call — `export default ambient(1);` (HARDEN-6 B).
+_HEAD_MODIFIER_WORDS = frozenset((
+    "export", "default", "public", "private", "protected", "static", "final", "abstract",
+    "synchronized", "native", "transient", "volatile", "strictfp", "inline", "virtual",
+    "const", "extern", "unsafe", "suspend", "open", "override", "declare", "readonly", "pub",
+    "mut", "ref", "partial", "sealed", "internal", "implicit", "explicit", "friend", "constexpr",
+    "required", "optional", "hide", "reified", "tailrec", "infix", "operator", "external",
+    "actual", "expect", "crossinline", "noinline", "vararg",
+))
+#: Words that stand before a *call*'s name and never before a definition's (HARDEN-6 A/B).
+_CALL_HEAD_WORDS = frozenset((
+    "throw", "return", "await", "new", "typeof", "delete", "yield", "instanceof", "in", "of",
+    "case", "else", "do", "if", "while", "for", "switch", "catch", "try", "finally", "and",
+    "or", "not", "when", "then", "is", "as", "from", "import", "using", "with", "match",
+    "unless", "until", "guard", "defer", "go", "select", "spawn", "print", "echo",
+))
+#: A character that may stand directly before a definition's name because it belongs to its head: a
+#: C return type's `*`, a reference's `&`, a scope's `:`, a generic's `>`, a Go receiver's `)`. Every
+#: other operator there is a call's position.
+_HEAD_TYPE_CHARS = frozenset("*&:>)]")
+#: How far a name may be from the opening brace of a body-less declaration, same bound idea as above.
+_DECLARATION_SCAN_BOUND = 400
+
+
+def _head_name_position(head: str, target_name: str) -> Optional[int]:
+    """The offset in *head* of *target_name* as the head's own name — the occurrence followed by
+    optional whitespace and a signature opener (`(`, `<`, `[`) or by nothing at all. The last such
+    occurrence wins, so `Foo.prototype.h = async function (` names `h` and nothing else does.
+    None when no occurrence qualifies, in which case the caller stays conservative.
+    """
+    best: Optional[int] = None
+    for m in re.finditer(r"(?<![\w$.])" + re.escape(target_name) + r"(?![\w$])", head):
+        after = head[m.end():].lstrip(" \t")
+        if after and after[0] not in "(<[=:?":
+            continue
+        best = m.start()
+    return best
+
+
+def _head_prefix_kind(prefix: str) -> str:
+    """What *prefix* (the text on a head's line before its name) makes of the head: ``"declaration"``
+    (a type or a declaration keyword stands there), ``"modifiers"`` (modifier words only — a
+    declaration once a return type follows the parameter list), ``"bare"`` (nothing stands there) or
+    ``"call"`` (a call's position: `throw`, `return`, `await`, `new`, `=`, `(`, `,`, an operator, a
+    member access).
+    """
+    stripped = prefix.strip()
+    if not stripped:
+        return "bare"
+    if stripped.startswith(("//", "/*", "#", "--", ";", "*/", "*")):
+        # A commented-out declaration is not a declaration of anything this file compiles.
+        return "call"
+    words = re.findall(r"[A-Za-z_$][\w$]*", stripped)
+    if any(w in _CALL_HEAD_WORDS for w in words):
+        return "call"
+    if stripped.endswith("=>"):
+        return "call"
+    last_char = stripped[-1]
+    if last_char in "=([,!":
+        return "call"
+    if last_char not in _HEAD_TYPE_CHARS and last_char not in "_$" and not last_char.isalnum():
+        return "call"
+    if stripped.endswith(".") and not stripped.endswith("::"):
+        return "call"
+    if any(w not in _HEAD_MODIFIER_WORDS for w in words):
+        return "declaration"
+    return "modifiers"
+
+
+def _head_is_call(source: str, match: "re.Match[str]", target_name: str) -> bool:
+    """True when the matched head is a *call* of *target_name* rather than its definition (HARDEN-6 A).
+
+    A call written before the definition matches the bare `name(` heads and the return-typed head
+    (whose "return type" is then a word like `throw`), and the brace search after the argument list
+    happily walks past the rest of the caller into the real definition. A head whose name stands in
+    a call's position is therefore not a definition head at all.
+    """
+    line_start = _line_start_index(source, match.start())
+    head = source[line_start:match.end()]
+    pos = _head_name_position(head, target_name)
+    if pos is None:
+        return False
+    after_name = head[pos + len(target_name):]
+    follower = after_name.lstrip(" \t")
+    if follower is not after_name and re.match(r"(?:async\s+)?function\b", follower):
+        # `this.h = function (` / `Foo.prototype.h = async function (` — the prefix is a member
+        # access, but the head assigns a function expression: a definition all the same.
+        return False
+    return _head_prefix_kind(head[:pos]) == "call"
+
 #: Characters a line may end on and still continue on the next line (`const clamp = (a, b) =>`,
 #: `const total = a +\n  b;`). Everything else ends the logical line.
 _CONTINUATION_TAIL = frozenset("=+-*/%&|^?:,.<>([{")
@@ -586,14 +722,19 @@ def _bodyless_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     (`tests_bugfix/test_block_extractor_call_site_vs_definition.py`).
     """
     name = re.escape(target_name)
-    tp = r"(?:\s*<[^(){};]*>|\s*\[[^(){};]*\])?"
+    tp = r"(?:\s*<[^(){};\n]{1,200}>|\s*\[[^(){};\n]{1,200}\])?"
+    #: Every annotation and parameter-list class below is bounded and never crosses a newline: an
+    #: unbounded one (`(?::[^=;]+?)?`) scans to the end of the file for every line that starts with
+    #: the name, which on a data module of records made extraction quadratic — 11.6 s at 267 KB
+    #: for one name (HARDEN-6 C).
+    ann = r"(?::[^=;\n]{1,200})?"
     return [
         # const double = (x) => x * 2;   const clamp = (a, b) =>\n  a + b;   const f = <T>(x: T): T => x;
-        re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*(?::[^=;]+?)?=\s*(?:async\s*)?"
-                   rf"(?:<[^(){{}};]*>\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}]+?)?\s*=>"),
+        re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*{ann}=\s*(?:async\s*)?"
+                   rf"(?:<[^(){{}};\n]{{1,200}}>\s*)?(?:\([^)\n]{{1,400}}\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}\n]{{1,200}})?\s*=>"),
         # class A { handle = (e) => e + 1; }   (a class field: no const/let/var, an optional modifier before the name)
-        re.compile(rf"(?m)^\s*(?:(?:public|private|protected|static|readonly|override|declare)\s+)*{name}\s*(?::[^=;]+?)?=\s*"
-                   rf"(?:async\s*)?(?:<[^(){{}};]*>\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}]+?)?\s*=>"),
+        re.compile(rf"(?m)^\s*(?:(?:public|private|protected|static|readonly|override|declare)\s+)*{name}\s*{ann}=\s*"
+                   rf"(?:async\s*)?(?:<[^(){{}};\n]{{1,200}}>\s*)?(?:\([^)\n]{{1,400}}\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}\n]{{1,200}})?\s*=>"),
         # const f = function (a) ;   let f = async function () ;
         re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*=\s*(?:async\s+)?function\s*\*?\s*"
                    rf"[\w$]*\s*\("),
@@ -743,6 +884,11 @@ def _find_earliest_genuine_definition(source: str, target_name: str, lang: str =
 
     for pat in patterns:
         for match in pat.finditer(source):
+            if _head_is_call(source, match, target_name):
+                # HARDEN-6 A: a call of the name written before the definition is not a head. It
+                # used to be accepted, and the brace search after its argument list walked past the
+                # rest of its caller into the real definition, so the block started at the call.
+                continue
             has_arg_list = match.group(0).rstrip().endswith("(")
             open_idx = _find_definition_open_brace(source, match.end(), has_arg_list, lang)
             if open_idx is None:
@@ -759,7 +905,14 @@ def _find_earliest_genuine_definition(source: str, target_name: str, lang: str =
         end = _brace_scan_end(source, best_open_brace, lang=lang)
         return (best_match_start, best_open_brace, end)
 
-    return _find_earliest_bodyless_definition(source, target_name, lang)
+    bodyless = _find_earliest_bodyless_definition(source, target_name, lang)
+    if bodyless is not None:
+        return bodyless
+
+    # HARDEN-6 B: a declaration that has no body at all (`int proto(int a);`,
+    # `declare function f(x: number): void;`) used to answer "not found" — which Gate 1 reads as a
+    # hallucination. Last of the three passes, so it can only turn a "not found" into a block.
+    return _find_earliest_declaration(source, target_name, lang)
 
 
 def _find_earliest_bodyless_definition(source: str, target_name: str, lang: str = "") -> Optional[tuple]:
@@ -779,6 +932,166 @@ def _find_earliest_bodyless_definition(source: str, target_name: str, lang: str 
             has_arg_list = match.group(0).rstrip().endswith("(")
             end = _find_definition_end_bodyless(source, match.end(), has_arg_list, lang)
             if end is None:
+                continue
+
+            effective_start = _effective_match_start(source, match.start())
+            start = _line_start_index(source, effective_start)
+            if best_start is None or start < best_start:
+                best_start = start
+                best_match_start = effective_start
+                best_end = end
+
+    if best_start is None:
+        return None
+    return (best_match_start, None, best_end)
+
+
+#: The prefix of a typed declaration head (HARDEN-6 B): everything on the line before the name that
+#: is not a call's own punctuation. One character class, never a quantified token: a
+#: `(?:word[ \t]*)+`-shaped prefix backtracks exponentially on a line of words (`A::B::foo`, a long
+#: identifier), and the head is looked for on every line of every file.
+_DECLARATION_PREFIX_CLASS = r"[^\n();={}]"
+
+
+def _declaration_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
+    """The heads of a *declaration with no body at all* (HARDEN-6 B): `declare function f(x: number):
+    void;`, `int proto(int a);`, `abstract run(): void;`, `char *name_of(void);`,
+    `interface Store { reset(): void; }`.
+
+    The head is anchored at the line start and the prefix is one character class, so the pattern is
+    linear. What the prefix *means* is decided per match by `_head_prefix_kind`: a declaration needs
+    a type or a declaration keyword in front of its name, which is what keeps the ordinary call
+    `ambient(1);` — same shape, no prefix — out.
+    """
+    name = re.escape(target_name)
+    tp = r"(?:[ \t]*<[^(){};\n]{1,200}>|[ \t]*\[[^(){};\n]{1,200}\])?"
+    return [
+        re.compile(rf"(?m)^[ \t]*{_DECLARATION_PREFIX_CLASS}*?{name}{tp}[ \t]*\("),
+    ]
+
+
+def _find_definition_end_declaration(source: str, scan_from: int, has_arg_list: bool,
+                                     lang: str = "") -> Optional[tuple[int, bool]]:
+    """The end of a declaration that has no body (HARDEN-6 B) as `(index_past_the_semicolon,
+    has_return_type)`, or None when the head runs into a body or an initialiser instead.
+
+    A return type after the parameter list (`): void;`, `) -> int;`) is what makes a head with no
+    prefix of its own a declaration; without one, `reset(): void;` in an interface would be
+    indistinguishable from the call `reset();`.
+    """
+    n = len(source)
+    i = scan_from
+
+    if has_arg_list:
+        close_paren = _brace_scan_end(source, i - 1, "(", ")", lang)
+        if close_paren >= n:
+            return None
+        i = close_paren
+
+    state = "code"
+    escape = False
+    bound = min(n, i + _DECLARATION_SCAN_BOUND)
+    has_return_type = False
+
+    while i < bound:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+
+        if state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+            else:
+                i += 1
+            continue
+        if state in {"single", "double", "backtick", "char"}:
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            quote = {"single": "'", "double": '"', "backtick": "`", "char": "'"}[state]
+            if ch == quote:
+                state = "code"
+            i += 1
+            continue
+
+        if lang:
+            skip = _lang_skip(source, i, lang)
+            if skip is not None:
+                i = skip
+                continue
+        if ch == "/" and nxt == "/":
+            state = "line_comment"
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            state = "block_comment"
+            i += 2
+            continue
+        if ch == "'":
+            state = "single"
+            i += 1
+            continue
+        if ch == '"':
+            state = "double"
+            i += 1
+            continue
+        if ch == "`":
+            state = "backtick"
+            i += 1
+            continue
+
+        if ch == ";":
+            return (i + 1, has_return_type)
+        if ch in "{=":
+            return None
+        if ch in ":>" or (ch == "-" and nxt == ">"):
+            # A return type after the parameter list: `): void;`, `) -> int;`.
+            has_return_type = True
+            i += 2 if ch == "-" else 1
+            continue
+        i += 1
+
+    return None
+
+
+def _find_earliest_declaration(source: str, target_name: str, lang: str = "") -> Optional[tuple]:
+    """The earliest declaration of `target_name` that has no body (HARDEN-6 B), as
+    `(match_start, None, end)`.
+
+    Only reached when neither the braced search nor the body-less search found anything, so it can
+    only turn a "not found" into a found block. A head whose prefix is a call's position is skipped
+    here, which is what keeps `ambient(1);`, `return ambient(1);`, `const x = ambient(1);`,
+    `x.ambient(1);` and `export default ambient(1);` at "not found".
+    """
+    best_start = None
+    best_match_start = None
+    best_end = None
+
+    for pat in _declaration_candidate_patterns(target_name):
+        for match in pat.finditer(source):
+            has_arg_list = match.group(0).rstrip().endswith("(")
+            found = _find_definition_end_declaration(source, match.end(), has_arg_list, lang)
+            if found is None:
+                continue
+            end, has_return_type = found
+
+            line_start = _line_start_index(source, match.start())
+            head = source[line_start:match.end()]
+            pos = _head_name_position(head, target_name)
+            if pos is None:
+                continue
+            kind = _head_prefix_kind(head[:pos])
+            if kind == "call" or (kind != "declaration" and not has_return_type):
                 continue
 
             effective_start = _effective_match_start(source, match.start())
