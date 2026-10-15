@@ -996,10 +996,33 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     _EN_NOTHING_OK = _re.compile(
         r"^NOTHING\s+(?:TO\s+)?"
         r"(?:ADD(?:S|ED|ING)?|FIX(?:ES|ED|ING)?|CHANGE(?:S|D|ING)?|"
-        r"IMPROVE(?:S|D|MENT)?|CORRECT(?:S|ED|ION)?|WRONG)\b"
+        r"IMPROVE(?:S|D|MENT)?|CORRECT(?:S|ED|ION)?|"
+        r"COMPLETELY\s+WRONG|WRONG|"
+        r"FLAG(?:S)?|FOUND|ISSUE(?:S)?|PROBLEM(?:S)?|CONCERN(?:S)?|"
+        r"COMPLAINT(?:S)?|CONTRADICT(?:ORY|S|ING|ION(?:S)?)?)\b"
     )
     _EN_NOTE = _re.compile(r"^NOTE\b")
-    _EN_NOT_TOKENS = ("NOT", "NOTHING", "NONSENSE")
+    #: The verdict words a "NOT" negates into a rejection — the approval side (HARDEN-5 A).
+    _EN_NOT_NEGATES_APPROVAL = frozenset((
+        "APPROVED", "APPROVABLE", "APPROVE", "ACCEPTED", "ACCEPTABLE", "ACCEPT", "AGREED",
+        "OK", "OKAY", "GOOD", "VALID", "CONSISTENT", "CORRECT", "RIGHT", "TRUE", "EXACT",
+        "FINE", "PERFECT", "GREAT", "SOUND", "COMPLETE", "COMPLETELY", "FULLY", "DONE",
+        "RECOMMENDED", "ADEQUATE", "SATISFACTORY", "CLEAN", "CLEAR", "PROPER", "FITTING",
+        "SUFFICIENT", "RESOLVED", "FIXED", "WORKS", "WORKING",
+    ))
+    #: The problem words a "NO" negates into an approval (HARDEN-10 C): "No contradictions
+    #: found" is how the creative validator says there is nothing to fix.
+    _EN_NO_PROBLEM = _re.compile(
+        r"^NO\b\s+"
+        r"(?:CONTRADICTION(?:S)?|ERROR(?:S)?|INCONSISTENC(?:Y|IES)|CONFLICT(?:S)?|"
+        r"VIOLATION(?:S)?|OBJECTION(?:S)?|ISSUE(?:S)?|PROBLEM(?:S)?|CONCERN(?:S)?|"
+        r"FLAW(?:S)?|OMISSION(?:S)?|AMBIGUIT(?:Y|IES)|DEFECT(?:S)?)\b"
+        r"(?:\s+(?:FOUND|REMAIN(?:ING)?|LEFT|DETECTED))?"
+    )
+
+    #: The articles and qualifiers that stand between "NOT" and the verdict word
+    #: ("NOT A PROBLEM", "NOTHING COMPLETELY WRONG", "NOTHING VERY BAD").
+    _EN_NOT_FILLERS = frozenset(("A", "AN", "ANY", "VERY", "COMPLETELY", "QUITE", "ALL", "TOO", "AT ALL"))
 
     def _explicit_en_approval(upper: str) -> bool:
         """Whether *upper* says the opposite of a NOT/NOTHING rejection."""
@@ -1008,6 +1031,47 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             or _EN_NOTHING_OK.match(upper)
             or _EN_NOTE.match(upper)
         )
+
+    def _en_no_problem_approval(upper: str) -> bool:
+        """Whether *upper* is a "No <problem>" approval (HARDEN-10 C).
+
+        "No contradictions found", "No errors", "No inconsistencies" — the way the creative
+        validator says there is nothing to fix, matched the way the Russian
+        «нет противоречий» already was. Checked before the standalone ``NO`` token, which took
+        the first problem word away as the reason ("No contradictions found" went out to the
+        Coder as the rejection "contradictions found")."""
+        return bool(_EN_NO_PROBLEM.match(upper))
+
+    def _en_not_family_reason(line: str, upper: str) -> "str | None":
+        """The reason when *upper* opens a NOT-family rejection, else ``None``.
+
+        ``NOT`` and ``NOTHING`` reject by negating the clause that follows, so only a verdict
+        word on the *approval* side makes it a rejection: "NOT APPROVED", "NOT OK", "NOT GOOD"
+        (HARDEN-5 A). A word on the *problem* side says the opposite — "NOT REJECTED", "NOT A
+        PROBLEM", "NOT CONTRADICTORY", "NOTHING TO FLAG", "NOTHING FOUND", "NOTHING
+        CONTRADICTS …" — and is left to the approval rules, so it fails open to an approval
+        instead of going back to the Coder as a fix request (HARDEN-10 C). The reason is the
+        whole reply: the words after ``NOT`` alone would read as an approval ("NOT APPROVED"
+        → "APPROVED") and that is exactly what the Coder would be told to fix.
+        """
+        if _explicit_en_approval(upper):
+            # "NOT BAD", "NOTHING TO ADD", "NOTE: …" — prose that the fail-open rules
+            # approve, never a rejection.
+            return None
+        if _verdict_token_at_start(upper, "NONSENSE"):
+            return line.strip()
+        m = _re.match(r"^(?:NOT|NOTHING)\b[\s,:;]*(.*)$", upper)
+        if not m:
+            return None
+        words = m.group(1).split()
+        # "NOT A PROBLEM", "NOTHING COMPLETELY WRONG" — the article or the qualifier is not
+        # the verdict word, so step past them to the word "NOT" really negates.
+        while words and words[0] in _EN_NOT_FILLERS:
+            words = words[1:]
+        head = words[0] if words else ""
+        if head.rstrip(".,;:") not in _EN_NOT_NEGATES_APPROVAL:
+            return None
+        return line.strip()
 
     def _en_rejection_reason(line: str, upper: str) -> "str | None":
         """The reason when *upper* opens an English rejection, else ``None``.
@@ -1022,16 +1086,11 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         would read as an approval ("NOT APPROVED" → "APPROVED") and that is
         exactly what the Coder is told to fix.
         """
-        tokens = ("REVISE", "REJECT", "NO")
-        if not _explicit_en_approval(upper):
-            tokens = tokens + _EN_NOT_TOKENS
-        for token in tokens:
+        for token in ("REVISE", "REJECT", "NO"):
             if _verdict_token_at_start(upper, token):
-                if token in _EN_NOT_TOKENS:
-                    return line.strip()
                 rest = line.strip()[len(token):].lstrip(": ").strip()
                 return rest if rest else "validator rejected (no reason given)"
-        return None
+        return _en_not_family_reason(line, upper)
 
     # ── Scan: first try the first non-empty line; fall back to whole text ──
     candidates: list[str] = []
@@ -1067,6 +1126,11 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         if _EN_NOTHING_NEEDED.match(upper):
             return True, "", False
 
+        # "No contradictions found" is an approval, checked before the standalone NO token,
+        # which would take the problem word away as the reason (HARDEN-10 C).
+        if _en_no_problem_approval(upper):
+            return True, "", False
+
         # ── English REVISE / REJECT / NO / NOT ───────────────────────────
         _reject_reason = _en_rejection_reason(raw, upper)
         if _reject_reason is not None:
@@ -1084,6 +1148,8 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             if _lu.startswith("APPROVED") or _re.match(r"^OK\b", _lu):
                 return True, "", False
             if _EN_DISCOURSE_OK.match(_lu) or _EN_NOTHING_NEEDED.match(_lu):
+                return True, "", False
+            if _en_no_problem_approval(_lu):
                 return True, "", False
             _line_reject_reason = _en_rejection_reason(_line, _lu)
             if _line_reject_reason is not None:

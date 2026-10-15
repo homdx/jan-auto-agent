@@ -197,9 +197,21 @@ def stream_options_is_supported(url: str, model=None) -> bool:
 # value inside prose (`Set api_key = 'sk-live-…' in agents.ini`) — leaked.
 # The value is a quoted string (quotes kept when it is masked) or a run of
 # non-space characters that stops at a space, a `#` or a `;`.
+#
+# HARDEN-10 B: the `=` must be an assignment's, not one half of a comparison.
+# `assert client.api_key == key` has two `=` in a row, and the second alternative
+# of the value class matched the first one on its own — so the line went out as
+# `assert client.api_key =here_your_key key`, code that does not parse. The
+# `~=` of a match (`api_key =~ /re/`) is the same shape with a tilde ahead of the
+# second `=`. A comparison's `=` is always preceded by `=`, `!`, `<`, `>`, `~`,
+# `&` or `|`, and never followed by another `=` or a `~`.
+# The string prefix of a quoted value (`r`, `b`, `f`, `u`, `rb`, …) is part of the
+# value: without it the value class matched the prefix alone and left the quote pair
+# behind, so a raw string went out with its quotes in the wrong place (HARDEN-10 B).
 _API_KEY_LINE_RE = re.compile(
-    r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?)([\w.-]*api[_-]?key)([ \t]*=[ \t]*)'
-    r"(\"[^\"]*\"|'[^']*'|[^\s'\";]+)([ \t]*\r?)"
+    r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?)([\w.-]*api[_-]?key)'
+    r'([ \t]*(?<![=!<>~&|])=(?![=~])[ \t]*)'
+    r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";]+)([ \t]*\r?)"
 )
 # The same key with a type annotation before its `=`: `api_key: str = "…"`, `apiKey: string = '…'`.
 # Only a token-shaped literal is masked there (`_mask_annotated`): a short default is code.
@@ -219,10 +231,13 @@ _API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]
 # = None` yields the annotation, not the tail.
 _API_KEY_COLON_RE = re.compile(
     r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:[-*][ \t]+)?)([\w.-]*api[_-]?key)([ \t]*:[ \t]*)'
-    r"(\"[^\"]*\"|'[^']*'|[^#\s;\"'\,\}\]\)\|=&]+)"
+    r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^#\s;\"'\,\}\]\)\|=&]+)"
 )
 # A bare Python/JS identifier: a NAME, i.e. a reference to something, never a literal secret.
 _BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# A quoted value with no `{` inside — a literal, not a template. The prefix of a
+# Python string literal (`r`, `b`, `f`, `u`, `rb`, …) is part of the value (HARDEN-10 B).
+_PLAIN_QUOTED_RE = re.compile(r'^(?:[rbfuRBFU]{1,2})?(?:"[^"{}\n]*"|\'[^\'{}\n]*\')$')
 # Characters that make a value an expression rather than a literal token: a call, an
 # index, an attribute, a container or punctuation (`os.environ["X"]`, `config.api_key`).
 # `.` is the one that needs a second look, since a dotted value is either an attribute
@@ -247,7 +262,16 @@ _PLACEHOLDER_FLAT = frozenset({"yourkey", "yourapikey", "yourtoken", "changeme",
                                "replaceme", "todo", "xxx", "xxxx", "xxxxx", "xxxxxx"})
 # A `Bearer <token>` credential, wherever it sits in a line. The token must be long:
 # the phrase is also plain English ("bearer of the torch"), so a short word is prose.
-_BEARER_TOKEN_RE = re.compile(r"(?i)\b(bearer\s+)([^\s'\"`,;)}]{16,})")
+#
+# HARDEN-10 B: the token starts on a letter or a digit, and stops at a bracket, `$`, `<`
+# or `>` — those delimit a template hole or an interpolation
+# (`Bearer ${process.env.OPENAI_API_KEY}`, `f'Bearer {self.settings.api_key}'`), never a
+# credential. A long word of letters and underscores after the phrase is English too
+# ("the bearer authentication_scheme is used"), so the 16-character rule alone is not
+# enough: `_mask_bearer` refuses one, since a credential carries a digit or a separator.
+_BEARER_TOKEN_RE = re.compile(r"(?i)\b(bearer\s+)([A-Za-z0-9][^\s'\"`,;)}\[\]<>(){}$]{15,})")
+#: A word of letters and underscores only — the tail of an English phrase, not a credential.
+_BEARER_PROSE_WORD_RE = re.compile(r"[A-Za-z_]+")
 # Provider key prefixes, wherever they sit in a line (HARDEN-5 B: `Authorization:
 # Bearer sk-or-v1-…` leaked, since it is not an api_key assignment). The bare `sk-`
 # form needs a long tail: `sk-real-1` is a placeholder in this repo's own sources,
@@ -259,6 +283,16 @@ _SECRET_PREFIX_RE = re.compile(
     r"|\bxoxb-[A-Za-z0-9_\-]{10,}"
 )
 _MASK_PLACEHOLDER = "here_your_key"
+
+
+def _is_plain_quoted(value: str) -> bool:
+    """Whether *value* is a quoted string with nothing interpolated inside it.
+
+    A template (`api_key=f"key-{ref}"`, `api_key=f"Bearer {token}"`) is code: its
+    braces are an expression, and masking the quoted part would replace the
+    expression with the placeholder and change what the model is shown (HARDEN-10 B).
+    """
+    return bool(_PLAIN_QUOTED_RE.match(value))
 
 
 def _value_is_secret_literal(value: str, key_name: str, colon: bool = False) -> bool:
@@ -302,33 +336,39 @@ def _value_is_secret_literal(value: str, key_name: str, colon: bool = False) -> 
     value = (value or "").strip()
     if not value:
         return False
-    # A quoted string is a literal, whatever is inside it — except empty,
-    # which is a default value in code (`api_key = ''`), not a secret.
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        inner = value[1:-1].strip()
+    # A quoted string is a literal, whatever is inside it — except empty, which is a
+    # default value in code (`api_key = ''`), not a secret. A string prefix (`r`, `b`,
+    # `f`, `u`, `rb`, …) belongs to the quote, not to the value, so a raw string is
+    # the literal inside it and not the identifier `r`; and a `{` inside the quotes
+    # means the string is a template rather than a literal
+    # (`api_key=f"key-{ref}"` is code and is sent as it is) — both HARDEN-10 B.
+    if _is_plain_quoted(value):
+        body = _split_prefix(value)[1]
+        inner = body[1:-1].strip()
         return bool(inner) and not _is_template_placeholder(inner)
-    if _is_template_placeholder(value):
+    body = _split_prefix(value)[1]
+    if _is_template_placeholder(body):
         return False
-    if any(ch.isspace() for ch in value):
+    if any(ch.isspace() for ch in body):
         return False
-    if "." in value:
+    if "." in body:
         # HARDEN-9 A: a dotted value is a token as often as it is an attribute
         # path, so `.` alone must not decide between them.
-        return _dotted_value_is_secret(value)
-    if any(ch in value for ch in _EXPRESSION_CHARS):
+        return _dotted_value_is_secret(body)
+    if any(ch in body for ch in _EXPRESSION_CHARS):
         return False
-    if _NUMERIC_VALUE_RE.match(value):
+    if _NUMERIC_VALUE_RE.match(body):
         return False
-    if _BARE_IDENTIFIER_RE.match(value):
-        if value.strip("_").lower() in _CODE_WORDS:
+    if _BARE_IDENTIFIER_RE.match(body):
+        if body.strip("_").lower() in _CODE_WORDS:
             return False
         if colon:
             # HARDEN-9 B: on the colon form a bare identifier is a type or a
             # parameter name as often as it is a value, so only one that is long
             # enough to be a credential and token-shaped in its letters counts.
-            return (len(value) >= _TOKEN_MIN_LEN and _looks_like_a_token(value)
-                    and not _names_the_same_key(value, key_name))
-        return not _names_the_same_key(value, key_name)
+            return (len(body) >= _TOKEN_MIN_LEN and _looks_like_a_token(body)
+                    and not _names_the_same_key(body, key_name))
+        return not _names_the_same_key(body, key_name)
     # Not an identifier: an opaque bare token (sk-abc123, a long hex string) — a key.
     return True
 
@@ -405,9 +445,37 @@ def _names_the_same_key(value: str, key_name: str) -> bool:
     return bool(flat_value and flat_stem and (flat_value in flat_stem or flat_stem in flat_value))
 
 
+def _split_prefix(value: str) -> "tuple[str, str]":
+    """Split *value* into a string prefix (`r`, `b`, `f`, `u`, `rb`, …) and the rest.
+
+    Returns `("", value)` when there is no prefix — i.e. when the letters are not
+    followed by a quote, as in the identifier `rbtree` (HARDEN-10 B: a prefix belongs
+    to the quoted value, so it is masked with the quotes, not left behind: `rb"abc"`
+    masks to `rb"here_your_key"`, never to the bare name `here_your_key`)."""
+    if value[:2].lower() in {"rb", "br", "rf", "fr"} and len(value) > 2 and value[2] in "\"'":
+        return value[:2], value[2:]
+    i = 1 if value[:1] in "rbfuRBFU" else 0
+    if i and len(value) > i and value[i] in "\"'":
+        return value[:i], value[i:]
+    return "", value
+
+
+def _quote_parts(value: str) -> "tuple[str, str]":
+    """The string prefix and its quote character, or ``("", "")`` when *value* is
+    unquoted. The prefix goes on the opening side only: `rb"abc"` masks to
+    `rb"here_your_key"`, not `rb"here_your_keyrb"` (HARDEN-10 B)."""
+    prefix, body = _split_prefix(value)
+    if len(body) >= 2 and body[0] == body[-1] and body[0] in "\"'":
+        return prefix, body[0]
+    return "", ""
+
+
 def _quote_of(value: str) -> str:
-    """The quote character wrapping *value*, or ``""`` when it is unquoted."""
-    return value[0] if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'" else ""
+    """The string prefix and quote character wrapping *value*, or ``""`` when it is
+    unquoted. `rb"abc"` answers `rb"`: the masked text must stay parseable, and the
+    prefix is part of the quoted value (HARDEN-10 B)."""
+    prefix, quote = _quote_parts(value)
+    return prefix + quote
 
 
 def mask_api_key(text: "str | None") -> "str | None":
@@ -442,8 +510,8 @@ def mask_api_key(text: "str | None") -> "str | None":
         # A quoted value stays quoted: the masked text is what a faithful model
         # writes back, and an unquoted placeholder is a NameError waiting to
         # happen (`api_key = "x"` must not come back as `api_key = here_your_key`).
-        quote = _quote_of(value)
-        return f"{prefix}{key_name}{assign}{quote}{_MASK_PLACEHOLDER}{quote}{suffix}"
+        str_prefix, quote = _quote_parts(value)
+        return f"{prefix}{key_name}{assign}{str_prefix}{quote}{_MASK_PLACEHOLDER}{quote}{suffix}"
 
     def _mask_colon(m: "re.Match") -> str:
         prefix, key_name, assign, value = m.groups()
@@ -455,8 +523,17 @@ def mask_api_key(text: "str | None") -> "str | None":
             # `api_key: $OPENAI_API_KEY` is a reference to an environment variable (a shell, a
             # compose file, a CI config), the name of a secret and not the secret itself.
             return m.group(0)
-        quote = _quote_of(value)
-        return f"{prefix}{key_name}{assign}{quote}{_MASK_PLACEHOLDER}{quote}"
+        str_prefix, quote = _quote_parts(value)
+        return f"{prefix}{key_name}{assign}{str_prefix}{quote}{_MASK_PLACEHOLDER}{quote}"
+
+    def _mask_bearer(m: "re.Match") -> str:
+        token = m.group(2)
+        # "the bearer authentication_scheme is used" is English, not a credential: a long
+        # word of letters and underscores is prose, while a token carries a digit or a
+        # separator. The 16-character rule alone kept both (HARDEN-10 B).
+        if _BEARER_PROSE_WORD_RE.fullmatch(token):
+            return m.group(0)
+        return m.group(1) + _MASK_PLACEHOLDER
 
     def _mask_annotated(m: "re.Match") -> str:
         prefix, key_name, assign, value = m.groups()
@@ -471,7 +548,7 @@ def mask_api_key(text: "str | None") -> "str | None":
     text = _API_KEY_ANNOTATED_RE.sub(_mask_annotated, text)
     text = _API_KEY_COLON_RE.sub(_mask_colon, text)
     text = _API_KEY_JSON_RE.sub(r"\1" + _MASK_PLACEHOLDER + r"\2", text)
-    text = _BEARER_TOKEN_RE.sub(r"\1" + _MASK_PLACEHOLDER, text)
+    text = _BEARER_TOKEN_RE.sub(_mask_bearer, text)
     return _SECRET_PREFIX_RE.sub(_MASK_PLACEHOLDER, text)
 
 

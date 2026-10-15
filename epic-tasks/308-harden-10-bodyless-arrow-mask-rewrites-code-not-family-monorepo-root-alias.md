@@ -1,13 +1,17 @@
 # HARDEN-10 — four regressions of the last rounds: a bodyless arrow function is "not found", the secret mask rewrites code that holds no secret, "Nothing found" and "Not a problem" are rejections, a root-level package loses its imports in a monorepo
 
-**Status:** open — FINAL, written 2026-10-15 against `2c5bd52`. Four defects from an outside review, each **reproduced by running the code** on that commit (the output is below). A and D are consequences of HARDEN-6 (C, D), B of HARDEN-5 B, C of HARDEN-5 A. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 308: sensenova-var2 as it is — a bodyless arrow function with an empty, multi-line or annotated parameter list is found (A); the mask leaves a comparison, a `Bearer` in an f-string or a template and a prose `bearer` alone and keeps a string prefix with its quote (B); a negated verdict word is told from a rejection (C); a root-level package keeps its imports in a monorepo (D)). The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** HIGH (A: Gate 1 drops a task citing a one-line arrow function); MEDIUM (B, C); LOW (D)
 **File:** `tools/block_extractor.py` (A), `tools/llm_stream.py` (B), `tools/auto/inner_loop.py` (C), `tools/collect/graph.py` (D)
 **Symbol:** A: `_bodyless_candidate_patterns`, `_BODYLESS_SCAN_BOUND`. B: `_API_KEY_LINE_RE`, `_BEARER_TOKEN_RE`, `mask_api_key`. C: `_en_rejection_reason`, `_parse_verdict_soft`, `_EN_NOT_TOKENS`. D: `build_module_index`, `resolve_import`, `ModuleIndex.ambiguous_aliases`
-**Round:** —
+**Round:** 308
 **Size:** M
 **Depends on:** HARDEN-5 (303), HARDEN-6 (304), HARDEN-7 (305), all landed
 **Also touches:** `tests/`, `tests_bugfix/` (pins that must stay green: HARDEN-1 A8, HARDEN-5 B, HARDEN-6 C and D)
+
+Why not the others: in a black box that drives each tree (137 checks over A to D: nine arrow forms in four extensions, a parameter list over 400 characters, linear time, 16 comparisons and templates that stay as written, eight prefixed literals, masked real secrets, 21 verdicts, the monorepo rows), sensenova-var2, var4 and step-5-preview passed 136, var1 135, var3 134, agnes 133, laguna 97, glm 95 and the base 65 (nemotron's tree broke the box). The cross matrix put var2 first (its tests 274/274 and the most green on every other tree), with the arrow lengths, the `rb'…'` prefix and the `=~` comparison right; var1 and var3 lose a parameter list over 400 characters, agnes the `rb'` prefix. The outside patch of Parts A and B (contest-bench/308) is covered by var2's code line for line and no longer applies to it. One row stays a judgement call: `svc_a/tests/test_a.py` importing `app.models` resolves to the root package in every tree.
+
+Landed in the same series, before this commit: the three review fixes 37 to 39 of the outside reviewer (the `/edit` restore of a masked key, a call of a name taken for its declaration, the recovery patch and the collect artifact).
 
 ---
 

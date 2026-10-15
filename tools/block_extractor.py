@@ -764,18 +764,26 @@ def _bodyless_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     """
     name = re.escape(target_name)
     tp = r"(?:\s*<[^(){};\n]{1,200}>|\s*\[[^(){};\n]{1,200}\])?"
-    #: Every annotation and parameter-list class below is bounded and never crosses a newline: an
-    #: unbounded one (`(?::[^=;]+?)?`) scans to the end of the file for every line that starts with
-    #: the name, which on a data module of records made extraction quadratic — 11.6 s at 267 KB
-    #: for one name (HARDEN-6 C).
+    #: Every annotation and parameter-list class below is bounded: an unbounded one
+    #: (`(?::[^=;]+?)?`) scans to the end of the file for every line that starts with the name,
+    #: which on a data module of records made extraction quadratic — 11.6 s at 267 KB for one
+    #: name (HARDEN-6 C). A class followed by one closing bracket is still linear, though: the
+    #: engine walks forward to the first `)` and stops, and the head is looked for at a line start.
     ann = r"(?::[^=;\n]{1,200})?"
+    #: The parameter list, or a single parameter name. An empty list (`()`) and a list that wraps
+    #: over several lines are as common as a short single-line one, so the class admits a newline
+    #: and the bound is generous rather than tight (HARDEN-10 A: `const now = () => Date.now()`
+    #: answered "not found" because the class wanted at least one character and stopped at a
+    #: newline, and so did a wrapped `const h = (\n  a,\n  b\n) => a + b`).
+    params = r"(?:\([^)]{0,2000}\)|[A-Za-z_$][\w$]*)"
     return [
         # const double = (x) => x * 2;   const clamp = (a, b) =>\n  a + b;   const f = <T>(x: T): T => x;
+        # const now = () => Date.now();   const f = (): string => 'a';   const g = <T>() => 1;
         re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*{ann}=\s*(?:async\s*)?"
-                   rf"(?:<[^(){{}};\n]{{1,200}}>\s*)?(?:\([^)\n]{{1,400}}\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}\n]{{1,200}})?\s*=>"),
+                   rf"(?:<[^(){{}};\n]{{1,200}}>\s*)?{params}\s*(?::\s*[^=;{{}}\n]{{1,200}})?\s*=>"),
         # class A { handle = (e) => e + 1; }   (a class field: no const/let/var, an optional modifier before the name)
         re.compile(rf"(?m)^\s*(?:(?:public|private|protected|static|readonly|override|declare)\s+)*{name}\s*{ann}=\s*"
-                   rf"(?:async\s*)?(?:<[^(){{}};\n]{{1,200}}>\s*)?(?:\([^)\n]{{1,400}}\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}\n]{{1,200}})?\s*=>"),
+                   rf"(?:async\s*)?(?:<[^(){{}};\n]{{1,200}}>\s*)?{params}\s*(?::\s*[^=;{{}}\n]{{1,200}})?\s*=>"),
         # const f = function (a) ;   let f = async function () ;
         re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*=\s*(?:async\s+)?function\s*\*?\s*"
                    rf"[\w$]*\s*\("),

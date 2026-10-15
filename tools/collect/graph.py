@@ -77,7 +77,9 @@ class ModuleIndex(Dict[str, str]):
       at (`svc_b` for `svc_b/app/views.py`). `()` when the module's root is the repo root.
     * ``ambiguous_aliases`` — the aliases two or more modules claim (`app.models` in a
       `svc_a/app/`, `svc_b/app/` layout). Such an alias is never resolved by picking the first
-      claimant.
+      claimant. HARDEN-10 D keeps one exception: an alias that is a module's *own* dotted name is
+      not contested — a root-level `app/models.py` is `app.models`, and it is the unambiguous
+      answer for an importer that sits outside every sub-project's root.
 
     A plain `dict` built by hand still works as an index — every accessor here degrades to
     "no layout information" — so an older caller that passes one keeps resolving exactly as it did.
@@ -217,6 +219,7 @@ def build_module_index(modules: Iterable[ModuleRecord]) -> ModuleIndex:
     index: Dict[str, str] = {}
     for m in modules:
         index.setdefault(_module_dotted_name(m.path), m.path)
+    own_names = set(index)
 
     roots_by_path: Dict[str, Tuple[str, ...]] = {}
     alias_owners: Dict[str, Set[str]] = {}
@@ -232,7 +235,16 @@ def build_module_index(modules: Iterable[ModuleRecord]) -> ModuleIndex:
         alias_owners.setdefault(alias, set()).add(m.path)
         index.setdefault(alias, m.path)
 
-    ambiguous = {alias for alias, owners in alias_owners.items() if len(owners) > 1}
+    # HARDEN-10 D: an alias that is a module's *own* dotted name is not ambiguous. In a monorepo
+    # with `app/` at the repo root beside `svc_a/app/` and `svc_b/app/`, the root package's own
+    # `app.models` is among the claimants only by accident of the alias, and counting it made the
+    # alias contested for nobody — so `app/views.py` and the root's tests looked like they import
+    # nothing. The sub-projects' aliases stay contested among themselves; the root module is the
+    # unambiguous answer for an importer outside every sub-project's root.
+    ambiguous = {
+        alias for alias, owners in alias_owners.items()
+        if len(owners) > 1 and alias not in own_names
+    }
     return ModuleIndex(index, roots_by_path=roots_by_path, ambiguous_aliases=ambiguous)
 
 
@@ -329,6 +341,9 @@ def _lookup_index(dotted: str, index: Dict[str, str]) -> Optional[str]:
     """Exact match first, then the longest matching package prefix, skipping an alias two or more
     modules claim (HARDEN-6 D): a contested alias is left unresolved rather than resolved to
     whichever sub-project happened to sort first.
+
+    An alias that is a module's own dotted name is never in that set (HARDEN-10 D), so a
+    root-level package resolves for an importer outside every sub-project's root.
     """
     ambiguous = getattr(index, "ambiguous_aliases", frozenset())
     parts = dotted.split(".")
