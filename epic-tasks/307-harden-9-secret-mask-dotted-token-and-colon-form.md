@@ -1,9 +1,9 @@
-# HARDEN-9 — the secret mask lets a dotted token and an unquoted `api_key: <value>` line reach the model
+# HARDEN-9 — the secret mask lets a dotted token and an unquoted `api_key: <value>` line reach the model, a Western legacy file is read as cp1251, an arrow function in an object literal is "not found", and two operator-script gaps (`parse_sets`, `build_ini`)
 
-**Status:** open — FINAL, written 2026-10-15 against `0d28a9b`. Two gaps of one mask, each **reproduced by running the code** on that commit (the output is below). The code is the authority, not this ticket: if a line has moved, the symbol names the place.
-**Severity:** HIGH (A: a JWT or an OAuth token in a `.env` or INI line leaves the machine); MEDIUM (B)
-**File:** `tools/llm_stream.py`
-**Symbol:** `_value_is_secret_literal`, `_EXPRESSION_CHARS`, `_API_KEY_LINE_RE`, `mask_api_key`, `_mask_payload_secrets`
+**Status:** open — FINAL, written 2026-10-15 against `0d28a9b`. Five defects (A and B are one mask, C is the codec guess, D is two small gaps of an operator script, E is the extractor), each **reproduced by running the code** on that commit (the output is below). The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Severity:** HIGH (A: a JWT or an OAuth token in a `.env` or INI line leaves the machine); MEDIUM (B); MEDIUM-LOW (C); LOW (D); MEDIUM (E)
+**File:** `tools/llm_stream.py` (A, B), `tools/actions.py` and `tools/auto/coder.py` (C), `scripts/gate1_vote_layer2.py` (D), `tools/block_extractor.py` (E)
+**Symbol:** `_value_is_secret_literal`, `_EXPRESSION_CHARS`, `_API_KEY_LINE_RE`, `mask_api_key`, `_mask_payload_secrets`. C: `_edit_write_encodings`, `_file_encodings`, `_file_read_encoding`, `_pick_file_encoding`. D: `parse_sets`, `build_ini`. E: `extract_block` and the candidate patterns of a JS or TS definition head
 **Round:** —
 **Size:** S
 **Depends on:** HARDEN-1 (298), HARDEN-5 (303), both landed
@@ -68,6 +68,79 @@ The table above; the type-annotation lines and `def` signatures of this reposito
 
 ---
 
+## Part C — a Western cp1252 or latin-1 file is read as cp1251
+
+### What happens today
+
+`_edit_write_encodings` (used by `/edit` and, through `_file_encodings`, by the Coder since HARDEN-5 D) tries `cp1251` first and accepts it when the decoded text encodes back to the same bytes. `cp1251` and `cp1252` define almost every byte, so a Western file always round-trips as `cp1251` and the check never fails. On `0d28a9b`, for files written to a directory and read through `_file_encodings` / `_file_read_encoding`:
+
+| file | codec chosen | what the model is shown |
+|---|---|---|
+| `Café au lait, naïve façade, déjà vu` saved as cp1252 | `cp1251` | `Cafй au lait, naпve faзade, dйjа vu` |
+| `b"caf\xe9\n"` | `cp1251` | `cafй` |
+| `b"Gr\xfc\xdfe \xf6l\n"` | `cp1251` | `GrьЯe цl` |
+| `Привет мир` saved as cp1251 | `cp1251` | correct |
+
+The model copies the garbage back, and a revision that adds a genuine Western letter is refused: `_pick_file_encoding(('cp1251', 'cp1252', 'latin-1'), "Cafй au lait, naпve faзade\nCrème brûlée\n")` returns `(None, '')`, which the Coder reports as "missing some characters" with nothing named, and `/edit` refuses the same way. Unchanged text round-trips by luck.
+
+### What it does
+
+* The first candidate is the codec whose decoded letters look like the file's script: for each candidate that round-trips, count the letters it gives (Cyrillic against Latin with accents) and prefer the one that gives text of one script; a file whose high bytes decode to Latin letters in `cp1252` and to a mix of Cyrillic and Latin in no codec is read as `cp1252`. A real Russian `cp1251` file is read as `cp1251` as now, and `latin-1` stays last.
+* A UTF-8 file still returns exactly `("utf-8",)`. The one decision stays in `_edit_write_encodings`, so `/edit` and the Coder cannot disagree.
+
+### Tests (sketch)
+
+The table above through `_file_read_encoding` and `_edit_write_encodings`; an added Western line is written back in `cp1252`; a Russian `cp1251` file, a UTF-8 file, a UTF-8 file with a BOM and a pure-ASCII file are unchanged; the CC-16 Part C and HARDEN-5 D tests green unchanged.
+
+---
+
+## Part D — the operator script `scripts/gate1_vote_layer2.py`: a repeated option is a second variant, a base ini without a section is a `KeyError`
+
+### What happens today
+
+* `parse_sets("3+veto,3+veto+veto")` returns two variants, `(3, 'all', ('veto',))` and `(3, 'all', ('veto', 'veto'))`: the duplicate check compares the sorted option tuples, which differ, so the second is accepted and both run (and pay) as the same variant.
+* `build_ini` indexes `cfg["collect"]`, `cfg["gate1"]`, `cfg["gate1_llm"]` and `cfg["loop"]` without looking: a base ini without a `[collect]` section ends with `KeyError: 'collect'` and a traceback instead of a message naming the file and the section.
+
+### What it does
+
+* The options of a set are taken as a set: a repeated option is read once, or refused naming it, and two sets with the same options are the "named twice" refusal that already exists.
+* A missing section of the base ini is a `SystemExit` that names the section and the file (or the section is created), not a traceback.
+
+### Tests (sketch)
+
+`parse_sets("3+veto,3+veto+veto")`; `build_ini` with a base ini lacking `[collect]`, `[gate1]`, `[loop]` and `[gate1_llm]` in turn; the existing `parse_sets` tests green unchanged.
+
+---
+
+## Part E — an arrow function that is a property of an object literal is "not found"
+
+### What happens today
+
+HARDEN-4 D2 added `const f = (x) => {…}`, a class field and a method; a property of an object literal, `name: (x) => {…}`, has no `const` and no `function` before it and matches none of the patterns. On `0d28a9b`, for `.js` and `.ts`:
+
+```
+const api = { fetchUser: (id) => {…},  save: async (u) => {…},  plain(x) {…},  old: function (y) {…} };  export const top = (z) => {…};
+
+fetchUser   ''   (not found)
+save        ''   (not found)
+plain       found
+old         found
+top         found
+```
+
+`''` is "not found": Gate 1 drops the task that cites the function and the grounding falls back to the head of the file. Handlers, reducers, route tables and action maps are written this way.
+
+### What it does
+
+* `name: (args) => {…}`, `name: async (args) => {…}`, `name: args => {…}` and the single-expression form, as a property in an object literal, are found; the block is the property with its body, up to the closing brace (and the comma is not part of the body's end).
+* No result changes for any name the extractor finds today.
+
+### Tests (sketch)
+
+The rows above for `.js`, `.ts`, `.jsx`, `.tsx`; a property whose value is not a function (`name: 5`, `name: value`) is not a definition; the HARDEN-4 and HARDEN-6 tables green unchanged.
+
+---
+
 ## Contest
 
 One commit. The judge's own checks are not published and are written after the round, from the entries: the entries' own tests are cross-tested against every other entry's code, and the judge reads every diff. The judge runs the mask over this repository's own `.py` files before and after and expects no line of code to change.
@@ -79,4 +152,4 @@ One commit. The judge's own checks are not published and are written after the r
 
 ## Not in scope
 
-A bare identifier on the right of `=` that does not name the key (`self.api_key = token`): the mask rewrites it on the wire and `restore_masked_secrets` puts the real line back on write (HARDEN-5), so nothing reaches the disk changed. Secrets in places other than a key line (a bare token on a line by itself).
+A bare identifier on the right of `=` that does not name the key (`self.api_key = token`): the mask rewrites it on the wire and `restore_masked_secrets` puts the real line back on write (HARDEN-5), so nothing reaches the disk changed. Secrets in places other than a key line (a bare token on a line by itself), and a codec guess for East Asian or other legacy encodings.
