@@ -14,7 +14,7 @@ import time
 import logging
 from typing import List, Tuple
 
-from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
+from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence, restore_masked_secrets
 # HARDEN-7 C: the shared reader of a reply field's type. The validators this
 # module drives answer `feedback` themselves, and a list or a number in that
 # field raised AttributeError out of `/edit` and the text-QA loop.
@@ -1303,6 +1303,11 @@ class OrchestratorActions:
         # An empty revision is never written, so the target is not emptied.
         if not revised.strip():
             print(f"[{_ts()}] No content produced — file left unchanged.")
+            return
+
+        # The model was shown the file with its secrets masked: a line it gave back masked is the original line.
+        revised = restore_masked_secrets(original, revised)
+        if _refuse_unwritable(revised):
             return
 
         # If the loop ends with needs_fix, the file is written anyway (the .bak keeps it reversible), and the user is told.

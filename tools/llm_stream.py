@@ -201,6 +201,13 @@ _API_KEY_LINE_RE = re.compile(
     r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?)([\w.-]*api[_-]?key)([ \t]*=[ \t]*)'
     r"(\"[^\"]*\"|'[^']*'|[^\s'\";]+)([ \t]*\r?)"
 )
+# The same key with a type annotation before its `=`: `api_key: str = "…"`, `apiKey: string = '…'`.
+# Only a token-shaped literal is masked there (`_mask_annotated`): a short default is code.
+_API_KEY_ANNOTATED_RE = re.compile(
+    r'(?im)((?:^|[(,])[ \t]*(?:(?:val|var|let|const|readonly|public|private|protected|static|final|export)[ \t]+)*)'
+    r'([\w.-]*api[_-]?key)([ \t]*:[ \t]*[A-Za-z_][\w.\[\], |]*?[ \t]*=(?!=)[ \t]*)'
+    r"(\"[^\"\r\n]*\"|'[^'\r\n]*')"
+)
 # the same key in JSON: "api_key": "<value>", "openai_api_key": "<value>"
 _API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]*(")')
 # The same key in YAML/INI colon form, UNQUOTED: `api_key: <value>`, indented or
@@ -451,7 +458,17 @@ def mask_api_key(text: "str | None") -> "str | None":
         quote = _quote_of(value)
         return f"{prefix}{key_name}{assign}{quote}{_MASK_PLACEHOLDER}{quote}"
 
+    def _mask_annotated(m: "re.Match") -> str:
+        prefix, key_name, assign, value = m.groups()
+        inner = value[1:-1]
+        # A typed default (`api_key: str = "jan"`) is code; a credential is long and token-shaped.
+        if (not _value_is_secret_literal(value, key_name) or len(inner) < _TOKEN_MIN_LEN
+                or any(ch.isspace() for ch in inner) or not _looks_like_a_token(inner)):
+            return m.group(0)
+        return f"{prefix}{key_name}{assign}{value[0]}{_MASK_PLACEHOLDER}{value[0]}"
+
     text = _API_KEY_LINE_RE.sub(_mask_assignment, text)
+    text = _API_KEY_ANNOTATED_RE.sub(_mask_annotated, text)
     text = _API_KEY_COLON_RE.sub(_mask_colon, text)
     text = _API_KEY_JSON_RE.sub(r"\1" + _MASK_PLACEHOLDER + r"\2", text)
     text = _BEARER_TOKEN_RE.sub(r"\1" + _MASK_PLACEHOLDER, text)
