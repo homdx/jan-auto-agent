@@ -108,7 +108,7 @@ def test_coder_718_pass_is_classified_fail_open():
     source = CODER_PATH.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "tools/auto/coder.py")
     # Pinned to a still-genuine bare except site; update the line if the source shifts.
-    site = sites["tools/auto/coder.py:1157"]   # bare except; moved with the comment shortening (was 1165)
+    site = sites["tools/auto/coder.py:1243"]   # bare except; moved with the comment shortening (was 1165 → 1157: RUN-10's retry kwargs; → 1243: HARDEN-5 D's codec helpers before _read_file_contents)
     assert site.body_kind == "pass"
     assert site.is_fail_open is True
 
@@ -116,7 +116,7 @@ def test_coder_718_pass_is_classified_fail_open():
 def test_coder_866_continue_is_not_silent():
     source = CODER_PATH.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "tools/auto/coder.py")
-    site = sites["tools/auto/coder.py:1122"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts (was 1130)
+    site = sites["tools/auto/coder.py:1208"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts (was 1130 → 1122: RUN-10's retry kwargs; → 1208: HARDEN-5 D's codec helpers before _read_file_contents)
     assert site.body_kind == "continue"
     assert site.is_fail_open is False
 

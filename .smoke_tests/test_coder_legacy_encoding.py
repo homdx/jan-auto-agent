@@ -1,0 +1,1 @@
+../tests/test_coder_legacy_encoding.py

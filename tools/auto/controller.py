@@ -702,12 +702,38 @@ class AutoController:
                     # can delete it. The regression check is skipped — there is
                     # no commit to check a tree against.
                     patch_path = self._save_uncommitted_patch(task, result)
+
+                    # HARDEN-5 C: OuterLoop.run_task set this task DONE the moment
+                    # it passed, before any commit happened, and nothing set it
+                    # back. A DONE task whose commit failed was skipped by a
+                    # resume (its work lived only in a patch nothing re-applies)
+                    # and read as done by the dependency check below, so a
+                    # dependent task ran and committed these files under its own
+                    # id — the sweep the patch was meant to prevent. TODO is the
+                    # one state the dependency check and a resume both already
+                    # treat as "not done".
+                    self.state.set_task_status(task["id"], STATUS_TODO)
                     self.state.log(
                         f"task {task['id']} NOT counted done — commit failed "
                         f"({commit_result.error})"
                         + (f"; work saved to {patch_path}" if patch_path
                            else "; could not save the work as a patch")
+                        + "; back to todo, so a resume and any dependent task "
+                          "both read it as not done"
                     )
+                    if patch_path:
+                        # The patch is the record now, so the tree goes back to
+                        # HEAD. Left in place, a later task's stage_all() would
+                        # sweep this work into its own commit under another id,
+                        # and a dirty tree is what a later --auto refuses for
+                        # changes the agent itself made. Only done once the patch
+                        # is on disk — destroying the tree when the patch write
+                        # failed would lose the only copy. B9's rule still
+                        # applies: a GitError is logged and the run continues.
+                        self._discard_exhausted_residue(
+                            task["id"],
+                            reason="commit failed, work saved as a patch",
+                        )
                     logger.error(
                         "task %s: commit failed after a passing acceptance "
                         "check (%s) — not counted done, work %s",
@@ -718,10 +744,12 @@ class AutoController:
                     if self.run_trace:
                         self.run_trace.log_task_failed(
                             task["id"], commit_result.error or "commit failed")
-                    # The edit IS in the tree, uncommitted: the collect model
-                    # built before it describes a tree that no longer exists,
-                    # so its paths are marked dirty here too (V9). With no sha,
-                    # _invalidate_collect falls back to the task's target_files.
+                    # The collect model built before this task describes a tree
+                    # that no longer holds it — either the edit is still in the
+                    # tree (the patch write failed) or the tree was just reset
+                    # back to HEAD — so its paths are marked dirty here too (V9).
+                    # With no sha, _invalidate_collect falls back to the task's
+                    # target_files.
                     self._invalidate_collect(task["id"], collect_bridge, None)
                 else:
                     tasks_done += 1

@@ -803,8 +803,8 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     """Parse a line-oriented Gate-2 verdict for creative mode (AUTO-CR-2 / CR-26-1).
 
     Protocol: the model is expected to reply with one line whose first token is
-    ``APPROVED`` (or ``OK``) or ``REVISE`` / ``REJECT`` / ``NO``.  If ``REVISE``,
-    the reason follows after ``: ``.
+    ``APPROVED`` (or ``OK``) or ``REVISE`` / ``REJECT`` / ``NO`` / ``NOT``.  If a
+    rejection token, the reason follows after it (``: `` or a space).
 
     Returns
     -------
@@ -818,19 +818,27 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
 
     Acceptance criteria (spec AUTO-CR-2 + AUTO-CR-26-1):
         * ``APPROVED`` / ``approved`` / ``OK …``                  → approved=True
-        * ``REVISE: <reason>`` / ``REJECT: …`` / ``NO: …``        → approved=False
+        * ``REVISE: <reason>`` / ``REJECT: …`` / ``NO: …`` /
+          ``NOT <anything>`` / ``NOTHING <prose>`` / ``NONSENSE``  → approved=False
+          (``NOT BAD`` / ``NOTHING TO ADD`` / ``NOTHING WRONG`` / ``NOTE:``
+          are the exceptions — approvals, matched before the NOT family)
         * Russian APPROVED forms (нет противоречий, согласна, …)  → approved=True
         * Russian REVISE forms (не согласна, противоречие, …)     → approved=False
         * Any other content (rambling, JSON, prose, …)            → approved=True (fail-open)
 
     Order is load-bearing: negated-positive RU rules (нет противоречий, не против,
     не противоречит) and the «не соглас» rule are tested **before** the bare
-    negative patterns (против, противоречи…, соглас) to avoid mis-classification.
+    negative patterns (против, противоречи…, соглас) to avoid mis-classification,
+    and the English approvals are tested **before** the English rejection tokens
+    for the same reason: ``NOT BAD`` is an approval whose first token is ``NOT``.
 
     The English verdict tokens match as whole words only (HARDEN-1 A1, see
-    ``_verdict_token_at_start``): ``NOT BAD`` / ``NOTE:`` / ``Normally`` /
-    ``NOPE`` are prose, not a bare ``NO`` rejection, and fall through to the
-    fail-open rules exactly as any other prose does.
+    ``_verdict_token_at_start``): ``Normally`` / ``NOPE`` / ``REVISED`` are not
+    verdicts. HARDEN-5 A adds ``NOT`` / ``NOTHING`` / ``NONSENSE`` back as
+    rejection tokens — after HARDEN-1 A1 a reply that began with ``NOT``
+    matched nothing and fell through to the fail-open approval — and the three
+    explicit NOT-family approvals listed above are matched first, so they keep
+    failing open to the later rules as prose.
     """
     import re as _re
 
@@ -964,6 +972,58 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         rest = s.strip()[m.start(2):].strip() if m.group(2) else ""
         return rest if rest else "validator rejected (no reason given)"
 
+    # ── HARDEN-5 A: "NOT …" opens a rejection, but an explicit approval first ──
+    # HARDEN-1 A1 made the tokens match as whole words, which took the rejection
+    # away from every reply beginning with "NOT": "NOT APPROVED", "Not good
+    # enough" and "Nothing works" matched nothing, were unparseable, and
+    # unparseable means approve — a chapter the model rejected went through.
+    # The NOT / NOTHING / NONSENSE rejections are added back below, and these
+    # three approvals are checked *before* them, so "NOT BAD" and "NOTHING TO
+    # ADD" stay approvals and "NOTE:" is read as prose (they fall through to
+    # the fail-open rules on purpose now, the way A1 made them do it by
+    # accident). "Normally", "NOPE", "NOT APPROVED" stay where they are: the
+    # NOT token needs a whole word after "NOT", so "NOPE" is not a NOT.
+    _EN_NOT_BAD = _re.compile(r"^NOT\s+BAD\b")
+    _EN_NOTHING_OK = _re.compile(
+        r"^NOTHING\s+(?:TO\s+)?"
+        r"(?:ADD(?:S|ED|ING)?|FIX(?:ES|ED|ING)?|CHANGE(?:S|D|ING)?|"
+        r"IMPROVE(?:S|D|MENT)?|CORRECT(?:S|ED|ION)?|WRONG)\b"
+    )
+    _EN_NOTE = _re.compile(r"^NOTE\b")
+    _EN_NOT_TOKENS = ("NOT", "NOTHING", "NONSENSE")
+
+    def _explicit_en_approval(upper: str) -> bool:
+        """Whether *upper* says the opposite of a NOT/NOTHING rejection."""
+        return bool(
+            _EN_NOT_BAD.match(upper)
+            or _EN_NOTHING_OK.match(upper)
+            or _EN_NOTE.match(upper)
+        )
+
+    def _en_rejection_reason(line: str, upper: str) -> "str | None":
+        """The reason when *upper* opens an English rejection, else ``None``.
+
+        Both the first-line pass and the per-line pass go through this one
+        helper, so the whole-word boundary (HARDEN-1 A1) and the NOT-family
+        approval guard cannot drift apart again.
+
+        ``REVISE`` / ``REJECT`` / ``NO`` are standalone tokens, so the reason is
+        what follows them. The NOT family rejects by *negating* the clause that
+        follows, so the reason is the whole reply — the words after ``NOT`` alone
+        would read as an approval ("NOT APPROVED" → "APPROVED") and that is
+        exactly what the Coder is told to fix.
+        """
+        tokens = ("REVISE", "REJECT", "NO")
+        if not _explicit_en_approval(upper):
+            tokens = tokens + _EN_NOT_TOKENS
+        for token in tokens:
+            if _verdict_token_at_start(upper, token):
+                if token in _EN_NOT_TOKENS:
+                    return line.strip()
+                rest = line.strip()[len(token):].lstrip(": ").strip()
+                return rest if rest else "validator rejected (no reason given)"
+        return None
+
     # ── Scan: first try the first non-empty line; fall back to whole text ──
     candidates: list[str] = []
     first_line: str | None = None
@@ -998,12 +1058,10 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         if _EN_NOTHING_NEEDED.match(upper):
             return True, "", False
 
-        # ── English REVISE / REJECT / NO ─────────────────────────────────
-        for token in ("REVISE", "REJECT", "NO"):
-            if _verdict_token_at_start(upper, token):
-                rest = raw.strip()[len(token):].lstrip(": ").strip()
-                reason = rest if rest else "validator rejected (no reason given)"
-                return False, reason, False
+        # ── English REVISE / REJECT / NO / NOT ───────────────────────────
+        _reject_reason = _en_rejection_reason(raw, upper)
+        if _reject_reason is not None:
+            return False, _reject_reason, False
 
         # A verdict on a later line behind a preamble is found too, since the protocol is the first token of a line (AUTO-BUG).
         for _line in raw.splitlines():
@@ -1018,11 +1076,9 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
                 return True, "", False
             if _EN_DISCOURSE_OK.match(_lu) or _EN_NOTHING_NEEDED.match(_lu):
                 return True, "", False
-            for token in ("REVISE", "REJECT", "NO"):
-                if _verdict_token_at_start(_lu, token):
-                    rest = _line.strip()[len(token):].lstrip(": ").strip()
-                    reason = rest if rest else "validator rejected (no reason given)"
-                    return False, reason, False
+            _line_reject_reason = _en_rejection_reason(_line, _lu)
+            if _line_reject_reason is not None:
+                return False, _line_reject_reason, False
 
         # ── Russian APPROVED (order matters — negated first) ──────────────
         for pat in _RU_APPROVED:

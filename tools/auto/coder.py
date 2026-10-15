@@ -364,6 +364,79 @@ def _guard2_all_skipped_error(skipped: list[str]) -> str:
     return "; ".join(_guard2_skip_message(p) for p in skipped[:5])
 
 
+def _file_encodings(path: Path) -> "tuple[str, ...]":
+    """The encodings *path* may be read back in, most faithful first.
+
+    HARDEN-5 D: the Coder read a task's files with ``errors="replace"`` and
+    wrote them back as UTF-8, so a legacy file was shown to the model as a run
+    of U+FFFD and then stored as UTF-8 mojibake — the same bug CC-16 fixed for
+    ``/edit`` by deciding the codec once, from the file's own bytes, before the
+    model is asked. The Coder's whole-file path uses that same helper
+    (``tools.actions._edit_write_encodings``), not a copy, so ``/edit`` and the
+    Coder cannot disagree about what one file's bytes mean.
+
+    Fail-open: anything unexpected — a file that vanished, a read error, a
+    broken import — yields ``("utf-8",)``, which is the old behaviour, so a
+    codec probe can never be what loses a write.
+    """
+    try:
+        from tools.actions import _edit_write_encodings
+
+        encodings = _edit_write_encodings(str(path))
+    except Exception:
+        return ("utf-8",)
+    return tuple(encodings) or ("utf-8",)
+
+
+def _file_read_encoding(path: Path) -> str:
+    """The one codec *path* is read in: the most faithful candidate.
+
+    ``errors="replace"`` is deliberately NOT passed — a legacy byte has a real
+    character in its own codec, and swapping it for U+FFFD is what the model
+    then copies back into the file. Strict is correct: if the strict decode
+    still fails the caller falls back to the old lossy read, so a file that
+    changed under us still gets shown.
+    """
+    encodings = _file_encodings(path)
+    return encodings[0] if encodings else "utf-8"
+
+
+def _pick_file_encoding(
+    encodings: "tuple[str, ...]", content: str
+) -> "tuple[str | None, str]":
+    """The first of *encodings* that can hold *content*, else ``(None, missing)``.
+
+    Delegates to ``tools.actions._pick_edit_encoding`` — the same function
+    ``/edit`` uses — so both paths walk one list in one order instead of each
+    picking its own codec for the same file. Fail-open: an unexpected error
+    yields ``("utf-8", "")``, the behaviour before HARDEN-5 D.
+    """
+    try:
+        from tools.actions import _pick_edit_encoding
+
+        return _pick_edit_encoding(encodings, content)
+    except Exception:
+        return ("utf-8", "")
+
+
+def _refuse_inencodable(encoding: "str | None", missing: str, rel: str) -> "str | None":
+    """The refusal message when *encoding* is ``None``, else ``None``.
+
+    HARDEN-5 D: a reply the file's codec cannot hold is refused, never written
+    with ``?`` or U+FFFD. The file is left exactly as it was, and the message
+    names what is missing so the model can drop those characters and try again
+    instead of seeing a bare codec traceback.
+    """
+    if encoding is not None:
+        return None
+    absent = missing if missing.strip() else "some characters"
+    return (
+        f"[ENCODING] {rel!r}: the file is not UTF-8 and the reply cannot be "
+        f"written in it — missing {absent}. Nothing was written to that file; "
+        f"convert it to UTF-8 first, or revise without those characters."
+    )
+
+
 class Coder(_llm_stream.LLMClientBase):
     """Generates full revised file content for a single autonomous task.
 
@@ -1085,10 +1158,23 @@ class Coder(_llm_stream.LLMClientBase):
                 continue
 
             try:
-                content = abs_path.read_text(encoding="utf-8", errors="replace")
+                raw = abs_path.read_bytes()
             except OSError as exc:
                 parts.append(f"### {rel}\n[unreadable: {exc}]")
                 continue
+            try:
+                # HARDEN-5 D: the file's own codec, decided from its bytes by the
+                # same helper /edit uses, applied strictly. A legacy byte has a
+                # real character in that codec, so nothing has to be replaced —
+                # and the Coder no longer feeds the model a run of U+FFFD that
+                # it then copies straight back into the file.
+                content = raw.decode(_file_read_encoding(abs_path))
+            except UnicodeError:
+                # Fail open: the file changed between the codec probe and the
+                # read, or no candidate described its bytes. The old lossy read
+                # is kept only as that fallback, so the task still gets its
+                # context instead of none.
+                content = raw.decode("utf-8", errors="replace")
 
             ext = Path(rel).suffix.lower()
 
@@ -2002,6 +2088,7 @@ class Coder(_llm_stream.LLMClientBase):
 
                 # Keep the existing file's permission bits when rewriting it.
                 existing_mode: "int | None" = None
+                encoding = "utf-8"
 
                 # Back up existing file before overwriting (reversible).
                 if dest.exists():
@@ -2009,17 +2096,49 @@ class Coder(_llm_stream.LLMClientBase):
                         existing_mode = stat.S_IMODE(dest.stat().st_mode)
                     except OSError:
                         existing_mode = None
+
+                    # HARDEN-5 D: write the reply back in the file's own codec,
+                    # decided from its bytes by the same helper /edit uses, so
+                    # the bytes outside the reply are the original bytes and a
+                    # legacy file is not silently re-encoded as UTF-8. Walking
+                    # the candidate list in order accepts a revision that only
+                    # the file's looser codec holds; a reply none of them holds
+                    # is refused rather than written as ? or U+FFFD, which the
+                    # model would then read back and happily keep. in_style_of
+                    # runs first, so the codec is the one that holds exactly the
+                    # text about to be written.
+                    # The model was shown the file with its secrets masked: a line it
+                    # gave back masked is the original line again, not the placeholder.
+                    try:
+                        content = _llm_stream.restore_masked_secrets(
+                            dest.read_bytes().decode("utf-8", errors="replace"), content)
+                    except OSError:
+                        pass
+                    content = in_style_of(dest, content)
+                    encoding, missing = _pick_file_encoding(
+                        _file_encodings(dest), content
+                    )
+                    refusal = _refuse_inencodable(encoding, missing, rel)
+                    if refusal:
+                        logger.warning("coder._write_files [%s]: %s", task_id, refusal)
+                        if not first_error:
+                            first_error = refusal
+                        continue
+                    logger.debug(
+                        "coder._write_files [%s]: writing %s in %s",
+                        task_id, dest, encoding,
+                    )
+
                     backup = dest.with_suffix(dest.suffix + ".coder.bak")
                     backup.unlink(missing_ok=True)
                     shutil.copy2(dest, backup)        # bytes and mode (see the delete branch)
-                    content = in_style_of(dest, content)
                     logger.debug(
                         "coder._write_files [%s]: backed up %s → %s",
                         task_id, dest, backup,
                     )
 
                 # Write atomically and keep the file's permission bits: a kill mid-write must not truncate the user's source file (BUGFIX).
-                atomic_write_text(dest, content, newline="")
+                atomic_write_text(dest, content, newline="", encoding=encoding)
                 if existing_mode is not None:
                     try:
                         os.chmod(dest, existing_mode)

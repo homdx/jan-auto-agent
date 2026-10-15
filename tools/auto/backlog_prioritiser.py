@@ -405,9 +405,22 @@ class BacklogPrioritiser:
         # code: "the loop will run only when enabled" made B depend on A, and the controller holds a task
         # whose dependency is not done — one failed task blocked an unrelated one
         # a call has no space before its parenthesis ("run (when enabled)" is prose), and "run.log" is a file
-        ext = r"(?:log|txt|md|rst|py|json|csv|ini|cfg|toml|ya?ml|sh|out|err|tmp|lock)\b"
-        return bool(re.search(rf"`[^`\n]*\b{name}\b[^`\n]*`|\b{name}\(|\.{name}\b|\b{name}\.(?!{ext})\w",
-                              task_b.instruction))
+        # HARDEN-5 E: the file-name exclusion must apply inside a backticked span too. File names are
+        # normally written in backticks, so a span that merely contained the word made an unrelated task
+        # a dependent: `main.py`, `run.log`, `scripts/run.sh`, `parse.json`, `config.ini` all did, and
+        # one of them failing blocked the other. The span counts only when the symbol in it is not part
+        # of a file name — i.e. not followed by .ext — so `main`, `run()`, `Store.load` still do.
+        ext = _FILE_EXT_RE
+        return bool(re.search(
+            rf"`[^`\n]*\b{name}(?!\.{ext})\b[^`\n]*`|\b{name}\(|\.{name}\b|\b{name}\.(?!{ext})\w",
+            task_b.instruction,
+        ))
+
+
+# HARDEN-5 E: the file extensions that make `name.ext` a file name rather than a
+# symbol — used both outside and inside a backticked span, so one place answers
+# "is this a file name". Kept a bare group so it can be used as a lookahead.
+_FILE_EXT_RE = r"(?:log|txt|md|rst|py|json|csv|ini|cfg|toml|ya?ml|sh|out|err|tmp|lock)\b"
 
 
 def _looks_like_code(name: str) -> bool:

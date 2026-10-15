@@ -186,11 +186,20 @@ def stream_options_is_supported(url: str, model=None) -> bool:
     return (url, model) not in _STREAM_OPTIONS_UNSUPPORTED_KEYS
 
 
-# Matches an api_key line, commented or not, so a pasted secret is masked before the LLM sees it (MASK-KEY-1).
-# The key name is its own group, so `mask_api_key` can tell a pass-through
-# assignment (`self.api_key = api_key`) from a literal value (HARDEN-1 A8).
+# Matches an api_key assignment anywhere in a line, commented or not, so a
+# pasted secret is masked before the LLM sees it (MASK-KEY-1). The key name is
+# its own group, so `mask_api_key` can tell a pass-through assignment
+# (`self.api_key = api_key`) from a literal value (HARDEN-1 A8).
+#
+# HARDEN-5 B: neither the line start nor the line end is required. The old
+# `^…$` anchors meant the value had to be the last thing on the line, so the
+# common shapes — a trailing `#`/`;` comment (`api_key = sk-live-…  # prod`), a
+# value inside prose (`Set api_key = 'sk-live-…' in agents.ini`) — leaked.
+# The value is a quoted string (quotes kept when it is masked) or a run of
+# non-space characters that stops at a space, a `#` or a `;`.
 _API_KEY_LINE_RE = re.compile(
-    r'(?im)^([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?)([\w.-]*api[_-]?key)([ \t]*=[ \t]*)(\S+)([ \t]*\r?)$'
+    r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?)([\w.-]*api[_-]?key)([ \t]*=[ \t]*)'
+    r"(\"[^\"]*\"|'[^']*'|[^\s'\";]+)([ \t]*\r?)"
 )
 # the same key in JSON: "api_key": "<value>", "openai_api_key": "<value>"
 _API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]*(")')
@@ -199,6 +208,30 @@ _BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Characters that make a value an expression rather than a literal token: a call, an
 # index, an attribute, a container or punctuation (`os.environ["X"]`, `config.api_key`).
 _EXPRESSION_CHARS = "([{)]},;'\"."
+# A bare number: also code (`api_key = 30` is not a secret).
+_NUMERIC_VALUE_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)$")
+# Names that are never secrets (HARDEN-5 B: `self.api_key = None` was sent out as
+# `self.api_key = here_your_key`, and a faithful rewrite raised a NameError).
+_CODE_WORDS = frozenset({"none", "true", "false", "null", "undefined", "nil"})
+_NON_ALNUM = re.compile(r"[^a-z0-9]")
+# A template placeholder is an unset value, not a secret: `api_key = your_key`, `<your key>`,
+# `changeme`, `xxx` are sent as they are (HARDEN-5 B), the same as the mask's own output.
+_PLACEHOLDER_FLAT = frozenset({"yourkey", "yourapikey", "yourtoken", "changeme", "hereyourkey", "insertkeyhere",
+                               "replaceme", "todo", "xxx", "xxxx", "xxxxx", "xxxxxx"})
+# A `Bearer <token>` credential, wherever it sits in a line. The token must be long:
+# the phrase is also plain English ("bearer of the torch"), so a short word is prose.
+_BEARER_TOKEN_RE = re.compile(r"(?i)\b(bearer\s+)([^\s'\"`,;)}]{16,})")
+# Provider key prefixes, wherever they sit in a line (HARDEN-5 B: `Authorization:
+# Bearer sk-or-v1-…` leaked, since it is not an api_key assignment). The bare `sk-`
+# form needs a long tail: `sk-real-1` is a placeholder in this repo's own sources,
+# not a credential (test_harden1_a8 pins it as untouched).
+_SECRET_PREFIX_RE = re.compile(
+    r"\b(?:sk-or-v1-|sk-proj-)[A-Za-z0-9_\-]{10,}"
+    r"|\bsk-[A-Za-z0-9_\-]{12,}"
+    r"|\bAIza[A-Za-z0-9_\-]{20,}"
+    r"|\bxoxb-[A-Za-z0-9_\-]{10,}"
+)
+_MASK_PLACEHOLDER = "here_your_key"
 
 
 def _value_is_secret_literal(value: str, key_name: str) -> bool:
@@ -214,6 +247,15 @@ def _value_is_secret_literal(value: str, key_name: str) -> bool:
     catches. Across this repo's own sources the old pattern matched hundreds
     of lines.
 
+    HARDEN-5 B: A8 kept only the key's *exact* own name (``self.api_key =
+    api_key``, ``_API_KEY``) and still masked every other identifier —
+    ``self.api_key = None`` and ``API_KEY = DEFAULT_API_KEY`` went out as
+    ``here_your_key``. An identifier that names the key it is assigned to, in
+    either direction (``key`` inside ``api_key``, ``DEFAULT_API_KEY`` outside
+    ``API_KEY``), is a reference, not a literal; so is a language constant.
+    A placeholder like ``test_or_key`` still does not name the key, so it is
+    still masked, and a masked value never survives a second pass.
+
     The intent is to keep a real secret out of the request without touching
     code, so only a *literal* is masked:
 
@@ -221,32 +263,67 @@ def _value_is_secret_literal(value: str, key_name: str) -> bool:
     * a bare token with no whitespace and no call, index, attribute or
       punctuation character (``api_key = sk-abc123``) — a key-shaped literal;
     * anything else is an expression (``os.environ["OPENAI_API_KEY"]``,
-      ``config.api_key``, ``get_key()``) and is sent verbatim;
-    * a bare identifier that IS the key's own name (``self.api_key = api_key``,
-      ``self.api_key = _API_KEY``) is a pass-through of a parameter, not a
-      secret, and is sent verbatim too.
+      ``config.api_key``, ``get_key()``), a bare number, a language constant, or a
+      name for the key itself — and is sent verbatim.
     """
     value = (value or "").strip()
     if not value:
         return False
-    # A quoted string is a literal, whatever is inside it.
+    # A quoted string is a literal, whatever is inside it — except empty,
+    # which is a default value in code (`api_key = ''`), not a secret.
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return True
+        inner = value[1:-1].strip()
+        return bool(inner) and not _is_template_placeholder(inner)
+    if _is_template_placeholder(value):
+        return False
     if any(ch.isspace() for ch in value) or any(ch in value for ch in _EXPRESSION_CHARS):
         return False
-    # A name that merely refers to the key it is being assigned to (`self.api_key =
-    # api_key`): the assigned name's last segment, so `self.api_key` is compared
-    # with `api_key` and not with the dotted name itself.
+    if _NUMERIC_VALUE_RE.match(value):
+        return False
     if _BARE_IDENTIFIER_RE.match(value):
-        return value.strip("_").lower() != key_name.rsplit(".", 1)[-1].strip("_").lower()
+        if value.strip("_").lower() in _CODE_WORDS:
+            return False
+        return not _names_the_same_key(value, key_name)
     # Not an identifier: an opaque bare token (sk-abc123, a long hex string) — a key.
     return True
 
 
+def _is_template_placeholder(value: str) -> bool:
+    """Whether *value* is an unset template value: ``<…>`` or a well-known stand-in."""
+    value = value.strip()
+    if value.startswith("<"):
+        return True
+    return _NON_ALNUM.sub("", value.lower()) in _PLACEHOLDER_FLAT
+
+
+def _names_the_same_key(value: str, key_name: str) -> bool:
+    """Whether the bare *value* names the key it is being assigned to.
+
+    Case and separators are ignored, and either direction counts: ``key`` is a
+    piece of ``api_key`` (``self.api_key = key`` is a parameter pass-through) and
+    ``DEFAULT_API_KEY`` contains ``API_KEY``. ``test_or_key`` contains neither, so
+    it stays a literal and is masked.
+    """
+    stem = key_name.rsplit(".", 1)[-1]
+    flat_value = _NON_ALNUM.sub("", value.lower())
+    flat_stem = _NON_ALNUM.sub("", stem.lower())
+    return bool(flat_value and flat_stem and (flat_value in flat_stem or flat_stem in flat_value))
+
+
+def _quote_of(value: str) -> str:
+    """The quote character wrapping *value*, or ``""`` when it is unquoted."""
+    return value[0] if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'" else ""
+
+
 def mask_api_key(text: "str | None") -> "str | None":
-    """Replace every ``api_key = <literal>`` line in *text* with
-    ``api_key = here_your_key``, leaving an expression on the right-hand side
-    alone (HARDEN-1 A8, see ``_value_is_secret_literal``).
+    """Replace every ``api_key = <literal>`` in *text* with
+    ``api_key = here_your_key``, leaving code on the right-hand side alone
+    (HARDEN-1 A8 / HARDEN-5 B, see ``_value_is_secret_literal``).
+
+    HARDEN-5 B: the secret is found where it sits, not only at the end of a
+    line — a quoted value keeps its quotes, a trailing ``#``/``;`` comment is
+    left alone, and a ``Bearer`` token or a known key prefix is masked anywhere
+    in the text.
 
     This is a plain string transform with no knowledge of *which* key is
     "real" — it masks unconditionally so a secret embedded in file content
@@ -257,14 +334,53 @@ def mask_api_key(text: "str | None") -> "str | None":
     if not text:
         return text
 
-    def _mask_line(m: "re.Match") -> str:
+    def _mask_assignment(m: "re.Match") -> str:
         prefix, key_name, assign, value, suffix = m.groups()
         if not _value_is_secret_literal(value, key_name):
             return m.group(0)
-        return f"{prefix}{key_name}{assign}here_your_key{suffix}"
+        # A quoted value stays quoted: the masked text is what a faithful model
+        # writes back, and an unquoted placeholder is a NameError waiting to
+        # happen (`api_key = "x"` must not come back as `api_key = here_your_key`).
+        quote = _quote_of(value)
+        return f"{prefix}{key_name}{assign}{quote}{_MASK_PLACEHOLDER}{quote}{suffix}"
 
-    text = _API_KEY_LINE_RE.sub(_mask_line, text)
-    return _API_KEY_JSON_RE.sub(r"\1here_your_key\2", text)
+    text = _API_KEY_LINE_RE.sub(_mask_assignment, text)
+    text = _API_KEY_JSON_RE.sub(r"\1" + _MASK_PLACEHOLDER + r"\2", text)
+    text = _BEARER_TOKEN_RE.sub(r"\1" + _MASK_PLACEHOLDER, text)
+    return _SECRET_PREFIX_RE.sub(_MASK_PLACEHOLDER, text)
+
+
+def restore_masked_secrets(original: "str | None", reply: "str | None") -> "str | None":
+    """Put a real secret back where the model gave its masked form back.
+
+    The request carries ``mask_api_key(file)``, so a faithful model returns the
+    line as ``api_key = "here_your_key"`` and a writer that stores the reply
+    replaces the real key on disk with the placeholder (HARDEN-5 B: the file
+    must be byte-identical except the lines the task asked for). A reply line
+    that equals the masked form of an *original* line that the mask changed is
+    that original line again; a line the model edited does not equal it and is
+    kept as written. Two lines that mask to the same text are restored in order.
+    """
+    if not original or not reply:
+        return reply
+    queues: "dict[str, list[str]]" = {}
+    for line in original.splitlines():
+        if "\ufffd" in line:
+            continue
+        masked = mask_api_key(line)
+        if masked != line:
+            queues.setdefault(masked, []).append(line)
+    if not queues:
+        return reply
+    out = []
+    for line in reply.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        queue = queues.get(body)
+        if queue:
+            out.append(queue.pop(0) + line[len(body):])
+        else:
+            out.append(line)
+    return "".join(out)
 
 
 def strip_think(text: "str | None") -> "str | None":

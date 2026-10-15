@@ -1,15 +1,17 @@
 # HARDEN-5 — five wrong answers that cost work or leak: a "NOT …" verdict approved, the secret mask, a failed commit marked DONE, the Coder on a non-UTF-8 file, backticked file names as dependencies
 
-**Status:** open — FINAL, written 2026-10-14 against `1fa8599`. Five defects from outside reviews, each **reproduced by running the code** on that commit (the output is below). Two of them (Parts A and B)
-are gaps left by the landed fixes HARDEN-1 A1 and A8; Part C is a gap in HARDEN-2 B2. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 303: sensenova-6-8-flash-lite-var2 as the base, with the template values of an unset key sent as they are and a masked line the model gives back restored to the real one, so a key never reaches the provider and never leaves the file; black box 303, 67 checks). Before: open — FINAL, written 2026-10-14 against `1fa8599`. Five defects from outside reviews, each reproduced by running the code on that commit. Two of them (Parts A and B) are gaps left by the landed fixes HARDEN-1 A1 and A8; Part C is a gap in HARDEN-2 B2.
 **Severity:** HIGH (A: a chapter the model rejected goes through; B: an API key reaches the provider); the rest MEDIUM
 **File:** `tools/auto/inner_loop.py` (A), `tools/llm_stream.py` (B), `tools/auto/controller.py` and `tools/auto/outer_loop.py` (C), `tools/auto/coder.py` (D), `tools/auto/backlog_prioritiser.py` (E)
 **Symbol:** A: `_parse_verdict_soft`. B: `_API_KEY_LINE_RE`, `_value_is_secret_literal`, `mask_api_key`, `_mask_payload_secrets`. C: `Controller._run_task_loop` (the `git_error` branch), `OuterLoop.run_task` (where a passing task is set `DONE`).
 D: `Coder._read_file_contents`, `Coder._write_files`. E: `BacklogPrioritiser._cross_file_symbol_ref`
-**Round:** —
+**Round:** 303
 **Size:** M
 **Depends on:** HARDEN-1 (298), HARDEN-2 (299), CC-16 (302), all landed
 **Also touches:** `tests/`, `tests_bugfix/` (one file per part)
+
+
+Why not the others: in a black box that drives each tree (67 checks: the verdict parser, the mask on every shape, the real `OuterLoop` over the real commit and git, the Coder on latin-1 / cp1251 / UTF-8 files, the dependency rule; the base passes 28) sensenova-6-8-flash-lite-var2 passes 64, sensenova-6-8-flash-lite-var1 61, sensenova-6-8-flash-lite-var3 61, step-5-preview 60, sensenova-6-8-flash-lite-var4 59 (from its working tree), agnes-2-5-flash 58 of 63, nemotron-3-super-120b-a12b 40, laguna-s-2-1 28, glm-4-7-flash 26 of 62 (working tree), and this commit 67. The cross matrix put var2's own tests at 248 of 248 on its code; every entry left the real key overwritten by the placeholder on disk, which this commit closes. Tested three times: 8662 passed, 2 skipped, and 4267 passed, each time.
 
 ---
 

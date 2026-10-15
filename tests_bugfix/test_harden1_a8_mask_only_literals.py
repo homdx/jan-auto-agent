@@ -9,11 +9,12 @@ gives the placeholder back, the file is written, and working code becomes a
 ``NameError`` nothing catches: a faithful edit asked to change one line changed
 three.
 
-Only a *literal* is masked now — a quoted string, or a bare token with no
-whitespace and no call/index/attribute/punctuation characters that is not the
-key's own name. An expression on the right-hand side is sent as it is, which
-still keeps the real secret out of the request: a literal key is the literal
-case.
+Only a *literal* is masked now — a quoted string (its quotes are kept,
+HARDEN-5 B: an unquoted placeholder is a ``NameError`` waiting to happen), or a
+bare token with no whitespace and no call/index/attribute/punctuation characters
+that does not name the key it is assigned to. An expression on the right-hand
+side is sent as it is, which still keeps the real secret out of the request: a
+literal key is the literal case.
 """
 
 from __future__ import annotations
@@ -122,7 +123,10 @@ class TestAMixedFileKeepsItsShape:
         assert out[2] == "        self.api_key = api_key"          # sent verbatim
         assert out[3] == "        self._timeout = 30"
         assert out[4] == '        self.fallback = "sk-real-1"'     # a different name
-        assert out[5] == '        self.api_key = here_your_key'   # a literal key
+        # HARDEN-5 B: a masked quoted value keeps its quotes. Stripping them
+        # sent `self.api_key = here_your_key` to a faithful model, which wrote
+        # the placeholder back and turned the file into a NameError.
+        assert out[5] == '        self.api_key = "here_your_key"'   # a literal key
         assert out[6] == '        self.other = os.environ["OPENAI_API_KEY"]'
 
 
@@ -226,5 +230,7 @@ class TestAFaithfulEditRoundTrip:
         assert "sk-live-real-key" not in sent          # the literal key never reaches the model
         assert "here_your_key" in sent
         assert "self.api_key = api_key" in sent        # the pass-through line does
-        # only the masked key line and the instructed line differ on disk
-        assert changed == [3, 4], f"lines changed: {changed}: {after!r}"
+        # only the instructed line differs on disk: the key line the model gave back
+        # masked is the real line again (HARDEN-5 B), not the placeholder
+        assert changed == [4], f"lines changed: {changed}: {after!r}"
+        assert "sk-live-real-key" in after

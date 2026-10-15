@@ -39,6 +39,32 @@ def _pid_state(pid: int) -> str | None:
         return None
 
 
+def _assert_gone(pid: int, label: str, timeout: float = 5.0) -> None:
+    """Fail unless *pid* is dead **and reaped** within *timeout*.
+
+    ``SIGKILL`` is synchronous but the corpse is not gone at the same instant: the
+    kernel still has to finish delivering it and the (already killed) shell still
+    has to be reaped before ``/proc/<pid>`` disappears. Reading the state once, at
+    the moment the raise propagates out of ``_execute``, comes back ``R`` (a few
+    microseconds before the signal landed) or ``Z`` on a loaded box and fails the
+    run although the group really is dead — that is how this file went red while
+    ``_kill_process_group`` worked. Poll instead.
+
+    The regression these assertions guard against is a member that outlives the
+    kill at all: killing the shell alone leaves a ``sleep 60`` in state ``R`` for
+    its whole 60 seconds, long past *timeout*. A poll therefore fails every
+    regression a single read would, minus the ones that never happened.
+    """
+    deadline = time.monotonic() + timeout
+    last = _pid_state(pid)
+    while last is not None and time.monotonic() < deadline:
+        time.sleep(0.02)
+        last = _pid_state(pid)
+    assert last is None, (
+        f"{label} outlived the kill: ({pid}) is still {last!r} after {timeout:.0f}s"
+    )
+
+
 def _wait_for(path: Path, timeout: float = 10.0) -> str:
     """Block until `path` holds a pid, and return it. The child is the one that
     writes it, so a non-empty file means it is up."""
@@ -61,15 +87,24 @@ def executor(tmp_path: Path) -> Executor:
     return Executor(base_dir=tmp_path, timeout_sec=0)
 
 
-def _run_until_interrupt(executor: Executor, command: str, cwd: Path, pidfile: str = "pid.pid"):
+def _run_until_interrupt(executor: Executor, command: str, cwd: Path,
+                         pidfiles: tuple[str, ...] = ("pid.pid",)):
     """Run `_execute(command)` in a thread whose `communicate` raises KeyboardInterrupt
-    once the child is up — what Ctrl-C does to the agent process while the command
-    runs. Returns `(exception, [pids written by the command])`."""
-    pid_path = cwd / pidfile
+    once the command is *fully set up* — every pid file it promises has a pid in it —
+    which is what Ctrl-C does to the agent process while the command runs. Returns
+    `(exception, [pids written by the command])`.
+
+    Waiting for all of ``pidfiles``, not only the first, is what makes the kill land
+    after every grandchild exists: `pid.pid` is written before the shell forks the
+    children, so interrupting on it alone kills the shell mid-setup and leaves the
+    later pid files unwritten, which the assertion below reads as "the command never
+    started" instead of judging the group.
+    """
     real_communicate = subprocess.Popen.communicate
 
     def _interrupting_communicate(self, *args, **kwargs):
-        _wait_for(pid_path)
+        for name in pidfiles:
+            _wait_for(cwd / name)
         raise KeyboardInterrupt
 
     box: list = []
@@ -109,7 +144,7 @@ def test_keyboard_interrupt_kills_the_commands_whole_group(executor, tmp_path):
     assert isinstance(exception, KeyboardInterrupt), f"expected the interrupt to propagate, got {exception!r}"
     assert pids, "the command never wrote its pid"
     # `exec sleep` keeps the shell's pid, so the file names the very process that must be gone.
-    assert _pid_state(pids["pid"]) is None, "the command outlived the interruption"
+    _assert_gone(pids["pid"], "the command")
 
 
 def test_keyboard_interrupt_kills_grandchildren_too(executor, tmp_path):
@@ -122,11 +157,14 @@ def test_keyboard_interrupt_kills_grandchildren_too(executor, tmp_path):
         "sleep 60 & echo $! > child2.pid; "
         "wait"
     )
-    exception, pids = _run_until_interrupt(executor, command, tmp_path)
+    exception, pids = _run_until_interrupt(
+        executor, command, tmp_path,
+        pidfiles=("pid.pid", "child1.pid", "child2.pid"),
+    )
     assert isinstance(exception, KeyboardInterrupt)
     assert set(pids) == {"pid", "child1", "child2"}, pids
     for name, pid in pids.items():
-        assert _pid_state(pid) is None, f"{name} ({pid}) outlived the interruption"
+        _assert_gone(pid, name)
 
 
 def test_other_exceptions_from_communicate_kill_the_group_too(executor, tmp_path):
@@ -159,7 +197,7 @@ def test_other_exceptions_from_communicate_kill_the_group_too(executor, tmp_path
         subprocess.Popen.communicate = real_communicate
     assert not thread.is_alive()
     assert isinstance(box[0], Boom)
-    assert _pid_state(int(pid_path.read_text(encoding="utf-8").strip())) is None
+    _assert_gone(int(pid_path.read_text(encoding="utf-8").strip()), "the command")
 
 
 # ── the paths that must not change ─────────────────────────────────────────────
@@ -182,4 +220,4 @@ def test_a_command_that_times_out_is_untouched(executor, tmp_path):
     assert result.exit_code == -1
     assert "partial" in result.stdout
     pid = int(pid_path.read_text(encoding="utf-8").strip())
-    assert _pid_state(pid) is None, "the timed-out command outlived its timeout"
+    _assert_gone(pid, "the timed-out command")
