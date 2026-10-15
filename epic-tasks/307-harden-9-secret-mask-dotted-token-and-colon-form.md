@@ -86,6 +86,7 @@ The model copies the garbage back, and a revision that adds a genuine Western le
 ### What it does
 
 * The first candidate is the codec whose decoded letters look like the file's script: for each candidate that round-trips, count the letters it gives (Cyrillic against Latin with accents) and prefer the one that gives text of one script; a file whose high bytes decode to Latin letters in `cp1252` and to a mix of Cyrillic and Latin in no codec is read as `cp1252`. A real Russian `cp1251` file is read as `cp1251` as now, and `latin-1` stays last.
+* A `# -*- coding: latin-1 -*-` (or `# coding=cp1252`) line in the first two lines of a source file names the codec, and it wins. When the Coder refuses a write because no codec holds the reply, the message names the characters that are the problem, not "some characters".
 * A UTF-8 file still returns exactly `("utf-8",)`. The one decision stays in `_edit_write_encodings`, so `/edit` and the Coder cannot disagree.
 
 ### Tests (sketch)
