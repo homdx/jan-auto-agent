@@ -695,9 +695,32 @@ def _head_prefix_kind(prefix: str) -> str:
         return "call"
     if stripped.endswith(".") and not stripped.endswith("::"):
         return "call"
+    if stripped.endswith("->"):
+        # A member access through a pointer (`x->label(`, `$this->label(`) is a call's position.
+        return "call"
     if any(w not in _HEAD_MODIFIER_WORDS for w in words):
         return "declaration"
     return "modifiers"
+
+
+#: A trailing scope qualification (`Engine::`, `std::chrono::`, `Self::`) with nothing in front of it.
+_QUALIFICATION_ONLY = re.compile(r"^(?:[A-Za-z_$][\w$]*(?:<[^<>]*>)?::)+$")
+
+
+def _declaration_prefix_is_call(prefix: str) -> bool:
+    """True when *prefix* puts a body-less head in an expression rather than a declaration.
+
+    A declaration with no body stands as a statement of its own, so a logical operator (`ready &&
+    f(1);`), a label or an object key (`timeout: f(5),`) or a bare scope qualification (`Engine::f(1);`,
+    `Self::f(1);`) in front of the name is the call's position — the declaration of `f` lives
+    elsewhere, in a header or in another module.
+    """
+    stripped = prefix.strip()
+    if "&&" in stripped or "||" in stripped:
+        return True
+    if stripped.endswith(":") and not stripped.endswith("::"):
+        return True
+    return bool(_QUALIFICATION_ONLY.match(stripped))
 
 
 def _head_is_call(source: str, match: "re.Match[str]", target_name: str) -> bool:
@@ -712,6 +735,10 @@ def _head_is_call(source: str, match: "re.Match[str]", target_name: str) -> bool
     head = source[line_start:match.end()]
     pos = _head_name_position(head, target_name)
     if pos is None:
+        return False
+    if re.search(r"(?:^|[^\w$])function[ \t]*\*?[ \t]*$", head[:pos]):
+        # `return function logger(req, res, next) {` — a named function expression is the name's
+        # definition, whatever stands before the `function`.
         return False
     after_name = head[pos + len(target_name):]
     follower = after_name.lstrip(" \t")
@@ -1090,6 +1117,32 @@ def _declaration_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     ]
 
 
+#: Words that may follow a body-less declaration's parameter list on the next line.
+_DECLARATION_TAIL_WORDS = frozenset((
+    "const", "noexcept", "override", "final", "throws", "throw", "volatile", "where", "requires",
+    "asm", "__asm__", "__attribute__",
+))
+
+
+def _declaration_tail_ok(source: str, i: int) -> bool:
+    """Whether what follows a parameter list ending at *i* can continue a declaration: its `;`, a
+    return type (`:`, `->`) or a qualifier word (`const`, `throws`, a macro attribute on the same
+    line). A `,`, a `)`, an operator or a member access means the parameter list was a call's
+    argument list (`closePath(),`, `streq(a, b) ||`, `f(x) + 1`)."""
+    n = len(source)
+    while i < n and source[i] in " \t\r":
+        i += 1
+    crossed = i < n and source[i] == "\n"
+    while i < n and source[i] in " \t\r\n":
+        i += 1
+    if i >= n:
+        return False
+    if source[i] in ";:" or source.startswith("->", i) or source.startswith(("//", "/*"), i):
+        return True
+    word = re.match(r"[A-Za-z_][\w]*", source[i:])
+    return bool(word) and (not crossed or word.group(0) in _DECLARATION_TAIL_WORDS)
+
+
 def _find_definition_end_declaration(source: str, scan_from: int, has_arg_list: bool,
                                      lang: str = "") -> Optional[tuple[int, bool]]:
     """The end of a declaration that has no body (HARDEN-6 B) as `(index_past_the_semicolon,
@@ -1107,6 +1160,8 @@ def _find_definition_end_declaration(source: str, scan_from: int, has_arg_list: 
         if close_paren >= n:
             return None
         i = close_paren
+        if not _declaration_tail_ok(source, i):
+            return None
 
     state = "code"
     escape = False
@@ -1210,7 +1265,7 @@ def _find_earliest_declaration(source: str, target_name: str, lang: str = "") ->
             pos = _head_name_position(head, target_name)
             if pos is None:
                 continue
-            kind = _head_prefix_kind(head[:pos])
+            kind = "call" if _declaration_prefix_is_call(head[:pos]) else _head_prefix_kind(head[:pos])
             if kind == "call" or (kind != "declaration" and not has_return_type):
                 continue
 
