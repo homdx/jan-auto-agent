@@ -436,12 +436,17 @@ def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
             raise ValueError(f"recorded base side not re-used: {diff}")
         recorded = base_side["results"]
         recorded_keys = [tuple(k) for k in ((base_side.get("identity") or {}).get("claims") or [])]
-        # this side's position -> the record's position, for the claims the record holds
-        slot = {j: recorded_keys.index(_claim_key(claims[i]))
+        # The record's position -> this side's position, for the claims the record holds
+        # (HARDEN-8 A). `_rekey_votes` maps old position -> new, and a recorded row's key is the
+        # position of its claim in the item list the record's voter was shown, so the mapping has
+        # to run from the record's side, not this side's. The two directions agree only while the
+        # claims sit in the same order as in the record, which is the one case the earlier tests
+        # put under test — reordered, a reused side handed each claim another claim's verdict.
+        slot = {recorded_keys.index(_claim_key(claims[i])): j
                 for j, i in enumerate(idx_b) if _claim_key(claims[i]) in recorded_keys}
         # A claim the record does not hold is voted here: its base verdict did not exist
         # yet, and refusing the whole side over it took down every entry after the first.
-        fresh = [j for j in range(len(idx_b)) if j not in slot]
+        fresh = [j for j in range(len(idx_b)) if j not in slot.values()]
         fresh_items = [items_b[j] for j in fresh]
         # Every claim of this run the record holds stays in the record: a claim that is a
         # world claim for *this* entry was voted at the base by an entry it anchored in,
@@ -487,9 +492,15 @@ def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
     if base_side is None:
         voted_b = results_b
     else:
+        # The fresh half is keyed by the positions of the item list it was shown, so a position
+        # p there is the claim `idx_b[fresh[p]]`; `base_index` holds claim indices, so the two
+        # spaces are joined through `idx_b` and never by a position used as an index (HARDEN-8 B).
+        # Used raw, a side whose code claims were a subset of the round's raised
+        # `ValueError: <position> is not in list` after the head and the fresh claim had been
+        # voted and paid for, and `claims_phase` reported it as a refusal of that entry.
         voted_b = _merge_vote_rows(
             [_rekey_votes(r, record_slots) for r in recorded], fresh_out["rows"],
-            {p: base_index.index(fresh[p]) for p in range(len(fresh))})
+            {p: base_index.index(idx_b[fresh[p]]) for p in range(len(fresh))})
     return {"deltas": deltas, "accept": accept,
             "base": {"rows": rows_b, "results": results_b, "voted": voted_b,
                      "table": table_b, "index": base_index},

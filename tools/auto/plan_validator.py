@@ -365,7 +365,13 @@ def validate_plan(
 # IMPROVEMENTS.md: removing a false positive's section
 
 # A whole task entry, from its heading to its separator, so it can be removed as one block (FIX-2 #8).
-_NEXT_ENTRY = r"(?:### (?=[\w.\-]*[\d._\-])[\w.\-]+: |## Manual Suggestions)"   # "task_b" is an id too
+# HARDEN-8 F: the id is every word character, hyphen and dot, so an id of letters alone (`alpha`,
+# `FIX`) is a boundary like `AUTO-T1`. It used to be accepted only when it held a digit, which made
+# the letters-only entries run on into each other: removing the first of three took the other two
+# with it. Where a heading *stands* is what decides it is a next entry, not what it is called —
+# `_NEXT_ENTRY` is only ever read after a separator (or at `## Manual Suggestions`), so a
+# `### Note: …` line inside an entry's own text still does not end it.
+_NEXT_ENTRY = r"(?:### [\w.\-]+: |## Manual Suggestions)"
 _FENCE_BLOCK = (
     r"(?m:^ {0,3})(?P<fence>`{3,}|~{3,})[^\n]*\n"   # opening fence line
     r"(?:(?!\n-{3,}\n+" + _NEXT_ENTRY + r")[\s\S])*?"  # block body, verbatim, within its entry

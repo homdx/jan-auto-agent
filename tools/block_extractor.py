@@ -549,7 +549,12 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     name = re.escape(target_name)
     # Generic type parameters between the name and the parenthesis are allowed, so many languages' signatures are found.
     tp = r"(?:\s*<[^(){};]*>|\s*\[[^(){};]*\])?"
-    word = r"[A-Za-z_$][\w$.]*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?(?:\[\s*\])*"
+    # A word of a return type, with its scope qualification and its template arguments
+    # (HARDEN-8 D): `std::string`, `std::vector<int>`, `Widget::Ptr`, `unsigned long int`.
+    # The qualification is what a C++ out-of-line method returns, and the type then stands
+    # on its own line above the name just as often as on the same line.
+    word = (r"[A-Za-z_$][\w$.]*(?:::[A-Za-z_$][\w$.]*)*"
+            r"(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?(?:\[\s*\])*")
     return [
         # function foo(...) {   function* gen() {   function identity<T>(a: T): T {
         re.compile(rf"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*{name}{tp}\s*\("),
@@ -568,8 +573,12 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
             rf"native|default|transient|volatile|strictfp|export|async|inline|"
             rf"virtual|const|extern|unsafe|suspend|open|override|fun|fn|pub)\s+)*"
             rf"(?:<[^(){{}};]*>\s+)?"
-            # The words of the return type are matched within a line, so a newline does not join them.
-            rf"(?:{word}(?:[ \t]*[*&]+[ \t]*|[ \t]+)){{0,3}}{word}(?:\s*[*&]+\s*|\s+)"
+            # The words of the return type are matched within a line, so a newline does not join them
+            # — but a qualified type (`std::string Widget::label()`) or a template argument list
+            # (`std::vector<int> Widget::items()`) needs the `::` and the `<…>` inside one word,
+            # and a type written on the line above (`std::string` / `Widget::label()`) needs the
+            # newline as its separator (HARDEN-8 D).
+            rf"(?:{word}(?:[ \t]*[*&]+[ \t]*|[ \t]+|\n)){{0,3}}{word}(?:\s*[*&]+\s*|\s+)"
             rf"(?:[\w$]+::)*{name}{tp}\s*\("
         ),
         # class X { foo(...) { ... } }

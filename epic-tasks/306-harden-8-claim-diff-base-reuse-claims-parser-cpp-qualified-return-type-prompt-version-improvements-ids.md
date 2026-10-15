@@ -1,14 +1,15 @@
 # HARDEN-8 — `claim_diff` reuses the base side against the wrong claims and crashes after the votes are paid, a claims list is skipped without a word, a C++ method returning `std::string` is "not found", a prompt entry without a version, and an IMPROVEMENTS.md entry with a letters-only id takes the others with it
 
-**Status:** open — FINAL, written 2026-10-15 against `6ddbe7c`. Six defects from outside reviews, each **reproduced by running the code** on that commit (the output is below). Parts A and B are gaps left by CC-16 Part E; Part C is a gap in the claims
-parser CC-16 and HARDEN-1 left; Part D is beside HARDEN-4 and HARDEN-6. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 306: step-5-preview as the base — the base side is re-keyed from the record's side to this side and joined through `idx_b` (A, B), a numbered claims list is read and a fenced `## Claims` is not a section in both parsers, `judge_epic_round` and `tools/contest/export.py` (C), a qualified C++ return type is found (D), `get_version_label` answers instead of raising (E), a letters-only IMPROVEMENTS id is a boundary (F)). The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** HIGH (A: the judging gives a claim another claim's base verdict); MEDIUM (B, D); LOW (C, E, F)
 **File:** `scripts/claim_diff.py` (A, B), `scripts/judge_epic_round.py` (C), `tools/block_extractor.py` (D), `tools/prompt_store.py` (E), `tools/auto/plan_validator.py` (F)
 **Symbol:** A/B: `judge_both` (`slot`, `fresh`, `base_index`, `voted_b`), `_rekey_votes`, `_record_slots`. C: `ticket_claims`, `_claims_section`, `_LIST_ITEM`. D: `extract_block` and the candidate patterns that read a definition head. E: `PromptStore.get_version_label`. F: `_NEXT_ENTRY`, `_task_section_pattern`, `_remove_from_improvements_md`
-**Round:** —
+**Round:** 306
 **Size:** M
 **Depends on:** CC-16 (302), HARDEN-4 (301), HARDEN-6 (304), all landed
-**Also touches:** `tests/`, `tests_bugfix/`
+**Also touches:** `tests/`, `tests_bugfix/`, `tools/contest/export.py` (the second reader of `## Claims`)
+
+Why not the others: in a black box that drives each tree (56 checks: a reused base side in the same, a reversed, a subset and a superset order, a multi-entry round, numbered and fenced claims lists, the C++ return types, a version-less record, letters-only ids), step-5-preview and sensenova-var3, -var2 and laguna passed all 56, var4 and agnes 55, nemotron 34. The cross matrix of their own tests put step-5-preview first (its code passed 82/82 of its own and the most of the others'); it alone kept `tools/contest/export.py` in step with the fence rule, so the summary and the judge read one section. Added to it: `get_version_label` answers `hardcoded` for an entry that is not a mapping or a stack that is not a list (sensenova-var3 and -var4 tests). Left alone: a call statement `std::cout << Widget::label();` is taken for a definition by the base and by every entry (not a regression of this round).
 
 ---
 

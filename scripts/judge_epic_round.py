@@ -923,12 +923,41 @@ _CLAIMS_HEADING = re.compile(r"^##\s+Claims(?:\s+.*)?$", re.I)
 #: The heading that ends any section body.
 _H2 = re.compile(r"^##\s+")
 
-#: `- [new] text` — the bracketed word is the claim's `expect`, the rest is the claim itself.
-#: The token is taken as written, so a mangled one like `- [ne]w` reports `[ne]w`, not `ne`.
-_CLAIM_BULLET = re.compile(r"^\s*[-*+]\s+(\S+)\s+(.*)$")
+#: `- [new] text` and `1. [new] text` — the bracketed word is the claim's `expect`, the rest is the
+#: claim itself. The token is taken as written, so a mangled one like `- [ne]w` reports `[ne]w`,
+#: not `ne`. A numbered item is a claim bullet too (HARDEN-8 C): it was neither here nor a
+#: `_LIST_ITEM`, so a numbered claims list gave no claims and no refusal.
+_CLAIM_BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(\S+)\s+(.*)$")
 
-#: A list item at all: a claim bullet that names no word is a refusal, not a silent skip.
-_LIST_ITEM = re.compile(r"^\s*[-*+]\s+")
+#: A list item at all (HARDEN-8 C): a dash, star or plus bullet *or* a numbered one, `1.` / `1)`.
+#: A claim bullet that names no word is a refusal, not a silent skip — the numbered form used to
+#: fall in neither branch, so `## Claims` holding `1. [new] a` gave no claims and no refusal.
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+#: A code fence's opening or closing line: ``` or ~~~ with up to three leading spaces.
+_FENCE_MARKER = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+class _FenceTracker:
+    """A fenced block's open/closed state, so a heading or a claim written inside a code block
+    is not read as one (HARDEN-8 C). The closer must be the same character and at least as long
+    as the opener, so a ``` inside a ```` block is body, not a closer."""
+
+    def __init__(self) -> None:
+        self._fence = ""
+
+    def feed(self, line: str) -> bool:
+        """One line: True when it is inside a fenced block afterwards."""
+        marker = _FENCE_MARKER.match(line)
+        if not self._fence:
+            if marker:
+                self._fence = marker.group(1)
+            return False
+        if marker and marker.group(1)[0] == self._fence[0] and len(marker.group(1)) >= len(self._fence) \
+                and not line.strip()[len(marker.group(1)):]:
+            self._fence = ""
+        return True
 
 
 def _claims_section(text):
@@ -936,17 +965,28 @@ def _claims_section(text):
 
     The section is optional and may be the ticket's last, so the body runs to the next `## `
     heading or to the end of the file. Line numbers start at 1, the way an editor numbers them:
-    a refusal names the line, not a position in a list."""
+    a refusal names the line, not a position in a list.
+
+    HARDEN-8 C: a fenced block is not read here at all. A `## Claims` written inside a code
+    block — a ticket that documents the section, or a prompt that quotes one — was a section,
+    and its lines were then parsed as claims.
+    """
     lines = (text or "").split("\n")
     start = None
+    fences = _FenceTracker()
     for i, line in enumerate(lines):
+        if fences.feed(line):
+            continue
         if _CLAIMS_HEADING.match(line):
             start = i + 1
             break
     if start is None:
         return []
     body = []
+    fences = _FenceTracker()
     for i in range(start, len(lines)):
+        if fences.feed(lines[i]):
+            continue
         if _H2.match(lines[i]):
             break
         body.append((i + 1, lines[i]))
@@ -960,8 +1000,10 @@ def ticket_claims(text, name=""):
     ticket adds, `fixed` states the defect (true at the base, false after the fix), `still` what
     must not change and `gone` what must not be there. Any other word is a refusal naming the line
     — a typo would otherwise leave claims that can never be met, and an `expect` that never matches
-    is the gate that looks like it checked. A bullet whose first word carries no brackets is refused
-    too: the section is a claims list, not prose. An indented line after a bullet is its
+    is the gate that looks like it checked. A list item whose first word carries no brackets is
+    refused too: the section is a claims list, not prose — a dash, star or plus bullet and a
+    numbered one alike (HARDEN-8 C: `1. [new] a` used to fall in neither branch, so a numbered
+    claims list gave no claims and no refusal). An indented line after a bullet is its
     continuation, so a long claim may wrap without becoming a second claim.
     """
     where = name or "ticket"

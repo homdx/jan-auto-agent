@@ -70,6 +70,33 @@ TASKS_DIR = "epic-tasks"
 #: parenthetical is still the section, so the match stops at the word.
 _CLAIMS_HEADING = re.compile(r"^##\s+Claims(?:\s+.*)?$", re.I)
 
+#: A code fence's opening or closing line, ``` or ~~~ with up to three leading spaces.
+_FENCE_MARKER = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def _has_claims_heading(text: str) -> bool:
+    """Whether *text* carries a `## Claims` heading outside a fenced block (HARDEN-8 C).
+
+    The heading is looked for the way `judge_epic_round.ticket_claims` reads the section, so the
+    two parsers agree: a `## Claims` written inside a code block — a ticket that documents the
+    section, or a prompt that quotes one — is not the section, and a summary never adds a
+    `--claims` line for it.
+    """
+    fence = ""
+    for line in text.split("\n"):
+        marker = _FENCE_MARKER.match(line)
+        if fence:
+            if marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence) \
+                    and not line.strip()[len(marker.group(1)):]:
+                fence = ""
+            continue
+        if marker:
+            fence = marker.group(1)
+            continue
+        if _CLAIMS_HEADING.match(line):
+            return True
+    return False
+
 
 def ticket_has_claims(out_dir, ticket, repo=None):
     """Whether the round's ticket carries a `## Claims` section — `False` when it has none.
@@ -87,9 +114,8 @@ def ticket_has_claims(out_dir, ticket, repo=None):
     for path in (root / TASKS_DIR / ticket, out.parent / TASKS_DIR / ticket,
                  out / ticket, out.parent / ticket):
         try:
-            for line in path.read_text(encoding="utf-8").split("\n"):
-                if _CLAIMS_HEADING.match(line):
-                    return True
+            if _has_claims_heading(path.read_text(encoding="utf-8")):
+                return True
         except OSError:
             continue
     return False

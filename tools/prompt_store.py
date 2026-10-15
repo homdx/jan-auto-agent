@@ -151,15 +151,28 @@ class PromptStore:
 
         Returns ``'v{n}'`` when a versioned prompt is active, or
         ``'hardcoded'`` when the stack is empty / agent is unknown.
+
+        HARDEN-8 E: the top of the stack is read with ``.get("version")``, the
+        way ``get_store_summary`` reads it, so a hand-edited or older-format
+        ``prompts.json`` whose top record has no ``version`` no longer raises
+        ``KeyError``: the label of the last record that still carries one is
+        answered, and ``hardcoded`` when no record does.
         """
         data = self._load()
         entry = data.get(agent_name)
-        if not entry or not entry.get("stack"):
+        # An entry that is not a mapping, or a stack that is not a list, is as unusable as an
+        # absent one: the label is answered, never raised (a hand-edited prompts.json).
+        stack = entry.get("stack") if isinstance(entry, dict) else None
+        if not stack or not isinstance(stack, list):
             return "hardcoded"
         # Falls back to the top of the stack when current_version is missing (bugfix).
-        stack = entry["stack"]
-        current_version = entry.get("current_version", stack[-1]["version"])
-        return f"v{current_version}"
+        current_version = entry.get("current_version")
+        if current_version is not None:
+            return f"v{current_version}"
+        for item in reversed(stack):
+            if isinstance(item, dict) and item.get("version") is not None:
+                return _version_label(item)
+        return "hardcoded"
 
     def push(self, agent_name: str, new_prompt: str, score: float) -> None:
         """
