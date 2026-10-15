@@ -746,8 +746,7 @@ class Executor:
         _logged_command = _redact_command(command)
 
         try:
-            # a session of its own: on a timeout the whole group is killed, not the shell alone (pytest and
-            # its xdist workers lived on)
+            # Own session, so a timeout kills the whole group (pytest's xdist workers too), not the shell alone.
             proc = subprocess.Popen(
                 command,
                 shell=True,

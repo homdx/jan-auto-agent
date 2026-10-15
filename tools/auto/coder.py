@@ -2009,8 +2009,7 @@ class Coder(_llm_stream.LLMClientBase):
                 try:
                     if dest.exists():
                         backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                        # bytes and mode: read as utf-8 with errors=replace, a latin-1 \xe9 came back
-                        # as U+FFFD, and a BOM + CRLF file as BOM + LF — no backup of the original
+                        # Backups keep the original bytes and mode, so no encoding or BOM is changed.
                         backup.unlink(missing_ok=True)    # copy2 keeps a read-only mode: it could not overwrite
                         shutil.copy2(dest, backup)
                         dest.unlink()

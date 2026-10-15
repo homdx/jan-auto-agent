@@ -852,28 +852,14 @@ def strip_json_fence(text: str) -> str:
         # A lone opening fence is not a block; a closing fence is required first (AUTO-FIX).
         if "```" in rest:
             return _before_closing_fence(rest)
-        # BUGFIX (audit): an unclosed fence used to fall back to returning
-        # the ORIGINAL `text` — opening marker and all — instead of `rest`
-        # (the content actually inside the fence). That's harmless when the
-        # JSON body is itself incomplete (json.loads fails either way), but
-        # when the model's JSON is complete and only the closing ``` was
-        # never emitted (truncation, or the model just omitted it), leaving
-        # the leading "```json" attached broke every caller's json.loads on
-        # otherwise-valid content. `rest` already excludes everything
-        # BEFORE the opening marker — the exact thing the AUTO-FIX above
-        # guards against discarding — so returning `rest.strip()` here
-        # loses nothing that returning `text` didn't equally risk losing,
-        # while giving complete-but-unclosed JSON a real chance to parse.
+        # An unclosed fence returns the content after the marker, so complete JSON still parses (BUGFIX).
         return rest.strip()
     if "```" in text:
         # Any fence label is removed, not just json, so the body parses as JSON (BUGFIX).
         rest = text[_FENCE_LABEL_RE.search(text).end():]
         if "```" in rest:
             return _before_closing_fence(rest)
-        # Only a single, unmatched "```" — not a real fence pair. Same
-        # reasoning as the ```json branch above: return what follows the
-        # marker (not the untouched original) so a complete JSON body with
-        # just a missing closing fence still parses.
+        # A single unmatched fence returns what follows it, for the same reason (BUGFIX).
         return rest.strip()
     return text
 

@@ -401,15 +401,8 @@ class BacklogPrioritiser:
         name = re.escape(symbol_a)
         if _looks_like_code(symbol_a):
             return bool(re.search(rf"\b{name}\b", task_b.instruction))
-        # A name that is also an English word (`run`, `parse`, `Store`) counts only where B writes it as
-        # code: "the loop will run only when enabled" made B depend on A, and the controller holds a task
-        # whose dependency is not done — one failed task blocked an unrelated one
-        # a call has no space before its parenthesis ("run (when enabled)" is prose), and "run.log" is a file
-        # HARDEN-5 E: the file-name exclusion must apply inside a backticked span too. File names are
-        # normally written in backticks, so a span that merely contained the word made an unrelated task
-        # a dependent: `main.py`, `run.log`, `scripts/run.sh`, `parse.json`, `config.ini` all did, and
-        # one of them failing blocked the other. The span counts only when the symbol in it is not part
-        # of a file name — i.e. not followed by .ext — so `main`, `run()`, `Store.load` still do.
+        # A name that is also an English word counts only where it is written as code (`run`, `Store`), not in prose.
+        # A backticked file name (`main.py`, `run.log`) is not a symbol: the span counts only where the name is not followed by .ext.
         ext = _FILE_EXT_RE
         return bool(re.search(
             rf"`[^`\n]*\b{name}(?!\.{ext})\b[^`\n]*`|\b{name}\(|\.{name}\b|\b{name}\.(?!{ext})\w",
@@ -417,9 +410,7 @@ class BacklogPrioritiser:
         ))
 
 
-# HARDEN-5 E: the file extensions that make `name.ext` a file name rather than a
-# symbol — used both outside and inside a backticked span, so one place answers
-# "is this a file name". Kept a bare group so it can be used as a lookahead.
+# The file extensions that make `name.ext` a file name rather than a symbol, inside and outside a backticked span.
 _FILE_EXT_RE = r"(?:log|txt|md|rst|py|json|csv|ini|cfg|toml|ya?ml|sh|out|err|tmp|lock)\b"
 
 

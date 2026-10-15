@@ -314,10 +314,7 @@ class PromptStore:
                 except OSError:
                     pass
             logger.error(f"PromptStore failed to write {self.store_path}: {e}")
-            # 5. Re-raise so callers (push/rollback) know the save did not
-            # happen, instead of silently returning as if it succeeded —
-            # without this, the caller believes the new state is durable
-            # while the store still holds the stale/previous data on disk.
+            # Re-raise a failed save, so the caller does not think the new state is durable (BUGFIX).
             raise RuntimeError(f"PromptStore failed to write {self.store_path}") from e
         except BaseException:
             # Ctrl-C mid-write: the temp file is not left behind either

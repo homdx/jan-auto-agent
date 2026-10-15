@@ -206,8 +206,7 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
             except FileExistsError:
                 raise
             except OSError:
-                # no hard links here: O_EXCL is the atomic "fail if it exists" (a check, then a replace, let two
-                # writers both win)
+                # No hard links: O_EXCL is the atomic "fail if it exists" (check-then-replace would let two writers win).
                 import shutil
                 out = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, os.stat(tmp_name).st_mode & 0o7777)
                 with os.fdopen(out, "wb") as dst, open(tmp_name, "rb") as src:
