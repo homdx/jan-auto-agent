@@ -203,11 +203,31 @@ _API_KEY_LINE_RE = re.compile(
 )
 # the same key in JSON: "api_key": "<value>", "openai_api_key": "<value>"
 _API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]*(")')
+# The same key in YAML/INI colon form, UNQUOTED: `api_key: <value>`, indented or
+# bullet-led (`  - api_key: <value>`), commented or not. `_API_KEY_LINE_RE` wants an
+# `=` and `_API_KEY_JSON_RE` wants a quoted value, so this is the one shape neither
+# reaches (HARDEN-9 B): a hex key, a UUID, a base64 string, an AWS key or a GitHub
+# token after a colon all left the machine. The value stops at a space, a `#`, a YAML
+# flow separator or a closing bracket, and never at a `=` — so `api_key: Optional[str]
+# = None` yields the annotation, not the tail.
+_API_KEY_COLON_RE = re.compile(
+    r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:[-*][ \t]+)?)([\w.-]*api[_-]?key)([ \t]*:[ \t]*)'
+    r"(\"[^\"]*\"|'[^']*'|[^#\s;\"'\,\}\]\)\|=&]+)"
+)
 # A bare Python/JS identifier: a NAME, i.e. a reference to something, never a literal secret.
 _BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Characters that make a value an expression rather than a literal token: a call, an
 # index, an attribute, a container or punctuation (`os.environ["X"]`, `config.api_key`).
+# `.` is the one that needs a second look, since a dotted value is either an attribute
+# path or a token — `_dotted_value_is_secret` settles it before this list is walked
+# (HARDEN-9 A: a pasted JWT used to lose the line here).
 _EXPRESSION_CHARS = "([{)]},;'\"."
+#: The shortest value that may be a credential in its own right: a shorter bare name is a
+#: variable or a type in either form, and a shorter dotted value is a path, not a token.
+_TOKEN_MIN_LEN = 16
+#: A dotted part that reads as a run of base64url: long, and mixed-case or digit-bearing,
+#: so it is not a plain word (`settings`, `OPENAI_KEY`).
+_BASE64URL_RUN_RE = re.compile(r"^[A-Za-z0-9_\-]{8,}$")
 # A bare number: also code (`api_key = 30` is not a secret).
 _NUMERIC_VALUE_RE = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)$")
 # Names that are never secrets (HARDEN-5 B: `self.api_key = None` was sent out as
@@ -234,8 +254,9 @@ _SECRET_PREFIX_RE = re.compile(
 _MASK_PLACEHOLDER = "here_your_key"
 
 
-def _value_is_secret_literal(value: str, key_name: str) -> bool:
-    """Whether the *value* of an ``api_key = …`` assignment is a literal that
+def _value_is_secret_literal(value: str, key_name: str, colon: bool = False) -> bool:
+    """Whether the *value* of an ``api_key = …`` (or, with *colon*, ``api_key: …``)
+    assignment is a literal that
     must be masked, as opposed to code that must be sent as it is.
 
     HARDEN-1 A8: the mask used to replace *whatever* followed the ``=``, so a
@@ -264,7 +285,12 @@ def _value_is_secret_literal(value: str, key_name: str) -> bool:
       punctuation character (``api_key = sk-abc123``) — a key-shaped literal;
     * anything else is an expression (``os.environ["OPENAI_API_KEY"]``,
       ``config.api_key``, ``get_key()``), a bare number, a language constant, or a
-      name for the key itself — and is sent verbatim.
+      name for the key itself — and is sent verbatim;
+    * a dotted value that is a token — a JWT or ``ya29.a0AfH6…`` (HARDEN-9 A) — is a
+      literal, while a path of words stays code;
+    * with *colon* (the unquoted YAML form, HARDEN-9 B) a bare identifier counts only
+      when it is long enough to be a credential and token-shaped, since on that form a
+      short identifier is a type annotation or a parameter name.
     """
     value = (value or "").strip()
     if not value:
@@ -276,16 +302,78 @@ def _value_is_secret_literal(value: str, key_name: str) -> bool:
         return bool(inner) and not _is_template_placeholder(inner)
     if _is_template_placeholder(value):
         return False
-    if any(ch.isspace() for ch in value) or any(ch in value for ch in _EXPRESSION_CHARS):
+    if any(ch.isspace() for ch in value):
+        return False
+    if "." in value:
+        # HARDEN-9 A: a dotted value is a token as often as it is an attribute
+        # path, so `.` alone must not decide between them.
+        return _dotted_value_is_secret(value)
+    if any(ch in value for ch in _EXPRESSION_CHARS):
         return False
     if _NUMERIC_VALUE_RE.match(value):
         return False
     if _BARE_IDENTIFIER_RE.match(value):
         if value.strip("_").lower() in _CODE_WORDS:
             return False
+        if colon:
+            # HARDEN-9 B: on the colon form a bare identifier is a type or a
+            # parameter name as often as it is a value, so only one that is long
+            # enough to be a credential and token-shaped in its letters counts.
+            return (len(value) >= _TOKEN_MIN_LEN and _looks_like_a_token(value)
+                    and not _names_the_same_key(value, key_name))
         return not _names_the_same_key(value, key_name)
     # Not an identifier: an opaque bare token (sk-abc123, a long hex string) — a key.
     return True
+
+
+def _looks_like_a_token(value: str) -> bool:
+    """Whether a bare identifier reads as a credential rather than a name.
+
+    A credential's letters are not all one case and not all one kind: ``AKIA…7…``,
+    ``ghp_abc…123``, ``dGhpc2lz…MTIz``. A name is ``some_long_variable`` or a type.
+    """
+    return any(ch.isdigit() for ch in value) or (
+        any(ch.isupper() for ch in value) and any(ch.islower() for ch in value))
+
+
+def _part_mixes_letters_and_digits(part: str) -> bool:
+    return any(ch.isalpha() for ch in part) and any(ch.isdigit() for ch in part)
+
+
+def _is_base64url_run(part: str) -> bool:
+    """Whether *part* reads as a run of base64url rather than a word: long enough
+    to be a token piece, and its letters not one uniform case without a digit."""
+    if not _BASE64URL_RUN_RE.match(part):
+        return False
+    return _looks_like_a_token(part)
+
+
+def _dotted_value_is_secret(value: str) -> bool:
+    """Whether a dotted bare *value* is a credential rather than code (HARDEN-9 A).
+
+    ``_EXPRESSION_CHARS`` held `.` on the strength of ``config.api_key``, so every
+    dotted value was read as an attribute path and a pasted JWT
+    (``eyJhbGci…eyJzdWIi…SflKxw…``, three base64url runs) or a Google OAuth token
+    (``ya29.a0AfH6SMBx9…``) went out to the provider unchanged — the shape every
+    ``.env`` and INI holds for a token. The same lines leaked before HARDEN-5, so
+    this is an old gap, not a regression of it.
+
+    Code reads as a path of names, so the literal is the rest of it: a token at
+    least as long as one that is normally issued, whose parts either all mix
+    letters with digits (a hex or alphanumeric run split on a dot) or hold at
+    least two long base64url runs, as a JWT's three do. ``config.api_key``,
+    ``self.settings.api_key``, ``os.environ.get`` and ``settings.OPENAI_KEY`` are
+    paths of words and stay code.
+    """
+    if len(value) < _TOKEN_MIN_LEN:
+        return False
+    parts = value.split(".")
+    if any(not part for part in parts):
+        return False
+    if all(_part_mixes_letters_and_digits(part) for part in parts):
+        return True
+    runs = sum(1 for part in parts if _is_base64url_run(part))
+    return runs >= 2
 
 
 def _is_template_placeholder(value: str) -> bool:
@@ -325,6 +413,12 @@ def mask_api_key(text: "str | None") -> "str | None":
     left alone, and a ``Bearer`` token or a known key prefix is masked anywhere
     in the text.
 
+    HARDEN-9: the two shapes the two assignments above did not cover. A dotted
+    token (a JWT, ``ya29.a0AfH6…``) was read as an attribute path, and an
+    unquoted YAML value (``api_key: <hex>``) was not looked at at all — a
+    literal after an ``=`` and after a ``:`` is one rule,
+    ``_value_is_secret_literal``, so both are masked by it.
+
     This is a plain string transform with no knowledge of *which* key is
     "real" — it masks unconditionally so a secret embedded in file content
     that gets pulled into a prompt can't leak to the LLM. Non-string input
@@ -344,7 +438,21 @@ def mask_api_key(text: "str | None") -> "str | None":
         quote = _quote_of(value)
         return f"{prefix}{key_name}{assign}{quote}{_MASK_PLACEHOLDER}{quote}{suffix}"
 
+    def _mask_colon(m: "re.Match") -> str:
+        prefix, key_name, assign, value = m.groups()
+        # The colon form is the colon's own judge: a bare identifier there is a type
+        # or a parameter name as often as it is a value (HARDEN-9 B).
+        if not _value_is_secret_literal(value, key_name, colon=True):
+            return m.group(0)
+        if value.startswith("$"):
+            # `api_key: $OPENAI_API_KEY` is a reference to an environment variable (a shell, a
+            # compose file, a CI config), the name of a secret and not the secret itself.
+            return m.group(0)
+        quote = _quote_of(value)
+        return f"{prefix}{key_name}{assign}{quote}{_MASK_PLACEHOLDER}{quote}"
+
     text = _API_KEY_LINE_RE.sub(_mask_assignment, text)
+    text = _API_KEY_COLON_RE.sub(_mask_colon, text)
     text = _API_KEY_JSON_RE.sub(r"\1" + _MASK_PLACEHOLDER + r"\2", text)
     text = _BEARER_TOKEN_RE.sub(r"\1" + _MASK_PLACEHOLDER, text)
     return _SECRET_PREFIX_RE.sub(_MASK_PLACEHOLDER, text)

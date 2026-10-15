@@ -118,7 +118,12 @@ def parse_sets(text: str) -> list:
         bad = set(opts) - {"veto", "notests", "collect"}
         if bad or (rule and rule not in ("all", "committed")):
             raise SystemExit(f"set {part!r}: options are +veto, +notests and +collect, rules all|committed")
-        item = (n, rule or ("all" if n == 3 else "committed"), tuple(sorted(opts)))
+        # HARDEN-9 D: the options are a set. A repeated one (`3+veto+veto`) used to
+        # survive as `('veto', 'veto')` — the duplicate check compares sorted option
+        # tuples, so `3+veto,3+veto+veto` read as two variants of one name and both
+        # ran, and both paid, for the same configuration. Read once; the two sets that
+        # result are then caught by the "named twice" refusal below.
+        item = (n, rule or ("all" if n == 3 else "committed"), tuple(sorted(set(opts))))
         # two sets of one name shared one directory and one result.json, and --resume took the second as done
         if any((o[0], o[2], o[1]) == (item[0], item[2], item[1]) for o in out):
             raise SystemExit(f"set {part!r}: {variant_name(item[0], item[2], item[1])} is named twice")
@@ -162,6 +167,12 @@ def build_ini(dest: Path, local: configparser.ConfigParser, base_ini: Path, mode
               opts: tuple = (), collect_skip: "str | None" = None) -> None:
     cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(base_ini, encoding="utf-8-sig")
+    # HARDEN-9 D: a section the base ini does not hold was a KeyError and a traceback.
+    # Check them in the order they are used and name the file and the section; nothing
+    # is written before this point, so dest is not left half-built.
+    for section in ("gate1_llm", "gate1", "loop", "collect"):
+        if not cfg.has_section(section):
+            raise SystemExit(f"{base_ini}: the base ini has no [{section}] section")
     rd = local[P + reader]
     for key in ("base_url", "api_key", "model"):
         cfg["gate1_llm"][key] = rd[key]

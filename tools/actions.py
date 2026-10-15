@@ -55,6 +55,100 @@ def _resolve_within_base(base_dir: str, file_path: str) -> "str | None":
     return target_real if inside else None
 
 
+#: The legacy codecs a non-UTF-8 file may be written back in, most faithful first.
+#: `cp1251` leads because it is this repository's own codec, and on a tie it wins.
+_LEGACY_WRITE_ENCODINGS: Tuple[str, ...] = ("cp1251", "cp1252")
+#: The PEP 263 coding cookie: `# coding: name`, `# coding=name`, `# -*- coding: name -*-`.
+_CODING_COOKIE_RE = re.compile(rb"coding[ \t]*[:=][ \t]*([A-Za-z0-9._-]+)")
+
+
+def _source_coding_cookie(raw: bytes) -> "str | None":
+    """The codec a coding cookie in the first two lines of *raw* names, or `None`.
+
+    HARDEN-9 C: a cookie is the author's declaration about this file, so it wins over
+    the script guess — but only where Python reads one: a `#` comment inside the first
+    two lines. The same words anywhere else are prose. Nothing here can raise, so a
+    malformed first line never reaches a run.
+    """
+    for line in raw.splitlines(True)[:2]:
+        if not line.lstrip().startswith(b"#"):
+            continue
+        match = _CODING_COOKIE_RE.search(line)
+        if match:
+            name = match.group(1).decode("ascii", "ignore").strip()
+            if name:
+                return name
+    return None
+
+
+#: The Cyrillic letters, in their two Unicode blocks.
+_CYRILLIC_RANGE = (0x0400, 0x052F)
+#: An accented run this long, with no plain letter in it, is a Cyrillic word
+#: seen through the cp1252 table.
+_ACCENTED_RUN_MIN = 2
+
+
+def _letter_runs(text: str):
+    """The maximal runs of `isalpha()` characters of *text*, in order."""
+    run: List[str] = []
+    for ch in text:
+        if ch.isalpha():
+            run.append(ch)
+        elif run:
+            yield run
+            run = []
+    if run:
+        yield run
+
+
+def _legacy_script_score(text: str) -> int:
+    """How many of *text*'s word runs read as a neighbouring codec — 0 when every
+    run reads as one script, which is what a correctly-read file gives.
+
+    cp1251 and cp1252 agree on almost every byte, so a Western file decoded as
+    cp1251 round-trips (`text.encode("cp1251") == raw`) and the round-trip test
+    cannot tell the codecs apart — it is `Cafй`, not `Café`, and both are "fine"
+    (HARDEN-9 C). What does is the *run* of letters each table gives, because the
+    two codecs differ only in what they make of a high byte: cp1252's high bytes
+    are accented Latin, cp1251's are Cyrillic, so the same bytes land in different
+    buckets. A word is one run of letters, and there a letter is Cyrillic, accented
+    Latin, or plain ASCII Latin:
+
+    * a Western file read as cp1251 puts a Cyrillic letter *inside* a run of
+      plain ones (`GrьЯe цl`, `Cafй`, `fazade`), so a run that holds Cyrillic
+      next to a Latin letter is a mis-decode;
+    * a Cyrillic file read as cp1252 turns every letter of a word into an
+      accented Latin one, so the run is all accents with no plain letter among
+      them (`ÐÐÈÂÅÒ` for `Привет`, `ìèð` for `мир`). Two or more, because one
+      accent is what a Western word keeps — the `é` of `Café`, the `À` of `À la`
+      — and a real word always has a plain letter with it.
+    * everything else — a run of one script, or accents among plain letters —
+      is what a correctly-read file gives.
+
+    Counting over the whole text cannot do this: cp1251's А-Я / а-я are the same
+    bytes as cp1252's À-ß / à-ÿ, so the tables differ only in which bucket a
+    letter goes into and a text-level share of the letters does not separate
+    them — `Hello мир friend` scored like a Western file either way. A file with
+    no letters gives no evidence and scores 0.
+    """
+    bad = 0
+    for run in _letter_runs(text):
+        cyr = lat = asc = 0
+        for ch in run:
+            code = ord(ch)
+            if _CYRILLIC_RANGE[0] <= code <= _CYRILLIC_RANGE[1]:
+                cyr += 1
+            elif ch.isascii():
+                asc += 1
+            else:
+                lat += 1
+        if cyr and lat + asc:
+            bad += 1                    # Cyrillic inside a Latin run
+        elif lat >= _ACCENTED_RUN_MIN and asc == 0:
+            bad += 1                    # an all-accent word: a Cyrillic file
+    return bad
+
+
 def _edit_write_encodings(target: str) -> "Tuple[str, ...]":
     """CC-16 (Part C): the encodings `/edit` may write *target* back in, most
     faithful first — decided **once, from the file's own bytes, before the
@@ -80,6 +174,15 @@ def _edit_write_encodings(target: str) -> "Tuple[str, ...]":
     round-trips wins), `latin-1` last since it decodes every byte and can
     therefore always be written back to. A UTF-8 file returns exactly
     `("utf-8",)`, so a UTF-8 edit is byte-identical to fix 34's.
+
+    HARDEN-9 C: "whichever round-trips wins" was the whole of the probe, and
+    `cp1251` and `cp1252` define almost every byte, so a Western file always
+    round-tripped as `cp1251` and `Café` went out to the model as `Cafй`.
+    The order is now judged by the script the codec gives back — a codec that
+    splits one file's letters between Cyrillic and Latin mis-read it, and
+    `cp1251`'s tie wins because it is this repository's own codec. A coding
+    cookie in the first two lines (`# -*- coding: latin-1 -*-`) names the
+    codec outright and overrides the guess.
     """
     try:
         with open(target, "rb") as fh:
@@ -95,18 +198,42 @@ def _edit_write_encodings(target: str) -> "Tuple[str, ...]":
     except UnicodeDecodeError:
         pass
 
-    candidates: List[str] = []
-    for legacy in ("cp1251", "cp1252"):
+    # HARDEN-9 C: a coding cookie in the first two lines names the codec, and a
+    # named codec wins over the script guess below. Fail-open: an unknown name or a
+    # cookie that cannot round-trip the file is simply ignored, and the guess stands.
+    cookie = _source_coding_cookie(raw)
+
+    ranked: List[Tuple[int, int, str]] = []
+    for index, legacy in enumerate(_LEGACY_WRITE_ENCODINGS):
         try:
             text = raw.decode(legacy)
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, LookupError):
             continue
         # The codec has to describe *this* file, not merely accept the bytes:
         # cp1251 and cp1252 both decode every byte, so the test is that
         # encoding the decoded text reproduces the original.
-        if text.encode(legacy) == raw:
-            candidates.append(legacy)
+        try:
+            faithful = text.encode(legacy) == raw
+        except UnicodeEncodeError:
+            continue
+        if not faithful:
+            continue
+        # Then it has to *read* it: a codec that splits one file's letters
+        # between two scripts is the wrong one for it, whatever it round-trips.
+        ranked.append((_legacy_script_score(text), index, legacy))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    candidates: List[str] = [legacy for _, _, legacy in ranked]
     candidates.append("latin-1")  # decodes anything, so always writable
+
+    if cookie:
+        try:
+            if raw.decode(cookie).encode(cookie) == raw:
+                # A named codec leads: it is the author's declaration, and it is still
+                # behind the list's other candidates, so a write the cookie cannot hold
+                # still has somewhere to go.
+                candidates = [cookie] + [enc for enc in candidates if enc != cookie]
+        except (UnicodeDecodeError, UnicodeEncodeError, LookupError):
+            pass
     return tuple(candidates)
 
 
@@ -119,7 +246,8 @@ def _pick_edit_encoding(encodings: "Tuple[str, ...]", revised: str) -> "Tuple[st
     not followed by a retry that comes back in cp1251. The returned
     characters are the reportable ones — printable, de-duplicated, in the
     order they appear — so the refusal can name what is missing instead of
-    quoting a bare codec message.
+    quoting a bare codec message, and they are the ones the file's own codec,
+    the first candidate, cannot hold.
     """
     for encoding in encodings:
         try:
@@ -127,13 +255,20 @@ def _pick_edit_encoding(encodings: "Tuple[str, ...]", revised: str) -> "Tuple[st
             return encoding, ""
         except UnicodeEncodeError:
             continue
-    # No candidate holds the revision: name the characters that fit none of
-    # them, so the message says what is missing rather than quoting a codec.
+    # No candidate holds the revision. Name the characters that keep it out, so the
+    # message says what to drop rather than quoting a codec or saying "some
+    # characters": the file is written back in its own codec, the first candidate,
+    # so the characters it cannot hold are the ones a second try has to lose
+    # (HARDEN-9 C: a reply that added a genuine Western letter to a legacy file was
+    # refused as "missing some characters", with nothing named). A character that fits
+    # no codec at all is in this same set, so there is nothing else to look for.
+    if not encodings:
+        return None, ""
     seen: List[str] = []
     for ch in revised:
         if ch in seen or not ch.isprintable():
             continue
-        if all(_cannot_encode(ch, enc) for enc in encodings):
+        if _cannot_encode(ch, encodings[0]):
             seen.append(ch)
     return None, " ".join(seen[:12])
 

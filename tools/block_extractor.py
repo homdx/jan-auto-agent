@@ -686,6 +686,11 @@ def _head_prefix_kind(prefix: str) -> str:
     last_char = stripped[-1]
     if last_char in "=([,!":
         return "call"
+    if last_char == "<" or "<<" in stripped:
+        # A stream insertion or a comparison (`std::cout << Widget::label();`, `a < label()`) is a
+        # call's position, never a type's: a type's prefix closes its template arguments
+        # (`Map<K, V> name(`) and has no `<<` in it.
+        return "call"
     if last_char not in _HEAD_TYPE_CHARS and last_char not in "_$" and not last_char.isalnum():
         return "call"
     if stripped.endswith(".") and not stripped.endswith("::"):
@@ -757,13 +762,18 @@ def _bodyless_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     ]
 
 
-def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: bool, lang: str = "") -> Optional[int]:
+def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: bool, lang: str = "",
+                                  stop_at_comma: bool = False) -> Optional[int]:
     """The end of a definition whose head matches but whose body has no `{ … }` (HARDEN-4 D2).
 
     Returns the index just past the `;` that ends the statement, or the end of its last logical
     line when there is none (`fun ff() = 1`), or None when nothing conclusive appears inside the
     bound. A line that ends on an operator continues on the next one, so a wrapped arrow body
     (`const clamp = (a, b) =>` / `  a + b;`) stays inside its own block.
+
+    With *stop_at_comma* a comma at depth 0 ends it instead of continuing, which is what an
+    object-literal property needs (HARDEN-9 E): the comma belongs to the literal, not to the
+    property's value.
     """
     n = len(source)
     i = scan_from
@@ -847,6 +857,10 @@ def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: boo
                 return i
         elif ch == ";" and depth == 0:
             return i + 1
+        elif stop_at_comma and ch == "," and depth == 0:
+            # HARDEN-9 E: the comma of the object literal is not this property's body. Without this
+            # the scan reads it as a continuation and runs the one-liner through its neighbours.
+            return i
         elif ch == "\n" and depth == 0:
             k = i - 1
             while k >= scan_from and source[k] in " \t\r":
@@ -921,7 +935,104 @@ def _find_earliest_genuine_definition(source: str, target_name: str, lang: str =
     # HARDEN-6 B: a declaration that has no body at all (`int proto(int a);`,
     # `declare function f(x: number): void;`) used to answer "not found" — which Gate 1 reads as a
     # hallucination. Last of the three passes, so it can only turn a "not found" into a block.
-    return _find_earliest_declaration(source, target_name, lang)
+    declaration = _find_earliest_declaration(source, target_name, lang)
+    if declaration is not None:
+        return declaration
+
+    # HARDEN-9 E: an arrow function that is a property of an object literal — `name: (x) => {…}` —
+    # has no `const` and no `function` in front of it, and it is how handlers, reducers, route
+    # tables and action maps are written. It is last of the four passes, so it can only turn a
+    # "not found" into a found block.
+    return _find_earliest_property_arrow_definition(source, target_name, lang)
+
+
+def _property_arrow_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
+    """The heads of an arrow function that is a **property of an object literal**
+    (HARDEN-9 E): `name: (x) => {…}`, `name: async (x) => {…}`, `name: x => {…}`,
+    `name?: x => {…}`, `name: <T>(x: T): T => {…}`, and the single-expression form.
+
+    This is the shape HARDEN-4 D2 stopped one step short of: there is no `const` and no
+    `function` in front of the name, so no pattern in `_brace_candidate_patterns`
+    reaches it, and `_head_prefix_kind` would read the `:` before the name as a return
+    type's position rather than as a property's. It is anchored at the line start with
+    `[ \t]*`, as the HARDEN-4 D2 heads are: a head that spans lines is not this form.
+    """
+    name = re.escape(target_name)
+    # `readonly`/`as const`-free modifiers of a property, a `?` for an optional one,
+    # optional TS type parameters after the colon, then the parameter list or a single
+    # parameter name, an optional return annotation, and the `=>`.
+    mods = r"(?:(?:readonly|public|private|protected|static)[ \t]+)*"
+    tp = r"(?:[ \t]*<[^(){};\n]{1,200}>|[ \t]*\[[^(){};\n]{1,200}\])?"
+    ann = r"(?::[^=;\n]{1,200})?"
+    params = r"(?:\([^)\n]{1,400}\)|[A-Za-z_$][\w$]*)"
+    return [
+        re.compile(
+            rf"(?m)^[ \t]*{mods}{name}[ \t]*[?]?[ \t]*:[ \t]*(?:async[ \t]+)?{tp}[ \t]*{params}"
+            rf"{ann}[ \t]*=>"
+        ),
+    ]
+
+
+def _find_earliest_property_arrow_definition(
+    source: str, target_name: str, lang: str = ""
+) -> Optional[tuple]:
+    """The earliest object-literal-property arrow definition of `target_name`
+    (HARDEN-9 E), as `(match_start, open_brace, end)`.
+
+    Braced bodies first, body-less ones only if there is no braced one anywhere — the same
+    order as the two passes above it, so a braced body always wins over a one-liner. Last of
+    the four passes, so it can only turn a "not found" into a found block: every block that
+    was found today is still found, from the same place.
+    """
+    best_start = None
+    best_match_start = None
+    best_open_brace = None
+    best_end = None
+
+    for pat in _property_arrow_candidate_patterns(target_name):
+        for match in pat.finditer(source):
+            if _head_is_call(source, match, target_name):
+                continue
+            # The head already consumed the parameters, the annotation and the `=>`, so a braced
+            # body opens at the very next `{`. A `{` anywhere further on belongs to something else
+            # (the object literal of a later property, a nested block), and the block would run
+            # across the whole literal instead of stopping at the property's own end.
+            tail = source[match.end():]
+            stripped = tail.lstrip(" \t\r\n")
+            if not stripped.startswith("{"):
+                continue
+            open_idx = match.end() + (len(tail) - len(stripped))
+            effective_start = _effective_match_start(source, match.start())
+            start = _line_start_index(source, effective_start)
+            if best_start is None or start < best_start:
+                best_start = start
+                best_match_start = effective_start
+                best_open_brace = open_idx
+
+    if best_start is not None:
+        return (best_match_start, best_open_brace, _brace_scan_end(source, best_open_brace, lang=lang))
+
+    # The single-expression form: `save: (u) => persist(u)` has no `{` to scan to. The comma of the
+    # object literal ends it, since it is not the property's body.
+    for pat in _property_arrow_candidate_patterns(target_name):
+        for match in pat.finditer(source):
+            if _head_is_call(source, match, target_name):
+                continue
+            # The head already consumed the parameters, so the body starts right after the `=>`.
+            end = _find_definition_end_bodyless(source, match.end(), False, lang,
+                                                stop_at_comma=True)
+            if end is None:
+                continue
+            effective_start = _effective_match_start(source, match.start())
+            start = _line_start_index(source, effective_start)
+            if best_start is None or start < best_start:
+                best_start = start
+                best_match_start = effective_start
+                best_end = end
+
+    if best_start is None:
+        return None
+    return (best_match_start, None, best_end)
 
 
 def _find_earliest_bodyless_definition(source: str, target_name: str, lang: str = "") -> Optional[tuple]:

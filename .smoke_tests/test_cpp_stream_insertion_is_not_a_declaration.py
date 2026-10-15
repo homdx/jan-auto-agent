@@ -1,0 +1,1 @@
+../tests/test_cpp_stream_insertion_is_not_a_declaration.py

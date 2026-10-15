@@ -1,13 +1,17 @@
 # HARDEN-9 — the secret mask lets a dotted token and an unquoted `api_key: <value>` line reach the model, a Western legacy file is read as cp1251, an arrow function in an object literal is "not found", and two operator-script gaps (`parse_sets`, `build_ini`)
 
-**Status:** open — FINAL, written 2026-10-15 against `0d28a9b`. Five defects (A and B are one mask, C is the codec guess, D is two small gaps of an operator script, E is the extractor), each **reproduced by running the code** on that commit (the output is below). The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 307: sensenova-var3 as the base — a dotted token and the unquoted `api_key: <value>` line are masked (A, B), the codec of a Western file is decided from the script of each word, with a coding cookie winning and a refusal naming the character (C; the per-word score is sensenova-var2's), a repeated option and a missing ini section are refused by name (D), a property arrow function of an object literal is found in its own pass behind every definition found today (E)). The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** HIGH (A: a JWT or an OAuth token in a `.env` or INI line leaves the machine); MEDIUM (B); MEDIUM-LOW (C); LOW (D); MEDIUM (E)
 **File:** `tools/llm_stream.py` (A, B), `tools/actions.py` and `tools/auto/coder.py` (C), `scripts/gate1_vote_layer2.py` (D), `tools/block_extractor.py` (E)
 **Symbol:** `_value_is_secret_literal`, `_EXPRESSION_CHARS`, `_API_KEY_LINE_RE`, `mask_api_key`, `_mask_payload_secrets`. C: `_edit_write_encodings`, `_file_encodings`, `_file_read_encoding`, `_pick_file_encoding`. D: `parse_sets`, `build_ini`. E: `extract_block` and the candidate patterns of a JS or TS definition head
-**Round:** —
+**Round:** 307
 **Size:** S
 **Depends on:** HARDEN-1 (298), HARDEN-5 (303), both landed
 **Also touches:** `tests/test_mask_api_key_forms.py`, `tests_bugfix/test_harden1_a8_mask_only_literals.py` (pins that must stay green), `tests_bugfix/`
+
+Why not the others: in a black box that drives each tree (180 checks over A to E: dotted tokens, every YAML form and its controls, the codec of Western, Russian and mixed files and the cookie, the script options, the arrow properties in four extensions), sensenova-var2 passed 176, var3 175, step-5-preview 172, var4 171, nemotron 153, var1 142, laguna 128, agnes 94 (the base) and glm 90. The cross matrix put var3 first by a distance (its tests 286/286 on its own code and the most on the others'): its arrow property is a separate pass behind every definition found today, where var2's pattern in the braced pass out-ranked a real definition; its identifier-path test keeps `client.v2Endpoint` as code, where var2 masks it. Its codec guess read a long Russian file with one English word as cp1252, step-5 and var4 did the same; var2's per-word score does not, and is used. Added to it: `api_key: $VAR` is a reference and stays as written, and the coding cookie test no longer pins the order behind the cookie.
+
+Found at judging and fixed in the same commit (present on the base, not a regression of this round): a C++ stream insertion that ends in a qualified call, `std::cout << Widget::label();`, was answered as the body-less declaration of `label`; `_head_prefix_kind` now treats a prefix with `<<` or ending in `<` as a call's position (`tests/test_cpp_stream_insertion_is_not_a_declaration.py`).
 
 ---
 
