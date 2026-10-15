@@ -375,37 +375,13 @@ def extract_claims(
         sentence = raw_sentence.strip()
         if not sentence:
             continue
-        # HARDEN-1 A5 (second line of defence): `summary.purpose` and
-        # `summary.notes` come straight from the model with no length cap, and
-        # `_SENTENCE_SPLIT_RE` only splits on sentence punctuation and
-        # newlines — so one "sentence" can be the model's whole reply. A
-        # 2 000+ character run of prose is not a claim about anything, and the
-        # per-sentence work below (bracket pairing, location/symbol regexes,
-        # crash-word probes) is unbounded in what it is asked to look at, so
-        # such a sentence yields nothing rather than being parsed. The bracket
-        # walk itself is linear now (`_pair_brackets`), so this cap bounds
-        # prompt-sized prose, it is not the fix for the quadratic walk.
-        #
-        # HARDEN-6 F: "yields nothing" was itself the bug. `_verify_text`
-        # rebuilds the summary text from the claims that were *kept*, so a true
-        # 2.5 KB run-on sentence of notes came out of the summary as nothing at
-        # all — `dropped_claims == 0`, no row in the verification report, prose
-        # nobody had rejected gone without a trace. The sentence is kept as one
-        # claim cut to the cap with a mark, and with no citations: there is
-        # nothing in it to verify, nothing in it is dropped, and the downstream
-        # per-claim work stays bounded by the cap.
+        # HARDEN-1 A5 / HARDEN-6 F: a 2 000+ character run-on sentence is kept cut to the cap with a mark. Its
+        # citations are still read from the whole of it (every check below is linear), so a fabricated one
+        # inside it is dropped like any other.
+        shown = sentence
         if len(sentence) > _MAX_CLAIM_SENTENCE_CHARS:
-            claims.append(
-                Claim(
-                    text=(
-                        sentence[:_MAX_CLAIM_SENTENCE_CHARS].rstrip()
-                        + f"… [truncated by Pass C: {len(sentence)} characters]"
-                    ),
-                    module=module_path,
-                    kind="generic",
-                )
-            )
-            continue
+            shown = (sentence[:_MAX_CLAIM_SENTENCE_CHARS].rstrip()
+                     + f"… [truncated by Pass C: {len(sentence)} characters]")
 
         # Every location, symbol and access citation in a sentence is extracted, not only the first (BUGFIX).
         locations = [f"{m.group(1)}:{m.group(2)}" for m in _LOCATION_RE.finditer(sentence)]
@@ -454,7 +430,7 @@ def extract_claims(
         for fields in citation_fields:
             claims.append(
                 Claim(
-                    text=sentence,
+                    text=shown,
                     module=module_path,
                     kind=kind,
                     symbol=fields.get("symbol"),

@@ -475,13 +475,12 @@ def ticket_format_spec() -> str:
         lines.append(f"## {section}")
         lines.append("")
     for section in OPTIONAL_SECTIONS:
+        # The bullets stand as written, not in a code block: a fenced list is not read as claims.
         lines += [f"## {section}", "",
-                  "```",
                   "- [new] `this_function` returns None when the config key is off.",
                   "- [fixed] `this_function` returns 0 for an artifact from an older run.",
                   "- [still] `this_function` never writes to the collect directory.",
-                  "- [gone] `old_helper` is imported from nowhere.",
-                  "```", ""]
+                  "- [gone] `old_helper` is imported from nowhere.", ""]
     lines.append(
         "Every header field above must be present; `## Acceptance` must hold a "
         "fenced code block with the command that proves the work. `## Claims` is optional, after "

@@ -42,6 +42,14 @@ def _empty_seeds(monkeypatch):
     monkeypatch.setattr(cli_mod.gates_mod, "build_gates_map", lambda modules, root: [])
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch):
+    """The refused module's retries do not wait out the real backoff (7 s per failing refresh)."""
+    summarize_repo = cli_mod.summarize_repo
+    monkeypatch.setattr(cli_mod, "summarize_repo",
+                        lambda *a, **k: summarize_repo(*a, **{"sleep_fn": lambda _s: None, **k}))
+
+
 @pytest.fixture
 def mini_repo_two_modules(tmp_path: Path) -> Path:
     pkg = tmp_path / "pkg"

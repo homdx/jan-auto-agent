@@ -545,7 +545,10 @@ class GitManager:
         base = "HEAD" if self._has_head() else "--cached"
         parts = [self._run_bytes(["git", "diff", base, "--binary", "--"],
                                  "git diff failed").decode("utf-8", "surrogateescape")]
+        collect = self._collect_dir()
         for path in self.untracked_paths():
+            if collect is not None and path.startswith(collect):
+                continue   # the discard keeps the collect artifact, and a patch that adds it again does not apply
             # --no-index exits 1 when the files differ, which is the normal case.
             proc = run_git(
                 ["git", "diff", "--no-index", "--binary", "--",

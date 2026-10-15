@@ -965,7 +965,8 @@ def action_refresh(
     # alongside the changed ones; unchanged modules that are already summarized
     # are not touched.
     previous_unsummarized = set(previous_manifest.unsummarized)
-    to_summarize += [m for m in current_modules if m.path in previous_unsummarized]
+    queued = {m.path for m in to_summarize}
+    to_summarize += [m for m in current_modules if m.path in previous_unsummarized and m.path not in queued]
 
     settings = read_collect_settings(config)
     # "Skipped" is reported only when there was something to summarise, not for a deletion-only refresh.

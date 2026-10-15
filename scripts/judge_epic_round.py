@@ -960,7 +960,7 @@ class _FenceTracker:
         return True
 
 
-def _claims_section(text):
+def _claims_section(text, fenced=False):
     """`[(line number, line)]` of a ticket's `## Claims` section — `[]` when it has none.
 
     The section is optional and may be the ticket's last, so the body runs to the next `## `
@@ -986,6 +986,8 @@ def _claims_section(text):
     fences = _FenceTracker()
     for i in range(start, len(lines)):
         if fences.feed(lines[i]):
+            if fenced:
+                body.append((i + 1, lines[i]))
             continue
         if _H2.match(lines[i]):
             break
@@ -1025,6 +1027,13 @@ def ticket_claims(text, name=""):
                              f"{', '.join('[' + w + ']' for w in CLAIM_WORDS)}")
         elif line.strip() and claims and line[:1] in (" ", "\t"):   # only an indented line continues it
             claims[-1]["claim"] = (claims[-1]["claim"] + " " + line.strip()).strip()
+    if not claims:
+        # A list written inside a code block is not read; said here rather than left as "no claims".
+        for lineno, line in _claims_section(text, fenced=True):
+            bullet = _CLAIM_BULLET.match(line)
+            if bullet and bullet.group(1).startswith("["):
+                raise ValueError(f"{where}:{lineno}: the claims are inside a code block — "
+                                 f"write them as a plain list under ## Claims")
     return claims
 
 

@@ -332,9 +332,10 @@ def validate_plan(
     kept = [task_id_of[id(c)] for c in accepted]
 
     if removed:
+        known_ids = [t.get("id") for t in state.all_tasks() if t.get("id")]
         for r in removed:
             state.remove_task(r.task_id)
-        _remove_from_improvements_md(base_path, [r.task_id for r in removed])
+        _remove_from_improvements_md(base_path, [r.task_id for r in removed], known_ids)
         _append_false_positives(base_path, removed)
         _commit_validation(base_path, cfg, removed)
 
@@ -372,28 +373,45 @@ def validate_plan(
 # `_NEXT_ENTRY` is only ever read after a separator (or at `## Manual Suggestions`), so a
 # `### Note: …` line inside an entry's own text still does not end it.
 _NEXT_ENTRY = r"(?:### [\w.\-]+: |## Manual Suggestions)"
-_FENCE_BLOCK = (
-    r"(?m:^ {0,3})(?P<fence>`{3,}|~{3,})[^\n]*\n"   # opening fence line
-    r"(?:(?!\n-{3,}\n+" + _NEXT_ENTRY + r")[\s\S])*?"  # block body, verbatim, within its entry
-    r"(?m:^ {0,3})(?P=fence)[^\n]*"                  # closing fence line
-)
 
 
-def _task_section_pattern(task_id: str) -> re.Pattern:
+def _next_entry(known_ids=None) -> str:
+    """The next entry's heading. Without the plan's ids, any `### <id>: `. With them, a heading of one of
+    them or of an id shaped like one (a digit, `.`, `_` or `-` in it), so a letters-only id the plan holds
+    is a boundary and a `### Notes: …` sub-heading after a rule inside an entry is not."""
+    if not known_ids:
+        return _NEXT_ENTRY
+    ids = "|".join(re.escape(i) for i in sorted(set(known_ids), key=len, reverse=True))
+    return r"(?:### (?:(?:" + ids + r")|(?=[\w.\-]*[\d._\-])[\w.\-]+): |## Manual Suggestions)"
+
+
+def _fence_block(next_entry: str) -> str:
+    return (
+        r"(?m:^ {0,3})(?P<fence>`{3,}|~{3,})[^\n]*\n"   # opening fence line
+        r"(?:(?!\n-{3,}\n+" + next_entry + r")[\s\S])*?"  # block body, verbatim, within its entry
+        r"(?m:^ {0,3})(?P=fence)[^\n]*"                  # closing fence line
+    )
+
+
+_FENCE_BLOCK = _fence_block(_NEXT_ENTRY)
+
+
+def _task_section_pattern(task_id: str, known_ids=None) -> re.Pattern:
+    next_entry = _next_entry(known_ids)
     return re.compile(
         r"### " + re.escape(task_id) + r":"
-        r"(?:" + _FENCE_BLOCK + r"|.)*?"
-        r"(?:\n-{3,}\n+(?=" + _NEXT_ENTRY + r"|\Z)"
+        r"(?:" + _fence_block(next_entry) + r"|.)*?"
+        r"(?:\n-{3,}\n+(?=" + next_entry + r"|\Z)"
         r"|(?=\n## Manual Suggestions|\Z))",
         re.DOTALL,
     )
 
 
-def _without_section(text: str, task_id: str) -> str:
+def _without_section(text: str, task_id: str, known_ids=None) -> str:
     """*text* without *task_id*'s entry; the blank lines where it was cut are made two at most. The whole
     file's runs of blank lines were collapsed, and every other entry's code sample lost its two blank lines
     (PEP 8's, before a def)."""
-    pattern = _task_section_pattern(task_id)
+    pattern = _task_section_pattern(task_id, known_ids)
     while (m := pattern.search(text)) is not None:   # every copy, as the re.sub before it did
         head, tail = text[:m.start()], text[m.end():]
         if head.endswith("\n\n") and tail.startswith("\n"):
@@ -408,7 +426,7 @@ _AUTO_SECTION_EMPTY_NOTE = (
 )
 
 
-def _remove_from_improvements_md(base_dir: Path, removed_ids: "list[str]") -> None:
+def _remove_from_improvements_md(base_dir: Path, removed_ids: "list[str]", known_ids=None) -> None:
     """Strip each removed task's section out of IMPROVEMENTS.md, if present.
 
     IMPROVEMENTS.md (``plan_emitter.IMPROVEMENTS_FILENAME``) is rendered
@@ -436,7 +454,7 @@ def _remove_from_improvements_md(base_dir: Path, removed_ids: "list[str]") -> No
     original = md_path.read_text(encoding="utf-8")
     text = original
     for task_id in removed_ids:
-        text = _without_section(text, task_id)
+        text = _without_section(text, task_id, known_ids)
 
     if text == original:
         return  # none of removed_ids had a section here — nothing to write

@@ -31,7 +31,16 @@ def safe_stdout_write(t: str) -> None:
     try:
         sys.stdout.write(t)
         sys.stdout.flush()
-    except (BrokenPipeError, OSError):
+    except UnicodeEncodeError:
+        # A stdout that is not UTF-8 (a Windows console redirected to a file, a latin-1 locale) gets the
+        # characters it can hold; the 🧠 of a banner is not a failed call.
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        try:
+            sys.stdout.write(t.encode(encoding, "replace").decode(encoding, "replace"))
+            sys.stdout.flush()
+        except (OSError, ValueError, LookupError):
+            pass
+    except (OSError, ValueError):   # BrokenPipeError is an OSError, a closed file a ValueError
         pass
 
 
