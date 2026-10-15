@@ -96,6 +96,11 @@ from tools.claimcheck.anchors import PathRepoView
 from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
+# HARDEN-7 B: the shared reader of a reply field's type. One presence reply the
+# model sent with `evidence` as a list used to raise AttributeError out of
+# `filter()`, which `pipeline.py` and `plan_validator.py` call without a guard —
+# one malformed reply ended the planning phase and lost every other candidate.
+from tools.llm_stream import reply_text
 from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
@@ -1903,9 +1908,21 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             logger.warning("Gate1._parse_presence_response [%s]: %s", candidate_title, reason)
             return False, reason, True
 
-        verdict  = (data.get("verdict")  or "").strip().lower()
-        reason   = (data.get("reason")   or "").strip()
-        evidence = (data.get("evidence") or "").strip()
+        # HARDEN-7 B: each field is read as text, whatever JSON type the model
+        # sent for it. `(data.get("verdict") or "").strip()` assumed every
+        # truthy field was already a string, so `"evidence": ["a", "b"]` raised
+        # `AttributeError: 'list' object has no attribute 'strip'` out of
+        # `filter()` — and with it the planning phase, every other candidate's
+        # verdict and every LLM call already paid for. A field of another type
+        # is now text (a list one item per line, a number as its text, None as
+        # empty), and a `verdict` that is not a recognisable word falls through
+        # to the unparseable path below — the existing re-ask, not an exception.
+        # A verdict is a word: a list or a number is no verdict in any spelling (`["confirmed"]` is not a
+        # confirmation), so it is the unparseable reply and is asked again, never read as a yes.
+        raw_verdict = data.get("verdict")
+        verdict  = raw_verdict.strip().lower() if isinstance(raw_verdict, str) else ""
+        reason   = reply_text(data.get("reason"))
+        evidence = reply_text(data.get("evidence"))
 
         if verdict == "confirmed":
             if code_block and not _evidence_found(evidence, code_block):

@@ -35,6 +35,11 @@ from tools.actions import OrchestratorActions, _ts
 from tools.faq_agent import FaqAgent
 import tools.backoff as backoff
 from tools.llm_stream import request_completion, strip_think, make_unverified_context
+# HARDEN-7 C: the shared reader of a reply field's type. The pipeline's
+# validator answers `feedback` itself, and a list or a number in that field
+# raised AttributeError out of `run_pipeline`, which catches only
+# KeyboardInterrupt and EOFError.
+from tools.llm_stream import reply_text
 from tools.ui import stream_tracker
 
 # Extensions with AST or block extraction and validation; the rest are plain text.
@@ -487,7 +492,7 @@ class Orchestrator(OrchestratorActions):
                     if iteration >= self.max_iterations:
                         print(f"[{_ts()}] ⚠️  Validator unavailable — "
                               f"max iterations reached, stopping. "
-                              f"({validation.get('feedback', '')})")
+                              f"({reply_text(validation.get('feedback'))})")
                         break
                     _chk = {
                         "loop": "run_pipeline",
@@ -502,7 +507,7 @@ class Orchestrator(OrchestratorActions):
                     continue  # retry same iteration (do not increment)
 
                 _api_err_count = 0
-                feedback = validation.get("feedback", "").strip()
+                feedback = reply_text(validation.get("feedback"))
                 if feedback:
                     print(f"❗ Validation – {feedback}")
 
@@ -576,7 +581,7 @@ class Orchestrator(OrchestratorActions):
             prompt_version=self.prompt_store.get_version_label("validator_agent"),
             iterations_used=iterations_used,
             validator_status=last_validation.get("status", "skipped"),
-            validator_feedback=last_validation.get("feedback", ""),
+            validator_feedback=reply_text(last_validation.get("feedback")),
             improvement_json_ok=improvement_json_ok,
             elapsed_seconds=total_elapsed,
         ))

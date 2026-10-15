@@ -527,24 +527,33 @@ class GitManager:
         ``a/<path>`` / ``b/<path>`` and the patch applies from the repo root
         like any other.
 
+        HARDEN-7 D: git's output is taken as BYTES and decoded with
+        ``surrogateescape``, so every byte git printed survives into the
+        returned string and back out of it. Decoding it as UTF-8 text instead
+        turned each ``\\r\\n`` line end into ``\\n`` and each non-UTF-8 byte into
+        U+FFFD, and ``git apply`` then refused the whole patch — one CRLF or
+        latin-1 file anywhere in the tree sank the recovery of every other file
+        too. The return type is still ``str`` for the existing callers; the
+        surrogate escapes are the one encoding that round-trips losslessly
+        through a ``str``.
+
         ``GitError`` propagates only when git itself could not be run: the
         caller treats a failed capture as "the work stays only in the working
         tree", never as an empty patch.
         """
         # No HEAD yet (a repo with no commit): the index diff is the whole patch.
         base = "HEAD" if self._has_head() else "--cached"
-        parts = [self._run(["git", "diff", base, "--binary", "--"],
-                           "git diff failed")]
+        parts = [self._run_bytes(["git", "diff", base, "--binary", "--"],
+                                 "git diff failed").decode("utf-8", "surrogateescape")]
         for path in self.untracked_paths():
             # --no-index exits 1 when the files differ, which is the normal case.
             proc = run_git(
                 ["git", "diff", "--no-index", "--binary", "--",
                  os.devnull, path],
-                cwd=self.repo_dir, timeout=120, encoding="utf-8",
-                errors="replace", retries=1,
+                cwd=self.repo_dir, timeout=120, text=False, retries=1,
             )
             if proc.returncode in (0, 1) and proc.stdout:
-                parts.append(proc.stdout)
+                parts.append(proc.stdout.decode("utf-8", "surrogateescape"))
         return "".join(parts)
 
     def untracked_paths(self) -> list[str]:
@@ -635,6 +644,40 @@ class GitManager:
     _LOCK_CONTENTION_RE = LOCK_CONTENTION_RE
     _LOCK_RETRIES = LOCK_RETRIES
     _LOCK_BACKOFF_S = LOCK_BACKOFF_S
+
+    def _run_bytes(self, cmd: list[str], error_msg: str) -> bytes:
+        """One attempt at *cmd*, returning git's stdout as raw ``bytes``.
+
+        HARDEN-7 D: the one caller that must reproduce git's output byte for
+        byte — ``diff_working_tree``'s patch — cannot go through ``_run``,
+        which decodes as UTF-8 with ``errors="replace"`` and so loses every
+        ``\\r`` and every non-UTF-8 byte. Everything else about the call is
+        ``_run``'s: the same held-index ladder, the same 60 s bound, the same
+        ``GitError`` on a failure.
+        """
+        try:
+            proc = run_git(
+                cmd,
+                cwd=self.repo_dir,
+                timeout=60,
+                text=False,
+                retries=self._LOCK_RETRIES,
+                backoff_s=self._LOCK_BACKOFF_S,
+                sleep=self._backoff,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise self._raise(cmd, error_msg, exc) from exc
+        if proc.returncode != 0:
+            # Decoded for the message only: an error text is never the bytes
+            # the caller was going to write out.
+            shown = (proc.stderr or b"").decode("utf-8", "replace")
+            raise GitError(
+                f"{error_msg}\n"
+                f"  cmd : {' '.join(cmd)}\n"
+                f"  code: {proc.returncode}\n"
+                f"  err : {shown.strip()}"
+            )
+        return proc.stdout or b""
 
     def _run(self, cmd: list[str], error_msg: str) -> str:
         """Run *cmd* inside *repo_dir*, capture output, raise on failure.

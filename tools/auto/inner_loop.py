@@ -55,6 +55,10 @@ from tools.auto.gate_registry import (  # GATES-1 / GATES-2
 from tools.agent_trace import tracer   # AUTO-CR-27: per-stage decision tracing
 from tools.auto.utils import is_pytest_command   # RUN-3
 from tools.llm_stream import strip_json_fence     # HARDEN-1 A7: Gate 2's fence handling
+# HARDEN-7: the shared readers of a reply field's type. Gate 2's "approved" is
+# read fail-closed and its "feedback" as text, so a verdict a small local model
+# spelled as a string can neither approve a rejection nor crash the review.
+from tools.llm_stream import reply_is_yes, reply_text
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -759,7 +763,12 @@ class LLMGate2Validator:
                 ]
             else:
                 self.last_missing_context = []
-            approved = bool(parsed.get("approved", False))
+            # HARDEN-7 A: read the verdict fail-closed. `bool(...)` made every
+            # non-empty string true, so `{"approved": "false", "feedback":
+            # "REJECT: ..."}` — a rejection in the model's own words — was
+            # committed as an approval. Only an explicit yes approves now, and
+            # the reply's feedback is kept for the rejection below.
+            approved = reply_is_yes(parsed.get("approved"))
             if approved:
                 return True, ""
 
@@ -1104,18 +1113,25 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
 
 
 def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
-    """Build a structured rejection string from a Gate-2 dict (LOOP-1)."""
-    feedback = parsed.get("feedback", "no reason given")
+    """Build a structured rejection string from a Gate-2 dict (LOOP-1).
+
+    HARDEN-7 A: ``feedback`` and ``suggested_approach`` are read through
+    :func:`tools.llm_stream.reply_text`, so a rejection whose critique the model
+    sent as a list or a number still reaches the coder as text instead of
+    ``Reason: ['a', 'b']``.
+    """
+    feedback = reply_text(parsed.get("feedback")) or "no reason given"
     # A hints string is wrapped as one hint, so it is not sliced character by character (BUGFIX).
     raw_hints = parsed.get("hints")
     if isinstance(raw_hints, list):
-        hints = raw_hints
+        # A hint of another type is text, and a null or empty one is no hint: `[null]` printed "1. None" to the coder.
+        hints = [h for h in (reply_text(h) for h in raw_hints) if h]
     elif isinstance(raw_hints, str) and raw_hints.strip():
         hints = [raw_hints]
     else:
         hints = []
     hints = hints[:max_hints]
-    approach = parsed.get("suggested_approach", "")
+    approach = reply_text(parsed.get("suggested_approach"))
 
     lines = [f"Reason: {feedback}"]
     if hints:

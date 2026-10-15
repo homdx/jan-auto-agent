@@ -15,6 +15,10 @@ import logging
 from typing import List, Tuple
 
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
+# HARDEN-7 C: the shared reader of a reply field's type. The validators this
+# module drives answer `feedback` themselves, and a list or a number in that
+# field raised AttributeError out of `/edit` and the text-QA loop.
+from tools.llm_stream import reply_text
 from tools.agent_trace import tracer
 from tools.file_reader import read_file
 from tools.ui import Spinner, stream_tracker
@@ -399,7 +403,7 @@ class OrchestratorActions:
 
             if validation.get("_api_error") or validation.get("_unparseable"):
                 print(f"[{_ts()}] ⚠️  Validator unavailable — accepting answer as-is. "
-                      f"({validation.get('feedback', '')})")
+                      f"({reply_text(validation.get('feedback'))})")
                 print(f"[{_ts()}] ✅ Answer found in {file_path} (unvalidated).")
                 return
 
@@ -408,7 +412,7 @@ class OrchestratorActions:
                       f"(validated, grounded={validation.get('grounded')}).")
                 return
 
-            feedback = (validation.get("feedback") or "").strip()
+            feedback = reply_text(validation.get("feedback"))
             if feedback:
                 print(f"[{_ts()}] ❗ Answer rejected: {feedback}")
             print(f"[{_ts()}] No chunk contained a validated answer to: {query}")
@@ -450,7 +454,7 @@ class OrchestratorActions:
 
             if validation.get("_api_error") or validation.get("_unparseable"):
                 print(f"[{_ts()}] ⚠️  Validator unavailable — accepting answer as-is. "
-                      f"({validation.get('feedback', '')})")
+                      f"({reply_text(validation.get('feedback'))})")
                 print(f"[{_ts()}] ✅ Answer found in chunk {i}/{len(chunks)} (unvalidated).")
                 return
 
@@ -459,7 +463,7 @@ class OrchestratorActions:
                       f"(validated, grounded={validation.get('grounded')}).")
                 return
 
-            feedback = (validation.get("feedback") or "").strip()
+            feedback = reply_text(validation.get("feedback"))
             if feedback:
                 print(f"[{_ts()}] ❗ Chunk {i}/{len(chunks)} answer rejected: {feedback}")
 
@@ -711,7 +715,7 @@ class OrchestratorActions:
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Validator unavailable — "
                           f"max iterations reached, keeping best answer. "
-                          f"({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
+                          f"({reply_text(validation.get('feedback'))}, {_val_elapsed:.1f}s)")
                     break
                 _chk = {
                     "loop": "run_text_qa",
@@ -726,7 +730,7 @@ class OrchestratorActions:
                 continue  # retry same iteration (do not increment)
 
             _api_err_count = 0
-            feedback = (validation.get("feedback") or "").strip()
+            feedback = reply_text(validation.get("feedback"))
             if feedback:
                 print(f"[{_ts()}] ❗ Validator feedback: {feedback}")
             iteration += 1
@@ -737,7 +741,7 @@ class OrchestratorActions:
         if validation.get("status") != "approved":
             print(f"[{_ts()}] ⚠️  UNVALIDATED ANSWER — validator never approved "
                   f"after {self.max_iterations} iteration(s). Last feedback: "
-                  f"{validation.get('feedback', '(none)')!r}. Review carefully.")
+                  f"{reply_text(validation.get('feedback'))!r}. Review carefully.")
         print(answer.strip() if answer and answer.strip() else "(no answer produced)")
         print(f"\n[{_ts()}] status={validation.get('status', 'unknown')}  "
               f"grounded={validation.get('grounded')}")
@@ -1123,7 +1127,7 @@ class OrchestratorActions:
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Edit validator unavailable — "
                           f"max iterations reached, writing best effort. "
-                          f"({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
+                          f"({reply_text(validation.get('feedback'))}, {_val_elapsed:.1f}s)")
                     break
                 _chk = {
                     "loop": "run_edit",
@@ -1141,7 +1145,11 @@ class OrchestratorActions:
                 continue  # retry same iteration (do not increment)
 
             _api_err_count = 0
-            feedback = (validation.get("feedback") or "").strip()
+            # HARDEN-7 C: the feedback is read as text, so a validator that
+            # listed its complaints as a JSON array prints them instead of
+            # raising AttributeError out of `/edit` — and out of the shell with
+            # it, since nothing there catches it.
+            feedback = reply_text(validation.get("feedback"))
             if feedback:
                 print(f"[{_ts()}] ❗ Edit feedback: {feedback}")
 

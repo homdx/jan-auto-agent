@@ -8,6 +8,9 @@ import logging
 
 from tools.agent_trace import tracer
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
+# HARDEN-7 C: the shared reader of a reply field's type, used to normalise the
+# `feedback` this agent returns (see validate()'s last step).
+from tools.llm_stream import reply_text
 from tools.ui import safe_stdout_write as _safe_stdout_write
 
 logger = logging.getLogger(__name__)
@@ -232,5 +235,15 @@ class ValidatorAgent:
         if isinstance(parsed_result.get("suggested_searches"), list):
             parsed_result["suggested_searches"] = \
                 parsed_result["suggested_searches"][:self.max_hints]
+        # HARDEN-7 C: the `feedback` is a string by the time it leaves here,
+        # whatever JSON type the model sent for it. Every caller does
+        # `(validation.get("feedback") or "").strip()`, which raises
+        # AttributeError on a list, a number or an object — and in the
+        # interactive shell nothing catches that (`main.py` catches only
+        # KeyboardInterrupt and EOFError), so the shell exits after every LLM
+        # call of the run has been paid for. A string is left exactly as it
+        # arrived, so a well-behaved reply is unchanged.
+        if not isinstance(parsed_result.get("feedback"), str):
+            parsed_result["feedback"] = reply_text(parsed_result.get("feedback"))
         tracer.event("validator_agent", "orchestrator", "result", content=parsed_result)
         return parsed_result

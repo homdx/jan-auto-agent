@@ -864,6 +864,63 @@ def strip_json_fence(text: str) -> str:
     return text
 
 
+#: The spellings a model's yes/no field may carry for a yes (HARDEN-7). The
+#: list is closed on purpose: anything not in it — a string such as "false",
+#: "no" or "rejected" included — is a no, so a field read this way can only
+#: ever lose an approval, never invent one.
+_YES_SPELLINGS: tuple[str, ...] = ("true", "yes", "y", "1", "approved", "ok")
+
+
+def reply_text(value) -> str:
+    """Read one field of a model's JSON reply as text, whatever type it arrived as.
+
+    HARDEN-7: a prompt asks for ``"feedback": "one concise sentence"`` and a
+    small local model answers ``["too long", "no tests"]``, ``5`` or ``{"a": 1}``.
+    Every caller then does ``(value or "").strip()``, which raises
+    ``AttributeError: 'list' object has no attribute 'strip'`` on the first two
+    and takes the run down with it — after the call has already been paid for.
+
+    A string comes back stripped, unchanged otherwise, so a well-behaved reply
+    is byte-identical to what the caller's own ``.strip()`` produced. A list is
+    one item per line; any other value is its text; ``None`` is empty. Never
+    raises, so the reader itself cannot be the thing that ends a run.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        # A list one item per line: the model meant several lines of text and
+        # sent them as JSON. Nesting is flattened with the same rule.
+        return "\n".join(reply_text(item) for item in value).strip()
+    return str(value).strip()
+
+
+def reply_is_yes(value) -> bool:
+    """Read one field of a model's JSON reply as a yes/no, fail-closed.
+
+    HARDEN-7 A: ``bool(parsed.get("approved", False))`` treats every non-empty
+    string as ``True``, so Gate 2 — the last check before a commit — read
+    ``{"approved": "false", "feedback": "REJECT: breaks the public API"}`` as an
+    APPROVAL and committed a change its own validator had rejected.
+
+    Only an explicit yes approves: the JSON ``true``, the number ``1``, or a
+    string whose trimmed, lower-cased spelling is in ``_YES_SPELLINGS``. Every
+    other value — a string such as ``"false"``, ``"no"`` or ``"rejected"``
+    included, and any number that is not 1 — is a no.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in _YES_SPELLINGS
+    # A list or an object is not a verdict in any spelling: a no.
+    return False
+
+
 def make_unverified_context() -> ssl.SSLContext:
     """Return an SSLContext that skips certificate verification."""
     ctx = ssl.create_default_context()

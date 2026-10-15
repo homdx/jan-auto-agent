@@ -7,6 +7,13 @@ from typing import Any, Dict, List, TYPE_CHECKING
 if TYPE_CHECKING:
     from tools.prompt_parser import ParsedPrompt
 
+# HARDEN-7 C: the shared reader of a reply field's type. `render` is the last
+# step of a run — after every LLM call has been paid for — and the improvement
+# agent's `explanation` / `improved_code` used to be read with
+# `(improvement.get("explanation") or "").strip()`, which raised AttributeError
+# on a model that answered with a list instead of a string.
+from tools.llm_stream import reply_text
+
 # Strip only bullet markers ("- ", "* "), not a leading minus or star that is part of the text (e.g. "-1 is returned").
 _BULLET_MARKER_RE = re.compile(r"^\s*[-*]\s+")
 
@@ -105,7 +112,7 @@ class OutputFormatter:
 
         # Skip EXPLANATION for intent show and show_imports.
         if intent not in ("show", "show_imports"):
-            explanation_text = (improvement.get("explanation") or "").strip()
+            explanation_text = reply_text(improvement.get("explanation"))
             if explanation_text:
                 print("# EXPLANATION")
                 print(explanation_text)
@@ -126,7 +133,7 @@ class OutputFormatter:
             print()
 
             # Sub-Section: IMPROVED CODE
-            improved_code_text = (improvement.get("improved_code") or "").strip()
+            improved_code_text = reply_text(improvement.get("improved_code"))
             if improved_code_text:
                 print("# IMPROVED CODE")
                 print(improved_code_text)

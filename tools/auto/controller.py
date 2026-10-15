@@ -877,7 +877,15 @@ class AutoController:
             )
             return ""
         try:
-            atomic_write_text(patch_path, diff)
+            # HARDEN-7 D: the patch is written as the bytes git printed.
+            # ``diff_working_tree`` returns a str decoded with surrogateescape,
+            # so each lone surrogate here is one byte of a CRLF line end or of a
+            # non-UTF-8 file; ``errors="surrogateescape"`` puts it back and
+            # ``newline=""`` leaves the line ends alone. Encoding it as plain
+            # UTF-8 replaced the surrogates with U+FFFD, and ``git apply`` then
+            # refused the whole patch — one such file anywhere in the tree sank
+            # the recovery of the task's other files as well.
+            atomic_write_text(patch_path, diff, newline="", errors="surrogateescape")
         except OSError as exc:
             logger.error(
                 "task %s: could not write %s (%s) — the uncommitted work "

@@ -161,7 +161,8 @@ def _umask() -> int:
 
 
 def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = False,
-                      newline: "str | None" = None, encoding: str = "utf-8") -> None:
+                      newline: "str | None" = None, encoding: str = "utf-8",
+                      errors: str = "strict") -> None:
     """Write *content* to *path* atomically (temp file + ``os.replace``).
 
     ``os.replace`` is a single filesystem rename, which POSIX and Windows both
@@ -185,6 +186,13 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
     give it (0666 less the umask): mkstemp's temporary file is 0600, and the
     rename made a 0644 IMPROVEMENTS.md and a 0755 script 0600. *newline* is
     ``open()``'s: ``""`` writes *content*'s line ends as they are.
+
+    *errors* is ``open()``'s too, and matters only for a caller whose *content*
+    holds lone surrogates — HARDEN-7 D: a patch captured from git with
+    ``surrogateescape``, where each surrogate is one byte git actually printed.
+    ``errors="surrogateescape"`` turns each back into that byte and
+    ``newline=""`` keeps ``\\r\\n`` as it was, so the file on disk is the bytes
+    git produced.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,7 +204,7 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
             os.chmod(tmp_name, (path.stat().st_mode & 0o7777) if path.exists() else 0o666 & ~_umask())
         except OSError:
             pass
-        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as f:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline, errors=errors) as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
