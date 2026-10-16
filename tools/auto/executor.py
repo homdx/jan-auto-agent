@@ -1009,9 +1009,11 @@ _SECRET_AUTH_RE = re.compile(
 # have swallowed the rest of the command (`x-api-key: v pytest -q` became
 # `x-api-key: [REDACTED]`). `Authorization` keeps its own rule: its value is two words,
 # `Bearer sk-...`, and it is run first so the token behind the word is hidden too.
+# The credential word is a whole part of the name and the separator is not half of a `::`, so a
+# pytest node id (`test_tokenizer.py::TestTokenizer::test_split`) and `TOKENIZERS_PARALLELISM` stay.
 _SECRET_HEADER_RE = re.compile(
-    r"(?i)([A-Za-z0-9_-]*[-_]?(?:api[-_]?key|apikey|token|secret|password|passwd|"
-    r"key)[A-Za-z0-9_-]*)([=:])(\s*)([^\s\"'\n]+)(?=[\s\"'\n]|$)"
+    r"(?i)((?<![A-Za-z0-9_])(?:[A-Za-z0-9]+[-_])*(?:api[-_]?key|apikey|token|secret|password|passwd|key)"
+    r"(?:[-_][A-Za-z0-9]+)*)([=:])(?!:)(\s*)([^\s\"'\n]+)(?=[\s\"'\n]|$)"
 )
 
 # HARDEN-12 D: `NAME=value` handing a key to a command, where NAME names a credential.
@@ -1019,7 +1021,7 @@ _SECRET_HEADER_RE = re.compile(
 # a `NAME=value` mid-argument is a coincidence (`grep foo=bar file`) and stays.
 _SECRET_ENV_ASSIGN_RE = re.compile(
     r"(?i)(^|[;|&])(\s*)((?:export\s+|env\s+)?)"
-    r"([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Za-z0-9_]*)"
+    r"((?:[A-Za-z0-9]+_)*(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD)(?:_[A-Za-z0-9]+)*)"
     r"=(\s*)(\"[^\"]*\"|'[^']*'|[^\s;|&]+)"
 )
 
@@ -1027,7 +1029,7 @@ _SECRET_ENV_ASSIGN_RE = re.compile(
 # `name://`, the user is kept, and a URL without a password is left byte for byte. The
 # user may be empty: `redis://:password@host` names no user at all (HARDEN-15 C).
 _SECRET_URL_USERINFO_RE = re.compile(
-    r"([A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:)([^@\s]+)(@)"
+    r"([A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:)([^@\s/]+)(@)"   # a `/` ends the authority: `host:443/@scope` is a port
 )
 
 # HARDEN-12 D: `-u user:pass`. The colon is the tell, so `-u someflag` is a flag value,
@@ -1220,7 +1222,8 @@ def _redact_command(command: str) -> str:
         redacted = _SECRET_URL_USERINFO_RE.sub(
             lambda m: f"{m.group(1)}[REDACTED]{m.group(3)}", redacted)
         redacted = _SECRET_USER_OPT_RE.sub(
-            lambda m: f"{m.group(1)}{m.group(2)}:[REDACTED]", redacted)
+            lambda m: m.group(0) if m.group(2).isdigit() and m.group(3).isdigit()   # `-u 1000:1000` is uid:gid
+            else f"{m.group(1)}{m.group(2)}:[REDACTED]", redacted)
         redacted = _redact_password_flags(redacted)
         return redacted
     except Exception:  # pragma: no cover — never let redaction crash the executor

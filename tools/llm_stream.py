@@ -228,7 +228,8 @@ _API_KEY_ANNOTATED_RE = re.compile(
     r"(\"[^\"\r\n]*\"|'[^'\r\n]*')"
 )
 # the same key in JSON: "api_key": "<value>", "openai_api_key": "<value>"
-_API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]*(")')
+# An empty value (`"api_key": ""`) is an unset key, not a secret.
+_API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]+(")')
 # The same key in YAML/INI colon form, UNQUOTED: `api_key: <value>`, indented or
 # bullet-led (`  - api_key: <value>`), commented or not. `_API_KEY_LINE_RE` wants an
 # `=` and `_API_KEY_JSON_RE` wants a quoted value, so this is the one shape neither
@@ -262,7 +263,9 @@ _API_KEY_COLON_RE = re.compile(
 # — `os.environ["X_API_KEY"] = os.getenv("Y")` stays code.
 _ENV_SUBSCRIPT_ASSIGN_RE = re.compile(
     r"(?i)([ \t]*(?:[#;]+[ \t]*)?)"
-    r"((?:[A-Za-z_][\w.]*\.)?environ)\[([\"'])([\w.-]*(?:key|token|secret|password)[\w.-]*)\3\]"
+    # The credential word is a whole part of the name: `TOKENIZERS_PARALLELISM`, `KEYBOARD_LAYOUT` are not keys.
+    r"((?:[A-Za-z_][\w.]*\.)?environ)\[([\"'])"
+    r"((?:[\w.-]*[_.-])?(?:api[_-]?key|key|token|secret|password|passwd)(?:[_.-][\w.-]*)?)\3\]"
     r"([ \t]*(?<![=!<>~&|])=(?![=~])[ \t]*)"
     r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";]+)([ \t]*\r?)"
 )
@@ -450,7 +453,10 @@ def _value_is_secret_literal(value: str, key_name: str, colon: bool = False) -> 
     if _is_plain_quoted(value):
         body = _split_prefix(value)[1]
         inner = body[1:-1].strip()
-        return bool(inner) and not _is_template_placeholder(inner)
+        # `apiKey = "apiKey"` (an enum's member) names the key, it does not hold one.
+        own_name = _NON_ALNUM.sub("", key_name.rsplit(".", 1)[-1].lower())
+        return (bool(inner) and not _is_template_placeholder(inner)
+                and _NON_ALNUM.sub("", inner.lower()) != own_name)
     body = _split_prefix(value)[1]
     if _REFERENCE_VALUE_RE.match(body):
         # A format or shell reference names a value that lives somewhere else, so it holds no
