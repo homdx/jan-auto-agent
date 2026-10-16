@@ -1,13 +1,17 @@
 # HARDEN-13 — an ordinary edit above a key line makes the restore write `here_your_key` over the real key; a masked line that could not be restored is written anyway; a retry overwrites the only backup; a bare JWT, an XML element and a spaced `apikey <token>` leave the machine, and a digit-free token after a colon is not masked
 
-**Status:** open
+**Status:** landed (round 311: step-5-preview as the base — the reply is aligned against the masked original line for line and a key is restored only where the line it sits under is the line it sat under (A), a restore that failed refuses the write in `Coder._write_files` and `/edit` (A2), every line ending `splitlines()` knows is put back (A3), the first write of a task run makes the `.coder.bak` and the later ones keep it (B), and the XML element and attribute pair, the spaced name, the bare JWT and the digit-free token are masked by humps and length in small checks (C)). The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** HIGH (A: a routine config edit destroys a working key on disk, the write reports success); MEDIUM (B: after A the key survives only in a backup the next write replaces); MEDIUM (C: a secret reaches the provider); LOW (A3)
 **File:** `tools/llm_stream.py` (A, C), `tools/auto/coder.py` (A2, B), `tools/actions.py` (A2)
 **Symbol:** A: `restore_masked_secrets`. A2: `Coder._write_files` (the restore call), `/edit` (`run_edit`, the restore call). B: `Coder._write_files` (the `.coder.bak` copy). C: `_SECRET_PREFIX_RE`, `_identifier_is_a_credential`, `_API_KEY_LINE_RE`, `mask_api_key`
-**Round:** (set when the round starts)
+**Round:** 311
 **Size:** M
 **Depends on:** HARDEN-5 (303), HARDEN-9 (307), HARDEN-11 (309), HARDEN-12 (310), all landed
 **Also touches:** `tests/test_mask_api_key_forms.py`, `tests_bugfix/test_harden11_*`, `tests_bugfix/test_restore_*` (pins that encode today's "left as the placeholder" rule: each one that changes is a decision the commit states), `tests/`, `tests_bugfix/`
+
+Why not the others: in a black box that drives each tree (345 checks over A to C through the real `restore_masked_secrets`, `Coder._write_files` and `/edit`), step-5-preview passed 342, sensenova-var1 339, var2 338, var3 334, laguna 313, var4 309, agnes 305, nemotron 294, and glm-4.7-flash did not import (its `tools/llm_stream.py` was cut by 2 400 lines). The round was stopped at 2 h 20 with one entry READY and the rest judged from their working trees. Step-5's alignment is the only one that keeps HARDEN-11 A's guarantee (a pairing is accepted only under the same header) while giving the table of Part A, and its tests were the strongest in the cross matrix (136/136 on its own code, the most on the others'). var1 refused the ordinary edit that var2 and step-5 restored, var2 missed `API key: V`, var3 lost a renamed section and masked `<add key="mode" value="production"/>`.
+
+Found at judging and fixed in the same commit (present in every entry, or on the base): `<api_key>$OPENAI_API_KEY</api_key>` was masked, where `api_key: $VAR` is a reference (the new XML rule forgot the `$` exception); a `base_url` deleted between a header and its key lost the key (the place was the deleted line); `difflib.SequenceMatcher` with `autojunk=False` is quadratic in the lines that repeat, 9 000 lines cost 6.6 s on every write (now the common head and tail are paired as they stand and a middle over a million cells is aligned without the popular lines); and a key line the model edited around (`"api_key": "…", "model": "z"`, blanks or a comment after the key) is not the masked text of any original line, so it was written with the placeholder in it and no word of it (the secrets of the paired original line go back into the placeholders in order). `tests/test_harden13_judging_gaps.py` pins them.
 
 ---
 

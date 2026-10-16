@@ -10,6 +10,7 @@ This lets the validator / improvement agents show their answer being typed out
 in real time while still receiving the complete text to json.loads() at the end.
 """
 
+import difflib
 import json
 import logging
 import re
@@ -243,9 +244,13 @@ _API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]
 # `api_key => 'gsk_…'` behind. The arrow alternative is tried before the `=` one, and
 # the `=` one keeps HARDEN-10 B's guards, so `api_key >= '…'` and `api_key == '…'`
 # are still comparisons and not assignments.
+#
+# HARDEN-13 C: the name may carry a space, `API key:` — the very same key written
+# the way a sentence writes it. Only between `api` and `key`, so a name is not a
+# run of prose words.
 _API_KEY_COLON_RE = re.compile(
     r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:[-*][ \t]+)?)'
-    r"((?:['\"])?[\w.-]*api[_-]?key(?:['\"])?)"
+    r"((?:['\"])?[\w.-]*api[ _\-]?key(?:['\"])?)"
     r"([ \t]*(?:=>|(?<![=!<>~&|])=(?![=~>])|:)[ \t]*)"
     r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^#\s;\"'\,\}\]\)\|=&]+)"
 )
@@ -264,9 +269,45 @@ _ENV_SUBSCRIPT_ASSIGN_RE = re.compile(
 # HARDEN-12 B: an XML element whose tag is a key name, `<api_key>gsk_…</api_key>`. The tag
 # name carries the rule's job, the content is judged by `_value_is_secret_literal`, so
 # `<api_key>Value</api_key>` stays as it is.
+#
+# HARDEN-13 C: the plain `<api_key>` shape never matched at all — the leading
+# `[A-Za-z]` of the old name class ate the `a` of `api`, so only a *prefixed* name
+# (`<openai_api_key>`, `<myapikey>`) could match and the commonest one of them all left
+# the machine. The prefix is optional now, and `secret_key` is a key name too.
 _API_KEY_XML_RE = re.compile(
-    r"(?i)(<([A-Za-z][\w:-]*(?:api[_-]?key|apikey)[\w:-]*)[ \t]*>)([^<\r\n]*)(</\2[ \t]*>)"
+    r"(?i)(<([\w.-]*(?:api[_-]?key|apikey|secret[_-]?key)[\w.-]*)[ \t]*>)"
+    r"([^<\r\n]*)(</\2[ \t]*>)"
 )
+# HARDEN-13 C: a bare `<key>V</key>` element. The tag names no key, so it counts
+# only when the element's own line or the element it sits inside does — found
+# first, judged second (see `_mask_bare_key_element`).
+_BARE_KEY_XML_RE = re.compile(
+    r"(?i)(<key(?:[ \t]+[^<>]*)?>)([^<\r\n]*)(</key[ \t]*>)"
+)
+# HARDEN-13 C: an XML start tag, found first so its attributes can be walked as a
+# pair — `key="api_key" value="V"` — before the value is judged at all.
+_XML_START_TAG_RE = re.compile(r"<([A-Za-z][\w:.-]*)((?:[ \t]+[A-Za-z_][\w:.-]*"
+                               r"(?:[ \t]*=[ \t]*(?:\"[^\"]*\"|'[^']*'|[^\s>]+))?)*)[ \t]*/?>")
+_XML_ATTR_RE = re.compile(r"([A-Za-z_][\w:.-]*)[ \t]*=[ \t]*(\"[^\"]*\"|'[^']*'|[^\s>]+)")
+# A key name as the whole value of an attribute: `key="api_key"`.
+_XML_KEY_NAME_VALUE_RE = re.compile(
+    r"^[\w.-]*(?:api[ _\-]?key|apikey|secret[ _\-]?key)s?$", re.IGNORECASE)
+# HARDEN-13 C: the same key in prose, with a space where a config has `=` or `:`
+# (`apikey V`, `x-api-key V`). The value is a token, so `api_key is required`
+# and `apikey of the provider` are prose and stay.
+_API_KEY_SPACE_RE = re.compile(
+    r"(?i)(?<![\w.-])([\w.-]*api[ _\-]?key)([ \t]+)"
+    r"([A-Za-z0-9][A-Za-z0-9_-]{19,})(?![\w-])"
+)
+# A key name wherever it sits in a line, for the rules that have to look at the
+# line rather than at a key-value pair (HARDEN-13 C: the bare `<key>` element).
+_KEY_NAME_IN_LINE_RE = re.compile(r"(?i)api[ _\-]?key")
+# A tag of any shape, open, close or self-closed, for walking a parent chain.
+_XML_ANY_TAG_RE = re.compile(r"<([/]?)([A-Za-z][\w:.-]*)((?:[^<>\"']|\"[^\"]*\"|'[^']*')*)>")
+# HARDEN-13 C: a bare JWT, three base64url runs joined by dots with the first
+# starting `eyJ` (the base64 of `{"`), wherever it stands — with a key name or
+# without one. The runs are judged one by one, not by one pattern.
+_JWT_RUN_RE = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}")
 # A bare Python/JS identifier: a NAME, i.e. a reference to something, never a literal secret.
 _BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # A quoted value with no `{` inside — a literal, not a template. The prefix of a
@@ -458,6 +499,11 @@ def _name_is_not_a_credential(name: str) -> bool:
     return len(parts) > 1 and parts[-1] in _NOT_A_CREDENTIAL_SUFFIXES
 
 
+#: A name is rarely over 32 letters: a single run of letters that long, with no case
+#: structure to break it into words, is what a token looks like (HARDEN-13 C).
+_NAME_MAX_LETTERS = 32
+
+
 def _identifier_is_a_credential(value: str) -> bool:
     """Whether a bare identifier of letters, digits and underscores carries the shape
     of a credential rather than a name (HARDEN-12 A).
@@ -470,8 +516,45 @@ def _identifier_is_a_credential(value: str) -> bool:
     CamelCase name a credential, so an indented dataclass field went out masked and a
     faithful edit wrote the placeholder back where an annotation named a class — the
     module then failed to import, and nothing reported it.
+
+    HARDEN-13 C: a run of letters is not only a name — ``qLKjHGfdSaZXcVbNmPoiUyTzAbCdEfGh``
+    is a credential too, and a rule that wanted a digit threw every digit-free token
+    away. So the letters are asked whether they read as a name: a name is words of three
+    or more letters (``Provider|Credentials|Holder``) with at most one short acronym
+    (``Async|Open|AI|Client|Factory``), while a token has several one- and two-letter
+    humps (``q|LKj|HG|fd|Sa|ZX|c|Vb``). Only a word with no case structure at all is
+    read by length, since a name is rarely over 32 letters.
     """
-    return any(ch.isdigit() for ch in value) or bool(_SECRET_PREFIX_RE.search(value))
+    return (any(ch.isdigit() for ch in value)
+            or bool(_SECRET_PREFIX_RE.search(value))
+            or not _letters_read_as_a_name(value))
+
+
+#: A CamelCase word: an acronym run that the next word does not lowercase (`API` in
+#: `APIKey`, and `AABB` whole), a capitalised word, or a run of lowercase letters and
+#: digits. `re.findall` of it splits a name into its humps.
+_CAMEL_HUMP_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _letters_read_as_a_name(value: str) -> bool:
+    """Whether a run of letters (with underscores, or digits) reads as a name
+    rather than a token (HARDEN-13 C).
+
+    Two small checks, because one pattern cannot tell ``ProviderCredentialsHolder``
+    from ``qLKjHGfdSaZXcVbNmPoiUyTzAbCdEfGh``: the *humps* — a name is several words of
+    three or more letters with at most one short acronym, a token has several one- or
+    two-letter humps — and, for a word with no case structure at all, the *length*,
+    since a name is rarely over 32 letters.
+    """
+    humps = _CAMEL_HUMP_RE.findall(value)
+    short = sum(1 for hump in humps if len(hump) < 3)
+    if len(humps) >= 3 and short <= 1:
+        return True         # ProviderCredentialsHolder, APIKeyProviderFactory
+    if short >= 3:
+        return False        # qLKjHGfdSaZXcVbNmPoiUyTzAbCdEfGh
+    if len(value) > _NAME_MAX_LETTERS and len(humps) <= 2:
+        return False        # one long run of letters, with no case structure
+    return True             # str, client_factory, SecretStr, OAuth
 
 
 def _part_mixes_letters_and_digits(part: str) -> bool:
@@ -569,6 +652,29 @@ def _quote_of(value: str) -> str:
     return prefix + quote
 
 
+def _xml_parent_element(before: str) -> "str | None":
+    """The name of the element an XML element at the end of *before* sits inside,
+    or ``None`` when it is at the top level (HARDEN-13 C).
+
+    Walks the tags that came before it and keeps a stack of the open ones, the
+    way a document's own nesting does, so `<api_keys><key>…</key></api_keys>`
+    answers `api_keys` and a bare `<key>` answers `None`.
+    """
+    stack: "list[str]" = []
+    for match in _XML_ANY_TAG_RE.finditer(before):
+        closing, name = match.group(1), match.group(2)
+        if match.group(0).endswith("/>"):
+            continue                      # self-closed: it opens nothing
+        if closing:
+            while stack and stack[-1] != name:
+                stack.pop()
+            if stack:
+                stack.pop()
+            continue
+        stack.append(name)
+    return stack[-1] if stack else None
+
+
 def mask_api_key(text: "str | None") -> "str | None":
     """Replace every ``api_key = <literal>`` in *text* with
     ``api_key = here_your_key``, leaving code on the right-hand side alone
@@ -640,6 +746,9 @@ def mask_api_key(text: "str | None") -> "str | None":
 
     def _mask_xml(m: "re.Match") -> str:
         open_tag, tag_name, value, close_tag = m.groups()
+        if value.strip().startswith("$"):
+            # `<api_key>$OPENAI_API_KEY</api_key>` names an environment variable, as `api_key: $VAR` does.
+            return m.group(0)
         if not _value_is_secret_literal(value, tag_name, colon=not _is_plain_quoted(value)):
             return m.group(0)
         str_prefix, quote = _quote_parts(value)
@@ -650,9 +759,77 @@ def mask_api_key(text: "str | None") -> "str | None":
         # "the bearer authentication_scheme is used" is English, not a credential: a long
         # word of letters and underscores is prose, while a token carries a digit or a
         # separator. The 16-character rule alone kept both (HARDEN-10 B).
-        if _BEARER_PROSE_WORD_RE.fullmatch(token):
+        if _BEARER_PROSE_WORD_RE.fullmatch(token) and _letters_read_as_a_name(token):
             return m.group(0)
         return m.group(1) + _MASK_PLACEHOLDER
+
+    def _mask_space(m: "re.Match") -> str:
+        key_name, separator, value = m.groups()
+        # The value is a token, and a name is prose: `api_key is required`,
+        # `apikey of the provider` never reach the length rule, and a class name
+        # that does is still a name.
+        if len(value) < _TOKEN_MIN_LEN:
+            return m.group(0)
+        if not (any(ch.isdigit() for ch in value) or not _letters_read_as_a_name(value)):
+            return m.group(0)
+        return f"{key_name}{separator}{_MASK_PLACEHOLDER}"
+
+    def _mask_jwt(m: "re.Match") -> str:
+        """A bare JWT: three base64url runs, the first of them `eyJ` — the base64
+        of `{"`, the header every JWT starts with. The runs are checked one by one,
+        so a dotted path of words (`self.settings.api_key`) is never one."""
+        runs = m.group(0).split(".")
+        if len(runs) != 3 or not runs[0].startswith("eyJ"):
+            return m.group(0)
+        if any(not _BASE64URL_RUN_RE.match(run) or len(run) < 4 for run in runs):
+            return m.group(0)
+        return _MASK_PLACEHOLDER
+
+    def _mask_bare_key_element(m: "re.Match") -> str:
+        """`<key>V</key>` where the element's line, or the element it sits inside,
+        names an API key. A bare `<key>` is a dictionary entry as often as it is a
+        credential, so the line has to say so."""
+        open_tag, value, close_tag = m.groups()
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        line = text[line_start:m.end()]
+        parent = _xml_parent_element(text[:m.start()])
+        if not (_KEY_NAME_IN_LINE_RE.search(line)
+                or (parent and _XML_KEY_NAME_VALUE_RE.match(parent))):
+            return m.group(0)
+        if value.strip().startswith("$"):
+            return m.group(0)
+        if not _value_is_secret_literal(value, "api_key", colon=not _is_plain_quoted(value)):
+            return m.group(0)
+        str_prefix, quote = _quote_parts(value)
+        return f"{open_tag}{str_prefix}{quote}{_MASK_PLACEHOLDER}{quote}{close_tag}"
+
+    def _mask_xml_attribute_pair(m: "re.Match") -> str:
+        """`key="api_key" value="V"` inside one start tag: the attribute that names
+        the key, and the attribute that holds its value. The pair is found first,
+        then the value is asked about."""
+        attributes = m.group(2)
+        pairs = _XML_ATTR_RE.findall(attributes)
+        if not any(_XML_KEY_NAME_VALUE_RE.match(value.strip("\"'")) for _, value in pairs):
+            return m.group(0)
+        held = ""
+
+        def _value_attribute(attr: "re.Match") -> str:
+            nonlocal held
+            if attr.group(1).lower() != "value":
+                return attr.group(0)
+            quoted = attr.group(2)
+            prefix, quote = _quote_parts(quoted)
+            if not quote:
+                # An unquoted XML attribute value is not a literal the model would
+                # ever hand back, so it is left alone.
+                return attr.group(0)
+            held = quoted[1:-1]
+            return f"{attr.group(1)}={quote}{_MASK_PLACEHOLDER}{quote}"
+
+        replaced = _XML_ATTR_RE.sub(_value_attribute, attributes)
+        if not held or not _value_is_secret_literal(held, "api_key"):
+            return m.group(0)
+        return m.group(0).replace(attributes, replaced, 1)
 
     def _mask_annotated(m: "re.Match") -> str:
         prefix, key_name, assign, value = m.groups()
@@ -669,8 +846,81 @@ def mask_api_key(text: "str | None") -> "str | None":
     text = _API_KEY_JSON_RE.sub(r"\1" + _MASK_PLACEHOLDER + r"\2", text)
     text = _ENV_SUBSCRIPT_ASSIGN_RE.sub(_mask_env_subscript, text)
     text = _API_KEY_XML_RE.sub(_mask_xml, text)
+    text = _BARE_KEY_XML_RE.sub(_mask_bare_key_element, text)
+    text = _XML_START_TAG_RE.sub(_mask_xml_attribute_pair, text)
     text = _BEARER_TOKEN_RE.sub(_mask_bearer, text)
+    # HARDEN-13 C: the forms that need no key name at all, or no separator — a
+    # bare JWT and a key name followed by its token by a space.
+    text = _JWT_RUN_RE.sub(_mask_jwt, text)
+    text = _API_KEY_SPACE_RE.sub(_mask_space, text)
     return _SECRET_PREFIX_RE.sub(_MASK_PLACEHOLDER, text)
+
+
+# Every place str.splitlines() ends a line at, `\r\n` first so the pair is one
+# boundary (HARDEN-13 A3). restore_masked_secrets used to drop only `\n` and
+# `\r`, so a line the reply ended with U+2028 lost 8 characters of its own value
+# — `api_key = sk-…<U+2028>` came back as `api_key = here_your_key<U+2028>` with
+# the original's ending nowhere and the placeholder left on disk.
+_LINE_BOUNDARY_RE = re.compile(r"\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _split_lines_keepends(text: str) -> "list[str]":
+    """Split *text* into lines on every boundary `str.splitlines()` ends a line
+    at, each line keeping its own ending (HARDEN-13 A3)."""
+    if not text:
+        return []
+    lines: "list[str]" = []
+    start = 0
+    for match in _LINE_BOUNDARY_RE.finditer(text):
+        lines.append(text[start:match.end()])
+        start = match.end()
+    if start < len(text):
+        lines.append(text[start:])
+    return lines
+
+
+def _line_body(line: str) -> str:
+    """*line* without the ending `str.splitlines()` would take off it."""
+    match = _LINE_BOUNDARY_RE.search(line)
+    return line[:match.start()] if match else line
+
+
+def _line_ending(line: str) -> str:
+    """The ending `str.splitlines()` would take off *line* (`""` when there is
+    none) — whatever it is, so a U+2028 is put back as the U+2028 it was."""
+    match = _LINE_BOUNDARY_RE.search(line)
+    return line[match.start():] if match else ""
+
+
+#: Above this many cells (lines of the original x lines of the reply, after the common
+#: head and tail are taken off) the alignment leaves out the lines that repeat.
+_EXACT_ALIGN_CELLS = 1_000_000
+
+
+#: How much of a place line's own characters must still start the line that
+#: replaced it for that line to count as the same one, edited (HARDEN-13 A).
+#: ``[groq]`` → ``[groq_fast]`` is a rename of the same header; ``[openai]`` →
+#: ``[openrouter]`` is another section, and a key must never follow it.
+_SAME_LINE_EDIT_MIN = 0.7
+
+
+def _line_is_the_same_edited(original: str, reply: str) -> bool:
+    """Whether the *reply* line is the *original* line with an edit in it.
+
+    A section the model renamed and a ``base_url`` it rewrote above a key are
+    the line the key sits under, so the key is still restored against them. A
+    line that merely took the old one's place is not: the original's own
+    characters still start the reply line, and a different section's header
+    does not keep that much of it.
+    """
+    if not original or not reply:
+        return False
+    kept = 0
+    for left, right in zip(original, reply):
+        if left != right:
+            break
+        kept += 1
+    return kept >= _SAME_LINE_EDIT_MIN * min(len(original), len(reply))
 
 
 def restore_masked_secrets(original: "str | None", reply: "str | None") -> "str | None":
@@ -684,92 +934,272 @@ def restore_masked_secrets(original: "str | None", reply: "str | None") -> "str 
     that original line again; a line the model edited does not equal it and is
     kept as written.
 
-    HARDEN-11 A: the masked text alone does not say *which* original line it
-    was — every provider section of an ini masks to the same
-    ``api_key = here_your_key``, and handing those back in order wrote a real
-    key under another provider as soon as the reply's structure differed from
-    the file's: delete the first of three sections and its neighbours' keys each
-    moved up one, add a section and the first key was copied into it, reorder
-    the sections and all three keys were swapped. So each original line is
-    filed under its **place** — the nearest line above it that the mask left
-    alone (a section header, a key that is not itself masked) — and a reply line
-    gets a real line back only when the same line sits above it there. Two
-    identical lines under the same line are restored in order, as before. A
-    masked line with no original line in its place is left as the placeholder
-    and warned about, so a structural edit never moves a key: with two or more
-    candidates for that text there is no telling which is right, and guessing is
-    what put a key under the wrong provider. The one case that is not a guess —
-    the whole file holds a single line with that masked text, nothing else has
-    taken it, and no other line of that text was restored by place — is still
-    restored, which is what keeps a file of nothing but key lines restorable when
-    the model rewrites one of them.
+    HARDEN-11 A filed every changed line under its *place* — the nearest line
+    above it that the mask left alone — and that held only for a reply whose
+    structure matched the file's to the line. One line added between a header
+    and its key moved the place, so a routine edit ("change the base_url of one
+    provider") wrote the placeholder over a working key and reported success
+    (HARDEN-13 A). The restore now aligns the whole reply against the masked
+    original with a line-for-line sequence alignment: a masked original line
+    that sits in an unchanged stretch of the reply gets its text back, and an
+    inserted, edited or re-indented line changes only its own stretch.
+
+    HARDEN-11 A's guarantee still holds on top of it: an alignment pair is
+    accepted only when the line the key sits under in the reply is the line it
+    sat under in the original (the same one, or the same one edited — a renamed
+    section is the same header), so no key is ever written under another header
+    than the one it was under. A masked line whose own place is gone — a
+    deleted, an added and a reordered section, a header the model renamed away —
+    stays the placeholder as before, and
+    :func:`unrestored_masked_lines` names it so the writers can refuse it.
     """
+    text, _ = _restore_masked_secrets(original, reply)
+    return text
+
+
+def unrestored_masked_lines(
+    original: "str | None", reply: "str | None",
+) -> "list[tuple[int, str]]":
+    """The reply lines that stayed the placeholder although the mask had
+    changed the original line they came from (HARDEN-13 A2).
+
+    ``[(line number, line text), …]``, one entry per failed restore. A line is
+    a failed restore when it equals the masked text of an original line the
+    mask changed and the restore gave no original line back for it — the one
+    shape that turns a working key into ``here_your_key`` on disk while the
+    writer reports success. A reply that *removes* the key line, or replaces it
+    with another expression, is not a failed restore: its line is not the
+    masked text of anything, so nothing was asked of the restore. Neither is a
+    file that holds the placeholder on purpose: there the original line is the
+    same text, so the mask never changed it.
+    """
+    _, failures = _restore_masked_secrets(original, reply)
+    return failures
+
+
+def _secrets_of_masked_line(original: str, masked: str) -> "list[str] | None":
+    """The values the mask put the placeholder over in one line, in order, or ``None``
+    when the line cannot be taken apart without a guess.
+
+    ``masked`` is ``original`` with each secret replaced by the placeholder, so the text
+    between the placeholders is the same on both sides and the secret is what stands
+    between two of those pieces in the original.
+    """
+    pieces = masked.split(_MASK_PLACEHOLDER)
+    if len(pieces) < 2 or not original.startswith(pieces[0]):
+        return None
+    secrets: "list[str]" = []
+    position = len(pieces[0])
+    for index in range(1, len(pieces)):
+        piece = pieces[index]
+        if index == len(pieces) - 1:
+            if piece and not original.endswith(piece):
+                return None
+            end = len(original) - len(piece)
+        else:
+            end = original.find(piece, position) if piece else position
+        if end < position:
+            return None
+        secrets.append(original[position:end])
+        position = end + len(piece)
+    rebuilt = pieces[0] + "".join(secret + piece for secret, piece in zip(secrets, pieces[1:]))
+    return secrets if rebuilt == original and all(secrets) else None
+
+
+def _restore_masked_secrets(
+    original: "str | None", reply: "str | None",
+) -> "tuple[str | None, list[tuple[int, str]]]":
+    """The shared body of :func:`restore_masked_secrets` and
+    :func:`unrestored_masked_lines`: the restored text and the failed lines."""
     if not original or not reply:
-        return reply
-    # One pass over the original: every changed line, in file order, filed under
-    # (its place, its masked text). The place is the nearest preceding line the
-    # mask left alone; a masked line is not a place for the one below it.
-    entries: list[str] = []
-    queues: "dict[tuple[str | None, str], list[int]]" = {}
+        return reply, []
+    original_lines = _split_lines_keepends(original)
+    reply_lines = _split_lines_keepends(reply)
+    # Both sides are compared with their leading whitespace removed, so a file
+    # the model re-indented as a whole is still the same file; the reply's own
+    # indentation is what the restored line is written with.
+    original_norms = [_line_body(line).lstrip() for line in original_lines]
+    reply_norms = [_line_body(line).lstrip() for line in reply_lines]
+    # The alignment runs against the *masked* original: that is the text the
+    # model saw, so a faithful reply is line-for-line equal to it and every
+    # masked line has a place to come back to.
+    original_masked = [mask_api_key(norm) for norm in original_norms]
+
+    # ── one pass over the original: every changed line, in file order ─────────
+    entries: "list[str]" = []                # the original line, with its ending
+    entry_of: "dict[int, int]" = {}          # original line index -> entry index
+    entry_place: "list[int | None]" = []     # the original index of its place
+    entry_above: "list[list[int]]" = []      # the lines above its place back to the last masked line
+    queued: "dict[tuple[str | None, str], list[int]]" = {}
     by_text: "dict[str, list[int]]" = {}
     masked_texts: "set[str]" = set()
-    place: "str | None" = None
-    for line in original.splitlines():
-        if "\ufffd" in line:
+    place: "int | None" = None
+    above_place: "list[int]" = []
+    for number, norm in enumerate(original_norms):
+        if "\ufffd" in norm:
             # An original line the reader could not decode is never a place a
             # key may be restored into.
             continue
-        masked = mask_api_key(line)
-        if masked != line:
-            queues.setdefault((place, masked), []).append(len(entries))
-            by_text.setdefault(masked, []).append(len(entries))
+        masked = original_masked[number]
+        if masked != norm:
+            index = len(entries)
+            entries.append(original_lines[number])
+            entry_of[number] = index
+            entry_place.append(place)
+            entry_above.append(above_place[:-1][::-1])
+            above_place = []
+            place_text = original_norms[place] if place is not None else None
+            queued.setdefault((place_text, masked), []).append(index)
+            by_text.setdefault(masked, []).append(index)
             masked_texts.add(masked)
-            entries.append(line)
-        else:
-            # A line the mask left alone is the next masked line's place. The
-            # reply walks the same rule, so the two places only match when the
-            # structure around the line is the structure of the original. A blank
-            # line is no place: `[a]` + blank + `api_key = …` is the same layout as
-            # without the blank, and counting it made every key of an ini written
-            # that way share one place (the first provider's key went under the
-            # second after the first section was deleted).
-            if line.strip():
-                place = line
+        elif norm:
+            # A line the mask left alone is the next masked line's place. A
+            # blank line is no place: `[a]` + blank + `api_key = …` is the same
+            # layout as without the blank, and counting it made every key of an
+            # ini written that way share one place (the first provider's key
+            # went under the second after the first section was deleted).
+            place = number
+            above_place.append(number)
     if not entries:
-        return reply
-    used: set[int] = set()
-    out = []
+        return reply, []
+
+    # ── the alignment: which reply line is which original line ──────────────
+    # `equal` is the strictly-identical pairing, `touched` the pairing that
+    # also covers an edited line — the one shape that needs the original's own
+    # text to be the place of the key below it (a renamed section header, a
+    # base_url edited above a key). An inserted line is in neither: it has no
+    # original line to be the place of anything.
+    equal: "dict[int, int]" = {}
+    touched: "dict[int, int]" = {}
+    # The lines both sides share at the head and at the tail are paired as they stand,
+    # and only what is left between them is aligned: an edit touches a few lines of a
+    # long file, and SequenceMatcher is quadratic in the lines that repeat (`}` and the
+    # blank line), so a 9 000-line file cost seconds on every write. A middle still too
+    # large for an exact alignment is aligned with the popular lines left out, which
+    # are never a key's neighbour worth anchoring on.
+    head = 0
+    limit = min(len(original_masked), len(reply_norms))
+    while head < limit and original_masked[head] == reply_norms[head]:
+        head += 1
+    tail = 0
+    while (tail < limit - head
+           and original_masked[len(original_masked) - 1 - tail] == reply_norms[len(reply_norms) - 1 - tail]):
+        tail += 1
+    for offset in range(head):
+        equal[offset] = touched[offset] = offset
+    for offset in range(tail):
+        equal[len(reply_norms) - 1 - offset] = touched[len(reply_norms) - 1 - offset] = len(original_masked) - 1 - offset
+    middle_a = original_masked[head:len(original_masked) - tail]
+    middle_b = reply_norms[head:len(reply_norms) - tail]
+    matcher = difflib.SequenceMatcher(
+        a=middle_a, b=middle_b, autojunk=len(middle_a) * len(middle_b) > _EXACT_ALIGN_CELLS)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(i2 - i1):
+                equal[head + j1 + offset] = head + i1 + offset
+                touched[head + j1 + offset] = head + i1 + offset
+        elif tag == "replace":
+            for offset in range(min(i2 - i1, j2 - j1)):
+                touched[head + j1 + offset] = head + i1 + offset
+
+    def _same_place(entry: int, number: int) -> bool:
+        """Whether the key line at reply *number* still sits under the line the
+        original entry at *entry* sits under.
+
+        The line above it in the file is that line — the same one, or the same
+        one edited (HARDEN-11 A's place rule, widened for HARDEN-13 A: a
+        section renamed ``[groq]`` → ``[groq_fast]`` is the same header, and a
+        ``base_url`` rewritten above a key is the same neighbour). Lines the
+        model *inserted* are skipped, which is what an edit above a key used to
+        break the restore with: ``max_tokens = 4000`` added under a header moved
+        the place and cost the key below it. A place that is gone altogether —
+        a section deleted, a header rewritten into another section's — accepts
+        nothing, so no key is written under a header it was not under.
+        """
+        wanted = entry_place[entry]
+        if wanted is None:
+            # A file of nothing but key lines: there is no place to compare,
+            # and the whole file is one unchanged stretch of key lines.
+            return True
+        # A line the model deleted between the header and the key (a base_url) is not the
+        # key's place any more: the line above it, back to the previous key, is.
+        candidates = [wanted] + entry_above[entry]
+        for above in range(number - 1, -1, -1):
+            norm = reply_norms[above]
+            if not norm or norm in masked_texts:
+                # A blank line and a masked line are no place (see the original
+                # pass above).
+                continue
+            if above not in touched:
+                # A line the reply has no original line for is an insertion,
+                # not a place: the key below it keeps the place it had.
+                continue
+            if touched[above] not in candidates:
+                # The line above the key is another line of the file, not the
+                # one this key sat under: keep looking, the place may be
+                # further up (a reply that reordered its own lines).
+                continue
+            if _line_is_the_same_edited(original_norms[touched[above]], norm):
+                return True
+        return False
+
+    used: "set[int]" = set()
+    placed: "set[str]" = set()
+    out: "list[str]" = []
     # No original line in this place: held for the second pass below.
     held: "list[tuple[int, str]]" = []
-    # The masked texts some reply line did get back by place: for those, a
-    # remaining candidate is another section's key, not this line's.
-    placed: set[str] = set()
-    place = None
-    for line in reply.splitlines(keepends=True):
-        # keepends gives the line's own ending back; only that may be dropped,
-        # since a body that ends in `g` or `n` must not lose a letter. The
-        # placeholder itself is idempotent, so a masked line is recognised by
-        # being a masked text of the original, not by masking it again.
-        body = line[:-1] if line.endswith("\n") else line
-        body = body[:-1] if body.endswith("\r") else body
-        if body in masked_texts:
-            # A masked line is restored by its place; the line above it stays
-            # the place of the next masked line, so two key lines under one
-            # header share that header and are restored in order.
-            queue = queues.get((place, body))
-            if queue:
-                index = queue.pop(0)
+    failures: "list[tuple[int, str]]" = []
+    place_norm: "str | None" = None
+    for number, line in enumerate(reply_lines):
+        body = _line_body(line)
+        ending = _line_ending(line)
+        norm = reply_norms[number]
+        if norm in masked_texts:
+            # A masked line is restored from the original line the alignment
+            # puts it on, or — for a line the alignment could not pair — from
+            # the same masked text under the same place. The line above it
+            # stays the place of the next masked line, so two key lines under
+            # one header share that header and are restored in order.
+            entry = entry_of.get(equal.get(number, -1))
+            if entry is not None and entry not in used and _same_place(entry, number):
+                index = entry
+            else:
+                queue = queued.get((place_norm, norm))
+                index = queue.pop(0) if queue else None
+            if index is not None:
                 used.add(index)
-                placed.add(body)
-                out.append(entries[index] + line[len(body):])
+                placed.add(norm)
+                # The reply's own indentation and its own ending, whatever it
+                # was, are what the restored line keeps.
+                indent = body[:len(body) - len(body.lstrip())]
+                out.append(f"{indent}{_line_body(entries[index]).lstrip()}{ending}")
                 continue
-            held.append((len(out), body))
+            held.append((number, norm))
             out.append(line)
             continue
+        if _MASK_PLACEHOLDER in norm:
+            # A line the model edited AROUND a key (`"model": "z"` on the key's own line,
+            # trailing blanks after it) is not the masked text of any original line, and
+            # used to be written with the placeholder in it and no word of it anywhere.
+            # It is paired with the original line the alignment puts it on; the secrets of
+            # that line go back into the placeholders, in order, or the line is a failure.
+            paired = touched.get(number)
+            entry = entry_of.get(paired) if paired is not None else None
+            if entry is not None:
+                secrets = _secrets_of_masked_line(original_norms[paired], original_masked[paired])
+                if (entry not in used and secrets is not None
+                        and norm.count(_MASK_PLACEHOLDER) == len(secrets) and _same_place(entry, number)):
+                    used.add(entry)
+                    restored = body
+                    for secret in secrets:
+                        restored = restored.replace(_MASK_PLACEHOLDER, secret, 1)
+                    out.append(restored + ending)
+                    continue
+                failures.append((number + 1, body))
         out.append(line)
-        if body.strip():
-            place = body
-    for position, body in held:
+        if norm:
+            place_norm = norm
+    for number, norm in held:
         # The line's place did not match, and that is normally the end of it: a
         # structural edit must not move a key. Two conditions open the one
         # exception that keeps HARDEN-5 B whole — a file every line of which is
@@ -778,21 +1208,24 @@ def restore_masked_secrets(original: "str | None", reply: "str | None") -> "str 
         # line it rewrote is then the nearest unmasked line in the reply, so the
         # place of every key below it shifts and none of them would be restored.
         # The key comes back only when *nothing* else of that masked text was
-        # restored by place — so no section got its own key while this line got
-        # one — and exactly one original line in the whole file has that text and
+        # restored — so no section got its own key while this line got one —
+        # and exactly one original line in the whole file has that text and
         # nothing has taken it, so there is no other key it could be.
-        left = [index for index in by_text.get(body, ()) if index not in used]
-        if body not in placed and len(left) == 1:
+        left = [index for index in by_text.get(norm, ()) if index not in used]
+        if norm not in placed and len(left) == 1:
             index = left[0]
             used.add(index)
-            line = out[position]
-            out[position] = entries[index] + line[len(body):]
+            line = reply_lines[number]
+            body = _line_body(line)
+            indent = body[:len(body) - len(body.lstrip())]
+            out[number] = f"{indent}{_line_body(entries[index]).lstrip()}{_line_ending(line)}"
             continue
         logger.warning(
             "restore_masked_secrets: %r has no original line in the same "
             "place — left as the placeholder (a structural edit must not "
-            "move a key)", body)
-    return "".join(out)
+            "move a key)", norm)
+        failures.append((number + 1, _line_body(reply_lines[number])))
+    return "".join(out), failures
 
 
 def strip_think(text: "str | None") -> "str | None":

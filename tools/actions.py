@@ -14,7 +14,7 @@ import time
 import logging
 from typing import List, Tuple
 
-from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence, restore_masked_secrets
+from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence, restore_masked_secrets, unrestored_masked_lines
 # HARDEN-7 C: the shared reader of a reply field's type. The validators this
 # module drives answer `feedback` themselves, and a list or a number in that
 # field raised AttributeError out of `/edit` and the text-QA loop.
@@ -1307,6 +1307,16 @@ class OrchestratorActions:
 
         # The model was shown the file with its secrets masked: a line it gave back masked is the original line.
         revised = restore_masked_secrets(original, revised)
+        # HARDEN-13 A2: a line the restore could not put a real key back into is a
+        # placeholder written over a working key, and the write below would report
+        # success while doing it. The edit is refused, the file is left as it is,
+        # and the line that could not be restored is named.
+        for number, line in unrestored_masked_lines(original, revised):
+            print(f"[{_ts()}] ❌ {file_path}: line {number} still holds the masked "
+                  f"placeholder ({line.strip()}) — the original key it came from "
+                  f"could not be restored; the file is left unchanged. Ask for the "
+                  f"line exactly as it was given to you.")
+            return
         if _refuse_unwritable(revised):
             return
 

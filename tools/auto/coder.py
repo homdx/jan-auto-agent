@@ -506,6 +506,10 @@ class Coder(_llm_stream.LLMClientBase):
         self._learned_max_tokens: Optional[int] = None  # last budget that parsed
         self._task_id: str = ""                          # same-task cursor
         self._task_max_tokens: int = int(self._max_tokens)  # same-task budget
+        # HARDEN-13 B: which task run already made the .coder.bak of a file. The
+        # backup is the copy of the file as it was BEFORE the run, so a retry of
+        # the same task must not overwrite it with what the first attempt wrote.
+        self._backups: "dict[str, str]" = {}
         # System prompt by task_mode (as architect and validator do): mode key, legacy key, then constant.
         _mode_key = f"system_{self._task_mode}" if self._task_mode != "code" else None
         if _mode_key and config.has_option(sec, _mode_key):
@@ -849,6 +853,23 @@ class Coder(_llm_stream.LLMClientBase):
             if self._learned_max_tokens is None
             else max(int(self._learned_max_tokens), int(max_tokens))
         )
+
+    def _backup_is_new(self, rel: str, task_id: str) -> bool:
+        """Whether the ``.coder.bak`` of *rel* has to be (re)made for this write.
+
+        HARDEN-13 B: within one task's run the backup is made by the first write
+        and kept by the later ones — a retry of a task that lost a key would
+        otherwise copy its own attempt over the only copy of the original, and
+        after a write in a plain (non-git) folder nothing would hold the real key
+        any more. A new task run (a new ``task_id``) starts again, and a stale
+        backup from an earlier run is replaced by the first write of this one, as
+        it always was.
+        """
+        return self._backups.get(rel, "") != task_id
+
+    def _backup_made(self, rel: str, task_id: str) -> None:
+        """Record that this task run made the backup of *rel*."""
+        self._backups[rel] = task_id
 
     def _raise_budget_after_truncation(
         self, task_id: str, used: int, parse_error: str,
@@ -2009,9 +2030,16 @@ class Coder(_llm_stream.LLMClientBase):
                 try:
                     if dest.exists():
                         backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                        # Backups keep the original bytes and mode, so no encoding or BOM is changed.
-                        backup.unlink(missing_ok=True)    # copy2 keeps a read-only mode: it could not overwrite
-                        shutil.copy2(dest, backup)
+                        # HARDEN-13 B: the backup of a file is made by the FIRST
+                        # write of a task run and kept by the later ones, so the
+                        # retry of a task cannot copy what the first attempt wrote
+                        # over the only copy of the original. A stale backup from
+                        # an earlier run is replaced, as before.
+                        if self._backup_is_new(rel, task_id):
+                            # Backups keep the original bytes and mode, so no encoding or BOM is changed.
+                            backup.unlink(missing_ok=True)    # copy2 keeps a read-only mode: it could not overwrite
+                            shutil.copy2(dest, backup)
+                            self._backup_made(rel, task_id)
                         dest.unlink()
                         logger.info(
                             "coder._write_files [%s]: DELETED %s (backup: %s)",
@@ -2113,6 +2141,25 @@ class Coder(_llm_stream.LLMClientBase):
                             dest.read_bytes().decode("utf-8", errors="replace"), content)
                     except OSError:
                         pass
+                    # HARDEN-13 A2: a reply line the restore could not put a real
+                    # key back into is a placeholder written over a working key, and
+                    # the write below would report success while doing it. It is
+                    # refused like a safety refusal, so the attempt's feedback names
+                    # the file and the line and the loop retries.
+                    refusal = ""
+                    for number, line in _llm_stream.unrestored_masked_lines(
+                            dest.read_bytes().decode("utf-8", errors="replace"), content):
+                        refusal = (
+                            f"[SAFETY] {rel!r} line {number} still holds the masked "
+                            f"placeholder ({line.strip()!r}) — the original key it "
+                            f"came from could not be restored; write blocked. Send the "
+                            f"line exactly as it was given to you.")
+                        logger.warning("coder._write_files [%s]: %s", task_id, refusal)
+                        break
+                    if refusal:
+                        if not first_error:
+                            first_error = refusal
+                        continue
                     content = in_style_of(dest, content)
                     encoding, missing = _pick_file_encoding(
                         _file_encodings(dest), content
@@ -2129,8 +2176,13 @@ class Coder(_llm_stream.LLMClientBase):
                     )
 
                     backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                    backup.unlink(missing_ok=True)
-                    shutil.copy2(dest, backup)        # bytes and mode (see the delete branch)
+                    # HARDEN-13 B: made by the first write of a task run and kept by
+                    # the later ones (see the delete branch above), so a retry that
+                    # would have overwritten the original keeps it.
+                    if self._backup_is_new(rel, task_id):
+                        backup.unlink(missing_ok=True)
+                        shutil.copy2(dest, backup)        # bytes and mode (see the delete branch)
+                        self._backup_made(rel, task_id)
                     logger.debug(
                         "coder._write_files [%s]: backed up %s → %s",
                         task_id, dest, backup,

@@ -297,9 +297,12 @@ class TestTheCoderWritesEachKeyUnderItsOwnSection:
         assert (tmp_path / rel).read_text(encoding="utf-8") == _PROFILE.replace(
             "model = gpt-4o-mini", "model = gpt-4o")
 
-    def test_a_placeholder_that_reaches_a_real_key_is_warned_about(self, tmp_path, caplog):
+    def test_a_placeholder_that_reaches_a_real_key_is_refused(self, tmp_path, caplog):
         """A reply that moved a section gets the placeholder and a warning
-        naming the line, so a real key is never written under a foreign header."""
+        naming the line, and HARDEN-11 A wrote the file anyway — a placeholder on
+        disk is a working key destroyed, so HARDEN-13 A2 refuses the write: the
+        file stays byte-identical, and the refusal names the file and the line so
+        the attempt's feedback can ask for the line back."""
         rel = "agents.ini"
         (tmp_path / rel).write_text(_INI, encoding="utf-8")
         reply = ("[anthropic]\napi_key = here_your_key\n"
@@ -310,11 +313,9 @@ class TestTheCoderWritesEachKeyUnderItsOwnSection:
             written, err = _coder()._write_files(
                 [{"path": rel, "content": reply}], tmp_path, task_id="T1",
                 allowed_paths={rel})
-        assert written == [rel] and err == ""
-        out = (tmp_path / rel).read_text(encoding="utf-8")
-        assert "[anthropic]\napi_key = here_your_key\n" in out
-        assert f"[openai]\napi_key = {_OPENAI}\n" in out
-        assert _OPENAI not in out.split("[anthropic]")[1].split("[openai]")[0]
+        assert written == [] and err
+        assert "[SAFETY]" in err and "'agents.ini'" in err and "line 2" in err
+        assert (tmp_path / rel).read_text(encoding="utf-8") == _INI
         assert any("here_your_key" in r.message for r in caplog.records)
 
 
