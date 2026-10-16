@@ -997,12 +997,18 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"^NOTHING\s+(?:TO\s+)?"
         r"(?:ADD(?:S|ED|ING)?|FIX(?:ES|ED|ING)?|CHANGE(?:S|D|ING)?|"
         r"IMPROVE(?:S|D|MENT)?|CORRECT(?:S|ED|ION)?|"
+        r"REPORT(?:S|ED|ING)?|FLAG(?:S|ED|ING)?|NOTE(?:S|D)?|"
         r"COMPLETELY\s+WRONG|WRONG|"
-        r"FLAG(?:S)?|FOUND|ISSUE(?:S)?|PROBLEM(?:S)?|CONCERN(?:S)?|"
+        r"FOUND|ISSUE(?:S)?|PROBLEM(?:S)?|CONCERN(?:S)?|"
         r"COMPLAINT(?:S)?|CONTRADICT(?:ORY|S|ING|ION(?:S)?)?)\b"
     )
     _EN_NOTE = _re.compile(r"^NOTE\b")
     #: The verdict words a "NOT" negates into a rejection — the approval side (HARDEN-5 A).
+    #: HARDEN-14 A: this set is no longer the *decision*: a "NOT …" reply is a rejection unless it
+    #: is on the problem side (see `_EN_NOT_PROBLEM`), because every creative rejection that is not
+    #: "NOT APPROVED"-shaped — "Not coherent", "NOT READY", "Nothing makes sense" — fell through
+    #: to the fail-open rule and shipped the chapter. The set stays as the class of words the NOT
+    #: family is *known* to negate, which is what the problem-side guard below is built against.
     _EN_NOT_NEGATES_APPROVAL = frozenset((
         "APPROVED", "APPROVABLE", "APPROVE", "ACCEPTED", "ACCEPTABLE", "ACCEPT", "AGREED",
         "OK", "OKAY", "GOOD", "VALID", "CONSISTENT", "CORRECT", "RIGHT", "TRUE", "EXACT",
@@ -1022,7 +1028,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
 
     #: The articles and qualifiers that stand between "NOT" and the verdict word
     #: ("NOT A PROBLEM", "NOTHING COMPLETELY WRONG", "NOTHING VERY BAD").
-    _EN_NOT_FILLERS = frozenset(("A", "AN", "ANY", "VERY", "COMPLETELY", "QUITE", "ALL", "TOO", "AT ALL"))
+    _EN_NOT_FILLERS = frozenset(("A", "AN", "ANY", "VERY", "COMPLETELY", "QUITE", "ALL", "TOO", "AT ALL", "SINGLE"))
 
     def _explicit_en_approval(upper: str) -> bool:
         """Whether *upper* says the opposite of a NOT/NOTHING rejection."""
@@ -1039,20 +1045,74 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         validator says there is nothing to fix, matched the way the Russian
         «нет противоречий» already was. Checked before the standalone ``NO`` token, which took
         the first problem word away as the reason ("No contradictions found" went out to the
-        Coder as the rejection "contradictions found")."""
-        return bool(_EN_NO_PROBLEM.match(upper))
+        Coder as the rejection "contradictions found").
+
+        HARDEN-14 A: adjectives may stand between "No" and the problem word — "No major
+        inconsistencies", "No further objections" — and they are not the problem. The old
+        shape admitted none, so such a reply fell through to the bare ``NO`` rejection and a
+        clean chapter went back to the Coder.
+        """
+        return bool(_EN_NO_PROBLEM.match(upper) or _EN_NO_PROBLEM_ADJ.match(upper))
+
+    # ── HARDEN-14 A: the problem side of the NOT family — the approvals ──────
+    # A "NOT" that negates a *problem* says there is no problem: "NOT A PROBLEM",
+    # "NOT A CONTRADICTION", "NOT REJECTED", "NOTHING WRONG". These are the exception
+    # list now, so a *new* rejection phrase needs no new code — the default for a
+    # NOT/NOTHING reply is the rejection (HARDEN-14 A). Deliberately *not* here:
+    # "Not ready", "Not coherent", "Not believable", "Not a match", "Not enough",
+    # "Not suitable" and "Not plausible" are live rejections — a reviewer's note
+    # about fit, not a problem named and denied.
+    _EN_NOT_PROBLEM_WORDS = frozenset((
+        "PROBLEM", "PROBLEMS", "ISSUE", "ISSUES", "CONTRADICTION", "CONTRADICTIONS",
+        "CONTRADICTORY", "CONFLICT", "CONFLICTS", "ERROR", "ERRORS", "FLAW", "FLAWS",
+        "INCONSISTENCY", "INCONSISTENCIES", "INCONSISTENT", "VIOLATION", "VIOLATIONS",
+        "OBJECTION", "OBJECTIONS", "DEFECT", "DEFECTS", "AMBIGUITY", "AMBIGUITIES",
+        "AMBIGUOUS", "OMISSION", "OMISSIONS", "MISTAKE", "MISTAKES", "BUG", "BUGS",
+        "DISCREPANCY", "DISCREPANCIES", "MISMATCH", "WRONG", "INCORRECT", "REPORT",
+        "REPORTED",
+        # the rejection verdicts themselves: "NOT REJECTED", "NOT REVISE", "NOT DISAPPROVED"
+        "REJECTED", "REJECTION", "REJECTIONS", "REJECT", "REVISE", "REVISION",
+        "REVISIONS", "DISAPPROVED", "DISAPPROVE", "DECLINED", "REFUSED", "DENIED",
+    ))
+    #: "NOT IN CONFLICT (WITH …)" names a conflict and denies it: an approval, matched on its
+    #: own because the word after "NOT" is the preposition, not the problem.
+    _EN_NOT_IN_CONFLICT = _re.compile(r"^NOT\s+IN\s+(?:CONFLICT|CONTRADICTION|VIOLATION|DISAGREEMENT)\b")
+    #: A "NO" with adjectives between it and the problem word: "No major inconsistencies"
+    #: is how the creative validator says there is nothing to fix, and every word between
+    #: "No" and the problem word is an adjective, not the problem (HARDEN-14 A).
+    _EN_NO_ADJECTIVES = (
+        r"(?:MAJOR|MINOR|SIGNIFICANT|INSIGNIFICANT|SERIOUS|SEVERE|NOTICEABLE|NOTED|"
+        r"OBSERVED|APPARENT|CLEAR|REAL|ACTUAL|SUCH|OTHER|FURTHER|ADDITIONAL|ANY|"
+        r"MORE|MOST|NEW|REMAINING|OUTSTANDING|OBVIOUS|GLARING|MATERIAL|NOTABLE)\s+"
+    )
+    _EN_NO_PROBLEM_ADJ = _re.compile(
+        r"^NO\b\s+(?:" + _EN_NO_ADJECTIVES + r")*"
+        r"(?:CONTRADICTION(?:S)?|ERROR(?:S)?|INCONSISTENC(?:Y|IES)|CONFLICT(?:S)?|"
+        r"VIOLATION(?:S)?|OBJECTION(?:S)?|ISSUE(?:S)?|PROBLEM(?:S)?|CONCERN(?:S)?|"
+        r"FLAW(?:S)?|OMISSION(?:S)?|AMBIGUIT(?:Y|IES)|DEFECT(?:S)?)\b"
+        r"(?:\s+(?:FOUND|REMAIN(?:ING)?|LEFT|DETECTED))?"
+    )
 
     def _en_not_family_reason(line: str, upper: str) -> "str | None":
         """The reason when *upper* opens a NOT-family rejection, else ``None``.
 
-        ``NOT`` and ``NOTHING`` reject by negating the clause that follows, so only a verdict
-        word on the *approval* side makes it a rejection: "NOT APPROVED", "NOT OK", "NOT GOOD"
-        (HARDEN-5 A). A word on the *problem* side says the opposite — "NOT REJECTED", "NOT A
-        PROBLEM", "NOT CONTRADICTORY", "NOTHING TO FLAG", "NOTHING FOUND", "NOTHING
-        CONTRADICTS …" — and is left to the approval rules, so it fails open to an approval
-        instead of going back to the Coder as a fix request (HARDEN-10 C). The reason is the
-        whole reply: the words after ``NOT`` alone would read as an approval ("NOT APPROVED"
-        → "APPROVED") and that is exactly what the Coder would be told to fix.
+        HARDEN-14 A: a reply whose first word is ``NOT`` or ``NOTHING`` is a
+        **rejection by default**. HARDEN-5 A / HARDEN-10 C had it the other way
+        round — the family rejected only when the word after the fillers
+        negated something on the approval side, so "NOT READY", "Not coherent",
+        "Nothing makes sense", "Not in character for Ana", "Nothing matches the
+        bible" (41 live rejections, three of three through
+        ``ContinuityValidator.check``) matched nothing, were unparseable, and
+        the fail-open rule **approved the chapter** the model had thrown out.
+        The continuity, fact and theme validators have no re-ask, so that
+        approval was final.
+
+        The approval side is now the exception list: the problem-side shapes
+        (``_EN_NOT_PROBLEM_WORDS``) plus the explicit approvals already matched
+        before this function (``NOT BAD``, ``NOTHING TO ADD``, ``NOTE:``). The
+        reason is still the whole reply — the words after ``NOT`` alone would
+        read as an approval ("NOT APPROVED" → "APPROVED"), which is exactly what
+        the Coder would be told to fix.
         """
         if _explicit_en_approval(upper):
             # "NOT BAD", "NOTHING TO ADD", "NOTE: …" — prose that the fail-open rules
@@ -1060,8 +1120,15 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             return None
         if _verdict_token_at_start(upper, "NONSENSE"):
             return line.strip()
+        if _verdict_token_at_start(upper, "NOTE"):
+            # "NOTE:" opens a note, not a NOT-family rejection (HARDEN-1 A1).
+            return None
         m = _re.match(r"^(?:NOT|NOTHING)\b[\s,:;]*(.*)$", upper)
         if not m:
+            return None
+        if _EN_NOT_IN_CONFLICT.match(upper):
+            # "NOT IN CONFLICT (WITH …)": the preposition stands between NOT and the
+            # problem word, so the shape is matched on its own.
             return None
         words = m.group(1).split()
         # "NOT A PROBLEM", "NOTHING COMPLETELY WRONG" — the article or the qualifier is not
@@ -1069,8 +1136,11 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         while words and words[0] in _EN_NOT_FILLERS:
             words = words[1:]
         head = words[0] if words else ""
-        if head.rstrip(".,;:") not in _EN_NOT_NEGATES_APPROVAL:
+        if head.rstrip(".,;:") in _EN_NOT_PROBLEM_WORDS:
+            # A negation of a problem: "nothing to fix", never a rejection.
             return None
+        # A recognised approval-side word ("NOT APPROVED") rejects, and so does
+        # every unknown one ("NOT READY", "Not coherent", "Nothing makes sense").
         return line.strip()
 
     def _en_rejection_reason(line: str, upper: str) -> "str | None":

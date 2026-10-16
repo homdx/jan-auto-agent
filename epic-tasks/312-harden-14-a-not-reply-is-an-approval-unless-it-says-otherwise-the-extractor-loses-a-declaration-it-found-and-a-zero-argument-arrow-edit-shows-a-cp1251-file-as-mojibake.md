@@ -1,10 +1,10 @@
 # HARDEN-14 — a creative validator's `NOT READY` / `Not coherent` / `Nothing makes sense` is read as an approval; the extractor loses a prototype whose macro is on the next line (a regression) and does not find a zero-argument or async arrow property, `= 0`, `= delete`, `= default`; `/edit` shows a cp1251 file as mojibake and flattens the line endings of a mixed file; the judge script drops a `## Claims:` section without a word
 
-**Status:** open
+**Status:** landed (round 312: step-5-preview as the base — a NOT/NOTHING reply rejects unless it is on the problem side (A), the extractor finds a macro tail, a zero-argument, async and multi-line property arrow and a `= 0`/`= delete`/`= default` declaration and refuses a TS type member (B), /edit reads in the codec it writes, keeps a mixed file's own line endings and refuses a wide encoding (C), a colon'd or nested Claims heading opens its section (D) — with var4's level-aware Claims section and its refusal of an empty one)
 **Severity:** HIGH-MEDIUM (A: a rejected chapter ships; creative mode only); MEDIUM (B1: a regression, Gate 1 drops a real symbol; B2, B3: Gate 1 drops a real symbol); MEDIUM-LOW (C1); LOW (C2, C3, D)
 **File:** `tools/auto/inner_loop.py` (A), `tools/block_extractor.py` (B), `tools/actions.py` and `tools/file_reader.py` (C), `scripts/judge_epic_round.py` (D)
 **Symbol:** A: `_parse_verdict_soft`, `_en_not_family_reason`, `_EN_NOT_NEGATES_APPROVAL`. B: `_declaration_tail_ok`, `_find_definition_end_declaration`, `_property_arrow_candidate_patterns`. C: `run_edit` (the `read_file` call), `_edit_write_encodings`, `read_file`, `in_style_of`. D: `ticket_claims`, `_claims_section`
-**Round:** (set when the round starts)
+**Round:** 312
 **Size:** M
 **Depends on:** HARDEN-5 (303), HARDEN-6 (304), HARDEN-9 (307), HARDEN-10 (308), CC review fixes 38, all landed
 **Also touches:** `tests_bugfix/` pins of HARDEN-5 A and HARDEN-10 C (the NOT family), of HARDEN-6 B and fix 38 (the extractor), `tests/`
@@ -112,3 +112,7 @@ One commit. The judge's own checks are not published and are written after the r
 ## Not in scope
 
 Rust (`pub(crate)`, bounds, `extern "C"`, nested comments: the project does not fix Rust), Ruby, a codec guess for East Asian encodings, UTF-16 support (refusal only), and the plain-folder first commit that stages `.env` and `node_modules/` (kept as designed).
+
+Why not the others: in a black box that drives each tree (77 checks over A to D through the real `_parse_verdict_soft`, `ContinuityValidator.check`, `extract_block`, `run_edit` and `ticket_claims`), step-5-preview passed 76, sensenova-var2 76, var4 74, agnes 74, var3 61, var1 50, glm 38, laguna 36, nemotron 32 (laguna's provider rejected the request for the last hour; nemotron and glm shipped a different ticket's code).
+
+Found at judging and fixed in the same commit (present in the winner, or in every entry): `Not a single contradiction found.` was a rejection (`SINGLE` is a filler like `A`); `Not in contradiction with the bible` and `No new errors` were rejections; a destructor `~I() = default;` was found by `~I` but not by the class name `I`; `onDone: () => void | null;` in an `interface` was a definition. var4's Claims section ends at a heading of its own level and a heading with no claim is a refusal; the extractor over 13 395 names of 400 C, C++, JS and TS sources lost none and found two more.

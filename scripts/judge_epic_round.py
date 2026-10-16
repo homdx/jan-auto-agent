@@ -918,10 +918,16 @@ CLAIMS_LEAD = ("claims: a lead, not a gate — a mismatch is a model's reading, 
 
 #: `## Claims` — the optional section that carries the round's claims, after `## Acceptance`.
 #: A heading that adds a parenthetical is still the section, so the match stops at the word.
-_CLAIMS_HEADING = re.compile(r"^##\s+Claims(?:\s+.*)?$", re.I)
+#: `## Claims`, `### Claims`, `#### Claims` — with an optional trailing colon and an optional
+#: suffix (`## Claims (3)`); case-insensitive. HARDEN-14 D: levels 3 and 4 and the colon did not
+#: open the section, so a ticket that wrote them scored nothing and said nothing.
+_CLAIMS_HEADING = re.compile(
+    r"^(#{2,4})[ \t]+Claims[ \t]*(?::[ \t]*(?:\S.*)?)?(?:[ \t]+\S.*)?[ \t]*$", re.I
+)
 
-#: The heading that ends any section body.
-_H2 = re.compile(r"^##\s+")
+#: Any markdown heading with its level, so a `### Claims` section ends at a `###` sibling and not
+#: only at a `## `.
+_HEADING_LEVEL = re.compile(r"^(#{1,6})[ \t]")
 
 #: `- [new] text` and `1. [new] text` — the bracketed word is the claim's `expect`, the rest is the
 #: claim itself. The token is taken as written, so a mangled one like `- [ne]w` reports `[ne]w`,
@@ -961,27 +967,32 @@ class _FenceTracker:
 
 
 def _claims_section(text, fenced=False):
-    """`[(line number, line)]` of a ticket's `## Claims` section — `[]` when it has none.
+    """`(the heading's line number, [(line number, line)])` of a ticket's `## Claims` section —
+    `None` when it has none.
 
-    The section is optional and may be the ticket's last, so the body runs to the next `## `
-    heading or to the end of the file. Line numbers start at 1, the way an editor numbers them:
-    a refusal names the line, not a position in a list.
+    The section is optional and may be the ticket's last, so the body runs to the next heading of
+    its own level or a shallower one, or to the end of the file. Line numbers start at 1, the way
+    an editor numbers them: a refusal names the line, not a position in a list.
 
     HARDEN-8 C: a fenced block is not read here at all. A `## Claims` written inside a code
     block — a ticket that documents the section, or a prompt that quotes one — was a section,
-    and its lines were then parsed as claims.
+    and its lines were then parsed as claims. HARDEN-14 D: the heading's level is returned, so a
+    `### Claims` section does not keep reading past a `###` sibling.
     """
     lines = (text or "").split("\n")
     start = None
+    level = 2
     fences = _FenceTracker()
     for i, line in enumerate(lines):
         if fences.feed(line):
             continue
-        if _CLAIMS_HEADING.match(line):
+        m = _CLAIMS_HEADING.match(line)
+        if m:
             start = i + 1
+            level = len(m.group(1))
             break
     if start is None:
-        return []
+        return None
     body = []
     fences = _FenceTracker()
     for i in range(start, len(lines)):
@@ -989,10 +1000,11 @@ def _claims_section(text, fenced=False):
             if fenced:
                 body.append((i + 1, lines[i]))
             continue
-        if _H2.match(lines[i]):
+        hm = _HEADING_LEVEL.match(lines[i])
+        if hm and len(hm.group(1)) <= level:
             break
         body.append((i + 1, lines[i]))
-    return body
+    return start, body
 
 
 def ticket_claims(text, name=""):
@@ -1009,8 +1021,12 @@ def ticket_claims(text, name=""):
     continuation, so a long claim may wrap without becoming a second claim.
     """
     where = name or "ticket"
+    found = _claims_section(text)
+    if found is None:
+        return []
+    heading_lineno, body = found
     claims = []
-    for lineno, line in _claims_section(text):
+    for lineno, line in body:
         bullet = _CLAIM_BULLET.match(line)
         if bullet:
             token, claim = bullet.group(1), bullet.group(2).strip()
@@ -1029,11 +1045,16 @@ def ticket_claims(text, name=""):
             claims[-1]["claim"] = (claims[-1]["claim"] + " " + line.strip()).strip()
     if not claims:
         # A list written inside a code block is not read; said here rather than left as "no claims".
-        for lineno, line in _claims_section(text, fenced=True):
+        for lineno, line in _claims_section(text, fenced=True)[1]:
             bullet = _CLAIM_BULLET.match(line)
             if bullet and bullet.group(1).startswith("["):
                 raise ValueError(f"{where}:{lineno}: the claims are inside a code block — "
                                  f"write them as a plain list under ## Claims")
+        # HARDEN-14 D: a ticket that opened the section and gave it no claim is a refusal naming
+        # the heading, not `[]` — `[]` read as "the ticket said nothing", so the judge scored
+        # nothing and said nothing.
+        raise ValueError(f"{where}:{heading_lineno}: the Claims section has no claim — write a "
+                         f"list of `[word]` items under it")
     return claims
 
 

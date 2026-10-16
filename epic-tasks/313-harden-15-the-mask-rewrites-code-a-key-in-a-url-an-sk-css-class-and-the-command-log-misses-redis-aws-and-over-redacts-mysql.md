@@ -74,9 +74,13 @@ The three lines above unchanged; the provider keys of the HARDEN-12 C table mask
 
 `redis-cli -a <pw>` and the value of `aws configure set <name containing secret|key|token> <value>` are redacted; a `-p` followed by a space for `mysql` and `mysqldump` is the database, not a password (the attached form stays redacted).
 
+Found again by an outside review of `264440c` (the `redis-cli -a` case; already here). Two more spellings of the same hole, same function, checked on `0815666`: `docker login -u me --password hunter2` is logged as written (only `-p` is looked at for `docker login`), and `redis-cli --pass pw` and `redis-cli -u redis://:pw@host` are logged as written.
+
+* `docker login --password <pw>` (and `--password=<pw>`; `--password-stdin` takes no value and stays) is redacted; `redis-cli --pass <pw>` and the password of a `redis://:pw@host` / `rediss://user:pw@host` URL given to `-u` are redacted. A command with none of these is logged as it was.
+
 ### Tests (sketch)
 
-The three commands; the HARDEN-12 D table unchanged.
+The three commands and the three spellings above; the HARDEN-12 D table unchanged.
 
 ---
 

@@ -101,6 +101,40 @@ def _letter_runs(text: str):
         yield run
 
 
+def _legacy_symbol_score(text: str) -> int:
+    """How many of *text*'s non-ASCII characters read as a lone letter of another script
+    (HARDEN-14 C4) — the tie-break `_legacy_script_score` leaves open.
+
+    With no letters in it at all the script score is 0 for both cp1251 and cp1252, so
+    `cp1251` — this repository's own codec, and last in the tie-break — won every such file.
+    That is wrong for a cp1252 file whose only non-ASCII character is `€`: byte `0x80` is
+    `Ђ` in cp1251 and `€` in cp1252, and `/edit` wrote the `€` back as `0x88`, which reads
+    back as `ˆ`. A character of a script the rest of the text shows no trace of is a
+    mis-decode; a symbol or a digit is what a correctly-read file keeps. The score is 0 when
+    the text has a letter of its own, since there the script score already decided.
+    """
+    if not text:
+        return 0
+    # "A letter of its own" is a letter of the script the text is otherwise in: a
+    # non-Cyrillic non-ASCII letter (an accented Latin one, `é` of `Café`). A lone Cyrillic
+    # letter in an otherwise-plain-ASCII text is exactly the mis-decode being counted.
+    has_own = any(
+        not ch.isascii() and ch.isalpha()
+        and not (_CYRILLIC_RANGE[0] <= ord(ch) <= _CYRILLIC_RANGE[1])
+        for ch in text
+    )
+    if has_own:
+        return 0
+    bad = 0
+    for ch in text:
+        if ch.isascii():
+            continue
+        code = ord(ch)
+        if _CYRILLIC_RANGE[0] <= code <= _CYRILLIC_RANGE[1]:
+            bad += 1          # a Cyrillic letter in a text with none of its own
+    return bad
+
+
 def _legacy_script_score(text: str) -> int:
     """How many of *text*'s word runs read as a neighbouring codec — 0 when every
     run reads as one script, which is what a correctly-read file gives.
@@ -220,9 +254,15 @@ def _edit_write_encodings(target: str) -> "Tuple[str, ...]":
             continue
         # Then it has to *read* it: a codec that splits one file's letters
         # between two scripts is the wrong one for it, whatever it round-trips.
-        ranked.append((_legacy_script_score(text), index, legacy))
-    ranked.sort(key=lambda item: (item[0], item[1]))
-    candidates: List[str] = [legacy for _, _, legacy in ranked]
+        ranked.append((_legacy_script_score(text), _legacy_symbol_score(text), index, legacy))
+    # Primary: the script score (HARDEN-9 C). Secondary (HARDEN-14 C4): with no letters at
+    # all the script score is 0 for both codecs and `cp1251` won every such tie, so a
+    # cp1252 file whose only non-ASCII character is `€` (byte `0x80`, cp1251's `Ђ`) was read
+    # as cp1251 and written back as `0x88`, which reads back as `ˆ`. The lower score wins:
+    # a decoding that leaves the text with a printable symbol beats one that reads it as a
+    # lone Cyrillic letter. The index stays last, so a genuine tie still falls to `cp1251`.
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    candidates: List[str] = [legacy for _, _, _, legacy in ranked]
     candidates.append("latin-1")  # decodes anything, so always writable
 
     if cookie:
@@ -280,6 +320,110 @@ def _cannot_encode(ch: str, encoding: str) -> bool:
         return False
     except UnicodeEncodeError:
         return True
+
+
+#: The byte-order marks of the wide encodings `/edit` refuses by name (HARDEN-14 C3). A UTF-16
+#: or UTF-32 file read as latin-1 is a wall of NULs the model cannot work with, and the edit
+#: used to print `status=approved` with a backup anyway.
+_WIDE_BOMS = (
+    (b"\x00\x00\xfe\xff", "UTF-32 BE"),
+    (b"\xff\xfe\x00\x00", "UTF-32 LE"),
+    (b"\xfe\xff", "UTF-16 BE"),
+    (b"\xff\xfe", "UTF-16 LE"),
+)
+
+
+def _wide_bom_name(raw: bytes) -> "str | None":
+    """The name of the wide encoding *raw* starts with, or ``None``.
+
+    HARDEN-14 C3: the UTF-32 BOMs are tested before the UTF-16 ones, because a UTF-32 LE BOM
+    begins with the UTF-16 LE one. Fail-open by construction: an unreadable or empty file
+    has no BOM here and is read normally.
+    """
+    for bom, name in _WIDE_BOMS:
+        if raw.startswith(bom):
+            return name
+    return None
+
+
+def _read_edit_target(target: str, encodings: "Tuple[str, ...]") -> str:
+    """Read *target* in the codec its own bytes say, for `/edit` to show the model (HARDEN-14 C1).
+
+    `run_edit` used to read the file with `tools.file_reader.read_file` — UTF-8, else
+    `latin-1` — while the write codec came from `_edit_write_encodings`, which puts `cp1251`
+    first. A cp1251 file was therefore *shown* to the model as `Ïðèâåò ìèð` and then written
+    back as cp1251, so an instruction in Russian about a Russian file could not be done: the
+    text the model was handed is not the text it was asked about. The Coder reads such a file
+    in its own codec (`_file_read_encoding`, HARDEN-9 C); this is the same one decision, made
+    once and taken from the same list the write walks.
+
+    Fail-open, as everywhere in this part: an undecodable file, an unreadable file or a codec
+    that no longer describes the bytes falls back to the lossy read, so `/edit` still has
+    something to work with rather than an exception into the run.
+    """
+    try:
+        with open(target, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    for encoding in encodings:
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _edit_line_ends(dest: str, content: str) -> str:
+    """*content* with *dest*'s line endings, decided per line (HARDEN-14 C2).
+
+    `in_style_of` (tools.auto.utils) takes CRLF for the whole file when more than half of its
+    `\\n` follow a `\\r`, so `a\\r\\nb\\r\\nc\\nd\\ne\\n` edited on `c` came out as
+    `a\\nb\\nC\\nd\\ne\\n` — the untouched `a` and `b` lost the `\\r` they were written with.
+    A line of the reply that equals a line of the original (after the line ending) keeps *that
+    line's own* ending, used once; a changed or a new line takes the file's majority style, so
+    an all-CRLF and an all-LF file are unchanged and only a genuinely mixed one is spared the
+    flattening. The BOM is `in_style_of`'s own, so this only supplies the endings.
+    """
+    try:
+        with open(dest, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return content
+    if not raw:
+        return content
+    majority_crlf = raw.count(b"\r\n") * 2 > raw.count(b"\n")
+    changed_ending = "\r\n" if majority_crlf else "\n"
+    original_lines = raw.decode("utf-8", errors="replace").splitlines(keepends=True)
+    by_text: dict = {}
+    for line in original_lines:
+        body = line.rstrip("\r\n")
+        by_text.setdefault(body, []).append(line[len(body):])
+    # The reply may arrive with either ending (a faithful model echoes what it was shown), so
+    # it is normalised to LF first: a `\r` left in the body would be doubled when the line's
+    # own ending is put back.
+    parts = content.replace("\r\n", "\n").split("\n")
+    out: list = []
+    last = len(parts) - 1
+    for pos, body in enumerate(parts):
+        if pos == last and body == "":
+            out.append("")                    # the empty string after a trailing newline
+            continue
+        endings = by_text.get(body)
+        if endings:
+            out.append(body + endings.pop(0))  # the line's own ending, used once
+        elif pos == last:
+            out.append(body)                   # a last line with no ending of its own
+        else:
+            out.append(body + changed_ending)  # a changed or a new line: the majority
+    text = "".join(out)
+    # The BOM is `in_style_of`'s own half: the model writes no BOM, so a BOM the original had
+    # is put back rather than dropped on the floor.
+    if raw.startswith(b"\xef\xbb\xbf") and not text.startswith("\ufeff"):
+        text = "\ufeff" + text
+    return text
 
 
 def _remove_edit_backup(path: str) -> None:
@@ -1114,10 +1258,20 @@ class OrchestratorActions:
             return
         start = time.time()
         tracer.start_run(f"/edit {instruction} in {file_path}")
+
+        # ── HARDEN-14 C3: a UTF-16 / UTF-32 file is refused by name ───────────────
+        # Such a file read as latin-1 is a wall of NULs the model cannot work with: it
+        # cannot find its line, the edit applies nothing, and `/edit` still printed
+        # `status=approved` with a backup while the file lost its `\r`. Refused like a file
+        # with undecodable bytes today — and left byte-identical.
         try:
-            original = read_file(target)
-        except Exception as e:
-            print(f"[{_ts()}] Could not read {target}: {e}")
+            with open(target, "rb") as _fh:
+                _wide = _wide_bom_name(_fh.read())
+        except OSError:
+            _wide = None
+        if _wide:
+            print(f"[{_ts()}] ❌ {file_path} is {_wide} — convert it to UTF-8 first; "
+                  f"nothing was written.")
             return
 
         # ── CC-16 (Part C): the write encoding, decided once ───────────────────────
@@ -1129,6 +1283,10 @@ class OrchestratorActions:
         _edit_encodings = _edit_write_encodings(target)
         _legacy_named = [e for e in _edit_encodings if e not in ("utf-8", "latin-1")]
         _encoding = _edit_encodings[0] if len(_edit_encodings) == 1 else ""
+
+        # HARDEN-14 C1: the file is read in the codec it will be *written* back in, so the
+        # model is shown the text it is asked about — not latin-1 mojibake of a cp1251 file.
+        original = _read_edit_target(target, _edit_encodings)
 
         def _refuse_unwritable(text: str) -> bool:
             """True (after saying why) when *text* fits none of the file's write
@@ -1336,11 +1494,13 @@ class OrchestratorActions:
             backup = f"{target}.bak.{time.strftime('%H%M%S')}.{_bak_n}"
         try:
             import shutil
-            from pathlib import Path
-            from tools.auto.utils import atomic_write_text, in_style_of
+            from tools.auto.utils import atomic_write_text
             shutil.copy2(target, backup)        # the original's bytes and mode
+            # HARDEN-14 C2: `_edit_line_ends` decides each line's own ending, and keeps the
+            # BOM, so the write is not run through `in_style_of`'s whole-file majority pass —
+            # which is exactly the flattening this part removes.
             atomic_write_text(
-                target, in_style_of(Path(target), revised), newline="", encoding=_encoding,
+                target, _edit_line_ends(target, revised), newline="", encoding=_encoding,
             )
         except Exception as e:
             # CC-16 (Part C): the backup was made for a write that never landed.

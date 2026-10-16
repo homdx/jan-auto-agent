@@ -577,7 +577,17 @@ def test_an_unknown_word_is_a_refusal_that_names_the_line():
 def test_a_ticket_without_the_section_has_no_claims():
     assert judge.ticket_claims(_TICKET.split("## Claims")[0], "296-x.md") == []
     assert judge.ticket_claims("", "296-x.md") == []
-    assert judge.ticket_claims("## Claims\n\n") == []
+
+
+def test_a_claims_heading_with_no_claim_is_a_refusal():
+    # HARDEN-14 D: a ticket that opened the section and gave it nothing was `[]`, which read as
+    # "the ticket said nothing" — the judge then scored nothing and said nothing.
+    with pytest.raises(ValueError, match=r"296-x\.md:1: the Claims section has no claim"):
+        judge.ticket_claims("## Claims\n\n", "296-x.md")
+    with pytest.raises(ValueError, match=r"296-x\.md:1: the Claims section has no claim"):
+        judge.ticket_claims("## Claims:\n", "296-x.md")
+    with pytest.raises(ValueError, match=r"296-x\.md:3: the Claims section has no claim"):
+        judge.ticket_claims("# T\n\n### Claims\n\n", "296-x.md")
 
 
 # ------------------------------------------------------------------ the phase's refusals

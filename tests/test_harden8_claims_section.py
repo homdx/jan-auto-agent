@@ -150,4 +150,10 @@ def test_the_shipped_bullet_forms_are_unchanged():
 def test_a_ticket_without_the_section_has_no_claims():
     assert _claims("## Why\n\nnothing here\n") == []
     assert _claims("") == []
-    assert _claims("## Claims\n\n") == []
+
+
+def test_a_claims_heading_with_no_claim_is_a_refusal():
+    # HARDEN-14 D supersedes HARDEN-8's `[]` here: a ticket that opened the section and gave it
+    # nothing is a refusal naming the heading, not "the ticket said nothing".
+    with pytest.raises(ValueError, match=r"306-x\.md:1: the Claims section has no claim"):
+        _claims("## Claims\n\n")

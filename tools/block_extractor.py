@@ -983,7 +983,7 @@ def _find_earliest_genuine_definition(source: str, target_name: str, lang: str =
 
 def _property_arrow_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     """The heads of an arrow function that is a **property of an object literal**
-    (HARDEN-9 E): `name: (x) => {…}`, `name: async (x) => {…}`, `name: x => {…}`,
+    (HARDEN-9 E, HARDEN-14 B2): `name: (x) => {…}`, `name: async (x) => {…}`, `name: x => {…}`,
     `name?: x => {…}`, `name: <T>(x: T): T => {…}`, and the single-expression form.
 
     This is the shape HARDEN-4 D2 stopped one step short of: there is no `const` and no
@@ -991,28 +991,249 @@ def _property_arrow_candidate_patterns(target_name: str) -> list[re.Pattern[str]
     reaches it, and `_head_prefix_kind` would read the `:` before the name as a return
     type's position rather than as a property's. It is anchored at the line start with
     `[ \t]*`, as the HARDEN-4 D2 heads are: a head that spans lines is not this form.
+
+    **HARDEN-14 B2**: the pattern stops at the `(` or at a bare identifier — it does *not*
+    try to match the parameter list, a return annotation and the `=>`. The empty list
+    (`() =>`), the `async` keyword in front of it and a parameter list that wraps over
+    several lines all failed the one-regex shape, because the parameter class wanted at
+    least one character and stopped at the newline. The parameter list's own matching `)`,
+    the `=>` after it and what follows the `=>` are found by a bounded scan
+    (`_property_arrow_head_end`) instead of by a wider regular expression — widening the
+    regex would take the TS type members (`onSave: (v: string) => void;`) with it.
     """
     name = re.escape(target_name)
     # `readonly`/`as const`-free modifiers of a property, a `?` for an optional one,
-    # optional TS type parameters after the colon, then the parameter list or a single
-    # parameter name, an optional return annotation, and the `=>`.
+    # optional TS type parameters after the colon, an optional `async`, then the start of
+    # the parameter list or a single parameter name — the head, up to the point where the
+    # scan takes over.
     mods = r"(?:(?:readonly|public|private|protected|static)[ \t]+)*"
     tp = r"(?:[ \t]*<[^(){};\n]{1,200}>|[ \t]*\[[^(){};\n]{1,200}\])?"
-    ann = r"(?::[^=;\n]{1,200})?"
-    params = r"(?:\([^)\n]{1,400}\)|[A-Za-z_$][\w$]*)"
+    params = r"(?:\(|[A-Za-z_$][\w$]*)"
     return [
         re.compile(
             rf"(?m)^[ \t]*{mods}{name}[ \t]*[?]?[ \t]*:[ \t]*(?:async[ \t]+)?{tp}[ \t]*{params}"
-            rf"{ann}[ \t]*=>"
         ),
     ]
+
+
+#: HARDEN-14 B2: how far from the `(` the parameter list's matching `)` is looked for. A
+#: parameter list longer than this is not one — a guard so a malformed `(` cannot walk the
+#: whole file.
+_PROPERTY_PARAM_BOUND = 4000
+
+
+def _property_arrow_head_end(source: str, open_paren: int) -> "tuple[int, bool] | None":
+    """`(index just past the `=>`, whether the head declared a return type)` of a property arrow
+    whose parameter list opens at *open_paren*, or ``None`` when the shape is not a function.
+
+    HARDEN-14 B2, step 2: from the `(` a balanced, comment-aware scan finds the matching
+    `)` (newlines allowed inside, bounded to a few thousand characters), and what follows
+    decides whether the head is a definition at all:
+
+    * a `=>` — a function; the return annotation that may precede it is reported, because a
+      typed head (`typed: <T>(x: T): T => x`) is a definition and a type member's is not;
+    * a `;`, a `,` or a stray `)` with no `=>` — the value is not a function (`name: (a, b)`).
+    """
+    n = len(source)
+    i = open_paren
+    depth = 0
+    state = "code"
+    escape = False
+    bound = min(n, open_paren + _PROPERTY_PARAM_BOUND)
+    close_paren = None
+
+    while i < bound:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+            else:
+                i += 1
+            continue
+        if state in {"single", "double", "backtick", "char"}:
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            quote = {"single": "'", "double": '"', "backtick": "`", "char": "'"}[state]
+            if ch == quote:
+                state = "code"
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            state = "line_comment"
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            state = "block_comment"
+            i += 2
+            continue
+        if ch in "'\"`":
+            state = {"'": "single", '"': "double", "`": "backtick"}[ch]
+            escape = False
+            i += 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_paren = i
+                break
+        i += 1
+
+    if close_paren is None:
+        return None
+    # A return annotation may sit between the `)` and the `=>` (`opt?: (x): User => x`,
+    # `typed: <T>(x: T): T => x`), and both may wrap over lines; only a `;`, a `,` or a stray
+    # `)` ends the head. The annotation is remembered (HARDEN-14 B2): a typed arrow whose head
+    # declares its return type is a *definition*, while a bare identifier after a `=>` with no
+    # annotation is how a TypeScript type member ends (`onSave: (v: string) => void;`).
+    j = close_paren + 1
+    bound = min(n, j + 4000)
+    saw_annotation = False
+    while j < bound:
+        ch = source[j]
+        if ch in ";,)":
+            return None
+        if ch == ":":
+            saw_annotation = True
+            j += 1
+            continue
+        if ch == "=":
+            if source.startswith("=>", j):
+                return (j + 2, saw_annotation)
+            return None
+        if ch == "\n" and source[j - 1] not in "(,:=<>[\n \t":
+            # A line that ends on an operator continues; anything else ends the head.
+            return None
+        j += 1
+    return None
+
+
+#: HARDEN-14 B2: the `| null` / `& Foo<T>[]` tail of a union or intersection type.
+_TYPE_UNION_TAIL = re.compile(r"(?:\s*[|&]\s*[A-Za-z_$][\w$.]*(?:<[^;()]*>)?(?:\[\s*\])*)+")
+
+
+def _property_arrow_value_is_type(source: str, after_arrow: int,
+                                 head_typed: bool = False) -> bool:
+    """True when what follows a `=>` at *after_arrow* is a **type**, not a value (HARDEN-14 B2).
+
+    A TypeScript type member has a type after the `=>` and then `;`, `,` or `)` and no body:
+    `onSave: (value: string) => void;`, `onOpen: (id: number) => Promise<void>,`,
+    `callback: (ev: Event) => void`. A definition has a `{` body or an expression after the
+    `=>` (`save: async (u) => persist(u),`).
+
+    *head_typed* is the head's own return annotation (`_property_arrow_head_end`): a head
+    that declares its return type is a typed arrow function — a definition — whatever
+    follows, which is what keeps the HARDEN-9 E row `typed: <T>(x: T): T => x` found.
+
+    The test is otherwise the shape of what follows: a type is a name (possibly templated)
+    followed immediately by a terminator, an expression is a call, an operator or a literal.
+    """
+    if head_typed:
+        return False
+    n = len(source)
+    i = after_arrow
+    while i < n and source[i] in " \t\r\n":
+        i += 1
+    if i >= n:
+        return False
+    if source[i] == "{":
+        return False                     # an object/block body: a definition
+    # A type starts with an identifier or a `void`-shaped keyword; an expression starts with an
+    # operator, a literal, a bracket or a call.
+    m = re.match(r"[A-Za-z_$][\w$]*", source[i:])
+    if not m:
+        return False
+    name = m.group(0)
+    j = i + len(name)
+    # Skip a template argument list or an array suffix: `Promise<void>`, `Map<K, V>[]`.
+    while j < n and source[j] in " \t":
+        j += 1
+    if j < n and source[j] == "<":
+        depth = 0
+        while j < n and j < i + 400:
+            if source[j] == "<":
+                depth += 1
+            elif source[j] == ">":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            elif source[j] in "\n;)":
+                break
+            j += 1
+        while j < n and source[j] in " \t\r\n":
+            j += 1
+    while j < n and source[j] == "[":
+        k = source.find("]", j)
+        if k < 0 or k - j > 400:
+            break
+        j = k + 1
+        while j < n and source[j] in " \t\r\n":
+            j += 1
+    # A union or intersection goes on with more type names (`() => void | null;`); an expression
+    # that uses `|` or `&` between operands is not told apart here, and it ends in a call or a
+    # literal that the terminator test below refuses.
+    um = _TYPE_UNION_TAIL.match(source, j)
+    if um:
+        j = um.end()
+        while j < n and source[j] in " \t\r\n":
+            j += 1
+    # A type is a name followed straight away by a terminator; an expression has something
+    # between (`persist(u)`, `x + 1`, `load(id)`).
+    if j >= n:
+        return False
+    return source[j] in ";,)"
+
+
+#: A `{` body may open right after the `=>`, or after a newline or a return annotation.
+_PROPERTY_BARE_ARROW = re.compile(r"[ \t]*=>")
+
+
+def _property_arrow_tail(source: str, match: "re.Match[str]") -> "tuple[int, bool] | None":
+    """`(index just past the head's `=>`, whether the head declared a return type)` for a
+    property-arrow head *match*, or ``(None, False)`` when the shape is not a function.
+
+    HARDEN-14 B2: the head pattern stops at the `(` or at a bare single parameter name, so the
+    `=>` is either what the balanced parameter-list scan found (`_property_arrow_head_end`) or
+    what follows that bare name (`bare: id => load(id)`).
+    """
+    if source[match.end() - 1:match.end()] == "(":
+        found = _property_arrow_head_end(source, match.end() - 1)
+        if found is None:
+            return (None, False)
+        return found
+    m = _PROPERTY_BARE_ARROW.match(source, match.end())
+    if not m:
+        return (None, False)
+    return (m.end(), False)
 
 
 def _find_earliest_property_arrow_definition(
     source: str, target_name: str, lang: str = ""
 ) -> Optional[tuple]:
     """The earliest object-literal-property arrow definition of `target_name`
-    (HARDEN-9 E), as `(match_start, open_brace, end)`.
+    (HARDEN-9 E, HARDEN-14 B2), as `(match_start, open_brace, end)`.
+
+    HARDEN-14 B2: the head pattern stops at the `(` (or at a bare identifier), and the rest —
+    the matching `)`, the `=>` and what follows it — is a bounded scan
+    (`_property_arrow_head_end`). That is what makes the empty parameter list
+    (`handler: () => {…}`), `async` and a parameter list over several lines work without
+    widening one regex for the three shapes, and it is also where a TypeScript type member
+    (`onSave: (v: string) => void;`) is told apart from a definition.
 
     Braced bodies first, body-less ones only if there is no braced one anywhere — the same
     order as the two passes above it, so a braced body always wins over a one-liner. Last of
@@ -1028,15 +1249,20 @@ def _find_earliest_property_arrow_definition(
         for match in pat.finditer(source):
             if _head_is_call(source, match, target_name):
                 continue
+            tail_start, head_typed = _property_arrow_tail(source, match)
+            if tail_start is None:
+                continue
+            if _property_arrow_value_is_type(source, tail_start, head_typed):
+                continue
             # The head already consumed the parameters, the annotation and the `=>`, so a braced
             # body opens at the very next `{`. A `{` anywhere further on belongs to something else
             # (the object literal of a later property, a nested block), and the block would run
             # across the whole literal instead of stopping at the property's own end.
-            tail = source[match.end():]
+            tail = source[tail_start:]
             stripped = tail.lstrip(" \t\r\n")
             if not stripped.startswith("{"):
                 continue
-            open_idx = match.end() + (len(tail) - len(stripped))
+            open_idx = tail_start + (len(tail) - len(stripped))
             effective_start = _effective_match_start(source, match.start())
             start = _line_start_index(source, effective_start)
             if best_start is None or start < best_start:
@@ -1053,8 +1279,13 @@ def _find_earliest_property_arrow_definition(
         for match in pat.finditer(source):
             if _head_is_call(source, match, target_name):
                 continue
+            tail_start, head_typed = _property_arrow_tail(source, match)
+            if tail_start is None:
+                continue
+            if _property_arrow_value_is_type(source, tail_start, head_typed):
+                continue
             # The head already consumed the parameters, so the body starts right after the `=>`.
-            end = _find_definition_end_bodyless(source, match.end(), False, lang,
+            end = _find_definition_end_bodyless(source, tail_start, False, lang,
                                                 stop_at_comma=True)
             if end is None:
                 continue
@@ -1130,13 +1361,23 @@ _DECLARATION_TAIL_WORDS = frozenset((
     "const", "noexcept", "override", "final", "throws", "throw", "volatile", "where", "requires",
     "asm", "__asm__", "__attribute__",
 ))
+#: HARDEN-14 B3: the `= 0` / `= delete` / `= default` tail of a body-less C++ declaration.
+#: Only these three, and only ahead of the `;` the caller looks for, so an initialiser
+#: (`int x = 0;` is not a function declaration) still stops the scan.
+_DECLARATION_EQ_TAIL = re.compile(r"=\s*(?:0|delete|default)\b[ \t\r\n]*(?=[;)}])")
+#: The macro-shaped words that may follow a body-less declaration's parameter list on the next
+#: line (HARDEN-14 B1): `int api(int a)\n    DEPRECATED_MACRO;`. A bare upper-case identifier
+#: (digits and underscores allowed) is how a macro attribute is written after the parameters, on
+#: the line below them, and fix 38 left every one of them at "not found".
+_DECLARATION_MACRO_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 
 def _declaration_tail_ok(source: str, i: int) -> bool:
     """Whether what follows a parameter list ending at *i* can continue a declaration: its `;`, a
-    return type (`:`, `->`) or a qualifier word (`const`, `throws`, a macro attribute on the same
-    line). A `,`, a `)`, an operator or a member access means the parameter list was a call's
-    argument list (`closePath(),`, `streq(a, b) ||`, `f(x) + 1`)."""
+    return type (`:`, `->`), a qualifier word (`const`, `throws`, a macro attribute on the same
+    line) or a bare upper-case macro on the next line (HARDEN-14 B1). A `,`, a `)`, an operator or
+    a member access means the parameter list was a call's argument list (`closePath(),`,
+    `streq(a, b) ||`, `f(x) + 1`)."""
     n = len(source)
     while i < n and source[i] in " \t\r":
         i += 1
@@ -1147,8 +1388,21 @@ def _declaration_tail_ok(source: str, i: int) -> bool:
         return False
     if source[i] in ";:" or source.startswith("->", i) or source.startswith(("//", "/*"), i):
         return True
+    if _DECLARATION_EQ_TAIL.match(source, i):
+        # HARDEN-14 B3: `= 0`, `= delete`, `= default` — the tail of a pure-virtual, a
+        # deleted or a defaulted declaration, on the same line or the next.
+        return True
     word = re.match(r"[A-Za-z_][\w]*", source[i:])
-    return bool(word) and (not crossed or word.group(0) in _DECLARATION_TAIL_WORDS)
+    if not word:
+        return False
+    text = word.group(0)
+    if not crossed or text in _DECLARATION_TAIL_WORDS:
+        return True
+    # HARDEN-14 B1: on the next line, only a qualifier word or a macro-shaped name
+    # continues a declaration; a lower-case word is the next statement's own code.
+    if _DECLARATION_MACRO_RE.match(text):
+        return True
+    return False
 
 
 def _find_definition_end_declaration(source: str, scan_from: int, has_arg_list: bool,
@@ -1235,7 +1489,18 @@ def _find_definition_end_declaration(source: str, scan_from: int, has_arg_list: 
 
         if ch == ";":
             return (i + 1, has_return_type)
-        if ch in "{=":
+        if ch in "{":
+            return None
+        if ch == "=":
+            # HARDEN-14 B3: `= 0`, `= delete` and `= default` end a body-less C++
+            # declaration — `virtual void f() = 0;`, `void g() = delete;`,
+            # `~I() = default;`. The `=` was the scan's stop, so every pure-virtual,
+            # deleted and defaulted declaration answered "not found". The scan
+            # resumes at the `;` that follows it, so only that form is accepted.
+            m = _DECLARATION_EQ_TAIL.match(source, i)
+            if m:
+                i = m.end()
+                continue
             return None
         if ch in ":>" or (ch == "-" and nxt == ">"):
             # A return type after the parameter list: `): void;`, `) -> int;`.
@@ -1274,6 +1539,10 @@ def _find_earliest_declaration(source: str, target_name: str, lang: str = "") ->
             if pos is None:
                 continue
             kind = "call" if _declaration_prefix_is_call(head[:pos]) else _head_prefix_kind(head[:pos])
+            # HARDEN-14 B3: a destructor's name opens with `~` and carries no return type, so
+            # it is a declaration on its own — `~I() = default;`, `~I();`.
+            if target_name.startswith("~"):
+                kind = "declaration"
             if kind == "call" or (kind != "declaration" and not has_return_type):
                 continue
 
@@ -1436,6 +1705,12 @@ def extract_block(source: str, target_name: str, file_ext: str) -> str:
     ext = _normalize_ext(file_ext)
 
     block = _extract_block_named(source, target_name, ext)
+    if (not block and target_name and ext in (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh")
+            and target_name[0].isalpha() and "." not in target_name):
+        # HARDEN-14 B3: a destructor (`~I() = default;`) is a symbol some callers name `I`, the
+        # class's name, and some `~I`; with no other definition of `I` in the file the destructor
+        # is what the name means.
+        block = _extract_block_named(source, "~" + target_name, ext)
     if block or not target_name or "." not in target_name:
         return block
 
