@@ -204,13 +204,19 @@ def stream_options_is_supported(url: str, model=None) -> bool:
 # `assert client.api_key =here_your_key key`, code that does not parse. The
 # `~=` of a match (`api_key =~ /re/`) is the same shape with a tilde ahead of the
 # second `=`. A comparison's `=` is always preceded by `=`, `!`, `<`, `>`, `~`,
-# `&` or `|`, and never followed by another `=` or a `~`.
+# `&` or `|`, and never followed by another `=`, a `~` or a `>`.
+#
+# HARDEN-12 B: a trailing `>` is the Ruby or PHP hash arrow, `api_key => 'gsk_…'`, and
+# the value class ate the `>` on its own, so the line went out as
+# `api_key =here_your_key '…'` — the comparison's `=` is the one this guard was written
+# for, but the arrow is the other half of that shape. The `=>` is the colon rule's to
+# take (`_API_KEY_COLON_RE`), which keeps the arrow and only touches the value.
 # The string prefix of a quoted value (`r`, `b`, `f`, `u`, `rb`, …) is part of the
 # value: without it the value class matched the prefix alone and left the quote pair
 # behind, so a raw string went out with its quotes in the wrong place (HARDEN-10 B).
 _API_KEY_LINE_RE = re.compile(
     r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?)([\w.-]*api[_-]?key)'
-    r'([ \t]*(?<![=!<>~&|])=(?![=~])[ \t]*)'
+    r'([ \t]*(?<![=!<>~&|])=(?![=~>])[ \t]*)'
     r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";]+)([ \t]*\r?)"
 )
 # The same key with a type annotation before its `=`: `api_key: str = "…"`, `apiKey: string = '…'`.
@@ -229,9 +235,37 @@ _API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]
 # token after a colon all left the machine. The value stops at a space, a `#`, a YAML
 # flow separator or a closing bracket, and never at a `=` — so `api_key: Optional[str]
 # = None` yields the annotation, not the tail.
+#
+# HARDEN-12 B widens the left-hand side and the separator, not the value rule: a key
+# name may wear quotes (`{'api_key': 'gsk_…'}`, a Python dict written with single
+# quotes — `_API_KEY_JSON_RE` takes a double-quoted name only), and the separator may
+# be the Ruby or PHP hash arrow `=>` or a plain `=`, which is what left
+# `api_key => 'gsk_…'` behind. The arrow alternative is tried before the `=` one, and
+# the `=` one keeps HARDEN-10 B's guards, so `api_key >= '…'` and `api_key == '…'`
+# are still comparisons and not assignments.
 _API_KEY_COLON_RE = re.compile(
-    r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:[-*][ \t]+)?)([\w.-]*api[_-]?key)([ \t]*:[ \t]*)'
+    r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:[-*][ \t]+)?)'
+    r"((?:['\"])?[\w.-]*api[_-]?key(?:['\"])?)"
+    r"([ \t]*(?:=>|(?<![=!<>~&|])=(?![=~>])|:)[ \t]*)"
     r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^#\s;\"'\,\}\]\)\|=&]+)"
+)
+# HARDEN-12 B: a subscript on the left, `os.environ["GROQ_API_KEY"] = "gsk_…"` (or the
+# single-quoted `os.environ['GROQ_API_KEY'] = '…'`). None of the rules above reaches it:
+# `_API_KEY_LINE_RE` wants the *name* to hold `api_key`, and here the key name sits inside
+# the brackets. Only a name that names a credential counts, so `os.environ["HOME"] = "x"`
+# is left alone, and the value goes through `_value_is_secret_literal` like every other one
+# — `os.environ["X_API_KEY"] = os.getenv("Y")` stays code.
+_ENV_SUBSCRIPT_ASSIGN_RE = re.compile(
+    r"(?i)([ \t]*(?:[#;]+[ \t]*)?)"
+    r"((?:[A-Za-z_][\w.]*\.)?environ)\[([\"'])([\w.-]*(?:key|token|secret|password)[\w.-]*)\3\]"
+    r"([ \t]*(?<![=!<>~&|])=(?![=~])[ \t]*)"
+    r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";]+)([ \t]*\r?)"
+)
+# HARDEN-12 B: an XML element whose tag is a key name, `<api_key>gsk_…</api_key>`. The tag
+# name carries the rule's job, the content is judged by `_value_is_secret_literal`, so
+# `<api_key>Value</api_key>` stays as it is.
+_API_KEY_XML_RE = re.compile(
+    r"(?i)(<([A-Za-z][\w:-]*(?:api[_-]?key|apikey)[\w:-]*)[ \t]*>)([^<\r\n]*)(</\2[ \t]*>)"
 )
 # A bare Python/JS identifier: a NAME, i.e. a reference to something, never a literal secret.
 _BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -281,6 +315,17 @@ _SECRET_PREFIX_RE = re.compile(
     r"|\bsk-[A-Za-z0-9_\-]{12,}"
     r"|\bAIza[A-Za-z0-9_\-]{20,}"
     r"|\bxoxb-[A-Za-z0-9_\-]{10,}"
+    # HARDEN-12 C: the other providers' key shapes, in prose, a comment or a log line —
+    # Groq, GitHub, Hugging Face, xAI, GitLab, AWS. Every tail is long, so a shorter word
+    # that merely starts the same way (`hf_model`, a bare `gsk_`, `AKIA` in a sentence)
+    # is untouched: a provider issues tens of characters after its prefix.
+    r"|\bgsk_[A-Za-z0-9]{20,}"
+    r"|\bgh(?:p|o|s|u)_[A-Za-z0-9]{20,}"
+    r"|\bgithub_pat_[A-Za-z0-9_]{20,}"
+    r"|\bhf_[A-Za-z0-9]{20,}"
+    r"|\bxai-[A-Za-z0-9]{20,}"
+    r"|\bglpat-[A-Za-z0-9_\-]{16,}"
+    r"|\b(?:AKIA|ASIA)[A-Z0-9]{12,}"
 )
 _MASK_PLACEHOLDER = "here_your_key"
 
@@ -330,8 +375,9 @@ def _value_is_secret_literal(value: str, key_name: str, colon: bool = False) -> 
     * a dotted value that is a token — a JWT or ``ya29.a0AfH6…`` (HARDEN-9 A) — is a
       literal, while a path of words stays code;
     * with *colon* (the unquoted YAML form, HARDEN-9 B) a bare identifier counts only
-      when it is long enough to be a credential and token-shaped, since on that form a
-      short identifier is a type annotation or a parameter name.
+      when it has the shape of a credential — a digit among its letters, or one of the
+      providers' key prefixes — since on that form a word of letters is a type
+      annotation or a parameter name, whatever its length and case (HARDEN-12 A).
     """
     value = (value or "").strip()
     if not value:
@@ -351,6 +397,13 @@ def _value_is_secret_literal(value: str, key_name: str, colon: bool = False) -> 
         return False
     if any(ch.isspace() for ch in body):
         return False
+    if not any(ch.isalnum() for ch in body):
+        # `api_key=…` / `api_key: ...` in a docstring or a comment is an elision, not a key.
+        return False
+    if colon and "`" in body:
+        # A backtick is Markdown, not a credential: `` `x-api-key: v`, `` in a comment or a
+        # docstring names the header and does not hold one.
+        return False
     if "." in body:
         # HARDEN-9 A: a dotted value is a token as often as it is an attribute
         # path, so `.` alone must not decide between them.
@@ -363,10 +416,10 @@ def _value_is_secret_literal(value: str, key_name: str, colon: bool = False) -> 
         if body.strip("_").lower() in _CODE_WORDS:
             return False
         if colon:
-            # HARDEN-9 B: on the colon form a bare identifier is a type or a
-            # parameter name as often as it is a value, so only one that is long
-            # enough to be a credential and token-shaped in its letters counts.
-            return (len(body) >= _TOKEN_MIN_LEN and _looks_like_a_token(body)
+            # HARDEN-12 A: on the colon form a bare identifier is a type, a class or a
+            # variable as often as it is a value, so only one with the shape of a
+            # credential counts. `AsyncOpenAIClientFactory` is an annotation.
+            return (_identifier_is_a_credential(body)
                     and not _names_the_same_key(body, key_name))
         return not _names_the_same_key(body, key_name)
     # Not an identifier: an opaque bare token (sk-abc123, a long hex string) — a key.
@@ -378,9 +431,47 @@ def _looks_like_a_token(value: str) -> bool:
 
     A credential's letters are not all one case and not all one kind: ``AKIA…7…``,
     ``ghp_abc…123``, ``dGhpc2lz…MTIz``. A name is ``some_long_variable`` or a type.
+
+    Used where the value sits inside a quote or a dotted run. For the bare identifier
+    after a colon `_identifier_is_a_credential` is the rule: the mixed-case half of this
+    test reads a CamelCase class name as a credential, which is what rewrote an
+    annotation (HARDEN-12 A).
     """
     return any(ch.isdigit() for ch in value) or (
         any(ch.isupper() for ch in value) and any(ch.islower() for ch in value))
+
+
+#: The last word of a variable name that says the variable holds a count, a path or a
+#: label and not the credential its other words mention (`TOKEN_COUNT`, `KEY_DIR`,
+#: `API_KEY_NAME`, `SECRET_FILE`): such a name is not a credential's, whatever else is in it.
+_NOT_A_CREDENTIAL_SUFFIXES = frozenset({
+    "count", "dir", "path", "file", "name", "id", "type", "length", "len", "size", "limit",
+    "max", "min", "ttl", "timeout", "url", "uri", "host", "port", "env", "var", "field",
+    "header", "prefix", "index", "version", "mode", "format", "label", "pattern",
+})
+
+
+def _name_is_not_a_credential(name: str) -> bool:
+    """Whether a variable name ends in a word that makes it a count, a path or a label
+    (`TOKEN_COUNT`, `KEY_DIR`), so a value behind it is no secret."""
+    parts = re.split(r"[_.\-]", name.lower())
+    return len(parts) > 1 and parts[-1] in _NOT_A_CREDENTIAL_SUFFIXES
+
+
+def _identifier_is_a_credential(value: str) -> bool:
+    """Whether a bare identifier of letters, digits and underscores carries the shape
+    of a credential rather than a name (HARDEN-12 A).
+
+    A credential either has a digit among its letters (``AKIAIOSFODNN7EXAMPLE``,
+    ``ghp_…0123``) or starts with one of the providers' key prefixes. A word of letters,
+    CamelCase or snake_case, whatever its length and case, is a type, a class or a
+    variable: ``AsyncOpenAIClientFactory``, ``ProviderCredentialsHolder``, ``SecretStr``,
+    ``client_factory``. The old mixed-case half of ``_looks_like_a_token`` called every
+    CamelCase name a credential, so an indented dataclass field went out masked and a
+    faithful edit wrote the placeholder back where an annotation named a class — the
+    module then failed to import, and nothing reported it.
+    """
+    return any(ch.isdigit() for ch in value) or bool(_SECRET_PREFIX_RE.search(value))
 
 
 def _part_mixes_letters_and_digits(part: str) -> bool:
@@ -494,6 +585,15 @@ def mask_api_key(text: "str | None") -> "str | None":
     literal after an ``=`` and after a ``:`` is one rule,
     ``_value_is_secret_literal``, so both are masked by it.
 
+    HARDEN-12: three more shapes that reached the provider, through the same rule.
+    A key name in single quotes with a ``:`` or a ``=>`` (``{'api_key': '…'}``,
+    ``api_key => '…'``), a subscript assignment (``os.environ["GROQ_API_KEY"] = "…"``),
+    and an XML element whose tag is a key name (``<api_key>…</api_key>``) are now
+    looked at as well; and a bare key with a known provider prefix (``gsk_``,
+    ``ghp_``, ``hf_``, ``xai-``, ``glpat-``, ``AKIA``/``ASIA``) is masked wherever it
+    sits. In exchange the unquoted colon form no longer reads a CamelCase class name as
+    a credential (Part A): ``api_key: AsyncOpenAIClientFactory`` is an annotation.
+
     This is a plain string transform with no knowledge of *which* key is
     "real" — it masks unconditionally so a secret embedded in file content
     that gets pulled into a prompt can't leak to the LLM. Non-string input
@@ -526,6 +626,25 @@ def mask_api_key(text: "str | None") -> "str | None":
         str_prefix, quote = _quote_parts(value)
         return f"{prefix}{key_name}{assign}{str_prefix}{quote}{_MASK_PLACEHOLDER}{quote}"
 
+    def _mask_env_subscript(m: "re.Match") -> str:
+        prefix, environ, quote, name, assign, value, suffix = m.groups()
+        if _name_is_not_a_credential(name):
+            return m.group(0)
+        # The subscript names the key, so it is not the value: `os.environ["X_API_KEY"] =
+        # os.getenv("Y")` is code and stays, whatever the letters (HARDEN-12 B).
+        if not _value_is_secret_literal(value, name, colon=not _is_plain_quoted(value)):
+            return m.group(0)
+        str_prefix, vquote = _quote_parts(value)
+        return (f"{prefix}{environ}[{quote}{name}{quote}]{assign}"
+                f"{str_prefix}{vquote}{_MASK_PLACEHOLDER}{vquote}{suffix}")
+
+    def _mask_xml(m: "re.Match") -> str:
+        open_tag, tag_name, value, close_tag = m.groups()
+        if not _value_is_secret_literal(value, tag_name, colon=not _is_plain_quoted(value)):
+            return m.group(0)
+        str_prefix, quote = _quote_parts(value)
+        return f"{open_tag}{str_prefix}{quote}{_MASK_PLACEHOLDER}{quote}{close_tag}"
+
     def _mask_bearer(m: "re.Match") -> str:
         token = m.group(2)
         # "the bearer authentication_scheme is used" is English, not a credential: a long
@@ -548,6 +667,8 @@ def mask_api_key(text: "str | None") -> "str | None":
     text = _API_KEY_ANNOTATED_RE.sub(_mask_annotated, text)
     text = _API_KEY_COLON_RE.sub(_mask_colon, text)
     text = _API_KEY_JSON_RE.sub(r"\1" + _MASK_PLACEHOLDER + r"\2", text)
+    text = _ENV_SUBSCRIPT_ASSIGN_RE.sub(_mask_env_subscript, text)
+    text = _API_KEY_XML_RE.sub(_mask_xml, text)
     text = _BEARER_TOKEN_RE.sub(_mask_bearer, text)
     return _SECRET_PREFIX_RE.sub(_MASK_PLACEHOLDER, text)
 

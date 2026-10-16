@@ -60,6 +60,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from tools.llm_stream import _name_is_not_a_credential
 import shlex
 import shutil
 import signal
@@ -996,9 +997,120 @@ _SECRET_OPT_RE = re.compile(
 )
 
 # Authorization values are two words (Bearer token); matched up to the next quote or flag so the token is hidden too.
+# Run before `_SECRET_HEADER_RE`: that one takes a single token, which would have left the token behind the `Bearer`.
 _SECRET_AUTH_RE = re.compile(
     r"(Authorization)([=:]\s*|\s+)([^\"'\n]+?)(?=\s+--|[\"'\n]|$)"
 )
+
+# HARDEN-12 D: a credential-named HTTP header anywhere in the command, `x-api-key: v`,
+# `X-API-KEY: v`, `x-token: v`. The name must carry a credential word, so
+# `Accept: application/json` and `Content-Type: application/json` stay. The value is one
+# token — a header's value is a single word, and running it to the end of the line would
+# have swallowed the rest of the command (`x-api-key: v pytest -q` became
+# `x-api-key: [REDACTED]`). `Authorization` keeps its own rule: its value is two words,
+# `Bearer sk-...`, and it is run first so the token behind the word is hidden too.
+_SECRET_HEADER_RE = re.compile(
+    r"(?i)([A-Za-z0-9_-]*[-_]?(?:api[-_]?key|apikey|token|secret|password|passwd|"
+    r"key)[A-Za-z0-9_-]*)([=:])(\s*)([^\s\"'\n]+)(?=[\s\"'\n]|$)"
+)
+
+# HARDEN-12 D: `NAME=value` handing a key to a command, where NAME names a credential.
+# It may sit only at the start of a command, or right after a `;`, `&&`, `||` or `|` —
+# a `NAME=value` mid-argument is a coincidence (`grep foo=bar file`) and stays.
+_SECRET_ENV_ASSIGN_RE = re.compile(
+    r"(?i)(^|[;|&])(\s*)((?:export\s+|env\s+)?)"
+    r"([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Za-z0-9_]*)"
+    r"=(\s*)(\"[^\"]*\"|'[^']*'|[^\s;|&]+)"
+)
+
+# HARDEN-12 D: `user:pass@` in a URL, only the password. The scheme is any
+# `name://`, the user is kept, and a URL without a password is left byte for byte.
+_SECRET_URL_USERINFO_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]+:)([^@\s]+)(@)"
+)
+
+# HARDEN-12 D: `-u user:pass`. The colon is the tell, so `-u someflag` is a flag value,
+# not a credential, and `grep -u` / `ls -u` are left alone.
+_SECRET_USER_OPT_RE = re.compile(
+    r"(\s(?:-u|--user)(?:\s+|=))([^\s:]+):([^\s]+)"
+)
+
+# `-p value` / `-pvalue` is a password only for the commands that take one. `ls -p`,
+# `grep -p pat`, `pytest -p no:cacheprovider` and `docker run -p 8080:80` are unrelated
+# flags and stay as they are (HARDEN-12 D).
+_PASSWORD_OPT_COMMANDS = frozenset({
+    "mysql", "mysqldump", "mariadb", "mariadb-dump", "redis-cli", "sshpass", "htpasswd",
+})
+_PASSWORD_OPT_RE = re.compile(r"(?<![\w-])(-p)([ \t]*)(\S*)")
+#: The wrappers the real program sits behind, and the leading `NAME=value` assignments that
+#: are the thing being redacted, never the program.
+_WRAPPER_COMMANDS = frozenset({"sudo", "nohup", "env", "xargs"})
+_ENV_ASSIGN_TOKEN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+#: Splits a command into its sub-commands, so each one's program decides for itself.
+_COMMAND_SPLIT_RE = re.compile(r";|&&|\|\||[|]")
+
+
+def _first_program(segment: str) -> "tuple[str, list]":
+    """The program a command segment runs, and its tokens.
+
+    Leading ``NAME=value`` assignments are skipped (they are the thing being redacted),
+    as are ``sudo``, ``nohup``, ``env``, ``xargs`` and ``timeout`` — the last with its
+    duration argument. The program is taken off its path (``/usr/bin/mysql`` is
+    ``mysql``). Never raises.
+    """
+    tokens = segment.split()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if _ENV_ASSIGN_TOKEN_RE.match(token):
+            i += 1
+            continue
+        name = token.lower()
+        if name == "timeout":
+            i += 2
+            continue
+        if name in _WRAPPER_COMMANDS:
+            i += 1
+            continue
+        return os.path.basename(token).lower(), tokens
+    return "", tokens
+
+
+def _looks_like_a_password(value: str) -> bool:
+    """Whether a `-p` value is a password rather than a database name or a port.
+
+    A password carries a letter and is longer than a name (`mysql -p db` keeps its
+    database, `mysql -psecretpass1234` loses its password).
+    """
+    return len(value) >= 4 and any(ch.isalpha() for ch in value)
+
+
+def _redact_password_flags(command: str) -> str:
+    """Redact the value of `-p` for the commands that take a password there.
+
+    Done segment by segment, because `-p` means something else in almost every other
+    tool (`ls -p`, `grep -p`, `pytest -p`, `docker run -p`): the program of the segment
+    decides whether its `-p` is a password.
+    """
+    out = []
+    pos = 0
+    for match in _COMMAND_SPLIT_RE.finditer(command):
+        out.append(_redact_password_flags_in_segment(command[pos:match.start()]))
+        out.append(match.group(0))
+        pos = match.end()
+    out.append(_redact_password_flags_in_segment(command[pos:]))
+    return "".join(out)
+
+
+def _redact_password_flags_in_segment(segment: str) -> str:
+    program, tokens = _first_program(segment)
+    is_docker_login = program == "docker" and any(t.lower() == "login" for t in tokens)
+    if not (program in _PASSWORD_OPT_COMMANDS or is_docker_login):
+        return segment
+    return _PASSWORD_OPT_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]"
+        if _looks_like_a_password(m.group(3)) else m.group(0),
+        segment)
 
 
 def _redact_command(command: str) -> str:
@@ -1014,10 +1126,30 @@ def _redact_command(command: str) -> str:
     log lines — all of which tend to be archived or shared by an operator
     debugging a run. Only the option/header's value is replaced; the
     option name and the rest of the command are left intact.
+
+    HARDEN-12 D: four more shapes the same command line carries, each of which
+    is redacted with the name or the rest of the command intact — ``NAME=value``
+    at the start of a command where NAME names a credential (the usual way a key
+    is handed to a test command), a credential-named header (``x-api-key:``), the
+    password of ``user:pass@`` in a URL, and the argument of ``-u user:pass`` and
+    ``-p value`` / ``-pvalue`` for the commands that take a password there. A
+    command without a secret is returned byte for byte.
     """
     try:
         redacted = _SECRET_OPT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", command)
         redacted = _SECRET_AUTH_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted)
+        redacted = _SECRET_HEADER_RE.sub(
+            lambda m: m.group(0) if _name_is_not_a_credential(m.group(1))
+            else f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]", redacted)
+        redacted = _SECRET_ENV_ASSIGN_RE.sub(
+            lambda m: m.group(0) if _name_is_not_a_credential(m.group(4))
+            else f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}={m.group(5)}[REDACTED]",
+            redacted)
+        redacted = _SECRET_URL_USERINFO_RE.sub(
+            lambda m: f"{m.group(1)}[REDACTED]{m.group(3)}", redacted)
+        redacted = _SECRET_USER_OPT_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}:[REDACTED]", redacted)
+        redacted = _redact_password_flags(redacted)
         return redacted
     except Exception:  # pragma: no cover — never let redaction crash the executor
         return command

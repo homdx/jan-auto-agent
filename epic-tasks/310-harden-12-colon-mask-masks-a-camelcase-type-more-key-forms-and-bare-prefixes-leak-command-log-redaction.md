@@ -1,13 +1,15 @@
 # HARDEN-12 — the colon-form mask rewrites a CamelCase type name into the placeholder; a single-quoted dict key, `os.environ["X_API_KEY"] = "…"`, `api_key => '…'` and an XML tag leave the machine; a bare Groq, GitHub, Hugging Face, xAI or AWS key in prose is not masked; the executor's command log keeps inline secrets
 
-**Status:** open — FINAL, written 2026-10-15 against `5dfd4d5`. Four defects from outside reviews, each **reproduced by running the code** on that commit (the output is below). Part A is a regression of HARDEN-9 B (the ticket's own landed code), B and C are gaps of the same mask (`mask_api_key`), D is the executor's command redaction. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 310: sensenova-var4 as the base — a bare identifier after the colon is a credential only with a digit or a provider prefix, so a CamelCase type stays (A); a single-quoted dict key, `os.environ["X"] = "…"`, `api_key => '…'` and an XML tag are masked (B); a bare Groq, GitHub, Hugging Face, xAI, GitLab and AWS key is masked in prose (C); the command log redacts `NAME=value`, a credential header, `user:pass@` and `-u user:pass` and `-p` for the commands that take one (D)). The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** MEDIUM (A: a file edit that writes the masked line back turns a type into an undefined name, silently); MEDIUM (B, C: a secret reaches the provider); LOW-MEDIUM (D: a secret is kept in traces and progress logs)
 **File:** `tools/llm_stream.py` (A, B, C), `tools/auto/executor.py` (D)
 **Symbol:** A: `_looks_like_a_token`, `_value_is_secret_literal` (the `colon=True` branch), `_API_KEY_COLON_RE`. B: `_API_KEY_LINE_RE`, `_API_KEY_JSON_RE`, `_API_KEY_COLON_RE`, `mask_api_key`. C: `_SECRET_PREFIX_RE`. D: `_redact_command`, `_SECRET_OPT_RE`, `_SECRET_AUTH_RE`
-**Round:** —
+**Round:** 310
 **Size:** M
 **Depends on:** HARDEN-1 (298), HARDEN-5 (303), HARDEN-9 (307), all landed
 **Also touches:** `tests/test_mask_api_key_forms.py`, `tests_bugfix/test_harden1_a8_mask_only_literals.py` and the HARDEN-9 mask tests (pins that must stay green), `tests/`, `tests_bugfix/`
+
+Why not the others: in a black box that drives each tree (428 checks over A to D: 20 type names in six layouts, 11 credential shapes in three, 16 more key forms with their restore, 11 providers' prefixes in nine sentences and 22 look-alikes, 22 commands that carry a secret and 27 that do not), sensenova-var4 passed 421, var1 and step-5-preview 420, laguna 419, var2 and var3 418, agnes 410, nemotron 395, glm 380 and the base 244. The cross matrix put var4 first (its tests 257/257, 252 to 256 on every other good tree). Added to it by the judge: `--user` like `-u`; a variable named for a count or a path (`TOKEN_COUNT=5`, `KEY_DIR=/tmp/keys`, `API_KEY_NAME`) is no credential in the command log or in `os.environ["…"] = …`; a Markdown backtick in a value (a comment quoting `x-api-key: v`) and an elision (`api_key=…`) are no key — the entry's own comments and the repository's `story_bible.py` were rewritten by its mask until then. Left alone: a quoted forward reference `api_key: 'ProviderCredentialsHolder'` is a quoted literal in every tree.
 
 ---
 

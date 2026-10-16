@@ -435,3 +435,135 @@ def test_a_colon_form_reference_to_an_environment_variable_is_not_a_secret():
     from tools.llm_stream import mask_api_key
     for line in ("api_key: $OPENAI_API_KEY", "- api_key: $KEY_FROM_CI", "    openai_api_key: $OPENAI_API_KEY"):
         assert mask_api_key(line) == line
+
+
+# ── HARDEN-12: a CamelCase type after a colon is code, and more key-line forms ──
+
+
+class TestAColonFormNameIsNotACredential:
+    """Part A: the colon form read a CamelCase class name as a credential, so an indented
+    dataclass field went out masked and a faithful edit wrote the placeholder back where an
+    annotation named a class."""
+
+    @pytest.mark.parametrize("text", [
+        "    api_key: AsyncOpenAIClientFactory,",
+        "api_key: ProviderCredentialsHolder",
+        "api_key: SecretStr",
+        "api_key: Optional[ProviderCredentialsHolder] = None",
+        "def __init__(self, api_key: APIKeyProviderFactory, timeout: int = 30):",
+    ])
+    def test_the_ticket_rows_are_untouched(self, text):
+        assert mask_api_key(text) == text
+
+    @pytest.mark.parametrize("text, secret", [
+        ("api_key: sk-live-abcdef1234567890", "sk-live-abcdef1234567890"),
+        ("api_key: AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+        ("api_key: 0123456789abcdef0123456789abcdef", "0123456789abcdef0123456789abcdef"),
+    ])
+    def test_a_credential_after_a_colon_is_still_masked(self, text, secret):
+        out = mask_api_key(text)
+        assert secret not in out
+        assert _MASKED in out
+        assert mask_api_key(out) == out
+
+    def test_the_annotated_file_still_imports(self):
+        source = (
+            "@dataclass\n"
+            "class Settings:\n"
+            "    api_key: ProviderCredentialsHolder\n"
+            "    live = gsk_abcdefghijklmnopqrstuvwxyz012345\n"
+        )
+        out = mask_api_key(source)
+        assert out.splitlines()[2] == "    api_key: ProviderCredentialsHolder"
+        compile(out, "masked.py", "exec")
+
+
+class TestTheOtherKeyLineForms:
+    """Part B: a key line with a quoted name, a subscript on the left, a hash arrow, or an
+    XML tag. The same literal test decides what a value is, so a reference stays as written."""
+
+    @pytest.mark.parametrize("text, secret", [
+        ("{'api_key': 'xai-abcdefghijklmnopqrstuvwxyz012345'}",
+         "xai-abcdefghijklmnopqrstuvwxyz012345"),
+        ('os.environ["GROQ_API_KEY"] = "gsk_abcdefghijklmnopqrstuvwxyz012345"',
+         "gsk_abcdefghijklmnopqrstuvwxyz012345"),
+        ("api_key => 'gsk_abcdefghijklmnopqrstuvwxyz012345'",
+         "gsk_abcdefghijklmnopqrstuvwxyz012345"),
+        ("<api_key>gsk_abcdefghijklmnopqrstuvwxyz012345</api_key>",
+         "gsk_abcdefghijklmnopqrstuvwxyz012345"),
+    ])
+    def test_the_secret_does_not_leave(self, text, secret):
+        out = mask_api_key(text)
+        assert secret not in out, text
+        assert _MASKED in out, text
+        assert mask_api_key(out) == out
+
+    @pytest.mark.parametrize("text", [
+        'os.environ["X_API_KEY"] = os.getenv("Y")',
+        "os.environ['X_API_KEY'] = None",
+        "{'api_key': None}",
+        "{'api_key': value}",
+        "<api_key>Value</api_key>",
+        "api_key: AsyncOpenAIClientFactory",
+    ])
+    def test_a_reference_or_a_type_is_code(self, text):
+        assert mask_api_key(text) == text
+
+    def test_the_quotes_are_kept(self):
+        assert mask_api_key("{'api_key': 'xai-abcdefghijklmnopqrstuvwxyz012345'}") == \
+            "{'api_key': 'here_your_key'}"
+        assert mask_api_key('os.environ["GROQ_API_KEY"] = "gsk_abcdefghijklmnopqrstuvwxyz012345"') == \
+            'os.environ["GROQ_API_KEY"] = "here_your_key"'
+
+
+class TestABareProviderKeyInProse:
+    """Part C: a key with no label at all, wherever it sits."""
+
+    @pytest.mark.parametrize("text, secret", [
+        ("use gsk_abcdefghijklmnopqrstuvwxyz012345 to log in",
+         "gsk_abcdefghijklmnopqrstuvwxyz012345"),
+        ("token ghp_abcdefghijklmnopqrstuvwxyz012345", "ghp_abcdefghijklmnopqrstuvwxyz012345"),
+        ("hf_abcdefghijklmnopqrstuvwxyz012345 here", "hf_abcdefghijklmnopqrstuvwxyz012345"),
+        ("xai-abcdefghijklmnopqrstuvwxyz012345", "xai-abcdefghijklmnopqrstuvwxyz012345"),
+        ("glpat-abcdefghijklmnopqrstuvwxyz1234", "glpat-abcdefghijklmnopqrstuvwxyz1234"),
+        ("key AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+    ])
+    def test_a_bare_key_is_masked(self, text, secret):
+        out = mask_api_key(text)
+        assert secret not in out
+        assert _MASKED in out
+        assert mask_api_key(out) == out
+
+    @pytest.mark.parametrize("text", [
+        "hf_model = 3",
+        "gsk_ alone",
+        "AKIA in a sentence",
+        'self.fallback = "sk-real-1"',
+    ])
+    def test_a_short_word_that_starts_the_same_way_is_prose(self, text):
+        assert mask_api_key(text) == text
+
+
+def test_a_name_that_is_a_count_or_a_path_holds_no_credential():
+    """`os.environ["TOKEN_COUNT"] = "5"` and `KEY_DIR=/tmp/keys` mention a credential word but name a count and a path."""
+    from tools.llm_stream import _name_is_not_a_credential, mask_api_key
+    for name in ("TOKEN_COUNT", "KEY_DIR", "API_KEY_NAME", "SECRET_FILE", "PASSWORD_LENGTH"):
+        assert _name_is_not_a_credential(name)
+    for name in ("API_KEY", "HF_TOKEN", "DB_PASSWORD", "OPENAI_API_KEY"):
+        assert not _name_is_not_a_credential(name)
+    assert mask_api_key("os.environ['TOKEN_COUNT'] = '5'") == "os.environ['TOKEN_COUNT'] = '5'"
+    assert "here_your_key" in mask_api_key("os.environ['HF_TOKEN'] = 'hf_abcdefghijklmnopqrstuvwxyz0123'")
+
+
+def test_a_backtick_value_on_the_colon_form_is_markdown_not_a_key():
+    """A comment quoting a header, `x-api-key: v`, is prose and is sent as written."""
+    from tools.llm_stream import mask_api_key
+    for line in ("# the header `x-api-key: v`, a token", "(``x-api-key:``), the", "`X-API-KEY: v`, `x-token: v`."):
+        assert mask_api_key(line) == line
+
+
+def test_an_elision_is_not_a_key():
+    """`api_key=…,` in a docstring is shorthand for an argument, not a credential."""
+    from tools.llm_stream import mask_api_key
+    for line in ("make(config, base_url=…, api_key=…, model=…,", "api_key=…", "api_key: …", "api_key: ...", "api_key = ..."):
+        assert mask_api_key(line) == line
