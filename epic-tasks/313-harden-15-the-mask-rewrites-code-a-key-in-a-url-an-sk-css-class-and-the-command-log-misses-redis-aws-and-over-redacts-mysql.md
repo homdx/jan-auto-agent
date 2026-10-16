@@ -1,10 +1,10 @@
 # HARDEN-15 — the mask rewrites code: a string that ends in `api_key=` gets a quote and a placeholder, a format placeholder and `$KEY` are masked, a query tail is eaten, an `sk-` CSS class and an SSH key type become `here_your_key`; the command log keeps `redis-cli -a` and `aws configure set` and over-redacts `mysql -p mydb`
 
-**Status:** open
+**Status:** landed (round 313: sensenova-6-8-flash-lite-var3 as the base — a quote that closes a string is not a value, a format or shell reference is not a secret, an unquoted value stops at `&` and `#` (A), an `sk-` slug is not a key (B), the command log redacts `redis-cli -a` / `--pass`, a `redis://:pw@host` URL and `aws configure set`, and keeps `mysql -p mydb` (C))
 **Severity:** MEDIUM-HIGH (A: the model is shown broken code and an `/edit` writes a syntax error to disk); LOW-MEDIUM (B); LOW (C: logs only)
 **File:** `tools/llm_stream.py` (A, B), `tools/auto/executor.py` (C)
 **Symbol:** A: `_API_KEY_LINE_RE`, `_mask_assignment`, `mask_api_key`, `_value_is_secret_literal`. B: `_SECRET_PREFIX_RE`. C: `_redact_command`, `_SECRET_OPT_RE`
-**Round:** (set when the round starts)
+**Round:** 313
 **Size:** S
 **Depends on:** HARDEN-1 (298), HARDEN-9 (307), HARDEN-10 (308), HARDEN-12 (310), HARDEN-13 (311, tests of the restore), all landed
 **Also touches:** `tests/test_mask_api_key_forms.py`, `tests_bugfix/test_harden1_a8_mask_only_literals.py` and the HARDEN-9/10/12 mask tests (pins that must stay green), `tests/`, `tests_bugfix/`
@@ -96,3 +96,7 @@ One commit. The judge's own checks are not published and are written after the r
 ## Not in scope
 
 Rust, an unlabelled secret in prose, the restore (HARDEN-13, ticket 311) and the verdict parser (HARDEN-14, ticket 312).
+
+Why not the others: in a black box that drives each tree (79 checks over A to C through the real `mask_api_key`, `restore_masked_secrets` and `_redact_command`, written after the entries), sensenova-var3, sensenova-var1 and laguna passed 79, var4 77, var2 76, step-5-preview 75, agnes 73, nemotron 60 (it leaves `sk-live-…` unmasked and has the `body` bug it names itself), glm 52 (ERROR, `provider_unavailable`, never delivered). var3 is the base because it is the only one of the three that keeps `mysql -p mydb` by a rule that does not guess from the length (a spaced `-p` word of lower-case letters is the database), masks a lower-case `sk-live-…1` and puts the `redis-cli` rules in the per-program segment. The mask over 28,000 files of this repository and the installed libraries changed 2,359 lines before and 2,282 after, none new, 77 fewer (the `sk-` classes and the URL concatenations).
+
+Found at judging and fixed in the same commit: var3 stopped an unquoted value at `=` as well, so a padded base64 key kept its `==` (`api_key=here_your_key==`); the stop set is `& #` and whitespace and quotes only. Tests of the judge's cases: `tests/test_harden15_judge_cases_313.py`. Other entries' own tests ran on this tree: 382 passed; the 3 that failed pin a wrong expectation (agnes expects a literal value in a URL to stay, var4 expects `mysql -psecretpass1234` to be logged as written), 3 files import private names of their own tree.

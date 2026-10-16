@@ -990,7 +990,7 @@ def pytest_config_requests_pool(base_dir: "str | Path") -> bool:
 
 # Matches a likely-secret CLI option followed by a single-token value; the option name stays visible for debugging.
 _SECRET_OPT_RE = re.compile(
-    r"(--(?:api[-_]?key|token|secret|password|passwd|pwd|auth|"
+    r"(--(?:api[-_]?key|token|secret|password|passwd|pass|pwd|auth|"
     r"access[-_]?key|client[-_]?secret|private[-_]?key))"
     r"([=:]\s*|\s+)"
     r"(\S+)"
@@ -1024,15 +1024,18 @@ _SECRET_ENV_ASSIGN_RE = re.compile(
 )
 
 # HARDEN-12 D: `user:pass@` in a URL, only the password. The scheme is any
-# `name://`, the user is kept, and a URL without a password is left byte for byte.
+# `name://`, the user is kept, and a URL without a password is left byte for byte. The
+# user may be empty: `redis://:password@host` names no user at all (HARDEN-15 C).
 _SECRET_URL_USERINFO_RE = re.compile(
-    r"([A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]+:)([^@\s]+)(@)"
+    r"([A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:)([^@\s]+)(@)"
 )
 
 # HARDEN-12 D: `-u user:pass`. The colon is the tell, so `-u someflag` is a flag value,
-# not a credential, and `grep -u` / `ls -u` are left alone.
+# not a credential, and `grep -u` / `ls -u` are left alone. A colon that opens a URL
+# (`-u redis://:pw@host`) is not one: the URL's password is the URL rule's, and this one
+# would have rewritten `redis://` to `redis:` (HARDEN-15 C).
 _SECRET_USER_OPT_RE = re.compile(
-    r"(\s(?:-u|--user)(?:\s+|=))([^\s:]+):([^\s]+)"
+    r"(\s(?:-u|--user)(?:\s+|=))([^\s:]+):(?!//)([^\s]+)"
 )
 
 # `-p value` / `-pvalue` is a password only for the commands that take one. `ls -p`,
@@ -1042,6 +1045,23 @@ _PASSWORD_OPT_COMMANDS = frozenset({
     "mysql", "mysqldump", "mariadb", "mariadb-dump", "redis-cli", "sshpass", "htpasswd",
 })
 _PASSWORD_OPT_RE = re.compile(r"(?<![\w-])(-p)([ \t]*)(\S*)")
+# HARDEN-15 C: MySQL reads the password attached to `-p` and nothing else — `-p` on its
+# own is the prompt flag, so the next word is the database (`mysql -p mydb`). The family,
+# not the single name, since mysqldump takes the same flag.
+_MYSQL_FAMILY_COMMANDS = frozenset({"mysql", "mysqldump", "mariadb", "mariadb-dump"})
+# A database name, not a password: letters and `_`, nothing else. A password always
+# carries a digit or an upper-case letter, because a database is named after a word and a
+# password is not (`mysql -p mydb` vs `mysql -p secretpass1234 db`) (HARDEN-15 C).
+_DATABASE_NAME_RE = re.compile(r"[a-z_]+")
+# HARDEN-15 C: redis-cli's own `-a <password>`. `-a` is `--all` in almost every other tool
+# (`ls -a`, `grep -a`, `sort -a`), so only redis-cli's is looked at. Its `--pass` is a
+# long option and is caught by `_SECRET_OPT_RE`.
+_REDIS_CLI_PASSWORD_RE = re.compile(r"(?<![\w-])(-a)([ \t]*)(\S*)")
+# HARDEN-15 C: `aws configure set <name> <value>` writes the named credential into
+# ~/.aws/credentials. The name names it, so the value is the secret.
+_AWS_CONFIGURE_SET_RE = re.compile(r"(?<![\w-])(set)\s+(\S+)\s+(\S+)")
+#: A word that names a credential, for `aws configure set`'s name.
+_SECRET_NAME_RE = re.compile(r"(?i)secret|key|token")
 #: The wrappers the real program sits behind, and the leading `NAME=value` assignments that
 #: are the thing being redacted, never the program.
 _WRAPPER_COMMANDS = frozenset({"sudo", "nohup", "env", "xargs"})
@@ -1085,12 +1105,56 @@ def _looks_like_a_password(value: str) -> bool:
     return len(value) >= 4 and any(ch.isalpha() for ch in value)
 
 
-def _redact_password_flags(command: str) -> str:
-    """Redact the value of `-p` for the commands that take a password there.
+def _looks_like_a_database_name(value: str) -> bool:
+    """Whether a value after a spaced `-p` is a database name, not a password.
 
-    Done segment by segment, because `-p` means something else in almost every other
-    tool (`ls -p`, `grep -p`, `pytest -p`, `docker run -p`): the program of the segment
-    decides whether its `-p` is a password.
+    See `_DATABASE_NAME_RE`: `mydb` and `my_database` are databases and `secretpass1234`
+    is a password (HARDEN-15 C).
+    """
+    return bool(_DATABASE_NAME_RE.fullmatch(value))
+
+
+def _password_flag_repl(match: "re.Match", program: str) -> str:
+    """The replacement for one `-p` hit: the password, or the flag as it stood.
+
+    For the MySQL family a *spaced* `-p` is the prompt flag, so its next word is the
+    database and is left alone — unless it is not a name, in which case it is a password
+    after all (`mysql -p secretpass1234 db`) (HARDEN-15 C). The attached form is a
+    password for every command here.
+    """
+    value = match.group(3)
+    if not _looks_like_a_password(value):
+        return match.group(0)
+    if bool(match.group(2)) and program in _MYSQL_FAMILY_COMMANDS \
+            and _looks_like_a_database_name(value):
+        return match.group(0)
+    return f"{match.group(1)}{match.group(2)}[REDACTED]"
+
+
+def _redact_aws_configure_set(segment: str) -> str:
+    """Redact the value `aws configure set` is told to write, where the name says it is a
+    credential. A name that does not (`set default region us-east-1`) keeps both its
+    words (HARDEN-15 C).
+    """
+    return _AWS_CONFIGURE_SET_RE.sub(
+        lambda m: m.group(0) if not _SECRET_NAME_RE.search(m.group(2))
+        else f"{m.group(1)} {m.group(2)} [REDACTED]", segment)
+
+
+def _redact_redis_cli_passwords(segment: str) -> str:
+    """Redact redis-cli's `-a <password>`; see `_REDIS_CLI_PASSWORD_RE`."""
+    return _REDIS_CLI_PASSWORD_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]"
+        if _looks_like_a_password(m.group(3)) else m.group(0), segment)
+
+
+def _redact_password_flags(command: str) -> str:
+    """Redact the password a command takes in a flag only that program reads as one.
+
+    Done segment by segment, because `-p`, `-a` and `aws configure set` each mean
+    something else in almost every other tool (`ls -p`, `grep -a`, `pytest -p`,
+    `docker run -p`): the program of the segment decides what its own flags hold
+    (HARDEN-15 C).
     """
     out = []
     pos = 0
@@ -1104,13 +1168,15 @@ def _redact_password_flags(command: str) -> str:
 
 def _redact_password_flags_in_segment(segment: str) -> str:
     program, tokens = _first_program(segment)
+    out = segment
+    if program == "aws" and "configure" in tokens and "set" in tokens:
+        out = _redact_aws_configure_set(out)
+    if program == "redis-cli":
+        out = _redact_redis_cli_passwords(out)
     is_docker_login = program == "docker" and any(t.lower() == "login" for t in tokens)
     if not (program in _PASSWORD_OPT_COMMANDS or is_docker_login):
-        return segment
-    return _PASSWORD_OPT_RE.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]"
-        if _looks_like_a_password(m.group(3)) else m.group(0),
-        segment)
+        return out
+    return _PASSWORD_OPT_RE.sub(lambda m: _password_flag_repl(m, program), out)
 
 
 def _redact_command(command: str) -> str:
@@ -1134,6 +1200,12 @@ def _redact_command(command: str) -> str:
     password of ``user:pass@`` in a URL, and the argument of ``-u user:pass`` and
     ``-p value`` / ``-pvalue`` for the commands that take a password there. A
     command without a secret is returned byte for byte.
+
+    HARDEN-15 C: the same flags, three corrections — ``redis-cli -a`` and the value
+    ``aws configure set`` writes under a credential-named key are redacted, a `-p`
+    followed by a space for the MySQL family is the database and stays (the attached
+    form is still a password), and ``--pass`` and the password of an empty-user URL
+    (``redis://:pw@host``) are redacted without mangling the URL.
     """
     try:
         redacted = _SECRET_OPT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", command)

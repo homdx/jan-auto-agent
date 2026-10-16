@@ -567,3 +567,104 @@ def test_an_elision_is_not_a_key():
     from tools.llm_stream import mask_api_key
     for line in ("make(config, base_url=…, api_key=…, model=…,", "api_key=…", "api_key: …", "api_key: ...", "api_key = ..."):
         assert mask_api_key(line) == line
+
+
+# ── HARDEN-15 A: `api_key=` at the end of a string is not an assignment ───────
+
+
+class TestAnApiKeyAtTheEndOfAString:
+    """HARDEN-15 A: the closing quote of a string after `api_key=` is not the opening
+    quote of a value, a format or shell reference is not a literal, and an unquoted value
+    in a query string ends at `&`. An `/edit` of such a line used to write a placeholder
+    where an expression stood — a syntax error that imports fine, then fails at call time."""
+
+    @pytest.mark.parametrize("text", [
+        'url = "https://a.com/d?api_key=" + key + "&format=json"',
+        'r = requests.get("https://a.com/v1/q?api_key=" + os.environ["K"], timeout=5)',
+        'params = "api_key=" + key + "&q=" + q',
+        'log.info("using api_key=%s", key)',
+        'curl "https://x.io/q?api_key=$KEY&lang=en"',
+        'u = "?api_key=%s&lang=en" % key',
+    ])
+    def test_a_line_that_is_code_is_sent_as_written(self, text):
+        assert mask_api_key(text) == text
+
+    @pytest.mark.parametrize("text, secret", [
+        ('"?api_key=abc123def456&x=1&y=2"', "abc123def456"),
+        ('"https://host/v1?api_key=abc123def456&x=1&y=2"', "abc123def456"),
+    ])
+    def test_the_tail_of_a_query_string_is_kept(self, text, secret):
+        out = mask_api_key(text)
+        assert secret not in out
+        assert _MASKED in out
+        assert "&x=1&y=2" in out
+
+    def test_a_real_literal_in_a_query_string_is_still_masked(self):
+        for text in ('api_key="sk-abcdefghijklmnopqrstuvwxyz"', "api_key = abc123"):
+            assert _MASKED in mask_api_key(text), text
+
+    def test_an_edit_of_another_attribute_leaves_the_line_untouched(self):
+        # The model is asked to change `json` to `xml`; the line it is shown is the line
+        # as written, so it can only change the word it was told to change.
+        line = 'url = "https://a.com/d?api_key=" + key + "&format=json"'
+        edited = line.replace("json", "xml")
+        assert mask_api_key(line) == line
+        assert mask_api_key(edited) == edited
+        for fragment in ('"https://a.com/d?api_key="', ' + key + ', '"&format='):
+            assert fragment in edited
+
+    @pytest.mark.parametrize("text", [
+        'url = "?api_key=" + key + "&format=json"',
+        'u = "api_key=" + key + "&q=" + q',
+        'log.info("using api_key=%s", key)',
+    ])
+    def test_the_mask_is_idempotent_on_the_code_it_leaves(self, text):
+        once = mask_api_key(text)
+        assert once == text
+        assert mask_api_key(once) == text
+
+
+# ── HARDEN-15 B: `sk-` followed by a lower-case slug is not a key ─────────────
+
+
+class TestASlugAfterSkIsNotAKey:
+    """HARDEN-15 B: a hyphenated or underscored run of lower-case letters alone is a
+    class name or a key type, not a credential. The bare form needs a digit or an
+    upper-case letter, and that character in a part of at least twelve."""
+
+    @pytest.mark.parametrize("text", [
+        '<div class="sk-fading-circle"></div>',
+        'class="sk-toggleable__label"',
+        'b"sk-ecdsa-sha2-nistp256@openssh.com"',
+    ])
+    def test_a_slug_is_sent_as_written(self, text):
+        assert mask_api_key(text) == text
+
+    @pytest.mark.parametrize("secret", [
+        "sk-live-aaaaaaaaaaaaaaaaaaa1",
+        "sk-live-AbC123XyZ9qwerty",
+        "sk-or-v1-ABCDEF1234567890abcdef",
+        "sk-proj-ABCDEF1234567890",
+        "sk-abcdefghijklmnopqrstuvwxyz0123",
+    ])
+    def test_a_key_with_a_digit_or_an_upper_case_letter_is_still_masked(self, secret):
+        out = mask_api_key(f"key is {secret} here")
+        assert secret not in out
+        assert _MASKED in out
+        assert mask_api_key(out) == out
+
+    def test_the_same_shape_with_a_literal_is_masked_on_the_assignment(self):
+        # The tail is too short for the bare form, but an assignment holds a literal
+        # whatever its shape, so the label still does its work.
+        assert _MASKED in mask_api_key("api_key = sk-live-AbC123XyZ9")
+
+    def test_a_class_name_is_left_alone_next_to_a_real_key(self):
+        line = 'class="sk-fading-circle" key="sk-or-v1-ABCDEF1234567890abcdef"'
+        out = mask_api_key(line)
+        assert 'sk-fading-circle' in out
+        assert "sk-or-v1-ABCDEF1234567890abcdef" not in out
+        assert _MASKED in out
+
+    def test_the_ssh_key_type_inside_a_string_is_kept(self):
+        source = 'method = b"sk-ecdsa-sha2-nistp256@openssh.com"\n'
+        assert mask_api_key(source) == source

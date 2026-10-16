@@ -218,7 +218,7 @@ def stream_options_is_supported(url: str, model=None) -> bool:
 _API_KEY_LINE_RE = re.compile(
     r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?)([\w.-]*api[_-]?key)'
     r'([ \t]*(?<![=!<>~&|])=(?![=~>])[ \t]*)'
-    r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";]+)([ \t]*\r?)"
+    r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";&#]+)([ \t]*\r?)"
 )
 # The same key with a type annotation before its `=`: `api_key: str = "…"`, `apiKey: string = '…'`.
 # Only a token-shaped literal is masked there (`_mask_annotated`): a short default is code.
@@ -334,7 +334,17 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]")
 # A template placeholder is an unset value, not a secret: `api_key = your_key`, `<your key>`,
 # `changeme`, `xxx` are sent as they are (HARDEN-5 B), the same as the mask's own output.
 _PLACEHOLDER_FLAT = frozenset({"yourkey", "yourapikey", "yourtoken", "changeme", "hereyourkey", "insertkeyhere",
-                               "replaceme", "todo", "xxx", "xxxx", "xxxxx", "xxxxxx"})
+                              "replaceme", "todo", "xxx", "xxxx", "xxxxx", "xxxxxx"})
+# A value that is a reference rather than a literal (HARDEN-15 A): a shell form
+# (`$KEY`, `${KEY}`) or a format placeholder (`%s`, `%(name)s`, `{}`, `{name}`). Either
+# names a value that lives somewhere else, so the assignment holds no secret of its own.
+# The colon form already exempted a leading `$`; this reaches the `=` form, where
+# `log.info("using api_key=%s", key)` and `?api_key=$KEY` used to go out masked.
+_REFERENCE_VALUE_RE = re.compile(
+    r"\$\{?[A-Za-z_][\w]*(?:\.[\w]+)*\}?"
+    r"|%[-+ #0]*\d*(?:\.\d+)?(?:\(\w+\))?[-+ #0]*[diouxXeEfFgGrscb]"
+    r"|\{[A-Za-z_][\w]*(?:\.[\w]+)*\}|\{\}"
+)
 # A `Bearer <token>` credential, wherever it sits in a line. The token must be long:
 # the phrase is also plain English ("bearer of the torch"), so a short word is prose.
 #
@@ -351,9 +361,17 @@ _BEARER_PROSE_WORD_RE = re.compile(r"[A-Za-z_]+")
 # Bearer sk-or-v1-…` leaked, since it is not an api_key assignment). The bare `sk-`
 # form needs a long tail: `sk-real-1` is a placeholder in this repo's own sources,
 # not a credential (test_harden1_a8 pins it as untouched).
+#
+# HARDEN-15 B: a long tail is not enough either. The bare form needs a digit or an
+# upper-case letter, and that character in a part of at least 12 letters — a slug is
+# a run of short lower-case words, hyphenated or underscored, and carries none
+# (`class="sk-fading-circle"`, `sk-toggleable__label`, and the SSH key type
+# `sk-ecdsa-sha2-nistp256` all read as words). `sk-live-AbC123…`,
+# `sk-abcdefghijklmnopqrstuvwxyz0123` and the two explicit prefixes above keep their
+# long mixed part and are still masked.
 _SECRET_PREFIX_RE = re.compile(
     r"\b(?:sk-or-v1-|sk-proj-)[A-Za-z0-9_\-]{10,}"
-    r"|\bsk-[A-Za-z0-9_\-]{12,}"
+    r"|\bsk-(?=[A-Za-z0-9_\-]*[A-Z0-9])(?=[A-Za-z0-9_\-]*[A-Za-z0-9_]{12,})[A-Za-z0-9_\-]{12,}"
     r"|\bAIza[A-Za-z0-9_\-]{20,}"
     r"|\bxoxb-[A-Za-z0-9_\-]{10,}"
     # HARDEN-12 C: the other providers' key shapes, in prose, a comment or a log line —
@@ -434,6 +452,12 @@ def _value_is_secret_literal(value: str, key_name: str, colon: bool = False) -> 
         inner = body[1:-1].strip()
         return bool(inner) and not _is_template_placeholder(inner)
     body = _split_prefix(value)[1]
+    if _REFERENCE_VALUE_RE.match(body):
+        # A format or shell reference names a value that lives somewhere else, so it holds no
+        # secret of its own (HARDEN-15 A): `log.info("using api_key=%s", key)`,
+        # `?api_key=$KEY`. Only the unquoted body is looked at here — a quoted value is still
+        # the literal between its quotes.
+        return False
     if _is_template_placeholder(body):
         return False
     if any(ch.isspace() for ch in body):
@@ -652,6 +676,39 @@ def _quote_of(value: str) -> str:
     return prefix + quote
 
 
+def _is_a_closing_quote(text: str, index: int, quote: str) -> bool:
+    """Whether the *quote* at *index* closes a string that opened earlier on its line.
+
+    Walks the line up to *index* and keeps the one open quote, so the quote that ends the
+    URL string in `url = "?api_key=" + key + "&x=" + x` is seen to close, and not to open
+    a value of its own (HARDEN-15 A). The value class used to take that quote and the
+    quote that opens the next string for one literal, so the line went out as
+    `url = "?api_key="here_your_key"&x=" + x` — a placeholder where an expression stood,
+    and an edit of the string wrote the broken line to disk.
+
+    A quote of the other kind inside an open string is a literal character, not a toggle:
+    `"a 'b' c"` stays one string, and a line that mixes the kinds still balances
+    (`{"a": 'b', "api_key": 'x'}` has no string open at the value).
+    """
+    if quote not in "\"'":
+        return False
+    start = text.rfind("\n", 0, index) + 1
+    open_quote: "str | None" = None
+    i = start
+    while i < index:
+        char = text[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char in "\"'":
+            if open_quote is None:
+                open_quote = char
+            elif char == open_quote:
+                open_quote = None
+        i += 1
+    return open_quote == quote
+
+
 def _xml_parent_element(before: str) -> "str | None":
     """The name of the element an XML element at the end of *before* sits inside,
     or ``None`` when it is at the top level (HARDEN-13 C).
@@ -711,6 +768,14 @@ def mask_api_key(text: "str | None") -> "str | None":
 
     def _mask_assignment(m: "re.Match") -> str:
         prefix, key_name, assign, value, suffix = m.groups()
+        # Step one: is the value a value at all? A quote straight after `api_key=` that
+        # closes a string opened earlier on the line is not the opening quote of a value,
+        # it ends the string the key sits inside, so the line is code and goes out as it
+        # is (HARDEN-15 A).
+        if _is_a_closing_quote(text, m.start(4), value[0]):
+            return m.group(0)
+        # Step two: what is the value? A reference is not a secret, and an unquoted value
+        # ends at `&` or `#`, so the rest of a query string is left to stand.
         if not _value_is_secret_literal(value, key_name):
             return m.group(0)
         # A quoted value stays quoted: the masked text is what a faithful model
@@ -721,6 +786,10 @@ def mask_api_key(text: "str | None") -> "str | None":
 
     def _mask_colon(m: "re.Match") -> str:
         prefix, key_name, assign, value = m.groups()
+        # The `=` branch of this pattern is the same join point as _mask_assignment, so it
+        # needs the same first step: `url = "?api_key=" + key` is code (HARDEN-15 A).
+        if _is_a_closing_quote(text, m.start(4), value[0]):
+            return m.group(0)
         # The colon form is the colon's own judge: a bare identifier there is a type
         # or a parameter name as often as it is a value (HARDEN-9 B).
         if not _value_is_secret_literal(value, key_name, colon=True):
