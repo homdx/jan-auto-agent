@@ -1,10 +1,10 @@
 # HARDEN-11 — a restored key goes to the wrong provider after a structural edit, a stream that ends in an error event returns the half reply as a normal one, one invalid byte in a stream loses the whole reply
 
-**Status:** open — FINAL, written 2026-10-15 against `cd6fa18`. Three defects of `tools/llm_stream.py` from an outside review, each **reproduced by running the code** on that commit (the output is below). Part A is a gap in `restore_masked_secrets` (HARDEN-5 B); B and C are in the streaming branch of `request_completion`. The code is the authority, not this ticket: if a line has moved, the symbol names the place.
+**Status:** landed (round 309: step-5-preview as the base — a masked line is restored by its place (the nearest unmasked line above it) and a line with no original in its place stays the placeholder with a warning (A); an `error` object or `finish_reason: "error"` on a stream is a failure of the call, retried before the first token and a `RuntimeError` after it (B); a stream line with a bad byte is decoded with replacement characters and the rest of the reply is kept (C)). The code is the authority, not this ticket: if a line has moved, the symbol names the place.
 **Severity:** HIGH (A: a real key is written under another provider's section); MEDIUM (B, C)
 **File:** `tools/llm_stream.py`
 **Symbol:** A: `restore_masked_secrets` (called from `Coder._write_files`). B/C: the SSE loop of `request_completion` (`line = raw_line.decode("utf-8-sig")`, the `done`/`token` handling, `_meta_from_chunk`)
-**Round:** —
+**Round:** 309
 **Size:** S
 **Depends on:** HARDEN-5 (303), HARDEN-9 (307, same file), all landed or queued
 **Also touches:** `tests/`, `tests_bugfix/` (the HARDEN-5 B restore tests must stay green)

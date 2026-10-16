@@ -561,27 +561,116 @@ def restore_masked_secrets(original: "str | None", reply: "str | None") -> "str 
     must be byte-identical except the lines the task asked for). A reply line
     that equals the masked form of an *original* line that the mask changed is
     that original line again; a line the model edited does not equal it and is
-    kept as written. Two lines that mask to the same text are restored in order.
+    kept as written.
+
+    HARDEN-11 A: the masked text alone does not say *which* original line it
+    was — every provider section of an ini masks to the same
+    ``api_key = here_your_key``, and handing those back in order wrote a real
+    key under another provider as soon as the reply's structure differed from
+    the file's: delete the first of three sections and its neighbours' keys each
+    moved up one, add a section and the first key was copied into it, reorder
+    the sections and all three keys were swapped. So each original line is
+    filed under its **place** — the nearest line above it that the mask left
+    alone (a section header, a key that is not itself masked) — and a reply line
+    gets a real line back only when the same line sits above it there. Two
+    identical lines under the same line are restored in order, as before. A
+    masked line with no original line in its place is left as the placeholder
+    and warned about, so a structural edit never moves a key: with two or more
+    candidates for that text there is no telling which is right, and guessing is
+    what put a key under the wrong provider. The one case that is not a guess —
+    the whole file holds a single line with that masked text, nothing else has
+    taken it, and no other line of that text was restored by place — is still
+    restored, which is what keeps a file of nothing but key lines restorable when
+    the model rewrites one of them.
     """
     if not original or not reply:
         return reply
-    queues: "dict[str, list[str]]" = {}
+    # One pass over the original: every changed line, in file order, filed under
+    # (its place, its masked text). The place is the nearest preceding line the
+    # mask left alone; a masked line is not a place for the one below it.
+    entries: list[str] = []
+    queues: "dict[tuple[str | None, str], list[int]]" = {}
+    by_text: "dict[str, list[int]]" = {}
+    masked_texts: "set[str]" = set()
+    place: "str | None" = None
     for line in original.splitlines():
         if "\ufffd" in line:
+            # An original line the reader could not decode is never a place a
+            # key may be restored into.
             continue
         masked = mask_api_key(line)
         if masked != line:
-            queues.setdefault(masked, []).append(line)
-    if not queues:
-        return reply
-    out = []
-    for line in reply.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        queue = queues.get(body)
-        if queue:
-            out.append(queue.pop(0) + line[len(body):])
+            queues.setdefault((place, masked), []).append(len(entries))
+            by_text.setdefault(masked, []).append(len(entries))
+            masked_texts.add(masked)
+            entries.append(line)
         else:
+            # A line the mask left alone is the next masked line's place. The
+            # reply walks the same rule, so the two places only match when the
+            # structure around the line is the structure of the original. A blank
+            # line is no place: `[a]` + blank + `api_key = …` is the same layout as
+            # without the blank, and counting it made every key of an ini written
+            # that way share one place (the first provider's key went under the
+            # second after the first section was deleted).
+            if line.strip():
+                place = line
+    if not entries:
+        return reply
+    used: set[int] = set()
+    out = []
+    # No original line in this place: held for the second pass below.
+    held: "list[tuple[int, str]]" = []
+    # The masked texts some reply line did get back by place: for those, a
+    # remaining candidate is another section's key, not this line's.
+    placed: set[str] = set()
+    place = None
+    for line in reply.splitlines(keepends=True):
+        # keepends gives the line's own ending back; only that may be dropped,
+        # since a body that ends in `g` or `n` must not lose a letter. The
+        # placeholder itself is idempotent, so a masked line is recognised by
+        # being a masked text of the original, not by masking it again.
+        body = line[:-1] if line.endswith("\n") else line
+        body = body[:-1] if body.endswith("\r") else body
+        if body in masked_texts:
+            # A masked line is restored by its place; the line above it stays
+            # the place of the next masked line, so two key lines under one
+            # header share that header and are restored in order.
+            queue = queues.get((place, body))
+            if queue:
+                index = queue.pop(0)
+                used.add(index)
+                placed.add(body)
+                out.append(entries[index] + line[len(body):])
+                continue
+            held.append((len(out), body))
             out.append(line)
+            continue
+        out.append(line)
+        if body.strip():
+            place = body
+    for position, body in held:
+        # The line's place did not match, and that is normally the end of it: a
+        # structural edit must not move a key. Two conditions open the one
+        # exception that keeps HARDEN-5 B whole — a file every line of which is
+        # masked, where the model rewrites a key line into an unmasked one
+        # (``api_key = here_your_key`` → ``api_key = os.environ["KEY"]``): the
+        # line it rewrote is then the nearest unmasked line in the reply, so the
+        # place of every key below it shifts and none of them would be restored.
+        # The key comes back only when *nothing* else of that masked text was
+        # restored by place — so no section got its own key while this line got
+        # one — and exactly one original line in the whole file has that text and
+        # nothing has taken it, so there is no other key it could be.
+        left = [index for index in by_text.get(body, ()) if index not in used]
+        if body not in placed and len(left) == 1:
+            index = left[0]
+            used.add(index)
+            line = out[position]
+            out[position] = entries[index] + line[len(body):]
+            continue
+        logger.warning(
+            "restore_masked_secrets: %r has no original line in the same "
+            "place — left as the placeholder (a structural edit must not "
+            "move a key)", body)
     return "".join(out)
 
 
@@ -1166,6 +1255,19 @@ def _parse_retry_after(e: urllib.error.HTTPError, detail: str) -> "float | None"
                 return max(0.1, float(retry_after))
             except ValueError:
                 pass
+    return _retry_hint_from_text(detail)
+
+
+def _retry_hint_from_text(detail: str) -> "float | None":
+    """HARDEN-11 B: return how long an error *body* asks us to wait, in seconds,
+    or ``None`` when it asks for nothing.
+
+    An ``error`` object on a live stream has no HTTP headers to carry a
+    ``Retry-After``, so the hint in its own message — Groq's ``"Please try again
+    in 820ms"``, Gemini's ``"Please retry in 57.062042596s."`` — is the only one
+    there is. The two regexes are the ones the header-less 429 path already
+    walked, and ``_parse_retry_after`` still asks its header first.
+    """
     m = _RETRY_AFTER_MS_RE.search(detail)
     if m:
         try:
@@ -1455,6 +1557,57 @@ def retry_kwargs_from_config(config, section: str = "loop") -> dict:
     }
 
 
+class _StreamErrorEvent(Exception):
+    """HARDEN-11 B: the provider failed this call *inside* a live stream.
+
+    Raised by the streaming read of ``request_completion`` when a chunk carries
+    a top-level ``error`` object or a final ``finish_reason`` of ``"error"``,
+    so the SSE loop's own ``except`` can treat it exactly like the network
+    failures next to it — retried while no token has been passed on, reported as
+    a ``RuntimeError`` once tokens were emitted. It never escapes the function:
+    both outcomes are the ``RuntimeError`` the callers' retry ladders expect.
+    """
+
+    def __init__(self, message: str, code: "int | None" = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+def _stream_error_of(chunk) -> "tuple[str, int | None] | None":
+    """HARDEN-11 B: a streamed chunk's ``error`` object as ``(message, code)``,
+    or ``None`` when the chunk carries none.
+
+    The OpenAI-compatible shape is ``{"error": {"message": "upstream died",
+    "code": 502}}``, at the top level of a chunk, mid-stream or on its own;
+    Ollama's NDJSON branch sends a bare ``{"error": "model not found"}``. The
+    SSE loop used to step over both: a provider that died after two tokens
+    handed back half a reply as if it were the model's answer, and one that
+    died before any handed back ``""``, so no retry and no 429 logic ever ran.
+    Only a truthy ``error`` counts — ``{"error": null}`` is a provider's empty
+    placeholder field, not a failure.
+    """
+    if not isinstance(chunk, dict):
+        return None
+    error = chunk.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        code = code if isinstance(code, int) and not isinstance(code, bool) else None
+        message = None
+        for key in ("message", "detail", "msg"):
+            value = error.get(key)
+            if isinstance(value, str) and value.strip():
+                message = value.strip()
+                break
+        if message is None:
+            message = (f"provider error {code}" if code is not None
+                       else "provider error (no message)")
+        return message, code
+    if isinstance(error, str) and error.strip():
+        return error.strip(), None
+    return None
+
+
 def request_completion(url, headers, payload, timeout, stream=False, on_token=None,
                        api_format: str = "openai", ssl_context: "ssl.SSLContext | None" = None,
                        error_retries: int = DEFAULT_ERROR_RETRIES,
@@ -1507,6 +1660,16 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
 
     Pass ``error_retries=0`` to restore the pre-AUTO-RATE-1 fail-fast
     behavior (raise immediately on the first error, no wait).
+
+    HARDEN-11 B: a failure the provider reports *inside* a live stream counts
+    too. A chunk with a top-level ``error`` object, or a final ``finish_reason``
+    of ``"error"``, is this call failing: with no token passed on yet it is
+    retried on the same budget (a 429 code read like a 429 status, its own
+    "try again in Nms" hint honoured), and once tokens were emitted it raises
+    ``RuntimeError`` naming the error message instead of returning the half
+    reply as the model's answer. HARDEN-11 C: a stream line that is not valid
+    UTF-8 is decoded with replacement characters and parsed as far as it parses,
+    so one bad byte costs that line rather than every token already read.
 
     ``on_retry``, if given, is called with a one-line human-readable
     string before each wait, mirroring the retry callbacks already used
@@ -1926,13 +2089,29 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     meta = CompletionMeta()
     # The streaming read is retried too, but only before any token has been passed on (BUGFIX).
     _stream_attempt = 0
+    # One undecodable line is logged once per call, not once per line (HARDEN-11 C).
+    _bad_line_logged = False
     while True:
         try:
             with _open() as response:
                 for raw_line in response:
                     _check_deadline("the stream")
                     # A BOM on the first stream line is stripped, so that chunk is not dropped (utf-8-sig).
-                    line = raw_line.decode("utf-8-sig").strip()
+                    # HARDEN-11 C: one byte that is not UTF-8 costs that line, not
+                    # the whole reply — the good tokens on both sides of it are
+                    # kept, and the fault is logged once instead of raising out of
+                    # the read as a raw UnicodeDecodeError nothing catches.
+                    try:
+                        line = raw_line.decode("utf-8-sig")
+                    except UnicodeDecodeError as exc:
+                        line = raw_line.decode("utf-8-sig", errors="replace")
+                        if not _bad_line_logged:
+                            _bad_line_logged = True
+                            logger.warning(
+                                "request_completion: a stream line from %s is not "
+                                "valid UTF-8 (%s) — decoded with replacement "
+                                "characters, the rest of the stream is kept", url, exc)
+                    line = line.strip()
                     if not line:
                         continue
 
@@ -1947,6 +2126,14 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             done  = chunk.get("done", False)
                         except json.JSONDecodeError:
                             continue
+                        # HARDEN-11 B: an error object on the stream is this call
+                        # failing, whether or not it is the provider's last word.
+                        _err = _stream_error_of(chunk)
+                        if _err is not None:
+                            raise _StreamErrorEvent(*_err)
+                        if chunk.get("done_reason") == "error":
+                            raise _StreamErrorEvent(
+                                "the provider reported done_reason 'error' on the stream")
                         _meta_from_chunk(chunk, meta, api_format)
                     else:
                         # OpenAI SSE: "data: {...}" lines
@@ -1974,6 +2161,15 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             done  = False
                         except (json.JSONDecodeError, KeyError):
                             continue
+                        # HARDEN-11 B: an error object is a failure of this call, and
+                        # so is a final finish_reason of "error" — neither may be
+                        # taken for an ordinary finish.
+                        _err = _stream_error_of(chunk)
+                        if _err is not None:
+                            raise _StreamErrorEvent(*_err)
+                        if isinstance(first, dict) and first.get("finish_reason") == "error":
+                            raise _StreamErrorEvent(
+                                "the provider reported finish_reason 'error' on the stream")
                         _meta_from_chunk(chunk, meta, api_format)
 
                     if token:
@@ -1985,6 +2181,50 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     if done:
                         break
             break
+        except _StreamErrorEvent as e:
+            # HARDEN-11 B: before any token has been passed on this is retried
+            # like a dropped connection (a 429 code like a 429 status); after
+            # tokens were emitted the half reply is not the model's answer and
+            # is reported instead, the way the other mid-stream failures are.
+            if parts:
+                raise RuntimeError(
+                    f"provider error reading stream from {url}: {e.message} "
+                    f"(after {_stream_attempt} retr{'y' if _stream_attempt == 1 else 'ies'}"
+                    f", tokens already emitted)"
+                ) from None
+            if _stream_attempt >= error_retries:
+                raise RuntimeError(
+                    f"provider error reading stream from {url}: {e.message} "
+                    f"(after {_stream_attempt} retr{'y' if _stream_attempt == 1 else 'ies'})"
+                ) from None
+            # The wait a 429's own message asks for, when it asks (AUTO-RATE-1);
+            # anything else waits the fixed backoff, exactly as an HTTP status does.
+            wait_s = _retry_hint_from_text(e.message) if e.code == 429 else None
+            if wait_s is None:
+                wait_s = error_retry_wait_sec
+
+            if wait_s > max_retry_after_sec:
+                msg = (
+                    f"provider error reading stream from {url}: server asked for a "
+                    f"{wait_s:.0f}s wait, longer than the "
+                    f"{max_retry_after_sec:.0f}s cap (looks like a daily/"
+                    f"monthly quota reset, not a transient rate limit) "
+                    f"— not waiting"
+                )
+                logger.warning("request_completion: %s", msg)
+                if on_retry:
+                    on_retry(msg)
+                raise RuntimeError(
+                    f"provider error reading stream from {url}: {e.message}"
+                ) from None
+
+            msg = (
+                f"provider error reading stream from {url}: {e.message}, waiting "
+                f"{wait_s:.1f}s and retrying "
+                f"(attempt {_stream_attempt + 1}/{error_retries})"
+            )
+            retry_after(msg, wait_s)
+            _stream_attempt += 1
         except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
             if parts or _stream_attempt >= error_retries:
                 raise RuntimeError(
