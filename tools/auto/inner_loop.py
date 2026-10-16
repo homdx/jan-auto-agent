@@ -1038,21 +1038,35 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             or _EN_NOTE.match(upper)
         )
 
-    def _en_no_problem_approval(upper: str) -> bool:
-        """Whether *upper* is a "No <problem>" approval (HARDEN-10 C).
+    #: What turns "No <problem>" into the start of a complaint: a contrast, an exception, a clause after `;`.
+    _EN_NO_PROBLEM_CAVEAT = _re.compile(
+        r"\b(?:BUT|HOWEVER|EXCEPT|ALTHOUGH|THOUGH|YET|ONLY|APART\s+FROM|ASIDE\s+FROM|OTHER\s+THAN)\b"
+        r"|;\s*\S"
+    )
 
-        "No contradictions found", "No errors", "No inconsistencies" — the way the creative
-        validator says there is nothing to fix, matched the way the Russian
-        «нет противоречий» already was. Checked before the standalone ``NO`` token, which took
-        the first problem word away as the reason ("No contradictions found" went out to the
-        Coder as the rejection "contradictions found").
+    def _en_no_problem_verdict(line: str, upper: str) -> "tuple[bool, str] | None":
+        """The verdict of a "No <problem>" reply, or ``None`` when *upper* is not one.
 
-        HARDEN-14 A: adjectives may stand between "No" and the problem word — "No major
-        inconsistencies", "No further objections" — and they are not the problem. The old
-        shape admitted none, so such a reply fell through to the bare ``NO`` rejection and a
-        clean chapter went back to the Coder.
-        """
-        return bool(_EN_NO_PROBLEM.match(upper) or _EN_NO_PROBLEM_ADJ.match(upper))
+        "No contradictions found", "No errors", "No inconsistencies" (HARDEN-10 C), "No major
+        inconsistencies" (HARDEN-14 A) and the casual "No issues" / "No, it's good" are the way
+        the creative validator says there is nothing to fix, matched the way the Russian
+        «нет противоречий» already was, and before the standalone ``NO`` token, which took the
+        first problem word away as the reason. Each is an approval only when it is the whole
+        verdict: "No contradictions found, but Anna's age changes…", "No errors except one: …"
+        and "No issues." followed by a `REVISE:` or `REJECT:` line reject, with the reply's own
+        words as the reason."""
+        m = _EN_NO_PROBLEM.match(upper) or _EN_NO_PROBLEM_ADJ.match(upper) or _EN_DISCOURSE_OK.match(upper)
+        if not m:
+            return None
+        if _EN_NO_PROBLEM_CAVEAT.search(upper[m.end():]):
+            return False, line.strip()
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        later = lines[lines.index(line.strip()) + 1:] if line.strip() in lines else []
+        for ln in later:
+            lu = ln.upper()
+            if _verdict_token_at_start(lu, "REVISE") or _verdict_token_at_start(lu, "REJECT"):
+                return False, _en_rejection_reason(ln, lu)
+        return True, ""
 
     # ── HARDEN-14 A: the problem side of the NOT family — the approvals ──────
     # A "NOT" that negates a *problem* says there is no problem: "NOT A PROBLEM",
@@ -1188,9 +1202,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
             return True, "", False
 
-        # A casual "No, it's perfect" is an approval, not a rejection; a "No" that names a real problem still rejects (AUTO-BUG).
-        if _EN_DISCOURSE_OK.match(upper):
-            return True, "", False
+        # A casual "No, it's perfect" is an approval (`_en_no_problem_verdict`); a "No" that names a real problem still rejects (AUTO-BUG).
 
         # ── English "NO <revisions/changes/…> NEEDED" approval guard ─────
         if _EN_NOTHING_NEEDED.match(upper):
@@ -1198,8 +1210,9 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
 
         # "No contradictions found" is an approval, checked before the standalone NO token,
         # which would take the problem word away as the reason (HARDEN-10 C).
-        if _en_no_problem_approval(upper):
-            return True, "", False
+        _no_problem = _en_no_problem_verdict(raw, upper)
+        if _no_problem is not None:
+            return _no_problem[0], _no_problem[1], False
 
         # ── English REVISE / REJECT / NO / NOT ───────────────────────────
         _reject_reason = _en_rejection_reason(raw, upper)
@@ -1217,10 +1230,11 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
                 return False, _line_ok_caveat, False
             if _lu.startswith("APPROVED") or _re.match(r"^OK\b", _lu):
                 return True, "", False
-            if _EN_DISCOURSE_OK.match(_lu) or _EN_NOTHING_NEEDED.match(_lu):
+            if _EN_NOTHING_NEEDED.match(_lu):
                 return True, "", False
-            if _en_no_problem_approval(_lu):
-                return True, "", False
+            _line_no_problem = _en_no_problem_verdict(_line, _lu)
+            if _line_no_problem is not None:
+                return _line_no_problem[0], _line_no_problem[1], False
             _line_reject_reason = _en_rejection_reason(_line, _lu)
             if _line_reject_reason is not None:
                 return False, _line_reject_reason, False
