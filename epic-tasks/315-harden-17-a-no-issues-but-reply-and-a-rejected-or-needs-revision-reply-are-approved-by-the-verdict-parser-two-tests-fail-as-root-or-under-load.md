@@ -21,7 +21,7 @@ An outside review of `0815666` found these. The parser items were re-run on `081
 
 ### What happens today
 
-On `0815666`, `_parse_verdict_soft(reply)[0]` is `True` (approved) for:
+On `0815666`, `_parse_verdict_soft(reply)[0]` is `True` (approved) for the lines below. **Update after CC review fix 41 (landed on top of round 313):** the first two (`No issues found, but …`, `No issues with the prose, but …`) are rejected now; the rest are still approved on the current head and remain this part's work:
 
 ```
 No issues found, but the ring is stolen in ch 3.
