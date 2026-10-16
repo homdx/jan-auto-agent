@@ -1,10 +1,10 @@
 # HARDEN-16 — `void f(x);` in JavaScript or TypeScript is the `void` operator on a call but `extract_block` reports it as a declaration of `f`; the bare-token mask rewrites an `AKIA…` / `ghp_…` token that is used as an identifier (`if AKIA… in keys`, `AKIA….split()`, `{AKIA…}`) into `here_your_key` and an `/edit` writes broken code
 
-**Status:** open
+**Status:** landed (round 314: sensenova-6-8-flash-lite-var4 as the base — in JS/TS a prefix that is only `void` is a call, so `void f(x);` is not the declaration of `f` while Java, C and the TS type members keep theirs (A); a bare provider token is left alone only where the syntax proves it is a name — an attribute, a call, an index, a comparison with a name, an f-string or template hole, an object-literal key, the name after `def`/`class`/`import`/`let`/`const` — and masked everywhere else (B))
 **Severity:** MEDIUM (A: Gate 1's existence check reads a call as a definition, so a claim that a function is missing can be let through); LOW (B: a token that is also an identifier is rare, but the model is shown broken code)
 **File:** `tools/block_extractor.py` (A), `tools/llm_stream.py` (B)
 **Symbol:** A: `_find_earliest_declaration`, `_head_prefix_kind`, `_CALL_HEAD_WORDS`. B: `_SECRET_PREFIX_RE`, `mask_bare_tokens`, `mask_api_key`
-**Round:** (set when the round starts)
+**Round:** 314
 **Size:** S
 **Depends on:** HARDEN-12 (310, the bare-token masker), HARDEN-13 (311), HARDEN-15 (313, same mask file; land after it), all landed or ahead of this one
 **Also touches:** `tests/`, `tests_bugfix/` (the HARDEN-12 C table and the block-extractor pins must stay green)
@@ -87,3 +87,7 @@ One commit. The judge's own checks are not published and are written after the r
 ## Not in scope
 
 Rust, the restore (HARDEN-13), the verdict parser (HARDEN-14), the other parts of the mask (HARDEN-15).
+
+Why not the others: the round was cut at 91 minutes with no entry READY (nemotron GAVE_UP on `tests_slow`), so every worktree was committed as it stood. In a black box that drives each tree (60 checks: `extract_block` over `void`, `await`, `typeof`, `delete`, `new`, `yield`, `!`, `return`, `throw` before a call and 13 declaration shapes in ts, java, c, cpp, h, kt; `mask_api_key` over six provider token shapes in 18 name positions and 16 value positions, a mixed line, an edit round trip), sensenova-var4 and var3 passed 60, step-5-preview and var2 54, agnes 54, nemotron 53, laguna and var1 48, glm 41 (it loses the C++ and header declarations). var4 is the base because the other entries' tests ran on it 535 passed and the var4 tests fail 5 times on var3's code (a shorter sibling token, the edit of a neighbouring line); var3's own 57 pass on var4. agnes's verdict-parser work (ticket 315's part) and its tests were left out.
+
+Found at judging and fixed in the same commit: var4's name check copied the text before the token and walked every region for each token, so a file with many tokens cost their product — it reads a window of 400 characters around the token and bisects the regions. Not taken: a token followed by `in x and …` as a name (step-5's test) — `the token ghp_… is valid and …` reads the same in prose, and leaking is worse than a broken line.

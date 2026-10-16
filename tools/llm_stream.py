@@ -715,6 +715,233 @@ def _is_a_closing_quote(text: str, index: int, quote: str) -> bool:
     return open_quote == quote
 
 
+#: Words after which the next identifier is a name this source declares, imports or binds,
+#: so a provider token in that spot is an identifier, not a value (HARDEN-16 B).
+_BARE_TOKEN_NAME_KEYWORD_RE = re.compile(r"(?:def|class|import|from|let|const|var|function)\s*$")
+#: A name-to-name comparison's operator, standing directly before a token (the token is the
+#: right operand) or directly after one (the token is the left operand). The operator ends the
+#: look, so the whitespace before it must be swallowed at the end of the look itself.
+_BARE_TOKEN_CMP_BEFORE_RE = re.compile(r"(?:\s*==|\s*!=|\s*not\s+in|\s*(?:in|is)\b)\s*$")
+_BARE_TOKEN_CMP_AFTER_RE = re.compile(r"^\s*(?:not\s+in|(?:in|is)\b|==|!=)")
+#: The comparison words that are English as well — `key is sk-… here`, `the key gh_… in config.yml`
+#: — so an operand of one of them proves a name only when the statement ends where code ends it
+#: (`==` and `!=` are no English, so they never need the proof).
+_BARE_TOKEN_CMP_WORD_RE = re.compile(r"^\s*(?:not\s+in|in|is)\b")
+#: The other side of such a comparison, when the token is the left operand: a name path, then the
+#: end of the statement — `x in keys:`, `x is self.keys`. Prose goes on with another word.
+_BARE_TOKEN_NAME_COMPARAND_RE = re.compile(
+    r"^\s*[A-Za-z_$][\w$]*(?:::[\w$]+|\[[^\]]*\]|(?:::|\.)[\w$]+)*\s*(?:$|:|;|,|\)|\]|}|\#|//|/\*)"
+)
+#: How far either side of a token the syntax rules read: a statement is shorter than this, and
+#: reading no further keeps the mask linear in the size of the text.
+_BARE_TOKEN_WINDOW = 400
+#: The closing brackets of a parenthesised reference, ahead of the `.`, `(` or `[` that follows it:
+#: `(NAME).strip()`, `(NAME)[0]`, `f(NAME).id` — the reference is a name, whatever it is wrapped in.
+_BARE_TOKEN_CLOSERS = ")]}"
+#: A statement end: what an operand of `in` or `is` is followed by in code, and never in prose.
+_BARE_TOKEN_STATEMENT_END = frozenset(":;),]}")
+
+
+def _statement_ends(rest: str) -> bool:
+    """Whether *rest* begins the end of a statement.
+
+    ``in``, ``is`` and ``not in`` are English too — ``key is sk-… here``, ``the key gh_… in
+    config.yml`` — so an operand followed by another word is prose and stays masked (HARDEN-16 B).
+    """
+    tail = rest.lstrip(" \t\r\n")
+    if not tail:
+        return True
+    return tail[0] in _BARE_TOKEN_STATEMENT_END or tail.startswith(("#", "//", "/*"))
+
+
+def _quote_end(text: str, open_index: int) -> int:
+    """The index just past the quote, or triple quote, that opened at *open_index*.
+
+    A backslash escapes the next character, so a literal quote inside the string does not close it.
+    A string that is not a triple quote cannot span a line: the quote is a stray character there,
+    and the region ends with the line rather than running on to swallow the rest of the file.
+    """
+    quote = text[open_index]
+    if text[open_index:open_index + 3] == quote * 3:
+        end = text.find(quote * 3, open_index + 3)
+        return len(text) if end < 0 else end + 3
+    i = open_index + 1
+    n = len(text)
+    while i < n:
+        char = text[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char == quote:
+            return i + 1
+        if char == "\n":
+            return i + 1
+        i += 1
+    return n
+
+
+def _text_regions(text: str) -> "list[tuple[int, int, str]]":
+    """Every string and comment of *text*, as ``(start, end, "string" | "comment")`` in order.
+
+    The syntax rules of ``_bare_token_is_a_name`` do not apply inside one of them: a token there is
+    a value the source carries, not a name it declares, so it stays masked. Escapes are honoured, a
+    quote of the other kind inside an open string is a literal character, and all three comment
+    forms (``#``, ``//``, ``/* … */``) are read, so a quote inside a comment does not open a string.
+    """
+    regions: "list[tuple[int, int, str]]" = []
+    i = 0
+    n = len(text)
+    while i < n:
+        char = text[i]
+        if char == "#" or text[i:i + 2] == "//":
+            end = text.find("\n", i)
+            regions.append((i, n if end < 0 else end, "comment"))
+            i = n if end < 0 else end
+            continue
+        if text[i:i + 2] == "/*":
+            end = text.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+            regions.append((i, end, "comment"))
+            i = end
+            continue
+        if char in "\"'`":
+            end = _quote_end(text, i)
+            regions.append((i, end, "string"))
+            i = end
+            continue
+        i += 1
+    return regions
+
+
+def _region_at(regions: "list[tuple[int, int, str]]", index: int) -> "tuple[int, int, str] | None":
+    """The ``(start, end, kind)`` region that holds *index*, or ``None`` when it is code.
+
+    The regions are in order and do not overlap, so the one that can hold *index* is the last
+    that starts at or before it: a bisection, not a walk, because a file with thousands of
+    tokens and thousands of strings would otherwise cost their product.
+    """
+    lo, hi = 0, len(regions)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if regions[mid][0] <= index:
+            lo = mid + 1
+        else:
+            hi = mid
+    if lo and regions[lo - 1][0] <= index < regions[lo - 1][1]:
+        return regions[lo - 1]
+    return None
+
+
+def _in_interpolation(text: str, span_start: int, span_end: int, start: int, end: int) -> bool:
+    """Whether a token at ``[start, end)`` inside the string ``(span_start, span_end)`` sits in an
+    interpolation: it opens a ``{…}`` pair and a matching ``}`` closes it before the string does.
+
+    An f-string's ``{name}`` and a template literal's ``${name}`` are expressions — a name there is
+    a name, while the rest of the literal's text is a value and stays masked (HARDEN-16 B).
+    """
+    i = start - 1
+    while i >= span_start and text[i] in " \t\r\n":
+        i -= 1
+    if i < span_start or text[i] != "{":
+        return False
+    depth = 1
+    j = end
+    while j < span_end:
+        char = text[j]
+        if char == "\\":
+            j += 2
+            continue
+        if char in "\"'`":
+            j = _quote_end(text, j)
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return True
+        j += 1
+    return False
+
+
+def _bare_token_is_a_name(text: str, start: int, end: int,
+                          regions: "list[tuple[int, int, str]]") -> bool:
+    """Whether the token at ``text[start:end]`` is a **name** in the syntax rather than a value.
+
+    HARDEN-16 B: a provider token used as an identifier used to go out as ``here_your_key`` —
+    ``if AKIA… in keys``, ``AKIA….split()``, ``{AKIA…}`` — and an ``/edit`` of the file wrote the
+    placeholder where a name stood, leaving code that does not run. Leaking is worse than a broken
+    line, so the exemption is narrow: the syntax has to prove the token is a name.
+
+    * an attribute, a call or an index of it, or an attribute of it — ``f(x).id``, ``name.split(``,
+      ``name[0]``, ``config.NAME``, ``f(NAME).id``, ``(NAME).strip()``;
+    * an operand of ``in``, ``not in``, ``is``, ``==`` or ``!=`` when the other side is not a
+      quoted string — a comparison of two names;
+    * the whole content of a ``{…}`` pair — an f-string or template interpolation, a shorthand
+      property, a set element;
+    * a key of an object literal — ``{NAME: 1}``, where the colon separates a key from a value;
+    * the name after ``def``, ``class``, ``import``, ``from``, ``let``, ``const``, ``var``,
+      ``function``;
+    * inside a string, only an interpolation counts — every other character of a quoted value is a
+      value, and so is everything in a comment; both stay masked.
+    """
+    region = _region_at(regions, start)
+    if region is not None:
+        if region[2] == "comment":
+            return False
+        return _in_interpolation(text, region[0], region[1], start, end)
+
+    # A window around the token, not the whole text: every rule below looks at the statement
+    # the token stands in, and a copy of a megabyte of file per token costs their product.
+    before = text[max(0, start - _BARE_TOKEN_WINDOW):start]
+    after = text[end:end + _BARE_TOKEN_WINDOW]
+    left = before.rstrip(" \t")
+    right = after.lstrip(" \t")
+
+    if left.endswith("."):
+        return True
+    # An attribute, a call or an index of the reference: the `.`, `(` or `[` may stand behind the
+    # closing bracket of a parenthesised reference — `(NAME).strip()`, `(NAME)[0]`.
+    j = 0
+    while j < len(right) and right[j] in _BARE_TOKEN_CLOSERS:
+        j += 1
+    if j < len(right) and right[j] in ".([":
+        return True
+    right_cmp = _BARE_TOKEN_CMP_AFTER_RE.match(after)
+    if right_cmp:
+        rest = after[right_cmp.end():]
+        if rest.lstrip(" \t")[:1] not in "\"'`" and (
+                not _BARE_TOKEN_CMP_WORD_RE.match(right_cmp.group(0))
+                or _BARE_TOKEN_NAME_COMPARAND_RE.match(rest)):
+            return True
+    left_cmp = _BARE_TOKEN_CMP_BEFORE_RE.search(before)
+    if left_cmp:
+        other = before[:left_cmp.start()].rstrip(" \t")
+        quoted = bool(other) and other[-1] in "\"'`" \
+            and _is_a_closing_quote(text, start - len(before) + left_cmp.start() - 1, other[-1])
+        if not quoted and (not _BARE_TOKEN_CMP_WORD_RE.match(left_cmp.group(0))
+                           or _statement_ends(after)):
+            return True
+    if left.endswith("{") and right.startswith("}"):
+        return True
+    if left.endswith(("{", ",")) and right.startswith(":") and not right.startswith(("::", ":=", "=>")):
+        return True
+    return bool(_BARE_TOKEN_NAME_KEYWORD_RE.search(before))
+
+
+def _mask_secret_prefix(match: "re.Match[str]",
+                        regions: "list[tuple[int, int, str]]") -> str:
+    """The token of a ``_SECRET_PREFIX_RE`` match, or the placeholder for it.
+
+    A token that the syntax proves to be a name is left alone (HARDEN-16 B): it names something in
+    the source, so masking it would hand the model a line that does not parse and an ``/edit``
+    would write ``here_your_key`` into it. Everything else — a value after an ``=`` or a ``:``, a
+    quoted string, a config line, a header — is the placeholder.
+    """
+    return match.group(0) if _bare_token_is_a_name(match.string, match.start(), match.end(), regions) \
+        else _MASK_PLACEHOLDER
+
+
 def _xml_parent_element(before: str) -> "str | None":
     """The name of the element an XML element at the end of *before* sits inside,
     or ``None`` when it is at the top level (HARDEN-13 C).
@@ -762,6 +989,14 @@ def mask_api_key(text: "str | None") -> "str | None":
     ``ghp_``, ``hf_``, ``xai-``, ``glpat-``, ``AKIA``/``ASIA``) is masked wherever it
     sits. In exchange the unquoted colon form no longer reads a CamelCase class name as
     a credential (Part A): ``api_key: AsyncOpenAIClientFactory`` is an annotation.
+
+    HARDEN-16: that last prefix mask is what rewrote a token used as an identifier —
+    ``if AKIA… in keys`` went out as ``if here_your_key in keys`` — and an ``/edit``
+    wrote the placeholder back where a name stood. A bare token is left alone only where
+    the syntax proves it is a name (see ``_bare_token_is_a_name``): in an attribute
+    access, a call or an index, a name-to-name comparison, an interpolation, a binding or
+    an object-literal key. In every other position — a value after an ``=`` or a ``:``,
+    a quoted value, a config line, a header, a comment — the placeholder still goes.
 
     This is a plain string transform with no knowledge of *which* key is
     "real" — it masks unconditionally so a secret embedded in file content
@@ -928,7 +1163,10 @@ def mask_api_key(text: "str | None") -> "str | None":
     # bare JWT and a key name followed by its token by a space.
     text = _JWT_RUN_RE.sub(_mask_jwt, text)
     text = _API_KEY_SPACE_RE.sub(_mask_space, text)
-    return _SECRET_PREFIX_RE.sub(_MASK_PLACEHOLDER, text)
+    # The strings and comments of the text as it stands now: a token inside one is a value, so the
+    # prefix mask below keeps it masked, whatever its neighbours look like (HARDEN-16 B).
+    regions = _text_regions(text)
+    return _SECRET_PREFIX_RE.sub(lambda m: _mask_secret_prefix(m, regions), text)
 
 
 # Every place str.splitlines() ends a line at, `\r\n` first so the pair is one

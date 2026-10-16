@@ -1,9 +1,9 @@
-# HARDEN-18 — a key call the model splits over lines is written with the placeholder; the Coder writes a non-string `content` as its Python repr; `/edit "my notes.txt"` keeps the quotes and the hint is not shell-safe
+# HARDEN-18 — two sections that share a line trade their keys on a reorder; a key call the model splits over lines is written with the placeholder; the Coder writes a non-string `content` as its Python repr; `/edit "my notes.txt"` keeps the quotes and the hint is not shell-safe
 
 **Status:** open
-**Severity:** HIGH (A: silent loss of a real key, success reported); MEDIUM (B: silent loss of the code); LOW (C)
-**File:** `tools/llm_stream.py` (A), `tools/auto/coder.py` (B), `tools/actions.py` (C)
-**Symbol:** A: `restore_masked_secrets` and its callers `Coder._write_files`, `OrchestratorActions.run_edit`. B: `Coder._parse_response`. C: `_parse_edit_command` / `_parse_payload_and_file`, the `restore with:` hint line of `run_edit`
+**Severity:** HIGH (D: a key written under another account's header, silently; A: silent loss of a real key, success reported); MEDIUM (B: silent loss of the code); LOW (C, E: id-less tasks only)
+**File:** `tools/llm_stream.py` (A, D), `tools/auto/coder.py` (B, E), `tools/actions.py` (C)
+**Symbol:** D: `restore_masked_secrets`, `_same_place`, the head/tail pairing. E: `Coder._backup_is_new`. A: `restore_masked_secrets` and its callers `Coder._write_files`, `OrchestratorActions.run_edit`. B: `Coder._parse_response`. C: `_parse_edit_command` / `_parse_payload_and_file`, the `restore with:` hint line of `run_edit`
 **Round:** (set when the round starts)
 **Size:** S
 **Depends on:** HARDEN-13 (311, the restore this extends; landed in `0815666`)
@@ -76,3 +76,61 @@ The four cases above plus a list with an indented line (indentation kept) and a 
 ### Tests
 
 `/edit "my notes.txt" :: …` and `'my notes.txt'` edit the file; the hint for a spaced name, run through `shlex.split`, has exactly three words; plain names print as before.
+
+---
+
+## Part D — two sections that share a line trade their keys when the model reorders them
+
+### What happens today
+
+`agents.ini` holds `[openai_personal]` and `[openai_work]`, each with the same `base_url = https://api.openai.com/v1` line above its key (and the same `model = gpt-4o` below it). The model sees both keys masked and is asked to put the work section first. On `5c403f1`, `restore_masked_secrets` returns
+
+```
+[openai_work]
+api_key = sk-personal-…      <- the personal key under the work header
+[openai_personal]
+api_key = sk-work-…          <- the work key under the personal header
+```
+
+with `written=['agents.ini'] error=''` through `Coder._write_files`; `/edit` does the same. An identical line above the key, or an identical line after it (`max_tokens = 4096`), is enough. The restore decides "same place" from one neighbouring line's text, and the head/tail pairing of HARDEN-13 pairs trailing lines as they stand, so two sections that share a line look unchanged and a reorder reads as no change. Ticket 311 promised that no key is restored under another header; this breaks it. A credential that moves to the wrong account is worse than a lost one.
+
+### What it does
+
+* Pair a masked line with its original only on an **anchor that is unique** in the file (the section header, or the nearest line that occurs once). Matched entries must keep their order and their header; otherwise the placeholder stays in the reply and Part A's write refusal fires.
+* A reorder of whole sections is restored by the header, never by a shared neighbour.
+* Same through `Coder._write_files` and `run_edit`; no special case for `[openai_*]` or INI.
+
+### Tests (sketch)
+
+The two-section file above with the sections swapped: each key under its own header or the write refused, never crossed; an identical line above, one below, both; three sections rotated; a faithful reply (nothing moved) still restores every key; the HARDEN-13 pins stay green.
+
+---
+
+## Part E — the first write of an id-less task makes no backup
+
+### What happens today
+
+`Coder._backup_is_new` compares `self._backups.get(rel, "") != task_id`. With an empty `task_id` (`generate()` allows one) that is `"" != ""`, so the first write makes no `.coder.bak`. And `./app.py` and `app.py` are different keys, so the second write of the same file overwrites the backup with attempt 1, the only copy of the original key.
+
+### What it does
+
+"Not recorded for this file" is the test, not an empty-string default, and the key is the resolved path.
+
+### Tests (sketch)
+
+An empty task id: the first write makes the backup, the second keeps it; `./app.py` then `app.py`: one backup, the original's.
+
+---
+
+## Contest
+
+One commit. The judge's checks are written after the round, from the entries; the entries' own tests are cross-tested on every other entry's code. The judge fuzzes the mask-and-restore round trip over random config files (sections that share lines, reorders, insertions, split calls) and expects a faithful reply to restore byte for byte and any other reply to restore every key under its own header or to be refused.
+
+## Acceptance
+
+**Layer 1 — offline.** The tests above; `.smoke_tests/ .regression_tests/` and `tests_bugfix -n 4` green unchanged.
+**Layer 2 — the operator.** `/edit "put the work section first"` on a two-provider `agents.ini` with shared lines keeps each key under its own header.
+
+## Not in scope
+
+Rust, a secret that is not an `api_key` assignment (HARDEN-19), the verdict parser (HARDEN-17).

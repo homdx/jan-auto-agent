@@ -1,7 +1,7 @@
 # HARDEN-17 — the verdict parser approves `No issues found, but …`, `Rejected: …`, `REJECTED - …`, a bare `Rejected` and `Needs revision: …` / `Needs work: …`; two tests make a CI run red (one fails as root, one is timing-dependent)
 
 **Status:** open
-**Severity:** HIGH-MEDIUM (A: a rejected chapter or edit is approved; the parser's fail-open default); LOW (B: tests only)
+**Severity:** HIGH-MEDIUM (A2: a clean chapter is sent back to be rewritten; A: a rejected chapter or edit is approved; the parser's fail-open default); LOW (B: tests only)
 **File:** `tools/auto/inner_loop.py` (A), `tests/test_actions_edit_legacy_encoding.py`, `tests/test_gate1_vote_inflight_review.py` (B)
 **Symbol:** A: `_parse_verdict_soft`, `_en_not_family_reason`, the rejection word lists next to them. B: `test_a_failing_write_removes_the_backup_it_made`, `test_votes_of_eight_workers_wait_for_the_whole_queue`
 **Round:** (set when the round starts)
@@ -46,6 +46,33 @@ Needs work: pacing.
 ### Tests (sketch)
 
 Each line above → not approved, with a reason that quotes the objection; the approvals above → approved; the continuity gate (`ContinuityValidator`, no second chance) rejects the first, fourth and seventh line.
+
+---
+
+## Part A2 — a clean approval that carries a `;`, `only` or `yet` is rejected (a regression of CC review fix 41)
+
+### What happens today
+
+On `5c403f1`, `_parse_verdict_soft` rejects eleven of nineteen natural approvals that `277d632` approved. The reason handed to the Coder is the approval sentence itself, so a clean chapter goes back to be "fixed":
+
+```
+No issues found; everything matches the bible.
+No contradictions found; the timeline is intact.
+No contradictions found. The chapter only uses facts from the bible.
+No issues. Yet another consistent chapter.
+```
+
+`_en_no_problem_verdict` takes any `;`, `ONLY` or `YET` after the phrase for a caveat (`_EN_NO_PROBLEM_CAVEAT`). `No discrepancies found.` and `No factual errors found.` were rejected before that fix and still are.
+
+### What it does
+
+* A conjunction or adverb is a caveat only where it **opens a clause** (`No issues, but …`, `No issues found. However, …`, `No issues; however …`), not anywhere after the phrase. `;`, `only` and `yet` alone are not triggers.
+* The problem nouns of the "No <problem>" phrase include `discrepancies` and `<adj> errors` / `<adj> issues` (`factual`, `continuity`, `plot`, `major`, `minor`).
+* Part A's cases stay: `No issues, but the ring is stolen`, `No issues. However, …`, `No issues.` followed by a `REVISE:` line are rejections.
+
+### Tests (sketch)
+
+The four lines above and `No discrepancies found.`, `No factual errors found.` approve; the Part A rejections and the CC fix 41 tests (`tests/test_verdict_review_q.py`) stay green.
 
 ---
 

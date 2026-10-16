@@ -707,6 +707,22 @@ def _head_prefix_kind(prefix: str) -> str:
 _QUALIFICATION_ONLY = re.compile(r"^(?:[A-Za-z_$][\w$]*(?:<[^<>]*>)?::)+$")
 
 
+def _prefix_is_js_void_operator(prefix: str, lang: str) -> bool:
+    """Whether *prefix* is nothing but the word `void` in a JavaScript or TypeScript file.
+
+    There `void` before a name is the void operator — `void f(x);` calls `f` and throws its
+    result away (the idiom for ignoring a Promise) — so the head is a call, not a declaration.
+    In Java and C the same word is a return type (`void main(void);`, `void reset();`), which is
+    what keeps `void` out of _CALL_HEAD_WORDS; a return type stands *after* a parameter list, and
+    the heads that carry one (`declare function f(): void;`, `reset(): void;` in an interface, an
+    abstract `run(): void;`) have a modifier or nothing in front of their name, never `void`
+    (HARDEN-16 A).
+    """
+    if lang != "js":
+        return False
+    return re.findall(r"[A-Za-z_$][\w$]*", prefix.strip()) == ["void"]
+
+
 def _declaration_prefix_is_call(prefix: str) -> bool:
     """True when *prefix* puts a body-less head in an expression rather than a declaration.
 
@@ -1539,6 +1555,12 @@ def _find_earliest_declaration(source: str, target_name: str, lang: str = "") ->
             if pos is None:
                 continue
             kind = "call" if _declaration_prefix_is_call(head[:pos]) else _head_prefix_kind(head[:pos])
+            # HARDEN-16 A: `void f(x);` is the void operator on a call in JavaScript and
+            # TypeScript, not a declaration of `f` — the declaration pass read it as one, so a
+            # Gate 1 claim that the file never defines `f` was let through. Java and C keep
+            # `void` as a return type and are untouched.
+            if _prefix_is_js_void_operator(head[:pos], lang):
+                kind = "call"
             # HARDEN-14 B3: a destructor's name opens with `~` and carries no return type, so
             # it is a declaration on its own — `~I() = default;`, `~I();`.
             if target_name.startswith("~"):
