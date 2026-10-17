@@ -234,15 +234,45 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
 
 
 def in_style_of(dest: Path, content: str) -> str:
-    """*content* with *dest*'s line ends (CRLF when most of its lines end so) and its BOM. The model writes
-    LF and no BOM, and a one-line edit of a CRLF file was a diff of every line (12 changed of 6)."""
+    """*content* with *dest*'s line ends and its BOM. The model writes LF and no BOM.
+
+    v13 (TA-4): the line ends are decided per line, as `/edit` does (`_edit_line_ends`): a reply line that
+    equals an original line keeps that line's own ending, used once; a changed or new line takes the file's
+    majority ending. So an untouched LF line of a mixed file stays LF. For a uniform file the result is the
+    same as the old whole-file rule.
+    """
     try:
         raw = dest.read_bytes()
     except OSError:
         return content
-    text = content.replace("\r\n", "\n")
-    if raw.count(b"\r\n") * 2 > raw.count(b"\n"):
-        text = text.replace("\n", "\r\n")
+    if not raw:
+        text = content.replace("\r\n", "\n")
+    else:
+        majority_crlf = raw.count(b"\r\n") * 2 > raw.count(b"\n")
+        changed_ending = "\r\n" if majority_crlf else "\n"
+        by_text: dict = {}
+        for line in raw.decode("utf-8", errors="replace").splitlines(keepends=True):
+            body = line.rstrip("\r\n")
+            by_text.setdefault(body, []).append(line[len(body):])
+        parts = content.replace("\r\n", "\n").split("\n")
+        out: list = []
+        last = len(parts) - 1
+        for pos, body in enumerate(parts):
+            if pos == last and body == "":
+                out.append("")
+                continue
+            if pos == last:
+                out.append(body)                  # the reply's last line: no ending unless it wrote one
+                continue
+            # v13 (TA-4 follow-up): an unterminated original last line has an EMPTY ending; it may only
+            # be used by the reply's last line, or two lines are glued (`beta` + `alpha` -> `betaalpha`).
+            endings = [e for e in by_text.get(body, []) if e]
+            if endings:
+                by_text[body].remove(endings[0])
+                out.append(body + endings[0])
+            else:
+                out.append(body + changed_ending)
+        text = "".join(out)
     if raw.startswith(b"\xef\xbb\xbf") and not text.startswith("\ufeff"):
         text = "\ufeff" + text
     return text

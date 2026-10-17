@@ -411,9 +411,13 @@ def _edit_line_ends(dest: str, content: str) -> str:
         if pos == last and body == "":
             out.append("")                    # the empty string after a trailing newline
             continue
+        # v13 (TA-4 follow-up): an unterminated original last line has an EMPTY ending; only the reply's
+        # last line may take it, or `beta` + `alpha` is written as `betaalpha`.
         endings = by_text.get(body)
-        if endings:
-            out.append(body + endings.pop(0))  # the line's own ending, used once
+        usable = [e for e in (endings or []) if e or pos == last]
+        if usable:
+            endings.remove(usable[0])
+            out.append(body + usable[0])       # the line's own ending, used once
         elif pos == last:
             out.append(body)                   # a last line with no ending of its own
         else:
