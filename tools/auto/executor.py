@@ -993,7 +993,7 @@ _SECRET_OPT_RE = re.compile(
     r"(--(?:api[-_]?key|token|secret|password|passwd|pass|pwd|auth|"
     r"access[-_]?key|client[-_]?secret|private[-_]?key))"
     r"([=:]\s*|\s+)"
-    r"(\S+)"
+    r"('[^'\n]*'|\"[^\"\n]*\"|\S+)"
 )
 
 # Authorization values are two words (Bearer token); matched up to the next quote or flag so the token is hidden too.
@@ -1037,7 +1037,13 @@ _SECRET_URL_USERINFO_RE = re.compile(
 # (`-u redis://:pw@host`) is not one: the URL's password is the URL rule's, and this one
 # would have rewritten `redis://` to `redis:` (HARDEN-15 C).
 _SECRET_USER_OPT_RE = re.compile(
-    r"(\s(?:-u|--user)(?:\s+|=))([^\s:]+):(?!//)([^\s]+)"
+    r"""(\s(?:-u|--user)(?:\s+|=))([^\s:'"]+):(?!//)([^\s'"]+)"""
+)
+
+# v13 (CMD-1): `-u 'user:pass word'`: the whole argument is one shell-quoted word, so its password may hold
+# spaces. Matched as one unit; the closing quote is the one that opened the word.
+_SECRET_USER_QUOTED_RE = re.compile(
+    r"""(\s(?:-u|--user)(?:\s+|=)(['"]))([^\s:'"]+):([^'"\n]+)(\2)"""
 )
 
 # `-p value` / `-pvalue` is a password only for the commands that take one. `ls -p`,
@@ -1046,7 +1052,7 @@ _SECRET_USER_OPT_RE = re.compile(
 _PASSWORD_OPT_COMMANDS = frozenset({
     "mysql", "mysqldump", "mariadb", "mariadb-dump", "redis-cli", "sshpass", "htpasswd",
 })
-_PASSWORD_OPT_RE = re.compile(r"(?<![\w-])(-p)([ \t]*)(\S*)")
+_PASSWORD_OPT_RE = re.compile(r"""(?<![\w-])(-p)([ \t]*)('[^'\n]*'|"[^"\n]*"|\S*)""")
 # HARDEN-15 C: MySQL reads the password attached to `-p` and nothing else — `-p` on its
 # own is the prompt flag, so the next word is the database (`mysql -p mydb`). The family,
 # not the single name, since mysqldump takes the same flag.
@@ -1058,7 +1064,7 @@ _DATABASE_NAME_RE = re.compile(r"[a-z_]+")
 # HARDEN-15 C: redis-cli's own `-a <password>`. `-a` is `--all` in almost every other tool
 # (`ls -a`, `grep -a`, `sort -a`), so only redis-cli's is looked at. Its `--pass` is a
 # long option and is caught by `_SECRET_OPT_RE`.
-_REDIS_CLI_PASSWORD_RE = re.compile(r"(?<![\w-])(-a)([ \t]*)(\S*)")
+_REDIS_CLI_PASSWORD_RE = re.compile(r"""(?<![\w-])(-a)([ \t]*)('[^'\n]*'|"[^"\n]*"|\S*)""")
 # HARDEN-15 C: `aws configure set <name> <value>` writes the named credential into
 # ~/.aws/credentials. The name names it, so the value is the secret.
 _AWS_CONFIGURE_SET_RE = re.compile(r"(?<![\w-])(set)\s+(\S+)\s+(\S+)")
@@ -1102,8 +1108,12 @@ def _looks_like_a_password(value: str) -> bool:
     """Whether a `-p` value is a password rather than a database name or a port.
 
     A password carries a letter and is longer than a name (`mysql -p db` keeps its
-    database, `mysql -psecretpass1234` loses its password).
+    database, `mysql -psecretpass1234` loses its password). A quoted word is one
+    value whatever is inside the quotes: `-p'my secret'` is judged on `my secret`.
     """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+        return (len(value) >= 1 and any(ch.isalpha() for ch in value)) or len(value) >= 4
     return len(value) >= 4 and any(ch.isalpha() for ch in value)
 
 
@@ -1127,7 +1137,7 @@ def _password_flag_repl(match: "re.Match", program: str) -> str:
     value = match.group(3)
     if not _looks_like_a_password(value):
         return match.group(0)
-    if bool(match.group(2)) and program in _MYSQL_FAMILY_COMMANDS \
+    if bool(match.group(2)) and program in _MYSQL_FAMILY_COMMANDS and value[:1] not in "'\"" \
             and _looks_like_a_database_name(value):
         return match.group(0)
     return f"{match.group(1)}{match.group(2)}[REDACTED]"
@@ -1221,6 +1231,9 @@ def _redact_command(command: str) -> str:
             redacted)
         redacted = _SECRET_URL_USERINFO_RE.sub(
             lambda m: f"{m.group(1)}[REDACTED]{m.group(3)}", redacted)
+        redacted = _SECRET_USER_QUOTED_RE.sub(
+            lambda m: m.group(0) if m.group(3).isdigit() and m.group(4).isdigit()
+            else f"{m.group(1)}{m.group(3)}:[REDACTED]{m.group(5)}", redacted)
         redacted = _SECRET_USER_OPT_RE.sub(
             lambda m: m.group(0) if m.group(2).isdigit() and m.group(3).isdigit()   # `-u 1000:1000` is uid:gid
             else f"{m.group(1)}{m.group(2)}:[REDACTED]", redacted)
