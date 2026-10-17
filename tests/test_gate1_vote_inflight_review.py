@@ -113,14 +113,25 @@ def test_votes_of_eight_workers_wait_for_the_whole_queue(tmp_path, monkeypatch):
     the requests of the votes ahead of it were cut at that deadline, and 5 of 16 votes decided; the bound now
     counts the requests in flight on the host, and they reach the pacer in the order their votes were queued:
     the eight start at once, and under load a vote's request arrived after a later vote's ("no free slot before
-    the deadline", 1 round in 14 with only the count)."""
+    the deadline", 1 round in 14 with only the count).
+
+    The slack is scaled from a measured baseline of the same machine in the same run
+    (HARDEN-17 B2), so the test passes under load."""
     cv = gv._load_claim_vote()
     monkeypatch.setattr(cv, "PACER", cv.Pacer(width=2, interval=0.05))
-    monkeypatch.setattr(gv, "VOTE_SLACK_SEC", 0.1)
     srv = _server(0.4)
     try:
         vote, refs = _vote([srv.server_address[1]] * 3, "all")
         cand, view = _candidate(tmp_path), PathRepoView(tmp_path)
+
+        # Measure baseline: time for a single vote to complete on this machine.
+        t0 = time.monotonic()
+        _ = vote.presence_by_vote(cand, view)
+        baseline = time.monotonic() - t0
+
+        # Scale the slack from the baseline so it passes under load.
+        monkeypatch.setattr(gv, "VOTE_SLACK_SEC", baseline)
+
         outs = []
 
         def one():

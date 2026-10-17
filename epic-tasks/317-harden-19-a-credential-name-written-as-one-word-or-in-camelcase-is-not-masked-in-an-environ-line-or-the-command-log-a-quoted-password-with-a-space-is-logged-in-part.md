@@ -80,6 +80,8 @@ The unquoted forms are right. The reviewer's patch (`v12-quoted-password-with-sp
 * One **value pattern** (a single-quoted word, a double-quoted word, or a run of non-space characters) shared by `-p`, `-a`, `--password=`/`--pass=`/`--passwd=`, `--token=`, `-u user:pass`, and the `_SECRET_OPT_RE` value; the whole token is redacted, quotes included. An unterminated quote redacts to the end of the line rather than leaving half a password.
 * The database-name exception of `mysql -p mydb` is unchanged and does not apply to a quoted word.
 
+The reviewer's second patch (`v13-cmd1-quoted-passwords-full.patch`: the long option and `-u 'user:pass'` as well as `-p` and `-a`) is applied as a separate CC commit right after round 315; this part is what stays for the round: the one shared value pattern instead of five copies, the docstring left in place, an unterminated quote, `--token=`, and `-u "a b:c d"` (a space in the user part).
+
 ### Tests (sketch)
 
 The seven commands above redacted whole; the reviewer's 8 cases (`tests_bugfix/test_v12_quoted_password_with_space.py` in the patch); the unquoted forms and the HARDEN-15 C tables unchanged; `--password="a b" --other x` keeps `--other x`.

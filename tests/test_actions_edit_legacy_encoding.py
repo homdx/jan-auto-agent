@@ -117,25 +117,18 @@ def test_a_latin1_revision_of_a_latin1_file_is_still_written_back_byte_for_byte(
 # ── a failed write leaves no backup ────────────────────────────────────────────
 
 def test_a_failing_write_removes_the_backup_it_made(tmp_path, capsys, monkeypatch):
-    """A write that fails (here: the directory made read-only after the backup was
-    taken) removes the `.bak` it had just created, so no backup of an edit that did
-    not happen is left behind."""
-    import shutil
-
+    """A write that fails (here: os.replace raises OSError) removes the `.bak` it had
+    just created, so no backup of an edit that did not happen is left behind.
+    os.chmod does not block root, so we monkeypatch the atomic writer instead."""
     f = tmp_path / "note.txt"
     f.write_text("line one\n", encoding="utf-8")
 
-    real_copy2 = shutil.copy2
+    def _raise_oserror(*args, **kwargs):
+        raise OSError("simulated write failure")
 
-    def _copy_then_lock(src, dst, **kw):
-        real_copy2(src, dst, **kw)
-        os.chmod(tmp_path, 0o500)  # the write that follows cannot land
+    monkeypatch.setattr(os, "replace", _raise_oserror)
 
-    monkeypatch.setattr(shutil, "copy2", _copy_then_lock)
-    try:
-        _editor("line two\n").run_edit("/edit note.txt :: tweak", str(tmp_path))
-    finally:
-        os.chmod(tmp_path, 0o700)
+    _editor("line two\n").run_edit("/edit note.txt :: tweak", str(tmp_path))
 
     assert f.read_text(encoding="utf-8") == "line one\n"
     assert _baks(f) == [], "a failed write left a backup behind"

@@ -1017,12 +1017,18 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         "SUFFICIENT", "RESOLVED", "FIXED", "WORKS", "WORKING",
     ))
     #: The problem words a "NO" negates into an approval (HARDEN-10 C): "No contradictions
-    #: found" is how the creative validator says there is nothing to fix.
+    #: found" is how the creative validator says there is nothing to fix. One vocabulary —
+    #: it is built into both the "No <problem>" phrases and the "the rest of the reply
+    #: names a problem" signal of HARDEN-17 A2 (`_EN_PROBLEM_NAMED`), so the approval rule
+    #: and the caveat rule cannot disagree about what a problem is.
+    _EN_PROBLEM_NOUNS = (
+        r"CONTRADICTION(?:S)?|ERROR(?:S)?|INCONSISTENC(?:Y|IES)|CONFLICT(?:S)?"
+        r"|VIOLATION(?:S)?|OBJECTION(?:S)?|ISSUE(?:S)?|PROBLEM(?:S)?|CONCERN(?:S)?"
+        r"|FLAW(?:S)?|OMISSION(?:S)?|AMBIGUIT(?:Y|IES)|DEFECT(?:S)?"
+        r"|DISCREPANC(?:Y|IES)|MISTAKE(?:S)?|TYPO(?:S)?"
+    )
     _EN_NO_PROBLEM = _re.compile(
-        r"^NO\b\s+"
-        r"(?:CONTRADICTION(?:S)?|ERROR(?:S)?|INCONSISTENC(?:Y|IES)|CONFLICT(?:S)?|"
-        r"VIOLATION(?:S)?|OBJECTION(?:S)?|ISSUE(?:S)?|PROBLEM(?:S)?|CONCERN(?:S)?|"
-        r"FLAW(?:S)?|OMISSION(?:S)?|AMBIGUIT(?:Y|IES)|DEFECT(?:S)?)\b"
+        r"^NO\b\s+(?:" + _EN_PROBLEM_NOUNS + r")\b"
         r"(?:\s+(?:FOUND|REMAIN(?:ING)?|LEFT|DETECTED))?"
     )
 
@@ -1038,11 +1044,41 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             or _EN_NOTE.match(upper)
         )
 
-    #: What turns "No <problem>" into the start of a complaint: a contrast, an exception, a clause after `;`.
-    _EN_NO_PROBLEM_CAVEAT = _re.compile(
-        r"\b(?:BUT|HOWEVER|EXCEPT|ALTHOUGH|THOUGH|YET|ONLY|APART\s+FROM|ASIDE\s+FROM|OTHER\s+THAN)\b"
-        r"|;\s*\S"
+    #: A contrast that OPENS A CLAUSE is the way a "No <problem>" verdict turns into a
+    #: complaint: it stands right after the phrase ("No errors except one: …") or after a
+    #: stop, a comma or a semicolon ("No issues, but …", "No issues found. However, …",
+    #: "No issues; however …"). HARDEN-17 A2: nowhere else. The old rule took any `;`,
+    #: `ONLY` or `YET` anywhere after the phrase for a caveat, which sent eleven natural
+    #: approvals ("No issues found; everything matches the bible.") back to the Coder with
+    #: the approval sentence as the reason to fix. "YET ANOTHER" is not a contrast.
+    _EN_CLAUSE_CAVEAT = _re.compile(
+        r"(?:^|[,;:.\!\?\n])\s*(?:"
+        r"(?:APART|ASIDE)\s+FROM|OTHER\s+THAN|NOTWITHSTANDING|"
+        r"BUT|HOWEVER|EXCEPT|ALTHOUGH|THOUGH|YET(?!\.?\s+ANOTHER\b)|ONLY)\b"
     )
+
+    #: A problem word anywhere in a clause, for the "…; one problem: …" shape, where no
+    #: contrast word stands between the approval and the complaint.
+    _EN_PROBLEM_NAMED = _re.compile(r"\b(?:" + _EN_PROBLEM_NOUNS + r")\b")
+    #: The negators that turn a named problem back into praise: "no problems", "no major
+    #: issues", "nothing contradicts the bible".
+    _EN_NEGATED_BY = frozenset((
+        "NO", "NOT", "NOTHING", "NONE", "NEVER", "NOBODY", "NOR", "NEITHER", "WITHOUT",
+        "LACK", "LACKS",
+    ))
+
+    def _names_a_problem(upper: str) -> bool:
+        """Whether *upper* names a problem rather than denying one.
+
+        The negation is looked up two words back, so "one problem" and "minor issues"
+        name a problem while "no problems", "no major issues" and "nothing contradicts"
+        deny one — the two read identically and only the first is a complaint.
+        """
+        for m in _EN_PROBLEM_NAMED.finditer(upper):
+            before = upper[:m.start()].split()[-2:]
+            if not any(w in _EN_NEGATED_BY for w in before):
+                return True
+        return False
 
     def _en_no_problem_verdict(line: str, upper: str) -> "tuple[bool, str] | None":
         """The verdict of a "No <problem>" reply, or ``None`` when *upper* is not one.
@@ -1054,17 +1090,25 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         first problem word away as the reason. Each is an approval only when it is the whole
         verdict: "No contradictions found, but Anna's age changes…", "No errors except one: …"
         and "No issues." followed by a `REVISE:` or `REJECT:` line reject, with the reply's own
-        words as the reason."""
+        words as the reason.
+        """
         m = _EN_NO_PROBLEM.match(upper) or _EN_NO_PROBLEM_ADJ.match(upper) or _EN_DISCOURSE_OK.match(upper)
         if not m:
             return None
-        if _EN_NO_PROBLEM_CAVEAT.search(upper[m.end():]):
+        rest = upper[m.end():]
+        if _EN_CLAUSE_CAVEAT.search(rest):
+            return False, line.strip()
+        # "No issues with tone; one problem: …": no contrast word separates the approval
+        # from the complaint, but the second clause names a problem and that is the complaint.
+        if _names_a_problem(rest):
             return False, line.strip()
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         later = lines[lines.index(line.strip()) + 1:] if line.strip() in lines else []
         for ln in later:
             lu = ln.upper()
-            if _verdict_token_at_start(lu, "REVISE") or _verdict_token_at_start(lu, "REJECT"):
+            # The directive words of HARDEN-17 A ("REJECTED: …", "Needs revision: …"), not only REVISE / REJECT:
+            # "No issues.\nREJECTED: the date breaks" was approved by every entry of round 315.
+            if _re.match(r"(?:REVISE|REJECT(?:ED)?|NEEDS?\s+(?:REVISION|WORK|CHANGES))\b", lu):
                 return False, _en_rejection_reason(ln, lu)
         return True, ""
 
@@ -1085,6 +1129,8 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         "DISCREPANCY", "DISCREPANCIES", "MISMATCH", "WRONG", "INCORRECT", "REPORT",
         "REPORTED",
         # the rejection verdicts themselves: "NOT REJECTED", "NOT REVISE", "NOT DISAPPROVED"
+        # the failure side of the same class: "NOT FAILED" denies the failure the way "NOT REJECTED" does
+        "FAIL", "FAILS", "FAILED", "FAILING", "FAILURE", "FAILURES",
         "REJECTED", "REJECTION", "REJECTIONS", "REJECT", "REVISE", "REVISION",
         "REVISIONS", "DISAPPROVED", "DISAPPROVE", "DECLINED", "REFUSED", "DENIED",
     ))
@@ -1097,15 +1143,46 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     _EN_NO_ADJECTIVES = (
         r"(?:MAJOR|MINOR|SIGNIFICANT|INSIGNIFICANT|SERIOUS|SEVERE|NOTICEABLE|NOTED|"
         r"OBSERVED|APPARENT|CLEAR|REAL|ACTUAL|SUCH|OTHER|FURTHER|ADDITIONAL|ANY|"
-        r"MORE|MOST|NEW|REMAINING|OUTSTANDING|OBVIOUS|GLARING|MATERIAL|NOTABLE)\s+"
+        r"MORE|MOST|NEW|REMAINING|OUTSTANDING|OBVIOUS|GLARING|MATERIAL|NOTABLE|"
+        r"FACTUAL|CONTINUITY|PLOT|TIMELINE)\s+"
     )
     _EN_NO_PROBLEM_ADJ = _re.compile(
         r"^NO\b\s+(?:" + _EN_NO_ADJECTIVES + r")*"
-        r"(?:CONTRADICTION(?:S)?|ERROR(?:S)?|INCONSISTENC(?:Y|IES)|CONFLICT(?:S)?|"
-        r"VIOLATION(?:S)?|OBJECTION(?:S)?|ISSUE(?:S)?|PROBLEM(?:S)?|CONCERN(?:S)?|"
-        r"FLAW(?:S)?|OMISSION(?:S)?|AMBIGUIT(?:Y|IES)|DEFECT(?:S)?)\b"
+        r"(?:" + _EN_PROBLEM_NOUNS + r")\b"
         r"(?:\s+(?:FOUND|REMAIN(?:ING)?|LEFT|DETECTED))?"
     )
+
+    #: The words a creative validator opens an approval with. HARDEN-17 A: the parser
+    #: returned on `APPROVED` and `OK` and failed open for everything else, so "Looks good,
+    #: but the ring is stolen" was approved on its first clause alone and the objection
+    #: after the `but` was never read. The single-word forms come from
+    #: `_EN_NOT_NEGATES_APPROVAL`, the approval side HARDEN-5 A already knew, so there is no
+    #: second list of praise words beside it.
+    _EN_APPROVAL_HEAD = _re.compile(
+        r"^(?:LOOKS\s+(?:GOOD|FINE|OK|OKAY|GREAT|PERFECT|EXCELLENT|NICE|FANTASTIC|WONDERFUL|ACCEPTABLE|RIGHT|CORRECT|CONSISTENT)|GOOD\s+TO\s+GO|"
+        r"ALL\s+(?:GOOD|FINE|RIGHT|OK|CLEAR)|THINGS?\s+(?:ARE|LOOK)\s+(?:GOOD|FINE|OK)|"
+        r"LGTM|LGTVM|NO\s+(?:CHANGES?|ISSUES?|COMMENTS?)\s+NEEDED|PASS(?:ED)?|YES"
+        r"|" + "|".join(sorted(_EN_NOT_NEGATES_APPROVAL)) + r")\b"
+    )
+
+    def _en_approval_caveat_reason(line: str, upper: str) -> "str | None":
+        """The objection when *upper* praises and then turns against itself.
+
+        HARDEN-17 A: "Looks good, but the ring is stolen" was approved on the first clause
+        alone. The part after the conjunction decides, and the objection is the reason —
+        handing the Coder the praise would send it to fix the good parts. A reply whose
+        objection cannot be told from its praise is a not-approved with its own words kept,
+        never an approval on the praise.
+        """
+        m = _EN_APPROVAL_HEAD.match(upper)
+        if not m:
+            return None
+        c = _EN_CLAUSE_CAVEAT.search(upper[m.end():])
+        if not c:
+            return None
+        s = line.strip()
+        obj = s[m.end() + c.end():].lstrip(" \t:;,.!?–—-").strip()
+        return obj if obj else s
 
     def _en_not_family_reason(line: str, upper: str) -> "str | None":
         """The reason when *upper* opens a NOT-family rejection, else ``None``.
@@ -1157,12 +1234,27 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         # every unknown one ("NOT READY", "Not coherent", "Nothing makes sense").
         return line.strip()
 
+    #: The words a reply opens a rejection with (HARDEN-17 A): one list, shared with the
+    #: NOT/NOTHING family in `_en_rejection_reason` below, so a reply is decided in one
+    #: place. "REJECTED" is a word of its own — `_verdict_token_at_start(upper, "REJECT")`
+    #: refused it as the tail of REJECT, and so did "REJECTED - …" and "Rejected" alone —
+    #: so a reply that began with any of these matched nothing, was unparseable, and the
+    #: fail-open rule approved a chapter the validator had thrown out.
+    _EN_REJECT_HEAD = _re.compile(
+        r"^(?:REJECT(?:ED)?"
+        r"|REVISE"
+        r"|NEED(?:S|ING)?\s+(?:A\s+|ANOTHER\s+|ANY\s+|MORE\s+|SOME\s+|FURTHER\s+|TO\s+BE\s+)?(?:REVISIONS?|REWRITE|REWRITTEN|WORK|CHANGES?|FIX(?:ES|ING)?|EDITS?)"
+        r"|REWRITE(?:N)?|REWROTE|FAIL(?:ED|S|ING|URE)?|DISAPPROVED|UNACCEPTABLE)"
+        r"\b"
+        r"(?:[\s]*[:;,.!?\-–—]*)"
+    )
+
     def _en_rejection_reason(line: str, upper: str) -> "str | None":
         """The reason when *upper* opens an English rejection, else ``None``.
 
         Both the first-line pass and the per-line pass go through this one
-        helper, so the whole-word boundary (HARDEN-1 A1) and the NOT-family
-        approval guard cannot drift apart again.
+        helper, so the whole-word boundary (HARDEN-1 A1), the rejection words of
+        HARDEN-17 A and the NOT-family approval guard cannot drift apart again.
 
         ``REVISE`` / ``REJECT`` / ``NO`` are standalone tokens, so the reason is
         what follows them. The NOT family rejects by *negating* the clause that
@@ -1170,6 +1262,13 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         would read as an approval ("NOT APPROVED" → "APPROVED") and that is
         exactly what the Coder is told to fix.
         """
+        m = _EN_REJECT_HEAD.match(upper)
+        if m:
+            # Strip the separators that stand between the verdict word and the reason
+            # ("REJECTED - …", "NEEDS REVISION: …") and keep everything else, trailing
+            # punctuation included: the reply's own words are the reason.
+            rest = line.strip()[m.end():].lstrip(" \t:;,.!?–—-").strip()
+            return rest if rest else "validator rejected (no reason given)"
         for token in ("REVISE", "REJECT", "NO"):
             if _verdict_token_at_start(upper, token):
                 rest = line.strip()[len(token):].lstrip(": ").strip()
@@ -1192,6 +1291,13 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     for raw in candidates:
         norm = _normalise(raw)
         upper = raw.strip().upper()
+
+        # An approval that turns on a contrast ("Looks good, but …") is not an approval at
+        # all, and it must be checked before the approval tokens and the fail-open rule
+        # (HARDEN-17 A).
+        _approval_caveat = _en_approval_caveat_reason(raw, upper)
+        if _approval_caveat is not None:
+            return False, _approval_caveat, False
 
         # A caveat right after OK is checked before the plain OK approval (BUGFIX).
         _ok_caveat = _ok_caveat_reason(raw)
@@ -1224,7 +1330,11 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             _lu = _line.strip().upper()
             if not _lu:
                 continue
-            # The same caveat check, per line, so a caveat behind a preamble is also caught.
+            # The same caveat checks, per line, so an approval that turns on a contrast is
+            # caught behind a preamble too.
+            _line_approval_caveat = _en_approval_caveat_reason(_line, _lu)
+            if _line_approval_caveat is not None:
+                return False, _line_approval_caveat, False
             _line_ok_caveat = _ok_caveat_reason(_line)
             if _line_ok_caveat is not None:
                 return False, _line_ok_caveat, False

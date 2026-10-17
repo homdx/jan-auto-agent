@@ -1,10 +1,10 @@
 # HARDEN-17 — the verdict parser approves `No issues found, but …`, `Rejected: …`, `REJECTED - …`, a bare `Rejected` and `Needs revision: …` / `Needs work: …`; two tests make a CI run red (one fails as root, one is timing-dependent)
 
-**Status:** open
+**Status:** landed (round 315: sensenova-6-8-flash-lite-var3 as the base — one problem-noun vocabulary shared by the "No <problem>" phrases and the caveat rule (A2), a caveat is a contrast that opens a clause, one `_EN_REJECT_HEAD` for `Rejected`, `Needs revision/work/changes/fixing`, `Rewrite`, `Fail(ed)` (A), an approval phrase followed by a contrast is judged on the clause after it, with the objection as the reason; B1 fails the write through `os.replace`, B2 scales the slack from a vote measured in the same run, both from var2)
 **Severity:** HIGH-MEDIUM (A2: a clean chapter is sent back to be rewritten; A: a rejected chapter or edit is approved; the parser's fail-open default); LOW (B: tests only)
 **File:** `tools/auto/inner_loop.py` (A), `tests/test_actions_edit_legacy_encoding.py`, `tests/test_gate1_vote_inflight_review.py` (B)
 **Symbol:** A: `_parse_verdict_soft`, `_en_not_family_reason`, the rejection word lists next to them. B: `test_a_failing_write_removes_the_backup_it_made`, `test_votes_of_eight_workers_wait_for_the_whole_queue`
-**Round:** (set when the round starts)
+**Round:** 315
 **Size:** S
 **Depends on:** HARDEN-14 (312, the NOT family in the same function; land after it)
 **Also touches:** `tests_bugfix/` pins of HARDEN-5 A and HARDEN-10 C (must stay green), `tests/`
@@ -104,3 +104,7 @@ One commit. The judge's own checks are not published and are written after the r
 ## Not in scope
 
 Rust (`pub(crate)` functions are not found: not fixed), the `NOT …` / `Nothing …` family and the cp1251 `/edit` (HARDEN-14, ticket 312), the mask (HARDEN-15, 16).
+
+Why not the others: seven entries READY (glm GAVE_UP with 972 deleted lines, nemotron crashed on an undefined name). In a black box over 61 replies (rejections, clean approvals, flips against the base) var2 scored 60, laguna 58, var3 and var4 59, step-5 59, var1 56, agnes 57; every entry still approved `No issues found.` over a later `REJECTED:` line. The entries' tests ran against every implementation: var3's code passed 431 of the cross cells, var4's 423, var2's 413. var3 was taken for the shared vocabulary and the single reject head; var4's `Needs fixing` / `Needs further revision` phrases, var4's FAIL words in the NOT family (`NOT FAILED` stays an approval) and var2's wider approval heads (`Looks great`) were folded in, the bare `Rejected` has the base's reason `validator rejected (no reason given)`, and the later-line directive of `No issues.` now knows `REJECTED` / `Needs revision` as well as `REVISE` / `REJECT` (found at judging, pinned in `tests/test_harden17_judge_cases_315.py`). Two decisions pinned: `No issues found, but all minor.` is a rejection; the reason of `Looks good, but X` is `X`. Not taken: var3's B2, which cut the fake server's delay from 0.4 s to 0.05 s and so tested a different queue.
+
+Open for the next tickets: `Nothing …` approvals and a directive after a period on the same line (HARDEN-22, 320).

@@ -56,9 +56,18 @@ A file with one LF line among CRLF lines (`alpha\n beta\r\n gamma\r\n delta\r\n`
 
 `in_style_of` gives each **untouched** line its own original ending and an edited or new line the file's majority ending: one shared rule with `_edit_line_ends` (call it, do not copy it). A file with a single ending style behaves as today.
 
+### B2 — `/edit` glues two lines when the file has no final newline and a line repeats (LE-1, HIGH)
+
+`_edit_line_ends` hands each reply line the next unused ending of an equal original line. An unterminated original last line has an **empty** ending, and the loop can pop it for a middle reply line: the original `alpha\nbeta` (no final newline) edited to `beta\nalpha\nbeta\n` is written as `betaalpha\nbeta\n`. A source file without a trailing newline where an edit repeats its last line (`return x`, `}`, `pass`, a blank line) becomes invalid. The reviewer's patch (`v13-line-endings-and-glued-lines.patch`: an empty ending may be used only by the reply's last line) is applied as a separate CC commit right after round 315; this part keeps the rest of the work: the single shared rule must carry that guard, and a test must pin it on both paths.
+
+### B3 — the match decodes the original as UTF-8 with `errors="replace"` and keeps the BOM in line 1
+
+* A cp1251 file `Привет\r\nмир\r\nok\nend\n` where the model changes only `ok`: both Cyrillic lines are written with `\n` (0 of 2 CRs kept), because the original lines decode to U+FFFD text that never equals the reply's correctly decoded line. The same structure in ASCII or UTF-8 keeps both. Decode the original with the codec `_read_edit_target` chose (or compare re-encoded lines).
+* A UTF-8 BOM file `\ufeffa = 1\r\nb = 2\nc = 3\nd = 4\n`: the first line loses its CRLF because the BOM stays in that line's body (`\ufeffa = 1`) and never equals the reply's `a = 1`. Strip a leading BOM from the first original body before matching (the Coder path writes the BOM back separately).
+
 ### Tests (sketch)
 
-The file above on both paths: `alpha` stays LF, `delta` takes the majority ending; an all-LF and an all-CRLF file unchanged.
+The file above on both paths: `alpha` stays LF, `delta` takes the majority ending; an all-LF and an all-CRLF file unchanged. B2: the glued case on both paths, `}`/`pass`/blank repeated last lines. B3: the cp1251 file (both Cyrillic CRs kept) and the BOM file (first CRLF kept) on both paths.
 
 ---
 
