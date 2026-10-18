@@ -1,10 +1,10 @@
 # HARDEN-18 — two sections that share a line trade their keys on a reorder; a key call the model splits over lines is written with the placeholder; the Coder writes a non-string `content` as its Python repr; `/edit "my notes.txt"` keeps the quotes and the hint is not shell-safe
 
-**Status:** open
+**Status:** landed (round 316: sensenova-6-8-flash-lite-var2 as the base — the restore pairs the masked lines of a replaced region with the placeholder lines of the reply by order and refuses a count that differs (A), a masked line is paired only on an anchor the file holds once and the writer checks the placeholders of the reply the model sent (D), `_content_to_text` joins a list of strings and rejects every other non-string (B), `_unquote_path` and a `shlex.quote`d hint (C), a backup keyed on the resolved path with "not recorded" as the test (E); judging added a line-identity rule for one-line sections (`"work": {"api_key": …}` reordered with a comma moved crossed two keys in the base and in every entry), an error that names the item and the type, the inner-quote rule of agnes/var4, a resolved backup key from step-5 and step-5's best-of-three `test_check_test_clocks`)
 **Severity:** HIGH (D: a key written under another account's header, silently; A: silent loss of a real key, success reported); MEDIUM (B: silent loss of the code); LOW (C, E: id-less tasks only)
 **File:** `tools/llm_stream.py` (A, D), `tools/auto/coder.py` (B, E), `tools/actions.py` (C)
 **Symbol:** D: `restore_masked_secrets`, `_same_place`, the head/tail pairing. E: `Coder._backup_is_new`. A: `restore_masked_secrets` and its callers `Coder._write_files`, `OrchestratorActions.run_edit`. B: `Coder._parse_response`. C: `_parse_edit_command` / `_parse_payload_and_file`, the `restore with:` hint line of `run_edit`
-**Round:** (set when the round starts)
+**Round:** 316
 **Size:** S
 **Depends on:** HARDEN-13 (311, the restore this extends; landed in `0815666`)
 **Also touches:** `tests_bugfix/` pins of HARDEN-9 A, HARDEN-12, HARDEN-13 A (must stay green), `tests/`
@@ -134,3 +134,7 @@ One commit. The judge's checks are written after the round, from the entries; th
 ## Not in scope
 
 Rust, a secret that is not an `api_key` assignment (HARDEN-19), the verdict parser (HARDEN-17).
+
+Why not the others: eight entries (nemotron produced no commit on the branch and was left with a test file and a `.bak`; glm's `_content_to_str` is not defined, so every `content` reply crashes). A black box over 40 checks (the five parts through `restore_masked_secrets`, `_write_files`, `_parse_response`, `run_edit` and a 120-config fuzz of the mask-reorder-restore round trip) scored the base 16, var2, var1 and step-5 39, var4 39, var3 38, laguna 37, agnes 34, glm 23, nemotron 16. The fuzz found a written placeholder with success reported in agnes, laguna and step-5 (a reorder of three sections lost a key), and a lost key of two split calls in var4 and laguna. var1 and var3 stalled and mixed in the work of HARDEN-19 (317), so var2, which is clean, was the base. The entries' tests ran against every implementation (90 cells): the failures that remain on the ideal are the other entries' private helper names (`_unquote_file_name`, `_BACKUP_NOT_RECORDED`) and the choice to refuse a split call that the ideal restores.
+
+Open for the next tickets: a secret that is not an `api_key` assignment (HARDEN-19, 317) and the parser tickets that follow (320, 321, 322).

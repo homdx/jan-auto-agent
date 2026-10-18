@@ -333,6 +333,29 @@ def _is_truthy_delete(value) -> bool:
     return False
 
 
+def _content_to_text(content) -> "str | None":
+    """The file text behind a parsed ``content`` field, or ``None`` when the
+    field holds something that is not text.
+
+    HARDEN-18 B: ``str(content)`` wrote the Python repr of whatever the model
+    put in the field — ``["import os", "print(os.getcwd())"]`` became the file
+    text ``['import os', 'print(os.getcwd())']``, ``0`` became ``0``, ``false``
+    became ``False`` — and for a ``.py`` file that is a valid expression
+    statement, so the code was gone and nothing complained. A list whose items
+    are all strings is the line list of the file: it is joined with ``\\n`` with
+    each item's own indentation intact (never stripped) and one final newline
+    added. Anything else that is not a string — a number, a bool, a dict, a list
+    with a non-string item — is reported like a missing ``content``, so no file
+    is written for that item.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and all(isinstance(item, str) for item in content):
+        text = "\n".join(content)
+        return text if not text or text.endswith("\n") else text + "\n"
+    return None
+
+
 # Guard-2 skip messages (RUN-1)
 
 
@@ -854,8 +877,8 @@ class Coder(_llm_stream.LLMClientBase):
             else max(int(self._learned_max_tokens), int(max_tokens))
         )
 
-    def _backup_is_new(self, rel: str, task_id: str) -> bool:
-        """Whether the ``.coder.bak`` of *rel* has to be (re)made for this write.
+    def _backup_is_new(self, key: str, task_id: str) -> bool:
+        """Whether the ``.coder.bak`` of *key* has to be (re)made for this write.
 
         HARDEN-13 B: within one task's run the backup is made by the first write
         and kept by the later ones — a retry of a task that lost a key would
@@ -864,8 +887,24 @@ class Coder(_llm_stream.LLMClientBase):
         any more. A new task run (a new ``task_id``) starts again, and a stale
         backup from an earlier run is replaced by the first write of this one, as
         it always was.
+
+        HARDEN-18 E: "not recorded for this file" is the test, not an
+        empty-string default — with an empty ``task_id`` (``generate()`` allows
+        one) the comparison was ``"" != ""`` and the first write of an id-less
+        task made no backup at all. An id-less run is never compared with a
+        recorded id, so its later writes keep the first backup and a task with an
+        id still replaces the stale one. *key* is the resolved path, so
+        ``./app.py`` and ``app.py`` are one file and the second write keeps the
+        backup of the first.
         """
-        return self._backups.get(rel, "") != task_id
+        recorded = self._backups.get(key)
+        if recorded is None:
+            return True
+        if task_id:
+            return recorded != task_id
+        # An id-less run made no comparison it could win: every earlier run,
+        # recorded or not, keeps its backup.
+        return False
 
     def _backup_made(self, rel: str, task_id: str) -> None:
         """Record that this task run made the backup of *rel*."""
@@ -1551,6 +1590,7 @@ class Coder(_llm_stream.LLMClientBase):
             return [], msg
 
         parsed: list[dict] = []
+        bad_content: list[str] = []    # HARDEN-18 B: the items whose `content` is not text
         for i, item in enumerate(files_raw):
             if not isinstance(item, dict):
                 logger.debug(
@@ -1570,18 +1610,31 @@ class Coder(_llm_stream.LLMClientBase):
             if _is_truthy_delete(item.get("delete")):
                 parsed.append({"path": path, "delete": True})
                 continue
-            if content is None:
+            text = _content_to_text(content)
+            if text is None:
+                # HARDEN-18 B: a list of lines is the file, joined with its own
+                # indentation; any other non-string value is named as a missing
+                # `content` so the loop asks for the text instead of writing the
+                # repr of it.
                 logger.warning(
-                    "coder._parse_response [%s]: item %d (%r) missing 'content' — skipped",
-                    task_id, i, path,
+                    "coder._parse_response [%s]: item %d (%r) has no text 'content' "
+                    "(%s) — skipped", task_id, i, path, type(content).__name__,
                 )
+                bad_content.append(f"{path!r} ({type(content).__name__})")
                 continue
-            # Strip any inner code fence the model may have added around the content.
-            cleaned_content = _strip_code_fence(str(content))
+            # A single string is the file the model wrote, and may carry the fence it
+            # wrapped the whole file in. A joined list is the file line by line: it is
+            # taken as written, since the fence helper strips the text it is given and
+            # would take the first line's indentation with it.
+            cleaned_content = _strip_code_fence(text) if isinstance(content, str) else text
             parsed.append({"path": path, "content": cleaned_content})
 
         if not parsed:
             msg = f"no valid file entries after parsing {len(files_raw)} item(s)"
+            if bad_content:
+                # Named like a missing `content`, so the retry sends the text and not its repr.
+                msg += (f"; 'content' must be a string or a list of strings, got: "
+                        f"{', '.join(bad_content)}")
             logger.warning("coder._parse_response [%s]: %s", task_id, msg)
             return [], msg
 
@@ -2035,11 +2088,11 @@ class Coder(_llm_stream.LLMClientBase):
                         # retry of a task cannot copy what the first attempt wrote
                         # over the only copy of the original. A stale backup from
                         # an earlier run is replaced, as before.
-                        if self._backup_is_new(rel, task_id):
+                        if self._backup_is_new(str(dest.resolve()), task_id):
                             # Backups keep the original bytes and mode, so no encoding or BOM is changed.
                             backup.unlink(missing_ok=True)    # copy2 keeps a read-only mode: it could not overwrite
                             shutil.copy2(dest, backup)
-                            self._backup_made(rel, task_id)
+                            self._backup_made(str(dest.resolve()), task_id)
                         dest.unlink()
                         logger.info(
                             "coder._write_files [%s]: DELETED %s (backup: %s)",
@@ -2059,6 +2112,18 @@ class Coder(_llm_stream.LLMClientBase):
                 continue
 
             content = item["content"]
+
+            # HARDEN-18 B: a non-text `content` is the parse error `_parse_response`
+            # already reports, and a caller that built `parsed_files` itself must not
+            # crash the write with it either — `0` in a `.py` file would otherwise be
+            # written as its repr.
+            if not isinstance(content, str):
+                msg = (f"[SAFETY] {rel!r} has no text 'content' "
+                       f"({type(content).__name__}) — write blocked")
+                logger.error("coder._write_files [%s]: %s", task_id, msg)
+                if not first_error:
+                    first_error = msg
+                continue
 
             # Guard 2.5: tokenise and reject non-ASCII identifiers in code mode, so the retry names what to rename (pullrun-sim).
             if (
@@ -2137,29 +2202,34 @@ class Coder(_llm_stream.LLMClientBase):
                     # The model was shown the file with its secrets masked: a line it
                     # gave back masked is the original line again, not the placeholder.
                     try:
-                        content = _llm_stream.restore_masked_secrets(
-                            dest.read_bytes().decode("utf-8", errors="replace"), content)
+                        _original = dest.read_bytes().decode("utf-8", errors="replace")
                     except OSError:
-                        pass
-                    # HARDEN-13 A2: a reply line the restore could not put a real
-                    # key back into is a placeholder written over a working key, and
-                    # the write below would report success while doing it. It is
-                    # refused like a safety refusal, so the attempt's feedback names
-                    # the file and the line and the loop retries.
+                        _original = None
                     refusal = ""
-                    for number, line in _llm_stream.unrestored_masked_lines(
-                            dest.read_bytes().decode("utf-8", errors="replace"), content):
-                        refusal = (
-                            f"[SAFETY] {rel!r} line {number} still holds the masked "
-                            f"placeholder ({line.strip()!r}) — the original key it "
-                            f"came from could not be restored; write blocked. Send the "
-                            f"line exactly as it was given to you.")
-                        logger.warning("coder._write_files [%s]: %s", task_id, refusal)
-                        break
+                    if _original is not None:
+                        # HARDEN-13 A2: a reply line the restore could not put a real
+                        # key back into is a placeholder written over a working key, and
+                        # the write below would report success while doing it. It is
+                        # refused like a safety refusal, so the attempt's feedback names
+                        # the file and the line and the loop retries. Read off the reply
+                        # the model sent: HARDEN-18 D can put one key of a reordered file
+                        # back and lose another, and checking the restore's own output
+                        # hid the placeholder it left behind.
+                        for number, line in _llm_stream.unrestored_masked_lines(
+                                _original, content):
+                            refusal = (
+                                f"[SAFETY] {rel!r} line {number} still holds the masked "
+                                f"placeholder ({line.strip()!r}) — the original key it "
+                                f"came from could not be restored; write blocked. Send the "
+                                f"line exactly as it was given to you.")
+                            logger.warning("coder._write_files [%s]: %s", task_id, refusal)
+                            break
                     if refusal:
                         if not first_error:
                             first_error = refusal
                         continue
+                    if _original is not None:
+                        content = _llm_stream.restore_masked_secrets(_original, content)
                     content = in_style_of(dest, content)
                     encoding, missing = _pick_file_encoding(
                         _file_encodings(dest), content
@@ -2179,10 +2249,10 @@ class Coder(_llm_stream.LLMClientBase):
                     # HARDEN-13 B: made by the first write of a task run and kept by
                     # the later ones (see the delete branch above), so a retry that
                     # would have overwritten the original keeps it.
-                    if self._backup_is_new(rel, task_id):
+                    if self._backup_is_new(str(dest.resolve()), task_id):
                         backup.unlink(missing_ok=True)
                         shutil.copy2(dest, backup)        # bytes and mode (see the delete branch)
-                        self._backup_made(rel, task_id)
+                        self._backup_made(str(dest.resolve()), task_id)
                     logger.debug(
                         "coder._write_files [%s]: backed up %s → %s",
                         task_id, dest, backup,

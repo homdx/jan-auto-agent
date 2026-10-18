@@ -10,6 +10,7 @@ OrchestratorActions is a mixin; Orchestrator inherits from it and supplies:
 import os
 import re
 import json
+import shlex
 import time
 import logging
 from typing import List, Tuple
@@ -502,6 +503,24 @@ class OrchestratorActions:
     # Full-file search (/search)
 
     @staticmethod
+    def _unquote_path(value: str) -> str:
+        """The path a user typed, without the shell quotes they wrapped it in.
+
+        HARDEN-18 C: ``/edit "my notes.txt" :: …`` looked up
+        ``dir/"my notes.txt"`` — the quotes stayed in the name, and the error
+        named a file that does not exist. A matching pair of single or double
+        quotes around the whole path is the quoting of a name the user copied
+        from a listing; an unquoted path is unchanged, and a name that carries a
+        quote inside it (``it's a note.txt``, ``"my"file.txt``) is left alone,
+        since no pair surrounds it (`"a"b"` has the same quote inside: it is not a
+        quoted name, so it is not unwrapped).
+        """
+        if (len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"')
+                and value[0] not in value[1:-1]):
+            return value[1:-1]
+        return value
+
+    @staticmethod
     def _parse_payload_and_file(user_input: str, command: str):
         """
         Parse '/<command> <payload> in <file>' (also accepts '<file> :: <payload>').
@@ -514,14 +533,14 @@ class OrchestratorActions:
         # The separator is " :: " with spaces; a bare "::" would split identifiers like std::vector.
         if " :: " in body:                     # /<command> <file> :: <payload>
             file_path, payload = body.split(" :: ", 1)
-            return payload.strip(), file_path.strip()
+            return payload.strip(), OrchestratorActions._unquote_path(file_path.strip())
         if " in " in body:                     # /<command> <payload> in <file>
             payload, file_path = body.rsplit(" in ", 1)
-            return payload.strip(), file_path.strip()
+            return payload.strip(), OrchestratorActions._unquote_path(file_path.strip())
         # Fallback: first token is the file, the rest is the payload.
         parts = body.split(None, 1)
         if len(parts) == 2:
-            return parts[1].strip(), parts[0].strip()
+            return parts[1].strip(), OrchestratorActions._unquote_path(parts[0].strip())
         return None, None
 
     @staticmethod
@@ -1523,5 +1542,9 @@ class OrchestratorActions:
             fromfile=f"{file_path} (before)", tofile=f"{file_path} (after)"))
         print(f"\n[{_ts()}] ── FILE EDITED: {file_path} — {total:.1f}s from request ──")
         print(diff if diff.strip() else "(no textual changes)")
+        # HARDEN-18 C: a path may hold a space, so both sides of the hint are
+        # shell-quoted — `mv dir/my notes.txt.bak.105124 dir/my notes.txt` is
+        # four arguments and fails before it helps anyone.
         print(f"\n[{_ts()}] status={validation.get('status','unknown')}  "
-              f"backup={os.path.basename(backup)}  (restore with: mv {backup} {target})")
+              f"backup={os.path.basename(backup)}  "
+              f"(restore with: mv {shlex.quote(backup)} {shlex.quote(target)})")

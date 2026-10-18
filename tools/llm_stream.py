@@ -14,6 +14,7 @@ import difflib
 import json
 import logging
 import re
+from collections import Counter
 import ssl
 import time
 import urllib.request
@@ -1265,6 +1266,22 @@ def restore_masked_secrets(original: "str | None", reply: "str | None") -> "str 
     deleted, an added and a reordered section, a header the model renamed away —
     stays the placeholder as before, and
     :func:`unrestored_masked_lines` names it so the writers can refuse it.
+
+    HARDEN-18 D: that place must be an anchor the file holds *once*. Two sections
+    that share a line — the same ``base_url`` above each of their keys — were
+    indistinguishable by their neighbour, so a reorder of the sections read as no
+    change and each key came back under the other section's header. A masked
+    line is now paired with its original only on the nearest line above it that
+    occurs once in the file (usually the section header), so a whole-section
+    reorder restores by the header and never by a shared neighbour.
+
+    HARDEN-18 A: a key call the model split over several reply lines is not the
+    masked text of any original line, so the masked-text branch above cannot reach
+    it and the placeholder used to be written where the key had been. Inside a
+    replaced region the masked lines of the region and the placeholder lines of
+    the region are paired by order instead — k of each, every key back in its own
+    call — and a different count is recorded as a failed restore, so the write is
+    refused rather than losing a key.
     """
     text, _ = _restore_masked_secrets(original, reply)
     return text
@@ -1341,13 +1358,16 @@ def _restore_masked_secrets(
     # ── one pass over the original: every changed line, in file order ─────────
     entries: "list[str]" = []                # the original line, with its ending
     entry_of: "dict[int, int]" = {}          # original line index -> entry index
+    entry_origin: "list[int]" = []           # entry index -> its original line index
     entry_place: "list[int | None]" = []     # the original index of its place
     entry_above: "list[list[int]]" = []      # the lines above its place back to the last masked line
+    entry_anchors: "list[set[int]]" = []     # the ones of those that occur once in the file
     queued: "dict[tuple[str | None, str], list[int]]" = {}
     by_text: "dict[str, list[int]]" = {}
     masked_texts: "set[str]" = set()
     place: "int | None" = None
     above_place: "list[int]" = []
+    line_counts = Counter(original_norms)
     for number, norm in enumerate(original_norms):
         if "\ufffd" in norm:
             # An original line the reader could not decode is never a place a
@@ -1358,9 +1378,21 @@ def _restore_masked_secrets(
             index = len(entries)
             entries.append(original_lines[number])
             entry_of[number] = index
+            entry_origin.append(number)
             entry_place.append(place)
-            entry_above.append(above_place[:-1][::-1])
+            above = above_place[:-1][::-1]
+            entry_above.append(above)
             above_place = []
+            # HARDEN-18 D: the anchors of the entry — the lines above it the file
+            # holds exactly once. A line every section repeats (the shared
+            # base_url) cannot tell two keys apart, and pairing on it is what put
+            # each key under the other section's header; a section header, or any
+            # line that occurs once, can. An empty set — no line above it is
+            # unique — falls back to the place rule, which is the only evidence
+            # left in a file of key lines.
+            anchors = {candidate for candidate in ([place] if place is not None else []) + above
+                       if line_counts[original_norms[candidate]] == 1}
+            entry_anchors.append(anchors)
             place_text = original_norms[place] if place is not None else None
             queued.setdefault((place_text, masked), []).append(index)
             by_text.setdefault(masked, []).append(index)
@@ -1384,6 +1416,14 @@ def _restore_masked_secrets(
     # original line to be the place of anything.
     equal: "dict[int, int]" = {}
     touched: "dict[int, int]" = {}
+    # HARDEN-18 A: a masked line the model split over several reply lines is not
+    # the masked text of anything, so the masked-text branch cannot pair it. A
+    # replaced region is asked for its masked lines and its placeholder lines:
+    # the same count pairs them by order and every key comes back in its own
+    # call, a different count records every placeholder of the region as a
+    # failed restore and the write is refused.
+    ph_entry: "dict[int, int]" = {}   # reply line -> the masked line it holds
+    ph_fail: "set[int]" = set()       # placeholder lines with no masked line to pair with
     # The lines both sides share at the head and at the tail are paired as they stand,
     # and only what is left between them is aligned: an edit touches a few lines of a
     # long file, and SequenceMatcher is quadratic in the lines that repeat (`}` and the
@@ -1411,9 +1451,25 @@ def _restore_masked_secrets(
             for offset in range(i2 - i1):
                 equal[head + j1 + offset] = head + i1 + offset
                 touched[head + j1 + offset] = head + i1 + offset
-        elif tag == "replace":
-            for offset in range(min(i2 - i1, j2 - j1)):
-                touched[head + j1 + offset] = head + i1 + offset
+            continue
+        if tag == "delete":
+            continue
+        # replace and insert: the reply lines of the region are either the masked
+        # text of one of its masked lines (the masked-text branch handles those)
+        # or a placeholder the model wrote for a secret the region held.
+        block_masked = [entry_of[head + i] for i in range(i1, i2) if head + i in entry_of]
+        block_placeholders = [head + j for j in range(j1, j2)
+                              if _MASK_PLACEHOLDER in reply_norms[head + j]
+                              and reply_norms[head + j] not in masked_texts]
+        if block_masked and len(block_masked) == len(block_placeholders):
+            for entry_index, reply_number in zip(block_masked, block_placeholders):
+                ph_entry[reply_number] = entry_index
+        elif block_placeholders:
+            # A different count: the restore cannot say which key a placeholder is,
+            # and pairing one of them would write the placeholder over another key.
+            ph_fail.update(block_placeholders)
+        for offset in range(min(i2 - i1, j2 - j1)):
+            touched[head + j1 + offset] = head + i1 + offset
 
     def _same_place(entry: int, number: int) -> bool:
         """Whether the key line at reply *number* still sits under the line the
@@ -1428,31 +1484,42 @@ def _restore_masked_secrets(
         the place and cost the key below it. A place that is gone altogether —
         a section deleted, a header rewritten into another section's — accepts
         nothing, so no key is written under a header it was not under.
+
+        HARDEN-18 D: the line it counts has to be one the file holds exactly
+        once. A line several sections repeat (the same ``base_url`` above each of
+        their keys) is no anchor: two sections that share one traded their keys on
+        a reorder, because the shared neighbour looked unchanged. The walk below
+        skips a non-anchor line instead of accepting it, and keeps going up to the
+        header. A line the model deleted is no anchor either, so the header above
+        it takes over and the key stays.
         """
         wanted = entry_place[entry]
-        if wanted is None:
+        candidates = [wanted] + entry_above[entry] if wanted is not None else []
+        if not candidates:
             # A file of nothing but key lines: there is no place to compare,
             # and the whole file is one unchanged stretch of key lines.
             return True
-        # A line the model deleted between the header and the key (a base_url) is not the
-        # key's place any more: the line above it, back to the previous key, is.
-        candidates = [wanted] + entry_above[entry]
+        anchors = entry_anchors[entry]
+        anchor_texts = {original_norms[anchor] for anchor in anchors}
         for above in range(number - 1, -1, -1):
             norm = reply_norms[above]
             if not norm or norm in masked_texts:
                 # A blank line and a masked line are no place (see the original
                 # pass above).
                 continue
-            if above not in touched:
-                # A line the reply has no original line for is an insertion,
-                # not a place: the key below it keeps the place it had.
+            target = touched.get(above)
+            if target in candidates:
+                # The line the alignment pairs with one of the lines this key sat
+                # under; it has to be one the file holds once.
+                if (not anchors or target in anchors) \
+                        and _line_is_the_same_edited(original_norms[target], norm):
+                    return True
                 continue
-            if touched[above] not in candidates:
-                # The line above the key is another line of the file, not the
-                # one this key sat under: keep looking, the place may be
-                # further up (a reply that reordered its own lines).
-                continue
-            if _line_is_the_same_edited(original_norms[touched[above]], norm):
+            if anchors and norm in anchor_texts:
+                # The header the model moved: the alignment calls it an insertion
+                # (it paired the other block with these lines), but a line the
+                # file holds exactly once can only be that line, so the key under
+                # it is the key of that section.
                 return True
         return False
 
@@ -1478,7 +1545,20 @@ def _restore_masked_secrets(
                 index = entry
             else:
                 queue = queued.get((place_norm, norm))
-                index = queue.pop(0) if queue else None
+                index = None
+                if queue:
+                    # HARDEN-18 D: the queue is keyed by the place's *text*, and a
+                    # place several sections share is the shape that traded the keys,
+                    # so the anchor decides before an entry is consumed. The entries
+                    # are tried in file order and the ones that do not still sit under
+                    # their own header stay in the queue for a later line.
+                    kept: "list[int]" = []
+                    for candidate in queue:
+                        if index is None and candidate not in used and _same_place(candidate, number):
+                            index = candidate
+                        else:
+                            kept.append(candidate)
+                    queue[:] = kept
             if index is not None:
                 used.add(index)
                 placed.add(norm)
@@ -1494,12 +1574,36 @@ def _restore_masked_secrets(
             # A line the model edited AROUND a key (`"model": "z"` on the key's own line,
             # trailing blanks after it) is not the masked text of any original line, and
             # used to be written with the placeholder in it and no word of it anywhere.
-            # It is paired with the original line the alignment puts it on; the secrets of
-            # that line go back into the placeholders, in order, or the line is a failure.
-            paired = touched.get(number)
-            entry = entry_of.get(paired) if paired is not None else None
+            # It is paired with the masked line of its region (HARDEN-18 A: a key call
+            # split over several reply lines), or — for one line — with the original line
+            # the alignment puts it on; the secrets of that line go back into the
+            # placeholders, in order, or the line is a failure.
+            entry = ph_entry.get(number)
+            paired = None
+            if entry is None:
+                paired = touched.get(number)
+                entry = entry_of.get(paired) if paired is not None else None
             if entry is not None:
-                secrets = _secrets_of_masked_line(original_norms[paired], original_masked[paired])
+                # HARDEN-18 D (judge): a line that names its own section before
+                # the placeholder (`"work": {"api_key": "…", …}` in a JSON file,
+                # one section per line) and was reordered with a comma moved is
+                # paired with the line at the same *position* by the alignment,
+                # and that is the other section's key. The text before the
+                # placeholder is the line's identity: when exactly one other
+                # unused masked line starts with the same text and the paired one
+                # does not, the key is that line's.
+                lead = norm.split(_MASK_PLACEHOLDER, 1)[0]
+                paired_lead = original_masked[entry_origin[entry]].split(_MASK_PLACEHOLDER, 1)[0]
+                if lead.strip() and lead != paired_lead:
+                    same_lead = [other for other in range(len(entries))
+                                 if other not in used and other != entry
+                                 and original_masked[entry_origin[other]].split(
+                                     _MASK_PLACEHOLDER, 1)[0] == lead]
+                    if len(same_lead) == 1:
+                        entry = same_lead[0]
+            if entry is not None:
+                origin = entry_origin[entry]
+                secrets = _secrets_of_masked_line(original_norms[origin], original_masked[origin])
                 if (entry not in used and secrets is not None
                         and norm.count(_MASK_PLACEHOLDER) == len(secrets) and _same_place(entry, number)):
                     used.add(entry)
@@ -1508,6 +1612,11 @@ def _restore_masked_secrets(
                         restored = restored.replace(_MASK_PLACEHOLDER, secret, 1)
                     out.append(restored + ending)
                     continue
+                failures.append((number + 1, body))
+            elif number in ph_fail:
+                # HARDEN-18 A: the placeholder came from a masked line of its region that
+                # the restore could not pair it with — the write would keep the placeholder
+                # on disk and the real key only in the .bak, so the write is refused.
                 failures.append((number + 1, body))
         out.append(line)
         if norm:
@@ -1525,7 +1634,9 @@ def _restore_masked_secrets(
         # and exactly one original line in the whole file has that text and
         # nothing has taken it, so there is no other key it could be.
         left = [index for index in by_text.get(norm, ()) if index not in used]
-        if norm not in placed and len(left) == 1:
+        # HARDEN-18 D: the exception keeps the key under its own header — an entry
+        # that has no line above it at all (a file of key lines) still takes it.
+        if norm not in placed and len(left) == 1 and _same_place(left[0], number):
             index = left[0]
             used.add(index)
             line = reply_lines[number]
