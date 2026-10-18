@@ -988,12 +988,27 @@ def pytest_config_requests_pool(base_dir: "str | Path") -> bool:
     return any(is_xdist_flag(t) for t in tokens)
 
 
+# HARDEN-19 C: the value of a secret-bearing flag, one class for `-p`, `-a`, `--password=`,
+# `--token=` and the rest. A quoted word is one value whatever is inside the quotes, so
+# `'my secret'` is the password and not `'my` followed by a bare `secret'`; and a quote
+# need not be closed, since `-p'my secret` at the end of a line is still the password and
+# stopping at the space would have put its second word in the log. `\S*` rather than `\S+`
+# so a bare `-p` with no value matches at all — the judges below refuse an empty value.
+# It is a capturing group: the callers number their groups against it.
+_SECRET_VALUE_RE = r"('[^'\n]*'?|\"[^\"\n]*\"?|\S*)"
+
+
 # Matches a likely-secret CLI option followed by a single-token value; the option name stays visible for debugging.
+#
+# HARDEN-19 C: the value is the shared `_SECRET_VALUE_RE` — a single-quoted word, a
+# double-quoted word, or a run of non-space characters — so `--password='my secret'` is one
+# value, not two. The empty alternative of that class is why the replacement below keeps the
+# match as it stood when nothing followed the option.
 _SECRET_OPT_RE = re.compile(
     r"(--(?:api[-_]?key|token|secret|password|passwd|pass|pwd|auth|"
     r"access[-_]?key|client[-_]?secret|private[-_]?key))"
     r"([=:]\s*|\s+)"
-    r"('[^'\n]*'|\"[^\"\n]*\"|\S+)"
+    + _SECRET_VALUE_RE
 )
 
 # Authorization values are two words (Bearer token); matched up to the next quote or flag so the token is hidden too.
@@ -1018,12 +1033,37 @@ _SECRET_HEADER_RE = re.compile(
 
 # HARDEN-12 D: `NAME=value` handing a key to a command, where NAME names a credential.
 # It may sit only at the start of a command, or right after a `;`, `&&`, `||` or `|` —
-# a `NAME=value` mid-argument is a coincidence (`grep foo=bar file`) and stays.
+# a `NAME=value` mid-argument is a coincidence (`grep foo=bar file.txt`) and stays.
+#
+# HARDEN-19 B: the name is not restricted to one that carries a credential word as a whole
+# part — `PGPASSWORD`, `GITHUBTOKEN`, `NGROK_AUTHTOKEN` and `DBPASSWORD` name credentials
+# too, and CC review fix 40's rule is what threw them away. The pattern takes any name and
+# asks `_name_is_a_credential`, the same helper the mask uses: `MAX_TOKENS=100`,
+# `TOKENIZER=bert`, `KEYBOARD=us` and `FOO=bar` are not credentials and stay as written.
 _SECRET_ENV_ASSIGN_RE = re.compile(
     r"(?i)(^|[;|&])(\s*)((?:export\s+|env\s+)?)"
-    r"((?:[A-Za-z0-9]+_)*(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD)(?:_[A-Za-z0-9]+)*)"
-    r"=(\s*)(\"[^\"]*\"|'[^']*'|[^\s;|&]+)"
+    r"([A-Za-z_][A-Za-z0-9_.-]*)=(\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;|&]+)"
 )
+
+# HARDEN-19 B: a `NAME=value` that is not at the start of a command and cannot be, where
+# NAME is a delimited path and names a credential — npm's
+# `//registry.npmjs.org/:_authToken=…` and git's `config token.secret=…`. The anchored rule
+# above does not reach a name mid-argument, and the last component is the credential's
+# (`_authToken`), so the name is wide and `_name_is_a_credential` decides. A single
+# component is not matched here: `grep foo=bar file.txt` is the coincidence the anchor
+# exists for. The lookbehind keeps an option's own name out — `--api-key=…` is
+# `_SECRET_OPT_RE`'s, and the `-` or the word before it says so.
+_SECRET_PATH_ASSIGN_RE = re.compile(
+    r"(?i)(?<![\w-])([A-Za-z0-9_][A-Za-z0-9_.:/*-]*[_.:/*-][A-Za-z0-9_-]+)="
+    r"(\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;|&]+)"
+)
+
+# HARDEN-19 B: npm's other spelling, `npm config set <name> <value>` with a space for the
+# `=`: `npm config set //registry.npmjs.org/:_authToken ghp_…`. The name is the one word
+# before the value, so the name rule decides; `npm config set registry https://…` stays.
+_NPM_CONFIG_SET_RE = re.compile(r"(?i)(\bnpm\s+config\s+set\s+)([^\s=]+)(\s+)(\S+)")
 
 # HARDEN-12 D: `user:pass@` in a URL, only the password. The scheme is any
 # `name://`, the user is kept, and a URL without a password is left byte for byte. The
@@ -1042,8 +1082,12 @@ _SECRET_USER_OPT_RE = re.compile(
 
 # v13 (CMD-1): `-u 'user:pass word'`: the whole argument is one shell-quoted word, so its password may hold
 # spaces. Matched as one unit; the closing quote is the one that opened the word.
+#
+# HARDEN-19 C: the user may hold a space too (`-u "a b:c d"`), and the closing quote need
+# not be there — `-u 'admin:my secret` at the end of a line is still a password, and the
+# pass runs to the end of the line rather than leaving half of it behind.
 _SECRET_USER_QUOTED_RE = re.compile(
-    r"""(\s(?:-u|--user)(?:\s+|=)(['"]))([^\s:'"]+):([^'"\n]+)(\2)"""
+    r"""(\s(?:-u|--user)(?:\s+|=)(['"]))([^'"\n]*?):([^'"\n]*)(\2)?"""
 )
 
 # `-p value` / `-pvalue` is a password only for the commands that take one. `ls -p`,
@@ -1052,7 +1096,7 @@ _SECRET_USER_QUOTED_RE = re.compile(
 _PASSWORD_OPT_COMMANDS = frozenset({
     "mysql", "mysqldump", "mariadb", "mariadb-dump", "redis-cli", "sshpass", "htpasswd",
 })
-_PASSWORD_OPT_RE = re.compile(r"""(?<![\w-])(-p)([ \t]*)('[^'\n]*'|"[^"\n]*"|\S*)""")
+_PASSWORD_OPT_RE = re.compile(r"""(?<![\w-])(-p)([ \t]*)(""" + _SECRET_VALUE_RE + r""")""")
 # HARDEN-15 C: MySQL reads the password attached to `-p` and nothing else — `-p` on its
 # own is the prompt flag, so the next word is the database (`mysql -p mydb`). The family,
 # not the single name, since mysqldump takes the same flag.
@@ -1064,7 +1108,7 @@ _DATABASE_NAME_RE = re.compile(r"[a-z_]+")
 # HARDEN-15 C: redis-cli's own `-a <password>`. `-a` is `--all` in almost every other tool
 # (`ls -a`, `grep -a`, `sort -a`), so only redis-cli's is looked at. Its `--pass` is a
 # long option and is caught by `_SECRET_OPT_RE`.
-_REDIS_CLI_PASSWORD_RE = re.compile(r"""(?<![\w-])(-a)([ \t]*)('[^'\n]*'|"[^"\n]*"|\S*)""")
+_REDIS_CLI_PASSWORD_RE = re.compile(r"""(?<![\w-])(-a)([ \t]*)(""" + _SECRET_VALUE_RE + r""")""")
 # HARDEN-15 C: `aws configure set <name> <value>` writes the named credential into
 # ~/.aws/credentials. The name names it, so the value is the secret.
 _AWS_CONFIGURE_SET_RE = re.compile(r"(?<![\w-])(set)\s+(\S+)\s+(\S+)")
@@ -1110,6 +1154,10 @@ def _looks_like_a_password(value: str) -> bool:
     A password carries a letter and is longer than a name (`mysql -p db` keeps its
     database, `mysql -psecretpass1234` loses its password). A quoted word is one
     value whatever is inside the quotes: `-p'my secret'` is judged on `my secret`.
+
+    HARDEN-19 C: a quote need not be closed — `-p'my secret` at the end of a line is the
+    whole password, and the letters of the opening quote are not letters of a value, so
+    an unterminated word is judged on its length and letters like any bare one.
     """
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
         value = value[1:-1]
@@ -1218,9 +1266,21 @@ def _redact_command(command: str) -> str:
     followed by a space for the MySQL family is the database and stays (the attached
     form is still a password), and ``--pass`` and the password of an empty-user URL
     (``redis://:pw@host``) are redacted without mangling the URL.
+
+    HARDEN-19 B and C: the name rule is the mask's ``_name_is_a_credential``, so
+    ``PGPASSWORD=…``, ``NGROK_AUTHTOKEN=…``, ``GITHUBTOKEN=…`` and ``DBPASSWORD=…`` are
+    read by their words as well — ``MAX_TOKENS=100``, ``TOKENIZER=bert`` and
+    ``KEYBOARD=us`` still are not — and a name that is a delimited path and sits
+    mid-command is looked at too, npm's ``//registry.npmjs.org/:_authToken=…`` among them.
+    And every flag value takes the shared ``_SECRET_VALUE_RE``, so a quoted password with
+    a space is one value, quotes and all: ``mysql -p'my secret'``,
+    ``redis-cli -a "my secret"``, ``--password='my secret'`` and
+    ``-u 'admin:my secret'`` are redacted whole, and an unterminated quote runs to the
+    end of the line rather than leaving half a password behind.
     """
     try:
-        redacted = _SECRET_OPT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", command)
+        redacted = _SECRET_OPT_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]" if m.group(3) else m.group(0), command)
         redacted = _SECRET_AUTH_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted)
         redacted = _SECRET_HEADER_RE.sub(
             lambda m: m.group(0) if _name_is_not_a_credential(m.group(1))
@@ -1229,11 +1289,17 @@ def _redact_command(command: str) -> str:
             lambda m: m.group(0) if _name_is_not_a_credential(m.group(4))
             else f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}={m.group(5)}[REDACTED]",
             redacted)
+        redacted = _SECRET_PATH_ASSIGN_RE.sub(
+            lambda m: m.group(0) if _name_is_not_a_credential(m.group(1))
+            else f"{m.group(1)}={m.group(2)}[REDACTED]", redacted)
+        redacted = _NPM_CONFIG_SET_RE.sub(
+            lambda m: m.group(0) if _name_is_not_a_credential(m.group(2))
+            else f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]", redacted)
         redacted = _SECRET_URL_USERINFO_RE.sub(
             lambda m: f"{m.group(1)}[REDACTED]{m.group(3)}", redacted)
         redacted = _SECRET_USER_QUOTED_RE.sub(
             lambda m: m.group(0) if m.group(3).isdigit() and m.group(4).isdigit()
-            else f"{m.group(1)}{m.group(3)}:[REDACTED]{m.group(5)}", redacted)
+            else f"{m.group(1)}{m.group(3)}:[REDACTED]{m.group(5) or ''}", redacted)
         redacted = _SECRET_USER_OPT_RE.sub(
             lambda m: m.group(0) if m.group(2).isdigit() and m.group(3).isdigit()   # `-u 1000:1000` is uid:gid
             else f"{m.group(1)}{m.group(2)}:[REDACTED]", redacted)

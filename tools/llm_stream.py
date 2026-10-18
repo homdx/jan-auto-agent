@@ -262,14 +262,79 @@ _API_KEY_COLON_RE = re.compile(
 # the brackets. Only a name that names a credential counts, so `os.environ["HOME"] = "x"`
 # is left alone, and the value goes through `_value_is_secret_literal` like every other one
 # — `os.environ["X_API_KEY"] = os.getenv("Y")` stays code.
+#
+# HARDEN-19 A: the container is no longer `environ` alone, and the name inside the brackets
+# is not restricted to one that carries a credential word as a whole part — `STRIPEKEY` and
+# `clientSecret` name credentials too, and CC review fix 40's rule is what threw them away.
+# The pattern takes any name and asks `_name_is_a_credential`: `os.environ["HOME"] = "x"`,
+# `process.env["HOME"] = "/root"`, `TOKENIZERS_PARALLELISM` and `KEYBOARD_LAYOUT` all stay.
+_ENV_NAME_RE = r"[A-Za-z_][A-Za-z0-9_.\-]*"
+_ENV_CONTAINER_RE = r"(?:\$\{?[A-Za-z_]\w*\}?|\w+(?:\.\w+)*)"
+_ENV_LHS_VALUE_RE = r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";]+)"
 _ENV_SUBSCRIPT_ASSIGN_RE = re.compile(
     r"(?i)([ \t]*(?:[#;]+[ \t]*)?)"
-    # The credential word is a whole part of the name: `TOKENIZERS_PARALLELISM`, `KEYBOARD_LAYOUT` are not keys.
-    r"((?:[A-Za-z_][\w.]*\.)?environ)\[([\"'])"
-    r"((?:[\w.-]*[_.-])?(?:api[_-]?key|key|token|secret|password|passwd)(?:[_.-][\w.-]*)?)\3\]"
+    r"(" + _ENV_CONTAINER_RE + r")\[([\"'])"
+    r"(" + _ENV_NAME_RE + r")\3\]"
     r"([ \t]*(?<![=!<>~&|])=(?![=~])[ \t]*)"
-    r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";]+)([ \t]*\r?)"
+    + _ENV_LHS_VALUE_RE + r"([ \t]*\r?)"
 )
+# HARDEN-19 A: the same name written to a call rather than a subscript,
+# `os.environ.setdefault("N", v)`, `os.environ.get("N", default)`,
+# `System.setProperty("api.key", v)`, `os.putenv("N", v)`. The name is the first
+# argument, the value the second, and the value is not a subscript's right-hand side, so
+# it may not take a closing bracket. `get` and `getenv` are read-only with one argument —
+# `System.getenv("api.key")` — and this pattern needs the comma, so they are read the way
+# they are written: only the assigned default is looked at.
+_ENV_SUBSCRIPT_CALL_RE = re.compile(
+    r"(?i)([ \t]*(?:[#;]+[ \t]*)?)"
+    r"(" + _ENV_CONTAINER_RE + r")"
+    r"((?:\.setdefault|\.get(?:env)?|\.setProperty|\.putenv)\()"
+    r"([\"'])(" + _ENV_NAME_RE + r")\4([ \t]*,[ \t]*)"
+    r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";)]+)"
+)
+# HARDEN-19 A: the attribute form of the same write, `process.env.STRIPEKEY = "…"` and
+# `Bun.env.clientSecret = "…"`: the environment object, a dot, the name, an assignment. The
+# generic assignment rules read the name by its underscore-separated words, so a name
+# written as one word went through. The container must END in `env` (or `environ`) as a
+# whole path part, so `dotenv.STRIPEKEY` and `self.environment.KEY` are not it.
+_ENV_ATTR_ASSIGN_RE = re.compile(
+    r"(?i)([ \t]*(?:[#;]+[ \t]*)?)"
+    r"((?<![\w$.])(?:[A-Za-z_$][\w$]*\.)*(?:env|environ))\."
+    r"(" + _ENV_NAME_RE + r")"
+    r"([ \t]*(?<![=!<>~&|])=(?![=~])[ \t]*)"
+    + _ENV_LHS_VALUE_RE + r"([ \t]*\r?)"
+)
+#: The object that holds environment variables, read off the tail of the container path:
+#: `os.environ`, `process.env`, `ENV`, `$_ENV`, or the JVM's property store `System`.
+#: The tail is `env` or `environ`, plain or with a `_` ahead of it (`_ENV`), so `dotenv`
+#: and `FOOENV` are not it.
+_ENV_CONTAINER_TAIL_RE = re.compile(r"(?i)(?:^|[_])(?:env|environ)$")
+
+
+#: The module-level functions that write an environment value, or take a default for it:
+#: `os.putenv("N", v)` assigns and `os.getenv("N", default)` holds one. There is no env
+#: object in their path — the function name is the store.
+_ENV_MODULE_CALL_RE = re.compile(r"(?i)\bos\.(?:putenv|getenv)\($")
+
+
+def _container_is_a_credential_store(container: str) -> bool:
+    """Whether *container* is the object that holds environment variables, whatever language
+    wrote the line (HARDEN-19 A). Never raises on a malformed container."""
+    if not container or not isinstance(container, str):
+        return False
+    tail = container.rsplit(".", 1)[-1].strip("${}")
+    if tail.lower() == "system":
+        return True
+    return bool(_ENV_CONTAINER_TAIL_RE.search(tail))
+
+
+def _is_an_environment_write(container: str, call: str = "") -> bool:
+    """Whether a write goes to the environment at all (HARDEN-19 A). Never raises."""
+    if _ENV_MODULE_CALL_RE.search((container or "") + (call or "")):
+        return True
+    return _container_is_a_credential_store(container)
+
+
 # HARDEN-12 B: an XML element whose tag is a key name, `<api_key>gsk_…</api_key>`. The tag
 # name carries the rule's job, the content is judged by `_value_is_secret_literal`, so
 # `<api_key>Value</api_key>` stays as it is.
@@ -522,12 +587,83 @@ _NOT_A_CREDENTIAL_SUFFIXES = frozenset({
     "header", "prefix", "index", "version", "mode", "format", "label", "pattern",
 })
 
+#: HARDEN-19: a word that, standing alone, says the variable holds a credential. The
+#: `AUTH`+`TOKEN` pairing and the compound `APIKEY` come out of the same split, so no
+#: extra rule is needed for them.
+_CREDENTIAL_WORDS = frozenset({"key", "token", "secret", "password", "passwd", "pwd", "apikey"})
+
+#: HARDEN-19: the names that the "ends in a credential word" half of
+#: `_name_is_a_credential` would call a credential and are not — the false friends of the
+#: last word (`MONKEY`, `TURKEY`, `HOTKEY`, `DONKEY`, `KEYBOARD`, `KEYMAP`) and the ones
+#: this codebase uses as a key column or a limit (`PRIMARY_KEY`, `MAX_TOKENS`,
+#: `TOKENIZERS_PARALLELISM`).
+_CREDENTIAL_FALSE_FRIENDS = frozenset({
+    "monkey", "turkey", "hotkey", "donkey", "keyboard", "keymap",
+    "tokenizers_parallelism", "primary_key", "max_tokens",
+})
+
+#: HARDEN-19: how a name splits into its words inside a run of letters — the camelCase
+#: boundary, `APIKey` → `API`, `Key`, `clientSecret` → `client`, `Secret`. `_` and `-`
+#: are split first, so the separators need no case structure of their own.
+_NAME_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _credential_name_words(name: str) -> "list[str]":
+    """The words of a variable name, lowercased: split on `_`, `-` and `.`, and inside a
+    run of letters on the camelCase boundary. `SYSTEM_ACCESSTOKEN` is `system`,
+    `accesstoken`; `clientSecret` is `client`, `secret`; `STRIPEKEY` is the one word
+    `stripekey`. Never raises."""
+    if not name or not isinstance(name, str):
+        return []
+    words = []
+    for chunk in re.split(r"[_.\-]", name):
+        words.extend(_NAME_WORD_RE.findall(chunk))
+    return [word.lower() for word in words if word]
+
+
+#: The words that, next to `KEY`, make it a database key and not a secret.
+_DATABASE_KEY_KINDS = frozenset({"primary", "foreign", "unique", "index", "sort", "partition"})
+
+
+def _name_is_a_credential(name: str) -> bool:
+    """Whether a variable name names a credential — HARDEN-19's one rule, the mask and the
+    command log both ask it.
+
+    A word that stands alone and names a credential (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`,
+    `PASSWD`, `PWD`, `APIKEY`) counts, and so does a name that *ends* in one of those words
+    written together: `STRIPEKEY`, `GITHUBTOKEN`, `AUTHTOKEN`, `SECRETKEY`, `clientSecret`,
+    `dbPassword`. CC review fix 40 asked for the credential word to be a whole part of the
+    name only, which is what left `STRIPEKEY` and the camelCase forms unmasked; the "ends
+    in" half closes that gap, and `_CREDENTIAL_FALSE_FRIENDS` and the count-and-path
+    suffixes keep the friends it was written for (`MONKEY_PATCH`, `KEYBOARD_LAYOUT`,
+    `TOKENIZERS_PARALLELISM`, `PRIMARY_KEY`, `MAX_TOKENS`, `KEY_DIR`) out.
+    Never raises on a malformed name.
+    """
+    if not name or not isinstance(name, str):
+        return False
+    lowered = name.strip().lower()
+    if lowered in _CREDENTIAL_FALSE_FRIENDS:
+        return False
+    words = _credential_name_words(name)
+    if not words:
+        return False
+    if words[-1] in _NOT_A_CREDENTIAL_SUFFIXES:
+        # `TOKEN_COUNT`, `KEY_DIR`, `API_KEY_NAME`: the last word says count, path or label.
+        return False
+    if "key" in words and not _DATABASE_KEY_KINDS.isdisjoint(words):
+        # `PRIMARY_KEY`, `FOREIGN_KEY`, `UNIQUE_KEY`, `INDEX_KEY`, `user_primary_key`: a
+        # database key column, not a credential.
+        return False
+    if any(word in _CREDENTIAL_WORDS for word in words):
+        return True
+    flat = re.sub(r"[^a-z0-9]", "", lowered)
+    return bool(flat) and any(flat.endswith(word) for word in _CREDENTIAL_WORDS)
+
 
 def _name_is_not_a_credential(name: str) -> bool:
-    """Whether a variable name ends in a word that makes it a count, a path or a label
-    (`TOKEN_COUNT`, `KEY_DIR`), so a value behind it is no secret."""
-    parts = re.split(r"[_.\-]", name.lower())
-    return len(parts) > 1 and parts[-1] in _NOT_A_CREDENTIAL_SUFFIXES
+    """Whether a variable name is not a credential's — the inverse of
+    `_name_is_a_credential`, kept because the rules that skip a hit ask it that way."""
+    return not _name_is_a_credential(name)
 
 
 #: A name is rarely over 32 letters: a single run of letters that long, with no case
@@ -999,6 +1135,14 @@ def mask_api_key(text: "str | None") -> "str | None":
     an object-literal key. In every other position — a value after an ``=`` or a ``:``,
     a quoted value, a config line, a header, a comment — the placeholder still goes.
 
+    HARDEN-19 A: the environment write is read by its name's words, not by whether it
+    carries a credential word as a whole part. ``os.environ["STRIPEKEY"]``,
+    ``os.environ["clientSecret"]`` and ``os.environ["PGPASSWORD"]`` are a credential now,
+    while ``TOKENIZERS_PARALLELISM``, ``KEYBOARD_LAYOUT``, ``MONKEY_PATCH``, ``PRIMARY_KEY``
+    and ``MAX_TOKENS`` are not, and the write may sit in a call rather than a subscript —
+    ``os.environ.setdefault("N", v)``, ``System.setProperty("api.key", v)`` and
+    ``os.putenv("N", v)`` take the same rule.
+
     This is a plain string transform with no knowledge of *which* key is
     "real" — it masks unconditionally so a secret embedded in file content
     that gets pulled into a prompt can't leak to the LLM. Non-string input
@@ -1043,17 +1187,58 @@ def mask_api_key(text: "str | None") -> "str | None":
         str_prefix, quote = _quote_parts(value)
         return f"{prefix}{key_name}{assign}{str_prefix}{quote}{_MASK_PLACEHOLDER}{quote}"
 
-    def _mask_env_subscript(m: "re.Match") -> str:
-        prefix, environ, quote, name, assign, value, suffix = m.groups()
-        if _name_is_not_a_credential(name):
-            return m.group(0)
-        # The subscript names the key, so it is not the value: `os.environ["X_API_KEY"] =
-        # os.getenv("Y")` is code and stays, whatever the letters (HARDEN-12 B).
+    def _masked_env_value(container: str, name: str, value: str, call: str = "") -> "str | None":
+        """The masked value of one environment write, or `None` when the line is not a
+        credential (HARDEN-19 A): the write does not go to the environment, the name is not
+        a credential's, or the value is code — `os.environ["X_API_KEY"] = os.getenv("Y")`
+        is a reference to a value that lives elsewhere.
+
+        The call form asks one thing more of a quoted value, because the second argument of
+        `setdefault`, `get`, `getenv` or `setProperty` is a *default*: `os.environ
+        .setdefault("CONTEST_GATE_API_KEY", "unset-for-the-round")` is a stand-in in this
+        repository's own sources, and a stand-in is letters of one case with no digit —
+        not the shape of a credential. The subscript's right-hand side is the key's own
+        value, so it keeps the plain rule. A value the provider issues with a prefix
+        (`gsk_…`) is not a call value's to decide: the bare-token pass catches it wherever
+        it sits.
+        """
+        if not _is_an_environment_write(container, call):
+            return None
+        if not _name_is_a_credential(name):
+            return None
+        # The subscript names the key, so it is not the value: an unquoted right-hand side is
+        # judged by the colon rule, and a bare identifier there is a variable, not a token.
         if not _value_is_secret_literal(value, name, colon=not _is_plain_quoted(value)):
-            return m.group(0)
+            return None
+        if call:
+            _, body = _split_prefix(value)
+            if len(body) >= 2 and body[0] == body[-1] and body[0] in "\"'":
+                inner = body[1:-1]
+                if len(inner) < 4 or not _looks_like_a_token(inner):
+                    return None
         str_prefix, vquote = _quote_parts(value)
-        return (f"{prefix}{environ}[{quote}{name}{quote}]{assign}"
-                f"{str_prefix}{vquote}{_MASK_PLACEHOLDER}{vquote}{suffix}")
+        return f"{str_prefix}{vquote}{_MASK_PLACEHOLDER}{vquote}"
+
+    def _mask_env_subscript(m: "re.Match") -> str:
+        prefix, container, quote, name, assign, value, suffix = m.groups()
+        masked = _masked_env_value(container, name, value)
+        if masked is None:
+            return m.group(0)
+        return f"{prefix}{container}[{quote}{name}{quote}]{assign}{masked}{suffix}"
+
+    def _mask_env_attr(m: "re.Match") -> str:
+        prefix, container, name, assign, value, suffix = m.groups()
+        masked = _masked_env_value(container, name, value)
+        if masked is None:
+            return m.group(0)
+        return f"{prefix}{container}.{name}{assign}{masked}{suffix}"
+
+    def _mask_env_call(m: "re.Match") -> str:
+        prefix, container, call, quote, name, separator, value = m.groups()
+        masked = _masked_env_value(container, name, value, call)
+        if masked is None:
+            return m.group(0)
+        return f"{prefix}{container}{call}{quote}{name}{quote}{separator}{masked}"
 
     def _mask_xml(m: "re.Match") -> str:
         open_tag, tag_name, value, close_tag = m.groups()
@@ -1156,6 +1341,8 @@ def mask_api_key(text: "str | None") -> "str | None":
     text = _API_KEY_COLON_RE.sub(_mask_colon, text)
     text = _API_KEY_JSON_RE.sub(r"\1" + _MASK_PLACEHOLDER + r"\2", text)
     text = _ENV_SUBSCRIPT_ASSIGN_RE.sub(_mask_env_subscript, text)
+    text = _ENV_SUBSCRIPT_CALL_RE.sub(_mask_env_call, text)
+    text = _ENV_ATTR_ASSIGN_RE.sub(_mask_env_attr, text)
     text = _API_KEY_XML_RE.sub(_mask_xml, text)
     text = _BARE_KEY_XML_RE.sub(_mask_bare_key_element, text)
     text = _XML_START_TAG_RE.sub(_mask_xml_attribute_pair, text)

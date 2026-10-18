@@ -1,10 +1,10 @@
 # HARDEN-19 — a credential variable named `STRIPEKEY`, `GITHUBTOKEN`, `AUTHTOKEN`, `clientSecret` or `PGPASSWORD` reaches the model and the command log unmasked; `os.environ.setdefault(…)`, `process.env["K"]`, `ENV["K"]` are not looked at; a quoted password with a space is logged after its first word
 
-**Status:** open
+**Status:** landed (round 317: sensenova-6-8-flash-lite-var1 as the base — one `_name_is_a_credential` in `tools/llm_stream.py` splits a name at `_ - .` and at camelCase and calls it a credential when a word, or the end of the name written together, is `key`/`token`/`secret`/`password`/`passwd`/`pwd`/`apikey`, with a stoplist of false friends and the count/path/label suffixes; the environ mask reads any environment store (`os.environ`, `process.env`, `ENV`, `$_ENV`, `System`) in the subscript and in the `setdefault`/`getenv`/`setProperty`/`putenv` call forms, the command log's `NAME=value`, a delimited mid-command path (`//registry.npmjs.org/:_authToken=`, `token.secret=`) and every secret flag take the same rule, and one `_SECRET_VALUE_RE` serves `-p`, `-a`, `--password=`, `--token=` and `-u`; judging added the attribute form `process.env.STRIPEKEY = "…"` (every entry leaked it), the database key columns `FOREIGN_KEY`/`UNIQUE_KEY`/`INDEX_KEY`/`SORT_KEY` from var4, and `npm config set <name> <value>` with a space from var3)
 **Severity:** MEDIUM (A: a real secret under a very common name is sent to the model; C: a partial password is kept in the logs); LOW-MEDIUM (B: logs, `PGPASSWORD=… psql` in clear)
 **File:** `tools/llm_stream.py` (A), `tools/auto/executor.py` (B, C)
 **Symbol:** A: the environ-subscript mask of HARDEN-12 B and its name rule (CC review fix 40). B: `_redact_command`, `_SECRET_ENV_ASSIGN_RE`, `_name_is_not_a_credential`. C: `_PASSWORD_OPT_RE`, `_REDIS_CLI_PASSWORD_RE`, `_SECRET_OPT_RE`, `_SECRET_USER_OPT_RE`, `_looks_like_a_password`
-**Round:** (set when the round starts)
+**Round:** 317
 **Size:** M
 **Depends on:** HARDEN-15 (313), CC review fixes 40 and 41 (`a036ae6`, `f7061c4`), all landed
 **Also touches:** `tests/test_mask_review_q.py`, the HARDEN-12 B and D tests (pins that must stay green), `tests/`, `tests_bugfix/`
@@ -100,3 +100,11 @@ One commit. The judge's checks are written after the round, from the entries; th
 ## Not in scope
 
 Rust, Windows `set NAME=…`, and the decision whether `mask_api_key` should mask every labelled secret (`password`, `client_secret`, `private_key` in a config file, `let secretKey = "…"`): see the note in the report, it is a scope decision for the operator and not part of this ticket.
+
+---
+
+## Why not the others (round 317)
+
+Nine entries (laguna shipped no test; nemotron left a test file uncommitted and made two commits; glm's own tests assert that `stripeKey` is *not* masked, against the ticket, and its rule masks `KEY_DIR`, `TOKEN_COUNT`, `MONKEY`). A black box of 104 checks (21 credential names through the mask, 14 false friends, five access forms of three names, Java `System.setProperty`, 14 names through the command log, the HARDEN-12 D untouched table, 18 quoted-password and uid:gid shapes) scored the base 53, glm 50, nemotron 82, agnes 96, laguna 98, var3 99, var2 100, var4 100, step-5 100, var1 103; the ideal 104. A corpus run of the mask over 1540 sources (the repository and site-packages) changed the same 917 lines as the base for var1. The cross matrix showed var1's tests green on every sane implementation and the others' tests failing only on `FOREIGN_KEY`/`INDEX_KEY`/`UNIQUE_KEY` (var4), the space form of `npm config set` (var3) and glm's inverted pins. Two shapes nobody covered: `process.env.STRIPEKEY = "…"` (the generic rules read the name by its underscores) and `os.putenv` was read only by var1; `System.setProperty` only by var1, var2, var3, var4 and step-5.
+
+Open for the next tickets: a plain `stripe_key = "<hex>"` / `STRIPEKEY = "<hex>"` assignment, `clientSecret: "<hex>"` and `const githubToken = "<hex>"` are still sent as written (the mask only reads an environment write by name, and a labelled secret in a config file by its prefix) — the scope decision in "Not in scope"; `MAX_TOKEN` (singular) is masked as before.
