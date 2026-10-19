@@ -289,7 +289,8 @@ class TestOneBadByteCostsOneLine:
 
     def test_the_reply_around_the_bad_byte_survives(self, fake):
         body = _sse_raw(b"data: " + json.dumps(_chunk({"content": "ok"})).encode(),
-                        b"data: \xff\xfe bad")
+                        b"data: \xff\xfe bad",
+                        b"data: [DONE]")
         fake(body)
         assert request_completion(URL, HEADERS, _payload(), 10, stream=True) == "ok"
 
@@ -303,7 +304,8 @@ class TestOneBadByteCostsOneLine:
     def test_a_bad_byte_inside_a_token_keeps_the_token_with_a_replacement(self, fake):
         body = _sse_raw(
             b"data: " + json.dumps(_chunk({"content": "ok"})).encode() + b"\n\n",
-            b'data: {"choices":[{"delta":{"content":"to\xffken"}}]}')
+            b'data: {"choices":[{"delta":{"content":"to\xffken"}}]}',
+            b"data: [DONE]")
         fake(body)
         assert request_completion(URL, HEADERS, _payload(), 10, stream=True) == "okto\ufffdken"
 

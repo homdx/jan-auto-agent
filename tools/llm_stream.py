@@ -11,6 +11,7 @@ in real time while still receiving the complete text to json.loads() at the end.
 """
 
 import difflib
+import http.client
 import json
 import logging
 import re
@@ -28,6 +29,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_ERROR_RETRIES = 60
 DEFAULT_ERROR_RETRY_WAIT_SEC = 10.0
 DEFAULT_MAX_RETRY_AFTER_SEC = 180.0
+
+#: The transport failures every branch of `request_completion` retries on the same budget as a
+#: retryable HTTP status: the network errors of AUTO-FIX, plus `http.client.HTTPException` -
+#: the family that holds `IncompleteRead`, what a body shorter than its `Content-Length` (or a
+#: chunked body cut after one chunk) raises instead of a `ConnectionError` (HARDEN-23 B). One
+#: tuple, read by the three read loops, so a new transport error is added in one place.
+_RETRYABLE_TRANSPORT_ERRORS = (
+    TimeoutError, ssl.SSLError, ConnectionError,
+    urllib.error.URLError, http.client.HTTPException,
+)
 
 
 @dataclass
@@ -217,7 +228,7 @@ def stream_options_is_supported(url: str, model=None) -> bool:
 # value: without it the value class matched the prefix alone and left the quote pair
 # behind, so a raw string went out with its quotes in the wrong place (HARDEN-10 B).
 _API_KEY_LINE_RE = re.compile(
-    r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:export[ \t]+)?)([\w.-]*api[_-]?key)'
+    r'(?i)((?:(?<![ \t])[ \t]+)?(?:[#;]+[ \t]*)?(?:export[ \t]+)?)((?<![\w.-])[\w.-]*api[_-]?key)'
     r'([ \t]*(?<![=!<>~&|])=(?![=~>])[ \t]*)'
     r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";&#]+)([ \t]*\r?)"
 )
@@ -251,8 +262,8 @@ _API_KEY_JSON_RE = re.compile(r'(?i)("[\w.-]*api[_-]?key"[ \t]*:[ \t]*")[^"\r\n]
 # the way a sentence writes it. Only between `api` and `key`, so a name is not a
 # run of prose words.
 _API_KEY_COLON_RE = re.compile(
-    r'(?i)([ \t]*(?:[#;]+[ \t]*)?(?:[-*][ \t]+)?)'
-    r"((?:['\"])?[\w.-]*api[ _\-]?key(?:['\"])?)"
+    r'(?i)((?:(?<![ \t])[ \t]+)?(?:[#;]+[ \t]*)?(?:[-*][ \t]+)?)'
+    r"((?:['\"])?(?<![\w.-])[\w.-]*api[ _\-]?key(?:['\"])?)"
     r"([ \t]*(?:=>|(?<![=!<>~&|])=(?![=~>])|:)[ \t]*)"
     r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^#\s;\"'\,\}\]\)\|=&]+)"
 )
@@ -272,8 +283,8 @@ _ENV_NAME_RE = r"[A-Za-z_][A-Za-z0-9_.\-]*"
 _ENV_CONTAINER_RE = r"(?:\$\{?[A-Za-z_]\w*\}?|\w+(?:\.\w+)*)"
 _ENV_LHS_VALUE_RE = r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";]+)"
 _ENV_SUBSCRIPT_ASSIGN_RE = re.compile(
-    r"(?i)([ \t]*(?:[#;]+[ \t]*)?)"
-    r"(" + _ENV_CONTAINER_RE + r")\[([\"'])"
+    r"(?i)((?:(?<![ \t])[ \t]+)?(?:[#;]+[ \t]*)?)"
+    r"((?<![\w$.])" + _ENV_CONTAINER_RE + r")\[([\"'])"
     r"(" + _ENV_NAME_RE + r")\3\]"
     r"([ \t]*(?<![=!<>~&|])=(?![=~])[ \t]*)"
     + _ENV_LHS_VALUE_RE + r"([ \t]*\r?)"
@@ -286,8 +297,8 @@ _ENV_SUBSCRIPT_ASSIGN_RE = re.compile(
 # `System.getenv("api.key")` — and this pattern needs the comma, so they are read the way
 # they are written: only the assigned default is looked at.
 _ENV_SUBSCRIPT_CALL_RE = re.compile(
-    r"(?i)([ \t]*(?:[#;]+[ \t]*)?)"
-    r"(" + _ENV_CONTAINER_RE + r")"
+    r"(?i)((?:(?<![ \t])[ \t]+)?(?:[#;]+[ \t]*)?)"
+    r"((?<![\w$.])" + _ENV_CONTAINER_RE + r")"
     r"((?:\.setdefault|\.get(?:env)?|\.setProperty|\.putenv)\()"
     r"([\"'])(" + _ENV_NAME_RE + r")\4([ \t]*,[ \t]*)"
     r"((?:[rbfuRBFU]{1,2})?(?:\"[^\"]*\"|'[^']*')|[^\s'\";)]+)"
@@ -298,9 +309,12 @@ _ENV_SUBSCRIPT_CALL_RE = re.compile(
 # written as one word went through. The container must END in `env` (or `environ`) as a
 # whole path part, so `dotenv.STRIPEKEY` and `self.environment.KEY` are not it.
 _ENV_ATTR_ASSIGN_RE = re.compile(
-    r"(?i)([ \t]*(?:[#;]+[ \t]*)?)"
+    r"(?i)((?:(?<![ \t])[ \t]+)?(?:[#;]+[ \t]*)?)"
     r"((?<![\w$.])(?:[A-Za-z_$][\w$]*\.)*(?:env|environ))\."
-    r"(" + _ENV_NAME_RE + r")"
+    # HARDEN-23 C: a property name has no dot (the shared _ENV_NAME_RE allows one, for the quoted
+    # subscript form). With the dot the name swallowed the rest of an `env.env.env.…` line and gave
+    # it back one character at a time from every `env.` — quadratic on a long line.
+    r"([A-Za-z_][A-Za-z0-9_\-]*)"
     r"([ \t]*(?<![=!<>~&|])=(?![=~])[ \t]*)"
     + _ENV_LHS_VALUE_RE + r"([ \t]*\r?)"
 )
@@ -357,7 +371,7 @@ _BARE_KEY_XML_RE = re.compile(
 # pair — `key="api_key" value="V"` — before the value is judged at all.
 _XML_START_TAG_RE = re.compile(r"<([A-Za-z][\w:.-]*)((?:[ \t]+[A-Za-z_][\w:.-]*"
                                r"(?:[ \t]*=[ \t]*(?:\"[^\"]*\"|'[^']*'|[^\s>]+))?)*)[ \t]*/?>")
-_XML_ATTR_RE = re.compile(r"([A-Za-z_][\w:.-]*)[ \t]*=[ \t]*(\"[^\"]*\"|'[^']*'|[^\s>]+)")
+_XML_ATTR_RE = re.compile(r"(?<![\w:.-])([A-Za-z_][\w:.-]*)[ \t]*=[ \t]*(\"[^\"]*\"|'[^']*'|[^\s>]+)")
 # A key name as the whole value of an attribute: `key="api_key"`.
 _XML_KEY_NAME_VALUE_RE = re.compile(
     r"^[\w.-]*(?:api[ _\-]?key|apikey|secret[ _\-]?key)s?$", re.IGNORECASE)
@@ -376,7 +390,7 @@ _XML_ANY_TAG_RE = re.compile(r"<([/]?)([A-Za-z][\w:.-]*)((?:[^<>\"']|\"[^\"]*\"|
 # HARDEN-13 C: a bare JWT, three base64url runs joined by dots with the first
 # starting `eyJ` (the base64 of `{"`), wherever it stands — with a key name or
 # without one. The runs are judged one by one, not by one pattern.
-_JWT_RUN_RE = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}")
+_JWT_RUN_RE = re.compile(r"(?<![\w.-])[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}")
 # A bare Python/JS identifier: a NAME, i.e. a reference to something, never a literal secret.
 _BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # A quoted value with no `{` inside — a literal, not a template. The prefix of a
@@ -3200,7 +3214,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 )
                 retry_after(msg, wait_s)
                 attempt += 1
-            except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
+            except _RETRYABLE_TRANSPORT_ERRORS as e:
                 # Connection-level errors reuse the HTTP retry budget, and are reported with the provider (AUTO-FIX).
                 if attempt >= error_retries:
                     raise RuntimeError(
@@ -3223,8 +3237,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 with _open() as response:
                     # A UTF-8 BOM is dropped before parsing, so json.loads does not fail on it (utf-8-sig).
                     raw = json.loads(_read_body(response).decode("utf-8-sig"))
-            except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError,
-                    ValueError) as e:
+            except _RETRYABLE_TRANSPORT_ERRORS + (ValueError,) as e:
                 # A truncated or garbled body is retried like a dropped connection (BUGFIX).
                 if _read_attempt >= error_retries:
                     raise RuntimeError(
@@ -3259,6 +3272,8 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     while True:
         try:
             with _open() as response:
+                # HARDEN-23 A: tracks whether the stream saw its completion marker ([DONE]/done:true).
+                _seen_done = False
                 for raw_line in response:
                     _check_deadline("the stream")
                     # A BOM on the first stream line is stripped, so that chunk is not dropped (utf-8-sig).
@@ -3306,6 +3321,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             continue
                         data = line[len("data:"):].strip()
                         if data == "[DONE]":
+                            _seen_done = True
                             break
                         try:
                             chunk = json.loads(data)
@@ -3344,7 +3360,48 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         if on_token is not None:
                             on_token(token)
                     if done:
+                        _seen_done = True
                         break
+            # HARDEN-23 A: a stream that ends without [DONE]/done and with no
+            # finish_reason (and no trailing usage chunk) is a truncation — the
+            # provider dropped the body or closed it short. A silent drop passes
+            # as a normal reply today, and Gate 1's budget check reads
+            # finish_reason=None like "stop".
+            #
+            # A completion signal accepts the stream: a finish_reason set on any
+            # chunk, a usage-only final chunk (OpenAI include_usage sends one with
+            # empty choices), or the [DONE]/done marker above. Everything else — a
+            # clean close with a content-only last chunk, a partial last line, or
+            # nothing at all — is retried like a dropped connection when no token
+            # reached on_token, and raises a RuntimeError naming the provider once
+            # one did (the error-event path's shape, HARDEN-11 B).
+            if (not _seen_done and meta.finish_reason is None
+                    and meta.completion_tokens is None):
+                if parts:
+                    raise RuntimeError(
+                        f"stream from {url} ended mid-reply with "
+                        f"{meta.content_chunks} chunk(s) but no finish_reason "
+                        f"and no [DONE] "
+                        f"(after {_stream_attempt} retr"
+                        f"{'y' if _stream_attempt == 1 else 'ies'}, "
+                        f"tokens already emitted)"
+                    ) from None
+                if _stream_attempt >= error_retries:
+                    raise RuntimeError(
+                        f"stream from {url} ended mid-reply before any token "
+                        f"and never sent [DONE], a finish_reason or usage "
+                        f"(after {_stream_attempt} retr"
+                        f"{'y' if _stream_attempt == 1 else 'ies'})"
+                    ) from None
+                msg = (
+                    f"stream from {url} ended mid-reply before any token "
+                    f"and never sent [DONE], a finish_reason or usage, "
+                    f"waiting {error_retry_wait_sec:.1f}s and retrying "
+                    f"(attempt {_stream_attempt + 1}/{error_retries})"
+                )
+                retry_after(msg, error_retry_wait_sec)
+                _stream_attempt += 1
+                continue
             break
         except _StreamErrorEvent as e:
             # HARDEN-11 B: before any token has been passed on this is retried
@@ -3390,7 +3447,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
             )
             retry_after(msg, wait_s)
             _stream_attempt += 1
-        except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
+        except _RETRYABLE_TRANSPORT_ERRORS as e:
             if parts or _stream_attempt >= error_retries:
                 raise RuntimeError(
                     f"{type(e).__name__} reading stream from {url}: {e} "

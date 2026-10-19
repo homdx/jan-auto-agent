@@ -1,10 +1,10 @@
 # HARDEN-23 — a streaming reply cut by a dropped connection is returned as complete; an `IncompleteRead` on a blocking reply is never retried; `mask_api_key` costs 10–17 s on one 20,000-character line
 
-**Status:** open
+**Status:** landed (round 321: laguna-s-2-1 as the base for A and B - a stream that ends with no [DONE], no finish_reason and no usage (so also a clean close after a whole content chunk) is retried while no token reached on_token and a RuntimeError naming the provider afterwards, an empty stream the same; http.client.HTTPException joins the retried transport errors of the blocking read, the stream read and _open() through one _RETRYABLE_TRANSPORT_ERRORS tuple (sensenova var4); C: the key-name patterns are anchored with (?<![\w.-]) (laguna), the blank-prefix of five patterns starts only at the start of a run of blanks, the XML attribute name is anchored, and the env attribute name has no dot - the own finds that made a line of 20,000 blanks, tabs, `apikey`, `env.` or `os.environ.` linear too)
 **Severity:** MEDIUM (A: half a JSON verdict, half a file or half a ticket is parsed as whole; C: a minified file stalls a call)
 **File:** `tools/llm_stream.py`
 **Symbol:** A: `request_completion` (the stream-reading loop). B: `request_completion` (`stream=False`, the read-loop `except`). C: `mask_api_key`
-**Round:** (set when the round starts)
+**Round:** 321
 **Size:** M
 **Depends on:** none
 **Also touches:** `tests_bugfix/` pins of HARDEN-11 (error event fails the call), `tests/`
@@ -58,3 +58,9 @@ One commit. The judge's checks are written after the round; the entries' tests a
 ## Not in scope
 
 An SSE event split over several `data:` lines (rare); the extractor shapes of Rust, React wrappers, arrow members, C#, Dart.
+
+## Why not the others (round 321)
+
+A black box of 103 checks (Part A streams over a local server: cuts at a chunk boundary, mid-line, empty, Ollama, the shapes that must stay good; Part B blocking and chunked IncompleteRead; Part C 24 long lines and 50 masks compared with the base) scored the base 77, laguna 103, var4 99, var3 96, step-5 96, var1 96, var2 93, agnes 81, glm 68 (nemotron shipped no code beyond a 3454-line `.fixed` copy and was not scored). Only laguna's rule for A rejects a stream cut after a whole content chunk, which is the usual proxy drop; var4, var3, step-5 and var2 accept a last chunk that parses, so a cut at a chunk boundary came back as the answer. var2 and agnes also reached outside the ticket: var2 rewrote the HARDEN-7 `reply_text` pins (a list became JSON), agnes touched `collect/*` and `repo_ingest`. Laguna's anchors did not make a line of blanks, `apikey` repeated or `env.` repeated linear (5-15 s each); var4's guards did not either. The judge's `--cross` was cut off: every cell on a tree with the slow mask ran into the 900 s cell timeout, so the others' tests were run on the ideal as copies instead (99 passed, 36 failed - the failures are the "complete last chunk is accepted" and "an empty stream is a reply" designs, glm's IncompleteRead built with an integer, and var2's collect pins). Two HARDEN-11 fakes got a [DONE] line because a stream with none is a truncation now.
+
+Open for the next tickets: a provider that really never sends a finish_reason, [DONE] or usage now fails after the retries (watch the first live run); `_BARE_TOKEN_CMP_BEFORE_RE` is still quadratic on a 20,000-blank run when called on its own (mask_api_key does not reach it with such a run).
