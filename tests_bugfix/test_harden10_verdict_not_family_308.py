@@ -161,7 +161,7 @@ class TestTheApprovalsOfHARDEN5AStay:
         assert approved is True
         assert unparseable is True
 
-    @pytest.mark.parametrize("reply", ["Normally fine", "NOPE", "Nope, works"])
+    @pytest.mark.parametrize("reply", ["Normally fine", "Nope, works"])  # a bare NOPE rejects since HARDEN-22 C
     def test_a_word_that_only_begins_with_no_is_prose(self, reply):
         assert _parse_verdict_soft(reply)[0] is True
 

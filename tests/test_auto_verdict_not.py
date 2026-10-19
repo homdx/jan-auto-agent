@@ -54,7 +54,7 @@ TABLE = [
     ("No - bad", False),
     ("REVISE: x", False),
     ("Normally", True),
-    ("NOPE", True),
+    ("NOPE", False),   # HARDEN-22 C: the whole word rejects
 ]
 
 

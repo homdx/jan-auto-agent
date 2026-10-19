@@ -993,11 +993,17 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     # accident). "Normally", "NOPE", "NOT APPROVED" stay where they are: the
     # NOT token needs a whole word after "NOT", so "NOPE" is not a NOT.
     _EN_NOT_BAD = _re.compile(r"^NOT\s+BAD\b")
+    #: The actions a validator can have "nothing of": "nothing to add", "nothing to fix".
+    #: `_EN_NOTHING_OK`'s `TO` shape and the `NEEDS` / `TO BE` shapes of HARDEN-22 A both
+    #: read this one vocabulary, so the two cannot disagree about what has to be done.
+    _EN_NOTHING_ACTIONS = (
+        r"ADD(?:S|ED|ING)?|FIX(?:ES|ED|ING)?|CHANGE(?:S|D|ING)?|"
+        r"IMPROVE(?:S|D|MENT)?|CORRECT(?:S|ED|ION)?|"
+        r"REPORT(?:S|ED|ING)?|FLAG(?:S|ED|ING)?|NOTE(?:S|D)?"
+    )
     _EN_NOTHING_OK = _re.compile(
         r"^NOTHING\s+(?:TO\s+)?"
-        r"(?:ADD(?:S|ED|ING)?|FIX(?:ES|ED|ING)?|CHANGE(?:S|D|ING)?|"
-        r"IMPROVE(?:S|D|MENT)?|CORRECT(?:S|ED|ION)?|"
-        r"REPORT(?:S|ED|ING)?|FLAG(?:S|ED|ING)?|NOTE(?:S|D)?|"
+        r"(?:" + _EN_NOTHING_ACTIONS + r"|"
         r"COMPLETELY\s+WRONG|WRONG|"
         r"FOUND|ISSUE(?:S)?|PROBLEM(?:S)?|CONCERN(?:S)?|"
         r"COMPLAINT(?:S)?|CONTRADICT(?:ORY|S|ING|ION(?:S)?)?)\b"
@@ -1080,19 +1086,43 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
                 return True
         return False
 
+    #: "Not approved" after an approval phrase is the verdict too ("No issues. Not approved.").
+    _EN_NOT_APPROVED = _re.compile(r"^NOT\s+(?:APPROVED|ACCEPTABLE|ACCEPTED|OK|READY)\b")
+
+    def _directive_reason(sent: str) -> "str | None":
+        """The reason when the sentence *sent* opens with a rejection directive.
+
+        HARDEN-22 B: one word list (`_EN_REJECT_HEAD`) decides whether a sentence that follows
+        an approval phrase is the verdict — before, the scan knew only REVISE / REJECT /
+        NEEDS REVISION, so "REJECTED: …", "Rejected - …" and "Needs revision: …" were missed.
+        """
+        up = _re.sub(r"^PLEASE\s+", "", sent.strip().upper())
+        hm = _EN_REJECT_HEAD.match(up) or _EN_NOT_APPROVED.match(up)
+        if not hm:
+            return None
+        if _EN_NOT_APPROVED.match(up):
+            return sent.strip()
+        return _en_rejection_reason(_re.sub(r"^\s*PLEASE\s+", "", sent, flags=_re.I), up)
+
     def _en_no_problem_verdict(line: str, upper: str) -> "tuple[bool, str] | None":
         """The verdict of a "No <problem>" reply, or ``None`` when *upper* is not one.
 
         "No contradictions found", "No errors", "No inconsistencies" (HARDEN-10 C), "No major
-        inconsistencies" (HARDEN-14 A) and the casual "No issues" / "No, it's good" are the way
-        the creative validator says there is nothing to fix, matched the way the Russian
-        «нет противоречий» already was, and before the standalone ``NO`` token, which took the
-        first problem word away as the reason. Each is an approval only when it is the whole
-        verdict: "No contradictions found, but Anna's age changes…", "No errors except one: …"
-        and "No issues." followed by a `REVISE:` or `REJECT:` line reject, with the reply's own
-        words as the reason.
+        inconsistencies" (HARDEN-14 A), the NOTHING / NOT denials of HARDEN-22 A ("Nothing is
+        wrong", "Nothing else to add", "Not seeing any issues") and the casual "No issues" /
+        "No, it's good" are the way the creative validator says there is nothing to fix,
+        matched the way the Russian «нет противоречий» already was, and before the standalone
+        ``NO`` token, which took the first problem word away as the reason. Each is an approval
+        only when it is the whole verdict: "No contradictions found, but Anna's age changes…",
+        "No errors except one: …" and "No issues." followed by a `REVISE:` or `REJECT:` line
+        reject, with the reply's own words as the reason.
         """
-        m = _EN_NO_PROBLEM.match(upper) or _EN_NO_PROBLEM_ADJ.match(upper) or _EN_DISCOURSE_OK.match(upper)
+        if _explicit_en_approval(upper):
+            # The classic NOT-family approvals ("NOTHING TO ADD", "NOTHING WRONG", "NOTE: …")
+            # stay prose: they are approved by the fail-open rule, never parsed here.
+            return None
+        m = (_EN_NO_PROBLEM.match(upper) or _EN_NO_PROBLEM_ADJ.match(upper)
+             or _EN_NOTHING_DENIAL.match(upper) or _EN_DISCOURSE_OK.match(upper))
         if not m:
             return None
         rest = upper[m.end():]
@@ -1102,14 +1132,23 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         # from the complaint, but the second clause names a problem and that is the complaint.
         if _names_a_problem(rest):
             return False, line.strip()
+        # HARDEN-22 B: a directive that opens a sentence on the approval's own line —
+        # "No contradictions. REVISE: fix the timeline." — not only on a later one.
+        tail = line.strip()[m.end():]
+        for sp in _EN_AFTER_STOP.finditer(tail.upper()):
+            sent = tail[sp.end():]
+            stop = _EN_SENTENCE_STOP.search(sent)
+            if stop:
+                sent = sent[:stop.end()]
+            reason = _directive_reason(sent)
+            if reason is not None:
+                return False, reason
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         later = lines[lines.index(line.strip()) + 1:] if line.strip() in lines else []
         for ln in later:
-            lu = ln.upper()
-            # The directive words of HARDEN-17 A ("REJECTED: …", "Needs revision: …"), not only REVISE / REJECT:
-            # "No issues.\nREJECTED: the date breaks" was approved by every entry of round 315.
-            if _re.match(r"(?:REVISE|REJECT(?:ED)?|NEEDS?\s+(?:REVISION|WORK|CHANGES))\b", lu):
-                return False, _en_rejection_reason(ln, lu)
+            reason = _directive_reason(ln)
+            if reason is not None:
+                return False, reason
         return True, ""
 
     # ── HARDEN-14 A: the problem side of the NOT family — the approvals ──────
@@ -1121,7 +1160,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     # "Not suitable" and "Not plausible" are live rejections — a reviewer's note
     # about fit, not a problem named and denied.
     _EN_NOT_PROBLEM_WORDS = frozenset((
-        "PROBLEM", "PROBLEMS", "ISSUE", "ISSUES", "CONTRADICTION", "CONTRADICTIONS",
+        "PROBLEM", "PROBLEMS", "PROBLEMATIC", "AMISS", "ISSUE", "ISSUES", "CONTRADICTION", "CONTRADICTIONS",
         "CONTRADICTORY", "CONFLICT", "CONFLICTS", "ERROR", "ERRORS", "FLAW", "FLAWS",
         "INCONSISTENCY", "INCONSISTENCIES", "INCONSISTENT", "VIOLATION", "VIOLATIONS",
         "OBJECTION", "OBJECTIONS", "DEFECT", "DEFECTS", "AMBIGUITY", "AMBIGUITIES",
@@ -1142,7 +1181,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     #: "No" and the problem word is an adjective, not the problem (HARDEN-14 A).
     _EN_NO_ADJECTIVES = (
         r"(?:MAJOR|MINOR|SIGNIFICANT|INSIGNIFICANT|SERIOUS|SEVERE|NOTICEABLE|NOTED|"
-        r"OBSERVED|APPARENT|CLEAR|REAL|ACTUAL|SUCH|OTHER|FURTHER|ADDITIONAL|ANY|"
+        r"OBSERVED|APPARENT|CLEAR|REAL|ACTUAL|SUCH|OTHER|ELSE|FURTHER|ADDITIONAL|ANY|"
         r"MORE|MOST|NEW|REMAINING|OUTSTANDING|OBVIOUS|GLARING|MATERIAL|NOTABLE|"
         r"FACTUAL|CONTINUITY|PLOT|TIMELINE)\s+"
     )
@@ -1151,6 +1190,62 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"(?:" + _EN_PROBLEM_NOUNS + r")\b"
         r"(?:\s+(?:FOUND|REMAIN(?:ING)?|LEFT|DETECTED))?"
     )
+
+    #: The verbs the `NEEDS` / `TO BE` shapes admit that the bare `TO` shape of
+    #: `_EN_NOTHING_OK` does not: "nothing to revise" is a denial, but "nothing revised"
+    #: would read the other way, so these follow a connector only (HARDEN-22 A).
+    _EN_NOTHING_ACTIONS_VERB = (
+        r"REVISE(?:D|S|ING)?|REVISION(?:S)?|MENTION(?:S|ED|ING)?|AMEND(?:S|ED|ING)?|"
+        r"RAISE(?:D|S|ING)?|EDIT(?:S|ED|ING)?|WORK(?:S|ED|ING)?"
+    )
+    #: The participles a "NOTHING" denial can end on: "nothing major was found", "nothing
+    #: serious detected". They stay out of `_EN_NOT_PROBLEM_WORDS` on purpose — "NOT FOUND"
+    #: is a missing thing, not a denied problem.
+    _EN_NOT_FOUND_PARTICIPLES = (
+        r"FOUND|DETECTED|NOTED|NOTICED|RAISED|OBSERVED|SPOTTED|IDENTIFIED|LISTED|RECORDED|MISSING|LACKING|OFF"
+    )
+    #: A problem stated as a phrase rather than a word: "nothing is out of character",
+    #: "nothing is out of line" — the denial is of the phrase, not of a single word.
+    _EN_PROBLEM_PHRASES = r"OUT\s+OF\s+(?:CHARACTER|LINE|CONTEXT|PLACE|PLACEMENT)"
+
+    #: The denial an English validator writes when there is nothing to fix, in the shapes
+    #: HARDEN-14 A's problem-word rule did not cover. An adjective stands between
+    #: "NOTHING" and the finding ("Nothing major was found"), the verb is an auxiliary
+    #: ("Nothing needs fixing", "Nothing to be corrected"), a copula links them
+    #: ("Nothing is wrong", "Nothing seems inconsistent"), "ELSE" stands in for the problem
+    #: ("Nothing else to add"), and "NOT SEEING ANY <problem>" denies the problem without
+    #: the word "NOTHING". One decision for the whole family: the adjectives are
+    #: `_EN_NO_ADJECTIVES`, the problem words `_EN_NOT_PROBLEM_WORDS`, the actions
+    #: `_EN_NOTHING_ACTIONS` — no second word list beside them (HARDEN-22 A).
+    _EN_NOTHING_DENIAL = _re.compile(
+        r"(?:"
+        r"(?:(?:NO\s*[,.:;]?\s+)?)?NOTHING\b\s*(?:"
+        r"(?:" + _EN_NO_ADJECTIVES + r")*"
+        r"(?:TO\s+(?:BE\s+)?|NEEDS?\s+(?:TO\s+(?:BE\s+)?)?|REQUIRES?\s+|REMAINS?\s+TO\s+(?:BE\s+)?)"
+        r"(?:" + _EN_NOTHING_ACTIONS + r"|" + _EN_NOTHING_ACTIONS_VERB + r")\b"
+        r"|"
+        r"(?:" + _EN_NO_ADJECTIVES + r")*"
+        r"(?:WAS\s+|WERE\s+|IS\s+|ARE\s+|SEEMS?\s+|APPEARS?\s+|LOOKS?\s+|FEELS?\s+|HOLDS?\s+)?"
+        r"(?:(?:AT\s+ALL|COMPLETELY|ENTIRELY|FULLY|QUITE|VERY|TOO|MUCH|PARTIALLY|ESPECIALLY|JUST|ONLY)\s+)?"
+        r"(?:" + "|".join(sorted(_EN_NOT_PROBLEM_WORDS)) + r"|"
+        + _EN_NOT_FOUND_PARTICIPLES + r"|" + _EN_PROBLEM_PHRASES + r")\b"
+        r")"
+        r"|"
+        r"(?:(?:NO\s*[,.:;]?\s+)?)?NOT\s+"
+        r"(?:FIND|FINDS|FINDING|SEE|SEES|SEEN|SEEING|SEEM|SEEMS|SEEMED|NOTICE|NOTICES|NOTICED|NOTICING|"
+        r"APPEAR|APPEARS|APPEARED|LOOK|LOOKS|LOOKED)\s+"
+        r"(?:(?:ANY|A|AN|THE|SUCH|ANY\s+OTHER)\s+)?"
+        r"(?:" + "|".join(sorted(_EN_NOT_PROBLEM_WORDS)) + r"|"
+        + _EN_NOT_FOUND_PARTICIPLES + r")\b"
+        r")"
+    )
+
+    #: The start of a sentence after an approval phrase: a stop on the same line, a
+    #: semicolon, or a new line. HARDEN-22 B — "No contradictions. REVISE: fix the
+    #: timeline." put the order on the approval's own line, so a later-line scan never saw
+    #: it, and "No issues; REVISE: fix X." was approved the same way.
+    _EN_AFTER_STOP = _re.compile(r"(?:^|[.!?;]\s+|\n)")
+    _EN_SENTENCE_STOP = _re.compile(r"[.!?]+(?=\s+\S)")
 
     #: The words a creative validator opens an approval with. HARDEN-17 A: the parser
     #: returned on `APPROVED` and `OK` and failed open for everything else, so "Looks good,
@@ -1205,7 +1300,14 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         read as an approval ("NOT APPROVED" → "APPROVED"), which is exactly what
         the Coder would be told to fix.
         """
-        if _explicit_en_approval(upper):
+        m0 = _EN_NOT_BAD.match(upper) or _EN_NOTHING_OK.match(upper) or _EN_NOTE.match(upper)
+        if m0 is not None:
+            tail = upper[m0.end():]
+            # "Nothing wrong, but the ring is stolen": the contrast is the verdict, not the
+            # denial. These are approved by the fail-open rule, so without this the denial
+            # that turned into a complaint would ship the chapter (HARDEN-22 B's caveat rule).
+            if _EN_CLAUSE_CAVEAT.search(tail) or _names_a_problem(tail):
+                return line.strip()
             # "NOT BAD", "NOTHING TO ADD", "NOTE: …" — prose that the fail-open rules
             # approve, never a rejection.
             return None
@@ -1243,6 +1345,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     _EN_REJECT_HEAD = _re.compile(
         r"^(?:REJECT(?:ED)?"
         r"|REVISE"
+        r"|INCORRECT"
         r"|NEED(?:S|ING)?\s+(?:A\s+|ANOTHER\s+|ANY\s+|MORE\s+|SOME\s+|FURTHER\s+|TO\s+BE\s+)?(?:REVISIONS?|REWRITE|REWRITTEN|WORK|CHANGES?|FIX(?:ES|ING)?|EDITS?)"
         r"|REWRITE(?:N)?|REWROTE|FAIL(?:ED|S|ING|URE)?|DISAPPROVED|UNACCEPTABLE)"
         r"\b"
@@ -1273,6 +1376,12 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             if _verdict_token_at_start(upper, token):
                 rest = line.strip()[len(token):].lstrip(": ").strip()
                 return rest if rest else "validator rejected (no reason given)"
+        # HARDEN-22 C: a reply that is the word "Nope" alone rejects, in any case; it has no
+        # verdict token, so it used to fall open to an approval. "Nope, works" (HARDEN-10 C) is
+        # not that reply: with words after it the "nope" may answer "any problems?", so it stays
+        # prose, and so does any word that merely begins with NO (HARDEN-1 A1).
+        if _normalise(line) == "nope":
+            return line.strip()
         return _en_not_family_reason(line, upper)
 
     # ── Scan: first try the first non-empty line; fall back to whole text ──

@@ -49,9 +49,11 @@ class TestAWordThatBeginsWithAVerdictTokenIsNotAVerdict:
         approved, _reason, unparseable = _parse_verdict_soft("Normally fine")
         assert approved is True and unparseable is True
 
-    def test_nope_is_not_a_rejection(self):
-        approved, _reason, unparseable = _parse_verdict_soft("NOPE")
-        assert approved is True and unparseable is True
+    def test_nope_is_a_rejection_of_its_own(self):
+        """HARDEN-22 C: NOPE is the whole word "nope", not a NO token with the tail PE, and it rejects."""
+        approved, reason, unparseable = _parse_verdict_soft("NOPE")
+        assert approved is False and unparseable is False
+        assert reason == "NOPE"
 
     def test_the_reason_is_never_the_words_own_tail(self):
         for reply in ("NOT BAD", "Nothing to add, looks good", "NOTE: fine",

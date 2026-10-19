@@ -1,10 +1,10 @@
 # HARDEN-22 — `Nothing major was found.`, `Nothing else to add.`, `Nothing is wrong.`, `Nothing needs fixing.`, `Not seeing any issues.` are rejections; `No contradictions. REVISE: fix the timeline.` is an approval; `Incorrect:` and `Nope` fail open; a dead constant
 
-**Status:** open
+**Status:** landed (round 320: sensenova-6-8-flash-lite-var4 as the base — A: one `_EN_NOTHING_DENIAL` over the shared adjective, problem-word and `_EN_NOTHING_ACTIONS` lists approves `Nothing major was found`, `Nothing else to add`, `Nothing is wrong`, `Nothing needs fixing`, `Not seeing any issues` and the same after a leading `No,` with an empty reason; the HARDEN-14 rejections stay and a denial that goes on with a contrast or a named problem rejects; B: one `_EN_REJECT_HEAD` decides for a directive after a stop on the approval's own line and on a later line (`No contradictions. REVISE: …`, `Rejected -`, `Needs revision:`), plus my own finds `Not approved` and `Please revise`; C: `Incorrect` is a reject head and a reply that is the bare word `Nope` (any case) rejects, while `Nope, works` stays prose as HARDEN-10 C pinned it; D: the ticket was wrong, `_EN_NOT_NEGATES_APPROVAL` is read in `_EN_APPROVAL_HEAD` and stays; own finds `Nothing needs to change`, `Nothing remains to be fixed`, `Not finding any issues`, `Nothing is missing`, `Nothing is lacking`, `Nothing is off`)
 **Severity:** MEDIUM (a clean chapter goes back to be "fixed" with its own approval as the reason; one rejection ships)
 **File:** `tools/auto/inner_loop.py`
 **Symbol:** `_parse_verdict_soft`, `_en_not_family_reason`, `_EN_NOTHING_OK`, `_EN_NOT_FILLERS`, `_EN_NO_PROBLEM_ADJ`, `_en_no_problem_verdict`, `_EN_NO_PROBLEM_CAVEAT`, `_EN_NOT_NEGATES_APPROVAL`
-**Round:** (set when the round starts)
+**Round:** 320
 **Size:** S
 **Depends on:** HARDEN-17 (315, the same function; land after it)
 **Also touches:** `tests_bugfix/` pins of HARDEN-5 A, HARDEN-10 C, HARDEN-14 A (must stay green), `tests/`
@@ -88,3 +88,11 @@ One commit. The judge's own checks are written after the round, from the entries
 ## Not in scope
 
 Rust; the mask (HARDEN-15, 16, 19); Russian verdict words other than regressions.
+
+---
+
+## Why not the others (round 320)
+
+A black box of 61 replies (the Part A approvals, the HARDEN-14 rejections that must stay, Part B directives after a stop, Part C, guards) scored the base 32, glm 49, nemotron 48 (it left a 2400-line `.backup` file), step-5 57, agnes 58, var3 59, var4 60; the ideal 61. var4 was the smallest entry that kept every pin of HARDEN-5 A, 10 C and 14 A green. var3 and agnes rewrote the HARDEN-1 A1 / 10 C pins wholesale (`NOPE` and `Nope, works`, the `unparseable` flag of the NOT-family approvals), which the ticket forbids; the only pin moved here is the bare `NOPE`, because Part C asks for it; step-5 deleted the constant Part D asked about and broke nothing, but its denials missed `Not finding` and `Nothing needs to be fixed`; glm's tests asserted the bug. A probe of 59 further replies found the gaps now folded in. The cross matrix showed no behaviour lead outside the `NOPE` choice and the shape of a reason.
+
+Open for the next tickets: `Nothing here contradicts the outline.` and `No issues. Reject nothing.` are still read as rejections; a one-word `Nope` in a longer reply (`Nope, the date is wrong.`) is a fail-open approval until a pin of HARDEN-10 C is reopened.
