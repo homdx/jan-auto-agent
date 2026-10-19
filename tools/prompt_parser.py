@@ -14,6 +14,72 @@ class ParsedPrompt:
     raw: str              # Original prompt
 
 
+#: Strategy A's declaration keywords. A keyword is what introduces the symbol, so it can never
+#: be the symbol itself.
+_DECLARATION_KEYWORDS = "def|class|function|func"
+
+#: Strategy C's stopwords: the intent and filler words, plus the declaration keywords. Without the
+#: keywords, a verified head that falls through (`the parse_data class represent`) would hand
+#: `class` over as the target, because `class` does occur in the source (HARDEN-20 C).
+_CANDIDATE_STOPWORDS = (
+    "show|improve|explain|find|view|display|me|the|in|from|optimize|fix|refactor|correct"
+    "|get|read|describe|understand|doc|" + _DECLARATION_KEYWORDS
+)
+
+
+#: Prose that stands where a symbol would be when there is no source to look the name up in (the
+#: first, source-less pass of `main.py`, and a caller with no file): the question words and the
+#: verbs a sentence puts after "the X function" — "what does the handle_request function return".
+#: Applied only without a source; with one, the definition test is the judge and a symbol that is
+#: really called `fail` or `work` is found as such.
+_PROSE_WORDS = frozenset((
+    "what", "how", "why", "when", "where", "which", "who", "does", "do", "did", "is", "are", "was",
+    "were", "tell", "about", "this", "that", "these", "those", "it", "its", "can", "could", "would",
+    "should", "will", "and", "or", "of", "to", "for", "with", "work", "works", "working", "return",
+    "returns", "returning", "fail", "fails", "failing", "represent", "represents", "mean", "means",
+    "raise", "raises", "throw", "throws", "take", "takes", "accept", "accepts", "compute", "computes",
+    "behave", "behaves", "handle", "handles", "break", "breaks", "crash", "crashes", "wrong",
+))
+_PROSE_WORD_RE = re.compile(r"\b(?:" + "|".join(sorted(_PROSE_WORDS, key=len, reverse=True)) + r")\b", re.IGNORECASE)
+
+
+def _declaration_head_is_a_symbol(remainder: str, match: "re.Match[str]", source: str) -> bool:
+    """True when Strategy A's head names a **symbol** rather than a verb (HARDEN-20 C).
+
+    `parse_prompt`'s first strategy is `\\b(def|class|function|func)\\s+(name)\\b`, which takes
+    whatever word follows the keyword and short-circuits the strategies that would find the
+    real symbol, so "what does the handle_request function return" came out with
+    `target_name="return"`. The match is therefore validated the way the later strategy
+    validates a candidate: the name must be a symbol of *source*, or be written in the
+    prompt as a code reference — followed straight away by `(` or `:`.
+
+    A plain word search in the source is not the test here: a prose verb like `return` occurs
+    in every file that returns anything, so the head would still be taken for the symbol. A
+    definition position is what counts — `def name`, `class name`, `function name`,
+    `func name`, or an assignment or annotation to it (`name =`, `name:`).
+
+    With no *source* there is nothing to verify against, so the head is accepted as before:
+    an unverifiable match is not a rejection.
+    """
+    name = re.escape(match.group(2))
+    if not source:
+        # Nothing to verify against, so the name cannot be looked up: a prose word after the keyword
+        # ("function return", "class represent") is a verb, a code reference (`def f(`, `class A:`)
+        # and any other word are taken as before.
+        if re.match(r'[ \t]*[(:]', remainder[match.end():]):
+            return True
+        return match.group(2).lower() not in _PROSE_WORDS
+    if match.group(1) in ("def", "func"):
+        return True                      # a prefix keyword: the word after it is the name, defined yet or not
+    if re.search(r'\b(?:def|class|function|func)\s+' + name + r'\b', source):
+        return True
+    if re.search(r'\b' + name + r'\s*[=:]', source):
+        return True
+    if re.match(r'[ \t]*[(:]', remainder[match.end():]):
+        return True                      # `def handle_request(`, written as a code reference
+    return False
+
+
 def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     """
     Attempts to break down the natural language prompt into structured tokens
@@ -40,9 +106,11 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     target_name = ""
     target_type = "unknown"
 
-    # Strategy A: Target explicit language declaration keywords
-    decl_match = re.search(r'\b(def|class|function|func)\s+([A-Za-z_][\w]*)\b', remainder)
-    if decl_match:
+    # Strategy A: Target explicit language declaration keywords. HARDEN-20 C: the head is
+    # validated before it wins — a verb after the keyword (`... function return`) falls through
+    # to the strategies that find the real symbol.
+    decl_match = re.search(r'\b(' + _DECLARATION_KEYWORDS + r')\s+([A-Za-z_][\w]*)\b', remainder)
+    if decl_match and _declaration_head_is_a_symbol(remainder, decl_match, source):
         kw, name = decl_match.group(1), decl_match.group(2)
         target_name = name
         target_type = "class" if kw == "class" else "function"
@@ -58,7 +126,9 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
             ).strip()
         else:
             # Strategy C: the single standalone identifier word, accepted only if it exists in the source.
-            clean_rem = re.sub(r'\b(show|improve|explain|find|view|display|me|the|in|from|optimize|fix|refactor|correct|get|read|describe|understand|doc)\b', ' ', remainder, flags=re.IGNORECASE).strip()
+            clean_rem = re.sub(r'\b(' + _CANDIDATE_STOPWORDS + r')\b', ' ', remainder, flags=re.IGNORECASE).strip()
+            if not source:
+                clean_rem = _PROSE_WORD_RE.sub(' ', clean_rem).strip()   # no source to check a word against
             words = clean_rem.split()
             valid_identifiers = [w for w in words if re.match(r'^[A-Za-z_][\w]*$', w)]
             for candidate in valid_identifiers:

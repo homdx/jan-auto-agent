@@ -217,6 +217,11 @@ _LANG_OF_EXT = {
     **{e: "c" for e in (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx")},
     **{e: "js" for e in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")},
 }
+#: HARDEN-20 A: the extensions whose `=>` sits in a **typed** language. Only there can the bare word
+#: after a property arrow's `=>` be a *type* (`onSave: (v: string) => void`) rather than the
+#: arrow's body (`noop: () => undefined`, `isOn: () => true`, `f: (a) => fallback`). JavaScript has
+#: no type position after a `=>`, so a bare word there is always an expression.
+_TYPESCRIPT_EXTS = frozenset({".ts", ".tsx", ".mts", ".cts", ".d.ts"})
 #: a Rust char literal: `'a'`, `'\n'`, `'\x41'`, `'\u{1F600}'`; any other `'` is a lifetime or a label
 _RUST_CHAR = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]{1,6}\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'")
 #: words after which a JS `/` starts a regex literal, not a division
@@ -923,7 +928,9 @@ def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: boo
     return None
 
 
-def _find_earliest_genuine_definition(source: str, target_name: str, lang: str = "") -> Optional[tuple]:
+def _find_earliest_genuine_definition(
+    source: str, target_name: str, lang: str = "", typed_lang: bool = False
+) -> Optional[tuple]:
     """
     Search every brace-language candidate pattern for `target_name` and
     return (match_start, open_brace_index, close_brace_end_index) for the
@@ -994,7 +1001,7 @@ def _find_earliest_genuine_definition(source: str, target_name: str, lang: str =
     # has no `const` and no `function` in front of it, and it is how handlers, reducers, route
     # tables and action maps are written. It is last of the four passes, so it can only turn a
     # "not found" into a found block.
-    return _find_earliest_property_arrow_definition(source, target_name, lang)
+    return _find_earliest_property_arrow_definition(source, target_name, lang, typed_lang=typed_lang)
 
 
 def _property_arrow_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
@@ -1143,7 +1150,7 @@ _TYPE_UNION_TAIL = re.compile(r"(?:\s*[|&]\s*[A-Za-z_$][\w$.]*(?:<[^;()]*>)?(?:\
 
 
 def _property_arrow_value_is_type(source: str, after_arrow: int,
-                                 head_typed: bool = False) -> bool:
+                                  head_typed: bool = False, typed_lang: bool = True) -> bool:
     """True when what follows a `=>` at *after_arrow* is a **type**, not a value (HARDEN-14 B2).
 
     A TypeScript type member has a type after the `=>` and then `;`, `,` or `)` and no body:
@@ -1155,11 +1162,19 @@ def _property_arrow_value_is_type(source: str, after_arrow: int,
     that declares its return type is a typed arrow function — a definition — whatever
     follows, which is what keeps the HARDEN-9 E row `typed: <T>(x: T): T => x` found.
 
+    HARDEN-20 A: *typed_lang* is False for `.js`/`.jsx`, which have no type position after a
+    `=>` — there a bare word, `null`, `undefined`, `true`, `false` or an identifier is the
+    arrow's **body** (`noop: () => undefined`, `isOn: () => true`, `f: (a) => fallback`), so
+    the whole type test is skipped and the row is found. TypeScript keeps the test.
+
     The test is otherwise the shape of what follows: a type is a name (possibly templated)
     followed immediately by a terminator, an expression is a call, an operator or a literal.
     """
     if head_typed:
         return False
+    if not typed_lang:
+        return False                    # JavaScript: a bare word after the `=>` is a body, not a type
+
     n = len(source)
     i = after_arrow
     while i < n and source[i] in " \t\r\n":
@@ -1219,6 +1234,36 @@ def _property_arrow_value_is_type(source: str, after_arrow: int,
 _PROPERTY_BARE_ARROW = re.compile(r"[ \t]*=>")
 
 
+def _arrow_params_are_annotated(source: str, open_paren: int) -> bool:
+    """True when the parameter list that opens at *open_paren* annotates a parameter with a type
+    (`(value: string)`, `(a, b?: number)`) — syntax only TypeScript (or Flow) has (HARDEN-20 A).
+
+    A `.js` file has no type position after a `=>`, so `h: (a) => undefined` is a body there; but
+    `onSave: (value: string) => void;` in a `.js` file is a type member written in TypeScript
+    syntax, and the HARDEN-14 B2 rejection stays for it. Only the top level of the list counts:
+    `(a = {x: 1})` and `({a: b})` carry a colon that is an object's, not an annotation.
+    """
+    depth = 0
+    start = open_paren + 1
+    i = start
+    n = len(source)
+    parts = []
+    while i < n and i < open_paren + 2000:
+        ch = source[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                parts.append(source[start:i])
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(source[start:i])
+            start = i + 1
+        i += 1
+    return any(re.match(r"\s*[A-Za-z_$][\w$]*\s*\??\s*:", part) for part in parts)
+
+
 def _property_arrow_tail(source: str, match: "re.Match[str]") -> "tuple[int, bool] | None":
     """`(index just past the head's `=>`, whether the head declared a return type)` for a
     property-arrow head *match*, or ``(None, False)`` when the shape is not a function.
@@ -1239,7 +1284,7 @@ def _property_arrow_tail(source: str, match: "re.Match[str]") -> "tuple[int, boo
 
 
 def _find_earliest_property_arrow_definition(
-    source: str, target_name: str, lang: str = ""
+    source: str, target_name: str, lang: str = "", typed_lang: bool = False
 ) -> Optional[tuple]:
     """The earliest object-literal-property arrow definition of `target_name`
     (HARDEN-9 E, HARDEN-14 B2), as `(match_start, open_brace, end)`.
@@ -1268,7 +1313,11 @@ def _find_earliest_property_arrow_definition(
             tail_start, head_typed = _property_arrow_tail(source, match)
             if tail_start is None:
                 continue
-            if _property_arrow_value_is_type(source, tail_start, head_typed):
+            if _property_arrow_value_is_type(
+                source, tail_start, head_typed,
+                typed_lang or (source[match.end() - 1:match.end()] == "("
+                               and _arrow_params_are_annotated(source, match.end() - 1)),
+            ):
                 continue
             # The head already consumed the parameters, the annotation and the `=>`, so a braced
             # body opens at the very next `{`. A `{` anywhere further on belongs to something else
@@ -1298,7 +1347,11 @@ def _find_earliest_property_arrow_definition(
             tail_start, head_typed = _property_arrow_tail(source, match)
             if tail_start is None:
                 continue
-            if _property_arrow_value_is_type(source, tail_start, head_typed):
+            if _property_arrow_value_is_type(
+                source, tail_start, head_typed,
+                typed_lang or (source[match.end() - 1:match.end()] == "("
+                               and _arrow_params_are_annotated(source, match.end() - 1)),
+            ):
                 continue
             # The head already consumed the parameters, so the body starts right after the `=>`.
             end = _find_definition_end_bodyless(source, tail_start, False, lang,
@@ -1580,8 +1633,9 @@ def _find_earliest_declaration(source: str, target_name: str, lang: str = "") ->
     return (best_match_start, None, best_end)
 
 
-def _extract_brace_block(source: str, target_name: str, lang: str = "") -> str:
-    found = _find_earliest_genuine_definition(source, target_name, lang)
+def _extract_brace_block(source: str, target_name: str, lang: str = "",
+                         typed_lang: bool = False) -> str:
+    found = _find_earliest_genuine_definition(source, target_name, lang, typed_lang=typed_lang)
     if found is None:
         return ""
 
@@ -1713,7 +1767,8 @@ def _extract_block_named(source: str, target_name: str, ext: str) -> str:
     if ext == ".py":
         return _extract_python_block(source, target_name)
     # Default to brace-based strategy for JS/TS/Go/Java/C/C++/Rust/etc.
-    return _extract_brace_block(source, target_name, _LANG_OF_EXT.get(ext, ""))
+    return _extract_brace_block(source, target_name, _LANG_OF_EXT.get(ext, ""),
+                                typed_lang=ext in _TYPESCRIPT_EXTS)
 
 
 def extract_block(source: str, target_name: str, file_ext: str) -> str:
@@ -2070,7 +2125,9 @@ def _find_block_start_line_fallback(source: str, target_name: str, file_ext: str
         return None
 
     # The earliest real definition is used, not the first pattern that matches, so a call site cannot pre-empt it (AUTO-BUG).
-    found = _find_earliest_genuine_definition(source, target_name, _LANG_OF_EXT.get(ext, ""))
+    found = _find_earliest_genuine_definition(
+        source, target_name, _LANG_OF_EXT.get(ext, ""), typed_lang=ext in _TYPESCRIPT_EXTS
+    )
     if found is None:
         return None
     match_start, _open_idx, _end = found

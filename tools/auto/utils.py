@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tools.actions import _edit_line_ends
+
 logger = logging.getLogger(__name__)
 
 
@@ -236,46 +238,23 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
 def in_style_of(dest: Path, content: str) -> str:
     """*content* with *dest*'s line ends and its BOM. The model writes LF and no BOM.
 
-    v13 (TA-4): the line ends are decided per line, as `/edit` does (`_edit_line_ends`): a reply line that
-    equals an original line keeps that line's own ending, used once; a changed or new line takes the file's
-    majority ending. So an untouched LF line of a mixed file stays LF. For a uniform file the result is the
-    same as the old whole-file rule.
+    HARDEN-20 B: this calls the one shared rule, `_edit_line_ends` (tools/actions.py), instead
+    of keeping its own copy. That copy had flattened a mixed file: every line took the file's
+    majority ending, so a single LF line among CRLF lines edited on one line produced a diff
+    of every line that did not match the majority. Now a reply line that still equals an
+    original line keeps that line's own ending, used once, and a changed or a new line takes
+    the majority ending — which for a uniform file is the whole old rule, unchanged.
+
+    Fail-open: a file that cannot be read comes back as *content*, and an empty one as LF, so
+    a missing destination never raises into a run.
     """
     try:
         raw = dest.read_bytes()
     except OSError:
         return content
     if not raw:
-        text = content.replace("\r\n", "\n")
-    else:
-        majority_crlf = raw.count(b"\r\n") * 2 > raw.count(b"\n")
-        changed_ending = "\r\n" if majority_crlf else "\n"
-        by_text: dict = {}
-        for line in raw.decode("utf-8", errors="replace").splitlines(keepends=True):
-            body = line.rstrip("\r\n")
-            by_text.setdefault(body, []).append(line[len(body):])
-        parts = content.replace("\r\n", "\n").split("\n")
-        out: list = []
-        last = len(parts) - 1
-        for pos, body in enumerate(parts):
-            if pos == last and body == "":
-                out.append("")
-                continue
-            if pos == last:
-                out.append(body)                  # the reply's last line: no ending unless it wrote one
-                continue
-            # v13 (TA-4 follow-up): an unterminated original last line has an EMPTY ending; it may only
-            # be used by the reply's last line, or two lines are glued (`beta` + `alpha` -> `betaalpha`).
-            endings = [e for e in by_text.get(body, []) if e]
-            if endings:
-                by_text[body].remove(endings[0])
-                out.append(body + endings[0])
-            else:
-                out.append(body + changed_ending)
-        text = "".join(out)
-    if raw.startswith(b"\xef\xbb\xbf") and not text.startswith("\ufeff"):
-        text = "\ufeff" + text
-    return text
+        return content.replace("\r\n", "\n")
+    return _edit_line_ends(str(dest), content)
 
 
 def _cfg_mode(

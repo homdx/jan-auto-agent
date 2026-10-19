@@ -398,8 +398,11 @@ _FENCE_BLOCK = _fence_block(_NEXT_ENTRY)
 
 def _task_section_pattern(task_id: str, known_ids=None) -> re.Pattern:
     next_entry = _next_entry(known_ids)
+    # HARDEN-20 D: the heading is anchored at a line start, so an entry that *quotes* another
+    # entry's heading mid-line (``… see ### AUTO-2: title …``) is not cut by removing that other
+    # entry: the quote is prose inside this entry's body, not the heading itself.
     return re.compile(
-        r"### " + re.escape(task_id) + r":"
+        r"(?m)^### " + re.escape(task_id) + r":"
         r"(?:" + _fence_block(next_entry) + r"|.)*?"
         r"(?:\n-{3,}\n+(?=" + next_entry + r"|\Z)"
         r"|(?=\n## Manual Suggestions|\Z))",

@@ -1,10 +1,10 @@
 # HARDEN-20 — `h: (a) => undefined,` is not found in JavaScript (a regression of HARDEN-14); the Coder flattens the line endings of a mixed file; "what does the `handle_request` function return" names `return` as the symbol; a task removed from IMPROVEMENTS.md cuts the entry that quotes its heading; a ticket's claims are announced differently by the judge and by the export
 
-**Status:** open
+**Status:** landed (round 318: sensenova-6-8-flash-lite-var4 as the base — A: the property-arrow type test runs for the TypeScript extensions only, and a `.js` head with a typed parameter (`onSave: (value: string) => void;`) is still a type member, so the HARDEN-14 B2 pins stay unchanged; B: `in_style_of` calls `_edit_line_ends`, which decodes the original in the codec `_read_edit_target` chose and strips a leading BOM before the match; C: the declaration head is validated against the source's definitions or a code reference; D: the heading is anchored at a line start; E: the export asks the judge's `_claims_section`, the heading reaches six levels and the lines come from `splitlines()`; judging added the source-less prompt (the first pass of `main.py` has no source: question words and the verbs after "the X function" are not a symbol), `def`/`func` as a prefix keyword that names its word whether or not the source defines it yet, the `.js` typed-parameter head, and an empty file's LF ending in the shared rule)
 **Severity:** MEDIUM (A: Gate 1 rejects a real symbol as a hallucination; C: the prompt parser names the wrong symbol, silently); LOW-MEDIUM (B: a diff of every line that does not match the majority; E: claims judged but never announced, or lost on a CRLF ticket); LOW (D)
 **File:** `tools/block_extractor.py` (A), `tools/auto/utils.py` and `tools/auto/coder.py` (B), `tools/prompt_parser.py` (C), `tools/auto/plan_validator.py` (D), `scripts/judge_epic_round.py` and `tools/contest/export.py` (E)
 **Symbol:** A: the property-arrow patterns (HARDEN-14 B2). B: `in_style_of`, `_edit_line_ends`. C: `parse_prompt`, strategy A (`decl_match`). D: `_task_section_pattern`, `_without_section`. E: `_claims_section`, `_CLAIMS_HEADING`, `_has_claims_heading`
-**Round:** (set when the round starts)
+**Round:** 318
 **Size:** M
 **Depends on:** HARDEN-14 (312), HARDEN-16 (314), both landed
 **Also touches:** the HARDEN-14 B and D tests (pins that must stay green), `tests/`, `tests_bugfix/`
@@ -142,3 +142,11 @@ One commit. The judge's checks are written after the round, from the entries; th
 ## Not in scope
 
 Rust, Ruby, C# and Dart arrow members, React wrappers (`useCallback`, `memo`, `forwardRef`) and `module.exports.f = …` (JS/TS shapes the project does not target; Python, Java and Kotlin only).
+
+---
+
+## Why not the others (round 318)
+
+Nine entries (step-5 shipped tests and no code; laguna and glm ended in ERROR, a 400 and a rate limit; nemotron left a dirty tree; glm's `_edit_line_ends` glues repeated last lines, 586 of 600 fuzz replies). A black box of 203 checks (JavaScript and TypeScript property arrows in four extensions, `in_style_of` and `_edit_line_ends` on mixed, uniform, cp1251, BOM, glued and empty files with a fuzz that both paths agree and that no line is ever glued, seven prompts with and without a source, the quoted heading, 14 claims-heading shapes in LF and CRLF) scored the base 140, step-5 140, glm 145, laguna 169, nemotron 182, var1 191, var2 192, agnes 195, var3 196, var4 197; the ideal 203. The cross matrix: var4's and var3's tests passed on their own code and on each other's (199/199, 181/181); agnes's `.d.ts` union type `() => void | null;` fails on var1 and var2; var2's `improve def get in api.py` fails on every code but its own, so the ideal keeps it; the `##### Claims` pin that var2 left closed is against the ticket's `#{2,6}`. var4 moved the HARDEN-14 B2 type-member rows out of `.js` and so changed two pins; the ideal restores them unchanged, because a typed parameter list is TypeScript syntax in any file.
+
+Open for the next tickets: `_edit_line_ends` now also hands back an empty file's reply with LF endings (it returned it as written), and the Coder path keeps the original's final newline when the model drops it from an unchanged last line (`/edit` always did) — both are the one shared rule, pinned in `tests/test_harden20_judging_gaps.py`.

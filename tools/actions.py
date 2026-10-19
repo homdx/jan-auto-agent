@@ -347,6 +347,33 @@ def _wide_bom_name(raw: bytes) -> "str | None":
     return None
 
 
+def _text_encoding_of(raw: bytes, encodings: "Tuple[str, ...]") -> str:
+    """The first codec of *encodings* that decodes *raw* — the codec `_read_edit_target` chose.
+
+    HARDEN-20 B3: the line-ending match must read the same bytes the same way, and the caller
+    otherwise has no way to ask which codec that was. Fail-open: a codec name Python does not
+    know, or a list that none of it matches, yields the UTF-8 fallback `_read_edit_target`
+    falls back to, so nothing here can raise into a run.
+    """
+    for encoding in encodings:
+        try:
+            raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        return encoding
+    return "utf-8"
+
+
+def _decode_lenient(raw: bytes, encoding: str) -> str:
+    """*raw* in *encoding*, falling back to the lossy UTF-8 read when it no longer describes
+    the bytes (a file that changed between the read and the write, or a codec name Python
+    does not know). The same two-step read `_read_edit_target` makes."""
+    try:
+        return raw.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return raw.decode("utf-8", errors="replace")
+
+
 def _read_edit_target(target: str, encodings: "Tuple[str, ...]") -> str:
     """Read *target* in the codec its own bytes say, for `/edit` to show the model (HARDEN-14 C1).
 
@@ -369,16 +396,11 @@ def _read_edit_target(target: str, encodings: "Tuple[str, ...]") -> str:
         return ""
     if not raw:
         return ""
-    for encoding in encodings:
-        try:
-            return raw.decode(encoding)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return raw.decode("utf-8", errors="replace")
+    return _decode_lenient(raw, _text_encoding_of(raw, encodings))
 
 
-def _edit_line_ends(dest: str, content: str) -> str:
-    """*content* with *dest*'s line endings, decided per line (HARDEN-14 C2).
+def _edit_line_ends(dest: str, content: str, encoding: "str | None" = None) -> str:
+    """*content* with *dest*'s line endings, decided per line (HARDEN-14 C2, HARDEN-20 B).
 
     `in_style_of` (tools.auto.utils) takes CRLF for the whole file when more than half of its
     `\\n` follow a `\\r`, so `a\\r\\nb\\r\\nc\\nd\\ne\\n` edited on `c` came out as
@@ -386,7 +408,24 @@ def _edit_line_ends(dest: str, content: str) -> str:
     A line of the reply that equals a line of the original (after the line ending) keeps *that
     line's own* ending, used once; a changed or a new line takes the file's majority style, so
     an all-CRLF and an all-LF file are unchanged and only a genuinely mixed one is spared the
-    flattening. The BOM is `in_style_of`'s own, so this only supplies the endings.
+    flattening. The BOM is put back at the end, so this also supplies the BOM.
+
+    This is the one shared rule: `/edit` and the Coder's `in_style_of` both call it, so the two
+    paths cannot drift apart again.
+
+    HARDEN-20 B2: an unterminated original last line has an **empty** ending, and only the
+    reply's own last line may take it. Handing it to a middle line glues two lines: the
+    original `alpha\\nbeta` edited to `beta\\nalpha\\nbeta\\n` would be written as
+    `betaalpha\\nbeta\\n`, and a source file whose last line an edit repeats (`return x`,
+    `}`, `pass`, a blank line) becomes invalid.
+
+    HARDEN-20 B3: the original is decoded in *encoding*, the codec `_read_edit_target` chose
+    for this file, or the same codec re-derived from the file's own bytes when the caller did
+    not say. A cp1251 file decoded as UTF-8 is U+FFFD text that never equals the reply's
+    correctly decoded line, so every original line looked changed and the file came out flat
+    LF. A leading BOM is stripped from the first original body before the match — otherwise it
+    stays in that body and `a = 1` never equals `\\ufeffa = 1`, and the first line loses its
+    ending. Fail-open: an unreadable file comes back as *content* untouched.
     """
     try:
         with open(dest, "rb") as fh:
@@ -394,10 +433,18 @@ def _edit_line_ends(dest: str, content: str) -> str:
     except OSError:
         return content
     if not raw:
-        return content
+        return content.replace("\r\n", "\n")      # an empty file has no style: LF, as `in_style_of` always said
+    if encoding is None:
+        try:
+            encoding = _text_encoding_of(raw, _edit_write_encodings(dest))
+        except Exception:
+            encoding = "utf-8"
     majority_crlf = raw.count(b"\r\n") * 2 > raw.count(b"\n")
     changed_ending = "\r\n" if majority_crlf else "\n"
-    original_lines = raw.decode("utf-8", errors="replace").splitlines(keepends=True)
+    original_lines = _decode_lenient(raw, encoding).splitlines(keepends=True)
+    # HARDEN-20 B3: a BOM is not part of the first line's text, and the match is on the text.
+    if original_lines and original_lines[0].startswith("\ufeff"):
+        original_lines[0] = original_lines[0].removeprefix("\ufeff")
     by_text: dict = {}
     for line in original_lines:
         body = line.rstrip("\r\n")
@@ -412,8 +459,8 @@ def _edit_line_ends(dest: str, content: str) -> str:
         if pos == last and body == "":
             out.append("")                    # the empty string after a trailing newline
             continue
-        # v13 (TA-4 follow-up): an unterminated original last line has an EMPTY ending; only the reply's
-        # last line may take it, or `beta` + `alpha` is written as `betaalpha`.
+        # HARDEN-20 B2: an empty ending (the original's unterminated last line) may only go to
+        # the reply's last line, or `beta` + `alpha` is written as `betaalpha`.
         endings = by_text.get(body)
         usable = [e for e in (endings or []) if e or pos == last]
         if usable:
@@ -424,7 +471,7 @@ def _edit_line_ends(dest: str, content: str) -> str:
         else:
             out.append(body + changed_ending)  # a changed or a new line: the majority
     text = "".join(out)
-    # The BOM is `in_style_of`'s own half: the model writes no BOM, so a BOM the original had
+    # The BOM is this function's own half: the model writes no BOM, so a BOM the original had
     # is put back rather than dropped on the floor.
     if raw.startswith(b"\xef\xbb\xbf") and not text.startswith("\ufeff"):
         text = "\ufeff" + text

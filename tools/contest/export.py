@@ -23,8 +23,10 @@ writes no `entrants.json` — its `SUMMARY.md` is still written.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,36 +68,49 @@ _JUDGE = "python3 scripts/judge_epic_round.py"
 #: The folder the round's ticket comes from, relative to the repo root.
 TASKS_DIR = "epic-tasks"
 
-#: `## Claims` — the optional section that carries the ticket's claims; a heading that adds a
-#: parenthetical is still the section, so the match stops at the word.
-_CLAIMS_HEADING = re.compile(r"^##\s+Claims(?:\s+.*)?$", re.I)
+#: `scripts/judge_epic_round.py`, from this module's own place in the tree.
+_JUDGE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "judge_epic_round.py"
+_JUDGE_MODULE = None
+_JUDGE_TRIED = False
 
-#: A code fence's opening or closing line, ``` or ~~~ with up to three leading spaces.
-_FENCE_MARKER = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+def _judge_claims_section(text):
+    """`(heading line, [(lineno, line)])` of *text*'s Claims section — from the judge's own
+    reader — or ``None``.
+
+    HARDEN-20 E: this module used to keep its own copy of the heading pattern, `^##\\s+Claims`
+    split on `\\n`, and the two disagreed with the judge's: a `#### Claims` ticket was judged but
+    never announced here, and on a CRLF ticket the judge saw no claims at all while the summary
+    added its `--claims` line. One reader now, so the summary's line and the claims phase cannot
+    disagree. Fail-open: a judge that cannot be loaded, or a reader that raises on a mangled
+    ticket, is no claims section — never an exception into the round.
+    """
+    global _JUDGE_MODULE, _JUDGE_TRIED
+    if not _JUDGE_TRIED:
+        _JUDGE_TRIED = True
+        try:
+            spec = importlib.util.spec_from_file_location("_judge_for_export", _JUDGE_SCRIPT)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules["_judge_for_export"] = module
+                spec.loader.exec_module(module)
+                _JUDGE_MODULE = module
+        except Exception:
+            _JUDGE_MODULE = None
+    try:
+        return _JUDGE_MODULE._claims_section(text)
+    except Exception:
+        return None
 
 
 def _has_claims_heading(text: str) -> bool:
-    """Whether *text* carries a `## Claims` heading outside a fenced block (HARDEN-8 C).
+    """Whether *text* carries a Claims heading the judge will read (HARDEN-8 C, HARDEN-20 E).
 
-    The heading is looked for the way `judge_epic_round.ticket_claims` reads the section, so the
-    two parsers agree: a `## Claims` written inside a code block — a ticket that documents the
-    section, or a prompt that quotes one — is not the section, and a summary never adds a
-    `--claims` line for it.
+    The judge's own reader decides, so a `## Claims` written inside a code block — a ticket that
+    documents the section, or a prompt that quotes one — is not the section, and the summary never
+    adds a `--claims` line for it.
     """
-    fence = ""
-    for line in text.split("\n"):
-        marker = _FENCE_MARKER.match(line)
-        if fence:
-            if marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence) \
-                    and not line.strip()[len(marker.group(1)):]:
-                fence = ""
-            continue
-        if marker:
-            fence = marker.group(1)
-            continue
-        if _CLAIMS_HEADING.match(line):
-            return True
-    return False
+    return _judge_claims_section(text) is not None
 
 
 def ticket_has_claims(out_dir, ticket, repo=None):

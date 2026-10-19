@@ -3,7 +3,9 @@
 
 `ticket_claims("## Claims:\n\n- [new] a\n")` returned `[]`, as did the same under `###` or `####`,
 as did a file with no section at all — so the judge scored nothing and said nothing. A heading of
-level 2 to 4 whose text is `Claims` with an optional trailing colon opens the section.
+level 2 to 4 whose text is `Claims` with an optional trailing colon opens the section. HARDEN-20 E
+opened it to all six markdown levels, because the reader is now the one the summary uses too and
+the ceiling was an arbitrary 4.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ _spec.loader.exec_module(judge)
 
 
 class TestTheHeadingLevelsOpenTheSection:
-    """Level 2 to 4, with or without a trailing colon."""
+    """Level 2 to 6, with or without a trailing colon."""
 
     @pytest.mark.parametrize("heading", [
         "## Claims:",
@@ -34,6 +36,8 @@ class TestTheHeadingLevelsOpenTheSection:
         "## Claims",
         "## claims",
         "### CLAIMS:",
+        "##### Claims",
+        "###### Claims",
     ])
     def test_the_claim_is_read(self, heading):
         claims = judge.ticket_claims(f"{heading}\n\n- [new] `a` returns 1.\n", "t.md")
@@ -73,7 +77,7 @@ class TestTheRefusals:
         with pytest.raises(ValueError, match=r"t\.md:3: the Claims section has no claim"):
             judge.ticket_claims("# T\n\n#### Claims:\n", "t.md")
 
-    @pytest.mark.parametrize("text", ["", "## No claims here\n", "##### Claims\n\n- [new] a\n",
+    @pytest.mark.parametrize("text", ["", "## No claims here\n",
                                       "## Claimants\n\n- [new] a\n", "```md\n## Claims\n```\n"])
     def test_a_ticket_without_a_claims_heading_still_has_no_claims(self, text):
         assert judge.ticket_claims(text, "t.md") == []

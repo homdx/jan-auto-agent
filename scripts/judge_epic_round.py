@@ -918,11 +918,13 @@ CLAIMS_LEAD = ("claims: a lead, not a gate — a mismatch is a model's reading, 
 
 #: `## Claims` — the optional section that carries the round's claims, after `## Acceptance`.
 #: A heading that adds a parenthetical is still the section, so the match stops at the word.
-#: `## Claims`, `### Claims`, `#### Claims` — with an optional trailing colon and an optional
-#: suffix (`## Claims (3)`); case-insensitive. HARDEN-14 D: levels 3 and 4 and the colon did not
-#: open the section, so a ticket that wrote them scored nothing and said nothing.
+#: Any of the six levels — `## Claims` through `###### Claims` — with an optional trailing colon
+#: and an optional suffix (`## Claims (3)`); case-insensitive. HARDEN-14 D: levels 3 and 4 and
+#: the colon did not open the section, so a ticket that wrote them scored nothing and said
+#: nothing. HARDEN-20 E: the ceiling was level 4, so a `#### Claims` ticket was judged by this
+#: reader yet never announced by the one the summary used — now the same six levels both sides.
 _CLAIMS_HEADING = re.compile(
-    r"^(#{2,4})[ \t]+Claims[ \t]*(?::[ \t]*(?:\S.*)?)?(?:[ \t]+\S.*)?[ \t]*$", re.I
+    r"^(#{2,6})[ \t]+Claims[ \t]*(?::[ \t]*(?:\S.*)?)?(?:[ \t]+\S.*)?[ \t]*$", re.I
 )
 
 #: Any markdown heading with its level, so a `### Claims` section ends at a `###` sibling and not
@@ -977,9 +979,11 @@ def _claims_section(text, fenced=False):
     HARDEN-8 C: a fenced block is not read here at all. A `## Claims` written inside a code
     block — a ticket that documents the section, or a prompt that quotes one — was a section,
     and its lines were then parsed as claims. HARDEN-14 D: the heading's level is returned, so a
-    `### Claims` section does not keep reading past a `###` sibling.
+    `### Claims` section does not keep reading past a `###` sibling. HARDEN-20 E: the lines come
+    from `splitlines()`, not `split("\\n")` — on a CRLF ticket the heading read `## Claims\r`,
+    which the pattern did not match, so the round judged nothing at all and said nothing.
     """
-    lines = (text or "").split("\n")
+    lines = (text or "").splitlines()
     start = None
     level = 2
     fences = _FenceTracker()
