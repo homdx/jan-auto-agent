@@ -16,6 +16,8 @@ operator's `HEAD`, index and working tree are never written.
 
 from __future__ import annotations
 
+import configparser
+import copy
 import hashlib
 import os
 import re
@@ -31,6 +33,28 @@ from typing import Optional
 from tools.claimcheck.anchors import PathRepoView
 from tools.collect import cli as collect_cli
 from tools.collect import loader as collect_loader
+
+#: The pipeline's `[search] max_depth` (see `agents.ini`), which `RepoIngestor` reads when
+#: `Target.collect` is handed a config. When it is not, claim-check falls back to this so
+#: `src/`-layout projects with three-level packages still resolve their imports.
+_COLLECT_DEFAULT_MAX_DEPTH = 8
+
+#: A singleton default config, so `id()` is stable across `Target.collect` calls when the
+#: caller passes `None` — the cache key in `collect` is `id(config)`, and a fresh config
+#: per call would defeat the "once per sha" contract.
+_COLLECT_DEFAULT_CONFIG = None  # type: ignore[misc]  # set in `_default_config`
+
+
+def _default_config() -> configparser.ConfigParser:
+    """The singleton config used when `collect` is handed `None`. Never rebuilt, so
+    `id(config)` is the same object every call and the model cache in `Target._models`
+    hits as it did before HARDEN-21 D."""
+    global _COLLECT_DEFAULT_CONFIG
+    if _COLLECT_DEFAULT_CONFIG is None:
+        cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+        cfg["search"] = {"max_depth": str(_COLLECT_DEFAULT_MAX_DEPTH)}
+        _COLLECT_DEFAULT_CONFIG = cfg
+    return _COLLECT_DEFAULT_CONFIG
 
 
 class TargetError(Exception):
@@ -325,6 +349,7 @@ class Target:
         self._token: Optional[Path] = None   # this open's entry in <sha>/users (see close)
         self._closed = False
         self._models: dict = {}
+        self._config_memo: dict = {}   # id(caller config) -> (caller config, config with a depth)
 
     def __enter__(self) -> "Target":
         return self
@@ -491,7 +516,16 @@ class Target:
         """The `CollectModel` of the tree, built into `<tree>/.collect/` once per sha.
 
         A failure of collect (not a Python repository, a parse error, 300 s) does not fail
-        the target: the result is the loader's absent model and `warnings` says why."""
+        the target: the result is the loader's absent model and `warnings` says why.
+
+        `config` may be `None`: the collect defaults to `[search] max_depth = 8` — the
+        same value `agents.ini` sets — so a `src/`-layout project with a three-level
+        package still resolves its imports. Without this, `RepoIngestor` falls back to
+        `max_depth = 2` and every module of a nested package sits out of the index, so
+        the import graph, callers, config reads, gates and contracts in the evidence
+        packs are missing without any warning (HARDEN-21 D).
+        """
+        config = self._collect_config(config)
         # The config is held by the cache entry, so a reused id() cannot return another config's model.
         key = id(config)
         hit = self._models.get(key)
@@ -504,8 +538,91 @@ class Target:
             model = None
         if model is None or model.status != collect_loader.STATUS_FRESH:
             model = self._build_collect(config)
+        # HARDEN-21 D: a truncated walk should say so, not silently omit deep files.
+        trunc = self._truncation_reason(config)
+        if trunc:
+            self.warnings.append(trunc)
         self._models[key] = (config, model)
         return model
+
+    @staticmethod
+    def _names_a_depth(config) -> bool:
+        """Does *config* name a walk depth, in the sections `RepoIngestor` reads it from?"""
+        try:
+            for section in ("architect", "search"):
+                value = config.get(section, "max_depth", fallback=None)
+                if value is not None and str(value).strip():
+                    return True
+        except (configparser.Error, AttributeError, TypeError, ValueError):
+            return False
+        return False
+
+    def _collect_config(self, config):
+        """The config claim-check's collect uses: *config* when it names a walk depth, else a
+        copy of it (or a minimal `[search]` section) with `max_depth = 8` — the value
+        `agents.ini` sets. The claim-check ini (`contest.ini`) has no `[search]` at all, so
+        handing it over unchanged would leave `RepoIngestor` at its own fallback of 2 and
+        silently truncate the walk.
+
+        One effective config per caller config, kept on the target: the model cache below is
+        keyed by `id()`, and a copy made on every call would never hit it. A caller config is
+        held by the memo, so a reused `id()` cannot return another config's copy.
+        """
+        if config is None:
+            return _default_config()
+        if self._names_a_depth(config):
+            return config
+        hit = self._config_memo.get(id(config))
+        if hit is not None and hit[0] is config:
+            return hit[1]
+        effective = copy.deepcopy(config)
+        if not effective.has_section("search"):
+            effective.add_section("search")
+        effective.set("search", "max_depth", str(_COLLECT_DEFAULT_MAX_DEPTH))
+        self._config_memo[id(config)] = (config, effective)
+        return effective
+
+    @staticmethod
+    def _max_depth(config):
+        """`[search] max_depth` from `config` (the same key `RepoIngestor` reads) —
+        the value that decides how deep the collect walked, so a truncated scan can
+        say so in `warnings` instead of silently omitting deep files."""
+        try:
+            raw = (config.get("architect", "max_depth", fallback=None)
+                   or config.get("search", "max_depth", fallback=None))
+            return int(raw) if raw is not None else _COLLECT_DEFAULT_MAX_DEPTH
+        except (configparser.Error, AttributeError, TypeError, ValueError):
+            return _COLLECT_DEFAULT_MAX_DEPTH
+
+    def _truncation_reason(self, config):
+        """A warning when the collect walk hit `max_depth`, or `""` otherwise.
+
+        Files one level past the limit are the signal: the walk prunes any directory at
+        or beyond the limit, so their presence means the scan is incomplete (HARDEN-21 D).
+        Fail-open: a broken view, a malformed config or an unbounded depth
+        (`max_depth <= 0`) returns `""` — no warning, no crash.
+        """
+        try:
+            depth = self._max_depth(config)
+            if depth <= 0:
+                return ""
+            limit = depth
+        except Exception:  # noqa: BLE001 — the warning is a nice-to-have, never a hard failure
+            return ""
+        try:
+            view = self.view()
+        except Exception:  # noqa: BLE001
+            return ""
+        try:
+            for path in view.files():
+                # RepoIngestor yields files from directories at depth <= max_depth, so a
+                # file with `parts` count > max_depth + 1 lives in a pruned directory.
+                parts = Path(path).parts
+                if len(parts) > limit + 1:
+                    return f"collect walk hit max_depth={limit}; files deeper than that are not in the model"
+        except Exception:  # noqa: BLE001
+            return ""
+        return ""
 
     def _build_collect(self, config):
         box: dict = {}

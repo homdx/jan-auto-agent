@@ -107,17 +107,20 @@ def load_claims(path: Path) -> list:
 # ------------------------------------------------------------------ the two sides
 
 def prepare_sides(claims: list, base: Target, head: Target, budget: PackBudget,
-                  collect: bool = True) -> dict:
+                  collect: bool = True, config=None) -> dict:
     """The items, meta and resolved anchors of both sides, the world flags and the GONE flags.
+
+    *config* is the run's ini, passed to `Target.collect` on both sides (HARDEN-21 D).
 
     A claim that is ``world`` at one side only (a commit that exists at head alone) is not a
     world claim: its world side gets a pack too — usually the empty one — so a vote there
     cannot stand without evidence (CC-6's quote check downgrades it), and the rule gives
     ``NEW`` or ``UNCLEAR`` instead of a judgement nobody could see."""
-    items_b, meta_b = cv.prepare_target(claims, base, budget, collect=collect)
-    items_h, meta_h = cv.prepare_target(claims, head, budget, base=base.sha, collect=collect)
-    model_b = base.collect() if collect else None      # cached by the target: no second build
-    model_h = head.collect() if collect else None
+    items_b, meta_b = cv.prepare_target(claims, base, budget, collect=collect, config=config)
+    items_h, meta_h = cv.prepare_target(claims, head, budget, base=base.sha, collect=collect,
+                                        config=config)
+    model_b = base.collect(config) if collect else None      # cached by the target: no second build
+    model_h = head.collect(config) if collect else None
     view_b, view_h = base.view(), head.view()
     res_b = [cc_compare.resolve(c["claim"], view_b) for c in claims]
     res_h = [cc_compare.resolve(c["claim"], view_h) for c in claims]
@@ -389,9 +392,10 @@ def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
                budget: PackBudget = PackBudget(), collect: bool = True,
                accept: str = cv.DEFAULT_ACCEPT, base_side: "dict | None" = None,
                voters=None, runs: "int | None" = None,
-               sides: "dict | None" = None, seed: "int | None" = None,
-               fixed_prompt: "bool | None" = None,
-               models: "dict | None" = None) -> dict:
+                sides: "dict | None" = None, seed: "int | None" = None,
+                fixed_prompt: "bool | None" = None,
+                models: "dict | None" = None,
+                config=None) -> dict:
     """The core of the command: both sides prepared, voted (the two sides at once, so their
     jobs share one pool) and tallied, and the deltas. *vote* is the seam: the CLI's
     `make_vote` (``ask_v2`` over voters x runs), or a test's fake voter.
@@ -415,8 +419,10 @@ def judge_both(claims: list, base: Target, head: Target, vote: VoteFn,
     does not hold is voted here, once, and kept in the side's ``index`` so the next entry
     that needs it finds it in the record. A claim set that differs is therefore never a
     refusal — only the identity fields above are.
+
+    *config* is the run's ini, passed to `Target.collect` on both sides (HARDEN-21 D).
     """
-    sides = prepare_sides(claims, base, head, budget, collect) if sides is None else sides
+    sides = prepare_sides(claims, base, head, budget, collect, config=config) if sides is None else sides
     # A world claim is judged once, at head, so its change is always n/a; an expect on it can never be met, so it is refused before any request is made.
     odd = [str(c.get("id") or i + 1) for i, c in enumerate(claims) if c.get("expect") and sides["world"][i]]
     if odd:
@@ -725,7 +731,8 @@ def main(argv: "list[str] | None" = None) -> int:
                 got = judge_both(claims, base, head, plan_and_vote, budget, collect=not args.no_collect,
                                  accept=accept, base_side=base_record, voters=voters, runs=args.runs,
                                  seed=args.seed, fixed_prompt=args.fixed_prompt,
-                                 models=cv.voter_models(voters, parser))
+                                 models=cv.voter_models(voters, parser),
+                                 config=parser)
             except ValueError as exc:
                 print(f"claim_diff: {args.claims}: {exc}", file=sys.stderr)
                 return 2

@@ -121,6 +121,54 @@ _DEFAULT_KEYWORD_SYSTEM = (
 )
 
 
+
+def make_kw_pattern(kw: str) -> "re.Pattern[str]":
+    """A compiled regex that finds whole occurrences of `kw` in free text.
+
+    Keyword matches must respect word boundaries on both sides — for a
+    plain-word keyword that is exactly what `\\b` gives, but `\\b` also
+    refuses to match at either end of a hyphenated keyword (`ansible-playbook`),
+    because a hyphen is a non-word character. The ticket that used to hide
+    this called a match only when the neighbours were one of a small set
+    (`/`, `.`, whitespace), which made commas, colons, brackets and
+    question marks — the punctuation of both documentation and questions —
+    fail to match, and the best-scoring file could score zero and fall
+    under the `_answer_smart` cutoff.
+
+    The generalisation here is "no word character next to the keyword" —
+    `(?<!\\w)` / `(?!\\w)` — which is the same meaning `\\b` has for plain
+    keywords, and which keeps the slash and period cases working
+    (those characters are still non-word characters). It also handles
+    keywords that carry non-word characters at their edges (`c++`,
+    `.env`): the boundary is checked against the character OUTSIDE the
+    keyword, so a leading or trailing punctuation is a valid edge, not a
+    signal to skip.
+
+    A keyword containing a literal space (e.g. `"install node"`) is still
+    matched as a whole phrase; `re.escape` turns it into `install\\snode`,
+    and the two lookarounds still apply at the phrase edges.
+
+    Moved to module scope (from `_rank_candidates._make_kw_pattern`) so it
+    can be tested in isolation.
+    """
+    if not kw:
+        return re.compile(r"(?!x)x")
+    escaped = re.escape(kw)
+    if re.search(r"\W", kw):
+        # Exclusion set = word chars plus each unique NON-WHITESPACE non-word
+        # char appearing inside the keyword.  Whitespace inside the keyword
+        # (e.g. `"install node"`) is a separator, not part of a token, so it
+        # is not in the exclusion set and the phrase can still sit next to a
+        # space.  A hyphen or period inside the keyword IS part of a token
+        # (`ansible-playbook`, `foo.bar`), so it is excluded and a joining
+        # hyphen in `run-ansible-playbook` does not satisfy the lookbehind.
+        extras = sorted({c for c in kw
+                         if not c.isalnum() and c != "_" and not c.isspace()})
+        exclusion = r"[\w" + "".join(re.escape(c) for c in extras) + r"]"
+        return re.compile(r"(?<!" + exclusion + r")" + escaped + r"(?!" + exclusion + r")")
+    return re.compile(r"\b" + escaped + r"\b")
+
+
 class FaqAgent:
     """
     Scans a knowledge folder and answers a single question against its content.
@@ -487,18 +535,7 @@ class FaqAgent:
         building the shortlist so they never receive a Stage-1 LLM call.
         """
         lower_kw = [k.lower().strip() for k in keywords if k.strip()]
-
-        def _make_kw_pattern(kw: str) -> "re.Pattern[str]":
-            escaped = re.escape(kw)
-            if re.search(r"\W", kw):
-                # \b does not work for hyphenated keywords, so they are matched with a lookaround (BUGFIX).
-                return re.compile(
-                    r"(?:(?:^|(?<=[/.\s])))" + escaped + r"(?=[/.\s]|$)",
-                    re.MULTILINE,
-                )
-            return re.compile(r"\b" + escaped + r"\b")
-
-        kw_patterns = [(kw, _make_kw_pattern(kw)) for kw in lower_kw]
+        kw_patterns = [(kw, make_kw_pattern(kw)) for kw in lower_kw]
 
         def _score(name: str, content: str) -> int:
             combined = (name + " " + content).lower()

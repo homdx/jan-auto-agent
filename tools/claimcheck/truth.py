@@ -577,7 +577,8 @@ def rebuild(votes: dict, repo, *, scratch, parser=None) -> tuple:
                 base_sha = None
         # collect facts only when the vote had them: a votes.json older than the field had none
         items, _meta = claim_vote.prepare_target(claims, target, _budget_of(target_info, parser),
-                                                 base_sha, collect=bool(target_info.get("collect")))
+                                                  base_sha, collect=bool(target_info.get("collect")),
+                                                  config=parser)
         view = target.view()
         resolved = [cc_anchors.resolve_claim(c["claim"], view)
                     for c in claims]

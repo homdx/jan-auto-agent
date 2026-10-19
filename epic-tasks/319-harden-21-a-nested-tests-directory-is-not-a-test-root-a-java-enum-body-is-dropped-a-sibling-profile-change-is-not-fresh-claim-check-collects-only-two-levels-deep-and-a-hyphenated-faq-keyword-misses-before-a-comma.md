@@ -1,10 +1,10 @@
 # HARDEN-21 — test detection knows only this repo's layout (`b/tests/test_b.py`, `src/pkg/tests/`, `*_test.py`, `__tests__/`), a Java enum body is dropped, a sibling-profile edit is "up to date", claim-check collects only two directories deep, and a hyphenated FAQ keyword is missed before a comma
 
-**Status:** open
+**Status:** landed (round 319: sensenova-6-8-flash-lite-var4 as the base for A, B, E, with three borrowings — A: a path component named `tests`, `test` or `__tests__` makes the path test code at any depth, `*_test.py` is a test module, `contest.py` / `latest/` / `attestation/` are not; B: the enum body declarations are walked, a record's compact constructor is a symbol whose signature is the record's own components (`Point(int x, int y)`, var3's idea), an `@interface` and its elements are symbols, a Javadoc survives a run of line comments; C: var1's `profile_hashes` in the manifest, which `is_fresh` compares only when the caller passes them, so `loader.load` keeps calling a tree with sibling profiles fresh, and a tree that names no `sibling_profiles` tracks no profile, so an edit of its `agents.ini` costs nothing; D: `Target.collect` hands `RepoIngestor` a copy of the caller's config with `[search] max_depth = 8` when the config names no depth (the claim-check's `contest.ini` has no `[search]`), the claim scripts pass their ini, a truncated scan says so in `warnings`; E: `make_kw_pattern` at module scope, `\b` for a plain keyword as before, `(?<!\w)`-style edges for a keyword with a non-word character)
 **Severity:** MEDIUM (A, B, D: wrong evidence for the Architect, Gate 1 and the claim voters on other target repos); LOW (C, E)
 **File:** `tools/collect/test_paths.py` (A), `tools/collect/java_facts.py` (B), `tools/collect/cli.py`, `tools/collect/manifest.py` (C), `tools/claimcheck/target.py`, `scripts/claim_vote.py`, `scripts/claim_diff.py` (D), `tools/faq_agent.py` (E)
 **Symbol:** A: `is_test_path`, `is_test_module`, `TEST_PATH_PREFIXES`. B: `_walk_type_body`. C: `_freshness`, `is_fresh`. D: `Target.collect`. E: `_make_kw_pattern` inside `_rank_candidates`
-**Round:** (set when the round starts)
+**Round:** 319
 **Size:** M
 **Depends on:** none
 **Also touches:** `tests/` (new files only), `tests_bugfix/` pins of the collect test map must stay green
@@ -119,3 +119,11 @@ One commit. The judge's own checks are not published and are written after the r
 ## Not in scope
 
 Rust, Ruby, C#, Dart (extractor shapes outside Python, Java, Kotlin), the `build_call_edges` builder and the Java import graph (not reviewed), the `IMPROVEMENTS.md` section anchor (HARDEN-20 D).
+
+---
+
+## Why not the others (round 319)
+
+Ten entries (nemotron left only a task file, glm ended in ERROR on an overloaded provider, laguna fixed two files). A black box of 106 checks (the path table both ways and a collect of a tree with `b/tests/test_b.py`, Java enum / record / `@interface` shapes, sibling-profile edits with a relative and an absolute config path and a tree that names none, a git repository with a module at depth 5 and configs with and without `[search]`, 25 keyword lines) scored the base 32, nemotron 32, glm 35, laguna 64, var2 99, var3 99, agnes 100, step-5 101, var1 102, var4 103; the ideal 106. var4 was the only entry with the `@interface` elements and the cleanest Java, but its freshness check made `loader.load` call every tree with sibling profiles stale (agnes and step-5 the same) and its depth fix was never reached from `contest.ini`, which has no `[search]`, as was agnes's; var1 had both right but hashed `agents.ini` for every tree and changed a plain keyword's edge, so `docker` no longer matched `docker-compose`; var2 ignored a depth in the config; var3 kept the depth fix out of the claim scripts. var4 and step-5 also implemented ticket 320 in their trees (`inner_loop.py`); that part is left for round 320.
+
+Open for the next tickets: `scripts/judge_epic_round.py` still calls `prepare_sides` / `judge_both` without the ini, so the judge's own claim-check walks at the default depth.

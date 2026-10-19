@@ -541,11 +541,15 @@ def report_sha(path: "Path | None") -> "str | None":
 
 
 def prepare_target(claims: list[dict], target: Target, budget: PackBudget,
-                   base: "str | None" = None, collect: bool = True) -> tuple:
+                   base: "str | None" = None, collect: bool = True,
+                   config: "configparser.ConfigParser | None" = None) -> tuple:
     """(items, meta) for the claims at *target*: each claim's anchors resolved and
     classified there (CC-1); a ``code`` or ``mixed`` claim gets its pack (CC-5, with
     ``base``..the target's sha when *base* is given, and the collect facts of the target when
-    *collect*), a ``world`` claim ``None``."""
+    *collect*), a ``world`` claim ``None``.
+
+    *config* is the run's ini, handed to `Target.collect`: one that names a walk depth walks to
+    it, one that does not walks to `COLLECT_MAX_DEPTH_DEFAULT` (HARDEN-21 D)."""
     view = target.view()
     items, meta = [], []
     model = [None, False]    # built once, on the first claim that needs a pack
@@ -557,7 +561,7 @@ def prepare_target(claims: list[dict], target: Target, budget: PackBudget,
         if kind != "world":
             if collect and not model[1]:
                 # CC-3: collect facts reach the voter's pack; a repository collect cannot model is an absent model.
-                model[:] = [target.collect(), True]
+                model[:] = [target.collect(config), True]
             pack = build_pack(text, resolved, view, model=model[0], base=base,
                               head=target.sha if base else None, budget=budget)
         items.append((text, pack))
@@ -757,7 +761,8 @@ def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
             except TargetError as exc:
                 print(f"claim_vote: --base {args.base}: does not resolve ({exc})", file=sys.stderr)
                 return 2
-        items, meta = prepare_target(claims, target, budget, base_sha, collect=not args.no_collect)
+        items, meta = prepare_target(claims, target, budget, base_sha, collect=not args.no_collect,
+                                     config=parser)
         jobs = [(m, r) for m in voters for r in range(args.runs)]
         with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
             results = list(pool.map(lambda j: ask_v2(j[0], items, j[1], args.seed, parser,

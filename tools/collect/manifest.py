@@ -328,6 +328,12 @@ class Manifest:
     # A --no-llm build records () — no summary is expected there. Older manifests
     # without the key read as () and are unaffected.
     unsummarized: Tuple[str, ...] = field(default_factory=tuple)
+    # HARDEN-21 C: the `.ini` files `CONFIG_MAP.md` is built from — the primary config and every
+    # `[collect] sibling_profiles` entry. A separate map, not extra keys in `file_hashes`, so a
+    # profile edit shows as "one file changed" to nothing but this comparison and never appears as
+    # an added or removed *module* in `--refresh`'s diff. Older manifests read as {} — and are
+    # fresh for the setting's own purposes, since a tree without profiles hashes nothing.
+    profile_hashes: Dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -338,6 +344,7 @@ class Manifest:
             "file_hashes": dict(self.file_hashes),
             "skip_dirs": sorted(self.skip_dirs),
             "unsummarized": sorted(self.unsummarized),
+            "profile_hashes": dict(self.profile_hashes),
         }
 
     def to_json(self, *, indent: int = 2) -> str:
@@ -369,8 +376,14 @@ class Manifest:
             # A missing or malformed unsummarized key falls back to [] (older manifests); the manifest is not unreadable.
             unsummarized=tuple(sorted(d.get("unsummarized", [])))
             if isinstance(d.get("unsummarized"), (list, tuple))
-            and all(isinstance(x, str) for x in d["unsummarized"])
+            and all(isinstance(x, str) for x in d.get("unsummarized", []))
             else tuple(),
+            # HARDEN-21 C: a missing or malformed profile_hashes key reads as {} (older
+            # manifests, and the common case of a tree with no sibling_profiles).
+            profile_hashes=dict(d["profile_hashes"])
+            if isinstance(d.get("profile_hashes"), dict)
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in d["profile_hashes"].items())
+            else {},
         )
 
     @classmethod
@@ -388,6 +401,7 @@ def build_manifest(
     config: Optional["configparser.ConfigParser"] = None,
     skip_dirs: Optional[Iterable[str]] = None,
     unsummarized: Optional[Iterable[str]] = None,
+    profile_hashes: Optional[Dict[str, str]] = None,
 ) -> Manifest:
     """Build a `Manifest` for `root`. If `files` isn't given, discovers
     `*.py` files under `root` via `discover_files`.
@@ -418,6 +432,9 @@ def build_manifest(
     CC-15: `unsummarized` records the paths of modules whose Pass B produced no
     summary; a --no-llm build passes () so the manifest is fresh, and an older
     manifest without the key is read as () (below).
+    HARDEN-21 C: `profile_hashes` is the `{path: sha256}` map of the `.ini` files
+    `CONFIG_MAP.md` depends on, built with `hash_tree` over the same path list the
+    caller hashes its modules with — `is_fresh(..., profile_hashes=...)` compares it.
     """
     root = Path(root)
     effective = effective_skip_dirs(config, skip_dirs)
@@ -434,6 +451,7 @@ def build_manifest(
         file_hashes=file_hashes if file_hashes is not None else hash_tree(root, file_list),
         skip_dirs=tuple(sorted(effective)),
         unsummarized=tuple(sorted(unsummarized)) if unsummarized is not None else tuple(),
+        profile_hashes=dict(profile_hashes) if profile_hashes is not None else {},
     )
 
 
@@ -455,6 +473,7 @@ def is_fresh(
     files: Optional[Iterable[str]] = None,
     hashes: Optional[Dict[str, str]] = None,
     skip_dirs: Optional[Iterable[str]] = None,
+    profile_hashes: Optional[Dict[str, str]] = None,
 ) -> bool:
     """True iff `manifest` was built by the CURRENT collector_version AND
     `root`'s current content hashes exactly match `manifest`'s.
@@ -508,10 +527,19 @@ def is_fresh(
     that same `files` — `action_collect` did, and hashing the tree here and
     then again inside the `action_refresh` it delegates to was the second of
     the three full tree hashes one stale `--collect` used to cost.
+    HARDEN-21 C: `profile_hashes` is the `{path: sha256}` map of the `.ini` files
+    `CONFIG_MAP.md` depends on — the primary config and every `[collect]
+    sibling_profiles` entry. Those are not in `file_hashes`, which holds modules only,
+    so without this an edit to a sibling profile left the artifact reporting "up to
+    date" until some `.py` file happened to change, and `CONFIG_MAP.md` kept the
+    gap the profile was written to fix. Omitting it (the older call sites) keeps
+    today's behaviour exactly.
     """
     if manifest.collector_version != COLLECTOR_VERSION:
         return False
     if skip_dirs is not None and tuple(sorted(skip_dirs)) != tuple(manifest.skip_dirs):
+        return False
+    if profile_hashes is not None and dict(profile_hashes) != dict(manifest.profile_hashes):
         return False
     # CC-15: a manifest with unsummarized modules is stale — they will be retried
     # at the next --collect / --refresh instead of being reported up to date.

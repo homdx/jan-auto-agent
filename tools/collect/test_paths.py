@@ -54,39 +54,72 @@ TEST_PATH_PREFIXES: Tuple[str, ...] = (
     ".smoke_tests/", ".regression_tests/",
 )
 
+#: Directory basenames that make a path test code at ANY depth, not just at
+#: the root. `b/tests/test_b.py`, `src/pkg/tests/x.py` and
+#: `src/test/java/...` are all test code — a test root is a test root no
+#: matter how deep it sits. Hardcoded root prefixes above cover legacy
+#: variants (`tests_bugfix/`, `.smoke_tests/`); these cover the plain
+#: "a directory named tests" shape that every other layout uses.
+TEST_PATH_DIRS: Tuple[str, ...] = ("tests", "test", "__tests__")
+
 #: Test scaffolding file names, wherever they sit (pytest's hook file is at the repo root).
 TEST_FILE_NAMES: Tuple[str, ...] = ("conftest.py",)
 
-#: pytest's discovery shape; the naming half of `is_test_module`.
+#: pytest's discovery shape; the naming half of `is_test_module`. `test_*`
+#: and `*_test` are both collected by pytest's default patterns, so both
+#: halves are test modules when they sit in a test location.
 TEST_FILE_PREFIX = "test_"
+TEST_FILE_SUFFIX = "_test"
+
+
+def _is_test_dir_component(component: str) -> bool:
+    """Is `component` a directory name that marks the enclosing path as test code?
+
+    Exact-match only: `"contest"`, `"latest"`, `"attestation"` and `"my-tests"`
+    do NOT contain `"tests"` or `"test"` as a whole component, so a shipped
+    module whose name merely contains the word is not classified as test
+    code.
+    """
+    return component in TEST_PATH_DIRS
 
 
 def is_test_path(path: str) -> bool:
     """Is `path` test code rather than shipped code? (Location rule.)
 
-    True under any `TEST_PATH_PREFIXES` root or for any `TEST_FILE_NAMES`
-    basename. Fail open: an empty or non-string path is "not a test", never
-    an exception.
+    True under any `TEST_PATH_PREFIXES` root, for any `TEST_FILE_NAMES`
+    basename, or when any path COMPONENT is one of `TEST_PATH_DIRS`
+    (`tests`, `test`, `__tests__`) — at any depth. Fail open: an empty or
+    non-string path is "not a test", never an exception.
     """
     if not isinstance(path, str) or not path:
         return False
     if path.startswith(TEST_PATH_PREFIXES):
         return True
-    return path.rsplit("/", 1)[-1] in TEST_FILE_NAMES
+    if path.rsplit("/", 1)[-1] in TEST_FILE_NAMES:
+        return True
+    # Split on `/` and reject any empty piece (leading `//` or trailing `/`).
+    for component in path.split("/"):
+        if _is_test_dir_component(component):
+            return True
+    return False
 
 
 def is_test_module(path: str) -> bool:
-    """Does `path` carry coverage? (Location rule **and** `test_*.py`.)
+    """Does `path` carry coverage? (Location rule **and** a pytest test name.)
 
     The TEST_MAP / RISK_INDEX split: True only for a pytest-discoverable
-    `test_*.py` inside a test root. `conftest.py`, fixtures and stub servers
-    under a test root satisfy `is_test_path` but not this — they are
-    scaffolding, and the map must not credit them as a covering test.
+    `test_*.py` OR `*_test.py` inside a test location. `conftest.py`,
+    fixtures and stub servers under a test root satisfy `is_test_path` but
+    not this — they are scaffolding, and the map must not credit them as a
+    covering test.
     """
     if not is_test_path(path):
         return False
     name = path.rsplit("/", 1)[-1]
-    return name.startswith(TEST_FILE_PREFIX) and name.endswith(".py")
+    if not name.endswith(".py"):
+        return False
+    stem = name[:-3]
+    return stem.startswith(TEST_FILE_PREFIX) or stem.endswith(TEST_FILE_SUFFIX)
 
 
 def canonical_test_path(root: Path, path: str) -> str:

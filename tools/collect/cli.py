@@ -373,6 +373,18 @@ def _sources_for(root: Path, modules: List[ModuleRecord]) -> Dict[str, str]:
     return sources
 
 
+def _primary_config_path(root: Path, config_path: str) -> Path:
+    """The primary profile `.ini`, as one file. `--config` may name it cwd-relative
+    (the default `agents.ini`) or be handed to `run()` root-relative by an in-process
+    caller, and neither resolution may silently mean another file: `_sibling_gaps`
+    diffs the primary against, and `_profile_paths` hashes, exactly this path.
+    """
+    primary = Path(config_path)
+    if primary.is_absolute() or primary.exists():
+        return primary
+    return Path(root) / primary
+
+
 def _sibling_gaps(root: Path, config: Optional[configparser.ConfigParser], config_path: Optional[str]):
     """`[collect] sibling_profiles = agents_32k.ini,agents_stub.ini` (comma
     list, optional) diffed against the primary config file. Empty by
@@ -385,7 +397,91 @@ def _sibling_gaps(root: Path, config: Optional[configparser.ConfigParser], confi
     if not names:
         return []
     siblings = {name: Path(root) / name for name in names}
-    return config_map_mod.diff_sibling_profiles(Path(config_path), siblings)
+    return config_map_mod.diff_sibling_profiles(_primary_config_path(root, config_path), siblings)
+
+
+def _profile_paths(
+    root: Path, config: Optional[configparser.ConfigParser], config_path: Optional[str]
+) -> List[str]:
+    """The `.ini` files `CONFIG_MAP.md` depends on, as repo-relative POSIX paths: the
+    primary config file, plus every `[collect] sibling_profiles` entry — `_sibling_gaps`
+    diffs exactly that set, so an edit to any of it changes the artifact.
+
+    HARDEN-21 C: `file_hashes` held modules only, so after fixing a sibling profile
+    `--check` and `--collect` answered "already up to date" and `CONFIG_MAP.md` kept the
+    gap until some `.py` file was touched. These paths are hashed into the manifest's
+    `profile_hashes` instead, so `is_fresh` sees them without touching the module diff.
+
+    `[]` when there is no primary config file — the case for a tree without a profile —
+    so such a tree hashes nothing extra and its manifest keeps its previous shape. Fail
+    open: a missing or unreadable entry is simply absent from the result (`hash_tree`
+    skips it), never an exception into a build.
+    """
+    if not config_path:
+        return []
+    # `CONFIG_MAP.md` diffs the primary against its siblings; a tree that names none has nothing
+    # the profiles could change, so an edit of its `agents.ini` must not make the model stale.
+    if config is None:
+        return []
+    try:
+        if not config.get("collect", "sibling_profiles", fallback="").strip():
+            return []
+    except (AttributeError, TypeError, ValueError, configparser.Error):
+        return []
+
+    def _key(p: Path) -> str:
+        # A `config_path` is cwd-relative, so it is resolved before it is made
+        # root-relative: `os.path.relpath` would otherwise mean
+        # `cwd / config_path`, and the manifest key would track the wrong file.
+        resolved = p.resolve()
+        try:
+            return resolved.relative_to(Path(root).resolve()).as_posix()
+        except ValueError:
+            # Outside `root`: keep the absolute path, so the key is still one file.
+            return resolved.as_posix()
+
+    out: List[str] = [_key(_primary_config_path(root, config_path))]
+    if config is not None:
+        try:
+            raw = config.get("collect", "sibling_profiles", fallback="")
+        except (AttributeError, TypeError, ValueError, configparser.Error):
+            raw = ""
+        if isinstance(raw, str):
+            for name in raw.split(","):
+                name = name.strip()
+                if name and _key(Path(root) / name) not in out:
+                    out.append(_key(Path(root) / name))
+    return out
+
+
+def _hash_modules_and_profiles(
+    root: Path,
+    modules: List[ModuleRecord],
+    config: Optional[configparser.ConfigParser],
+    config_path: Optional[str],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """`({module: sha256}, {profile ini: sha256})` from ONE `hash_tree` pass.
+
+    The modules and the `_profile_paths` of this run are hashed in the same
+    call and split afterwards, so the tree is read once, not once for the
+    modules and again for the `.ini` files — `--collect`, `--refresh` and
+    `--rebuild` each pay for exactly one hash pass either way (the counts the
+    stale-tree receipt pins). Splitting on membership rather than by two
+    separate calls keeps the two maps disjoint, which is what lets
+    `--refresh`'s module diff stay blind to a profile edit.
+
+    A missing or unreadable file is simply absent from its map
+    (`hash_tree`'s own rule), so a typo'd `sibling_profiles` entry costs
+    nothing and never fails the build.
+    """
+    module_paths = [m.path for m in modules]
+    profiles = _profile_paths(root, config, config_path)
+    profile_set = set(profiles)
+    hashed = manifest_mod.hash_tree(root, module_paths + profiles)
+    return (
+        {p: h for p, h in hashed.items() if p not in profile_set},
+        {p: h for p, h in hashed.items() if p in profile_set},
+    )
 
 
 def build_context(
@@ -587,6 +683,7 @@ def _write_manifest(
     file_hashes: Optional[Dict[str, str]] = None,
     config: Optional[configparser.ConfigParser] = None,
     unsummarized: Optional[Tuple[str, ...]] = None,
+    profile_hashes: Optional[Dict[str, str]] = None,
 ) -> None:
     """`provenance`, if given, must be a `(git_sha, dirty)` pair captured
     via `manifest_mod.capture_provenance(root)` *before* `_write_artifact`
@@ -595,13 +692,18 @@ def _write_manifest(
     `file_hashes`, if given, is the `{path: sha256}` map the caller already
     computed for this same set of modules, reused instead of re-hashing the
     tree here (see `manifest.build_manifest`).
+    `profile_hashes`, if given, is the caller's `{ini: sha256}` map over the
+    same `_profile_paths` set — recorded verbatim, never recomputed here, so
+    this write stays inside the caller's single hash pass (HARDEN-21 C).
+    `None` records an empty map: the caller tracked no profile, which is what
+    `is_fresh` compares it to.
     `unsummarized`, if given, is the sorted list of module paths whose Pass B
     produced no summary — the manifest records them so the next refresh can
     retry just those instead of treating the whole artifact as fresh."""
     files = sorted(m.path for m in modules)
     manifest = manifest_mod.build_manifest(
         root, files, provenance=provenance, file_hashes=file_hashes, config=config,
-        unsummarized=unsummarized,
+        unsummarized=unsummarized, profile_hashes=profile_hashes,
     )
     manifest_mod.write_manifest(manifest, collect_dir / MANIFEST_FILENAME)
 
@@ -634,14 +736,16 @@ def _read_previous_manifest(collect_dir: Path) -> Tuple[Optional[manifest_mod.Ma
 
 
 def _freshness(
-    root: Path, config: Optional[configparser.ConfigParser],
-) -> Tuple[CollectResult, Optional[List[ModuleRecord]], Optional[Dict[str, str]]]:
+    root: Path, config: Optional[configparser.ConfigParser], config_path: Optional[str] = None,
+) -> Tuple[CollectResult, Optional[List[ModuleRecord]], Optional[Dict[str, str]], Dict[str, str]]:
     """The one freshness verdict — what `--check` reports and what
-    `--collect` gates on — plus the Pass A scan and `{path: sha256}` map it
-    cost, so a stale `--collect` hands them to `action_refresh` instead of
-    scanning and hashing the same tree a second time. Both are `None` when
-    the verdict needed neither (no manifest, an unreadable one, a manifest
-    whose artifact is gone): the refresh that follows scans for itself.
+    `--collect` gates on — plus the Pass A scan and the two `{path: sha256}`
+    maps it cost (modules, profile `.ini` files), so a stale `--collect`
+    hands them to `action_refresh` instead of scanning and hashing the same
+    tree a second time. The first two are `None` when the verdict needed
+    neither (no manifest, an unreadable one, a manifest whose artifact is
+    gone): the refresh that follows scans for itself. `profile_hashes` is
+    always a map — `{}` when there was nothing to hash.
 
     One function for both callers on purpose: `action_collect` used to ask
     `action_check` for the verdict and then `action_refresh` re-derived the
@@ -668,20 +772,24 @@ def _freshness(
 
     existing, manifest_problem = _read_previous_manifest(collect_dir)
     if manifest_problem is not None:
-        return _verdict(False, f"manifest {manifest_problem} — treat as stale"), None, None
+        return _verdict(False, f"manifest {manifest_problem} — treat as stale"), None, None, {}
     if existing is None:
-        return _verdict(False, f"no manifest at {manifest_path} — collect has never run"), None, None
+        return _verdict(False, f"no manifest at {manifest_path} — collect has never run"), None, None, {}
     if not artifact_path.exists():
         return _verdict(
             False,
             f"manifest present at {manifest_path} but the artifact at "
             f"{artifact_path} is missing — needs a full rebuild",
-        ), None, None
+        ), None, None, {}
 
     modules = scan_repo(root, config=config)
-    hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
+    # One hash pass for both maps: the modules and the profile `.ini` files
+    # CONFIG_MAP.md is built from, split afterwards. Hashing them separately
+    # would be a second pass over the same tree, which the stale-tree receipt pins against.
+    hashes, profile_hashes = _hash_modules_and_profiles(root, modules, config, config_path)
     fresh = manifest_mod.is_fresh(existing, root, files=[m.path for m in modules],
-                                 hashes=hashes, skip_dirs=manifest_mod.skip_dirs_from_config(config))
+                                  hashes=hashes, skip_dirs=manifest_mod.skip_dirs_from_config(config),
+                                  profile_hashes=profile_hashes)
     if fresh:
         reason = "up to date"
     elif existing.unsummarized:
@@ -693,16 +801,27 @@ def _freshness(
             f"stale — manifest was built by collector_version="
             f"{existing.collector_version!r}, current is {manifest_mod.COLLECTOR_VERSION!r}"
         )
+    elif (dict(existing.file_hashes) == dict(hashes)
+          and dict(profile_hashes) != dict(existing.profile_hashes)):
+        # HARDEN-21 C: no tracked module moved — only the `.ini` files CONFIG_MAP.md is built
+        # from did, so the verdict says that instead of blaming a module. Comparing the manifest's
+        # own recorded hashes with `hashes` costs nothing: both maps were already computed here.
+        # The word "tracked file" is kept out of this sentence on purpose: the stale-message guard
+        # pins that it appears only when a module really changed.
+        reason = ("stale — a collect profile config changed, not a tracked module — "
+                  "CONFIG_MAP.md needs a rebuild")
     else:
         reason = "stale — a tracked file changed since the last collect run"
-    return _verdict(fresh, reason), modules, hashes
+    return _verdict(fresh, reason), modules, hashes, profile_hashes
 
 
-def action_check(root: Path, *, config: Optional[configparser.ConfigParser] = None) -> CollectResult:
+def action_check(root: Path, *, config: Optional[configparser.ConfigParser] = None,
+                 config_path: Optional[str] = None) -> CollectResult:
     """`--check`: freshness only. Never writes — not the manifest, not the
     artifact, nothing — regardless of what it finds. The verdict is
-    `_freshness`'s, the same one `--collect` gates on."""
-    return _freshness(Path(root), config)[0]
+    `_freshness`'s, the same one `--collect` gates on. `config_path` names
+    the profile `.ini` files that verdict hashes (HARDEN-21 C)."""
+    return _freshness(Path(root), config, config_path)[0]
 
 
 def _full_build(
@@ -713,6 +832,7 @@ def _full_build(
     llm_call: Optional[LlmCall],
     modules: Optional[List[ModuleRecord]] = None,
     hashes: Optional[Dict[str, str]] = None,
+    profile_hashes: Optional[Dict[str, str]] = None,
     drop_summaries: bool = False,
 ) -> Tuple[Path, List[str], CollectContext]:
     # Provenance is captured before the output directory is written, so the build's own output does not make the tree dirty.
@@ -722,8 +842,9 @@ def _full_build(
     if modules is None:
         modules = scan_repo(root, config=config)
     if hashes is None:
-        # Hashed once here and reused by _write_manifest, before _write_artifact writes to disk.
-        hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
+        # Hashed once here — modules and profile ini files in the same pass — and reused by
+        # _write_manifest, before _write_artifact writes to disk.
+        hashes, profile_hashes = _hash_modules_and_profiles(root, modules, config, config_path)
     # A build without Pass B carries previous summaries forward, tagged stale where the file changed, instead of erasing them (V8).
     pass_b_ran = llm_call is not None
     carried = stale = dropped = 0
@@ -757,7 +878,7 @@ def _full_build(
         if m.summary is None and m.parse_error is None and pass_b_ran
     ))
     _write_manifest(root, collect_dir, ctx.modules, provenance=provenance, file_hashes=hashes,
-                    config=config, unsummarized=unsummarized)
+                    config=config, unsummarized=unsummarized, profile_hashes=profile_hashes)
     written = sorted(set(written) | {MANIFEST_FILENAME})
     return collect_dir, written, ctx, unsummarized
 
@@ -845,6 +966,7 @@ def action_refresh(
     llm_call: Optional[LlmCall] = None,
     modules: Optional[List[ModuleRecord]] = None,
     hashes: Optional[Dict[str, str]] = None,
+    profile_hashes: Optional[Dict[str, str]] = None,
     drop_summaries: bool = False,
 ) -> CollectResult:
     """`--refresh`: diff-driven incremental rebuild (COLLECT-24).
@@ -932,15 +1054,21 @@ def action_refresh(
         previous_by_path = {}
 
     # The tree is scanned and hashed once, shared by the incremental path and the full-build fallback.
+    # Modules and profile ini files go through the same pass, so a stale `--refresh` hashes once too.
     current_modules = modules if modules is not None else scan_repo(root, config=config)
-    current_hashes = hashes if hashes is not None else manifest_mod.hash_tree(
-        root, [m.path for m in current_modules],
-    )
+    if hashes is not None:
+        current_hashes = hashes
+        current_profile_hashes = profile_hashes if profile_hashes is not None else {}
+    else:
+        current_hashes, current_profile_hashes = _hash_modules_and_profiles(
+            root, current_modules, config, config_path,
+        )
 
     if previous_manifest is None:
         collect_dir, written, ctx, unsummarized = _full_build(
             root, config=config, config_path=config_path, llm_call=llm_call,
-            modules=current_modules, hashes=current_hashes, drop_summaries=drop_summaries,
+            modules=current_modules, hashes=current_hashes, profile_hashes=current_profile_hashes,
+            drop_summaries=drop_summaries,
         )
         return CollectResult(
             action="refresh", wrote=True, fresh=True,
@@ -1068,7 +1196,8 @@ def action_refresh(
     }
     unsummarized = tuple(sorted(summarized_unsummarized | carried_unsummarized))
     _write_manifest(root, collect_dir, ctx.modules, provenance=provenance,
-                    file_hashes=current_hashes, config=config, unsummarized=unsummarized)
+                    file_hashes=current_hashes, config=config, unsummarized=unsummarized,
+                    profile_hashes=current_profile_hashes)
     written = sorted(set(written) | {MANIFEST_FILENAME})
 
     if changes.is_empty():
@@ -1126,16 +1255,19 @@ def action_collect(
     drops a version-mismatched previous manifest and falls back to
     `_full_build`.
 
-    Cost: one Pass A scan and one hash pass. `_freshness` — the same verdict
-    `action_check` reports — returns the scan and the hash map it computed,
-    and they are handed to `action_refresh` (`modules=`/`hashes=`), which
-    passes the map on to `_write_manifest`. This used to scan the tree twice
+    Cost: one Pass A scan and one hash pass — that one pass covers both the
+    modules and the profile `.ini` files `CONFIG_MAP.md` is built from,
+    hashed together and split afterwards rather than twice (HARDEN-21 C).
+    `_freshness` — the same verdict `action_check` reports — returns the scan
+    and the maps it computed, and they are handed to `action_refresh`
+    (`modules=`/`hashes=`/`profile_hashes=`), which passes them on to
+    `_write_manifest`. This used to scan the tree twice
     and hash it three times (freshness gate, the diff, then again inside
     `manifest.build_manifest`); Pass B was already down to one call per
     changed module, so Pass A and the hash passes were the next largest
     things on the receipt.
     """
-    verdict, modules, hashes = _freshness(Path(root), config)
+    verdict, modules, hashes, profile_hashes = _freshness(Path(root), config, config_path)
     if verdict.fresh:
         return CollectResult(
             action="collect", wrote=False, fresh=True,
@@ -1144,7 +1276,8 @@ def action_collect(
         )
     result = action_refresh(
         root, config=config, config_path=config_path, llm_call=llm_call,
-        modules=modules, hashes=hashes, drop_summaries=drop_summaries,
+        modules=modules, hashes=hashes, profile_hashes=profile_hashes,
+        drop_summaries=drop_summaries,
     )
     return CollectResult(
         action="collect", wrote=result.wrote, fresh=result.fresh,
@@ -1384,7 +1517,7 @@ def run(
         raise CollectCliError(f"unknown collect action {action!r}; must be one of {sorted(VALID_ACTIONS)}")
     root = Path(root)
     if action == "check":
-        return action_check(root, config=config)
+        return action_check(root, config=config, config_path=config_path)
 
     settings = read_collect_settings(config)
     if not settings.enabled and action != "check":
