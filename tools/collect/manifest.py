@@ -334,6 +334,12 @@ class Manifest:
     # an added or removed *module* in `--refresh`'s diff. Older manifests read as {} — and are
     # fresh for the setting's own purposes, since a tree without profiles hashes nothing.
     profile_hashes: Dict[str, str] = field(default_factory=dict)
+    # HARDEN-24 B: the files the walk skipped and why — `("path", "too deep")`,
+    # `("path", "too large")`, `("path", "unreadable")`. Before this the collect stage
+    # borrowed the Architect's depth and size limits and dropped a file with no word of it,
+    # so a deep tree or a large generated file was missing from the model and from here.
+    # Older manifests read as () and are unaffected.
+    skipped_files: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         return {
@@ -345,6 +351,7 @@ class Manifest:
             "skip_dirs": sorted(self.skip_dirs),
             "unsummarized": sorted(self.unsummarized),
             "profile_hashes": dict(self.profile_hashes),
+            "skipped_files": [list(pair) for pair in self.skipped_files],
         }
 
     def to_json(self, *, indent: int = 2) -> str:
@@ -384,6 +391,17 @@ class Manifest:
             if isinstance(d.get("profile_hashes"), dict)
             and all(isinstance(k, str) and isinstance(v, str) for k, v in d["profile_hashes"].items())
             else {},
+            # HARDEN-24 B: a missing or malformed skipped_files key reads as () — an older
+            # manifest never recorded skips, and a half-broken one must not make the manifest
+            # unreadable. A pair that is not a two-string tuple is dropped, not raised on.
+            skipped_files=tuple(
+                (str(pair[0]), str(pair[1]))
+                for pair in d.get("skipped_files", [])
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
+                and all(isinstance(x, str) for x in pair)
+            )
+            if isinstance(d.get("skipped_files"), (list, tuple))
+            else tuple(),
         )
 
     @classmethod
@@ -402,6 +420,7 @@ def build_manifest(
     skip_dirs: Optional[Iterable[str]] = None,
     unsummarized: Optional[Iterable[str]] = None,
     profile_hashes: Optional[Dict[str, str]] = None,
+    skipped_files: Optional[Iterable[Tuple[str, str]]] = None,
 ) -> Manifest:
     """Build a `Manifest` for `root`. If `files` isn't given, discovers
     `*.py` files under `root` via `discover_files`.
@@ -452,6 +471,10 @@ def build_manifest(
         skip_dirs=tuple(sorted(effective)),
         unsummarized=tuple(sorted(unsummarized)) if unsummarized is not None else tuple(),
         profile_hashes=dict(profile_hashes) if profile_hashes is not None else {},
+        # HARDEN-24 B: the skipped files are recorded as the walk named them, sorted by path
+        # so the manifest stays diffable. `None` records nothing, as `None` does for the other
+        # optional maps.
+        skipped_files=tuple(sorted(skipped_files)) if skipped_files is not None else tuple(),
     )
 
 

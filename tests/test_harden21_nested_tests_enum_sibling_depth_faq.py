@@ -239,9 +239,11 @@ def test_a_claim_check_collect_walks_to_the_pipeline_depth(tmp_path, ini):
 
 
 def test_a_depth_in_the_config_is_honoured_and_a_cut_scan_says_so(tmp_path):
+    """`[collect] max_depth` narrows the collect walk and the cut is announced: a
+    `[search]` depth is the Architect's, not the collect stage's (HARDEN-24 B)."""
     from tools.claimcheck.target import Target
     cfg = configparser.ConfigParser()
-    cfg.read_string("[search]\nmax_depth = 2\n")
+    cfg.read_string("[collect]\nmax_depth = 2\n")
     with Target.open(_deep_repo(tmp_path), "HEAD", scratch=tmp_path / "scratch") as target:
         paths = {m.path for m in target.collect(config=cfg).modules}
         assert "src/beta/util/deep/x/leaf.py" not in paths

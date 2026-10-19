@@ -189,15 +189,26 @@ class RepoIngestor:
         config: configparser.ConfigParser | None = None,
         task_mode: str = "code",
         extra_skip_dirs: "frozenset[str] | set[str] | None" = None,
+        max_depth: int | None = None,
+        max_file_kb: int | None = None,
+        collect_skips: bool = False,
     ) -> None:
         self.base_dir  = Path(base_dir).resolve()
         self._config   = config or configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
         self._task_mode = task_mode
 
         # Walk limits: [architect] overrides first, then [search]; creative mode uses its own size, and the collect skip list is added by the caller (AUTO-CR-3, CC-13).
+        # HARDEN-24 B: a caller may supply its own limits outright (`max_depth` / `max_file_kb`).
+        # The collect stage does exactly that, reading [collect] rather than sharing the
+        # Architect's [search] numbers; when it names none, the [architect]/[search] read below
+        # runs exactly as it always did.
         self._skip_dirs  = self._read_skip_dirs() | (set(extra_skip_dirs) if extra_skip_dirs else set())
-        self._max_depth  = self._read_int("max_depth",  2)
-        self._max_file_kb = self._read_int_mode("max_file_kb", 500)
+        self._max_depth  = self._read_int("max_depth",  2) if max_depth is None else int(max_depth)
+        self._max_file_kb = self._read_int_mode("max_file_kb", 500) if max_file_kb is None else int(max_file_kb)
+        self._collect_skips = bool(collect_skips)
+        #: `(relative_path, reason)` for every file the walk left out on a depth or a size
+        #: limit. Empty unless `collect_skips` was passed, so the Architect's walk is untouched.
+        self.skipped_files: list[tuple[str, str]] = []
 
         # Cluster definitions — config-driven or built-in default.
         self._cluster_defs: list[tuple[str, list[str]]] = self._read_cluster_defs()
@@ -224,18 +235,28 @@ class RepoIngestor:
         Applies skip_dirs, max_depth, max_file_kb, and binary-extension
         filters.  Hidden files (starting with ``.``) are skipped unless they
         are inside a directory that was not itself skipped.
+
+        HARDEN-24 B: with ``collect_skips=True`` the depth limit stops being a
+        prune and becomes a per-file decision, so a file below the limit is still
+        visited, recorded on ``self.skipped_files`` as ``("too deep",)`` and not
+        yielded. A size-limit skip is recorded as ``("too large",)`` the same way,
+        and a file the walk cannot stat as ``("unreadable",)``. Without the flag
+        the walk is exactly as it was: those files never reach a log line or a
+        caller at all.
         """
         base = self.base_dir
         for dirpath, dirnames, filenames in os.walk(base):
             rel_dir = Path(dirpath).relative_to(base)
             depth   = len(rel_dir.parts)
 
-            # Prune directories that exceed max_depth or are on the skip list.
+            # Prune directories that exceed max_depth or are on the skip list. With skip
+            # reporting the depth limit cannot prune, or the files below it would never
+            # be visited to be named; the per-file test below takes them out instead.
             dirnames[:] = [
                 d for d in sorted(dirnames)
                 if d not in self._skip_dirs
                 and not d.startswith(".")
-                and (self._max_depth <= 0 or depth < self._max_depth)
+                and (self._max_depth <= 0 or depth < self._max_depth or self._collect_skips)
             ]
 
             for fname in sorted(filenames):
@@ -251,15 +272,23 @@ class RepoIngestor:
                     continue
 
                 abs_path = Path(dirpath) / fname
+                rel_posix = (rel_dir / fname).as_posix()
+                if self._max_depth > 0 and depth > self._max_depth:
+                    if self._collect_skips:
+                        self.skipped_files.append((rel_posix, "too deep"))
+                    continue
                 try:
                     size_kb = abs_path.stat().st_size / 1024
                 except OSError:
+                    if self._collect_skips:
+                        self.skipped_files.append((rel_posix, "unreadable"))
                     continue
                 if self._max_file_kb > 0 and size_kb > self._max_file_kb:
                     logger.debug("walk: skipping large file %s (%.1f KB)", abs_path, size_kb)
+                    if self._collect_skips:
+                        self.skipped_files.append((rel_posix, "too large"))
                     continue
 
-                rel_posix = (rel_dir / fname).as_posix()
                 yield rel_posix
 
     def cluster(self, files: list[str]) -> list[RepoCluster]:

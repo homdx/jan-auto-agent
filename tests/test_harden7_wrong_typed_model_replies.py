@@ -90,8 +90,8 @@ class TestReplyText:
     def test_bool_is_its_text(self):
         assert reply_text(True) == "True"
 
-    def test_object_is_its_text_and_never_raises(self):
-        assert reply_text({"a": 1}) == "{'a': 1}"
+    def test_object_is_its_compact_json_and_never_raises(self):
+        assert reply_text({"a": 1}) == '{"a":1}'
 
 
 class TestReplyIsYes:
@@ -476,8 +476,8 @@ class TestValidatorFeedbackType:
     def test_a_number_feedback_becomes_text(self):
         assert _validate_with(5)["feedback"] == "5"
 
-    def test_an_object_feedback_becomes_text(self):
-        assert _validate_with({"a": 1})["feedback"] == "{'a': 1}"
+    def test_an_object_feedback_becomes_compact_json(self):
+        assert _validate_with({"a": 1})["feedback"] == '{"a":1}'
 
     def test_a_string_feedback_is_byte_identical_to_today(self):
         """The one behaviour a caller could notice: a string is left exactly as

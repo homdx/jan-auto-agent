@@ -134,15 +134,32 @@ def _source_root_split(
     scripts (`scripts/`, `tests/`) keeps the full path it always had; a leading `src`/`lib` counts
     as a source root even where it holds no `__init__.py` of its own, since that is the only reason
     it would be named that.
+
+    HARDEN-24 A: the shallowest *package* in the chain decides, not the deepest directory that
+    happens to hold no `__init__.py`. The old walk stopped at the first non-package directory it
+    met from the file's own directory upwards, so `src/c/tests/test_c.py` — a `tests/` folder
+    without an `__init__.py` *inside* the package `src/c` — stopped at `src/c/tests` and read the
+    source root as `src/c/tests`. Its layout-relative name became `test_c`, the import
+    `c.core` was rewritten to `c.tests.c.core`, and the longest-prefix fallback crawled that miss
+    up to `c` — the package's own `__init__.py` instead of `src/c/core.py`. With the shallowest
+    package the source root is `src` and the dotted name is `c.tests.test_c`, as it should be.
     """
     dirs = parts[:-1]
-    i = len(dirs)
-    while i > 0 and "/".join(dirs[:i]) in packages:
-        i -= 1
-    head = dirs[:i]
+    topmost = None
+    for i in range(1, len(dirs) + 1):
+        if "/".join(dirs[:i]) in packages:
+            topmost = i
+            break
+    if topmost is None:
+        # No package in the chain: the whole chain is the head, and the source-root check below
+        # decides whether it counts at all (a loose `scripts/` does not).
+        head = tuple(dirs)
+    else:
+        # The source root is the parent of the shallowest package in the chain.
+        head = tuple(dirs[:topmost - 1])
     if not head:
         return ()
-    if "/".join(head) not in roots and head[0] not in _SOURCE_ROOT_DIRS:
+    if topmost is None and "/".join(head) not in roots and head[0] not in _SOURCE_ROOT_DIRS:
         return ()
     if head[0] in _SOURCE_ROOT_DIRS and len(head) > 1:
         head = head[1:]

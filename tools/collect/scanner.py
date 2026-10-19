@@ -60,6 +60,44 @@ from tools.collect.lang import (
 from tools.collect.model import ModuleRecord
 
 
+#: The collect stage's own walk limits, read from `[collect]` (HARDEN-24 B). Both default at
+#: least as wide as the values the stage used to borrow from `[search]` (depth 2, 500 KB),
+#: so a `[collect]`-less config collects at least as much as before; a repo that nests its
+#: sources three folders deep or carries a generated 600 KB file no longer loses it.
+DEFAULT_COLLECT_MAX_DEPTH = 6
+DEFAULT_COLLECT_MAX_FILE_KB = 4096
+
+
+def _collect_int(config: Optional[configparser.ConfigParser], key: str, default: int) -> int:
+    """One `[collect]` int limit, fail-open: an absent key, a non-int or a negative value
+    gives the default rather than raising into a run (a malformed key is "no collect data",
+    never an abort)."""
+    if config is None:
+        return default
+    try:
+        raw = config.get("collect", key, fallback=None)
+    except (configparser.Error, KeyError, TypeError):
+        return default
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def collect_walk_limits(config: Optional[configparser.ConfigParser]) -> tuple[int, int]:
+    """The `(max_depth, max_file_kb)` the collect walk uses: `[collect] max_depth` and
+    `[collect] max_file_kb`, each defaulting to at least the `[search]` values the stage
+    used to read. The Architect keeps its own `[search]`/`[architect]` numbers — this pair
+    is the collect stage's, and nothing else reads it."""
+    return (
+        _collect_int(config, "max_depth", DEFAULT_COLLECT_MAX_DEPTH),
+        _collect_int(config, "max_file_kb", DEFAULT_COLLECT_MAX_FILE_KB),
+    )
+
+
 def scan_module(source: str, module_path: str) -> ModuleRecord:
     """Build one Python `ModuleRecord` from already-read `source` text.
 
@@ -219,10 +257,49 @@ def scan_repo(
     wasn't asked to look," which is exactly the point — a Python-only
     user sees zero behavior change whether or not `tree-sitter-java`
     happens to be installed.
+
+    HARDEN-24 B: the walk runs on the collect stage's own `[collect]`
+    limits, not on the Architect's `[search]` numbers. The files those
+    limits left out are returned by `scan_repo_ex` and recorded on the
+    manifest, so a depth or a size limit says so instead of dropping the
+    file from the model with no word of it.
     """
+    return _scan_repo(root, config)[0]
+
+
+def scan_repo_ex(
+    root: Path,
+    *,
+    config: Optional[configparser.ConfigParser] = None,
+) -> "tuple[List[ModuleRecord], List[tuple[str, str]]]":
+    """`scan_repo` plus `(path, reason)` for every file its walk skipped (HARDEN-24 B).
+
+    The reasons are the walk's own: `"too deep"` (past `[collect] max_depth`),
+    `"too large"` (past `[collect] max_file_kb`) and `"unreadable"` (the walk
+    could not stat it). Sorted by path, and empty when nothing was skipped —
+    which is also what a config that names no limits gives, since a malformed
+    limit degrades to the default rather than raising.
+    """
+    modules, skipped = _scan_repo(root, config)
+    return modules, sorted(skipped)
+
+
+def _scan_repo(
+    root: Path,
+    config: Optional[configparser.ConfigParser],
+) -> "tuple[List[ModuleRecord], List[tuple[str, str]]]":
     root = Path(root)
     # skip_dirs prunes the walk itself, so the artifact's module list and the manifest agree; no key means the defaults.
-    ingestor = RepoIngestor(root, config, extra_skip_dirs=_collect_skip_dirs(config))
+    # The depth and size limits are the collect stage's own (HARDEN-24 B), and the walk is asked to
+    # name what it leaves out rather than drop it silently.
+    max_depth, max_file_kb = collect_walk_limits(config)
+    ingestor = RepoIngestor(
+        root, config,
+        extra_skip_dirs=_collect_skip_dirs(config),
+        max_depth=max_depth,
+        max_file_kb=max_file_kb,
+        collect_skips=True,
+    )
     enabled = enabled_languages(config)
     java_exts = java_extensions_from_config(config)
 
@@ -259,7 +336,7 @@ def scan_repo(
                     language=language,
                 )
             )
-    return modules
+    return modules, list(ingestor.skipped_files)
 
 
 def scan_repo_payload(root: Path, *, config: Optional[configparser.ConfigParser] = None):

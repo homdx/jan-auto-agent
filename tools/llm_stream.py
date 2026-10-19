@@ -2334,11 +2334,22 @@ def strip_json_fence(text: str) -> str:
     return text
 
 
-#: The spellings a model's yes/no field may carry for a yes (HARDEN-7). The
-#: list is closed on purpose: anything not in it — a string such as "false",
-#: "no" or "rejected" included — is a no, so a field read this way can only
-#: ever lose an approval, never invent one.
-_YES_SPELLINGS: tuple[str, ...] = ("true", "yes", "y", "1", "approved", "ok")
+#: The spellings a model's yes/no field may carry for a yes (HARDEN-7), widened
+#: by HARDEN-24 C with the words the same approvals arrive as: ``okay`` (English
+#: for the same thing as ``ok``), the Russian ``да``, and ``approved`` already
+#: here. The list is closed on purpose: anything not in it — a string such as
+#: "false", "no" or "rejected" included — is a no, so a field read this way can
+#: only ever lose an approval, never invent one.
+_YES_SPELLINGS: tuple[str, ...] = ("true", "yes", "y", "1", "approved", "ok", "okay", "да")
+
+#: The punctuation a model leaves trailing on a yes/no field (HARDEN-24 C): a
+#: full stop, an exclamation mark, a quote of either kind, a backtick or a
+#: comma. Stripped from the right before the match, so ``"Yes."`` and ``"yes!"``
+#: are the same yes as ``yes`` and ``"ok, approved"`` reads as two yes spellings
+#: rather than one unrecognised string. Only from the right: a leading mark is
+#: the reply's own and is left alone by the caller's ``strip()``.
+_REPLY_TRAILING_CHARS = " \t.!\"'`,“”‘’«»"
+_REPLY_LEADING_QUOTES = "\"'`“‘«"
 
 
 def reply_text(value) -> str:
@@ -2352,18 +2363,44 @@ def reply_text(value) -> str:
 
     A string comes back stripped, unchanged otherwise, so a well-behaved reply
     is byte-identical to what the caller's own ``.strip()`` produced. A list is
-    one item per line; any other value is its text; ``None`` is empty. Never
-    raises, so the reader itself cannot be the thing that ends a run.
+    one item per line, which HARDEN-7 A pins and HARDEN-24 D keeps.
+
+    HARDEN-24 D: a dict comes back as compact JSON, not as the Python repr. The
+    repr is what ``str()`` gives, and a log line or a prompt that quotes the
+    field showed ``{'a': 1}`` — single quotes and a space — where the reply held
+    JSON. The compact form is what the model actually sent, so a quoted reply
+    reads back the way it was written. ``None`` stays empty: every caller that
+    needs to tell "held nothing" from "held an empty string" already does so with
+    the ``(none)`` marker it supplies itself, and a truthy marker here would
+    defeat the ``or "no reason given"`` fallbacks callers rely on. Never raises,
+    so the reader itself cannot be the thing that ends a run.
     """
     if value is None:
         return ""
     if isinstance(value, str):
         return value.strip()
+    if isinstance(value, dict):
+        # Compact JSON: the shape the model sent, read back the way it was written.
+        return _json_dump(value)
     if isinstance(value, (list, tuple)):
         # A list one item per line: the model meant several lines of text and
-        # sent them as JSON. Nesting is flattened with the same rule.
+        # sent them as JSON. HARDEN-7 A pins the shape, and HARDEN-24 D keeps it.
         return "\n".join(reply_text(item) for item in value).strip()
     return str(value).strip()
+
+
+def _json_dump(value) -> str:
+    """One value as compact JSON, or its ``str()`` when JSON has no shape for it.
+
+    A dict of one pair is ``{"a":1}`` — no space after the separators, and the
+    non-ASCII kept rather than escaped to ``\\u...``. Anything JSON cannot encode
+    (a set, a date, a key that is not a string) falls back to ``str()``, which is
+    the reader's fail-open default rather than an exception out of a log line.
+    """
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value).strip()
 
 
 def reply_is_yes(value) -> bool:
@@ -2378,6 +2415,14 @@ def reply_is_yes(value) -> bool:
     string whose trimmed, lower-cased spelling is in ``_YES_SPELLINGS``. Every
     other value — a string such as ``"false"``, ``"no"`` or ``"rejected"``
     included, and any number that is not 1 — is a no.
+
+    HARDEN-24 C: the match is on the *word*, not on the whole stripped string,
+    so the punctuation a model leaves trailing does not cost the approval.
+    ``"Yes."``, ``"yes!"``, ``"Approved."`` and ``"Yes"`` in quotes all approve,
+    and ``"ok, approved"`` approves as two yes spellings. A reply that goes on
+    with anything else — ``"Yes, but the date is wrong"``, ``"No"`` — is still a
+    no: every comma-separated part has to be a yes spelling, and a part that is
+    not is not a yes. Fail-closed is kept, only widened.
     """
     if isinstance(value, bool):
         return value
@@ -2386,7 +2431,12 @@ def reply_is_yes(value) -> bool:
     if isinstance(value, (int, float)):
         return value == 1
     if isinstance(value, str):
-        return value.strip().lower() in _YES_SPELLINGS
+        text = value.strip().lstrip(_REPLY_LEADING_QUOTES).rstrip(_REPLY_TRAILING_CHARS).lower()
+        if not text:
+            return False
+        # Every comma-separated part has to be a yes spelling: "ok, approved" is a yes,
+        # "Yes, but the date is wrong" is not.
+        return all(part.strip() in _YES_SPELLINGS for part in text.split(","))
     # A list or an object is not a verdict in any spelling: a no.
     return False
 

@@ -62,7 +62,7 @@ import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ from tools.collect import test_map as test_map_mod
 from tools.collect import verifier as verifier_mod
 from tools.collect._determinism import canonical_dumps
 from tools.collect.model import LLMSummary, ModuleRecord, Provenance
-from tools.collect.scanner import language_for, scan_file, scan_repo
+from tools.collect.scanner import language_for, scan_file, scan_repo, scan_repo_ex
 from tools.collect.summarizer import LlmCall, collect_max_retries, summarize_repo
 
 
@@ -674,6 +674,18 @@ def _write_artifact(collect_dir: Path, ctx: CollectContext) -> List[str]:
     return sorted(written)
 
 
+def _log_skipped_files(skipped_files: Optional[Iterable[Tuple[str, str]]]) -> None:
+    """One log line per file the collect walk skipped, with its reason (HARDEN-24 B).
+
+    Before this a depth or a size limit dropped a file from the structural model with no
+    word of it — the manifest never named it either. Each file is named once, here and on
+    the manifest; nothing raises, so a walk that skipped a thousand files cannot make a
+    run fail for the log.
+    """
+    for path, reason in (skipped_files or ()):
+        logger.warning("collect: skipping %s (%s)", path, reason)
+
+
 def _write_manifest(
     root: Path,
     collect_dir: Path,
@@ -684,6 +696,7 @@ def _write_manifest(
     config: Optional[configparser.ConfigParser] = None,
     unsummarized: Optional[Tuple[str, ...]] = None,
     profile_hashes: Optional[Dict[str, str]] = None,
+    skipped_files: Optional[Tuple[Tuple[str, str], ...]] = None,
 ) -> None:
     """`provenance`, if given, must be a `(git_sha, dirty)` pair captured
     via `manifest_mod.capture_provenance(root)` *before* `_write_artifact`
@@ -699,11 +712,15 @@ def _write_manifest(
     `is_fresh` compares it to.
     `unsummarized`, if given, is the sorted list of module paths whose Pass B
     produced no summary — the manifest records them so the next refresh can
-    retry just those instead of treating the whole artifact as fresh."""
+    retry just those instead of treating the whole artifact as fresh.
+    `skipped_files`, if given, is the `(path, reason)` pairs the walk left out
+    on a depth or a size limit (HARDEN-24 B) — the manifest records them so a
+    skipped file is named instead of missing with no word of it."""
     files = sorted(m.path for m in modules)
     manifest = manifest_mod.build_manifest(
         root, files, provenance=provenance, file_hashes=file_hashes, config=config,
         unsummarized=unsummarized, profile_hashes=profile_hashes,
+        skipped_files=skipped_files,
     )
     manifest_mod.write_manifest(manifest, collect_dir / MANIFEST_FILENAME)
 
@@ -834,13 +851,17 @@ def _full_build(
     hashes: Optional[Dict[str, str]] = None,
     profile_hashes: Optional[Dict[str, str]] = None,
     drop_summaries: bool = False,
+    skipped_files: Optional[Tuple[Tuple[str, str], ...]] = None,
 ) -> Tuple[Path, List[str], CollectContext]:
     # Provenance is captured before the output directory is written, so the build's own output does not make the tree dirty.
     collect_dir = resolve_collect_dir(root, config)
     provenance = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
     # The caller's scan and hash of this tree are reused, so a fallback build does not scan twice.
     if modules is None:
-        modules = scan_repo(root, config=config)
+        # HARDEN-24 B: the collect stage's own limits, and the files they left out — named here
+        # and on the manifest instead of dropped silently.
+        modules, skipped_files = scan_repo_ex(root, config=config)
+        _log_skipped_files(skipped_files)
     if hashes is None:
         # Hashed once here — modules and profile ini files in the same pass — and reused by
         # _write_manifest, before _write_artifact writes to disk.
@@ -878,7 +899,8 @@ def _full_build(
         if m.summary is None and m.parse_error is None and pass_b_ran
     ))
     _write_manifest(root, collect_dir, ctx.modules, provenance=provenance, file_hashes=hashes,
-                    config=config, unsummarized=unsummarized, profile_hashes=profile_hashes)
+                    config=config, unsummarized=unsummarized, profile_hashes=profile_hashes,
+                    skipped_files=skipped_files)
     written = sorted(set(written) | {MANIFEST_FILENAME})
     return collect_dir, written, ctx, unsummarized
 
@@ -1055,7 +1077,12 @@ def action_refresh(
 
     # The tree is scanned and hashed once, shared by the incremental path and the full-build fallback.
     # Modules and profile ini files go through the same pass, so a stale `--refresh` hashes once too.
-    current_modules = modules if modules is not None else scan_repo(root, config=config)
+    # HARDEN-24 B: the scan also returns the files the collect stage's own limits skipped, so a
+    # refresh records them on the manifest exactly as a full build does.
+    current_modules, current_skipped = (
+        (modules, ()) if modules is not None else scan_repo_ex(root, config=config)
+    )
+    _log_skipped_files(current_skipped)
     if hashes is not None:
         current_hashes = hashes
         current_profile_hashes = profile_hashes if profile_hashes is not None else {}
@@ -1068,7 +1095,7 @@ def action_refresh(
         collect_dir, written, ctx, unsummarized = _full_build(
             root, config=config, config_path=config_path, llm_call=llm_call,
             modules=current_modules, hashes=current_hashes, profile_hashes=current_profile_hashes,
-            drop_summaries=drop_summaries,
+            drop_summaries=drop_summaries, skipped_files=tuple(current_skipped),
         )
         return CollectResult(
             action="refresh", wrote=True, fresh=True,
@@ -1197,7 +1224,8 @@ def action_refresh(
     unsummarized = tuple(sorted(summarized_unsummarized | carried_unsummarized))
     _write_manifest(root, collect_dir, ctx.modules, provenance=provenance,
                     file_hashes=current_hashes, config=config, unsummarized=unsummarized,
-                    profile_hashes=current_profile_hashes)
+                    profile_hashes=current_profile_hashes,
+                    skipped_files=tuple(current_skipped))
     written = sorted(set(written) | {MANIFEST_FILENAME})
 
     if changes.is_empty():

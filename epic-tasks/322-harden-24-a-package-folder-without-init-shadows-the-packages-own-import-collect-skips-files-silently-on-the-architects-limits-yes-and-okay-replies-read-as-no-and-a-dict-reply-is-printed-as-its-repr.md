@@ -1,10 +1,10 @@
 # HARDEN-24 — an own-root `__init__.py` shadows `src/<pkg>/<folder>/` imports; `--collect` skips files silently on the Architect's depth and size limits; `reply_is_yes` reads `Yes.`, `okay`, `Да` as no; `reply_text` prints a dict as its repr and a `None` as an empty line
 
-**Status:** open
+**Status:** landed (round 322: sensenova-6-8-flash-lite-var1 as the base - A: the shallowest package in the chain decides the source root, so `c.core` from `src/c/tests/test_c.py` is `src/c/core.py`; B: the collect walk has its own `[collect] max_depth` / `max_file_kb` (defaults 6 and 4096), `[search]` stays the Architect's, every skipped file is logged once with its reason and listed in the manifest as a (path, reason) pair, claim-check reads `[collect]`; C: `Yes.`, `yes!`, `okay`, `Да`, `ok, approved`, `Approved.` approve - trailing punctuation and quotes are removed, every comma part must be a yes spelling, my own fix: a quote on both sides (`"yes"`; var1 pinned it as no); D: a dict is compact JSON, a list stays one item per line because the HARDEN-7 A pins are kept, `None` stays empty)
 **Severity:** MEDIUM (A: a wrong edge in the import graph; B: files missing from the model with no word of it; C: an approval read as a rejection by the gate); LOW (D: a log line)
 **File:** `tools/collect/graph.py` (A), `main.py` and the collect settings (B), `tools/llm_stream.py` (C, D)
 **Symbol:** A: `resolve_import`. B: the collect limits read from `[search]`. C: `reply_is_yes`. D: `reply_text`
-**Round:** (set when the round starts)
+**Round:** 322
 **Size:** S
 **Depends on:** HARDEN-7 (the two readers this extends)
 **Also touches:** `tests_bugfix/` pins of HARDEN-7 A, `tests/`
@@ -94,3 +94,9 @@ One commit. The judge's checks are written after the round, from the entries.
 ## Not in scope
 
 Rust, the verdict parser (HARDEN-17, 22), the key mask.
+
+## Why not the others (round 322)
+
+A black box of 119 checks (Part A real trees through `scan_repo`, `build_module_index`, `resolve_import`, `import_edges`; Part B `action_collect` with `[collect]` and `[search]` limits, the log and the manifest; Part C 31 yes and 43 no replies; Part D) scored the base 79, laguna 83 (Part A only), glm 106 (a `_getint` NameError broke every `[collect]` read), var2 114, agnes 116, var1 117, var3 117, var4 117, step-5 118; the ideal 119 (nemotron left an IndentationError in `collect/cli.py` and was not scored). agnes logged a skipped directory but its manifest list was always empty - the refresh path discards the skipped list - and var3 and var4 still let `[search]` limit the collect walk. The ticket said a list is compact JSON and also that the HARDEN-7 pins stay green; every entry kept the list one item per line, so did the ideal, and the black box accepts both. The others' tests were run on the ideal as copies: every failure is a private name (`CollectSettings.max_depth`, `_read_collect_int`, `SkippedFile`, `REASON_TOO_DEEP`), `None` as `(none)` or a list as JSON.
+
+Open for the next tickets: the quote on one side only (`"yes`) is read as yes; `reply_text(None)` is an empty string that a caller cannot tell from `""`; the default collect depth 6 is narrower than claim-check's 8.

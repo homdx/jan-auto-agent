@@ -571,22 +571,33 @@ def op_counts(monkeypatch):
     has to be patched there; `hash_tree` is always reached through the
     manifest module (`build_manifest`, `is_fresh` and the actions all call
     it that way), so patching that one attribute covers every caller.
+
+    HARDEN-24 B added `scan_repo_ex` for the same single Pass A that also
+    returns the files the walk skipped, so it is counted as one scan too —
+    otherwise the rebuild path would look like it scanned the tree zero
+    times.
     """
     from tools.collect import scanner as scanner_mod
 
     counts = {"scan_repo": 0, "hash_tree": 0}
     real_scan = scanner_mod.scan_repo
+    real_scan_ex = scanner_mod.scan_repo_ex
     real_hash = cli_mod.manifest_mod.hash_tree
 
     def _scan(*args, **kwargs):
         counts["scan_repo"] += 1
         return real_scan(*args, **kwargs)
 
+    def _scan_ex(*args, **kwargs):
+        counts["scan_repo"] += 1
+        return real_scan_ex(*args, **kwargs)
+
     def _hash(*args, **kwargs):
         counts["hash_tree"] += 1
         return real_hash(*args, **kwargs)
 
     monkeypatch.setattr(cli_mod, "scan_repo", _scan)
+    monkeypatch.setattr(cli_mod, "scan_repo_ex", _scan_ex)
     monkeypatch.setattr(cli_mod.manifest_mod, "hash_tree", _hash)
     return counts
 

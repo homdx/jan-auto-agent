@@ -34,9 +34,10 @@ from tools.claimcheck.anchors import PathRepoView
 from tools.collect import cli as collect_cli
 from tools.collect import loader as collect_loader
 
-#: The pipeline's `[search] max_depth` (see `agents.ini`), which `RepoIngestor` reads when
-#: `Target.collect` is handed a config. When it is not, claim-check falls back to this so
-#: `src/`-layout projects with three-level packages still resolve their imports.
+#: The collect walk depth (see `[search] max_depth = 8` in `agents.ini`) that claim-check uses
+#: when it is handed a config that names none. Without it, the collect walk falls back to its
+#: own limit of 2 and every module of a three-level package sits out of the index.
+#: HARDEN-24 B: the collect stage reads it from `[collect]`, not from the Architect's `[search]`.
 _COLLECT_DEFAULT_MAX_DEPTH = 8
 
 #: A singleton default config, so `id()` is stable across `Target.collect` calls when the
@@ -52,7 +53,7 @@ def _default_config() -> configparser.ConfigParser:
     global _COLLECT_DEFAULT_CONFIG
     if _COLLECT_DEFAULT_CONFIG is None:
         cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
-        cfg["search"] = {"max_depth": str(_COLLECT_DEFAULT_MAX_DEPTH)}
+        cfg["collect"] = {"max_depth": str(_COLLECT_DEFAULT_MAX_DEPTH)}
         _COLLECT_DEFAULT_CONFIG = cfg
     return _COLLECT_DEFAULT_CONFIG
 
@@ -518,11 +519,11 @@ class Target:
         A failure of collect (not a Python repository, a parse error, 300 s) does not fail
         the target: the result is the loader's absent model and `warnings` says why.
 
-        `config` may be `None`: the collect defaults to `[search] max_depth = 8` — the
-        same value `agents.ini` sets — so a `src/`-layout project with a three-level
-        package still resolves its imports. Without this, `RepoIngestor` falls back to
-        `max_depth = 2` and every module of a nested package sits out of the index, so
-        the import graph, callers, config reads, gates and contracts in the evidence
+        `config` may be `None`: the collect defaults to `[collect] max_depth = 8` — the same
+        value `agents.ini` sets on `[search]` — so a `src/`-layout project with a three-level
+        package still resolves its imports. Without this, the collect walk falls back to its
+        own limit of 2 and every module of a nested package sits out of the index, so the
+        import graph, callers, config reads, gates and contracts in the evidence
         packs are missing without any warning (HARDEN-21 D).
         """
         config = self._collect_config(config)
@@ -547,9 +548,9 @@ class Target:
 
     @staticmethod
     def _names_a_depth(config) -> bool:
-        """Does *config* name a walk depth, in the sections `RepoIngestor` reads it from?"""
+        """Does *config* name a walk depth, in the sections the collect walk reads it from?"""
         try:
-            for section in ("architect", "search"):
+            for section in ("collect", "architect", "search"):
                 value = config.get(section, "max_depth", fallback=None)
                 if value is not None and str(value).strip():
                     return True
@@ -559,10 +560,10 @@ class Target:
 
     def _collect_config(self, config):
         """The config claim-check's collect uses: *config* when it names a walk depth, else a
-        copy of it (or a minimal `[search]` section) with `max_depth = 8` — the value
-        `agents.ini` sets. The claim-check ini (`contest.ini`) has no `[search]` at all, so
-        handing it over unchanged would leave `RepoIngestor` at its own fallback of 2 and
-        silently truncate the walk.
+        copy of it (or a minimal `[collect]` section) with `max_depth = 8` — the value
+        `agents.ini` sets. The claim-check ini (`contest.ini`) has no `[collect]` at all, so
+        handing it over unchanged would leave the collect walk at its own fallback and
+        silently truncate the scan.
 
         One effective config per caller config, kept on the target: the model cache below is
         keyed by `id()`, and a copy made on every call would never hit it. A caller config is
@@ -576,19 +577,22 @@ class Target:
         if hit is not None and hit[0] is config:
             return hit[1]
         effective = copy.deepcopy(config)
-        if not effective.has_section("search"):
-            effective.add_section("search")
-        effective.set("search", "max_depth", str(_COLLECT_DEFAULT_MAX_DEPTH))
+        if not effective.has_section("collect"):
+            effective.add_section("collect")
+        effective.set("collect", "max_depth", str(_COLLECT_DEFAULT_MAX_DEPTH))
         self._config_memo[id(config)] = (config, effective)
         return effective
 
     @staticmethod
     def _max_depth(config):
-        """`[search] max_depth` from `config` (the same key `RepoIngestor` reads) —
-        the value that decides how deep the collect walked, so a truncated scan can
-        say so in `warnings` instead of silently omitting deep files."""
+        """The collect walk depth in `config` — the value that decides how deep the collect
+        walked, so a truncated scan can say so in `warnings` instead of silently omitting
+        deep files. `[collect] max_depth` is the collect stage's own key (HARDEN-24 B) and
+        wins; `[architect]` and `[search]` are the values it used to borrow.
+        """
         try:
-            raw = (config.get("architect", "max_depth", fallback=None)
+            raw = (config.get("collect", "max_depth", fallback=None)
+                   or config.get("architect", "max_depth", fallback=None)
                    or config.get("search", "max_depth", fallback=None))
             return int(raw) if raw is not None else _COLLECT_DEFAULT_MAX_DEPTH
         except (configparser.Error, AttributeError, TypeError, ValueError):
