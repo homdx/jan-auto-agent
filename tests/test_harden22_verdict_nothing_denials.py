@@ -351,3 +351,26 @@ def test_a_nope_with_words_after_it_stays_prose(reply):
     """HARDEN-10 C's pin: "Nope, works" may answer "any problems?", so only the bare word rejects."""
     approved, _reason, unparseable = _parse_verdict_soft(reply)
     assert approved is True and unparseable is True
+
+
+@pytest.mark.parametrize("reply", [
+    "Not seeing anything wrong.",
+    "Not seeing anything amiss.",
+    "Nothing needs a rewrite.",
+    "Nothing needs any fixing.",
+])
+def test_anything_and_a_noun_object_still_deny_the_problem(reply):
+    """Found by var1 / var2's tests after the landing: `anything` and `a rewrite` ended the denial."""
+    approved, reason, unparseable = _parse_verdict_soft(reply)
+    assert approved is True and reason == "" and unparseable is False, (reply, reason)
+
+
+@pytest.mark.parametrize("reply, reason", [
+    ("No, the timeline breaks.", "the timeline breaks."),
+    ("NO, broken", "broken"),
+    ("NO; broken", "broken"),
+])
+def test_the_reason_after_no_never_opens_with_a_comma(reply, reason):
+    """The `NO` token left its comma at the head of the reason handed to the Coder."""
+    approved, got, unparseable = _parse_verdict_soft(reply)
+    assert approved is False and got == reason and unparseable is False

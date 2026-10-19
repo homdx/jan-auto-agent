@@ -1195,7 +1195,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     #: `_EN_NOTHING_OK` does not: "nothing to revise" is a denial, but "nothing revised"
     #: would read the other way, so these follow a connector only (HARDEN-22 A).
     _EN_NOTHING_ACTIONS_VERB = (
-        r"REVISE(?:D|S|ING)?|REVISION(?:S)?|MENTION(?:S|ED|ING)?|AMEND(?:S|ED|ING)?|"
+        r"REVISE(?:D|S|ING)?|REVISION(?:S)?|REWRITE(?:S|N|ING)?|REWRITING|MENTION(?:S|ED|ING)?|AMEND(?:S|ED|ING)?|"
         r"RAISE(?:D|S|ING)?|EDIT(?:S|ED|ING)?|WORK(?:S|ED|ING)?"
     )
     #: The participles a "NOTHING" denial can end on: "nothing major was found", "nothing
@@ -1221,7 +1221,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"(?:"
         r"(?:(?:NO\s*[,.:;]?\s+)?)?NOTHING\b\s*(?:"
         r"(?:" + _EN_NO_ADJECTIVES + r")*"
-        r"(?:TO\s+(?:BE\s+)?|NEEDS?\s+(?:TO\s+(?:BE\s+)?)?|REQUIRES?\s+|REMAINS?\s+TO\s+(?:BE\s+)?)"
+        r"(?:TO\s+(?:BE\s+)?|NEEDS?\s+(?:TO\s+(?:BE\s+)?|AN?\s+|ANY\s+)?|REQUIRES?\s+|REMAINS?\s+TO\s+(?:BE\s+)?)"
         r"(?:" + _EN_NOTHING_ACTIONS + r"|" + _EN_NOTHING_ACTIONS_VERB + r")\b"
         r"|"
         r"(?:" + _EN_NO_ADJECTIVES + r")*"
@@ -1234,7 +1234,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"(?:(?:NO\s*[,.:;]?\s+)?)?NOT\s+"
         r"(?:FIND|FINDS|FINDING|SEE|SEES|SEEN|SEEING|SEEM|SEEMS|SEEMED|NOTICE|NOTICES|NOTICED|NOTICING|"
         r"APPEAR|APPEARS|APPEARED|LOOK|LOOKS|LOOKED)\s+"
-        r"(?:(?:ANY|A|AN|THE|SUCH|ANY\s+OTHER)\s+)?"
+        r"(?:(?:ANYTHING|ANY|A|AN|THE|SUCH|ANY\s+OTHER)\s+)?"
         r"(?:" + "|".join(sorted(_EN_NOT_PROBLEM_WORDS)) + r"|"
         + _EN_NOT_FOUND_PARTICIPLES + r")\b"
         r")"
@@ -1374,7 +1374,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             return rest if rest else "validator rejected (no reason given)"
         for token in ("REVISE", "REJECT", "NO"):
             if _verdict_token_at_start(upper, token):
-                rest = line.strip()[len(token):].lstrip(": ").strip()
+                rest = line.strip()[len(token):].lstrip(":;, ").strip()
                 return rest if rest else "validator rejected (no reason given)"
         # HARDEN-22 C: a reply that is the word "Nope" alone rejects, in any case; it has no
         # verdict token, so it used to fall open to an approval. "Nope, works" (HARDEN-10 C) is
