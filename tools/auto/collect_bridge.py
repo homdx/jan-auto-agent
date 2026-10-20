@@ -322,15 +322,19 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
     root = Path(base_dir)
     artifact_sha, head_sha = _stale_provenance(root, config)
     modules = hashes = None
+    skipped: tuple = ()
     changed = None
     reason: Optional[str] = None
     previous_version: Optional[str] = None
     current_version: Optional[str] = None
     try:
         from tools.collect import manifest as manifest_mod
-        from tools.collect.scanner import scan_repo
+        from tools.collect.scanner import scan_repo_ex
 
-        modules = scan_repo(root, config=config)
+        # CC review fixes 45: the walk's skipped files go to the refresh with the modules, so a
+        # refresh between tasks keeps them on the manifest instead of writing an empty list.
+        modules, skipped = scan_repo_ex(root, config=config)
+        skipped = tuple(skipped)
         hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
         previous = manifest_mod.read_manifest(
             cli_mod.resolve_collect_dir(root, config) / cli_mod.MANIFEST_FILENAME)
@@ -367,7 +371,7 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
     try:
         cli_mod.action_refresh(
             root, config=config, config_path=config_path, llm_call=llm_call,
-            modules=modules, hashes=hashes,
+            modules=modules, hashes=hashes, skipped_files=skipped,
         )
         reloaded = load_fn(base_dir, config=config, config_path=config_path)
         ok = getattr(reloaded, "status", "absent") == "fresh"

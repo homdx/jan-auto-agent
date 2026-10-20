@@ -52,3 +52,25 @@ def test_auto_workers_floor_and_override(monkeypatch):
     assert conftest.pytest_xdist_auto_num_workers(None) == 16
     monkeypatch.setenv("JAN_TEST_WORKERS", "2")
     assert conftest.pytest_xdist_auto_num_workers(None) == 2
+
+
+def test_the_live_scan_reads_the_repository_not_what_runs_left_in_it(tmp_path, monkeypatch):
+    """CC review fixes 45: round output and untracked sandboxes are not part of the live scan.
+
+    The live tests scan the checkout they run in. Since HARDEN-24 B widened the default walk,
+    a checkout that has run rounds handed them contest-out/ and claim-check-out/ (10,346
+    modules instead of 286) and an examples/task*/ sandbox that imports main.py.
+    """
+    import subprocess
+
+    root = tmp_path.resolve()
+    for rel in ("a.py", "untracked.py", "contest-out/r1/c.py", "claim-check-out/cc/d.py"):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text("x = 1\n")
+    for args in (("init", "-q"), ("add", "a.py")):
+        subprocess.run(["git", *args], cwd=root, capture_output=True, check=True)
+    monkeypatch.setattr(conftest, "ROOT", root)
+    monkeypatch.setattr(conftest, "_repo_scan_cache", {})
+    monkeypatch.setattr(conftest, "_shared", lambda name, compute: compute())
+
+    assert {m.path for m in conftest._cached_scan_repo(root)} == {"a.py"}

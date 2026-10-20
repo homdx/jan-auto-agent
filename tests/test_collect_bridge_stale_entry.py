@@ -387,14 +387,15 @@ def test_entry_refresh_no_count_when_the_pre_flight_fails(mini_repo, monkeypatch
     """Fail-open: the version check must not turn a failed pre-flight into
     anything other than what it always was — "?" on the line, no reason in
     the event, and the refresh still runs. Only the bridge's own lazy
-    `scan_repo` import is patched: `cli_mod.scan_repo` is bound at import,
-    so `action_refresh` rescans for itself and the refresh completes."""
+    `scan_repo_ex` import is patched (its pre-flight walk since CC review
+    fixes 45): `cli_mod.scan_repo_ex` is bound at import, so
+    `action_refresh` rescans for itself and the refresh completes."""
     cli_mod.action_collect(mini_repo)
     config_path = _write_ini(mini_repo, auto_refresh_between_tasks="true")
     _make_stale(mini_repo)
     events = _capture_events(monkeypatch)
     monkeypatch.setattr(
-        "tools.collect.scanner.scan_repo",
+        "tools.collect.scanner.scan_repo_ex",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("walk failed")),
     )
 

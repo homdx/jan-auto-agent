@@ -63,7 +63,8 @@ from tools.collect.model import ModuleRecord
 #: The collect stage's own walk limits, read from `[collect]` (HARDEN-24 B). Both default at
 #: least as wide as the values the stage used to borrow from `[search]` (depth 2, 500 KB),
 #: so a `[collect]`-less config collects at least as much as before; a repo that nests its
-#: sources three folders deep or carries a generated 600 KB file no longer loses it.
+#: sources three folders deep or carries a generated 600 KB file no longer loses it. A config
+#: whose `[architect]`/`[search]` names a wider limit keeps it (`collect_walk_limits`).
 DEFAULT_COLLECT_MAX_DEPTH = 6
 DEFAULT_COLLECT_MAX_FILE_KB = 4096
 
@@ -87,14 +88,52 @@ def _collect_int(config: Optional[configparser.ConfigParser], key: str, default:
     return value if value > 0 else default
 
 
+def _architect_int(config: Optional[configparser.ConfigParser], key: str) -> Optional[int]:
+    """`key` the way the Architect's walk reads it — `[architect]` first, then `[search]`
+    (`RepoIngestor._read_int`) — or None when neither names a number. Fail-open like
+    `_collect_int`: a malformed value is no value."""
+    if config is None:
+        return None
+    try:
+        raw = (config.get("architect", key, fallback=None)
+               or config.get("search", key, fallback=None))
+    except (configparser.Error, KeyError, TypeError, AttributeError):
+        return None
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return None
+
+
+def _at_least_as_wide(default: int, architect: Optional[int]) -> int:
+    """The collect default, widened to the Architect's limit when that one is wider.
+
+    CC review fixes 45: every shipped profile sets `[search] max_depth = 8`, which the
+    collect walk read until HARDEN-24 B gave it a default of its own; at 6, a module seven or
+    eight folders deep left the model of every shipped profile. The Architect's limit may
+    widen the collect walk, never narrow it (the reason `[collect]` exists): 0 or less is the
+    walk's own "no limit", and stays one.
+    """
+    if architect is None:
+        return default
+    if architect <= 0:
+        return 0
+    return max(default, architect)
+
+
 def collect_walk_limits(config: Optional[configparser.ConfigParser]) -> tuple[int, int]:
     """The `(max_depth, max_file_kb)` the collect walk uses: `[collect] max_depth` and
-    `[collect] max_file_kb`, each defaulting to at least the `[search]` values the stage
-    used to read. The Architect keeps its own `[search]`/`[architect]` numbers — this pair
+    `[collect] max_file_kb` when set, else the collect defaults widened to the
+    `[architect]`/`[search]` values the stage used to read, so no config collects less than
+    it did before HARDEN-24 B. A narrower `[search]` limits the Architect only — this pair
     is the collect stage's, and nothing else reads it."""
     return (
-        _collect_int(config, "max_depth", DEFAULT_COLLECT_MAX_DEPTH),
-        _collect_int(config, "max_file_kb", DEFAULT_COLLECT_MAX_FILE_KB),
+        _collect_int(config, "max_depth", _at_least_as_wide(
+            DEFAULT_COLLECT_MAX_DEPTH, _architect_int(config, "max_depth"))),
+        _collect_int(config, "max_file_kb", _at_least_as_wide(
+            DEFAULT_COLLECT_MAX_FILE_KB, _architect_int(config, "max_file_kb"))),
     )
 
 
@@ -336,7 +375,15 @@ def _scan_repo(
                     language=language,
                 )
             )
-    return modules, list(ingestor.skipped_files)
+    # CC review fixes 45: a skip is named only for a file this scan would have read. The walk
+    # yields every text file, so a deep README, a JSON fixture or a stylesheet came out
+    # "too deep" or "too large" too — a third of the 2,727 warnings on this repo, about
+    # files the model never holds.
+    skipped = [
+        (path, reason) for path, reason in ingestor.skipped_files
+        if (lang := _language(path)) is not None and lang in enabled
+    ]
+    return modules, skipped
 
 
 def scan_repo_payload(root: Path, *, config: Optional[configparser.ConfigParser] = None):

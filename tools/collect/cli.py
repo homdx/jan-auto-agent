@@ -754,7 +754,8 @@ def _read_previous_manifest(collect_dir: Path) -> Tuple[Optional[manifest_mod.Ma
 
 def _freshness(
     root: Path, config: Optional[configparser.ConfigParser], config_path: Optional[str] = None,
-) -> Tuple[CollectResult, Optional[List[ModuleRecord]], Optional[Dict[str, str]], Dict[str, str]]:
+) -> Tuple[CollectResult, Optional[List[ModuleRecord]], Optional[Dict[str, str]], Dict[str, str],
+           Tuple[Tuple[str, str], ...]]:
     """The one freshness verdict — what `--check` reports and what
     `--collect` gates on — plus the Pass A scan and the two `{path: sha256}`
     maps it cost (modules, profile `.ini` files), so a stale `--collect`
@@ -762,7 +763,9 @@ def _freshness(
     tree a second time. The first two are `None` when the verdict needed
     neither (no manifest, an unreadable one, a manifest whose artifact is
     gone): the refresh that follows scans for itself. `profile_hashes` is
-    always a map — `{}` when there was nothing to hash.
+    always a map — `{}` when there was nothing to hash. The last item is the
+    `(path, reason)` pairs that scan skipped (HARDEN-24 B), handed on with the
+    modules so the refresh records them — `()` when there was no scan.
 
     One function for both callers on purpose: `action_collect` used to ask
     `action_check` for the verdict and then `action_refresh` re-derived the
@@ -789,17 +792,20 @@ def _freshness(
 
     existing, manifest_problem = _read_previous_manifest(collect_dir)
     if manifest_problem is not None:
-        return _verdict(False, f"manifest {manifest_problem} — treat as stale"), None, None, {}
+        return _verdict(False, f"manifest {manifest_problem} — treat as stale"), None, None, {}, ()
     if existing is None:
-        return _verdict(False, f"no manifest at {manifest_path} — collect has never run"), None, None, {}
+        return _verdict(False, f"no manifest at {manifest_path} — collect has never run"), None, None, {}, ()
     if not artifact_path.exists():
         return _verdict(
             False,
             f"manifest present at {manifest_path} but the artifact at "
             f"{artifact_path} is missing — needs a full rebuild",
-        ), None, None, {}
+        ), None, None, {}, ()
 
-    modules = scan_repo(root, config=config)
+    # CC review fixes 45: the scan names what it skipped, and the list goes to the refresh with
+    # the modules. A plain scan_repo here dropped it, so the second --collect of a tree rewrote
+    # the manifest with no skipped file and logged none (the first one had both).
+    modules, skipped = scan_repo_ex(root, config=config)
     # One hash pass for both maps: the modules and the profile `.ini` files
     # CONFIG_MAP.md is built from, split afterwards. Hashing them separately
     # would be a second pass over the same tree, which the stale-tree receipt pins against.
@@ -829,7 +835,7 @@ def _freshness(
                   "CONFIG_MAP.md needs a rebuild")
     else:
         reason = "stale — a tracked file changed since the last collect run"
-    return _verdict(fresh, reason), modules, hashes, profile_hashes
+    return _verdict(fresh, reason), modules, hashes, profile_hashes, tuple(skipped)
 
 
 def action_check(root: Path, *, config: Optional[configparser.ConfigParser] = None,
@@ -990,6 +996,7 @@ def action_refresh(
     hashes: Optional[Dict[str, str]] = None,
     profile_hashes: Optional[Dict[str, str]] = None,
     drop_summaries: bool = False,
+    skipped_files: Optional[Iterable[Tuple[str, str]]] = None,
 ) -> CollectResult:
     """`--refresh`: diff-driven incremental rebuild (COLLECT-24).
 
@@ -1017,6 +1024,9 @@ def action_refresh(
     if given, is the `hash_tree` result over that same file set, so the
     tree is hashed once too rather than once here and once in the caller's
     freshness gate.
+    `skipped_files` goes with `modules`: the `(path, reason)` pairs that
+    same scan skipped, recorded on the manifest and logged once here (HARDEN-24
+    B). Left out with `modules` given, the manifest records none.
 
     Pass C (`verifier.verify_repo`) still runs over the full merged
     module list on every call, because a citation check needs the
@@ -1079,8 +1089,10 @@ def action_refresh(
     # Modules and profile ini files go through the same pass, so a stale `--refresh` hashes once too.
     # HARDEN-24 B: the scan also returns the files the collect stage's own limits skipped, so a
     # refresh records them on the manifest exactly as a full build does.
+    # `skipped_files` goes with `modules`: the files the caller's own scan skipped (CC review fixes 45).
     current_modules, current_skipped = (
-        (modules, ()) if modules is not None else scan_repo_ex(root, config=config)
+        (modules, tuple(skipped_files or ())) if modules is not None
+        else scan_repo_ex(root, config=config)
     )
     _log_skipped_files(current_skipped)
     if hashes is not None:
@@ -1295,7 +1307,7 @@ def action_collect(
     changed module, so Pass A and the hash passes were the next largest
     things on the receipt.
     """
-    verdict, modules, hashes, profile_hashes = _freshness(Path(root), config, config_path)
+    verdict, modules, hashes, profile_hashes, skipped = _freshness(Path(root), config, config_path)
     if verdict.fresh:
         return CollectResult(
             action="collect", wrote=False, fresh=True,
@@ -1305,7 +1317,7 @@ def action_collect(
     result = action_refresh(
         root, config=config, config_path=config_path, llm_call=llm_call,
         modules=modules, hashes=hashes, profile_hashes=profile_hashes,
-        drop_summaries=drop_summaries,
+        drop_summaries=drop_summaries, skipped_files=skipped,
     )
     return CollectResult(
         action="collect", wrote=result.wrote, fresh=result.fresh,

@@ -135,9 +135,39 @@ def _prune_shared(cache_dir: Path, keep: int = 3) -> None:
             f.unlink(missing_ok=True)
 
 
-def _scan_repo_shared(config=None):
-    """`scan_repo(ROOT)` computed once per unchanged tree, across processes."""
-    return _shared("scan_repo", lambda: _real_scan_repo(ROOT, config=config))
+# The live tests read the repository, not what the runs left in this checkout (CC review fixes 45).
+# Until HARDEN-24 B the default walk depth of 2 kept round output out by accident; at 6 a checkout
+# that has run rounds scanned 10,346 modules instead of 286 (contest-out/ 9,177, claim-check-out/
+# 866), main.py stopped being an entry point (a copied test imports it), five live tests failed
+# and two took 15-19 minutes each. The two round-output folders are not walked, and a module git
+# does not track (an examples/task*/ sandbox of run_flows.sh) is dropped; a clean checkout loses
+# nothing. Without git (an exported tree) every scanned module stays.
+_LIVE_SCAN_SKIP_DIRS = "contest-out, claim-check-out"
+
+
+def _tracked_paths():
+    """The paths git tracks in ROOT, or None when git cannot say."""
+    try:
+        out = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z"],
+                             capture_output=True, check=True, timeout=60).stdout
+    except Exception:
+        return None
+    return {p for p in out.decode("utf-8", "surrogateescape").split("\0") if p}
+
+
+def _live_scan():
+    import configparser
+
+    config = configparser.ConfigParser()
+    config["collect"] = {"skip_dirs": _LIVE_SCAN_SKIP_DIRS}
+    modules = _real_scan_repo(ROOT, config=config)
+    tracked = _tracked_paths()
+    return modules if tracked is None else [m for m in modules if m.path in tracked]
+
+
+def _scan_repo_shared():
+    """`scan_repo(ROOT)` of the repository's own files, computed once per unchanged tree, across processes."""
+    return _shared("scan_repo", _live_scan)
 
 
 def _cached_scan_repo(root, *, config=None):
@@ -147,7 +177,7 @@ def _cached_scan_repo(root, *, config=None):
     if config is not None:
         return _scan_root_with_config(root, config)
     if resolved not in _repo_scan_cache:
-        _repo_scan_cache[resolved] = _scan_repo_shared(config=config)
+        _repo_scan_cache[resolved] = _scan_repo_shared()
     return _repo_scan_cache[resolved]
 
 
