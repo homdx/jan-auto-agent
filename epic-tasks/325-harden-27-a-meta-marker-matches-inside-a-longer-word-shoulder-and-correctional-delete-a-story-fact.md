@@ -1,6 +1,6 @@
 # HARDEN-27 — `_strip_meta_parentheticals` matches its markers inside a longer word: `(his left shoulder, ...)` and `(... a correctional facility)` are deleted as self-commentary
 
-**Status:** open
+**Status:** landed (round 325: sensenova-6-8-flash-lite-var4 as the base - a closed table of the word forms each marker family stands for, one set lookup per word of the parenthetical, the two-word markers as phrases on word boundaries, fail-open on any surprise; my own finds: the possessive of a marker word (`this bullet's numbers are wrong`), the Russian plural, dative and passive forms (`пункты`, `пункту`, `удалён`, `удалены`) and `unoriginal`)
 **Severity:** MEDIUM (a story fact is dropped silently from the permanent chapter summary; nothing logs it)
 **File:** `tools/auto/summary_memory.py`
 **Symbol:** `_strip_meta_parentheticals`, `_META_PAREN_MARKERS`
@@ -52,3 +52,9 @@ One commit. The judge's checks are written after the round, from the entries.
 ## Not in scope
 
 Rust, the verdict parser, other filters in the file, nested parentheses, the list of markers itself beyond the boundary rule.
+
+## Why not the others (round 325)
+
+A black box of 55 parentheticals (14 story facts that stay, 30 commentary that goes, two-paren bullets, an unbalanced one, 100 000-character timings; its corpus compared with the base) scored the base 41, glm 45, nemotron 51, agnes 52, var1/var2/var3/step-5/laguna 54, var4 55; the ideal 55. glm matched only a few of the markers (`it shouldn't be here`, `this is incorrect`, `grammatical slip` stayed), and a Russian `пунктуация` was still dropped. nemotron rewrote the whole bullet: it ate the full stop after a removed parenthetical and collapsed every run of blanks and newlines, so a two-paragraph fact came back as one line. agnes still dropped `(he does notice the knife)` (`does not` as a substring) and kept `mentioned earlier` and `inaccurate`. var1 kept `mentioned earlier`, var2 and agnes and nemotron kept `inaccurate`, var3 and laguna and nemotron kept `грамматическая ошибка`, step-5 kept `оригинал говорит иначе`: each one a commentary word the old substring test removed. A possessive of the marker word (`this bullet's numbers are wrong`) stayed in var4 too until the ideal read it. The others' tests were run on the ideal as copies: every one passes except glm's and nemotron's (they pin their own outputs) and the ones that name a private table (var2's pattern, var3's form dict).
+
+Open for the next tickets: a marker word that is also a story noun (`a bullet grazed his arm`, `the original owner`) is still removed, as before; the table of forms is closed, so a commentary form it does not list (`corrects` is in, `unoriginally` is not) stays; the same plain-substring test elsewhere in the file was not looked at.

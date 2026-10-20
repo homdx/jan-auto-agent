@@ -152,19 +152,113 @@ _META_PAREN_MARKERS = (
 )
 
 
+# HARDEN-27: every marker above is a prefix *family* on purpose ("grammat"
+# covers grammar and grammatical, "ориги" covers оригинал and оригинальный),
+# and the old test was a plain substring search —
+# ``any(k in inner for k in _META_PAREN_MARKERS)``. A family root therefore
+# fired on any ordinary word that merely begins with the same letters:
+# "should" in *shoulder*, "correct" in *correctional*, "bullet" in *bulletin*,
+# "remove" in *removal*, "original" in *originality*, "пункт" in *пунктуация*.
+# The bullet that owned that fact was then deleted from synopsis.md — the
+# story's only long-term memory — with nothing logged.
+#
+# A marker now matches a whole word of the parenthetical, not a piece of one:
+# at the start of a word, and only through the word forms the commentary
+# actually uses — should / shouldn't, correct / corrected / correctly /
+# correction / incorrect, remove / removed, relevant / irrelevant. The dict
+# below is that rule, keyed by the single-word families; the two-word markers
+# ("does not", "not explicitly") match as phrases on word boundaries.
+_META_MARKER_WORD_FORMS: dict[str, tuple[str, ...]] = {
+    "bullet":    ("bullet", "bullets"),
+    "remove":    ("remove", "removes", "removed", "removing"),
+    "correct":   ("correct", "corrects", "corrected", "correcting", "correctly",
+                  "correction", "corrections", "incorrect", "incorrectly"),
+    "original":  ("original", "originals", "originally", "unoriginal"),
+    "accurate":  ("accurate", "accurately", "inaccurate", "inaccurately"),
+    "partially": ("partially",),
+    "should":    ("should", "shouldn't"),
+    "relevant":  ("relevant", "irrelevant"),
+    "mention":   ("mention", "mentions", "mentioned", "mentioning"),
+    "grammat":   ("grammar", "grammatical", "grammatically"),
+    "implies":   ("implies", "implied", "imply", "implying"),
+    "doesn't":   ("doesn't",),
+    "пункт":      ("пункт", "пункта", "пункту", "пункте", "пункты", "пунктам",
+                  "пунктами", "пунктах", "пунктов", "пунктом"),
+    "удалить":    ("удалить", "удалю", "удаляет", "удаляется", "удалит", "удалил",
+                  "удалила", "удалили", "удалять", "удалено", "удалена", "удалены",
+                  "удален", "удалён", "удалены", "удаленный", "удаленная",
+                  "удаленное", "удаленные"),
+    "ориги":      ("оригинал", "оригинала", "оригиналу", "оригинале", "оригиналом",
+                  "оригиналы", "оригинальных", "оригинальный", "оригинальная",
+                  "оригинальное", "оригинальные"),
+    "ошибоч":     ("ошибочный", "ошибочная", "ошибочное", "ошибочные", "ошибочно",
+                  "ошибочность", "ошибочности"),
+    "следует":    ("следует", "следовало"),
+    "граммат":    ("грамматика", "грамматики", "грамматику", "грамматический",
+                  "грамматическая", "грамматическое", "грамматические",
+                  "грамматично", "грамматичность"),
+    "подразум":   ("подразумевается", "подразумеваются", "подразумевает",
+                  "подразумевать"),
+    "уточня":     ("уточнять", "уточнить", "уточняю", "уточняет", "уточняется",
+                  "уточняются", "уточнение", "уточнения"),
+    "добавляет":  ("добавляет", "добавляю", "добавляют", "добавить",
+                  "добавлен", "добавлена", "добавлено", "добавлены", "добавление",
+                  "добавления", "добавил", "добавила", "добавили"),
+}
+
+# Every word form the commentary uses, flat, so the test below is one set lookup.
+_META_MARKER_WORDS = frozenset(w for forms in _META_MARKER_WORD_FORMS.values()
+                               for w in forms)
+
+# The two-word markers, as phrases. Bounded on both sides so "does not" cannot
+# fire inside a longer word.
+_META_PAREN_PHRASES: tuple[str, ...] = (
+    r"(?<!\w)does\s+not(?!\w)",
+    r"(?<!\w)not\s+explicitly(?!\w)",
+)
+_META_PAREN_PHRASE_RE = re.compile("|".join(_META_PAREN_PHRASES))
+
+# One word of the parenthetical, letter for letter (a-z and Cyrillic), carrying
+# the single apostrophe the commentary actually writes: shouldn't, doesn't.
+_META_PAREN_WORD_RE = re.compile(r"[a-z\u0430-\u044f\u0451]+(?:'[a-z\u0430-\u044f\u0451]+)*")
+
+
+def _is_meta_commentary(inner: str) -> bool:
+    """True when a parenthetical reads as the model's commentary on its own
+    bullet rather than a story fact (HARDEN-27). Never raises."""
+    if not inner:
+        return False
+    lowered = inner.lower().replace("\u2019", "'")   # “shouldn’t” → “shouldn't”
+    if _META_PAREN_PHRASE_RE.search(lowered):
+        return True
+    for word in _META_PAREN_WORD_RE.findall(lowered):
+        # "this bullet's numbers are wrong": the possessive is the marker word's own form.
+        if word in _META_MARKER_WORDS or (word.endswith("'s") and word[:-2] in _META_MARKER_WORDS):
+            return True
+    return False
+
+
 def _strip_meta_parentheticals(fact: str) -> str:
     """Remove trailing/embedded ``(...)`` segments that are self-evaluation
     commentary rather than story facts (e.g. '(this bullet should be removed
     because...)'). Keeps parentheticals that look like genuine content.
+
+    HARDEN-27: a marker matches a whole word, never a piece of one, so
+    "(his left shoulder, ...)" and "(a correctional facility upstate)" are
+    story facts and stay put. Only the commentary parenthetical of a bullet is
+    removed; the others are left byte-for-byte. Runs in one pass over the text,
+    so a 100 000-character parenthetical costs linear time. Fail-open: any
+    surprise returns the bullet unchanged rather than raising into the run.
     """
     import re as _re
 
-    def _repl(m: "_re.Match") -> str:
-        inner = m.group(1).lower()
-        return "" if any(k in inner for k in _META_PAREN_MARKERS) else m.group(0)
+    try:
+        def _repl(m: "_re.Match[str]") -> str:
+            return "" if _is_meta_commentary(m.group(1)) else m.group(0)
 
-    cleaned = _re.sub(r"\s*\(([^()]*)\)", _repl, fact)
-    return cleaned.strip()
+        return _re.sub(r"\s*\(([^()]*)\)", _repl, fact).strip()
+    except Exception:
+        return fact
 
 
 def _is_ok_sentinel(reply: str) -> bool:
