@@ -346,9 +346,13 @@ def test_an_approval_followed_by_not_approved_or_please_revise_rejects(reply):
     assert approved is False and reason.strip() and unparseable is False, (reply, reason)
 
 
-@pytest.mark.parametrize("reply", ["Nope, works", "Nope, the date is wrong."])
+@pytest.mark.parametrize("reply", ["Nope, works", "Nope, looks fine", "Nope, no issues"])
 def test_a_nope_with_words_after_it_stays_prose(reply):
-    """HARDEN-10 C's pin: "Nope, works" may answer "any problems?", so only the bare word rejects."""
+    """HARDEN-10 C's pin: "Nope, works" may answer "any problems?", so it stays prose.
+
+    HARDEN-25 C moved "Nope, the date is wrong." off this list: a "Nope," that goes on to
+    name the problem is the rejection it opens, not prose (test_harden25).
+    """
     approved, _reason, unparseable = _parse_verdict_soft(reply)
     assert approved is True and unparseable is True
 
