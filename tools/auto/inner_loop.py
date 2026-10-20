@@ -1061,8 +1061,13 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     #: `ONLY` or `YET` anywhere after the phrase for a caveat, which sent eleven natural
     #: approvals ("No issues found; everything matches the bible.") back to the Coder with
     #: the approval sentence as the reason to fix. "YET ANOTHER" is not a contrast.
+    #: CC review fixes 47: the blanks after the boundary are one run of spaces and tabs
+    #: and nothing else may take them — HARDEN-26 A wrote `\s*` twice in a row, `-\s+`
+    #: before a `\s*` and a `\s*` before the parenthesis, so "Looks good." and three
+    #: thousand blank lines took 95 s. A newline is a boundary of its own, so the last
+    #: one before the contrast still opens it: every match ends where it ended before.
     _EN_CLAUSE_CAVEAT = _re.compile(
-        r"(?:(?:^|[,;:.\!\?\n])\s*|[—–]|(?<=\s)-\s+|\s*\()\s*(?:"
+        r"(?:^|[,;:.\!\?\n]|[—–]|(?<=\s)-\s|\()[^\S\n]*(?:"
         r"(?:APART|ASIDE)\s+FROM|OTHER\s+THAN|NOTWITHSTANDING|"
         r"BUT|HOWEVER|EXCEPT|ALTHOUGH|THOUGH|YET(?!\.?\s+ANOTHER\b)|ONLY)\b"
     )
@@ -1376,6 +1381,13 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         it was never looked at, so an unparseable `False` was never even logged. The answer to
         the question is the verdict, and the clause after it is the reason; "Approved? Yes." and
         "OK? Sure." keep the head's approval.
+
+        CC review fixes 47: an answer that is the "No <problem>" approval on its own — "Approved?
+        No issues.", "OK? No problem.", "Approved? No changes needed." — answers with that
+        approval, not with a no: read alone, "No issues." approves (HARDEN-10 C), so after the
+        question it is no rejection either, and the Coder is never told to fix "issues.". Only a
+        `No` the next word follows with a blank is such an answer: "No, …", "No — …" and "No."
+        stay the rejection they open, whatever comes after them.
         """
         m = _EN_APPROVAL_HEAD.match(upper)
         if m is None:
@@ -1384,6 +1396,14 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         if a is None:
             return None
         s = line.strip()
+        answer_upper = upper[m.end():].lstrip().lstrip("?").lstrip()
+        if _re.match(r"NO\s+\w", answer_upper):
+            answer = s[m.end():].lstrip().lstrip("?").lstrip()
+            if _EN_NOTHING_NEEDED.match(answer_upper):
+                return None
+            verdict = _en_no_problem_verdict(answer, answer_upper)
+            if verdict is not None and verdict[0]:
+                return None
         rest = s[m.end() + a.start(1):].strip()
         return rest if rest else line.strip()
 
