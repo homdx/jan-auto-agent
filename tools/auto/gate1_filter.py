@@ -186,6 +186,41 @@ substring from the code block above, or "" if rejecting>", \
 "reason": "<one sentence explaining your decision>"}}
 """
 
+# RUN-12: a docs candidate's instruction is a change to make ("Append a ## Usage section to
+# README.md …"), not a defect, and the code template above told the reviewer to reject any claim
+# it could not point a line at — so every "add what is missing" came back rejected for the very
+# absence it named ("The excerpt does not contain a ## Usage section"), on low, medium and high
+# alike. This one asks whether the change is still needed: a missing section is confirmed, with
+# the text next to where it would go as the verbatim evidence; an addition the text already
+# makes is still rejected.
+_USER_PROMPT_TMPL_DOCS = """\
+Proposed documentation change: {instruction}
+
+Location: {location}
+
+Text at that location:
+```
+{code_block}
+```
+{grounding_notes}
+Is this change still needed in the text shown above — does the text NOT \
+already do what the change asks for?
+
+A change that asks to ADD something (a section, a sentence, an example, a \
+table) is needed exactly when the text shown does not contain it yet: that \
+absence is the problem, so confirm it. Reject the change only when the text \
+already says what it would add, or already fixes what it would fix — read \
+the whole text before deciding. A confident instruction is not evidence.
+
+Return ONLY this JSON (no extra keys). "evidence" is REQUIRED whenever \
+verdict is "confirmed" — a substring copied verbatim from the text above: \
+the passage the change would rewrite or, when something is missing, the \
+heading or line it would go next to; use "" only when rejecting:
+{{"verdict": "confirmed" | "rejected", "evidence": "<exact verbatim \
+substring from the text above, or "" if rejecting>", \
+"reason": "<one sentence explaining your decision>"}}
+"""
+
 # Context-size defaults, used only when [gate1] lacks max_context_lines and max_block_chars.
 _DEFAULT_MAX_CONTEXT_LINES = 60
 _DEFAULT_MAX_BLOCK_CHARS   = 4000
@@ -1462,7 +1497,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                      if getattr(self, "_presence_deadline_sec", 0) else None)
         _until = {"deadline": _deadline} if _deadline is not None else {}
 
-        user_msg = _USER_PROMPT_TMPL.format(
+        # getattr: a stub built without __init__ has no mode and is a code check (RUN-12).
+        template = _USER_PROMPT_TMPL_DOCS if getattr(self, "_task_mode", "code") == "docs" else _USER_PROMPT_TMPL
+        user_msg = template.format(
             instruction=candidate.instruction,
             location=location_str,
             code_block=code_block,
