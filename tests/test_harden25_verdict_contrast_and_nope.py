@@ -31,6 +31,17 @@ def test_a_contrast_after_the_object_of_a_denial_rejects_with_the_reply_as_the_r
     assert approved is False and unparseable is False and reason == reply
 
 
+# HARDEN-26 A: the same denial-caveat through a dash or a parenthesis.
+@pytest.mark.parametrize("reply", [
+    "Nothing wrong — but the ring is stolen.",
+    "Nothing wrong, but the ring is stolen — the ending.",
+    "No issues (but the ring is stolen).",
+])
+def test_a_contrast_after_a_denial_rejects_through_a_dash_or_parenthesis(reply):
+    approved, reason, unparseable = _verdict(reply)
+    assert approved is False and unparseable is False and reason == reply
+
+
 @pytest.mark.parametrize("reply", [
     "Nope, this contradicts the outline.",
     "Nope, there is an error in chapter two.",

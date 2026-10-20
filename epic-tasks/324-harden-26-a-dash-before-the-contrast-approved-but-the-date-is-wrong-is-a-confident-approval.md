@@ -1,10 +1,10 @@
 # HARDEN-26 — `APPROVED — but the date is wrong.` is a confident approval: a dash before the contrast is no clause boundary
 
-**Status:** open
+**Status:** landed (round 324: sensenova-6-8-flash-lite-var3 as the base - A: an em or en dash, a hyphen after a blank and an opening parenthesis are clause boundaries in `_EN_CLAUSE_CAVEAT` and `_EN_OK_CAVEAT`; B: an approval head followed by `?` and then `No`, `Nope` or `Not really` rejects with the rest as the reason; my own finds: a dash with no blank (`APPROVED—but ...`), `OK?? No, ...`, and a guard that a thousand dashes parse in linear time)
 **Severity:** MEDIUM (a rejection that says why is passed as an approval, with no fail-open warning)
 **File:** `tools/auto/inner_loop.py`
 **Symbol:** `_parse_verdict_soft`, `_EN_CLAUSE_CAVEAT`, `_EN_OK_CAVEAT`, `_en_approval_caveat_reason`
-**Round:** (set when the round starts)
+**Round:** 324
 **Size:** S
 **Depends on:** HARDEN-17 A (the approval-then-objection reader this extends), HARDEN-25 (lands the same reader)
 **Also touches:** `tests/test_harden17_verdict_approval_and_reject_words.py`, `tests/test_harden25_verdict_contrast_and_nope.py`, `tests/`
@@ -71,3 +71,9 @@ One commit. The judge's checks are written after the round, from the entries.
 ## Not in scope
 
 Rust, the Russian verdict words, the key mask, the stream reader, and the HARDEN-25 leftovers its ticket lists as open (`Nope, the ring is stolen.`, a conflict verb after another subject, `Nothing breaks.`).
+
+## Why not the others (round 324)
+
+A black box of 83 replies (Part A reasons and rejections, the dashes that open no contrast, Part B reasons, the affirmative answers, the HARDEN-17 guards; its corpus compared with the base) scored the base 47, glm 44, nemotron 73, var1 79, var4 79, var2 80, var3 80, step-5 80, laguna 81; the ideal 82. agnes was disqualified: its new `_EN_OK_CAVEAT` (`^OK\b\s*(?:[,.!?;:—–-]*\s*)*...`) nests two quantifiers, and `OK - - - ... x` with 24 dashes takes 7 s (double per dash), so a validator reply can hang the loop. nemotron approved only through its own `OK`/`APPROVED` head and read `Approved? Nobody objects.` as a rejection (`BODY OBJECTS.`) because it cut the answer on the first two letters; its reasons were also clipped (`T BAD.`). var4 narrowed `_EN_OK_CAVEAT` to a mark after the OK, so `OK so the date is wrong` approves again (a regression). laguna and var1/var2/var4 missed `APPROVED —but ...` or `OK?? No, ...` by one detail. glm's tests pin the opposite of the ticket (`APPROVED (no issues).` rejects). The others' tests were run on the ideal as copies: every one passes except glm's and var1's pin that a bare `Approved? No.` carries a placeholder reason (the ideal keeps the line as the reason).
+
+Open for the next tickets: a dash or a `No` on the line after the approval (`Approved\n- but ...`, `Approved?\nNo, ...`) is read line by line and still approves; `Nope, the ring is stolen.` and the other HARDEN-25 leftovers stay open.

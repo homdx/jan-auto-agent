@@ -970,8 +970,12 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     )
 
     # English "OK, but ..." caveat guard: an approval followed by a problem is not an approval (BUGFIX).
+    # HARDEN-26 A: the contrast after "OK" also opens with a dash or an opening parenthesis —
+    # "OK — but the seed entry is gone.", "OK (no issues)" — the same boundaries the clause
+    # caveat below takes, so the two readers cannot drift apart.
     _EN_OK_CAVEAT = _re.compile(
-        r"^OK[,.]?\s+(BUT|HOWEVER|SO)\b[,:]?\s*(.*)$"
+        r"^OK(?:\s*[,.]\s*|\s*[—–-]\s*|\s*\(\s*|\s+)"
+        r"(BUT|HOWEVER|SO)\b[,:]?\s*(.*)$"
     )
 
     def _ok_caveat_reason(s: str) -> "str | None":
@@ -1058,7 +1062,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     #: approvals ("No issues found; everything matches the bible.") back to the Coder with
     #: the approval sentence as the reason to fix. "YET ANOTHER" is not a contrast.
     _EN_CLAUSE_CAVEAT = _re.compile(
-        r"(?:^|[,;:.\!\?\n])\s*(?:"
+        r"(?:(?:^|[,;:.\!\?\n])\s*|[—–]|(?<=\s)-\s+|\s*\()\s*(?:"
         r"(?:APART|ASIDE)\s+FROM|OTHER\s+THAN|NOTWITHSTANDING|"
         r"BUT|HOWEVER|EXCEPT|ALTHOUGH|THOUGH|YET(?!\.?\s+ANOTHER\b)|ONLY)\b"
     )
@@ -1356,6 +1360,33 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         obj = s[m.end() + c.end():].lstrip(" \t:;,.!?–—-").strip()
         return obj if obj else s
 
+    #: The answer a question-form approval head is not approved by (HARDEN-26 B). `NOT` only
+    #: joins `REALLY` — "Not approved" is the rejection of `_EN_NOT_APPROVED` and stays where it
+    #: is, so an approval that merely takes a negative form keeps the read of the NOT family.
+    _EN_Q_NO_ANSWER = _re.compile(
+        r"^\s*[?]+\s*(?:NOPE|NOT\s+REALLY|NO)\b"
+        r"[,.\s:;!–—-]*(.*)$"
+    )
+
+    def _en_approval_question_rejection(line: str, upper: str) -> "str | None":
+        """The reason when an approval head is a question answered in the negative.
+
+        HARDEN-26 B: "Approved? No — the test is wrong." and "OK? Not really, the date is
+        wrong." were read on their first word — the head approved and the answer that followed
+        it was never looked at, so an unparseable `False` was never even logged. The answer to
+        the question is the verdict, and the clause after it is the reason; "Approved? Yes." and
+        "OK? Sure." keep the head's approval.
+        """
+        m = _EN_APPROVAL_HEAD.match(upper)
+        if m is None:
+            return None
+        a = _EN_Q_NO_ANSWER.match(upper[m.end():])
+        if a is None:
+            return None
+        s = line.strip()
+        rest = s[m.end() + a.start(1):].strip()
+        return rest if rest else line.strip()
+
     def _en_not_family_reason(line: str, upper: str) -> "str | None":
         """The reason when *upper* opens a NOT-family rejection, else ``None``.
 
@@ -1578,6 +1609,13 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         if _ok_caveat is not None:
             return False, _ok_caveat, False
 
+        # An approval head asked as a question and answered in the negative is the answer's
+        # rejection, never the head's approval (HARDEN-26 B) — it must come before the token
+        # check that approves on `APPROVED` and `OK`.
+        _q_rejection = _en_approval_question_rejection(raw, upper)
+        if _q_rejection is not None:
+            return False, _q_rejection, False
+
         # ── English APPROVED ──────────────────────────────────────────────
         if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
             return True, "", False
@@ -1618,6 +1656,9 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             _line_ok_caveat = _ok_caveat_reason(_line)
             if _line_ok_caveat is not None:
                 return False, _line_ok_caveat, False
+            _line_q_rejection = _en_approval_question_rejection(_line, _lu)
+            if _line_q_rejection is not None:
+                return False, _line_q_rejection, False
             if _lu.startswith("APPROVED") or _re.match(r"^OK\b", _lu):
                 return True, "", False
             if _EN_NOTHING_NEEDED.match(_lu):

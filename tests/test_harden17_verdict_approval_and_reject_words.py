@@ -103,6 +103,14 @@ APPROVALS_THAT_TURN = [
     ("All good, but the ring is stolen.", "the ring is stolen."),
     ("APPROVED, but the ring is stolen.", "the ring is stolen."),
     ("OK, but the ring is stolen.", "the ring is stolen."),
+    # HARDEN-26 A: the dash and the parenthesis are clause boundaries too — a dash is how the
+    # reviewers write that turn, and a dash that does not open a contrast keeps the approval.
+    ("APPROVED — but the ring is stolen.", "the ring is stolen."),
+    ("APPROVED - but the ring is stolen.", "the ring is stolen."),
+    ("OK — but the ring is stolen.", "the ring is stolen."),
+    ("Looks good — but the ring is stolen.", "the ring is stolen."),
+    ("APPROVED (but the ring is stolen)", "the ring is stolen"),
+    ("Looks good (though the timeline breaks)", "the timeline breaks"),
 ]
 
 
@@ -137,6 +145,9 @@ CONTRASTS_STILL_REJECT = [
     "No issues found, except one: the timeline breaks.",
     "No issues.\nREVISE: the date of the wedding is wrong.",
     "No, it's good, but the ending is rushed.",
+    # HARDEN-26 A: the same contrast through a dash, on the "No <problem>" side too.
+    "No issues — but the ring is stolen.",
+    "No issues — except one: the timeline breaks.",
 ]
 
 
