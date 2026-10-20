@@ -32,7 +32,7 @@ from tools.collect.java_facts import (
     _record_method_decl,
     _walk_type_body,
 )
-from tools.collect.java_parser import parse_java
+from tools.collect.java_parser import is_available, parse_java
 from tools.collect.model import FunctionRecord
 from tools.collect import manifest as manifest_mod
 from tools.collect import cli as collect_cli
@@ -110,11 +110,18 @@ def test_an_architect_untested_list_for_a_nested_tests_tree(tmp_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# B needs the optional Java backend (requirements.txt), like every other Java test: without it
+# parse_java returns tree=None and extract_java_symbols, which the scanner never calls on an
+# error result, raised AttributeError here instead of skipping.
+_needs_java = pytest.mark.skipif(not is_available(), reason="tree-sitter-java not installed")
+
+
 def _symbols(source: str, path: str = "Test.java"):
     result = parse_java(source, path)
     return {s.qualname: s for s in extract_java_symbols(result.tree, path)}
 
 
+@_needs_java
 def test_an_enum_with_members_constructor_nested_types_and_javadoc():
     src = (
         "enum Color { RED, GREEN;\n"
@@ -146,6 +153,7 @@ def test_an_enum_with_members_constructor_nested_types_and_javadoc():
     assert syms2["Test.java:Foo.bar"].docstring_first_line == "A doc"
 
 
+@_needs_java
 def test_a_record_with_a_compact_constructor_and_an_annotation_type():
     src = (
         "record Point(int x, int y) { public Point { if (x<0) throw new RuntimeException(); }\n"
