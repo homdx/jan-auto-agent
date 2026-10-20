@@ -15,8 +15,10 @@ TASKS=()
 
 GOAL_1="Harden main.py: docstrings, type hints, a pytest test"
 GOAL_2="Write user documentation for this project"
-GOAL_3="Write a narrative changelog entry for the greeting"
-GOAL_4="Write a narrative changelog entry for the greeting"
+# RUN-11: not "for the greeting" — the seed entry "### The first greeting" already tells that story, so
+# every honest new entry retold it, Gate 2 called the two a duplicate and the coder dropped the seed.
+GOAL_3="Write a narrative changelog entry for the runbook"
+GOAL_4="Write a narrative changelog entry for the runbook"
 
 SKILL_1="hello-code"
 SKILL_2="hello-docs"

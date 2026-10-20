@@ -246,7 +246,7 @@ InnerLoop: Gate-3 order for docs mode — existence
 Stage B skipped, and Gate-3 trimmed to two gates.
 
 ```bash
-python3 main.py --auto "Write a narrative changelog entry for the greeting" \
+python3 main.py --auto "Write a narrative changelog entry for the runbook" \
   --base examples/hello-world --config agents_32k.ini --skill hello-creative
 ```
 
@@ -262,10 +262,13 @@ the failure mode that once burned 10 feedback rounds and 84 Gate-2 decisions
 without converging, because the coder writes code, Gate 2 correctly refuses
 it, and the loop cannot escape.
 
-**Known defect.** The coder has rewritten `CHANGELOG.md` wholesale rather
-than prepending, dropping the `### The first greeting` seed entry. When that
-happens `continuity` has no predecessor left to compare against, so its
-approval means less than it appears to. Check the seed entry survived.
+**The seed entry must survive.** The goal names the runbook, a change no
+entry tells yet. It used to ask for an entry "for the greeting" — the story
+the `### The first greeting` seed entry already tells — so every new entry
+retold it, Gate 2 called the two a duplicate, and the coder rewrote
+`CHANGELOG.md` wholesale instead of prepending, dropping the seed (RUN-11).
+If the seed is gone anyway, `continuity` had no predecessor to compare
+against and its approval means less than it appears to.
 
 ## Flow 4 — narrative changelog, canon/continuity on a second provider
 
@@ -292,7 +295,7 @@ model    = your-second-provider-model
 Then run:
 
 ```bash
-python3 main.py --auto "Write a narrative changelog entry for the greeting" \
+python3 main.py --auto "Write a narrative changelog entry for the runbook" \
   --base examples/hello-world --config agents_32k.ini --skill hello-creative-split
 ```
 
