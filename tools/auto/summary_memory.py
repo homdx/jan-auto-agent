@@ -153,7 +153,7 @@ _META_PAREN_MARKERS = (
 
 
 # HARDEN-27: every marker above is a prefix *family* on purpose ("grammat"
-# covers grammar and grammatical, "ориги" covers оригинал and оригинальный),
+# covers grammatical and grammatically, "ориги" covers оригинал and оригинальный),
 # and the old test was a plain substring search —
 # ``any(k in inner for k in _META_PAREN_MARKERS)``. A family root therefore
 # fired on any ordinary word that merely begins with the same letters:
@@ -168,9 +168,18 @@ _META_PAREN_MARKERS = (
 # correction / incorrect, remove / removed, relevant / irrelevant. The dict
 # below is that rule, keyed by the single-word families; the two-word markers
 # ("does not", "not explicitly") match as phrases on word boundaries.
+#
+# CC review fixes 48: every form below holds its family's marker, so a word is
+# commentary only where the substring test also called it so — the rule moved
+# the boundary and must not reach further. HARDEN-27 had listed forms the old
+# test never matched, and the story fact went from synopsis.md again:
+# "(он добавил соль в суп)", "(деревня удалена от города)", "(ему следовало
+# бежать)", "(removing his helmet)", "(he went to grammar school)", "(as his
+# tone implied)". The one exception is "удалён" / "удалены", which the
+# HARDEN-27 follow-up pins as commentary, and "удален", the same word with е.
 _META_MARKER_WORD_FORMS: dict[str, tuple[str, ...]] = {
     "bullet":    ("bullet", "bullets"),
-    "remove":    ("remove", "removes", "removed", "removing"),
+    "remove":    ("remove", "removes", "removed"),
     "correct":   ("correct", "corrects", "corrected", "correcting", "correctly",
                   "correction", "corrections", "incorrect", "incorrectly"),
     "original":  ("original", "originals", "originally", "unoriginal"),
@@ -179,31 +188,25 @@ _META_MARKER_WORD_FORMS: dict[str, tuple[str, ...]] = {
     "should":    ("should", "shouldn't"),
     "relevant":  ("relevant", "irrelevant"),
     "mention":   ("mention", "mentions", "mentioned", "mentioning"),
-    "grammat":   ("grammar", "grammatical", "grammatically"),
-    "implies":   ("implies", "implied", "imply", "implying"),
+    "grammat":   ("grammatical", "grammatically"),
+    "implies":   ("implies",),
     "doesn't":   ("doesn't",),
     "пункт":      ("пункт", "пункта", "пункту", "пункте", "пункты", "пунктам",
                   "пунктами", "пунктах", "пунктов", "пунктом"),
-    "удалить":    ("удалить", "удалю", "удаляет", "удаляется", "удалит", "удалил",
-                  "удалила", "удалили", "удалять", "удалено", "удалена", "удалены",
-                  "удален", "удалён", "удалены", "удаленный", "удаленная",
-                  "удаленное", "удаленные"),
+    "удалить":    ("удалить", "удалён", "удален", "удалены"),
     "ориги":      ("оригинал", "оригинала", "оригиналу", "оригинале", "оригиналом",
                   "оригиналы", "оригинальных", "оригинальный", "оригинальная",
                   "оригинальное", "оригинальные"),
     "ошибоч":     ("ошибочный", "ошибочная", "ошибочное", "ошибочные", "ошибочно",
                   "ошибочность", "ошибочности"),
-    "следует":    ("следует", "следовало"),
+    "следует":    ("следует",),
     "граммат":    ("грамматика", "грамматики", "грамматику", "грамматический",
                   "грамматическая", "грамматическое", "грамматические",
                   "грамматично", "грамматичность"),
     "подразум":   ("подразумевается", "подразумеваются", "подразумевает",
                   "подразумевать"),
-    "уточня":     ("уточнять", "уточнить", "уточняю", "уточняет", "уточняется",
-                  "уточняются", "уточнение", "уточнения"),
-    "добавляет":  ("добавляет", "добавляю", "добавляют", "добавить",
-                  "добавлен", "добавлена", "добавлено", "добавлены", "добавление",
-                  "добавления", "добавил", "добавила", "добавили"),
+    "уточня":     ("уточнять", "уточняю", "уточняет", "уточняется", "уточняются"),
+    "добавляет":  ("добавляет",),
 }
 
 # Every word form the commentary uses, flat, so the test below is one set lookup.
