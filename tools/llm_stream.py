@@ -39,6 +39,11 @@ _RETRYABLE_TRANSPORT_ERRORS = (
     TimeoutError, ssl.SSLError, ConnectionError,
     urllib.error.URLError, http.client.HTTPException,
 )
+#: The members of that family no retry can mend (CC review fixes 46): `InvalidURL` is a
+#: malformed `base_url` — a port such as `11434x`, a control character — raised before anything
+#: is sent. Before HARDEN-23 it ended the call at once; as an `HTTPException` it went round the
+#: whole budget, 60 waits of 10 s for every call. Each read loop re-raises it ahead of the tuple.
+_PERMANENT_TRANSPORT_ERRORS = (http.client.InvalidURL,)
 
 
 @dataclass
@@ -390,7 +395,10 @@ _XML_ANY_TAG_RE = re.compile(r"<([/]?)([A-Za-z][\w:.-]*)((?:[^<>\"']|\"[^\"]*\"|
 # HARDEN-13 C: a bare JWT, three base64url runs joined by dots with the first
 # starting `eyJ` (the base64 of `{"`), wherever it stands — with a key name or
 # without one. The runs are judged one by one, not by one pattern.
-_JWT_RUN_RE = re.compile(r"(?<![\w.-])[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}")
+# CC review fixes 46: the anchor is the run's own ASCII class. HARDEN-23 C anchored it with `\w`,
+# which is Unicode: a token glued to a Cyrillic or accented letter (`токенeyJ…`) had no start the
+# anchor allowed and went to the model whole, where the unanchored pattern used to mask it.
+_JWT_RUN_RE = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}")
 # A bare Python/JS identifier: a NAME, i.e. a reference to something, never a literal secret.
 _BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # A quoted value with no `{` inside — a literal, not a template. The prefix of a
@@ -3264,6 +3272,8 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 )
                 retry_after(msg, wait_s)
                 attempt += 1
+            except _PERMANENT_TRANSPORT_ERRORS:
+                raise
             except _RETRYABLE_TRANSPORT_ERRORS as e:
                 # Connection-level errors reuse the HTTP retry budget, and are reported with the provider (AUTO-FIX).
                 if attempt >= error_retries:
@@ -3287,6 +3297,8 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 with _open() as response:
                     # A UTF-8 BOM is dropped before parsing, so json.loads does not fail on it (utf-8-sig).
                     raw = json.loads(_read_body(response).decode("utf-8-sig"))
+            except _PERMANENT_TRANSPORT_ERRORS:
+                raise
             except _RETRYABLE_TRANSPORT_ERRORS + (ValueError,) as e:
                 # A truncated or garbled body is retried like a dropped connection (BUGFIX).
                 if _read_attempt >= error_retries:
@@ -3497,6 +3509,8 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
             )
             retry_after(msg, wait_s)
             _stream_attempt += 1
+        except _PERMANENT_TRANSPORT_ERRORS:
+            raise
         except _RETRYABLE_TRANSPORT_ERRORS as e:
             if parts or _stream_attempt >= error_retries:
                 raise RuntimeError(
