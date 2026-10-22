@@ -118,6 +118,34 @@ def revive_agents(agents: list[dict], only: str | None = None, dead: bool = Fals
     return revived
 
 
+def _write_atomically(target: Path, text: str) -> None:
+    """*text* to *target* through a temp file and one rename (AUDIT3-C5).
+
+    A plain write_text truncates first, so a crash, Ctrl-C or full disk in
+    the middle left a cut file — the one the next step reads.
+    """
+    import os
+    import tempfile
+    target = Path(target)
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:    # mkstemp makes 0600; keep the file's mode, or write_text's usual 0644
+            os.chmod(tmp, target.stat().st_mode & 0o777 if target.exists() else 0o644)
+        except OSError:
+            pass
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("round", help="round number, a round's output folder, or its state.json")
@@ -156,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{revived} to revive" + (" (dry run, nothing written)" if args.dry_run else ""))
         return 0
     shutil.copy2(path, path.with_name(BACKUP_NAME))
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    _write_atomically(path, json.dumps(data, ensure_ascii=False, indent=1))
     print(f"{revived} revived; the old file is {path.with_name(BACKUP_NAME)}")
     stem, dot, leg = path.parent.name.rpartition(".")
     if dot and leg.isdigit():

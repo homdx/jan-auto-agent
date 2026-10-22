@@ -1037,9 +1037,27 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"|FLAW(?:S)?|OMISSION(?:S)?|AMBIGUIT(?:Y|IES)|DEFECT(?:S)?"
         r"|DISCREPANC(?:Y|IES)|MISTAKE(?:S)?|TYPO(?:S)?"
     )
+    #: AUDIT3-C13 (#49): one qualifier may stand before the noun ("No plot holes",
+    #: "No logic errors"), nouns may be joined by OR/AND ("No contradictions or
+    #: inconsistencies"), and "No changes are needed" / "No need for changes" deny
+    #: the work itself. The qualifier list is closed, so "No time, errors remain"
+    #: stays where it was.
+    _EN_PROBLEM_QUALIFIER = (
+        r"(?:PLOT|LOGIC(?:AL)?|CONTINUITY|FACTUAL|GRAMMATICAL|SPELLING|STYLE|STYLISTIC"
+        r"|MAJOR|MINOR|OBVIOUS|REAL|SIGNIFICANT|FURTHER|REMAINING|OTHER|NEW|MORE)\s+"
+    )
+    _EN_PROBLEM_NOUN_EXTRA = r"|GAP(?:S)?|HOLE(?:S)?"
     _EN_NO_PROBLEM = _re.compile(
-        r"^NO\b\s+(?:" + _EN_PROBLEM_NOUNS + r")\b"
-        r"(?:\s+(?:FOUND|REMAIN(?:ING)?|LEFT|DETECTED))?"
+        r"^NO\b\s+(?:" + _EN_PROBLEM_QUALIFIER + r")?"
+        r"(?:" + _EN_PROBLEM_NOUNS + _EN_PROBLEM_NOUN_EXTRA + r")\b"
+        r"(?:\s+(?:OR|AND|NOR)\s+(?:" + _EN_PROBLEM_QUALIFIER + r")?"
+        r"(?:" + _EN_PROBLEM_NOUNS + _EN_PROBLEM_NOUN_EXTRA + r")\b)*"
+        r"(?:\s+(?:WERE\s+|WAS\s+)?(?:FOUND|REMAIN(?:ING)?|LEFT|DETECTED))?"
+        r"|^NO\s+(?:FURTHER\s+|MORE\s+|OTHER\s+)?"
+        r"(?:CHANGE|REVISION|EDIT|REWRITE|FIX|CORRECTION|ADJUSTMENT|MODIFICATION)(?:S|ES)?"
+        r"\s+(?:ARE\s+|IS\s+)?(?:NEEDED|REQUIRED|NECESSARY)\b"
+        r"|^NO\s+NEED\s+(?:FOR\s+(?:ANY\s+)?(?:CHANGE|REVISION|EDIT|REWRITE|FIX|CORRECTION)(?:S|ES)?"
+        r"|TO\s+(?:CHANGE|REVISE|EDIT|REWRITE|FIX|CORRECT)\b(?:\s+ANYTHING)?)\b"
     )
 
     #: The articles and qualifiers that stand between "NOT" and the verdict word
@@ -1069,7 +1087,12 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     _EN_CLAUSE_CAVEAT = _re.compile(
         r"(?:^|[,;:.\!\?\n]|[—–]|(?<=\s)-\s|\()[^\S\n]*(?:"
         r"(?:APART|ASIDE)\s+FROM|OTHER\s+THAN|NOTWITHSTANDING|"
-        r"BUT|HOWEVER|EXCEPT|ALTHOUGH|THOUGH|YET(?!\.?\s+ANOTHER\b)|ONLY)\b"
+        r"BUT|HOWEVER|EXCEPT|ALTHOUGH|THOUGH|YET(?!\.?\s+ANOTHER\b)|ONLY|"
+        # AUDIT3-C13 (#50): the other ways a clause names its exception, and a
+        # request to change something right after the approval.
+        r"BESIDES|BEYOND|BARRING|SAVE(?:\s+FOR)?|BAR|UNLESS|"
+        r"WITH\s+THE\s+EXCEPTION\s+OF|"
+        r"PLEASE\s+(?:FIX|CHANGE|CORRECT|UPDATE|REVISE|ADD|REMOVE|ADDRESS|RENAME|REWRITE))\b"
     )
 
     #: A contrast word anywhere after a conflict denial, with no stop before it (HARDEN-25 A).

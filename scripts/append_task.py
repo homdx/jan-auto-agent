@@ -23,6 +23,9 @@ import csv
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import file_lock  # noqa: E402
+
 COLUMNS = ["ticket", "finding", "outcome", "commit", "note"]
 OUTCOMES = {"FIXED", "ALREADY-OK", "SKIPPED"}
 
@@ -64,35 +67,38 @@ def main():
             print(f"  x {p}", file=sys.stderr)
         return 1
 
-    existed = os.path.exists(a.progress) and os.path.getsize(a.progress) > 0
-    if existed and not a.allow_duplicate:
-        with open(a.progress, newline="", encoding="utf-8") as fh:
-            for prev in csv.DictReader(fh):
-                if (prev.get("ticket") or "").strip() == row["ticket"]:
-                    print(f"skipped: {row['ticket']} is already recorded as "
-                          f"{prev.get('outcome')} — move to the next ticket "
-                          f"(--allow-duplicate to override)", file=sys.stderr)
-                    return 2
-
     d = os.path.dirname(a.progress)
     if d:
         os.makedirs(d, exist_ok=True)
-    # csv writes at the end of the file; if the last line has no final newline, the new row would be glued onto it. Use the file's own line ending first.
-    eol, tail = "\r\n", ""
-    if existed:
-        with open(a.progress, "rb") as fh:
-            data = fh.read()
-        eol = "\r\n" if b"\r\n" in data else "\n"
-        if not data.endswith((b"\n", b"\r")):
-            tail = eol
-    with open(a.progress, "a", newline="", encoding="utf-8") as fh:
-        fh.write(tail)
-        w = csv.DictWriter(fh, fieldnames=COLUMNS, lineterminator=eol)
-        if not existed:
-            w.writeheader()
-        w.writerow(row)
-        fh.flush()
-        os.fsync(fh.fileno())
+    # AUDIT3-C4: the duplicate check and the append are one locked step, as in
+    # append_verdict.py — two agents recording one ticket both passed the check.
+    with file_lock.locked(a.progress):
+        existed = os.path.exists(a.progress) and os.path.getsize(a.progress) > 0
+        if existed and not a.allow_duplicate:
+            with open(a.progress, newline="", encoding="utf-8") as fh:
+                for prev in csv.DictReader(fh):
+                    if (prev.get("ticket") or "").strip() == row["ticket"]:
+                        print(f"skipped: {row['ticket']} is already recorded as "
+                              f"{prev.get('outcome')} — move to the next ticket "
+                              f"(--allow-duplicate to override)", file=sys.stderr)
+                        return 2
+
+        # csv writes at the end of the file; if the last line has no final newline, the new row would be glued onto it. Use the file's own line ending first.
+        eol, tail = "\r\n", ""
+        if existed:
+            with open(a.progress, "rb") as fh:
+                data = fh.read()
+            eol = "\r\n" if b"\r\n" in data else "\n"
+            if not data.endswith((b"\n", b"\r")):
+                tail = eol
+        with open(a.progress, "a", newline="", encoding="utf-8") as fh:
+            fh.write(tail)
+            w = csv.DictWriter(fh, fieldnames=COLUMNS, lineterminator=eol)
+            if not existed:
+                w.writeheader()
+            w.writerow(row)
+            fh.flush()
+            os.fsync(fh.fileno())
 
     # rows, not lines: a note may hold a quoted line break
     with open(a.progress, newline="", encoding="utf-8") as fh:

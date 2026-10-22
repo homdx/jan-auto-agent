@@ -496,7 +496,7 @@ def _display_path(found_path: Path, base_dir: Path) -> Path:
     try:
         return found_path.resolve().relative_to(Path(base_dir).resolve())
     except (ValueError, OSError, RuntimeError, TypeError):
-        return found_path.name
+        return Path(found_path.name)    # AUDIT3-C15: the annotated type, not a str
 
 
 #: Tracked-file lookups are not cached across calls, since the tree changes between Gate 1 passes; the list is read once per call.

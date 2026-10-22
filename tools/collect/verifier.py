@@ -161,6 +161,27 @@ _SAFE_WORDS_RE = re.compile(
 
 
 # Quote style is normalised on both sides before comparing accesses, so "x" and 'x' match (BUGFIX).
+def _site_key(location) -> "tuple[str, int] | None":
+    """``(path, first line)`` of a ``path:line`` / ``path:a-b`` location, or None."""
+    if not isinstance(location, str):
+        return None
+    m = re.match(r"^(.*?):(\d+)(?:[-–]\d+)?$", location.strip())
+    if not m:
+        return None
+    return m.group(1).replace("\\", "/"), int(m.group(2))
+
+
+def _same_access_sites(module, cited: str, location) -> list:
+    """The module's recorded accesses with the cited text, narrowed to the
+    claim's own line when the claim names one that parses (AUDIT3-3)."""
+    sites = [ga for ga in module.guarded_accesses
+             if _normalize_access(ga.access) == cited]
+    key = _site_key(location)
+    if key is None:
+        return sites
+    return [ga for ga in sites if _site_key(ga.location) == key]
+
+
 def _normalize_access(access: str) -> str:
     """Canonicalize an access-citation string for comparison purposes:
     fold both `'` and `"` to a single quote character. Only used for
@@ -599,19 +620,26 @@ def contradiction_check(
     """
     if claim.kind == "access_crash" and claim.access:
         cited = _normalize_access(claim.access)
-        for ga in module.guarded_accesses:
-            if _normalize_access(ga.access) == cited and ga.status == "GUARDED":
-                guard_desc = ga.guard or "guarded"
-                return (
-                    REASON_CONTRADICTS_GUARD,
-                    f"{claim.access} at {ga.location} is GUARDED ({guard_desc})",
-                )
+        # AUDIT3-3: a claim that names its line is judged by that line only —
+        # the same text GUARDED elsewhere in the module says nothing about it.
+        # A claim with no usable location keeps the COLLECT-17 rule: any
+        # GUARDED occurrence contradicts it.
+        same = _same_access_sites(module, cited, claim.location)
+        guarded = [ga for ga in same if ga.status == "GUARDED"]
+        if guarded and (_site_key(claim.location) is None
+                        or all(ga.status == "GUARDED" for ga in same)):
+            ga = guarded[0]
+            guard_desc = ga.guard or "guarded"
+            return (
+                REASON_CONTRADICTS_GUARD,
+                f"{claim.access} at {ga.location} is GUARDED ({guard_desc})",
+            )
 
     if claim.kind == "access_safe" and claim.access:
         # A safe-access claim is checked against UNGUARDED, the mirror of the crash check (COLLECT-17).
         cited = _normalize_access(claim.access)
-        for ga in module.guarded_accesses:
-            if _normalize_access(ga.access) == cited and ga.status == "UNGUARDED":
+        for ga in _same_access_sites(module, cited, claim.location):
+            if ga.status == "UNGUARDED":
                 return (
                     REASON_CONTRADICTS_CRASH,
                     f"{claim.access} at {ga.location} is UNGUARDED "

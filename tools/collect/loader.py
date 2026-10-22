@@ -61,7 +61,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from tools.collect import cli as cli_mod
 from tools.collect import manifest as manifest_mod
 from tools.collect import registries as registries_mod
-from tools.collect.model import ContractRecord, ModuleRecord
+from tools.collect.model import ContractRecord, ModuleRecord, ProvenanceViolation
 from tools.collect.registries import FailOpenEntry, SafetyAnswer
 from tools.collect.gates import GateEntry
 from tools.collect.risk import RiskEntry
@@ -488,7 +488,9 @@ def _load_from_dir(
             )
             for c in payload.get("config_map", [])
         )
-    except (AttributeError, KeyError, TypeError, ValueError):
+    except (AttributeError, KeyError, TypeError, ValueError, ProvenanceViolation):
+        # AUDIT3-C6: a record the model rejects (ProvenanceViolation, a RuntimeError)
+        # is an artifact problem too — "never raises for the artifact itself".
         # A valid JSON non-dict (e.g. a list) must not escape the loader; it is treated as absent.
         return _absent(collect_dir, "artifact has an unexpected shape — treated as absent")
 

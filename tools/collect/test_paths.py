@@ -80,7 +80,26 @@ def _is_test_dir_component(component: str) -> bool:
     module whose name merely contains the word is not classified as test
     code.
     """
-    return component in TEST_PATH_DIRS
+    # AUDIT3-C12: case-insensitive (C#'s `Tests/`), plus `spec`/`specs` and a
+    # .NET test project folder (`MyApp.Tests`, `MyApp.Test`).
+    low = component.lower()
+    return (low in TEST_PATH_DIRS or low in _EXTRA_TEST_DIRS
+            or low.endswith((".tests", ".test")))
+
+
+#: AUDIT3-C12: more directory names that are test roots in other ecosystems.
+_EXTRA_TEST_DIRS: Tuple[str, ...] = ("spec", "specs")
+
+#: AUDIT3-C12: file names that are unambiguously tests where tests sit next to
+#: the code (JS/TS, Go, Ruby, Java, C#). Python's bare `test_*.py` is still NOT
+#: a location signal: `tools/collect/test_map.py` is shipped code.
+_TEST_FILE_SUFFIXES: Tuple[str, ...] = tuple(
+    f".{kind}.{ext}" for kind in ("test", "spec")
+    for ext in ("js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts")
+) + ("_test.go", "_spec.rb")
+_TEST_CLASS_SUFFIXES: Tuple[str, ...] = (
+    "Test.java", "Tests.java", "Test.kt", "Tests.kt", "Test.cs", "Tests.cs",
+)
 
 
 def is_test_path(path: str) -> bool:
@@ -95,8 +114,17 @@ def is_test_path(path: str) -> bool:
         return False
     if path.startswith(TEST_PATH_PREFIXES):
         return True
-    if path.rsplit("/", 1)[-1] in TEST_FILE_NAMES:
+    name = path.rsplit("/", 1)[-1]
+    if name in TEST_FILE_NAMES:
         return True
+    if name.lower().endswith(_TEST_FILE_SUFFIXES):
+        return True
+    # `FooTest.java`, but not `Test.java` itself or `Contest.java`: the suffix
+    # must follow a capitalised word of its own.
+    for suffix in _TEST_CLASS_SUFFIXES:
+        stem = name[:-len(suffix)] if name.endswith(suffix) else ""
+        if stem and stem[-1:].isalnum() and (stem[-1].islower() or stem[-1].isdigit()):
+            return True
     # Split on `/` and reject any empty piece (leading `//` or trailing `/`).
     for component in path.split("/"):
         if _is_test_dir_component(component):

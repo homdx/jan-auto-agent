@@ -97,6 +97,19 @@ def _normalise(text: str) -> str:
     return text.lower().translate(_STRIP_TABLE)
 
 
+_WORD_TABLE = str.maketrans({c: " " for c in string.punctuation})
+
+
+def _normalise_words(text: str) -> str:
+    """Lowercase, punctuation to spaces, whitespace collapsed — word boundaries kept.
+
+    AUDIT3-10: `_normalise` drops whitespace too, so a substring test on it
+    matched across words: "Ann is old." ('annisold') sat inside "Hannis Oldman
+    was the mayor…" ('hannisoldman…') and the fact was deleted from the bible.
+    """
+    return " ".join(text.lower().translate(_WORD_TABLE).split())
+
+
 def _parse_bullets(text: str) -> list[str]:
     """Return raw bullet strings (without leading marker) from *text*."""
     # Numbered bullets are stripped only at the start of a line, so a number inside a fact is kept (BUGFIX).
@@ -235,6 +248,9 @@ def _dedup_substrings(bullets: list[str]) -> list[str]:
     wins, first-seen wins ties.
     """
     norms = [_normalise(b) for b in bullets]
+    # Containment is judged on whole words (AUDIT3-10); equality keeps the
+    # fully collapsed form, so spacing/punctuation variants are still duplicates.
+    words = [f" {_normalise_words(b)} " for b in bullets]
     keep = [True] * len(bullets)
 
     for i, norm_i in enumerate(norms):
@@ -248,8 +264,8 @@ def _dedup_substrings(bullets: list[str]) -> list[str]:
                 if j > i:
                     keep[j] = False
                 continue
-            if norm_i in norm_j:
-                # bullet i is a substring of the longer bullet j — drop i.
+            if words[i].strip() and words[i] in words[j]:
+                # bullet i is a whole-word substring of the longer bullet j — drop i.
                 keep[i] = False
                 break
 
@@ -306,10 +322,23 @@ class StoryBible:
 
     def load(self) -> str:
         """Return the current bible text, or ``""`` if the file does not exist."""
+        # AUDIT3-9 (same defect as synopsis.md): read in the file's own codec and
+        # remember it with the line end, so `_write` puts the bible back the way
+        # it was instead of re-encoding a cp1251 bible's facts as U+FFFD.
+        from tools.auto.summary_memory import _read_in_own_codec
         try:
-            return self._path.read_text(encoding="utf-8", errors="replace")
+            text, encodings, eol = _read_in_own_codec(self._path)
+        except FileNotFoundError:
+            self._codec = (("utf-8",), "\n", True)
+            return ""
         except OSError:
             return ""
+        except UnicodeError:
+            # Not decodable without loss: shown to the model, never written back.
+            self._codec = (("utf-8",), "\n", False)
+            return self._path.read_text(encoding="utf-8", errors="replace")
+        self._codec = (encodings, eol, True)
+        return text
 
     def extract(self, chapter_text: str, known_facts: str = "") -> list[str]:
         """Ask the LLM to extract durable facts from *chapter_text*.
@@ -661,10 +690,23 @@ class StoryBible:
 
     def _write(self, text: str) -> None:
         """Write *text* to the bible file.  Creates parent dirs as needed."""
+        from tools.auto.summary_memory import _codec_write_kwargs, _first_codec_holding
+        encodings, eol, writable = getattr(self, "_codec", (("utf-8",), "\n", True))
+        if not writable:
+            logger.error("StoryBible: %s is not readable without loss — left "
+                         "untouched (AUDIT3-9)", self._path)
+            return
+        if eol != "\n":
+            text = text.replace("\r\n", "\n").replace("\n", eol)
+        encoding = _first_codec_holding(encodings, text)
+        if encoding is None:
+            logger.error("StoryBible: the update holds characters %s's codec (%s) "
+                         "cannot store — left untouched", self._path, encodings[0])
+            return
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             # The bible is rewritten whole on every update, so the write is atomic: a kill mid-write cannot leave a half-written bible (bugfix).
-            atomic_write_text(self._path, text)
+            atomic_write_text(self._path, text, **_codec_write_kwargs(encoding, eol))
             logger.info("StoryBible: wrote %d chars to %s", len(text), self._path)
         except OSError as exc:
             logger.error("StoryBible: cannot write %s: %s", self._path, exc)

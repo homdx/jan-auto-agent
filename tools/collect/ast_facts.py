@@ -106,6 +106,13 @@ def _signature(node: ast.AST) -> str:
         # The first parameter of __init__ is not part of the calling convention, so it is dropped from the rendered list.
         head, sep, rest = rendered.partition(", ")
         rendered = rest if sep else ""
+        # AUDIT3-C16: `def __init__(self, /, x)` left a bare positional-only
+        # marker in front — `C(/, x)` is not Python. With `self` gone the
+        # marker has nothing before it, so it goes too.
+        if rendered == "/":
+            rendered = ""
+        elif rendered.startswith("/, "):
+            rendered = rendered[3:]
     full = f"{name}({rendered})"
     if len(full) <= _SIGNATURE_MAX_CHARS:
         return full

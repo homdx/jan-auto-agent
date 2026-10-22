@@ -77,6 +77,10 @@ class Spinner:
         try:
             sys.stdout.write(f"\r{self.frames[self.idx % len(self.frames)]} {self.message}...")
             sys.stdout.flush()
+        except UnicodeEncodeError:
+            # AUDIT3-18: a stdout that cannot hold the Braille frames gets ASCII ones.
+            self.frames = ["|", "/", "-", "\\"]
+            safe_stdout_write(f"\r{self.frames[self.idx % len(self.frames)]} {self.message}...")
         except (BrokenPipeError, OSError):
             # Stdout closed early (e.g. | head): stop the thread instead of spinning on a dead pipe.
             self.running = False
@@ -104,7 +108,7 @@ class Spinner:
         try:
             sys.stdout.write("\r" + " " * (len(self.message) + 6) + "\r")
             sys.stdout.flush()
-        except (BrokenPipeError, OSError):
+        except (BrokenPipeError, OSError, UnicodeEncodeError):
             pass
 
     # ── context-manager support ──────────────────────────────────────────
@@ -140,6 +144,9 @@ def stream_tracker():
         try:
             sys.stdout.write(t)
             sys.stdout.flush()
+        except UnicodeEncodeError:
+            # AUDIT3-18: a non-UTF-8 stdout must not kill a paid streaming call.
+            safe_stdout_write(t)
         except (BrokenPipeError, OSError):
             # Stdout closed early: streaming output is cosmetic, so keep tracking tokens and do not crash.
             pass

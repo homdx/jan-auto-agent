@@ -827,7 +827,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                     "ts":            ts,
                     "task":          task_id_fp,
                     "file_count":    params.get("file_count", 0),
-                    "files":         params.get("files", []),
+                    "files":         _param_list(params.get("files", [])),
                     "files_copied":  None,   # filled in on "done"
                     "files_missing": None,
                     "status":        "started",
@@ -843,8 +843,8 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                     if rec["task"] == task_id_fp and rec["status"] == "started":
                         rec["files_copied"]  = params.get("files_copied", 0)
                         rec["files_missing"] = params.get("files_missing", 0)
-                        rec["copied"]        = params.get("copied", [])
-                        rec["missing"]       = params.get("missing", [])
+                        rec["copied"]        = _param_list(params.get("copied", []))
+                        rec["missing"]       = _param_list(params.get("missing", []))
                         rec["status"]        = "done"
                         break
 
@@ -2021,6 +2021,25 @@ def main() -> int:
         render_auto_prompts(args.path)
 
     return 0
+
+
+def _param_list(value) -> list:
+    """A list-valued trace param as a list (AUDIT3-C2).
+
+    The tracer JSON-stringifies list params, so ``files`` arrives as the text
+    '["docs/a.md", …]'. Stored verbatim it was iterated character by
+    character: docs-mode runs read as code mode and the file list printed one
+    character per row. A string cut mid-JSON by the tracer's cap is no list.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
 
 
 if __name__ == "__main__":

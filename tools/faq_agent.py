@@ -1047,6 +1047,10 @@ class FaqAgent:
             try:
                 sys.stdout.write(t)
                 sys.stdout.flush()
+            except UnicodeEncodeError:
+                # AUDIT3-18: a non-UTF-8 stdout must not kill a paid streaming call.
+                from tools.ui import safe_stdout_write
+                safe_stdout_write(t)
             except (BrokenPipeError, OSError):
                 pass
 

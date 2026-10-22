@@ -382,8 +382,13 @@ class Orchestrator(OrchestratorActions):
             return None
 
     def run_pipeline(self, user_input: str, base_dir: str,
-                     resume_state: dict = None) -> None:
-        """Executes pipelines with adaptive search, validation loops, and visual feedback."""
+                     resume_state: dict = None) -> "bool | None":
+        """Executes pipelines with adaptive search, validation loops, and visual feedback.
+
+        AUDIT3-6: returns ``False`` when the query could not run at all (a target
+        outside the project, a missing file, an unreadable source) so ``--once``
+        can exit 1 on it; ``None`` otherwise, as before.
+        """
         start_time = time.time()
 
         # Full-file search mode: bypass AST block-extraction entirely.
@@ -405,10 +410,10 @@ class Orchestrator(OrchestratorActions):
         target_path = resolve_target_path(base_dir, parsed.file_path)
         if target_path is None:
             print(f"Error: Target path is outside the project: '{parsed.file_path}'")
-            return
+            return False
         if not os.path.exists(target_path) or not os.path.isfile(target_path):
             print(f"Error: Target path is not a valid file: '{parsed.file_path}'")
-            return
+            return False
 
         # Lower-case the extension, so "app.PY" counts as code.
         ext = Path(parsed.file_path).suffix.lower()
@@ -417,7 +422,8 @@ class Orchestrator(OrchestratorActions):
             source = file_reader.read_file(target_path)
         except Exception as e:
             logger.error(f"Execution failed while reading targets: {e}")
-            return
+            print(f"Error: cannot read '{parsed.file_path}': {e}")
+            return False
 
         # Re-parse with source so parse_prompt can verify the target symbol exists.
         parsed = parse_prompt(user_input, source=source)
@@ -701,6 +707,19 @@ Knowledge base (FAQ resolver)
     A: Go to Settings → Account → Reset password.
   Then ask:  /faq how do I reset my password?
 """
+
+
+def _warn_missing_explicit_config(config_path: str) -> None:
+    """Warn on stderr when a ``--config`` the user named does not exist (AUDIT3-C3).
+
+    --faq, --once and the shell silently ran on the built-in localhost
+    defaults, so a typo'd path looked like a model failure. They still run on
+    the defaults (scripts and tests rely on that), but now say so. The default
+    ``agents.ini`` may be absent quietly: the defaults are its documented stand-in.
+    """
+    if config_path != _DEFAULT_CONFIG_PATH and not os.path.exists(config_path):
+        print(f"Warning: config file not found: {config_path} — using the built-in "
+              f"defaults", file=sys.stderr)
 
 
 def _parse_args():
@@ -1000,6 +1019,12 @@ def main():
     args = _parse_args()
     base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
 
+    # AUDIT3-C9: --dry-run only means something with --auto; alone it fell
+    # through to the interactive shell, and a CI job reading EOF exited 0.
+    if args.dry_run and args.auto is None:
+        print("Error: --dry-run only applies together with --auto GOAL.", file=sys.stderr)
+        sys.exit(2)
+
     if not args.list_skills:
         _validate_typed_config_values(args.config, base_dir)
 
@@ -1060,6 +1085,12 @@ def main():
             run as collect_run,
         )
         from tools.collect.summarizer import make_summarizer_call_or_none, should_run_pass_b
+
+        # AUDIT3-C8: `--module ""` is refused, as /collect refuses it; the empty
+        # string read as "no module" and silently ran a whole-tree collect.
+        if args.module is not None and not args.check and not args.module.strip():
+            print("Error: --module needs a file path, got an empty value.", file=sys.stderr)
+            sys.exit(2)
 
         # Same precedence table as /collect, so --collect and /collect dispatch identically.
         action, _ = action_from_flags(
@@ -1123,6 +1154,7 @@ def main():
                 stream=sys.stderr,
             )
 
+        _warn_missing_explicit_config(args.config)
         orchestrator = Orchestrator(config_path=args.config)
 
         if json_mode:
@@ -1155,6 +1187,7 @@ def main():
         from tools.contest.cli import main as _contest_main
         sys.exit(_contest_main(shlex.split(args.contest)))
 
+    _warn_missing_explicit_config(args.config)
     orchestrator = Orchestrator(config_path=args.config)
 
     # Skip the resume prompt with --once: it would hang on stdin or run the saved query instead of the requested one.
@@ -1185,8 +1218,9 @@ def main():
             print("Error: --once requires a non-empty query string.", file=sys.stderr)
             sys.exit(1)
         try:
-            orchestrator.run_pipeline(query, base_dir)
-            sys.exit(0)
+            # AUDIT3-6: "0 ok / 1 error" — a query that could not run is an error.
+            ok = orchestrator.run_pipeline(query, base_dir)
+            sys.exit(1 if ok is False else 0)
         except Exception as e:
             logger.error("One-shot pipeline failed: %s", e)
             sys.exit(1)
@@ -1321,7 +1355,13 @@ def main():
                 print(f"Unknown command: {user_input.split()[0]}  —  type /help for the command list.")
                 continue
 
-            orchestrator.run_pipeline(user_input, base_dir)
+            # AUDIT3-14: one failed query is reported, not the end of the session
+            # (and of its chat history) — as --once already does.
+            try:
+                orchestrator.run_pipeline(user_input, base_dir)
+            except Exception as exc:  # noqa: BLE001 — the shell outlives one query
+                logger.exception("Pipeline failed for %r", user_input)
+                print(f"Error: {type(exc).__name__}: {exc}")
 
         except (KeyboardInterrupt, EOFError):
             print("\nShutting down runtime session shell.")

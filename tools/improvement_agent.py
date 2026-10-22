@@ -135,7 +135,7 @@ class ImprovementAgent:
                 related_code=json.dumps(context.get("related_code"), indent=2),
                 context_lines=context.get("context_lines"),
             )
-        except (KeyError, ValueError) as fmt_err:
+        except (KeyError, ValueError, IndexError, AttributeError) as fmt_err:  # AUDIT3-13: "{}" / "{0}" raise IndexError
             logger.error(
                 "ImprovementAgent: prompt template has invalid placeholders (%s) — "
                 "rolling back to hardcoded prompt for this call", fmt_err

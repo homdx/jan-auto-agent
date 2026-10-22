@@ -1646,8 +1646,12 @@ def _truncated_verdict(cleaned: str) -> "tuple[str, str]":
     key of the first object: ``{"verdict": "`` alone, or a reason cut before
     any verdict, is still no verdict and is asked again.
     """
+    # AUDIT3-5: the verdict object need not be the first brace — "I checked {the file}".
+    match = None
     start = cleaned.find("{")
-    match = _TRUNCATED_VERDICT_RE.match(cleaned[start:]) if start >= 0 else None
+    while start >= 0 and match is None:
+        match = _TRUNCATED_VERDICT_RE.match(cleaned[start:])
+        start = cleaned.find("{", start + 1)
     if match is None:
         return "", ""
     reason = match.group(2)
@@ -1681,16 +1685,27 @@ def _extract_verdict(reply) -> "tuple[str, str]":
         except (json.JSONDecodeError, ValueError):
             data = None
         if data is None:
+            # AUDIT3-5: every `{` is a candidate, not only the first — prose such as
+            # "I checked {the file}" before the object used to discard the verdict.
+            # The first object that carries a `verdict` wins; failing that, the
+            # first object at all (its reason is still worth reporting).
+            decoder = json.JSONDecoder(strict=False)
+            first_dict = None
             start = cleaned.find("{")
-            if start >= 0:
+            while start >= 0:
                 try:
-                    candidate, _ = json.JSONDecoder(strict=False).raw_decode(
-                        cleaned[start:]
-                    )
+                    candidate, _ = decoder.raw_decode(cleaned[start:])
                 except (json.JSONDecodeError, ValueError):
                     candidate = None
                 if isinstance(candidate, dict):
-                    data = candidate
+                    if "verdict" in candidate:
+                        data = candidate
+                        break
+                    if first_dict is None:
+                        first_dict = candidate
+                start = cleaned.find("{", start + 1)
+            if data is None:
+                data = first_dict
         if data is None:
             return _truncated_verdict(cleaned)
 

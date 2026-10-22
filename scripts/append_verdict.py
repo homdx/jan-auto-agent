@@ -40,6 +40,23 @@ def _locked(path):
         yield
 
 
+def _missing_final_newline(path) -> str:
+    """The line end to write first when *path* does not end with one, else "".
+
+    AUDIT3-19: a CSV whose last row has no line end (a spreadsheet export, an
+    interrupted write) had the next row glued onto it, destroying both — the
+    guard append_task.py already has.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return ""
+    if not data or data.endswith((b"\n", b"\r")):
+        return ""
+    return "\r\n" if b"\r\n" in data else "\n"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
@@ -107,7 +124,9 @@ def main():
                               f"{prev.get('truth')} — move on.", file=sys.stderr)
                         return 2
 
+        tail = _missing_final_newline(out) if existed else ""
         with open(out, "a", newline="", encoding="utf-8") as fh:
+            fh.write(tail)
             w = csv.DictWriter(fh, fieldnames=COLUMNS)
             if not existed:
                 w.writeheader()

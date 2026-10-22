@@ -33,7 +33,12 @@ SKIP_STATUS = ("landed", "queued", "closed")
 def load_tickets(tasks_dir):
     """Every NN-*.md in tasks/, in numeric order, with its finding key."""
     out = []
-    for name in sorted(os.listdir(tasks_dir)):
+    # AUDIT3-C1: numeric order, not text order — 2 before 10, 11 before 100.
+    def _order(name):
+        m = TICKET_RE.match(name)
+        return (int(m.group(1)) if m else -1, name)
+
+    for name in sorted(os.listdir(tasks_dir), key=_order):
         m = TICKET_RE.match(name)
         if not m:
             continue

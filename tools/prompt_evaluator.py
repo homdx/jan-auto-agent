@@ -384,9 +384,17 @@ def _validate_candidate_placeholders(candidate: str) -> Optional[str]:
     # Check brace balance — str.format() raises ValueError on lone { or }
     try:
         # Parse with string.Formatter to catch unmatched braces
-        list(string.Formatter().parse(candidate))
+        fields = list(string.Formatter().parse(candidate))
     except (ValueError, KeyError) as exc:
         return f"unmatched or invalid braces: {exc}"
+    # AUDIT3-13: `{}` and `{0}` parse fine but every `.format(name=…)` call then
+    # raises IndexError — a promoted candidate crashed the next validate().
+    for _literal, field, _spec, _conv in fields:
+        if field is None:
+            continue
+        head = field.split(".", 1)[0].split("[", 1)[0]
+        if head == "" or head.isdigit():
+            return f"positional placeholder {{{field}}} — only named placeholders are filled"
 
     return None
 

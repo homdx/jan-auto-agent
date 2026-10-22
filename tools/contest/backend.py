@@ -57,6 +57,7 @@ library plus ``tools.contest.kilo_client``; the agent loop is ``urllib``.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import os
@@ -1081,6 +1082,8 @@ class _AgentRecord:
         self.output_tokens = 0
         # One line per agent stdout line, or None at exit; a queue, so wait_idle can time out.
         self.lines: "queue.Queue" = queue.Queue()
+        # AUDIT3-9b: the last lines the agent wrote to stderr, kept for diagnosis.
+        self.stderr_tail: "collections.deque" = collections.deque(maxlen=200)
         self.reader: "threading.Thread | None" = None
 
 
@@ -1379,7 +1382,23 @@ class OpenRouterBackend:
                                   name="contest-agent-read")
         record.reader = thread
         thread.start()
+        # AUDIT3-9b: stderr is a pipe too, and nothing read it: once the agent
+        # had written a pipe's worth (~64 KiB of warnings or a traceback) its
+        # next write blocked forever and the turn hung until the silence clock.
+        threading.Thread(target=self._drain_stderr, args=(record, getattr(proc, "stderr", None)),
+                         daemon=True, name="contest-agent-stderr").start()
         return record
+
+    @staticmethod
+    def _drain_stderr(record: _AgentRecord, stream) -> None:
+        """Read the agent's stderr to its end, keeping the last lines."""
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                record.stderr_tail.append(line.rstrip("\r\n"))
+        except (OSError, ValueError):
+            pass
 
     @staticmethod
     def _write(record: _AgentRecord, payload: dict) -> None:

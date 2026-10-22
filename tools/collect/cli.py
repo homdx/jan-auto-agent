@@ -76,7 +76,7 @@ from tools.collect import risk as risk_mod
 from tools.collect import test_map as test_map_mod
 from tools.collect import verifier as verifier_mod
 from tools.collect._determinism import canonical_dumps
-from tools.collect.model import LLMSummary, ModuleRecord, Provenance
+from tools.collect.model import LLMSummary, ModuleRecord, Provenance, ProvenanceViolation
 from tools.collect.scanner import language_for, scan_file, scan_repo, scan_repo_ex
 from tools.collect.summarizer import LlmCall, collect_max_retries, summarize_repo
 
@@ -229,6 +229,27 @@ def read_collect_settings(config: Optional[configparser.ConfigParser]) -> Collec
     )
 
 
+def _carried_manifest_fields(previous, module_path: str, patched) -> dict:
+    """The manifest fields a `--module` patch keeps from the previous manifest.
+
+    AUDIT3-8: the patch built a fresh Manifest with only the hash fields, so
+    `unsummarized` (CC-15: modules Pass B still owes a summary — what makes
+    `is_fresh` retry them), `profile_hashes` and `skipped_files` were erased,
+    and the tree read "up to date" with a module that would never be retried.
+    The patched module leaves `unsummarized` once it has a summary.
+    """
+    if previous is None:
+        return {}
+    unsummarized = set(getattr(previous, "unsummarized", ()) or ())
+    if getattr(patched, "summary", None) is not None:
+        unsummarized.discard(module_path)
+    return {
+        "unsummarized": tuple(sorted(unsummarized)),
+        "profile_hashes": dict(getattr(previous, "profile_hashes", {}) or {}),
+        "skipped_files": tuple(getattr(previous, "skipped_files", ()) or ()),
+    }
+
+
 def resolve_collect_dir(root: Path, config: Optional[configparser.ConfigParser]) -> Path:
     """`[collect] dir` (default `.collect`), resolved relative to `root` if
     given as a relative path. This is the *only* function in this module
@@ -329,7 +350,7 @@ def _previous_summaries(collect_dir: Path) -> Tuple[Dict[str, LLMSummary], Dict[
             rec = ModuleRecord.from_dict(d)
             if rec.summary is not None:
                 summaries[rec.path] = rec.summary
-    except (AttributeError, OSError, ValueError, KeyError, TypeError):
+    except (AttributeError, OSError, ValueError, KeyError, TypeError, ProvenanceViolation):
         return {}, {}
     previous_manifest, _problem = _read_previous_manifest(collect_dir)
     if previous_manifest is not None:
@@ -1078,7 +1099,7 @@ def action_refresh(
             else:
                 artifact_problem = f"{artifact_path} is absent (the manifest has nothing to diff against)"
         # A stored artifact with the wrong shape is treated as no previous manifest, not a crash (BUGFIX).
-        except (AttributeError, OSError, ValueError, KeyError, TypeError) as exc:
+        except (AttributeError, OSError, ValueError, KeyError, TypeError, ProvenanceViolation) as exc:
             artifact_problem = f"{artifact_path} is unreadable or malformed ({exc})"
         if artifact_problem is None and not previous_by_path:
             # A modules-empty artifact next to a manifest is a partial write: reported as a problem, not read as no modules (BUGFIX).
@@ -1454,7 +1475,7 @@ def action_module(
     # A broken stored artifact raises a clean CollectCliError, not a raw TypeError/KeyError (BUGFIX).
     try:
         modules = [ModuleRecord.from_dict(d) for d in payload.get("modules", [])]
-    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+    except (AttributeError, KeyError, TypeError, ValueError, ProvenanceViolation) as exc:
         # A valid JSON non-object raises AttributeError, which is now caught too (bugfix).
         raise CollectCliError(f"existing artifact at {artifact_path} is malformed: {exc}") from exc
     by_path = {m.path: m for m in modules}
@@ -1522,11 +1543,13 @@ def action_module(
 
     # Patch only this file's manifest entry instead of rehashing the whole tree.
     manifest_path = collect_dir / MANIFEST_FILENAME
+    previous = None
     if manifest_path.exists():
         try:
             previous = manifest_mod.read_manifest(manifest_path)
             hashes = dict(previous.file_hashes)
         except (OSError, ValueError):
+            previous = None
             hashes = {}
     else:
         hashes = {}
@@ -1550,6 +1573,7 @@ def action_module(
         file_hashes=hashes,
         # The skip_dirs list is recorded too, so a patched manifest is not read as stale (CC-13).
         skip_dirs=tuple(sorted(manifest_mod.skip_dirs_from_config(config))),
+        **_carried_manifest_fields(previous, module_path, patched),
     )
     manifest_mod.write_manifest(patched_manifest, manifest_path)
     written = sorted(set(written) | {MANIFEST_FILENAME})

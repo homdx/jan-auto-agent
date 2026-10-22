@@ -73,6 +73,34 @@ _JUDGE_MODULE = None
 _JUDGE_TRIED = False
 
 
+def _write_atomically(target: Path, text: str) -> None:
+    """*text* to *target* through a temp file and one rename (AUDIT3-C5).
+
+    A plain write_text truncates first, so a crash, Ctrl-C or full disk in
+    the middle left a cut file — the one the next step reads.
+    """
+    import os
+    import tempfile
+    target = Path(target)
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:    # mkstemp makes 0600; keep the file's mode, or write_text's usual 0644
+            os.chmod(tmp, target.stat().st_mode & 0o777 if target.exists() else 0o644)
+        except OSError:
+            pass
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _judge_claims_section(text):
     """`(heading line, [(lineno, line)])` of *text*'s Claims section — from the judge's own
     reader — or ``None``.
@@ -340,7 +368,7 @@ def write_entrants(out_dir, base_sha, state, paths, *, repo=None) -> Path | None
     payload = {"base": str(base_sha or ""), "entrants": entrants}
     out.mkdir(parents=True, exist_ok=True)
     target = out / ENTRANTS_FILE
-    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_atomically(target, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return target
 
 
@@ -660,5 +688,5 @@ def write_summary(out_dir, state, base_sha, paths, *, repo=None, gate="") -> Pat
 
     out.mkdir(parents=True, exist_ok=True)
     target = out / SUMMARY_FILE
-    target.write_text("\n".join(header + body + decision_part + next_part), encoding="utf-8")
+    _write_atomically(target, "\n".join(header + body + decision_part + next_part))
     return target

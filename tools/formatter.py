@@ -122,7 +122,7 @@ class OutputFormatter:
         if intent not in ("show", "show_imports", "explain"):
             # Sub-Section: ISSUES
             print("# ISSUES")
-            issues = improvement.get("issues", [])
+            issues = _as_items(improvement.get("issues", []))
             if issues:
                 for issue in issues:
                     clean_issue = _BULLET_MARKER_RE.sub("", str(issue), count=1).strip()
@@ -141,7 +141,7 @@ class OutputFormatter:
 
             # Sub-Section: CHANGES
             print("# CHANGES")
-            changes = improvement.get("changes", [])
+            changes = _as_items(improvement.get("changes", []))
             if changes:
                 for change in changes:
                     clean_change = _BULLET_MARKER_RE.sub("", str(change), count=1).strip()
@@ -152,3 +152,17 @@ class OutputFormatter:
             print()
 
         print(divider)
+
+
+def _as_items(value) -> list:
+    """A reply's issues/changes as a list of items (AUDIT3-C7).
+
+    A model that answers ``"issues": "the function lacks error handling"`` sent
+    one string, which was iterated character by character — one bullet per
+    letter. A string is one item; a dict or a number is one item too.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]

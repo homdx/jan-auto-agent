@@ -1211,6 +1211,10 @@ class Coder(_llm_stream.LLMClientBase):
                     cited_symbol = _sym
 
         parts: list[str] = []
+        # AUDIT3-1: the files this prompt shows only in part, with the text the
+        # model did not see whole. `_write_files` refuses a reply that would
+        # replace such a file with less than it holds (see `_partial_view_error`).
+        self._partial_views = {}
         for rel in target_files:
             abs_path = base_dir / rel
             if not abs_path.exists():
@@ -1242,6 +1246,7 @@ class Coder(_llm_stream.LLMClientBase):
                 parts.append(f"### {rel}\n{content}")
                 continue
 
+            self._partial_views[rel] = content
             try:
                 chunks   = chunk_file(content, ext, self._max_file_chars)
                 assembled = select_relevant_chunks(chunks, cited_symbol, self._max_file_chars)
@@ -2000,6 +2005,59 @@ class Coder(_llm_stream.LLMClientBase):
             return None, f"rejected a path inside .git: {rel!r}"
         return dest, ""
 
+    def _partial_view_error(self, rel: str, content: str, dest: Path) -> str:
+        """``""``, or why *content* may not replace a file shown only in part.
+
+        AUDIT3-1: a file over ``max_file_chars`` reaches the prompt as its
+        import block plus the symbols that fit — or, for a file with no
+        top-level symbol (a script, a .json/.yaml), as the imports alone — yet
+        the reply is a *complete* file and was written over the original as
+        is. Every symbol and module-level statement the model never saw was
+        deleted. The reply is refused when it drops a top-level symbol of the
+        original, still carries a ``not included`` placeholder, or holds less
+        than half of the original's text; the original stays untouched.
+        """
+        views = getattr(self, "_partial_views", None) or {}
+        norm = rel.replace("\\", "/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        original = views.get(rel, views.get(norm))
+        if original is None:
+            return ""
+        try:
+            if not dest.is_file():
+                return ""
+        except OSError:
+            return ""
+        if re.search(r"# \[[^\]\n]* — \d+ chars, not included\]", content):
+            return (f"[SAFETY] {rel!r} still holds a '... not included]' placeholder — "
+                    f"the file was shown in part; return its complete text — write blocked")
+        ext = Path(rel).suffix.lower()
+
+        def _names(source: str) -> "set[str] | None":
+            try:
+                chunks = chunk_file(source, ext, 0)
+            except Exception:  # noqa: BLE001 — an unscannable text is judged by size alone
+                return None
+            if any(c.get("name") == "truncated" for c in chunks):
+                return None
+            return {c["name"] for c in chunks if not c.get("is_import")}
+
+        before, after = _names(original), _names(content)
+        if before and after is not None:
+            missing = sorted(before - after)
+            if missing:
+                shown = ", ".join(missing[:8]) + (" …" if len(missing) > 8 else "")
+                return (f"[SAFETY] {rel!r} was shown in part and the reply drops "
+                        f"{len(missing)} of its top-level symbols ({shown}) — the "
+                        f"original is kept; change only what you were shown and "
+                        f"keep every other symbol — write blocked")
+        if len(content) * 2 < len(original):
+            return (f"[SAFETY] {rel!r} was shown in part ({len(original)} chars) and "
+                    f"the reply would replace it with {len(content)} chars — the "
+                    f"original is kept — write blocked")
+        return ""
+
     def _write_files(
         self,
         parsed_files: list[dict],
@@ -2158,6 +2216,14 @@ class Coder(_llm_stream.LLMClientBase):
                 continue
             except OSError:
                 pass
+
+            # Guard 2.8 (AUDIT3-1): a file the prompt showed only in part.
+            partial_err = self._partial_view_error(rel, content, dest)
+            if partial_err:
+                logger.error("coder._write_files [%s]: %s", task_id, partial_err)
+                if not first_error:
+                    first_error = partial_err
+                continue
 
             # ── Guard 3: scan file content for dangerous patterns ──────────
             _existing = None

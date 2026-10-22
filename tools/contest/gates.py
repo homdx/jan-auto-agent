@@ -67,6 +67,11 @@ TIER_CHECK = os.path.join("scripts", "sync_test_tiers.py")
 FAIL_TAIL_LINES = 20
 
 
+#: AUDIT3-17: generous bounds for calls that used to have none.
+GIT_TIMEOUT_S = 300
+TIER_CHECK_TIMEOUT_S = 600
+
+
 def git(cwd, *args, check=False):
     """`git <args>` in *cwd*, stdout stripped. Raise `RuntimeError` when *check*.
 
@@ -77,8 +82,11 @@ def git(cwd, *args, check=False):
     """
     # core.quotepath=false keeps non-ASCII paths readable, so they match a test root and git show works.
     try:
-        r = run_git(["git", "-c", "core.quotepath=false", *args], cwd=cwd, errors="replace")
-    except OSError as exc:
+        # AUDIT3-17: a hung git (dead remote, stuck mount) no longer holds the
+        # harvest forever; a timeout reads as "git could not answer".
+        r = run_git(["git", "-c", "core.quotepath=false", *args], cwd=cwd, errors="replace",
+                    timeout=GIT_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as exc:
         # MIMO-5: no git binary / an unusable cwd raised past the documented ""
         # contract (run_git never swallows OSError) and crashed the harvest.
         if check:
@@ -473,8 +481,14 @@ def run_tests_detail(cwd, budget_sec: float = 0.0) -> tuple[str, list[str]]:
         tail.append(f"--- {d}")
         tail.extend(lines[-FAIL_TAIL_LINES:] or _tail(r.stderr))
     if os.path.isfile(os.path.join(cwd, TIER_CHECK)) and not any(t.endswith("budget✗") for t in out):
-        r = subprocess.run([sys.executable, TIER_CHECK, "--check"],
-                           cwd=cwd, capture_output=True, text=True, errors="replace")
+        # AUDIT3-17: bounded — it runs inside the round-wide test lock.
+        try:
+            r = subprocess.run([sys.executable, TIER_CHECK, "--check"],
+                               cwd=cwd, capture_output=True, text=True, errors="replace",
+                               timeout=TIER_CHECK_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            r = subprocess.CompletedProcess(
+                [TIER_CHECK], 124, "", f"tier check timed out after {TIER_CHECK_TIMEOUT_S}s")
         if r.returncode == 0:
             out.append("tiers:PASS")
         else:

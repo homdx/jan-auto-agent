@@ -708,7 +708,16 @@ def attach_clone(clone_path, agent: str, base_sha: str, branch: str, *, force: b
             f"clone {clone} does not contain base sha {base_sha} in any remote"
         )
 
-    dirty = _git(clone, ["status", "--porcelain"], check=False).stdout.strip()
+    # AUDIT3-15: a status that failed printed nothing and read as "clean", and
+    # the `clean -fdx` below then deleted whatever it could not report — the
+    # read-or-raise rule of `_dirty_outside_runs` (FL-2).
+    status = _git(clone, ["status", "--porcelain"], check=False)
+    if status.returncode != 0:
+        raise WorkspaceError(
+            f"clone {clone}: git status failed (exit {status.returncode}): "
+            f"{(status.stderr or '').strip()} — not resetting a tree that cannot be read"
+        )
+    dirty = status.stdout.strip()
     if dirty and not force:
         files = "\n  ".join(dirty.splitlines())
         raise WorkspaceError(

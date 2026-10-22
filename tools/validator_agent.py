@@ -124,7 +124,7 @@ class ValidatorAgent:
                 related_code=json.dumps(payload.get("related_code"), indent=2),
                 missing_refs=payload.get("missing_refs"),
             )
-        except (KeyError, ValueError) as fmt_err:
+        except (KeyError, ValueError, IndexError, AttributeError) as fmt_err:  # AUDIT3-13: "{}" / "{0}" raise IndexError
             logger.error(
                 "ValidatorAgent: prompt template has invalid placeholders (%s) — "
                 "rolling back to hardcoded prompt for this call", fmt_err

@@ -226,7 +226,14 @@ def _is_indexed_access(node: ast.Subscript) -> bool:
 
 
 #: Block-owning statements are walked once: only their head expressions are scanned here, not their bodies.
-_BLOCK_OWNING_STMT_TYPES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)
+#: AUDIT3-4: `match` (3.10+) and `try/except*` (3.11+) own nested blocks too.
+#: Read as plain statements they were scanned whole with the outer guard state,
+#: and a rebind inside a `case` never dropped the guard for what follows.
+_MATCH = getattr(ast, "Match", None)
+_TRY_STAR = getattr(ast, "TryStar", None)
+_BLOCK_OWNING_STMT_TYPES = tuple(t for t in (
+    ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try,
+    _MATCH, _TRY_STAR) if t is not None)
 
 #: Head-only fields for each block-owning statement type: everything except the nested statement lists.
 _HEAD_ONLY_FIELDS: Dict[type, Tuple[str, ...]] = {
@@ -238,6 +245,22 @@ _HEAD_ONLY_FIELDS: Dict[type, Tuple[str, ...]] = {
     ast.AsyncWith: ("items",),
     ast.Try: (),  # body/handlers/orelse/finalbody are all nested statement lists
 }
+if _MATCH is not None:
+    _HEAD_ONLY_FIELDS[_MATCH] = ("subject",)   # each case's guard is added in _own_scan_sources
+if _TRY_STAR is not None:
+    _HEAD_ONLY_FIELDS[_TRY_STAR] = ()
+
+
+def _pattern_bound_names(stmt) -> Set[str]:
+    """Names a `match` statement's case patterns bind (AUDIT3-4)."""
+    names: Set[str] = set()
+    for case in getattr(stmt, "cases", None) or []:
+        for node in ast.walk(case.pattern):
+            for attr in ("name", "rest"):
+                value = getattr(node, attr, None)
+                if isinstance(value, str):
+                    names.add(value)
+    return names
 
 
 #: Mutator methods that can empty a container again, so a truthy guard on it is dropped.
@@ -319,6 +342,9 @@ def _own_scan_sources(stmt: ast.stmt) -> List[ast.AST]:
             sources.extend(value)
         elif value is not None:
             sources.append(value)
+    for case in getattr(stmt, "cases", None) or []:
+        if case.guard is not None:
+            sources.append(case.guard)
     return sources
 
 
@@ -334,6 +360,8 @@ def _nested_stmt_lists(stmt: ast.stmt) -> List[List[ast.stmt]]:
             lists.append(value)
     for handler in getattr(stmt, "handlers", []):
         lists.append(handler.body)
+    for case in getattr(stmt, "cases", None) or []:
+        lists.append(case.body)
     return lists
 
 
@@ -386,6 +414,11 @@ def _rebound_names_in(
             for alias_name, source_name in aliases.items():
                 if source_name == mutated:
                     names.add(alias_name)
+        if _MATCH is not None and isinstance(s, _MATCH):
+            bound = _pattern_bound_names(s)
+            names |= bound
+            for name in bound:
+                aliases.pop(name, None)
         for nested in _nested_stmt_lists(s):
             names |= _rebound_names_in(nested, aliases)
     return names
@@ -656,11 +689,25 @@ class _FunctionGuardWalker:
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
                 self._walk(stmt.body, set(guarded_names), set(guarded_pairs), dict(guard_desc))
                 self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
-            elif isinstance(stmt, ast.Try):
+            elif isinstance(stmt, ast.Try) or (_TRY_STAR is not None and isinstance(stmt, _TRY_STAR)):
                 for attr in _COMPOUND_BODY_ATTRS:
                     self._walk(getattr(stmt, attr, []), set(guarded_names), set(guarded_pairs), dict(guard_desc))
                 for handler in stmt.handlers:
                     self._walk(handler.body, set(guarded_names), set(guarded_pairs), dict(guard_desc))
+                self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
+            elif _MATCH is not None and isinstance(stmt, _MATCH):
+                # AUDIT3-4: a pattern capture rebinds its name inside the case.
+                bound = _pattern_bound_names(stmt)
+                for case in stmt.cases:
+                    case_names = set(guarded_names) - bound
+                    case_pairs = {p for p in guarded_pairs if p[0] not in bound}
+                    case_desc = {k: v for k, v in guard_desc.items() if k not in bound}
+                    self._walk(case.body, case_names, case_pairs, case_desc)
+                for name in bound:
+                    guarded_names.discard(name)
+                    guard_desc.pop(name, None)
+                for pair in {p for p in guarded_pairs if p[0] in bound}:
+                    guarded_pairs.discard(pair)
                 self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
 
 

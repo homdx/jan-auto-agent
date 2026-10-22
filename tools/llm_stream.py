@@ -2039,6 +2039,14 @@ def _as_int_or_none(value) -> "int | None":
     return int(value)
 
 
+def _content_of(container) -> str:
+    """The ``content`` string of a streamed message/delta, or ``""`` (AUDIT3-10b)."""
+    if not isinstance(container, dict):
+        return ""
+    content = container.get("content", "")
+    return content if isinstance(content, str) else ""
+
+
 def _meta_from_chunk(chunk, meta: CompletionMeta, api_format: str) -> None:
     """RUN-9: fold one streamed chunk into *meta*, in place. Never raises —
     a non-standard chunk must not turn a delivered stream into an exception.
@@ -3055,9 +3063,14 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
             or "invalid" in low or "unexpected" in low
         )
 
+    _open_budget = {"used": 0}
+
     def _open():
         nonlocal body, req, _reasoning_stripped, _response_format_stripped, _think_depth_stripped, _reasoning_effort_toplevel_stripped, _zai_thinking_stripped, _stream_options_stripped
-        attempt = 0
+        # AUDIT3-12: the open retries share one budget for the whole call. Each
+        # outer read/stream retry re-entered _open with a fresh counter, so the
+        # real bound was (error_retries + 1)² requests, not error_retries + 1.
+        attempt = _open_budget["used"]
         while True:
             try:
                 return urllib.request.urlopen(req, timeout=_attempt_timeout(), context=ssl_context)
@@ -3272,6 +3285,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 )
                 retry_after(msg, wait_s)
                 attempt += 1
+                _open_budget["used"] = attempt
             except _PERMANENT_TRANSPORT_ERRORS:
                 raise
             except _RETRYABLE_TRANSPORT_ERRORS as e:
@@ -3288,6 +3302,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 )
                 retry_after(msg, error_retry_wait_sec)
                 attempt += 1
+                _open_budget["used"] = attempt
 
     if not stream:
         # The whole open and read is retried, since no partial result has reached the caller yet (BUGFIX).
@@ -3332,6 +3347,10 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     # One undecodable line is logged once per call, not once per line (HARDEN-11 C).
     _bad_line_logged = False
     while True:
+        # AUDIT3-11: each attempt starts with empty metadata. A retried attempt
+        # inherited the failed one's finish_reason/usage, and the truncation
+        # check below then took a stream with no completion signal as complete.
+        meta = CompletionMeta()
         try:
             with _open() as response:
                 # HARDEN-23 A: tracks whether the stream saw its completion marker ([DONE]/done:true).
@@ -3364,7 +3383,9 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             # A chunk that is not an object at all carries no token either (HARDEN-1 A2, as on the SSE branch).
                             if not isinstance(chunk, dict):
                                 continue
-                            token = (chunk.get("message") or {}).get("content", "")
+                            # AUDIT3-10b: a non-object message (a bare string) carries no token,
+                            # never an AttributeError that kills a paid call.
+                            token = _content_of(chunk.get("message"))
                             done  = chunk.get("done", False)
                         except json.JSONDecodeError:
                             continue
@@ -3400,7 +3421,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             # which the caller then retried and re-billed.
                             first = choices[0] if choices else None
                             # A null delta is treated as empty, so it does not raise AttributeError (BUGFIX).
-                            token = (first.get("delta") or {}).get("content", "") if isinstance(first, dict) else ""
+                            token = _content_of(first.get("delta")) if isinstance(first, dict) else ""
                             done  = False
                         except (json.JSONDecodeError, KeyError):
                             continue

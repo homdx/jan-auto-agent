@@ -559,7 +559,9 @@ class SummaryMemory:
             )
             return
         try:
-            chapter_text = chapter_path.read_text(encoding="utf-8", errors="replace")
+            # AUDIT3-9: in the chapter's own codec, so a cp1251 chapter is not
+            # summarized from a run of U+FFFD.
+            chapter_text, _enc, _eol = _read_in_own_codec(chapter_path, lossy_ok=True)
         except OSError as exc:
             logger.error(
                 "SummaryMemory.update: cannot read %s: %s — skipping synopsis update.",
@@ -673,11 +675,23 @@ class SummaryMemory:
             f"{_SECTION_END.format(name=chapter_file)}"
         )
 
-        # Read existing synopsis.
+        # Read existing synopsis — in its own codec and with its own line ends
+        # (AUDIT3-9): a cp1251 synopsis read with errors="replace" and written
+        # back as UTF-8 lost every earlier chapter's text to U+FFFD, and a CRLF
+        # file came back LF.
+        encodings: "tuple[str, ...]" = ("utf-8",)
+        eol = "\n"
         try:
-            existing = self._synopsis_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            existing, encodings, eol = _read_in_own_codec(self._synopsis_path)
+        except FileNotFoundError:
             existing = ""
+        except (OSError, UnicodeError) as exc:
+            logger.error(
+                "SummaryMemory: %s cannot be read without loss (%s) — left "
+                "untouched; the section for %s is not written",
+                self._synopsis_path, exc, chapter_file,
+            )
+            return
 
         # Replace existing section if present, otherwise append.
         pattern = re.compile(
@@ -691,10 +705,21 @@ class SummaryMemory:
             separator = "\n\n" if existing.strip() else ""
             new_content = existing.rstrip() + separator + section_text + "\n"
 
+        if eol != "\n":
+            new_content = new_content.replace("\n", eol)
+        encoding = _first_codec_holding(encodings, new_content)
+        if encoding is None:
+            logger.error(
+                "SummaryMemory: the section for %s holds characters %s's own codec "
+                "(%s) cannot store — left untouched", chapter_file,
+                self._synopsis_path, encodings[0],
+            )
+            return
         try:
             self._synopsis_path.parent.mkdir(parents=True, exist_ok=True)
             # The synopsis is written atomically, so a kill mid-write cannot leave an incomplete continuity context (bugfix).
-            atomic_write_text(self._synopsis_path, new_content)
+            atomic_write_text(self._synopsis_path, new_content,
+                              **_codec_write_kwargs(encoding, eol))
             logger.info(
                 "SummaryMemory: wrote synopsis section for %s → %s",
                 chapter_file, self._synopsis_path,
@@ -703,6 +728,55 @@ class SummaryMemory:
             logger.error(
                 "SummaryMemory: cannot write %s: %s", self._synopsis_path, exc,
             )
+
+
+def _read_in_own_codec(path: Path, *, lossy_ok: bool = False):
+    """``(text with LF line ends, candidate codecs, the file's line end)``.
+
+    AUDIT3-9: the codec is the one ``/edit`` and the Coder choose from the
+    file's bytes (``tools.actions._edit_write_encodings``): UTF-8 when the
+    bytes are UTF-8 (a BOM stays a ``\\ufeff`` character, as before), else
+    the legacy codec that describes them. Strict: a byte none of them reads
+    raises ``UnicodeError`` — unless *lossy_ok*, for text that is only read,
+    never written back.
+    """
+    raw = Path(path).read_bytes()
+    try:
+        from tools.actions import _edit_write_encodings
+        encodings = tuple(_edit_write_encodings(str(path))) or ("utf-8",)
+    except Exception:  # noqa: BLE001 — no probe: UTF-8, as before
+        encodings = ("utf-8",)
+    try:
+        text = raw.decode(encodings[0])
+    except UnicodeError:
+        if not lossy_ok:
+            raise
+        text = raw.decode("utf-8", errors="replace")
+    eol = "\r\n" if "\r\n" in text else "\n"
+    return text.replace("\r\n", "\n"), encodings, eol
+
+
+def _codec_write_kwargs(encoding: str, eol: str) -> dict:
+    """``atomic_write_text`` keywords for a file in *encoding* with *eol* ends.
+
+    A plain UTF-8, LF file is written exactly as before (no keywords — the
+    platform's newline translation and all); only a legacy codec or a CRLF
+    file gets ``newline=""`` and its codec, so its bytes come back as they were.
+    """
+    if encoding == "utf-8" and eol == "\n":
+        return {}
+    return {"newline": "", "encoding": encoding}
+
+
+def _first_codec_holding(encodings, text: str):
+    """The first of *encodings* that can store *text*, or None."""
+    for encoding in encodings:
+        try:
+            text.encode(encoding)
+            return encoding
+        except (UnicodeError, LookupError):
+            continue
+    return None
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────

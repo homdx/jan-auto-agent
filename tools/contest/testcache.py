@@ -225,6 +225,26 @@ _WRAPPERS = {
     "xvfb-run": (),
 }
 
+#: AUDIT3-2: options that change which tests run or how they are judged, so two
+#: runs that differ only in them must not share a cache entry. A cache miss
+#: costs a re-run; a wrong hit serves another configuration's verdict.
+#: Long spellings of the short keyed options, folded onto the short form.
+_KEYED_LONG_ALIASES = {"--config-file": "-c", "--override-ini": "-o",
+                       "--pythonwarnings": "-W"}
+#: Long options whose value is part of the key.
+_KEYED_LONG_VALUE = frozenset({"--ignore", "--ignore-glob", "--deselect", "--rootdir",
+                               "--confcutdir", "--import-mode"})
+#: Long switches that are part of the key.
+_KEYED_LONG_FLAGS = frozenset({"--runxfail", "--strict-markers", "--strict-config",
+                               "--strict", "--pyargs", "--noconftest"})
+def _warning_filter_can_fail(value: str) -> bool:
+    """A ``-W`` filter that turns warnings into errors (``error``, ``error::X``)."""
+    return str(value).strip().lower().startswith("error")
+
+
+#: ``-p`` values that only change speed or caching, never a verdict.
+_NEUTRAL_PLUGIN_SWITCHES = frozenset({"no:cacheprovider", "no:randomly"})
+
 #: pytest options that take a separate value (so the value is not a root).
 _VALUE_OPTIONS = frozenset({
     "-k", "-m", "-n", "-p", "-W", "-c", "-o", "-r", "-C",
@@ -235,6 +255,7 @@ _VALUE_OPTIONS = frozenset({
     "--max-worker-restart", "--timeout-method", "--cov", "--cov-report",
     "--capture", "--show-capture", "--tx", "--cache-clear-dir",
     "--lfnf", "--last-failed-no-failures", "--pyargs-dir", "--log-file",
+    "--config-file", "--pythonwarnings",
     "--log-cli-level", "--assert", "--maxprocesses", "--splits", "--group",
 })
 
@@ -315,6 +336,15 @@ def _pytest_run(args: list) -> PytestRun:
                 quiet += 1
             elif name == "--exitfirst":
                 flags.add("-x")
+            elif name == "--pythonwarnings" and not _warning_filter_can_fail(value):
+                pass                          # "ignore"/"default" can never fail a test
+            elif name in _KEYED_LONG_ALIASES:
+                # AUDIT3-2: a different ini, override or warning filter is a different run.
+                flags.add(f"{_KEYED_LONG_ALIASES[name]}={value}")
+            elif name in _KEYED_LONG_VALUE:
+                flags.add(f"{name}={value}")
+            elif name in _KEYED_LONG_FLAGS:
+                flags.add(name)
             continue
         # a short-option cluster: -xvq, -n4, -k expr, -qq
         body = token[1:]
@@ -328,6 +358,10 @@ def _pytest_run(args: list) -> PytestRun:
                     value = args[i]
                     i += 1
                 if c in ("k", "m"):
+                    flags.add(f"-{c}={value}")
+                elif c in ("c", "o") or (c == "W" and _warning_filter_can_fail(value)) \
+                        or (c == "p" and value not in _NEUTRAL_PLUGIN_SWITCHES):
+                    # AUDIT3-2: these change what pytest runs or how it judges it.
                     flags.add(f"-{c}={value}")
                 break                       # the rest of the cluster is the value
             if c == "x":

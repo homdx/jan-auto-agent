@@ -1067,6 +1067,28 @@ _SECRET_OPT_RE = re.compile(
     + _SECRET_VALUE_RE
 )
 
+# AUDIT3-C14 (#51): any long option whose NAME is a credential, value after a space —
+# `--auth-token V`, `--access-token V`, `--github-token V`, `--db-password V`,
+# `gpg --passphrase V`. The fixed list above names eleven options; the `=` form is
+# already read by name. A switch (`--no-token-check`) and a value that is another
+# flag are left alone.
+_SECRET_LONG_SPACE_RE = re.compile(
+    r"(?<![^\s\"'])(--([A-Za-z][A-Za-z0-9_-]*))([^\S\n]+)(?![-<>|&;])" + _SECRET_VALUE_RE
+)
+_SWITCH_PREFIXES = ("no-", "skip-", "disable-", "enable-", "with-", "without-", "allow-")
+
+
+def _option_names_a_credential(name: str) -> bool:
+    low = name.lower()
+    if low.startswith(_SWITCH_PREFIXES):
+        return False
+    if low.endswith(("-stdin", "-file", "-path", "-env", "-dir", "_file", "_path")):
+        return False    # `--password-stdin`, `--token-file p`: no secret on the line
+    if "passphrase" in low:
+        return True
+    return not _name_is_not_a_credential(low.replace("-", "_").upper())
+
+
 # Authorization values are two words (Bearer token); matched up to the next quote or flag so the token is hidden too.
 # Run before `_SECRET_HEADER_RE`: that one takes a single token, which would have left the token behind the `Bearer`.
 _SECRET_AUTH_RE = re.compile(
@@ -1337,6 +1359,10 @@ def _redact_command(command: str) -> str:
     try:
         redacted = _SECRET_OPT_RE.sub(
             lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]" if m.group(3) else m.group(0), command)
+        redacted = _SECRET_LONG_SPACE_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(3)}[REDACTED]"
+            if m.group(4) and "[REDACTED]" not in m.group(4)
+            and _option_names_a_credential(m.group(2)) else m.group(0), redacted)
         redacted = _SECRET_AUTH_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted)
         redacted = _SECRET_HEADER_RE.sub(
             lambda m: m.group(0) if _name_is_not_a_credential(m.group(1))

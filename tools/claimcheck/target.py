@@ -590,6 +590,25 @@ class Target:
         deep files. `[collect] max_depth` is the collect stage's own key (HARDEN-24 B) and
         wins; `[architect]` and `[search]` are the values it used to borrow.
         """
+        # AUDIT3-C11: a `[collect] max_depth` the walk rejects (0, -1, junk) is
+        # read the walk's way. It used to read here as "0 = unbounded, no
+        # warning" while the walk fell back to its default depth, so every
+        # deeper file left the model without a word.
+        try:
+            own = config.get("collect", "max_depth", fallback=None)
+        except (configparser.Error, AttributeError, TypeError, ValueError):
+            own = None
+        if own is not None:
+            try:
+                valid = int(str(own).strip()) > 0
+            except ValueError:
+                valid = False
+            if not valid:
+                try:
+                    from tools.collect.scanner import collect_walk_limits
+                    return collect_walk_limits(config)[0]
+                except Exception:  # noqa: BLE001 — the warning is a nice-to-have
+                    return _COLLECT_DEFAULT_MAX_DEPTH
         try:
             raw = (config.get("collect", "max_depth", fallback=None)
                    or config.get("architect", "max_depth", fallback=None)
