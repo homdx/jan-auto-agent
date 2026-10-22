@@ -277,7 +277,8 @@ def test_corrections_as_a_story_word_is_kept_and_as_a_label_is_stripped():
     from tools.auto.summary_memory import _strip_meta_parentheticals as strip
     fact = "Bob met Ann (her brother, a corrections officer)"
     assert strip(fact) == fact
-    kept = "The fix arrived (the correction was signed by the mayor)"
-    assert strip(kept) == kept
+    # CC review fixes 50: the singular is the model's note to itself again, as it
+    # was before AUDIT-23 ("(correction needed)", "(needs correction)").
+    assert strip("Ann is 30 (correction needed)") == "Ann is 30"
     assert strip("Ann is 30 (correction: she is 31)") == "Ann is 30"
     assert strip("Ann is 30 (this is incorrect)") == "Ann is 30"

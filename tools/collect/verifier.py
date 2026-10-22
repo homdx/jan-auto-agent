@@ -171,15 +171,35 @@ def _site_key(location) -> "tuple[str, int] | None":
     return m.group(1).replace("\\", "/"), int(m.group(2))
 
 
-def _same_access_sites(module, cited: str, location) -> list:
+def _claim_site_key(claim) -> "tuple[str, int] | None":
+    """The ``(path, line)`` an access claim is about, or None.
+
+    CC review fixes 50: `extract_claims` gives a claim ONE citation — its
+    location, its symbol or its access — so an access claim never carries the
+    line its sentence names, and the AUDIT3-3 narrowing never ran outside its
+    own tests. The line is read from the sentence then: the one ``path:line``
+    it cites in the claim's own module (two different ones name no single line).
+    """
+    key = _site_key(claim.location)
+    if key is not None:
+        return key
+    module = (claim.module or "").replace("\\", "/")
+    found = {(path.replace("\\", "/"), int(line))
+             for path, line in _LOCATION_RE.findall(claim.text or "")}
+    found = {k for k in found if k[0] == module}
+    return found.pop() if len(found) == 1 else None
+
+
+def _same_access_sites(module, cited: str, key) -> list:
     """The module's recorded accesses with the cited text, narrowed to the
-    claim's own line when the claim names one that parses (AUDIT3-3)."""
+    claim's own line *key* when one of them is on it (AUDIT3-3). A line with
+    no such access is the model's slip, not a site: every site is judged then,
+    as before AUDIT3-3 (CC review fixes 50)."""
     sites = [ga for ga in module.guarded_accesses
              if _normalize_access(ga.access) == cited]
-    key = _site_key(location)
     if key is None:
         return sites
-    return [ga for ga in sites if _site_key(ga.location) == key]
+    return [ga for ga in sites if _site_key(ga.location) == key] or sites
 
 
 def _normalize_access(access: str) -> str:
@@ -624,10 +644,11 @@ def contradiction_check(
         # the same text GUARDED elsewhere in the module says nothing about it.
         # A claim with no usable location keeps the COLLECT-17 rule: any
         # GUARDED occurrence contradicts it.
-        same = _same_access_sites(module, cited, claim.location)
+        key = _claim_site_key(claim)
+        same = _same_access_sites(module, cited, key)
+        on_line = key is not None and any(_site_key(ga.location) == key for ga in same)
         guarded = [ga for ga in same if ga.status == "GUARDED"]
-        if guarded and (_site_key(claim.location) is None
-                        or all(ga.status == "GUARDED" for ga in same)):
+        if guarded and (not on_line or len(guarded) == len(same)):
             ga = guarded[0]
             guard_desc = ga.guard or "guarded"
             return (
@@ -638,7 +659,7 @@ def contradiction_check(
     if claim.kind == "access_safe" and claim.access:
         # A safe-access claim is checked against UNGUARDED, the mirror of the crash check (COLLECT-17).
         cited = _normalize_access(claim.access)
-        for ga in _same_access_sites(module, cited, claim.location):
+        for ga in _same_access_sites(module, cited, _claim_site_key(claim)):
             if ga.status == "UNGUARDED":
                 return (
                     REASON_CONTRADICTS_CRASH,

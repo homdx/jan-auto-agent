@@ -1090,7 +1090,11 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"BUT|HOWEVER|EXCEPT|ALTHOUGH|THOUGH|YET(?!\.?\s+ANOTHER\b)|ONLY|"
         # AUDIT3-C13 (#50): the other ways a clause names its exception, and a
         # request to change something right after the approval.
-        r"BESIDES|BEYOND|BARRING|SAVE(?:\s+FOR)?|BAR|UNLESS|"
+        # CC review fixes 50: each in its exception sense only — "Save the
+        # file", "Bar none the best chapter", "Beyond that, great work" and
+        # "Besides, it reads well" are not exceptions, and rejected an approval.
+        r"BESIDES(?![^\S\n]*,)|BEYOND(?!\s+(?:THAT|THIS)\b)|BARRING|SAVE\s+FOR|"
+        r"BAR(?!\s+NONE\b)|UNLESS|"
         r"WITH\s+THE\s+EXCEPTION\s+OF|"
         r"PLEASE\s+(?:FIX|CHANGE|CORRECT|UPDATE|REVISE|ADD|REMOVE|ADDRESS|RENAME|REWRITE))\b"
     )

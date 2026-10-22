@@ -180,11 +180,14 @@ _META_PAREN_MARKERS = (
 _META_MARKER_WORD_FORMS: dict[str, tuple[str, ...]] = {
     "bullet":    ("bullet", "bullets"),
     "remove":    ("remove", "removes", "removed"),
-    # "correction(s)" is not here (AUDIT-23): "(her brother, a corrections
-    # officer)" is a story fact. As commentary it is "(correction: …)", matched
-    # as a phrase below.
+    # "corrections" is not here (AUDIT-23): "(her brother, a corrections
+    # officer)", "(the department of corrections)" are story facts. As
+    # commentary it is "(corrections: …)", matched as a phrase below. The
+    # singular stays (CC review fixes 50): "(correction needed)", "(needs
+    # correction)", "(minor correction)" are the model's notes to itself, and
+    # with the word gone they went into synopsis.md.
     "correct":   ("correct", "corrects", "corrected", "correcting", "correctly",
-                  "incorrect", "incorrectly"),
+                  "correction", "incorrect", "incorrectly"),
     "original":  ("original", "originals", "originally", "unoriginal"),
     "accurate":  ("accurate", "accurately", "inaccurate", "inaccurately"),
     "partially": ("partially",),
@@ -746,6 +749,17 @@ def _read_in_own_codec(path: Path, *, lossy_ok: bool = False):
         encodings = tuple(_edit_write_encodings(str(path))) or ("utf-8",)
     except Exception:  # noqa: BLE001 — no probe: UTF-8, as before
         encodings = ("utf-8",)
+    if encodings[0] != "utf-8" and _mostly_utf8(raw):
+        # CC review fixes 50: UTF-8 with a broken byte or two is UTF-8. Read as
+        # the legacy codec the probe falls back to, its Cyrillic was mojibake no
+        # legacy codec of the list could take a new section in — and the
+        # synopsis was never updated again. Lossy for those bytes only, as
+        # every read was before AUDIT3-9.
+        logger.warning("%s is UTF-8 with %d undecodable byte(s) — read as UTF-8, "
+                       "they become U+FFFD", path, raw.decode("utf-8", "replace").count("\ufffd"))
+        text = raw.decode("utf-8", errors="replace")
+        eol = "\r\n" if "\r\n" in text else "\n"
+        return text.replace("\r\n", "\n"), ("utf-8",), eol
     try:
         text = raw.decode(encodings[0])
     except UnicodeError:
@@ -754,6 +768,20 @@ def _read_in_own_codec(path: Path, *, lossy_ok: bool = False):
         text = raw.decode("utf-8", errors="replace")
     eol = "\r\n" if "\r\n" in text else "\n"
     return text.replace("\r\n", "\n"), encodings, eol
+
+
+def _mostly_utf8(raw: bytes) -> bool:
+    """True when *raw* is UTF-8 text with a few undecodable bytes (CC review fixes 50).
+
+    Valid multi-byte characters must be at least twice the broken bytes: a
+    cp1251 or cp1252 file decoded as UTF-8 breaks on nearly every non-ASCII
+    letter and makes a valid sequence only by accident (a capital letter before
+    "ё" or "»"), so it stays with its own codec.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    broken = text.count("\ufffd") - raw.count("\ufffd".encode("utf-8"))
+    valid = sum(1 for ch in text if ord(ch) > 127 and ch != "\ufffd")
+    return broken > 0 and valid >= 2 * broken
 
 
 def _codec_write_kwargs(encoding: str, eol: str) -> dict:
