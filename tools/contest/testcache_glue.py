@@ -19,7 +19,6 @@ import json
 import logging
 import re
 import time
-from pathlib import Path
 from typing import Callable, Optional
 
 from tools.contest import testcache

@@ -233,7 +233,7 @@ _VALUE_OPTIONS = frozenset({
     "--junitxml", "--junit-xml", "--dist", "--basetemp", "--import-mode",
     "--log-level", "--confcutdir", "--override-ini", "--numprocesses",
     "--max-worker-restart", "--timeout-method", "--cov", "--cov-report",
-    "--capture", "--show-capture", "--durations-min", "--tx", "--cache-clear-dir",
+    "--capture", "--show-capture", "--tx", "--cache-clear-dir",
     "--lfnf", "--last-failed-no-failures", "--pyargs-dir", "--log-file",
     "--log-cli-level", "--assert", "--maxprocesses", "--splits", "--group",
 })

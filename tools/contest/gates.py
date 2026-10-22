@@ -76,7 +76,14 @@ def git(cwd, *args, check=False):
     `judge_worktree` is written on it.
     """
     # core.quotepath=false keeps non-ASCII paths readable, so they match a test root and git show works.
-    r = run_git(["git", "-c", "core.quotepath=false", *args], cwd=cwd, errors="replace")
+    try:
+        r = run_git(["git", "-c", "core.quotepath=false", *args], cwd=cwd, errors="replace")
+    except OSError as exc:
+        # MIMO-5: no git binary / an unusable cwd raised past the documented ""
+        # contract (run_git never swallows OSError) and crashed the harvest.
+        if check:
+            raise RuntimeError(f"git {' '.join(args)} in {cwd}: {exc}") from exc
+        return ""
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} in {cwd}: {r.stderr.strip()}")
     return r.stdout.strip()
@@ -497,7 +504,10 @@ def judge_worktree(name, path, base, declared, want_tests):
     with only `gate`/`notes` — the caller must not index `commits` then.
     """
     row = {"agent": name, "path": path}
-    if not os.path.isdir(os.path.join(path, ".git")) and not os.path.exists(os.path.join(path, ".git")):
+    # MIMO-3: a `.git` entry is not proof — an empty `.git` file scored as a
+    # plausible "0 commits" row with every git call silently answering "".
+    if (not os.path.exists(os.path.join(path, ".git"))
+            or git(path, "rev-parse", "--is-inside-work-tree") != "true"):
         row["gate"] = "FAIL"
         row["notes"] = "not a git worktree"
         return row

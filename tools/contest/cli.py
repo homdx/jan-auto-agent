@@ -129,7 +129,6 @@ from tools.contest.variant import (
 from tools.contest.think_probe import (
     PROBE_CACHE_FILE,
     load_probe_cache,
-    probe_model,
     save_probe_cache,
 )
 from tools.contest.workspace import LegCarry, WorkspaceError, agent_tmp_dir, prepare_round

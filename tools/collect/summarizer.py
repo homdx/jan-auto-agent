@@ -384,18 +384,18 @@ def summarize_repo(
         last_error = ""
         try:
             result = retry_with_backoff(
-                lambda: summarize_module(
+                lambda module=module, source=source: summarize_module(
                     module, source, llm_call,
                     num_ctx=num_ctx, max_tokens=max_tokens,
                 ),
                 attempts=max_retries + 1,
                 sleep_fn=sleep_fn,
-                on_retry=lambda exc, n, wait: logger.warning(
+                on_retry=lambda exc, n, wait, _path=module.path: logger.warning(
                     "collect summarizer: %s failed (%s); retrying in %ds",
-                    module.path, exc, wait,
+                    _path, exc, wait,
                 ),
-                on_error=lambda exc, count: (
-                    on_error(module.path, exc, count) if on_error is not None else None
+                on_error=lambda exc, count, _path=module.path: (
+                    on_error(_path, exc, count) if on_error is not None else None
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — one bad module must not abort the batch

@@ -30,7 +30,6 @@ from typing import Callable, Optional
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO
 from tools.auto.git_manager import make_git_manager, DirtyTreeError, GitError, GitManager
 from tools.auto.commit_on_success import (
-    COMMIT_GIT_ERROR,
     COMMIT_NOTHING_TO_COMMIT,
     COMMIT_OK,
     CommitResult,

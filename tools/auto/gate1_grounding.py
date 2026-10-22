@@ -517,7 +517,7 @@ def _path_parts(p: object) -> list[str]:
     segments handles absolute, relative and plain-string inputs alike.
     """
     try:
-        return list(p.parts)  # type: ignore[union-attr]
+        return list(p.parts)  # type: ignore[union-attr,attr-defined]
     except AttributeError:
         return str(p).replace(os.sep, "/").split("/")
 

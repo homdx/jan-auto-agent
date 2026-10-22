@@ -195,8 +195,18 @@ def main(argv=None) -> int:
         git("switch", "-c", branch, args.base, cwd=repo)
         print(f"switched to a new branch {branch} at {args.base}")
         args.status = "open"
-        text = path.read_text()
+        # MIMO-2: the ticket is re-read at the new branch's base, where it may be
+        # missing or have no **Status:** line — say so instead of an AttributeError
+        # / FileNotFoundError after the branch switch already happened.
+        try:
+            text = path.read_text()
+        except OSError as err:
+            raise SystemExit(f"switched to {branch}, but {path} is not readable at "
+                             f"{args.base}: {err}") from None
         match = STATUS_RE.search(text)
+        if not match:
+            raise SystemExit(f"switched to {branch}, but {path} has no **Status:** "
+                             f"line at {args.base}")
 
     if args.status == "landed" and not args.sha:
         parser.error("landed needs --sha")

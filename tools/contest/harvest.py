@@ -203,6 +203,35 @@ def _resolve_claim(path: Path, claimed: str) -> str | None:
     return git(str(path), "rev-parse", "--verify", "--quiet", f"{claimed}^{{commit}}") or None
 
 
+def _unquote_git_path(text: str) -> str:
+    """A path as ``git status --porcelain`` printed it, with git's C quoting
+    undone (MIMO-4): ``"runs/ag\\303\\253nt/x"`` is ``runs/agënt/x``. Stripping the
+    quotes alone left the octal escapes, so the ground filter missed a
+    non-ASCII agent directory and named the runner's own file."""
+    text = text.strip()
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    body, out, i = text[1:-1], bytearray(), 0
+    simple = {"n": 10, "t": 9, "r": 13, "a": 7, "b": 8, "f": 12, "v": 11,
+              '"': 34, "\\": 92}
+    while i < len(body):
+        ch = body[i]
+        if ch == "\\" and i + 1 < len(body):
+            nxt = body[i + 1]
+            if nxt in "01234567" and i + 3 < len(body) and all(
+                    c in "01234567" for c in body[i + 1:i + 4]):
+                out.append(int(body[i + 1:i + 4], 8) & 0xFF)
+                i += 4
+                continue
+            if nxt in simple:
+                out.append(simple[nxt])
+                i += 2
+                continue
+        out.extend(ch.encode("utf-8"))
+        i += 1
+    return out.decode("utf-8", "replace")
+
+
 def _status_lines(ws: Workspace) -> list[str]:
     """The worktree's `git status --porcelain` lines: what the tree holds that
     the commit does not.
@@ -231,7 +260,7 @@ def _status_lines(ws: Workspace) -> list[str]:
     for line in r.stdout.splitlines():
         if not line.strip():
             continue
-        name = line[3:].rsplit(" -> ", 1)[-1].strip('"')
+        name = _unquote_git_path(line[3:].rsplit(" -> ", 1)[-1])
         if (name + "/").startswith(ground):
             continue
         lines.append(line)

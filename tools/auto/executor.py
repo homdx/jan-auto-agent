@@ -710,7 +710,7 @@ class Executor:
                     import re as _re_local
                     rewritten = _re_local.sub(
                         r"(?<!\S)" + _re_local.escape(basename) + r"(?!\S)",
-                        lambda _m: full_path,
+                        lambda _m, _p=full_path: _p,
                         command,
                         count=1,
                     )

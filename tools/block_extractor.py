@@ -1264,7 +1264,7 @@ def _arrow_params_are_annotated(source: str, open_paren: int) -> bool:
     return any(re.match(r"\s*[A-Za-z_$][\w$]*\s*\??\s*:", part) for part in parts)
 
 
-def _property_arrow_tail(source: str, match: "re.Match[str]") -> "tuple[int, bool] | None":
+def _property_arrow_tail(source: str, match: "re.Match[str]") -> "tuple[int | None, bool]":
     """`(index just past the head's `=>`, whether the head declared a return type)` for a
     property-arrow head *match*, or ``(None, False)`` when the shape is not a function.
 

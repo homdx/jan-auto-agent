@@ -31,7 +31,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tools.contest.runner import AgentState
 
 __all__ = [
     "ENTRANTS_FILE",

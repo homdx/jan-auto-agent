@@ -763,8 +763,8 @@ def issue_land(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> in
         note = landed_note(nn, record, score, follow_up)
         try:
             new_text = tickets.set_status_text(text, f"{LANDED_WORD} {note}")
-        except ValueError:
-            raise MergeError(f"{ticket_rel} has no **Status:** line to land")
+        except ValueError as err:
+            raise MergeError(f"{ticket_rel} has no **Status:** line to land") from err
         word = _landed_word_of(new_text)
         index_path = repo / INDEX_FILE
         new_rows = update_index_row(read_utf8(index_path), nn, word) if index_path.is_file() else None

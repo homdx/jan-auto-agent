@@ -207,7 +207,7 @@ class _Lock:
                     self._break(seen)
                     continue
                 if time.monotonic() > deadline:
-                    raise TargetError(f"lock {self.path}: held for more than {int(self.wait)} s")
+                    raise TargetError(f"lock {self.path}: held for more than {int(self.wait)} s") from None
                 time.sleep(0.05)
                 continue
             except OSError as err:

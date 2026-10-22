@@ -325,6 +325,10 @@ def _decode(raw: bytes | None):
         return text
 
 
+_ADDR_IN_USE_RE = re.compile(r"EADDRINUSE|address already in use|port \d+ is (?:already )?in use",
+                             re.IGNORECASE)
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -467,9 +471,33 @@ class KiloServer:
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
+    #: MIMO-1: how many fresh ports `spawn` tries when the child lost its port.
+    PORT_ATTEMPTS = 3
+
     @classmethod
     def spawn(cls, binary: str, *, log_path: str, hostname: str = "127.0.0.1",
               health_timeout: float = 30.0, env: dict | None = None) -> "KiloServer":
+        """Start ``kilo serve`` on a free port; see :meth:`_spawn_once`.
+
+        MIMO-1: the free port is found by binding port 0 and closing the socket,
+        and ``kilo serve`` binds it later — another process can take it in
+        between. A child that exits early with an address-in-use error in its
+        log is retried on a fresh port, up to :attr:`PORT_ATTEMPTS` times; any
+        other failure is raised at once, exactly as before.
+        """
+        for attempt in range(cls.PORT_ATTEMPTS):
+            try:
+                return cls._spawn_once(binary, log_path=log_path, hostname=hostname,
+                                       health_timeout=health_timeout, env=env)
+            except KiloServerError as err:
+                if (attempt + 1 >= cls.PORT_ATTEMPTS
+                        or not _ADDR_IN_USE_RE.search(getattr(err, "log_tail", "") or "")):
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    @classmethod
+    def _spawn_once(cls, binary: str, *, log_path: str, hostname: str = "127.0.0.1",
+                    health_timeout: float = 30.0, env: dict | None = None) -> "KiloServer":
         """Start ``kilo serve`` on a free port and wait until it is healthy.
 
         ``env`` (KC-35) is added on top of this process's own environment for the
