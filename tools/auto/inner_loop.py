@@ -851,6 +851,40 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     """
     import re as _re
 
+    # REP-VERDICT B: a verdict word the model wrapped in markdown or put behind a label —
+    # "**REVISE**: …", "- REVISE: …", "1. REVISE", "[REVISE] …", "> REVISE", "`REVISE`",
+    # "Verdict: REVISE", "**Verdict:** REJECT — …", "Answer: NO" — matched no token, was
+    # unparseable, and the continuity, fact, theme and architect validators (no re-ask)
+    # approved the chapter on fail-open. Such a line is read without its wrapper; a line
+    # whose unwrapped text does not open with a verdict word keeps its own text.
+    _DECOR_LEAD = _re.compile(r"^(?:\s*(?:#{1,6}\s+|>\s*|[-+•]\s+|\*\s+|\d{1,2}[.)]\s+))+")
+    _DECOR_WRAP = _re.compile(r"^(\*\*|__|\*|_|`|\[|\()\s*")
+    _DECOR_LABEL = _re.compile(
+        r"^(?:FINAL\s+)?(?:VERDICT|DECISION|ANSWER|RESULT|STATUS|CONCLUSION)\s*:\s*", _re.I)
+    _DECOR_VERDICT_WORD = _re.compile(
+        r"^(?:APPROVED|OK|REVISE|REJECT(?:ED)?|NO|NOT|NOPE|NEEDS?)\b", _re.I)
+
+    def _undecorate(line: str) -> str:
+        s = line.strip()
+        for _ in range(4):
+            prev = s
+            s = _DECOR_LEAD.sub("", s)
+            w = _DECOR_WRAP.match(s)
+            if w:
+                closer = {"[": "]", "(": ")"}.get(w.group(1), w.group(1))
+                s = s[w.end():]
+                at = s.find(closer)
+                if 0 < at <= 40:
+                    s = s[:at] + s[at + len(closer):]
+            s = _DECOR_LABEL.sub("", s).strip()
+            if s == prev:
+                break
+        if s != line.strip() and _DECOR_VERDICT_WORD.match(s):
+            return s
+        return line
+
+    text = "\n".join(_undecorate(ln) for ln in (text or "").splitlines())
+
     def _normalise(s: str) -> str:
         """Lowercase, collapse whitespace, strip surrounding punctuation."""
         s = s.lower().strip()
@@ -1627,6 +1661,64 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
                 denied = True
         return (True, "") if denied else None
 
+    #: REP-VERDICT A: what can follow the APPROVED / OK token and take the approval back.
+    _EN_APPROVED_TOKEN = _re.compile(r"^(?:APPROVED|OK\b)")
+    _EN_APPROVED_NEGATED = _re.compile(r"^[^\S\n]*[:=\-–—]?[^\S\n]*(NO|NOT|NOPE|FALSE|N)\b")
+    _EN_APPROVED_CONDITION = _re.compile(
+        r"^[^\S\n]*[,;:.—–-]?[^\S\n]*(?:IF|ONCE|PROVIDED|UNLESS|PENDING|CONDITIONAL(?:LY)?|"
+        r"ON\s+CONDITION)\b")
+    _EN_TAKE_BACK = _re.compile(r"^(?:ACTUALLY|ON\s+SECOND\s+THOUGHT|WAIT)\b[\s,:;—–-]*(?:NO|NOT)\b")
+
+    def _en_approved_token_verdict(line: str, upper: str) -> "tuple[bool, str] | None":
+        """The verdict of a reply that opens with ``APPROVED`` / ``OK``, else ``None``.
+
+        REP-VERDICT A: the token approved at once and nothing after it was read, so
+        "Approved: No", "approved = false", "APPROVED if the date is fixed",
+        "APPROVED. Actually no, …" and an APPROVED line followed by a ``REVISE: …`` line
+        (VD-3) were clean approvals with no re-ask, and the revision request was lost. A
+        negation right after the token, a condition, or a later sentence or line that opens
+        with a rejection directive takes the approval back, with the reply's words as the
+        reason. "Approved - no issues found", "APPROVED: not a problem", "APPROVED. Save the
+        file." and "APPROVED. Fix nothing." keep the approval.
+        """
+        m = _EN_APPROVED_TOKEN.match(upper)
+        if m is None:
+            return None
+        s = line.strip()
+        rest_upper = upper[m.end():]
+        neg = _EN_APPROVED_NEGATED.match(rest_upper)
+        if neg is not None:
+            word = neg.group(1)
+            r_up = rest_upper[neg.start(1):].strip()
+            r_line = s[m.end() + neg.start(1):].strip()
+            after = r_line[len(word):].lstrip(" \t:;,.!?–—-").strip()
+            reject = False
+            if word in ("FALSE", "NOPE", "N"):
+                reject = True
+            elif word == "NO":
+                if _re.match(r"NO\s+\w", r_up):
+                    # "Approved - no issues found": the No <problem> approval, unless it turns.
+                    if not _EN_NOTHING_NEEDED.match(r_up):
+                        v = _en_no_problem_verdict(r_line, r_up)
+                        if v is not None and not v[0]:
+                            return False, v[1]
+                else:
+                    reject = True
+            elif _en_not_family_reason(r_line, r_up) is not None:
+                reject = True
+            if reject:
+                return False, after or s
+        cond = _EN_APPROVED_CONDITION.match(rest_upper)
+        if cond is not None:
+            return False, s[m.end():].lstrip(" \t:;,.!?–—-").strip() or s
+        for sent in _sentences_after(s, m.end(), text):
+            reason = _directive_reason(sent)
+            if reason is not None:
+                return False, reason
+            if _EN_TAKE_BACK.match(sent.strip().upper()):
+                return False, sent.strip()
+        return True, ""
+
     # ── Scan: first try the first non-empty line; fall back to whole text ──
     candidates: list[str] = []
     first_line: str | None = None
@@ -1664,8 +1756,9 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             return False, _q_rejection, False
 
         # ── English APPROVED ──────────────────────────────────────────────
-        if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
-            return True, "", False
+        _approved = _en_approved_token_verdict(raw, upper)
+        if _approved is not None:
+            return _approved[0], _approved[1], False
 
         # A casual "No, it's perfect" is an approval (`_en_no_problem_verdict`); a "No" that names a real problem still rejects (AUTO-BUG).
 
@@ -1706,8 +1799,9 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             _line_q_rejection = _en_approval_question_rejection(_line, _lu)
             if _line_q_rejection is not None:
                 return False, _line_q_rejection, False
-            if _lu.startswith("APPROVED") or _re.match(r"^OK\b", _lu):
-                return True, "", False
+            _line_approved = _en_approved_token_verdict(_line, _lu)
+            if _line_approved is not None:
+                return _line_approved[0], _line_approved[1], False
             if _EN_NOTHING_NEEDED.match(_lu):
                 return True, "", False
             _line_no_problem = _en_no_problem_verdict(_line, _lu)
