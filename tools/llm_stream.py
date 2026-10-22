@@ -2497,9 +2497,13 @@ def _parse_retry_after(e: urllib.error.HTTPError, detail: str) -> "float | None"
         retry_after = e.headers.get("Retry-After")
         if retry_after:
             try:
-                return max(0.1, float(retry_after))
+                wait = float(retry_after)
             except ValueError:
-                pass
+                wait = None
+            # REP-RETRY-INF: "inf", "1e400" and "nan" are no wait the server can mean; "inf"
+            # was refused by the cap and reported as a daily quota reset.
+            if wait is not None and wait == wait and wait != float("inf"):
+                return max(0.1, wait)
     return _retry_hint_from_text(detail)
 
 

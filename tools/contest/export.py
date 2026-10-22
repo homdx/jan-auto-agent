@@ -390,7 +390,8 @@ def _cell(value) -> str:
         text = f"{value:g}"
     else:
         text = str(value)
-    return text.replace("|", "\\|").replace("\n", " ")
+    # REP-CELL-CR: a CRLF value kept its "\r", and a bare CR splits the markdown row.
+    return re.sub(r"[^\S\r\n]*[\r\n]+[^\S\r\n]*", " ", text).replace("|", "\\|")
 
 
 def _number(value) -> int:

@@ -89,7 +89,14 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     cleaned_raw = raw.strip()
     
     # 1. File path. A dotted symbol (MyClass.foo) can look like a file; prefer candidates marked with "in ".
-    file_matches = list(re.finditer(r'(?:^|\s)(in\s+)?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)\b', cleaned_raw))
+    # REP-PROMPT-PATH: a path in quotes or backticks ("in `a.py`", "in 'my file.py'") is the
+    # whole quoted span, and "~/proj/a.py" / "C:\\proj\\a.py" are paths too — the backtick broke
+    # the `(?:^|\s)` anchor, "~" and the drive colon were outside the class, and the prompt
+    # fell to a chat answer with the file never read, or to the wrong "file.py".
+    file_matches = list(re.finditer(r'(?:^|\s)(in\s+)?[`\'"]([^`\'"\n]+\.[A-Za-z0-9]+)[`\'"]', cleaned_raw))
+    file_matches += list(re.finditer(
+        r'(?:^|\s)(in\s+)?((?:~|[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)\b', cleaned_raw))
+    file_matches.sort(key=lambda m: m.start())
     if not file_matches:
         return None
 
@@ -129,12 +136,15 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
             clean_rem = re.sub(r'\b(' + _CANDIDATE_STOPWORDS + r')\b', ' ', remainder, flags=re.IGNORECASE).strip()
             if not source:
                 clean_rem = _PROSE_WORD_RE.sub(' ', clean_rem).strip()   # no source to check a word against
-            words = clean_rem.split()
-            valid_identifiers = [w for w in words if re.match(r'^[A-Za-z_][\w]*$', w)]
+            words = [w.strip("`'\"") for w in clean_rem.split()]
+            # REP-PROMPT-DOTTED: "Loader.load" is a target too, each part checked in the source;
+            # it used to be dropped, and "show Loader.load in a.py" showed the file's imports.
+            valid_identifiers = [w for w in words if re.match(r'^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$', w)]
             for candidate in valid_identifiers:
                 # Accept only when the symbol is actually defined or referenced in source.
-                if source and not re.search(
-                    r'\b' + re.escape(candidate) + r'\b', source
+                if source and not all(
+                    re.search(r'\b' + re.escape(part) + r'\b', source)
+                    for part in candidate.split(".")
                 ):
                     continue
                 target_name = candidate

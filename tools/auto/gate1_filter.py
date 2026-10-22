@@ -1925,6 +1925,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             try:
                 data = json.loads(stripped, strict=False)
             except json.JSONDecodeError:
+                data = _first_json_object(text)
+            if data is None:
                 reason = f"JSON decode failed ({exc}) — failing closed"
                 logger.warning(
                     "Gate1._parse_presence_response [%s]: %s  raw=%.200s",
@@ -1934,9 +1936,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             else:
                 logger.info(
                     "Gate1._parse_presence_response [%s]: strict JSON "
-                    "decode failed (%s) but recovered with strict=False "
-                    "(literal control character inside a string value, "
-                    "e.g. an unescaped newline) — treating as parsed.",
+                    "decode failed (%s) but recovered (strict=False for a "
+                    "literal control character, or the first JSON object "
+                    "behind a fence or prose) — treating as parsed.",
                     candidate_title, exc,
                 )
 
@@ -1957,7 +1959,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # A verdict is a word: a list or a number is no verdict in any spelling (`["confirmed"]` is not a
         # confirmation), so it is the unparseable reply and is asked again, never read as a yes.
         raw_verdict = data.get("verdict")
-        verdict  = raw_verdict.strip().lower() if isinstance(raw_verdict, str) else ""
+        verdict  = raw_verdict.strip().strip(".!\"'").strip().lower() if isinstance(raw_verdict, str) else ""
         reason   = reply_text(data.get("reason"))
         evidence = reply_text(data.get("evidence"))
 
@@ -1980,6 +1982,29 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         msg = f"unrecognised verdict {verdict!r} — failing closed"
         logger.warning("Gate1._parse_presence_response [%s]: %s", candidate_title, msg)
         return False, msg, True
+
+
+def _first_json_object(text: str):
+    """The first JSON object in *text*, or ``None``.
+
+    REP-GATE1-JSON: a valid verdict on a one-line fence ("```json {…}```"), behind "Here is
+    my verdict:" or followed by an explanation was a decode failure, re-asked up to the
+    ladder's end and left "unknown". Every ``{`` is tried in turn with ``raw_decode``, so prose
+    around the object is ignored; only a dict counts.
+    """
+    decoder = json.JSONDecoder(strict=False)
+    start = text.find("{")
+    tries = 0
+    while start != -1 and tries < 32:   # a bound: a reply full of braces is not re-parsed n² times
+        tries += 1
+        try:
+            obj, _end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict):
+            return obj
+        start = text.find("{", start + 1)
+    return None
 
 
 # Convenience factory (as in architect.review_clusters)

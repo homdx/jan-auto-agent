@@ -229,7 +229,10 @@ def find_previous_chapter_text(chapter_file: str, base_dir: "str | Path") -> str
     * no earlier chapter file is found, or
     * the chosen file can't be read.
     """
-    base = Path(base_dir)
+    # REP-CHAPTER-DIR: the previous chapter lives next to this one — "chapters/chapter_03.md"
+    # checked from the project root scanned the root only, found nothing, and the gate judged
+    # the chapter against the bible alone while the Coder had been shown chapter 2.
+    base = Path(base_dir) / Path(chapter_file).parent
     idx = _chapter_index(chapter_file)
     if idx is None:
         return ""

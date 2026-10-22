@@ -121,7 +121,9 @@ def _chunk_paragraphs(text: str, max_chars: int) -> list[str]:
     *max_chars*.  A single paragraph that exceeds *max_chars* is kept as its
     own chunk (we never split mid-paragraph).
     """
-    paragraphs = re.split(r"\n{2,}", text.strip())
+    # REP-CHUNK-BLANK: a blank line holding spaces is a paragraph break too; "\n   \n" kept
+    # a whole chapter in one paragraph and sent it to the model in one oversized call.
+    paragraphs = re.split(r"\n[^\S\n]*\n\s*", text.strip())
     chunks: list[str] = []
     current: list[str] = []
     current_len = 0

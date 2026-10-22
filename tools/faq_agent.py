@@ -169,6 +169,16 @@ def make_kw_pattern(kw: str) -> "re.Pattern[str]":
     return re.compile(r"\b" + escaped + r"\b")
 
 
+def _normalise_extensions(raw) -> list[str]:
+    """Each configured extension as ``.ext`` in lower case: "md", "*.md", ".MD" are all ".md"."""
+    out: list[str] = []
+    for e in raw:
+        e = str(e).strip().lower().lstrip("*").lstrip(".")
+        if e and "." + e not in out:
+            out.append("." + e)
+    return out
+
+
 class FaqAgent:
     """
     Scans a knowledge folder and answers a single question against its content.
@@ -222,7 +232,7 @@ class FaqAgent:
                 cfg.get("faq_agent", "knowledge_dir", fallback="./knowledge")
             )
             raw_ext = cfg.get("faq_agent", "extensions", fallback=".txt,.md")
-            self.extensions = [e.strip() for e in raw_ext.split(",") if e.strip()]
+            self.extensions = _normalise_extensions(raw_ext.split(","))
             try:
                 self.temperature = cfg.getfloat("faq_agent", "temperature", fallback=0.0)
             except ValueError as exc:
@@ -736,7 +746,9 @@ class FaqAgent:
             return docs
 
         for fpath in sorted(kdir.rglob("*")):
-            if fpath.is_file() and fpath.suffix in self.extensions:
+            # REP-FAQ-EXT: README.MD / FAQ.TXT were skipped without a word — the suffix is
+            # compared case-blind, against the normalised list.
+            if fpath.is_file() and fpath.suffix.lower() in _normalise_extensions(self.extensions):
                 rel = str(fpath.relative_to(kdir))
                 try:
                     docs.append((rel, fpath.read_text(encoding="utf-8")))

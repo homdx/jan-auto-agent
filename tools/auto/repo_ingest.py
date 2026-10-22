@@ -361,8 +361,15 @@ class RepoIngestor:
         """
         filename = Path(rel_path).name
         for pat in patterns:
-            if fnmatch.fnmatch(rel_path, pat) or fnmatch.fnmatch(filename, pat):
-                return True
+            # REP-CLUSTER-GLOB: fnmatch has no "**", so "src/**/*.py" missed "src/a.py"; a
+            # trailing "/" ("tests/") and a leading "/" ("/src/*") matched nothing. Each file
+            # fell silently into the catch-all cluster.
+            pat = pat.lstrip("/")
+            if pat.endswith("/"):
+                pat += "*"
+            for variant in {pat, pat.replace("**/", "")}:
+                if fnmatch.fnmatch(rel_path, variant) or fnmatch.fnmatch(filename, variant):
+                    return True
         return False
 
     # Dependency and build directories are always pruned from the walk, as in the context broker.

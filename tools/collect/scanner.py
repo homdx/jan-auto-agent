@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import ast
 import configparser
+import logging
 from pathlib import Path
 from typing import FrozenSet, List, Optional
 
@@ -85,7 +86,12 @@ def _collect_int(config: Optional[configparser.ConfigParser], key: str, default:
         value = int(str(raw).strip())
     except ValueError:
         return default
-    return value if value > 0 else default
+    if value <= 0:
+        # REP-COLLECT-LIMIT: "max_depth = 0" read as "no limit" was the default 6 without a word.
+        logging.getLogger(__name__).warning(
+            "[collect] %s = %s is not a positive number — using %d", key, value, default)
+        return default
+    return value
 
 
 def _architect_int(config: Optional[configparser.ConfigParser], key: str) -> Optional[int]:

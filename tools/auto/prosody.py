@@ -250,7 +250,7 @@ def is_verse_task(text: str) -> bool:
     False
     """
     lower = text.lower()
-    if "ритм" in lower or "рифм" in lower:
+    if _RHYTHM_RE.search(lower) or _RHYME_RE.search(lower):
         return True
     if any(stem in lower for stem in _VERSE_STEMS):
         return True
@@ -260,6 +260,12 @@ def is_verse_task(text: str) -> bool:
         return True
     return False
 
+
+# REP-PROSODY: "ритм" / "рифм" open a word (after за-/с-/при- at most): as bare substrings
+# they matched "алгоритм", "арифметика", "логарифм", "аритмия", and a prose chapter about
+# sorting or arithmetic was checked as a quatrain.
+_RHYTHM_RE = re.compile(r"(?<![а-яё])(?:за|с|при)?ритм")
+_RHYME_RE  = re.compile(r"(?<![а-яё])(?:за|с|при)?рифм")
 
 # Poem-noun stems — any substring match activates the gate.
 _VERSE_STEMS: tuple[str, ...] = (
@@ -302,8 +308,8 @@ def verse_requirements(text: str) -> tuple[bool, bool]:
     """
     t = text.lower()
     no_rhyme  = ("без рифм" in t) or ("белый стих" in t) or ("верлибр" in t)
-    rhyme_kw  = "рифм" in t
-    rhythm_kw = "ритм" in t
+    rhyme_kw  = bool(_RHYME_RE.search(t))
+    rhythm_kw = bool(_RHYTHM_RE.search(t))
     generic   = is_verse_task(t) and not (rhyme_kw or rhythm_kw)
 
     require_rhyme  = (rhyme_kw or generic) and not no_rhyme

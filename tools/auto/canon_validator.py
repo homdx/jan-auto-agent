@@ -385,14 +385,16 @@ class CanonValidator:
             # A non-numeric filename (prologue.md) has no known position; return nothing rather than later chapters.
             return []
         out: list[tuple[int, str]] = []
-        for p in base_dir.glob("*"):
+        # REP-CHAPTER-DIR: the chapter's own folder, paths kept relative to *base_dir*.
+        folder = Path(chapter_file).parent
+        for p in (Path(base_dir) / folder).glob("*"):
             if p.suffix.lower() not in (".md", ".txt"):
                 continue
             cidx = CanonValidator.chapter_index(p.name)
             if cidx is None:
                 continue
             if cidx < idx:
-                out.append((cidx, p.name))
+                out.append((cidx, (folder / p.name).as_posix()))
         out.sort()
         return [name for _, name in out]
 
