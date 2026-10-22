@@ -345,7 +345,7 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
     # used to overwrite one lock and start two runners; whichever exited
     # first then unlinked the lock the other still depended on.
     try:
-        claimed = _claim_lock(lock)
+        claimed = _claim_lock(lock, nn)
     except OSError as err:
         return output.refuse(f"cannot start the runner: {err}")
     if not claimed:
@@ -390,9 +390,35 @@ def _pid_alive(pid: str) -> bool:
     return True
 
 
-def _claim_lock(lock: Path) -> bool:
+def _holder_alive(holder: str, nn: Optional[int]) -> bool:
+    """True when *holder*, the pid in a round's lock, is a live owner of the lock.
+
+    CC review fixes 49: a live pid alone is no proof. After a crash or a reboot
+    the pid a lock names may belong to any other process; `round_alive` already
+    reads that as "not running", while the claim refused every later start as
+    "already running" until the lock was deleted by hand. The holder counts when
+    it is this process, the round's runner (`tools.contest run --ticket NN`, the
+    pid after the swap) or a `tools.arena` command (the starter between its claim
+    and the swap). With no readable cmdline (no /proc) a live pid is taken at
+    its word, as before.
+    """
+    if not _pid_alive(holder):
+        return False
+    if holder == str(os.getpid()):
+        return True
+    words = _cmdline(Path(PROC_ROOT), holder)
+    if words is None:
+        return True
+    return (nn is not None and _matches(words, nn)) or "tools.arena" in words
+
+
+def _claim_lock(lock: Path, nn: Optional[int] = None) -> bool:
     """Create *lock* holding this process's pid, atomically; False when a live
-    process already holds it. A lock left by a dead process is replaced."""
+    owner already holds it (`_holder_alive`). A lock left by a dead process — or
+    naming a pid that is now some other program — is replaced. *nn* defaults to
+    the round number in the lock's name (``NN.pid``)."""
+    if nn is None:
+        nn = _as_int(lock.name.split(".", 1)[0])
     for _ in range(2):
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -401,7 +427,7 @@ def _claim_lock(lock: Path) -> bool:
                 holder = lock.read_text(encoding="utf-8", errors="replace").strip()
             except OSError:
                 holder = ""
-            if _pid_alive(holder):
+            if _holder_alive(holder, nn):
                 return False
             if not holder:
                 # Empty: another claimer may be between its create and its
@@ -411,7 +437,7 @@ def _claim_lock(lock: Path) -> bool:
                         return False
                 except OSError:
                     pass
-            # stale: its process is gone
+            # stale: its process is gone, or the pid now names another program
             lock.unlink(missing_ok=True)
             continue
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

@@ -317,7 +317,7 @@ class Executor:
 
     # ── Workspace setup ───────────────────────────────────────────────────────
 
-    def _mirror_ignore(self):
+    def _mirror_ignore(self, workspace: Optional[Path] = None):
         """The ``copytree`` ignore callable for the repo mirror.
 
         On top of :data:`_MIRROR_IGNORE`:
@@ -326,6 +326,12 @@ class Executor:
           inside ``base_dir`` at a path the static list does not name (say
           ``<repo>/ws``) was mirrored into the workspace being populated —
           ``ws/T1/ws/T1/…`` — until the path length or the disk ran out.
+          CC review fixes 49: only a root that lies *inside* ``base_dir`` is
+          skipped. A root above it (``workspace_root`` = the repo's parent)
+          holds every file of the repo, and skipping "everything under the
+          root" mirrored nothing at all. *workspace*, the directory being
+          populated, is always skipped — it is the one place the copy can
+          recurse into, wherever the root is.
         * AUDIT-21: a symlink whose target resolves outside ``base_dir``, and
           a directory link back to one of its own ancestors (a cycle).
           ``symlinks=False`` follows links, so a link to ``/etc`` or ``~``
@@ -335,8 +341,10 @@ class Executor:
         try:
             base_real = self._base_dir.resolve()
             ws_real = self._workspace_root.resolve()
+            target = workspace.resolve() if workspace is not None else None
         except (OSError, RuntimeError):
             return _MIRROR_IGNORE
+        ws_inside = base_real in ws_real.parents
 
         def ignore(dirpath, names):
             skipped = set(_MIRROR_IGNORE(dirpath, names))
@@ -349,7 +357,10 @@ class Executor:
                 except (OSError, RuntimeError):
                     skipped.add(name)
                     continue
-                if real == ws_real or ws_real in real.parents:
+                if ws_inside and (real == ws_real or ws_real in real.parents):
+                    skipped.add(name)
+                    continue
+                if target is not None and (real == target or target in real.parents):
                     skipped.add(name)
                     continue
                 if entry.is_symlink() and real != base_real and base_real not in real.parents:
@@ -410,7 +421,7 @@ class Executor:
         try:
             shutil.copytree(
                 self._base_dir, workspace,
-                ignore=self._mirror_ignore(), dirs_exist_ok=True,
+                ignore=self._mirror_ignore(workspace), dirs_exist_ok=True,
                 # A link inside base_dir is copied as its target, so the workspace holds no links;
                 # a link whose target leaves base_dir is skipped by _mirror_ignore (AUDIT-21).
                 symlinks=False,

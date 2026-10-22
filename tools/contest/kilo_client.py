@@ -364,6 +364,38 @@ def _log_tail(path: str, max_bytes: int = 65536, max_chars: int = 2000) -> str:
     return raw.decode("utf-8", "replace")[-max_chars:]
 
 
+def _log_size(path: str) -> "int | None":
+    """The size of the log at *path*, or None when there is no file yet."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def _attempt_log(path: str, offset: "int | None", err) -> str:
+    """What one `spawn` attempt wrote to the log, for the lost-port test (MIMO-1).
+
+    CC review fixes 49: the log is opened for append, so the error's own tail
+    still held the first attempt's EADDRINUSE when a later attempt failed for
+    another reason — and that failure was retried as a lost port. Only the
+    bytes past *offset* (the size before the attempt) are this attempt's. With
+    no file before or after (a stub), the error's tail is all there is; a file
+    that did not grow holds nothing of this attempt.
+    """
+    size = _log_size(path)
+    if size is None:
+        return (getattr(err, "log_tail", "") or "") if offset is None else ""
+    start = offset or 0
+    if size <= start:
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(start, size - 65536))
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
 def _terminate(proc: subprocess.Popen, grace: float = 5.0) -> None:
     """terminate, wait ``grace`` seconds, then kill. Never raises."""
     if proc is None or proc.poll() is not None:
@@ -486,12 +518,13 @@ class KiloServer:
         other failure is raised at once, exactly as before.
         """
         for attempt in range(cls.PORT_ATTEMPTS):
+            offset = _log_size(log_path)
             try:
                 return cls._spawn_once(binary, log_path=log_path, hostname=hostname,
                                        health_timeout=health_timeout, env=env)
             except KiloServerError as err:
                 if (attempt + 1 >= cls.PORT_ATTEMPTS
-                        or not _ADDR_IN_USE_RE.search(getattr(err, "log_tail", "") or "")):
+                        or not _ADDR_IN_USE_RE.search(_attempt_log(log_path, offset, err))):
                     raise
         raise AssertionError("unreachable")  # pragma: no cover
 

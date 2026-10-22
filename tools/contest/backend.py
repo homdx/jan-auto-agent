@@ -1552,7 +1552,11 @@ def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
                                 start_new_session=posix)
         try:
             proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+        except BaseException:
+            # CC review fixes 49: not only a timeout — a Ctrl-C (KeyboardInterrupt)
+            # or any other exit of the wait kills the group too. In its own session
+            # the command no longer gets the terminal's SIGINT, so it kept running
+            # after the round was stopped, with no timeout left to end it.
             try:
                 if posix:
                     os.killpg(proc.pid, 9)

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -46,7 +47,10 @@ def _dead_pid() -> int:
 def test_lock_held_by_a_live_process_refuses_a_second_runner(tmp_path, monkeypatch, capsys):
     locks = tmp_path / ".arena" / "locks"
     locks.mkdir(parents=True)
-    holder = subprocess.Popen(["sleep", "30"])
+    # The holder is round 7's runner by its command line (CC review fixes 49): a
+    # live pid that is some other program no longer holds the lock.
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
+                               "tools.contest", "run", "--ticket", "7"])
     try:
         (locks / "7.pid").write_text(str(holder.pid), encoding="utf-8")
         spawned = []

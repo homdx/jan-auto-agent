@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import signal
 import subprocess
 import time
 from unittest.mock import patch
@@ -25,9 +27,18 @@ from tools.contest import backend
 
 def test_a_background_child_does_not_hold_the_call(tmp_path):
     t0 = time.monotonic()
-    code, out, err = backend._run_bash_group("echo hi; sleep 30 &", str(tmp_path), 20)
-    assert time.monotonic() - t0 < 10, "the call waited for the background child"
-    assert code == 0 and out.strip() == "hi"
+    code, out, err = backend._run_bash_group(
+        "echo hi; sleep 30 & echo $! > child.pid", str(tmp_path), 20)
+    try:
+        assert time.monotonic() - t0 < 10, "the call waited for the background child"
+        assert code == 0 and out.strip() == "hi"
+    finally:
+        # the child outlives the call by design; the test does not leave it behind
+        # (CC review fixes 49: each run used to leave a `sleep 30` running)
+        try:
+            os.kill(int((tmp_path / "child.pid").read_text().strip()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
 
 
 def test_timeout_kills_the_whole_group_and_returns_on_time(tmp_path):

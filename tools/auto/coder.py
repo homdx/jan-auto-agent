@@ -1211,10 +1211,10 @@ class Coder(_llm_stream.LLMClientBase):
                     cited_symbol = _sym
 
         parts: list[str] = []
-        # AUDIT3-1: the files this prompt shows only in part, with the text the
-        # model did not see whole. `_write_files` refuses a reply that would
-        # replace such a file with less than it holds (see `_partial_view_error`).
-        self._partial_views = {}
+        # AUDIT3-1: the files this prompt shows only in part, and the cited symbol
+        # their view was cut around. `_write_files` refuses a reply that drops what
+        # the model never saw (see `_partial_view_error`).
+        self._partial_views, self._partial_cited = {}, cited_symbol
         for rel in target_files:
             abs_path = base_dir / rel
             if not abs_path.exists():
@@ -2016,6 +2016,16 @@ class Coder(_llm_stream.LLMClientBase):
         deleted. The reply is refused when it drops a top-level symbol of the
         original, still carries a ``not included`` placeholder, or holds less
         than half of the original's text; the original stays untouched.
+
+        CC review fixes 49: "a top-level symbol" is one the model was NOT shown
+        (a ``# [name — N chars, not included]`` stub of its view). A symbol it
+        saw it may delete or rename — "remove the dead helper", "rename f5" on
+        any file over ``max_file_chars`` (8000 by default) were refused for good.
+        And the size floor is the text the model did not see, which the reply
+        must still hold, not half the file: dropping a large function it was
+        shown is an edit, not a loss. The view is rebuilt the way the prompt
+        built it (same chunks, same cited symbol, same budget); when it cannot
+        be, the strict rules above apply.
         """
         views = getattr(self, "_partial_views", None) or {}
         norm = rel.replace("\\", "/")
@@ -2043,16 +2053,32 @@ class Coder(_llm_stream.LLMClientBase):
                 return None
             return {c["name"] for c in chunks if not c.get("is_import")}
 
+        # What the model saw of the file: the names it got only as stubs, and the
+        # length of the text it did get (None: the view cannot be rebuilt).
+        hidden: "set[str] | None" = None
+        unseen_chars: "int | None" = None
+        try:
+            budget = int(getattr(self, "_max_file_chars"))
+            view = select_relevant_chunks(chunk_file(original, ext, budget),
+                                          getattr(self, "_partial_cited", None), budget)
+            hidden = {m.group(1) for m in _NOT_INCLUDED_STUB_RE.finditer(view)}
+            unseen_chars = max(0, len(original) - len(_NOT_INCLUDED_STUB_RE.sub("", view)))
+        except Exception:  # noqa: BLE001 — no view: every symbol and half the text must stay
+            hidden, unseen_chars = None, None
+
         before, after = _names(original), _names(content)
         if before and after is not None:
             missing = sorted(before - after)
+            if hidden is not None:
+                missing = [name for name in missing if name in hidden]
             if missing:
                 shown = ", ".join(missing[:8]) + (" …" if len(missing) > 8 else "")
                 return (f"[SAFETY] {rel!r} was shown in part and the reply drops "
-                        f"{len(missing)} of its top-level symbols ({shown}) — the "
-                        f"original is kept; change only what you were shown and "
-                        f"keep every other symbol — write blocked")
-        if len(content) * 2 < len(original):
+                        f"{len(missing)} of the top-level symbols you were not shown "
+                        f"({shown}) — the original is kept; change only what you were "
+                        f"shown and keep every other symbol — write blocked")
+        floor = unseen_chars if unseen_chars is not None else len(original) / 2
+        if len(content) < floor:
             return (f"[SAFETY] {rel!r} was shown in part ({len(original)} chars) and "
                     f"the reply would replace it with {len(content)} chars — the "
                     f"original is kept — write blocked")
@@ -2505,6 +2531,10 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
     symbol_chunks.sort(key=lambda c: c["line"])
 
     return [import_chunk] + symbol_chunks
+
+
+#: A symbol `select_relevant_chunks` left out of a partial view (CC review fixes 49).
+_NOT_INCLUDED_STUB_RE = re.compile(r"(?m)^# \[(.+?) — \d+ chars, not included\]$")
 
 
 def select_relevant_chunks(
