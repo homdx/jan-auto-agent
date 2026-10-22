@@ -180,8 +180,11 @@ _META_PAREN_MARKERS = (
 _META_MARKER_WORD_FORMS: dict[str, tuple[str, ...]] = {
     "bullet":    ("bullet", "bullets"),
     "remove":    ("remove", "removes", "removed"),
+    # "correction(s)" is not here (AUDIT-23): "(her brother, a corrections
+    # officer)" is a story fact. As commentary it is "(correction: …)", matched
+    # as a phrase below.
     "correct":   ("correct", "corrects", "corrected", "correcting", "correctly",
-                  "correction", "corrections", "incorrect", "incorrectly"),
+                  "incorrect", "incorrectly"),
     "original":  ("original", "originals", "originally", "unoriginal"),
     "accurate":  ("accurate", "accurately", "inaccurate", "inaccurately"),
     "partially": ("partially",),
@@ -218,6 +221,8 @@ _META_MARKER_WORDS = frozenset(w for forms in _META_MARKER_WORD_FORMS.values()
 _META_PAREN_PHRASES: tuple[str, ...] = (
     r"(?<!\w)does\s+not(?!\w)",
     r"(?<!\w)not\s+explicitly(?!\w)",
+    # "(correction: …)" / "(corrections — …)": the noun as the commentary's label.
+    r"^\s*corrections?\s*(?::|-|—|–)",
 )
 _META_PAREN_PHRASE_RE = re.compile("|".join(_META_PAREN_PHRASES))
 

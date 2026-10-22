@@ -26,6 +26,9 @@ import csv
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import file_lock  # noqa: E402
+
 COLUMNS = [
     "variant", "task_id", "title", "file", "symbol", "line_start", "line_end",
     "verdict", "severity", "defect_class", "caller_mutates", "impact", "repro",
@@ -105,26 +108,31 @@ def main():
     row["verdict"], row["severity"] = v, s
     row["caller_mutates"] = row["caller_mutates"].upper()
 
-    # --- dedupe against what is already on disk ------------------------------
-    existed = os.path.exists(out) and os.path.getsize(out) > 0
-    if existed and not a["allow_duplicate"]:
-        with open(out, newline="", encoding="utf-8") as fh:
-            for prev in csv.DictReader(fh):
-                if (prev.get("file"), prev.get("symbol")) == (row["file"], row["symbol"]):
-                    print(f"skipped: {row['file']}::{row['symbol']} is already recorded "
-                          f"as {prev.get('verdict')} — move on to the next finding "
-                          f"(--allow-duplicate to override)", file=sys.stderr)
-                    return 2
+    # AUDIT-15: the dedupe check, the header decision and the append are one
+    # locked step. Two reviewers' calls for one (file, symbol) both passed the
+    # check and both appended; two first writers both wrote a header.
+    with file_lock.locked(out):
+        # --- dedupe against what is already on disk --------------------------
+        existed = os.path.exists(out) and os.path.getsize(out) > 0
+        if existed and not a["allow_duplicate"]:
+            with open(out, newline="", encoding="utf-8") as fh:
+                for prev in csv.DictReader(fh):
+                    if (prev.get("file"), prev.get("symbol")) == (row["file"], row["symbol"]):
+                        print(f"skipped: {row['file']}::{row['symbol']} is already recorded "
+                              f"as {prev.get('verdict')} — move on to the next finding "
+                              f"(--allow-duplicate to override)", file=sys.stderr)
+                        return 2
 
-    with open(out, "a", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=COLUMNS)
-        if not existed:
-            w.writeheader()
-        w.writerow(row)
-        fh.flush()
-        os.fsync(fh.fileno())
+        with open(out, "a", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=COLUMNS)
+            if not existed:
+                w.writeheader()
+            w.writerow(row)
+            fh.flush()
+            os.fsync(fh.fileno())
 
-    n = sum(1 for _ in open(out, encoding="utf-8")) - 1
+        with open(out, encoding="utf-8") as fh:
+            n = sum(1 for _ in fh) - 1
     print(f"recorded #{n}: {row['verdict']}/{row['severity']} "
           f"{row['file']}::{row['symbol'] or '-'} -> {out}")
     return 0

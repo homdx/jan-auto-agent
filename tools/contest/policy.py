@@ -1342,26 +1342,53 @@ def _forbidden_match(path: Path, forbidden, worktree: "Path | None" = None) -> "
     return None
 
 
+def _glob_spellings(glob: str) -> tuple:
+    """*glob* and, when its literal directory part resolves elsewhere (a
+    ``/tmp`` that is ``/private/tmp``), the same glob on the resolved part.
+
+    AUDIT-3: these are what a *resolved* path is matched against. The literal
+    part is everything before the first wildcard, cut back to a ``/``; the
+    wildcard tail is kept verbatim.
+    """
+    out = [glob]
+    cut = min((i for i in (glob.find(c) for c in "*?[") if i >= 0), default=len(glob))
+    head = glob[:cut]
+    slash = head.rfind("/")
+    if slash > 0 and os.path.isabs(glob):
+        literal, tail = glob[:slash], glob[slash:]
+        resolved = _resolve(literal)
+        if resolved is not None and str(resolved) != literal:
+            out.append(str(resolved) + tail)
+    return tuple(out)
+
+
 def _inside_worktree_or_tmp(pairs: list, worktree: "Path | None", tmp_roots) -> bool:
     """True when every path the event names is a path the agent may use.
 
     ``worktree`` by containment, ``tmp_roots`` by glob — matched against the
-    resolved path and against every original spelling of it, so
-    ``/tmp/kilo/*`` claims ``/tmp/kilo/scratch`` and ``/tmp/kilo/scratch/*``
-    alike.
+    *resolved* path only (and against the glob with its literal directory part
+    resolved, so ``/tmp/kilo/*`` still claims ``/private/tmp/kilo/x`` where
+    ``/tmp`` is a link). ``/tmp/kilo/*`` claims ``/tmp/kilo/scratch`` and
+    ``/tmp/kilo/scratch/*`` alike.
+
+    AUDIT-3: the original spelling used to be matched too, so
+    ``/tmp/kilo/../../etc/passwd`` — or ``/tmp/kilo/link/x`` with ``link``
+    pointing at ``/etc`` — matched ``/tmp/kilo/*`` by its text while the place
+    it names is outside the scratch root, and was approved mechanically.
     """
     if not pairs:
         return False
     roots = [root for root in _as_list(tmp_roots) if isinstance(root, str) and root]
+    spellings = [s for glob in roots for s in _glob_spellings(glob)]
     for resolved, originals in pairs:
         if worktree is not None and _inside(resolved, worktree):
             continue
-        if any(
-            fnmatch.fnmatch(str(resolved), glob)
-            or fnmatch.fnmatch(original, glob)
-            for glob in roots
-            for original in originals
-        ):
+        # A ``dir/*`` pattern names the contents of ``dir``: it is read as the
+        # resolved directory plus ``/*``, never by the text it was written in.
+        names = [str(resolved)]
+        if any(str(o).endswith("/*") for o in originals):
+            names.append(str(resolved).rstrip("/") + "/*")
+        if any(fnmatch.fnmatch(name, glob) for glob in spellings for name in names):
             continue
         return False
     return True

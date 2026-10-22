@@ -25,43 +25,19 @@ TRUTH = {"REAL", "FALSE", "FIXED", "UNDECIDED"}
 SEV = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE", ""}
 
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import file_lock  # noqa: E402
+
+
 @contextlib.contextmanager
 def _locked(path):
     """An exclusive lock on *path*'s directory (POSIX ``flock``; on Windows a sidecar ``.<name>.lock``): the
     "is the file there" check, the "already decided" check and the append are one step. Eight first writers
     at once wrote the header twice (the second header then read as a verdict "TRUTH" and settled), and two
-    writers of one finding both passed."""
-    d, name = os.path.split(os.path.abspath(path))
-    if os.name == "nt":
-        import msvcrt
-        with open(os.path.join(d, f".{name}.lock"), "a+b") as fh:
-            while True:
-                try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
-                    break
-                except OSError:
-                    continue
-            try:
-                yield
-            finally:
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-    import fcntl
-    try:
-        fd = os.open(d, os.O_RDONLY)
-    except OSError:
-        fd = None
-    try:
-        if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except OSError:
-                pass    # a filesystem with no lock on a directory (some network, WSL mounts): unlocked, as before
+    writers of one finding both passed. AUDIT-13: `tools.file_lock.locked`, whose Windows retry is bounded
+    and limited to contention instead of looping on every ``OSError``."""
+    with file_lock.locked(path):
         yield
-    finally:
-        if fd is not None:
-            os.close(fd)                # closing it lets the lock go
 
 
 def main():

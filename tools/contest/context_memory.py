@@ -47,6 +47,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools import file_lock
+
 __all__ = [
     "DEFAULT_COMPACT_AT_PERCENT",
     "DEFAULT_DAYS",
@@ -505,22 +507,32 @@ def add(path, record: OverflowRecord, *, days: float = DEFAULT_DAYS,
         if not keep > 0 or not math.isfinite(stamp):
             return False
         target = Path(path)
-        existing = [entry.to_dict() for entry in load(path, days=days, now=stamp)]
-        existing.append(record.to_dict())
         target.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp",
-                                   dir=str(target.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(existing, fh, ensure_ascii=False, indent=2)
-                fh.write("\n")
-            os.replace(tmp, str(target))
-        except BaseException:
+        # AUDIT-11: the read, the merge and the replace are one locked step.
+        # Two rounds (or two agents of one round) that overflowed together each
+        # read the same old list and the later replace dropped the other's line.
+        with file_lock.locked(target):
+            if now is None:
+                # Taken under the lock (AUDIT-11 follow-up): a stamp from before
+                # the wait is older than a record another writer added meanwhile,
+                # and the age cut drops a record from "the future" — so the
+                # lock alone still lost the concurrent writers' lines.
+                stamp = time.time()
+            existing = [entry.to_dict() for entry in load(path, days=days, now=stamp)]
+            existing.append(record.to_dict())
+            fd, tmp = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp",
+                                       dir=str(target.parent))
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(existing, fh, ensure_ascii=False, indent=2)
+                    fh.write("\n")
+                os.replace(tmp, str(target))
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         return True
     except Exception as exc:  # noqa: BLE001 — a failed write is a warning, never a round
         _LOG.warning("context memory %s: %s: %s", path, type(exc).__name__, exc)

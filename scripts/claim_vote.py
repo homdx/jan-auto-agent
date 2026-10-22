@@ -105,7 +105,16 @@ class Pacer:
         elif not sem.acquire(timeout=max(0.0, deadline - time.monotonic())):
             raise TimeoutError(f"no free slot for {provider} before the deadline")
         with self._lock:
-            start = max(time.time(), self._next.get(provider, 0.0))
+            now = time.time()
+            start = max(now, self._next.get(provider, 0.0))
+            # AUDIT-14: the deadline also bounds the pacing sleep. A slot whose
+            # scheduled start lies past it is given back and the start time is
+            # not reserved, so the caller that stopped waiting neither starts
+            # late nor pushes every later caller's start back by an interval.
+            if deadline is not None and time.monotonic() + (start - now) > deadline:
+                sem.release()
+                raise TimeoutError(
+                    f"{provider}'s next start is past the deadline")
             self._next[provider] = start + self.interval
         time.sleep(max(0.0, start - time.time()))
         return sem

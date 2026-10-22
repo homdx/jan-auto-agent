@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import configparser
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,27 @@ def _version_label(item) -> str:
     record carries no version at all (HARDEN-1 A3)."""
     version = item.get("version") if isinstance(item, dict) else None
     return f"v{version}" if version is not None else _NO_VERSION_LABEL
+
+
+def _usable_stack(entry) -> list:
+    """The stack of *entry* as a list of mapping records, or ``[]``.
+
+    AUDIT-9: ``_load`` accepts any JSON object, so an agent entry that is not
+    a mapping, a ``stack`` that is not a list, or a record that is not a
+    mapping reached ``get_current``/``push``/``rollback``/``get_store_summary``
+    and raised there. Each of them reads the stack through this instead.
+    """
+    if not isinstance(entry, dict):
+        return []
+    stack = entry.get("stack")
+    if not isinstance(stack, list):
+        return []
+    return [item for item in stack if isinstance(item, dict)]
+
+
+def _int_version(item) -> "int | None":
+    version = item.get("version") if isinstance(item, dict) else None
+    return version if isinstance(version, int) and not isinstance(version, bool) else None
 
 
 class PromptStore:
@@ -79,13 +101,15 @@ class PromptStore:
         """Return the active prompt for agent_name, falling back to hardcoded."""
         data = self._load()
         entry = data.get(agent_name)
-        if not entry or not entry.get("stack"):
+        # Only records that carry a prompt string can answer (AUDIT-9).
+        stack = [item for item in _usable_stack(entry)
+                 if isinstance(item.get("prompt"), str)]
+        if not stack:
             return _get_hardcoded(agent_name)
-        stack = entry["stack"]
         current_version = entry.get("current_version", len(stack))
         # Find the entry matching current_version; fall back to top of stack.
         for item in reversed(stack):
-            if item["version"] == current_version:
+            if item.get("version") == current_version:
                 return item["prompt"]
         return stack[-1]["prompt"]
 
@@ -109,7 +133,7 @@ class PromptStore:
         rows = []
         for name in agent_names:
             entry = data.get(name, {})
-            stack = entry.get("stack", [])
+            stack = _usable_stack(entry)
 
             # Current version label + score
             if stack:
@@ -181,11 +205,19 @@ class PromptStore:
         prompts.json is created on first call.
         """
         data = self._load()
-        if agent_name not in data:
-            data[agent_name] = {"stack": [], "current_version": 0}
+        entry = data.get(agent_name)
+        if not isinstance(entry, dict) or not isinstance(entry.get("stack"), list) \
+                or len(_usable_stack(entry)) != len(entry.get("stack") or []):
+            if agent_name in data:
+                # AUDIT-9: a malformed entry is replaced, so its raw form is
+                # kept in a copy of the file before the save overwrites it.
+                self._backup_copy(f"malformed entry for {agent_name!r}")
+            entry = {"stack": _usable_stack(entry), "current_version": 0}
+            data[agent_name] = entry
 
-        stack = data[agent_name]["stack"]
-        next_version = (stack[-1]["version"] + 1) if stack else 1
+        stack = entry["stack"]
+        versions = [v for v in (_int_version(item) for item in stack) if v is not None]
+        next_version = (max(versions) + 1) if versions else 1
 
         stack.append({
             "version": next_version,
@@ -210,17 +242,30 @@ class PromptStore:
         """
         data = self._load()
         entry = data.get(agent_name)
+        if not isinstance(entry, dict) or not isinstance(entry.get("stack"), list):
+            return False    # AUDIT-9: a malformed entry has nothing to roll back
+        usable = _usable_stack(entry)
+        if len(usable) != len(entry["stack"]):
+            self._backup_copy(f"malformed records for {agent_name!r}")
+            entry["stack"] = usable
         if not entry or not entry.get("stack"):
             return False
 
         removed = entry["stack"].pop()
         stack = entry["stack"]
         data[agent_name]["stack"] = stack
+        if stack and "version" not in stack[-1]:
+            # a version-less record (HARDEN-1 A3) is now the top: no version to name
+            data[agent_name]["current_version"] = 0
+            self._save(data)
+            logger.info(f"PromptStore: rolled back '{agent_name}' from "
+                        f"{_version_label(removed)} → {_NO_VERSION_LABEL}")
+            return True
         data[agent_name]["current_version"] = stack[-1]["version"] if stack else 0
         self._save(data)
         logger.info(
-            f"PromptStore: rolled back '{agent_name}' from v{removed['version']} "
-            f"→ {'v' + str(stack[-1]['version']) if stack else 'hardcoded'}"
+            f"PromptStore: rolled back '{agent_name}' from {_version_label(removed)} "
+            f"→ {_version_label(stack[-1]) if stack else 'hardcoded'}"
         )
         return True
 
@@ -268,6 +313,28 @@ class PromptStore:
             self._quarantine(f"expected a JSON object, got {type(data).__name__}")
             return {}
         return data
+
+    def _backup_copy(self, reason: str) -> None:
+        """Copy the store aside before a save drops part of it (AUDIT-9).
+
+        Unlike :meth:`_quarantine` the file stays in place — the rest of it is
+        still good — only a copy is kept, as ``prompts.json.malformed-<stamp>``.
+        """
+        if not self.store_path.exists():
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        dest = self.store_path.with_suffix(f".json.malformed-{stamp}")
+        n = 0
+        while dest.exists():
+            n += 1
+            dest = self.store_path.with_suffix(f".json.malformed-{stamp}-{n:03d}")
+        try:
+            shutil.copy2(self.store_path, dest)
+            logger.warning("PromptStore: %s has a %s — copied to %s before "
+                           "rewriting it", self.store_path.name, reason, dest.name)
+        except OSError as exc:
+            logger.error("PromptStore: %s has a %s and could not be copied "
+                         "aside (%s)", self.store_path.name, reason, exc)
 
     def _quarantine(self, reason: str) -> None:
         """Move an unusable prompts.json aside and log why.

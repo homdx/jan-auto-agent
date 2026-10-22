@@ -261,7 +261,10 @@ class SearchAgent:
         already_searched_files, already_searched_pairs = _normalise_already_searched(
             already_searched
         )
-        visited_names = visited_names or set()
+        # AUDIT-22: `or` replaced a caller's EMPTY set with a new one, so the
+        # names this call visits never reached the set the caller passed in.
+        if visited_names is None:
+            visited_names = set()
         
         result: Dict[str, Any] = {
             "found": {},

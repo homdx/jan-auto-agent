@@ -340,12 +340,23 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
     if started is None:
         # one second of slack: some filesystems keep mtimes in whole seconds
         started = time.time() - 1
+    # AUDIT-5: the lock is taken with O_EXCL, so the liveness check and the
+    # claim are one step. Two `run start NN` that both passed round_alive()
+    # used to overwrite one lock and start two runners; whichever exited
+    # first then unlinked the lock the other still depended on.
+    try:
+        claimed = _claim_lock(lock)
+    except OSError as err:
+        return output.refuse(f"cannot start the runner: {err}")
+    if not claimed:
+        return output.refuse(f"round {nn} is already running in {repo}")
+    owned = {str(os.getpid())}
     try:
         try:
-            lock.write_text(str(os.getpid()), encoding="utf-8")
             child = SPAWN(line, cwd=str(repo))
         except OSError as err:
             return output.refuse(f"cannot start the runner: {err}")
+        owned.add(str(child.pid))
         # Bug 181: once the runner is up, a failed pid swap still waits for the child; never "cannot start" over a running runner.
         try:
             lock_tmp.write_text(f"{child.pid}\n", encoding="utf-8")
@@ -360,8 +371,63 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
                 # Ctrl-C reached the child too (same process group): wait it out
                 continue
     finally:
-        lock.unlink(missing_ok=True)
+        _release_lock(lock, owned)
     return _map_exit(code, state, started, written)
+
+
+def _pid_alive(pid: str) -> bool:
+    """True when process *pid* exists (a pid we may not signal still exists)."""
+    if not pid.isdigit() or int(pid) <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _claim_lock(lock: Path) -> bool:
+    """Create *lock* holding this process's pid, atomically; False when a live
+    process already holds it. A lock left by a dead process is replaced."""
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                holder = lock.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                holder = ""
+            if _pid_alive(holder):
+                return False
+            if not holder:
+                # Empty: another claimer may be between its create and its
+                # write — only an old empty lock is a dead claimer's.
+                try:
+                    if time.time() - lock.stat().st_mtime < 5:
+                        return False
+                except OSError:
+                    pass
+            # stale: its process is gone
+            lock.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        return True
+    return False
+
+
+def _release_lock(lock: Path, owned: set) -> None:
+    """Remove *lock* only while it still names one of *owned* — never another runner's."""
+    try:
+        holder = lock.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return
+    if holder in owned:
+        lock.unlink(missing_ok=True)
 
 
 # ── 211: the old round's uncommitted worktrees, and the one-shot `--fresh` ───
@@ -832,7 +898,16 @@ def run_rerun(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
     try:
         shutil.copy2(state, state.with_name(BACKUP_NAME))
         body = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
-        state.write_bytes(body)
+        # AUDIT-20: written beside it and swapped in, so a failed or
+        # interrupted write (a full disk) leaves the old state.json whole
+        # instead of a truncated one only a manual restore could fix.
+        tmp = state.with_name(f".{state.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_bytes(body)
+            os.replace(tmp, state)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         wrote = state.stat().st_mtime
     except OSError as err:
         return output.refuse(f"cannot write {state}: {err}")

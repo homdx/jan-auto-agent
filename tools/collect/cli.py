@@ -245,8 +245,9 @@ def resolve_collect_dir(root: Path, config: Optional[configparser.ConfigParser])
     checked with `os.path.normpath` on the unresolved path rather than
     `Path.resolve()`/`is_relative_to()` (which would require the path to
     already exist to be meaningful, and can behave surprisingly around
-    symlinks) — this is a config-sanity check, not a symlink-attack
-    defense.
+    symlinks) — that lexical test is the config-sanity check. AUDIT-1 adds
+    a second, symlink-aware test on the resolved path, so a `.collect` that
+    is a link out of the project is refused too.
     """
     settings = read_collect_settings(config)
     path = Path(settings.dir)
@@ -262,6 +263,27 @@ def resolve_collect_dir(root: Path, config: Optional[configparser.ConfigParser])
             f"outside the project root {normalized_root} — refusing to "
             f"write there. Check the `[collect] dir` setting in your "
             f"config for a stray absolute path or `..` traversal."
+        ) from None
+    # AUDIT-1: the lexical check above does not see symlinks — an in-repo
+    # `.collect` (or any parent of the configured dir) that is a symlink to
+    # somewhere else passed it, and every artifact write followed the link out
+    # of the project. `resolve(strict=False)` works on a path that does not
+    # exist yet, so a fresh checkout is still fine; the root is resolved the
+    # same way so a project that itself lives under a symlink is not refused.
+    try:
+        resolved_path = Path(root, path).resolve()
+        resolved_root = Path(root).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise CollectCliError(
+            f"[collect] dir {normalized_path} cannot be resolved: {exc}"
+        ) from None
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError:
+        raise CollectCliError(
+            f"[collect] dir {normalized_path} resolves through a symlink to "
+            f"{resolved_path}, which is outside the project root "
+            f"{resolved_root} — refusing to write there."
         ) from None
     return path
 
@@ -1440,6 +1462,14 @@ def action_module(
     abs_module = root / module_path
     if not abs_module.is_file():
         raise CollectCliError(f"--module path does not exist under {root}: {module_path}")
+    # AUDIT-2: a --module that is (or sits under) a symlink out of the project
+    # would be read and, with summaries on, sent to the LLM.
+    try:
+        abs_module.resolve().relative_to(Path(root).resolve())
+    except (ValueError, OSError, RuntimeError):
+        raise CollectCliError(
+            f"--module path resolves outside the project root {root}: {module_path}"
+        ) from None
     try:
         source = abs_module.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:

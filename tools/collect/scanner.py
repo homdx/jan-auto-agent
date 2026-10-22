@@ -314,8 +314,9 @@ def scan_repo_ex(
     """`scan_repo` plus `(path, reason)` for every file its walk skipped (HARDEN-24 B).
 
     The reasons are the walk's own: `"too deep"` (past `[collect] max_depth`),
-    `"too large"` (past `[collect] max_file_kb`) and `"unreadable"` (the walk
-    could not stat it). Sorted by path, and empty when nothing was skipped —
+    `"too large"` (past `[collect] max_file_kb`), `"unreadable"` (the walk
+    could not stat it) and `"outside repo"` (a symlink whose target leaves the
+    project root, AUDIT-2 — its target is never read). Sorted by path, and empty when nothing was skipped —
     which is also what a config that names no limits gives, since a malformed
     limit degrades to the default rather than raising.
     """

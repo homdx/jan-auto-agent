@@ -317,6 +317,61 @@ class Executor:
 
     # ── Workspace setup ───────────────────────────────────────────────────────
 
+    def _mirror_ignore(self):
+        """The ``copytree`` ignore callable for the repo mirror.
+
+        On top of :data:`_MIRROR_IGNORE`:
+
+        * AUDIT-10: the workspace root itself. A ``workspace_root`` configured
+          inside ``base_dir`` at a path the static list does not name (say
+          ``<repo>/ws``) was mirrored into the workspace being populated —
+          ``ws/T1/ws/T1/…`` — until the path length or the disk ran out.
+        * AUDIT-21: a symlink whose target resolves outside ``base_dir``, and
+          a directory link back to one of its own ancestors (a cycle).
+          ``symlinks=False`` follows links, so a link to ``/etc`` or ``~``
+          used to copy the outside data into the workspace the acceptance
+          check runs in — the opposite of what the comment beside it promised.
+        """
+        try:
+            base_real = self._base_dir.resolve()
+            ws_real = self._workspace_root.resolve()
+        except (OSError, RuntimeError):
+            return _MIRROR_IGNORE
+
+        def ignore(dirpath, names):
+            skipped = set(_MIRROR_IGNORE(dirpath, names))
+            for name in names:
+                if name in skipped:
+                    continue
+                entry = Path(dirpath) / name
+                try:
+                    real = entry.resolve()
+                except (OSError, RuntimeError):
+                    skipped.add(name)
+                    continue
+                if real == ws_real or ws_real in real.parents:
+                    skipped.add(name)
+                    continue
+                if entry.is_symlink() and real != base_real and base_real not in real.parents:
+                    logger.warning(
+                        "_prepare_workspace: not mirroring %s — symlink resolves "
+                        "outside %s", entry, base_real,
+                    )
+                    skipped.add(name)
+                    continue
+                if entry.is_symlink() and real.is_dir():
+                    # A link back to the directory it sits in (or one above
+                    # it) is a cycle copytree would follow forever.
+                    try:
+                        here = Path(dirpath).resolve()
+                    except (OSError, RuntimeError):
+                        here = None
+                    if here is not None and (real == here or real in here.parents):
+                        skipped.add(name)
+            return skipped
+
+        return ignore
+
     def _prepare_workspace(self, task_id: str, target_files: list[str]) -> Path:
         """Create the per-task workspace and populate it for acceptance_check.
 
@@ -355,8 +410,9 @@ class Executor:
         try:
             shutil.copytree(
                 self._base_dir, workspace,
-                ignore=_MIRROR_IGNORE, dirs_exist_ok=True,
-                # Symlinks are copied as their targets, so a link out of base_dir cannot reach outside the sandbox (SECURITY).
+                ignore=self._mirror_ignore(), dirs_exist_ok=True,
+                # A link inside base_dir is copied as its target, so the workspace holds no links;
+                # a link whose target leaves base_dir is skipped by _mirror_ignore (AUDIT-21).
                 symlinks=False,
             )
         except (OSError, shutil.Error) as exc:

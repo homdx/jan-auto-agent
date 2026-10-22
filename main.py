@@ -526,6 +526,9 @@ class Orchestrator(OrchestratorActions):
                     # Count discards directly rather than inferring them from the batch size.
                     _discarded = 0
                     for suggestion in new_suggestions:
+                        # A non-string is no reference name (AUDIT-17).
+                        if not isinstance(suggestion, str) or not suggestion.strip():
+                            continue
                         if suggestion in refs:
                             continue
                         if len(refs) < _refs_cap:

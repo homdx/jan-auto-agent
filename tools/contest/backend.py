@@ -1145,9 +1145,11 @@ class OpenRouterBackend:
                        rules: list, title: str,
                        agent: str | None = None,
                        variant: str | None = None) -> SessionRef:
-        # The reasoning variant is kept on the ref only, so the round record shows what was asked.
+        # AUDIT-18: the variant reaches the model too, as OpenRouter's
+        # ``reasoning.effort`` (see `_reasoning_effort`); it used to be kept on
+        # the ref only, so the round record named a variant the run never used.
         sid = f"openrouter-{model_id or title or 'agent'}"
-        record = self._spawn_one(sid, provider_id, model_id, agent)
+        record = self._spawn_one(sid, provider_id, model_id, agent, variant=variant or None)
         self._records[sid] = record
         return SessionRef(id=sid, provider_id=provider_id, model_id=model_id,
                           directory=self._directory, agent=agent, variant=variant or None)
@@ -1340,7 +1342,7 @@ class OpenRouterBackend:
                 f"no session {session.id!r} on this backend") from exc
 
     def _spawn_one(self, sid: str, provider_id: str, model_id: str,
-                   agent: str | None) -> _AgentRecord:
+                   agent: str | None, *, variant: str | None = None) -> _AgentRecord:
         if self._spawn_agent is not None:
             spawned = self._spawn_agent(self._base_url, model_id, self._directory,
                                         self._api_key, self._timeout, self._max_steps)
@@ -1361,6 +1363,8 @@ class OpenRouterBackend:
                 "--base-url", self._base_url, "--model", str(model_id),
                 "--directory", self._directory, "--max-steps", str(self._max_steps),
                 "--request-timeout", f"{self._timeout:g}"]
+        if variant:
+            argv += ["--variant", str(variant)]
         env = dict(os.environ)
         if self._extra_env:
             env.update(self._extra_env)
@@ -1505,14 +1509,83 @@ def _agent_tools() -> list:
     ]
 
 
+def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
+    """``bash -c command`` in its own process group: ``(returncode, stdout, stderr)``.
+
+    AUDIT-6: ``subprocess.run(..., capture_output=True, timeout=...)`` kills
+    only ``bash`` on a timeout and then waits for the pipes to close — and a
+    background child (``sleep 999 &``, a dev server) still holds them, so the
+    "timeout" waited as long as that child lived; with no timeout hit, a child
+    that kept the pipes open held the turn just the same. Output now goes to
+    temporary files, which nobody waits on, and the call returns when ``bash``
+    exits. On a timeout the whole process group is killed, then
+    ``TimeoutExpired`` is raised. A child that ``bash`` left running after a
+    normal exit is left alone, as before (a server the agent started on
+    purpose); it just no longer blocks the call.
+    """
+    import tempfile
+
+    posix = os.name != "nt"
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(["bash", "-c", command], cwd=cwd,
+                                stdout=out_f, stderr=err_f,
+                                stdin=subprocess.DEVNULL,
+                                start_new_session=posix)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                if posix:
+                    os.killpg(proc.pid, 9)
+                else:
+                    proc.kill()
+            except OSError:
+                pass
+            proc.wait()
+            raise
+        out_f.seek(0)
+        err_f.seek(0)
+        out = out_f.read().decode("utf-8", "replace")
+        err = err_f.read().decode("utf-8", "replace")
+    return proc.returncode, out, err
+
+
+#: Kilo-style variant names → OpenRouter ``reasoning.effort`` (AUDIT-18).
+_EFFORT_OF_VARIANT = {"minimal": "minimal", "low": "low", "medium": "medium",
+                      "high": "high", "xhigh": "xhigh", "max": "xhigh"}
+
+
+def _reasoning_effort(variant) -> "str | None":
+    """The ``reasoning.effort`` a session's *variant* asks for, or None.
+
+    ``None`` / empty / ``highest`` (resolved away before an openrouter round
+    starts) send nothing, as before. A name this table does not know is not
+    guessed at: it is reported on stderr and nothing is sent, so the round's
+    log says the variant was not applied rather than the run silently using
+    the provider default.
+    """
+    if not isinstance(variant, str) or not variant.strip():
+        return None
+    name = variant.strip().lower()
+    if name == "highest":
+        return None
+    effort = _EFFORT_OF_VARIANT.get(name)
+    if effort is None:
+        print(f"contest agent: reasoning variant {variant!r} has no OpenRouter "
+              f"reasoning.effort — the provider default is used", file=sys.stderr)
+    return effort
+
+
 class _Agent:
     """The loop: read a prompt, call the model, run its tool calls, say ``idle``."""
 
     def __init__(self, base_url: str, api_key: str, model: str, directory: str, *,
-                 max_steps: int = 24, request_timeout: float = 300.0) -> None:
+                 max_steps: int = 24, request_timeout: float = 300.0,
+                 variant: str | None = None) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
+        self._effort = _reasoning_effort(variant)
         self._directory = directory
         self._max_steps = max(1, int(max_steps))
         self._timeout = float(request_timeout)
@@ -1578,6 +1651,8 @@ class _Agent:
         payload = {"model": self._model, "messages": self._messages,
                    "tools": _agent_tools(), "tool_choice": "auto",
                    "temperature": 0.2, "max_tokens": 4096}
+        if self._effort:
+            payload["reasoning"] = {"effort": self._effort}
         data = json.dumps(payload, ensure_ascii=False).encode()
         headers = {"Content-Type": "application/json"}
         if self._api_key:
@@ -1627,19 +1702,18 @@ class _Agent:
             if reply != "once":
                 return "error", (message or "the reviewer refused this command")
             try:
-                proc = subprocess.run(["bash", "-c", command], cwd=self._directory,
-                                      capture_output=True, text=True,
-                                      timeout=_bash_timeout())
+                returncode, out, err = _run_bash_group(command, self._directory,
+                                                       _bash_timeout())
             except subprocess.TimeoutExpired:
                 return "error", f"timed out after {_bash_timeout():g}s: {command}"
             except (OSError, ValueError) as exc:
                 return "error", f"{type(exc).__name__}: {exc}"
-            text = proc.stdout or ""
-            if proc.stderr:
-                text += ("\n" if text else "") + "stderr:\n" + proc.stderr
-            if proc.returncode:
-                text = f"exit {proc.returncode}\n" + text.strip()
-            return ("completed" if proc.returncode == 0 else "error"), text
+            text = out or ""
+            if err:
+                text += ("\n" if text else "") + "stderr:\n" + err
+            if returncode:
+                text = f"exit {returncode}\n" + text.strip()
+            return ("completed" if returncode == 0 else "error"), text
 
         path = str(args.get("path") or "")
         if not path or path.startswith("/") or ".." in path.split("/"):
@@ -1739,10 +1813,11 @@ def agent_loop(argv=None) -> int:
     parser.add_argument("--directory", required=True)
     parser.add_argument("--max-steps", type=int, default=24)
     parser.add_argument("--request-timeout", type=float, default=300.0)
+    parser.add_argument("--variant", default=None)
     args = parser.parse_args(argv)
     _Agent(args.base_url, os.environ.get("CONTEST_AGENT_API_KEY", ""), args.model,
            args.directory, max_steps=args.max_steps,
-           request_timeout=args.request_timeout).run()
+           request_timeout=args.request_timeout, variant=args.variant).run()
     return 0
 
 

@@ -637,7 +637,18 @@ class AutoController:
             commit_on_success=commit_helper,
         )
 
-        for task in pending:
+        # AUDIT-4: a task whose dependency is still queued later in this run is
+        # deferred to the end of the queue, not marked BLOCKED on sight. Plan
+        # order is not guaranteed to be topological (a hand-edited plan.json,
+        # a task added mid-run), and a BLOCKED task is never pending again —
+        # so one out-of-order dependency used to strand runnable work for good.
+        # ``stalled`` holds the tasks deferred since the last one that actually
+        # ran: meeting one of them again means nothing in the queue can unblock
+        # it (a cycle, or a dependency that is itself waiting), so it is blocked.
+        queue = list(pending)
+        stalled: set = set()
+        while queue:
+            task = queue.pop(0)
             # AUTO-A4: check caps BEFORE executing each task
             reason = self.check_caps(tasks_processed)
             if reason:
@@ -656,6 +667,14 @@ class AutoController:
                     failed_deps.append(dep_id)
 
             if failed_deps:
+                queued_ids = {t.get("id") for t in queue}
+                if (any(dep in queued_ids for dep in failed_deps)
+                        and task["id"] not in stalled):
+                    stalled.add(task["id"])
+                    queue.append(task)
+                    logger.info("Task %s deferred: dependencies %s are still "
+                                "queued in this run", task["id"], failed_deps)
+                    continue
                 reason_str = f"dependency not done: {', '.join(failed_deps)}"
                 logger.info("Task %s blocked by incomplete dependencies: %s",
                             task["id"], failed_deps)
@@ -665,6 +684,7 @@ class AutoController:
                     self.run_trace.log_task_blocked(task["id"], reason_str)
                 continue
 
+            stalled.clear()
             if self.run_trace:
                 self.run_trace.log_task_start(task["id"], task.get("title", ""))
 
@@ -751,6 +771,20 @@ class AutoController:
                     # With no sha, _invalidate_collect falls back to the task's
                     # target_files.
                     self._invalidate_collect(task["id"], collect_bridge, None)
+                elif self._commit_left_task_blocked(task, commit_result):
+                    # AUDIT-7: CommitOnSuccess found nothing staged behind a
+                    # no-op acceptance check and marked the task BLOCKED
+                    # (AUTO-CR-DELTA-2). That outcome used to fall through to
+                    # here as a success: counted done, logged "completed", and
+                    # regression checks run against a commit that never
+                    # happened — while plan.json said BLOCKED.
+                    self.state.log(
+                        f"task {task['id']} NOT counted done — nothing staged "
+                        f"and its acceptance_check is trivial (left BLOCKED)"
+                    )
+                    if self.run_trace:
+                        self.run_trace.log_task_blocked(
+                            task["id"], "nothing staged, trivial acceptance_check")
                 else:
                     tasks_done += 1
                     self.state.log(
@@ -898,6 +932,23 @@ class AutoController:
                 task_id, patch_path,
             )
         return str(patch_path)
+
+    def _commit_left_task_blocked(self, task: dict, commit_result) -> bool:
+        """True when the commit made nothing and left *task* BLOCKED (AUDIT-7).
+
+        Read from the state, the one record both sides share: the commit helper
+        writes BLOCKED there for a creative task with nothing staged and a
+        no-op check, and an older helper that never does leaves it as it was.
+        """
+        if commit_result is None or commit_result.sha:
+            return False
+        if commit_result.outcome != COMMIT_NOTHING_TO_COMMIT:
+            return False
+        try:
+            current = self.state.get_task(task["id"])
+        except Exception:  # noqa: BLE001 — an unreadable state is not a block
+            return False
+        return isinstance(current, dict) and current.get("status") == STATUS_BLOCKED
 
     def _commit_outcome(self, commit_helper, task: dict, result) -> "CommitResult":
         """Commit *task* and return the classified :class:`CommitResult` (B2).

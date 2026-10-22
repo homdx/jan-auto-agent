@@ -498,6 +498,45 @@ class GitManager:
         logger.info("commit: %s  (%s)", sha[:12], message)
         return sha
 
+    def commit_paths(self, message: str, paths) -> Optional[str]:
+        """Commit only *paths* (repo-relative or absolute under the repo) with
+        *message*; ``None`` when none of them has a change (AUDIT-8).
+
+        Nothing else in the tree or the index is touched: ``git commit --
+        <paths>`` commits exactly those paths. Used for the files the agent
+        itself rewrites right after a task's commit (synopsis.md, the story
+        bible), so they land under that task's id instead of being swept into
+        whichever task commits next.
+        """
+        repo = Path(self.repo_dir).resolve()
+        rels: list[str] = []
+        for raw in paths or ():
+            p = Path(raw)
+            if p.is_absolute():
+                try:
+                    p = p.resolve().relative_to(repo)
+                except (ValueError, OSError):
+                    continue
+            rel = p.as_posix()
+            if rel and rel not in rels and not rel.startswith(".agent/"):
+                rels.append(rel)
+        if not rels:
+            return None
+        changed = [
+            rel for rel in rels
+            if self._run(["git", "status", "--porcelain", "--", rel],
+                         "git status failed").strip()
+        ]
+        if not changed:
+            return None
+        self._run(["git", "add", "-A", "--", *changed], "git add failed")
+        self._run(["git", "commit", "-m", message, "--", *changed],
+                  "git commit failed")
+        sha = self._run(["git", "rev-parse", "HEAD"],
+                        "git rev-parse HEAD failed").strip()
+        logger.info("commit_paths: %s  (%s)", sha[:12], message)
+        return sha
+
     def commit_task(self, task_id: str, title: str) -> Optional[str]:
         """Commit all staged changes with the conventional auto-task message.
 

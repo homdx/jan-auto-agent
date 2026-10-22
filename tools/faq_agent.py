@@ -772,7 +772,11 @@ class FaqAgent:
         keeps the old unlimited behavior.
         """
         parts: list[str] = []
-        budget_chars = 0
+        # None = no limit (num_ctx unknown, or the estimate failed). AUDIT-16:
+        # a computed budget of 0 — a num_ctx no larger than the output
+        # reserve — used to read as "no limit" through ``if budget_chars``
+        # and appended the whole knowledge base; it is a real (tiny) limit.
+        budget_chars = None
         if self.num_ctx:
             try:
                 from tools.auto.utils import chars_per_token
@@ -780,13 +784,13 @@ class FaqAgent:
                 usable_tokens = max(0, self.num_ctx - (self.max_tokens or 1024) - 400)
                 budget_chars = int(usable_tokens * chars_per_token(sample))
             except Exception:
-                budget_chars = 0  # estimation failed → old unlimited behavior
+                budget_chars = None  # estimation failed → old unlimited behavior
 
         used = 0
         skipped: list[str] = []
         for i, (name, content) in enumerate(docs):
             block = f"=== {name} ===\n{content.strip()}"
-            if budget_chars and used + len(block) > budget_chars:
+            if budget_chars is not None and used + len(block) > budget_chars:
                 if not parts:
                     # The top doc is kept even when it alone exceeds the budget, with a warning (BUGFIX).
                     logger.warning(

@@ -237,6 +237,9 @@ class CommitOnSuccess:
             self._update_synopsis(task)
             # AUTO-CR-23-1: update story bible after synopsis (same chapter).
             self._update_story_bible(task)
+            # AUDIT-8: both hooks rewrite tracked files after the commit; left
+            # in the tree, the next task's stage_all() commits them under its id.
+            self._commit_memory_files(task_id, title)
         else:
             if self._task_mode == "creative" and self._is_trivial_acceptance_check(
                 task.get("acceptance_check")
@@ -316,6 +319,40 @@ class CommitOnSuccess:
             return True
         normalized = check.strip().rstrip(";").strip()
         return normalized in {"true", ":", "exit 0", "/bin/true"}
+
+    def _memory_file_paths(self) -> list:
+        """The files the synopsis / story-bible hooks write (AUDIT-8)."""
+        out = []
+        synopsis = getattr(self._summary_memory, "_synopsis_path", None)
+        if isinstance(synopsis, Path):
+            out.append(synopsis)
+        bible = getattr(self._story_bible, "_path", None)
+        if isinstance(bible, Path):
+            out.append(bible)
+            out.append(bible.with_suffix(bible.suffix + ".pending.json"))
+        return out
+
+    def _commit_memory_files(self, task_id: str, title: str) -> None:
+        """Commit what the post-commit hooks changed as a follow-up commit of
+        the same task (AUDIT-8). Never raises: a failure is logged, and the
+        files are then simply left in the tree as they were before this fix."""
+        if self._task_mode != "creative":
+            return
+        commit_paths = getattr(self._git, "commit_paths", None)
+        paths = self._memory_file_paths()
+        if not paths or not callable(commit_paths):
+            return
+        try:
+            sha = commit_paths(f"auto({task_id}): update story memory — {title}", paths)
+        except Exception as exc:  # noqa: BLE001 — never disrupt the task's outcome
+            logger.error(
+                "CommitOnSuccess: could not commit synopsis/story-bible updates "
+                "for task %s — %s (they stay in the working tree)", task_id, exc,
+            )
+            return
+        if isinstance(sha, str) and sha:
+            logger.info("CommitOnSuccess: story memory for %s committed → %s",
+                        task_id, sha[:12])
 
     # ── AUTO-CR-5: synopsis hook ─────────────────────────────────────────────
 

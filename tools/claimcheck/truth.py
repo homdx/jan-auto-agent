@@ -33,6 +33,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from tools import file_lock as _file_lock
+
 TRUTH_HEADER = ("finding", "truth", "checked_by", "duplicate_of", "how")
 #: a settled verdict and the ``truth`` it writes (`harvest_report.TRUTH_VALUES` holds both)
 TRUTH_OF = {"TRUE": "REAL", "FALSE": "FALSE"}
@@ -446,40 +448,12 @@ def locked(path: Path):
     time each read the file, merged and renamed: the later rename dropped the other's rows (4 processes of
     40 rows each left 44 of 160). The lock is on *path*'s directory (POSIX ``flock``; the file itself is
     replaced by each write, so a lock on it would be on the old file, and a lock file beside it would be
-    left in the operator's directory); on Windows on a sidecar ``.<name>.lock``. A symlink is followed."""
-    path = Path(path)
-    real = Path(os.path.realpath(path)) if path.is_symlink() else path
-    real.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt":
-        import msvcrt
-        with open(real.parent / f".{real.name}.lock", "a+b") as fh:
-            while True:
-                try:
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)    # tries for 10 s, then raises
-                    break
-                except OSError:
-                    continue
-            try:
-                yield
-            finally:
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        return
-    import fcntl
-    try:
-        fd = os.open(real.parent, os.O_RDONLY)
-    except OSError:
-        fd = None
-    try:
-        if fd is not None:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except OSError:
-                pass    # a filesystem with no lock on a directory (some network, WSL mounts): unlocked, as before
+    left in the operator's directory); on Windows on a sidecar ``.<name>.lock``. A symlink is followed.
+
+    AUDIT-13: the code is `tools.file_lock.locked` now; on Windows it no longer retries every
+    ``OSError`` forever — only contention, a bounded number of times."""
+    with _file_lock.locked(path):
         yield
-    finally:
-        if fd is not None:
-            os.close(fd)                # closing it lets the lock go
 
 
 def write_truth(path: Path, rows: list, *, append: bool = False) -> tuple:

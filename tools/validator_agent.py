@@ -232,9 +232,17 @@ class ValidatorAgent:
             return _err
 
         # Cap suggested_searches at max_hints, so the outer loop cannot widen the search scope.
-        if isinstance(parsed_result.get("suggested_searches"), list):
-            parsed_result["suggested_searches"] = \
-                parsed_result["suggested_searches"][:self.max_hints]
+        # AUDIT-17: only non-empty strings survive — a model that answers with
+        # numbers, nulls or objects in the list put unhashable / non-name values
+        # into the caller's refs, and the next search iteration raised on them.
+        # A value that is not a list at all is no suggestion.
+        _suggested = parsed_result.get("suggested_searches")
+        if isinstance(_suggested, list):
+            parsed_result["suggested_searches"] = [
+                s.strip() for s in _suggested if isinstance(s, str) and s.strip()
+            ][:self.max_hints]
+        elif "suggested_searches" in parsed_result:
+            parsed_result["suggested_searches"] = []
         # HARDEN-7 C: the `feedback` is a string by the time it leaves here,
         # whatever JSON type the model sent for it. Every caller does
         # `(validation.get("feedback") or "").strip()`, which raises

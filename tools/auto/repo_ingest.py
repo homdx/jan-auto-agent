@@ -245,6 +245,15 @@ class RepoIngestor:
         caller at all.
         """
         base = self.base_dir
+        # AUDIT-2: a file symlink whose target leaves the repository is not a
+        # source file of this repository. os.walk lists it among *filenames*
+        # (it does not follow directory links, but file links are reported
+        # like files), and every reader downstream — the collect scanner, the
+        # architect's ingest, the LLM summary pass — then read the target.
+        try:
+            base_real = Path(base).resolve()
+        except (OSError, RuntimeError):
+            base_real = Path(os.path.abspath(base))
         for dirpath, dirnames, filenames in os.walk(base):
             rel_dir = Path(dirpath).relative_to(base)
             depth   = len(rel_dir.parts)
@@ -273,6 +282,17 @@ class RepoIngestor:
 
                 abs_path = Path(dirpath) / fname
                 rel_posix = (rel_dir / fname).as_posix()
+                if abs_path.is_symlink():
+                    try:
+                        abs_path.resolve().relative_to(base_real)
+                    except (ValueError, OSError, RuntimeError):
+                        logger.warning(
+                            "walk: skipping %s — symlink resolves outside %s",
+                            rel_posix, base_real,
+                        )
+                        if self._collect_skips:
+                            self.skipped_files.append((rel_posix, "outside repo"))
+                        continue
                 if self._max_depth > 0 and depth > self._max_depth:
                     if self._collect_skips:
                         self.skipped_files.append((rel_posix, "too deep"))
