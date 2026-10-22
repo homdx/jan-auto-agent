@@ -20,6 +20,8 @@ import ast
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 from types import SimpleNamespace
 
 from tools.auto.coder import Coder
@@ -197,6 +199,7 @@ def test_a_guard_still_covers_an_untouched_case():
     assert got[("m.py:7", "x[-1]")] == "GUARDED"
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="`except*` is a SyntaxError before Python 3.11")
 def test_except_star_body_is_walked_like_try():
     src = ("def f(x):\n"
            "    if not x:\n"
