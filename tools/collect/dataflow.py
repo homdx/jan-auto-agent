@@ -45,6 +45,7 @@ guarantee this whole epic exists for.
 from __future__ import annotations
 
 import ast
+import threading
 from typing import Dict, List, Optional, Set, Tuple
 
 from tools.collect.ast_facts import _dotted_name
@@ -319,6 +320,24 @@ def _mutated_name_in_stmt(stmt: ast.stmt) -> set:
     return set()
 
 
+#: PERF (REL-2 follow-up): what `extract_guarded_accesses` knows while it walks one tree.
+#: `_names_stored_in` is asked about every statement of every function — 190 000 on this repo —
+#: and walked each one whole, a third of `scan_repo`. `no_walrus`: the tree has no walrus, so a
+#: simple statement binds a name only in its own targets (a comprehension's variable and a
+#: lambda's are not counted) and a head read binds none — those are all it needs to walk, for
+#: the same names. Unset (a direct call): the full walk.
+_EXTRACT = threading.local()
+
+#: A simple statement (or a `with` item) whose bound names, with no walrus in the tree, are its
+#: targets' alone.
+_TARGET_FIELDS: Dict[type, Tuple[str, ...]] = {
+    ast.Assign: ("targets",), ast.AugAssign: ("target",), ast.AnnAssign: ("target",),
+    ast.Expr: (), ast.Return: (), ast.Raise: (), ast.Assert: (), ast.Delete: (),
+    ast.Pass: (), ast.Break: (), ast.Continue: (), ast.Global: (), ast.Nonlocal: (),
+    ast.withitem: ("optional_vars",),
+}
+
+
 def _names_stored_in(node: ast.AST) -> Set[str]:
     """Every bare name *node* binds in the enclosing scope (REL-2).
 
@@ -329,6 +348,16 @@ def _names_stored_in(node: ast.AST) -> Set[str]:
     """
     names: Set[str] = set()
     stack: List[ast.AST] = [node]
+    fields = None
+    if getattr(_EXTRACT, "no_walrus", False):
+        if isinstance(node, ast.expr) and not isinstance(getattr(node, "ctx", None), ast.Store):
+            return names    # a head read (`if` test, `for` iter, `match` subject) binds nothing
+        fields = _TARGET_FIELDS.get(type(node))
+    if fields is not None:
+        stack = []
+        for field in fields:
+            value = getattr(node, field)
+            stack.extend(v for v in (value if isinstance(value, list) else [value]) if v is not None)
     while stack:
         cur = stack.pop()
         if isinstance(cur, ast.Lambda):
@@ -799,8 +828,19 @@ def extract_guarded_accesses(tree: ast.Module, module_path: str) -> List[Guarded
     text as a tiebreaker for same-line cases.
     """
     accesses: List[GuardedAccess] = []
+    functions: List[ast.AST] = []
+    walrus = False
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.append(node)
+        elif isinstance(node, ast.NamedExpr):
+            walrus = True
+    outer = getattr(_EXTRACT, "no_walrus", False)
+    _EXTRACT.no_walrus = not walrus
+    try:
+        for node in functions:
             accesses.extend(_FunctionGuardWalker(module_path).run(node))
+    finally:
+        _EXTRACT.no_walrus = outer
     accesses.sort(key=lambda g: (int(g.location.rsplit(":", 1)[-1]), g.access))
     return accesses
