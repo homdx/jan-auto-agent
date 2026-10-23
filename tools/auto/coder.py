@@ -2005,6 +2005,114 @@ class Coder(_llm_stream.LLMClientBase):
             return None, f"rejected a path inside .git: {rel!r}"
         return dest, ""
 
+    def _splice_partial_reply(self, rel: str, content: str) -> "str | None":
+        """*content* laid over the original of a Python file shown only in part, or ``None``.
+
+        REL-6 #59/#60: the model sees a big file as its imports, the symbols that fit and
+        ``# [name — N chars, not included]`` stubs, and returns a file built from that view.
+        Written as is, that dropped every module-level line it never saw (`TIMEOUT = 30`,
+        the `__main__` block) — and the guard below, which refuses a reply that keeps a stub
+        or drops an unseen symbol, refused both replies a model can write from the view, so
+        any edit of such a file ended BLOCKED. The reply is now spliced: the original's
+        segments in the original's order, each symbol and the import block taken from the
+        reply, a symbol the model never saw kept from the original, a shown symbol the reply
+        dropped deleted, and a new symbol or new module-level code put after what precedes it
+        in the reply. ``None`` — the guard then decides as before — when the file is not one
+        this can be sure of: not ``.py``, not parseable, a repeated top-level name, a chunk
+        not found where it was cut, or no view to rebuild.
+        """
+        views = getattr(self, "_partial_views", None) or {}
+        norm = rel.replace("\\", "/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        original = views.get(rel, views.get(norm))
+        if original is None or Path(rel).suffix.lower() != ".py":
+            return None
+        try:
+            budget = int(getattr(self, "_max_file_chars"))
+            view = select_relevant_chunks(chunk_file(original, ".py", budget),
+                                          getattr(self, "_partial_cited", None), budget)
+            hidden = {m.group(1) for m in _NOT_INCLUDED_STUB_RE.finditer(view)}
+            orig_segments = _python_segments(original)
+            reply_segments = _python_segments(content)
+        except Exception:  # noqa: BLE001 — no splice: the guard decides
+            return None
+        if orig_segments is None or reply_segments is None:
+            return None
+        reply_symbols = {name: text for kind, name, text in reply_segments if kind == "symbol"}
+        reply_imports = next((text for kind, _n, text in reply_segments if kind == "imports"), None)
+        orig_names = {name for kind, name, _t in orig_segments if kind == "symbol"}
+        # A module-level line the original already holds is not new — a reply that carries
+        # the whole file (the original replayed with one edit) must not double it.
+        orig_gap_lines = {ln.strip() for kind, _n, t in orig_segments if kind == "gap"
+                          for ln in t.splitlines()}
+
+        # Reply-only pieces (new symbols, new module-level code), each anchored to the
+        # original symbol or import block that precedes it in the reply.
+        inserts: "dict[str, list[str]]" = {}
+        anchor = "<imports>"
+        for kind, name, text in reply_segments:
+            if kind == "imports":
+                anchor = "<imports>"
+            elif kind == "symbol" and name in orig_names:
+                anchor = name
+            elif kind == "symbol":
+                inserts.setdefault(anchor, []).append(text)
+            else:   # a gap of the reply: a stub moves the anchor to the symbol it stands for;
+                    # what is left, but a "..." note or a blank line, is new code
+                kept: list[str] = []
+                for ln in text.splitlines(keepends=True):
+                    stub = _NOT_INCLUDED_STUB_RE.match(ln.rstrip("\r\n"))
+                    if (stub is not None or not ln.strip() or re.match(r"^\s*#\s*\.\.\.", ln)
+                            or ln.strip() in orig_gap_lines):
+                        if stub is not None and stub.group(1) in orig_names:
+                            if kept:
+                                inserts.setdefault(anchor, []).append("".join(kept))
+                                kept = []
+                            anchor = stub.group(1)
+                        continue
+                    kept.append(ln)
+                if kept:
+                    inserts.setdefault(anchor, []).append("".join(kept))
+
+        def _block(text: str) -> str:
+            return text if text.endswith("\n") else text + "\n"
+
+        out: list[str] = []
+        dropped = False
+        for kind, name, text in orig_segments:
+            if kind == "gap" and dropped and not text.strip():
+                dropped = False                 # the blank lines after a deleted symbol go too
+                continue
+            dropped = False
+            if kind == "imports":
+                if reply_imports is None or reply_imports.strip() == text.strip():
+                    out.append(text)
+                else:   # the reply's imports, with the original's blank lines after them
+                    out.append(reply_imports.rstrip() + text[len(text.rstrip()):])
+                key = "<imports>"
+            elif kind == "symbol":
+                if name in reply_symbols:
+                    out.append(_block(reply_symbols[name]))
+                elif name in hidden:
+                    out.append(text)            # never shown: kept as it was
+                else:
+                    dropped = True              # shown and left out: deleted on purpose
+                key = name
+            else:
+                out.append(text)                # module-level code the view never showed
+                continue
+            for piece in inserts.pop(key, []):
+                out.append("\n\n" + _block(piece))
+        for pieces in inserts.values():         # an anchor that is gone: at the end
+            out.extend("\n\n" + _block(piece) for piece in pieces)
+        spliced = "".join(out)
+        try:
+            ast.parse(spliced)
+        except SyntaxError:
+            return None
+        return spliced
+
     def _partial_view_error(self, rel: str, content: str, dest: Path) -> str:
         """``""``, or why *content* may not replace a file shown only in part.
 
@@ -2243,7 +2351,15 @@ class Coder(_llm_stream.LLMClientBase):
             except OSError:
                 pass
 
-            # Guard 2.8 (AUDIT3-1): a file the prompt showed only in part.
+            # Guard 2.8 (AUDIT3-1): a file the prompt showed only in part. REL-6 #59/#60: a
+            # Python reply is first spliced over the original, so what the model never saw
+            # stays; the guard then checks the result.
+            try:
+                _spliced = self._splice_partial_reply(rel, content) if dest.is_file() else None
+            except OSError:
+                _spliced = None
+            if _spliced is not None:
+                content = _spliced
             partial_err = self._partial_view_error(rel, content, dest)
             if partial_err:
                 logger.error("coder._write_files [%s]: %s", task_id, partial_err)
@@ -2535,6 +2651,48 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
 
 #: A symbol `select_relevant_chunks` left out of a partial view (CC review fixes 49).
 _NOT_INCLUDED_STUB_RE = re.compile(r"(?m)^# \[(.+?) — \d+ chars, not included\]$")
+
+
+def _python_segments(source: str) -> "list[tuple[str, str, str]] | None":
+    """*source* cut into ``(kind, name, text)`` pieces that join back to it exactly.
+
+    ``kind`` is ``"imports"`` (the leading block `chunk_file` shows), ``"symbol"`` (a
+    top-level def or class, decorators included) or ``"gap"`` (any other module-level
+    text). ``None`` when the source does not parse, a top-level name repeats, or a block
+    cannot be placed — the splice that reads this then does not run (REL-6 #59).
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for ln in lines:
+        offsets.append(offsets[-1] + len(ln))
+    chunks = chunk_file(source, ".py", 0) if source else []
+    imports = next((c["content"] for c in chunks if c.get("is_import")), "")
+    if not source.startswith(imports):
+        return None
+    segments: "list[tuple[str, str, str]]" = [("imports", "imports", imports)] if imports else []
+    pos = len(imports)
+    seen: set = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if node.name in seen or node.end_lineno is None:
+            return None
+        seen.add(node.name)
+        first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+        start, end = offsets[first - 1], offsets[node.end_lineno]
+        if start < pos:
+            return None
+        if start > pos:
+            segments.append(("gap", "", source[pos:start]))
+        segments.append(("symbol", node.name, source[start:end]))
+        pos = end
+    if pos < len(source):
+        segments.append(("gap", "", source[pos:]))
+    return segments
 
 
 def select_relevant_chunks(

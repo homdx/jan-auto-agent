@@ -132,7 +132,7 @@ def main():
         # --- dedupe against what is already on disk --------------------------
         existed = os.path.exists(out) and os.path.getsize(out) > 0
         if existed and not a["allow_duplicate"]:
-            with open(out, newline="", encoding="utf-8") as fh:
+            with open(out, newline="", encoding="utf-8-sig") as fh:   # REL-2: a spreadsheet's BOM
                 for prev in csv.DictReader(fh):
                     if (prev.get("file"), prev.get("symbol")) == (row["file"], row["symbol"]):
                         print(f"skipped: {row['file']}::{row['symbol']} is already recorded "

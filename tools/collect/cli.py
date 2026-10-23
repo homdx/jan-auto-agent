@@ -1410,6 +1410,17 @@ def _normalize_module_path(
             f"--module path escapes the project root {root}: {raw!r}"
         )
     rel = normalized.replace(os.sep, "/")
+    # REL-2: a file under a directory the walk skips (`node_modules/`, a `[collect]
+    # skip_dirs` entry, a hidden `.dir/`) is never a module of the tree — patched in, it
+    # showed in MODULE_MAP and every query and made `check` report stale until the next
+    # full `--collect` dropped it again. The same name test as `manifest._walk`.
+    skip = manifest_mod.effective_skip_dirs(config)
+    for part in rel.split("/")[:-1]:
+        if part in skip or part.startswith("."):
+            raise CollectCliError(
+                f"--module path {raw!r} is under {part!r}/, a directory the collect walk "
+                f"skips ([collect] skip_dirs or a hidden directory) — refusing to patch it in"
+            )
     if language_for(rel, config) is None:
         raise CollectCliError(
             f"--module path {raw!r} (normalized: {rel!r}) has an extension "

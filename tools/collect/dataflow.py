@@ -319,6 +319,63 @@ def _mutated_name_in_stmt(stmt: ast.stmt) -> set:
     return set()
 
 
+def _names_stored_in(node: ast.AST) -> Set[str]:
+    """Every bare name *node* binds in the enclosing scope (REL-2).
+
+    A `Name` in a store context — an annotated, tuple, starred or augmented target, a
+    `with … as`, a walrus anywhere, a walrus inside a comprehension too — but not a
+    comprehension's own loop variable and nothing inside a lambda, which bind in a scope
+    of their own.
+    """
+    names: Set[str] = set()
+    stack: List[ast.AST] = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, ast.Lambda):
+            continue
+        if isinstance(cur, ast.comprehension):
+            stack.append(cur.iter)
+            stack.extend(cur.ifs)
+            stack.extend(n.value for n in ast.walk(cur.target) if isinstance(n, ast.NamedExpr))
+            continue
+        if isinstance(cur, ast.Name) and isinstance(cur.ctx, ast.Store):
+            names.add(cur.id)
+        stack.extend(ast.iter_child_nodes(cur))
+    return names
+
+
+def _stmt_bound_names(stmt: ast.stmt) -> Set[str]:
+    """The names *stmt* itself rebinds or empties, not counting its nested statement lists.
+
+    REL-2: only `x = …`, a `for x` target and a few mutators were known, so a guard on
+    `items` outlived `items: list = []`, `items, other = [], 1`, `a, *items = …`,
+    `items[:] = []`, `items *= 0`, `with open(p) as items`, `except E as items`,
+    `(items := [])` in any head, `import os as items`, `def items` and `class items` —
+    and `items[0]` after it was reported GUARDED, which refutes a true crash claim.
+    """
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {stmt.name}
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return {a.asname or a.name.split(".")[0] for a in stmt.names if a.name != "*"}
+    names: Set[str] = set()
+    for src in _own_scan_sources(stmt):
+        names |= _names_stored_in(src)
+    for handler in getattr(stmt, "handlers", None) or []:
+        if handler.name:
+            names.add(handler.name)
+    targets: List[ast.AST] = []
+    if isinstance(stmt, ast.Assign):
+        targets = list(stmt.targets)
+    elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
+        targets = [stmt.target]
+    for target in targets:
+        # `items[:] = []` empties the list in place; `items[0] = v` does not.
+        if (isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Slice)
+                and isinstance(target.value, ast.Name)):
+            names.add(target.value.id)
+    return names
+
+
 def _own_scan_sources(stmt: ast.stmt) -> List[ast.AST]:
     """AST nodes `_record_accesses_in_stmt` should scan for `stmt` itself.
 
@@ -395,7 +452,17 @@ def _rebound_names_in(
     aliases: Dict[str, str] = dict(_inherited_aliases) if _inherited_aliases else {}
     for s in stmts:
         if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue  # separate dataflow scope — a rebind there is irrelevant here
+            # separate dataflow scope — a rebind there is irrelevant here; the def's own
+            # name is a rebind in this one (REL-2)
+            if not isinstance(s, ast.Lambda):
+                names.add(s.name)
+                aliases.pop(s.name, None)
+            continue
+        for bound in _stmt_bound_names(s):
+            names.add(bound)
+            if not (isinstance(s, ast.Assign) and len(s.targets) == 1
+                    and isinstance(s.targets[0], ast.Name) and s.targets[0].id == bound):
+                aliases.pop(bound, None)
         if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
             names.add(s.targets[0].id)
             target = s.targets[0].id
@@ -515,6 +582,15 @@ class _FunctionGuardWalker:
         as a loop variable survived the loop as stale, unlike its
         recursive sibling `_rebound_names_in` (fixed alongside this).
         """
+        # REL-2: every other way the statement binds or empties a name, first.
+        for bound in _stmt_bound_names(stmt):
+            guarded_names.discard(bound)
+            guard_desc.pop(bound, None)
+            for pair in {p for p in guarded_pairs if p[0] == bound}:
+                guarded_pairs.discard(pair)
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == bound):
+                self._aliases.pop(bound, None)
         if isinstance(stmt, (ast.For, ast.AsyncFor)) and isinstance(stmt.target, ast.Name):
             target = stmt.target.id
             guarded_names.discard(target)
@@ -616,7 +692,9 @@ class _FunctionGuardWalker:
     ) -> None:
         for stmt in stmts:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-                continue  # separate dataflow scope — handled on its own pass
+                # separate dataflow scope — handled on its own pass; its name rebinds here (REL-2)
+                self._invalidate_reassigned(stmt, guarded_names, guarded_pairs, guard_desc)
+                continue
 
             self._record_accesses_in_stmt(stmt, guarded_names, guard_desc)
             self._invalidate_reassigned(stmt, guarded_names, guarded_pairs, guard_desc)

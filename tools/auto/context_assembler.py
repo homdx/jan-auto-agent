@@ -53,7 +53,8 @@ _INSTRUCTION_OVERHEAD_TOKENS = 300
 
 # Section markers in synopsis.md (AUTO-CR-5); read-only, so the assembler works without the synopsis.
 _SECTION_RE = re.compile(
-    r"<!--\s*BEGIN\s+(?P<name>\S+)\s*-->(?P<body>.*?)<!--\s*END\s+(?P=name)\s*-->",
+    # REL-6 #53: the same pattern as summary_memory's — a name may hold spaces.
+    r"<!--[^\S\n]*BEGIN[^\S\n]+(?P<name>[^\r\n]+?)[^\S\n]*-->(?P<body>.*?)<!--[^\S\n]*END[^\S\n]+(?P=name)[^\S\n]*-->",
     re.DOTALL,
 )
 

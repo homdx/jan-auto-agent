@@ -98,6 +98,7 @@ def _normalise(text: str) -> str:
 
 
 _WORD_TABLE = str.maketrans({c: " " for c in string.punctuation})
+_re_non_word = re.compile(r"[^\w\s]+")
 
 
 def _normalise_words(text: str) -> str:
@@ -107,7 +108,10 @@ def _normalise_words(text: str) -> str:
     matched across words: "Ann is old." ('annisold') sat inside "Hannis Oldman
     was the mayor…" ('hannisoldman…') and the fact was deleted from the bible.
     """
-    return " ".join(text.lower().translate(_WORD_TABLE).split())
+    # REL-2: every Unicode punctuation and symbol mark is a boundary, not only ASCII —
+    # «Анна», “Anna”, "Москве…" and "Paris—since" kept the mark on the word, so a fact
+    # that is a sub-phrase of a longer one was no longer seen inside it.
+    return " ".join(_re_non_word.sub(" ", text.lower().translate(_WORD_TABLE)).split())
 
 
 def _parse_bullets(text: str) -> list[str]:
@@ -700,9 +704,10 @@ class StoryBible:
             text = text.replace("\r\n", "\n").replace("\n", eol)
         encoding = _first_codec_holding(encodings, text)
         if encoding is None:
-            logger.error("StoryBible: the update holds characters %s's codec (%s) "
-                         "cannot store — left untouched", self._path, encodings[0])
-            return
+            # REL-2: as the synopsis — the update is written as UTF-8, not dropped.
+            logger.warning("StoryBible: the update holds characters %s's codec (%s) "
+                           "cannot store — the bible is rewritten as UTF-8", self._path, encodings[0])
+            encoding = "utf-8"
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             # The bible is rewritten whole on every update, so the write is atomic: a kill mid-write cannot leave a half-written bible (bugfix).

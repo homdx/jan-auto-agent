@@ -75,7 +75,9 @@ def recorded(progress_path):
         return {}
     # A file that will not decode, has an over-limit csv field, or contains a NUL byte reads as empty, as `run start`'s intake and the harvest read it.
     try:
-        with open(progress_path, newline="", encoding="utf-8") as fh:
+        # REL-2: utf-8-sig — with a spreadsheet's BOM the first header was "\ufeffticket",
+        # every row's ticket read as None, and recorded tickets were handed out again.
+        with open(progress_path, newline="", encoding="utf-8-sig") as fh:
             text = fh.read()
         if "\x00" in text:  # newer csv modules parse a NUL; older ones raise
             return {}

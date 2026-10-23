@@ -84,7 +84,9 @@ _SUMMARISE_OVERHEAD_TOKENS = 200
 _SECTION_BEGIN = "<!-- BEGIN {name} -->"
 _SECTION_END   = "<!-- END {name} -->"
 _SECTION_RE = re.compile(
-    r"<!--\s*BEGIN\s+(?P<name>\S+)\s*-->(?P<body>.*?)<!--\s*END\s+(?P=name)\s*-->",
+    # REL-6 #53: a name may hold spaces ("My Novel/chapter_01.md") — `\S+` wrote such a
+    # section and never read it back, so there was no STORY SO FAR.
+    r"<!--[^\S\n]*BEGIN[^\S\n]+(?P<name>[^\r\n]+?)[^\S\n]*-->(?P<body>.*?)<!--[^\S\n]*END[^\S\n]+(?P=name)[^\S\n]*-->",
     re.DOTALL,
 )
 
@@ -714,12 +716,16 @@ class SummaryMemory:
             new_content = new_content.replace("\n", eol)
         encoding = _first_codec_holding(encodings, new_content)
         if encoding is None:
-            logger.error(
+            # REL-2: an arrow, a minus sign or an emoji in a summary is common, and no legacy
+            # codec of the list holds it; the section was dropped and the chapter left a hole
+            # in the continuity memory for good. The text is already decoded, so the whole
+            # file is written as UTF-8 instead, with its own line ends.
+            logger.warning(
                 "SummaryMemory: the section for %s holds characters %s's own codec "
-                "(%s) cannot store — left untouched", chapter_file,
+                "(%s) cannot store — the synopsis is rewritten as UTF-8", chapter_file,
                 self._synopsis_path, encodings[0],
             )
-            return
+            encoding = "utf-8"
         try:
             self._synopsis_path.parent.mkdir(parents=True, exist_ok=True)
             # The synopsis is written atomically, so a kill mid-write cannot leave an incomplete continuity context (bugfix).
@@ -746,6 +752,14 @@ def _read_in_own_codec(path: Path, *, lossy_ok: bool = False):
     never written back.
     """
     raw = Path(path).read_bytes()
+    # REL-2: a UTF-16 file (PowerShell's `>` writes one) was probed as cp1251, which decodes
+    # almost any byte, and the new section went in as single bytes between the UTF-16 ones.
+    # Its BOM names it; the BOM stays a `\ufeff` character and is written back the same way.
+    for bom, codec in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+        if raw.startswith(bom) and not raw.startswith(b"\xff\xfe\x00\x00"):
+            text = raw.decode(codec, errors="replace" if lossy_ok else "strict")
+            eol = "\r\n" if "\r\n" in text else "\n"
+            return text.replace("\r\n", "\n"), (codec,), eol
     try:
         from tools.actions import _edit_write_encodings
         encodings = tuple(_edit_write_encodings(str(path))) or ("utf-8",)

@@ -257,6 +257,35 @@ _DEFAULT_MAX_FILE_CHARS    = 4000
 _DEFAULT_MAX_FILES_PER_REVIEW = 6
 
 
+# REL-2: the spellings a model cites a code symbol in — `f()`, `A.m(self)`, `` `f` ``,
+# `def f`, `A::m`, `A#m` — each read as the bare (dotted) name. Gate 1's existence check
+# looked the spelling up as it stood, found no `f()`, and dropped a real candidate as a
+# hallucinated anchor before the presence check. Each rewrite applies only when what is
+# left is an identifier, so a docs heading like "Install (Linux)" is kept as written.
+_SYMBOL_IDENT = r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*"
+_SYMBOL_QUOTED = _re.compile(r"^([`'\"])(.+)\1$")
+_SYMBOL_KEYWORD = _re.compile(
+    r"^(?:async\s+def|def|class|interface|enum|record)\s+(" + _SYMBOL_IDENT + r"(?:\(.*\))?)$")
+_SYMBOL_CALL = _re.compile(r"^(" + _SYMBOL_IDENT + r")\([^()]*\)$")   # "Install (Linux)" is a heading
+_SYMBOL_SEPARATORS = _re.compile(r"^[A-Za-z_$][\w$]*(?:(?:::|#|\.)[A-Za-z_$][\w$]*)+$")
+
+
+def _normalise_cited_symbol(symbol: str) -> str:
+    """*symbol* without the quotes, keyword, call parentheses or ``::``/``#`` a model added."""
+    m = _SYMBOL_QUOTED.match(symbol)
+    if m:
+        symbol = m.group(2).strip()
+    m = _SYMBOL_KEYWORD.match(symbol)
+    if m:
+        symbol = m.group(1)
+    m = _SYMBOL_CALL.match(symbol)
+    if m:
+        symbol = m.group(1)
+    if _SYMBOL_SEPARATORS.match(symbol):
+        symbol = symbol.replace("::", ".").replace("#", ".")
+    return symbol
+
+
 # Data model
 
 @dataclass
@@ -299,7 +328,7 @@ class CitedLocation:
         if self.symbol is None:
             return
         if isinstance(self.symbol, str):
-            self.symbol = self.symbol.strip() or None
+            self.symbol = _normalise_cited_symbol(self.symbol.strip()) or None
             return
         logger.debug(
             "CitedLocation: discarding non-string symbol %r (%s) for "
@@ -1702,23 +1731,38 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            # Salvage the complete objects from a truncated array instead of discarding every candidate (AUTO-CR-11).
-            salvaged = _salvage_json_objects(stripped)
-            if salvaged:
-                truncated = True
-                logger.warning(
-                    "_parse_candidates [%s]: array was truncated (%s) — "
-                    "salvaged %d complete task object(s) from the prefix.",
-                    cluster_name, exc, len(salvaged),
-                )
-                data = salvaged
-            else:
-                # Nothing salvageable (empty, degenerate or not JSON): flagged so the same request is retried, not a smaller one (AUTO-H5).
-                logger.warning(
-                    "_parse_candidates [%s]: JSON decode failed: %s\nRaw text: %.400s",
-                    cluster_name, exc, text,
-                )
-                return [], False, True
+            # REL-2: a complete array with prose around it ("Here are the tasks: [...]", a
+            # one-line ```json [...]``` fence) is read whole. It went to the salvage below,
+            # which set `truncated`, and the cluster was re-asked for fewer tasks.
+            data = _first_complete_json_array(stripped)
+            if data is None:
+                # Salvage the complete objects from a truncated array instead of discarding every candidate (AUTO-CR-11).
+                salvaged = _salvage_json_objects(stripped)
+                if salvaged:
+                    truncated = True
+                    logger.warning(
+                        "_parse_candidates [%s]: array was truncated (%s) — "
+                        "salvaged %d complete task object(s) from the prefix.",
+                        cluster_name, exc, len(salvaged),
+                    )
+                    data = salvaged
+                else:
+                    # Nothing salvageable (empty, degenerate or not JSON): flagged so the same request is retried, not a smaller one (AUTO-H5).
+                    logger.warning(
+                        "_parse_candidates [%s]: JSON decode failed: %s\nRaw text: %.400s",
+                        cluster_name, exc, text,
+                    )
+                    return [], False, True
+
+        if isinstance(data, dict):
+            # REL-2: {"tasks": [...]} and a single task object are the answer too — they
+            # were "unsalvageable" and re-asked with a higher temperature.
+            lists = [v for v in data.values()
+                     if isinstance(v, list) and v and all(isinstance(x, dict) for x in v)]
+            # A lone object is a task only with a cited location; anything else (`{"title":
+            # "not an array at all"}`) stays the non-array the plain retry is for (AUTO-H5).
+            data = data.get("tasks") if isinstance(data.get("tasks"), list) else (
+                lists[0] if lists else [data] if "cited_location" in data else data)
 
         if not isinstance(data, list):
             # Valid JSON that is not an array: unsalvageable, since there is no per-item content to extract.
@@ -2443,6 +2487,41 @@ def _to_str_or_empty(val: Any) -> str:
     return val.strip() if isinstance(val, str) else ""
 
 
+def _first_complete_json_array(text: str):
+    """The first complete JSON array of task objects in *text*, or ``None`` (REL-2).
+
+    ``raw_decode`` from each ``[`` in turn, at most 32 tries, so prose before or after the
+    answer and a one-line fence do not hide it. An array counts when every item is an
+    object (an empty one only when the text holds no object at all), so a task's own
+    ``"files": []`` is not taken for the answer. An answer that opens with an object — no
+    ``[`` before its first ``{`` — is that object. A cut-off array decodes nowhere, and
+    since its ``[`` comes first, ``None`` is returned and the salvage keeps the case.
+    """
+    decoder = json.JSONDecoder()
+
+    def _decode(idx):
+        try:
+            return decoder.raw_decode(text, idx)[0]
+        except json.JSONDecodeError:
+            return None
+
+    idx, tries = text.find("["), 0
+    while idx != -1 and tries < 32:
+        value = _decode(idx)
+        if isinstance(value, list):
+            if value and all(isinstance(v, dict) for v in value):
+                return value
+            if not value and "{" not in text:
+                return value
+        idx, tries = text.find("[", idx + 1), tries + 1
+    brace, bracket = text.find("{"), text.find("[")
+    if brace != -1 and (bracket == -1 or brace < bracket):
+        value = _decode(brace)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def _to_bool_or(val: Any, default: bool = False) -> bool:
     """Coerce *val* to bool, treating common string spellings sensibly.
 
@@ -2458,5 +2537,13 @@ def _to_bool_or(val: Any, default: bool = False) -> bool:
     if val is None:
         return default
     if isinstance(val, str):
-        return val.strip().lower() not in ("false", "no", "0", "")
+        # REL-2: a whitelist. The blacklist read "none", "null", "n/a" and "off" as True, so a
+        # hallucinated path with no anchor became an accepted "new file" task, exempt from
+        # Gate 1's existence check. An unknown spelling is *default*, never True by accident.
+        low = val.strip().lower()
+        if low in ("true", "yes", "y", "1", "on"):
+            return True
+        if low in ("false", "no", "n", "0", "off", "", "none", "null", "nil", "n/a", "na", "f"):
+            return False
+        return default
     return bool(val)

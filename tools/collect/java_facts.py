@@ -248,6 +248,7 @@ def _walk_type_body(
     symbols: List[FunctionRecord],
     *,
     member_default_access: str = "package-private",
+    in_enum: bool = False,
 ) -> None:
     for child in body_node.children:
         if child.type in _TYPE_DECL_TYPES:
@@ -256,8 +257,12 @@ def _walk_type_body(
                 default_access=member_default_access,
             )
         elif child.type in _METHOD_DECL_TYPES:
+            # REL-1 #4: an enum's constructor is implicitly private (JLS §8.9.2) — it was
+            # reported package-private.
+            default = ("private" if in_enum and child.type == "constructor_declaration"
+                       else member_default_access)
             _record_method_decl(
-                child, module_path, containing_qualname, symbols, default_access=member_default_access
+                child, module_path, containing_qualname, symbols, default_access=default
             )
         elif child.type == _COMPACT_CONSTRUCTOR:
             _record_compact_constructor(
@@ -273,7 +278,7 @@ def _walk_type_body(
             # loses every member after the constants.
             _walk_type_body(
                 child, module_path, containing_qualname, symbols,
-                member_default_access=member_default_access,
+                member_default_access=member_default_access, in_enum=in_enum,
             )
         # Other members (fields, blocks, comments) are not tracked and are not recursed into.
 
@@ -393,7 +398,8 @@ def _record_type_decl(
             "public" if node.type in ("interface_declaration", "annotation_type_declaration")
             else "package-private"
         )
-        _walk_type_body(body, module_path, qualname, symbols, member_default_access=member_default)
+        _walk_type_body(body, module_path, qualname, symbols, member_default_access=member_default,
+                        in_enum=node.type == "enum_declaration")
 
 
 def _record_method_decl(

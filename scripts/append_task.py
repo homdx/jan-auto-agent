@@ -75,7 +75,7 @@ def main():
     with file_lock.locked(a.progress):
         existed = os.path.exists(a.progress) and os.path.getsize(a.progress) > 0
         if existed and not a.allow_duplicate:
-            with open(a.progress, newline="", encoding="utf-8") as fh:
+            with open(a.progress, newline="", encoding="utf-8-sig") as fh:   # REL-2: a spreadsheet's BOM
                 for prev in csv.DictReader(fh):
                     if (prev.get("ticket") or "").strip() == row["ticket"]:
                         print(f"skipped: {row['ticket']} is already recorded as "
@@ -101,7 +101,7 @@ def main():
             os.fsync(fh.fileno())
 
     # rows, not lines: a note may hold a quoted line break
-    with open(a.progress, newline="", encoding="utf-8") as fh:
+    with open(a.progress, newline="", encoding="utf-8-sig") as fh:
         n = sum(1 for _ in csv.DictReader(fh))
     print(f"recorded #{n}: {row['outcome']} {row['ticket']}"
           + (f" @ {row['commit']}" if row["commit"] else "") + f" -> {a.progress}")
