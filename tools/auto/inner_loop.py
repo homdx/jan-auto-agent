@@ -1392,7 +1392,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     #: timeline." put the order on the approval's own line, so a later-line scan never saw
     #: it, and "No issues; REVISE: fix X." was approved the same way.
     _EN_AFTER_STOP = _re.compile(r"(?:^|[.!?;]\s+|\n)")
-    _EN_SENTENCE_STOP = _re.compile(r"[.!?]+(?=\s+\S)")
+    _EN_SENTENCE_STOP = _re.compile(r"(?<![.!?])[.!?]+(?![.!?])(?=\s+\S)")  # a run is tried from its start only: linear on "…….…"
 
     #: The words a creative validator opens an approval with. HARDEN-17 A: the parser
     #: returned on `APPROVED` and `OK` and failed open for everything else, so "Looks good,
@@ -1663,9 +1663,9 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
 
     #: REP-VERDICT A: what can follow the APPROVED / OK token and take the approval back.
     _EN_APPROVED_TOKEN = _re.compile(r"^(?:APPROVED|OK\b)")
-    _EN_APPROVED_NEGATED = _re.compile(r"^[^\S\n]*[:=\-–—]?[^\S\n]*(NO|NOT|NOPE|FALSE|N)\b")
+    _EN_APPROVED_NEGATED = _re.compile(r"^[^\S\n]*(?:[:=\-–—][^\S\n]*)?(NO|NOT|NOPE|FALSE|N)\b")
     _EN_APPROVED_CONDITION = _re.compile(
-        r"^[^\S\n]*[,;:.—–-]?[^\S\n]*(?:IF|ONCE|PROVIDED|UNLESS|PENDING|CONDITIONAL(?:LY)?|"
+        r"^[^\S\n]*(?:[,;:.—–-][^\S\n]*)?(?:IF|ONCE|PROVIDED|UNLESS|PENDING|CONDITIONAL(?:LY)?|"
         r"ON\s+CONDITION)\b")
     _EN_TAKE_BACK = _re.compile(r"^(?:ACTUALLY|ON\s+SECOND\s+THOUGHT|WAIT)\b[\s,:;—–-]*(?:NO|NOT)\b")
 

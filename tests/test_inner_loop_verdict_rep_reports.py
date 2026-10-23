@@ -55,3 +55,16 @@ def test_wrapped_reason_drops_the_wrapper():
 ])
 def test_plain_and_wrapped_approvals_stay_approvals(reply):
     assert _parse_verdict_soft(reply) == (True, "", False)
+
+
+@pytest.mark.parametrize("head", ["APPROVED", "OK", "Approved:", "APPROVED. "])
+@pytest.mark.parametrize("filler", [" ", "\t", ".", "!"])
+def test_a_long_run_after_the_approval_token_is_parsed_in_linear_time(head, filler):
+    """REP-VERDICT: 20 000 repeats behind APPROVED / OK must not make the verdict scan quadratic."""
+    import time
+    from tools.auto.inner_loop import _parse_verdict_soft
+
+    for text in (head + filler * 20000, head + filler * 20000 + "x"):
+        start = time.monotonic()
+        _parse_verdict_soft(text)
+        assert time.monotonic() - start < 2.0
