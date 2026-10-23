@@ -36,6 +36,15 @@ if str(ROOT) not in sys.path:
 _PYCACHE_PREFIX = str(Path(tempfile.gettempdir()) / ROOT.name)
 sys.pycache_prefix = _PYCACHE_PREFIX
 os.environ.setdefault("PYTHONPYCACHEPREFIX", _PYCACHE_PREFIX)
+# TEST-SPEED-1: under PYTHONDONTWRITEBYTECODE (or `-B`; Claude Code sets the variable for every
+# command it runs) a Python with a prefix reads .pyc under the prefix alone and never writes one
+# there, so in a checkout whose prefix was still empty — a fresh worktree, /tmp after a reboot —
+# every child python (each judge cell's pytest, each `python3 -c`) compiled pytest and the stdlib
+# from source at every start: 0.55 s, not 0.10 s, and the suite ran 326 s, not ~200 s. Writing
+# under our own prefix keeps the checkout as clean as not writing at all, so the run writes there.
+if os.environ.get("PYTHONPYCACHEPREFIX") == _PYCACHE_PREFIX:
+    sys.dont_write_bytecode = False
+    os.environ.pop("PYTHONDONTWRITEBYTECODE", None)
 
 
 # Cache scan_repo(REPO_ROOT) per test session: only this exact root with no config; tmp_path trees and explicit configs always rescan.
