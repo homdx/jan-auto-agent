@@ -59,6 +59,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 import logging
+from tools import file_lock
 from tools.auto.utils import _ts, atomic_write_text, safe_filename_component
 from pathlib import Path
 from typing import Any, Optional
@@ -190,7 +191,10 @@ class TicketStore:
     """Manages ticket persistence under *tickets_dir*.
 
     Each ticket is stored as ``<tickets_dir>/<ticket-id>.json``.  All writes
-    are atomic at the JSON level (full file rewrite on every mutation).
+    are atomic at the JSON level (full file rewrite on every mutation), and an
+    :meth:`update` holds :func:`tools.file_lock.locked` around its read-merge-write,
+    so two overlapping updates of one ticket do not revert each other (on POSIX;
+    on Windows the lock is the sidecar file of ``file_lock``).
 
     Parameters
     ----------
@@ -430,35 +434,44 @@ class TicketStore:
         if not path.exists():
             raise TicketNotFound(f"Ticket '{ticket_id}' not found")
 
-        try:
-            ticket = self._read(path)
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
-            self._quarantine(path, str(exc))
-            raise TicketSchemaError(
-                f"Ticket '{ticket_id}' is corrupt ({exc}) — quarantined"
-            ) from exc
-        # A wrong-shape file raises the documented schema error, not an attribute error (AUTO-FIX).
-        if not isinstance(ticket, dict):
-            self._quarantine(
-                path, f"expected a JSON object, got {type(ticket).__name__}"
-            )
-            raise TicketSchemaError(
-                f"Ticket '{ticket_id}' is corrupt (expected a JSON object, "
-                f"got {type(ticket).__name__}) — quarantined"
-            )
-        # Protect immutable fields
-        fields.pop("id", None)
-        fields.pop("created_at", None)
-        ticket.update(fields)
-        ticket["updated_at"] = _ts()
-        _validate(ticket)
-        # Update converts write failures to TicketError, as create does (AUTO-T37, BUGFIX).
-        try:
-            self._write(path, ticket)
-        except OSError as exc:
-            raise TicketError(
-                f"Could not write ticket '{ticket_id}' to {path}: {exc}"
-            ) from exc
+        # REL-5 TK-1: the read-merge-write is one step under the shared lock. Each write was
+        # atomic but the update was not: an `update_status` and an `update_body` that overlapped
+        # wrote back each other's old copy of the other field, and one change was lost silently
+        # (191 of 300 rounds). The ticket is read again inside the lock, so a ticket deleted
+        # meanwhile is still the documented `TicketNotFound`.
+        with file_lock.locked(path):
+            if not path.exists():
+                raise TicketNotFound(f"Ticket '{ticket_id}' not found")
+
+            try:
+                ticket = self._read(path)
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+                self._quarantine(path, str(exc))
+                raise TicketSchemaError(
+                    f"Ticket '{ticket_id}' is corrupt ({exc}) — quarantined"
+                ) from exc
+            # A wrong-shape file raises the documented schema error, not an attribute error (AUTO-FIX).
+            if not isinstance(ticket, dict):
+                self._quarantine(
+                    path, f"expected a JSON object, got {type(ticket).__name__}"
+                )
+                raise TicketSchemaError(
+                    f"Ticket '{ticket_id}' is corrupt (expected a JSON object, "
+                    f"got {type(ticket).__name__}) — quarantined"
+                )
+            # Protect immutable fields
+            fields.pop("id", None)
+            fields.pop("created_at", None)
+            ticket.update(fields)
+            ticket["updated_at"] = _ts()
+            _validate(ticket)
+            # Update converts write failures to TicketError, as create does (AUTO-T37, BUGFIX).
+            try:
+                self._write(path, ticket)
+            except OSError as exc:
+                raise TicketError(
+                    f"Could not write ticket '{ticket_id}' to {path}: {exc}"
+                ) from exc
         logger.debug("TicketStore.update: %s  fields=%s", ticket_id, list(fields))
 
     # ── Delete ───────────────────────────────────────────────────────────────

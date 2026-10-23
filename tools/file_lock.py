@@ -61,11 +61,15 @@ def msvcrt_acquire(fileno: int, msvcrt_mod, attempts: int = DEFAULT_NT_ATTEMPTS)
 def locked(path, *, attempts: int = DEFAULT_NT_ATTEMPTS):
     """Hold an exclusive lock for a read-modify-write of *path*.
 
-    A symlink is followed, so two spellings of one file share one lock. The
+    Symlinks are followed in every component, so two spellings of one file share one lock. The
     parent directory is created when missing.
     """
     path = Path(path)
-    real = Path(os.path.realpath(path)) if path.is_symlink() else Path(os.path.abspath(path))
+    # REL-3: every component is resolved, not only the last — the lock is taken on the
+    # parent directory, and a symlinked *directory* ("/data -> /mnt/vol/data") gave two
+    # spellings of one file two different locks. `realpath` of a path with no symlink in it
+    # is its absolute path, so nothing else changes.
+    real = Path(os.path.realpath(path))
     real.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":
         import msvcrt

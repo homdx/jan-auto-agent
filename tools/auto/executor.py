@@ -66,6 +66,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -85,6 +87,11 @@ _PROXY_SERVER_VARS = (
 
 # Output captured from stdout and stderr is capped, so runaway output cannot fill memory.
 _MAX_OUTPUT_CHARS = 64_000
+#: REL-1 #1: a command whose stdout or stderr file grows past this is killed. The text
+#: kept is `_MAX_OUTPUT_CHARS` anyway; this only stops a runaway writer filling the disk.
+_MAX_OUTPUT_FILE_BYTES = 64 * 1024 * 1024
+#: How often `_wait_bounded` looks at the output files while the command runs.
+_OUTPUT_POLL_SEC = 0.25
 
 # Maximum traceback snippet length returned in ExecutionResult.traceback.
 _MAX_TRACEBACK_CHARS = 4_000
@@ -813,6 +820,13 @@ class Executor:
         # The command is redacted only for storing and logging; the real command is what runs (BUGFIX).
         _logged_command = _redact_command(command)
 
+        # REL-1 #1: the output goes to two temporary files, not to pipes. `communicate`
+        # buffered the whole of it in memory before `_MAX_OUTPUT_CHARS` was applied, so a
+        # runaway `yes` or a print loop in model-written code took the agent down with a
+        # MemoryError (or the OOM killer) long before the timeout. A file over
+        # `_MAX_OUTPUT_FILE_BYTES` kills the group, so the disk is not filled either.
+        out_file = tempfile.TemporaryFile()
+        err_file = tempfile.TemporaryFile()
         try:
             # Own session, so a timeout kills the whole group (pytest's xdist workers too), not the shell alone.
             proc = subprocess.Popen(
@@ -820,22 +834,25 @@ class Executor:
                 shell=True,
                 cwd=str(cwd),
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                # REL-1 #2: never the agent's own stdin — the command could read what the user
+                # types, and one that waits for input waited out the whole timeout.
+                stdin=subprocess.DEVNULL,
+                stdout=out_file,
+                stderr=err_file,
                 start_new_session=os.name != "nt",
             )
+            over_cap = False
             try:
-                out, err = proc.communicate(timeout=timeout)
+                over_cap = _wait_bounded(proc, timeout, (out_file, err_file))
             except subprocess.TimeoutExpired:
                 _kill_process_group(proc)
                 try:
-                    out, err = proc.communicate(timeout=5)
+                    proc.communicate(timeout=5)
                 except subprocess.TimeoutExpired:
-                    out, err = "", ""
-                raise subprocess.TimeoutExpired(command, timeout, output=out, stderr=err) from None
+                    pass
+                raise subprocess.TimeoutExpired(
+                    command, timeout, output=_read_capped(out_file), stderr=_read_capped(err_file),
+                ) from None
             except BaseException:
                 # CC-16 (Part D): Ctrl-C. `subprocess.run` used to `except: process.kill(); raise`
                 # for *any* exception, KeyboardInterrupt included, and fix 35 dropped that when it
@@ -852,8 +869,12 @@ class Executor:
                 except subprocess.TimeoutExpired:
                     pass
                 raise
-            stdout = _truncate(out, _MAX_OUTPUT_CHARS)
-            stderr = _truncate(err, _MAX_OUTPUT_CHARS)
+            stdout = _read_capped(out_file)
+            stderr = _read_capped(err_file)
+            if over_cap:
+                stderr += (f"\n... [command killed: its output passed "
+                           f"{_MAX_OUTPUT_FILE_BYTES // (1024 * 1024)} MB]")
+                logger.warning("_execute: OUTPUT CAP task=%s cmd=%r", task_id, _logged_command)
             return ExecutionResult(
                 exit_code = proc.returncode,
                 stdout    = stdout,
@@ -904,6 +925,9 @@ class Executor:
                 command   = _logged_command,
                 task_id   = task_id,
             )
+        finally:
+            out_file.close()
+            err_file.close()
 
     def _build_env(self) -> dict[str, str]:
         """Return a child-process environment with proxy vars cleared."""
@@ -961,6 +985,51 @@ def _truncate(text: str, max_chars: int) -> str:
         return text
     notice = f"\n... [truncated — {len(text) - max_chars} chars omitted]"
     return text[:max_chars] + notice
+
+
+def _wait_bounded(proc: "subprocess.Popen", timeout: "float | None", files) -> bool:
+    """Wait for *proc* like ``communicate(timeout)``; ``True`` when it was killed for output size.
+
+    The command writes to *files* (REL-1 #1), so ``communicate`` only waits. It is called in
+    short slices so the files can be measured in between; ``TimeoutExpired`` leaves on the
+    caller's own deadline, and any other exception (Ctrl-C) leaves unchanged, as before.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        step = _OUTPUT_POLL_SEC
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            step = min(step, left)
+        try:
+            proc.communicate(timeout=step)
+            return False
+        except subprocess.TimeoutExpired:
+            pass
+        if any(os.fstat(f.fileno()).st_size > _MAX_OUTPUT_FILE_BYTES for f in files):
+            _kill_process_group(proc)
+            proc.wait()
+            return True
+
+
+def _read_capped(f) -> str:
+    """The text of the output file *f*, cut to `_MAX_OUTPUT_CHARS` the way `_truncate` cuts it.
+
+    Decoded as UTF-8 with replacement and universal newlines — what ``text=True`` gave the
+    pipes. Only the head is read (four bytes a character at most), so a huge file is never
+    loaded whole; the omitted count is then in bytes, and says so.
+    """
+    import io
+    size = os.fstat(f.fileno()).st_size
+    f.seek(0)
+    head_bytes = _MAX_OUTPUT_CHARS * 4
+    raw = f.read(head_bytes + 1)
+    text = io.TextIOWrapper(io.BytesIO(raw[:head_bytes]), encoding="utf-8", errors="replace").read()
+    if size <= head_bytes:
+        return _truncate(text, _MAX_OUTPUT_CHARS)
+    return (text[:_MAX_OUTPUT_CHARS]
+            + f"\n... [truncated — about {size - len(text[:_MAX_OUTPUT_CHARS].encode('utf-8'))} bytes omitted]")
 
 
 def _kill_process_group(proc: "subprocess.Popen") -> None:
@@ -1088,6 +1157,15 @@ _SECRET_LONG_SPACE_RE = re.compile(
 )
 _SWITCH_PREFIXES = ("no-", "skip-", "disable-", "enable-", "with-", "without-", "allow-")
 
+# REL-2: an authorization option's value is two words, scheme then credential —
+# `--authorization Bearer T`, `--auth Basic B64`, `--authorization "Bearer T"`. The one-word
+# rules above hid `Basic` (not a secret) and left the credential, and `--authorization` was
+# no credential name at all. Run first, so the scheme and the word after it go together.
+_SECRET_AUTH_SCHEME_OPT_RE = re.compile(
+    r"(?<![^\s\"'])(--(?:proxy-)?auth(?:orization)?)([=:][^\S\n]*|[^\S\n]+)"
+    r"([\"']?)(?i:bearer|basic|token|digest|negotiate)[^\S\n]+[^\s\"']+\3"
+)
+
 
 def _option_names_a_credential(name: str) -> bool:
     low = name.lower()
@@ -1097,6 +1175,8 @@ def _option_names_a_credential(name: str) -> bool:
         return False    # `--password-stdin`, `--token-file p`: no secret on the line
     if "passphrase" in low:
         return True
+    if low in ("authorization", "proxy-authorization"):
+        return True     # REL-2: `--authorization T` carries the token itself
     return not _name_is_not_a_credential(low.replace("-", "_").upper())
 
 
@@ -1368,8 +1448,11 @@ def _redact_command(command: str) -> str:
     end of the line rather than leaving half a password behind.
     """
     try:
+        redacted = _SECRET_AUTH_SCHEME_OPT_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]{m.group(3)}", command)
         redacted = _SECRET_OPT_RE.sub(
-            lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]" if m.group(3) else m.group(0), command)
+            lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]"
+            if m.group(3) and "[REDACTED]" not in m.group(3) else m.group(0), redacted)
         redacted = _SECRET_LONG_SPACE_RE.sub(
             lambda m: f"{m.group(1)}{m.group(3)}[REDACTED]"
             if m.group(4) and "[REDACTED]" not in m.group(4)

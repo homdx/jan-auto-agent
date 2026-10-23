@@ -406,10 +406,46 @@ def _holder_alive(holder: str, nn: Optional[int]) -> bool:
         return False
     if holder == str(os.getpid()):
         return True
-    words = _cmdline(Path(PROC_ROOT), holder)
-    if words is None:
-        return True
-    return (nn is not None and _matches(words, nn)) or "tools.arena" in words
+    root = Path(PROC_ROOT)
+    deadline = time.monotonic() + _YOUNG_HOLDER_WAIT_SEC
+    while True:
+        words = _cmdline(root, holder)
+        if words is None:
+            return True
+        if (nn is not None and _matches(words, nn)) or "tools.arena" in words:
+            return True
+        # REL-7 AR-1: a process that has only just started may not show its own command
+        # yet — between fork and exec /proc shows the parent's words, and during the exec
+        # none — so a second claimer took the lock from a runner that was starting. A young
+        # process is read again for a moment; a zombie is dead at once.
+        state, age, ppid = _proc_state_and_age(root, holder)
+        if state == "Z" or age is None or age > _YOUNG_HOLDER_SEC or time.monotonic() >= deadline:
+            return False
+        # Only a process still mid-start is waited on: no words yet (the exec), or the
+        # very words of its parent (the fork before the exec). "sleep 30" is a stranger.
+        if words and words != _cmdline(root, ppid):
+            return False
+        time.sleep(0.05)
+
+
+#: REL-7 AR-1: how young a lock holder must be to be read again, and for how long.
+_YOUNG_HOLDER_SEC = 5.0
+_YOUNG_HOLDER_WAIT_SEC = 2.0
+
+
+def _proc_state_and_age(proc_root: Path, pid: str) -> "tuple[str, Optional[float], str]":
+    """The state letter of `/proc/<pid>/stat`, the process's age in seconds and its parent pid.
+
+    `("", None, "")` when they cannot be read — the caller then does not wait on it.
+    """
+    try:
+        stat = (proc_root / pid / "stat").read_text(encoding="utf-8", errors="replace")
+        uptime = float((proc_root / "uptime").read_text(encoding="utf-8").split()[0])
+        fields = stat[stat.rindex(")") + 2:].split()    # the name may hold spaces and ')'
+        state, ppid, start_ticks = fields[0], fields[1], int(fields[19])
+        return state, uptime - start_ticks / os.sysconf("SC_CLK_TCK"), ppid
+    except (OSError, ValueError, IndexError, AttributeError):
+        return "", None, ""
 
 
 def _claim_lock(lock: Path, nn: Optional[int] = None) -> bool:
