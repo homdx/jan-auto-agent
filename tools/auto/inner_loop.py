@@ -1080,7 +1080,7 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"(?:PLOT|LOGIC(?:AL)?|CONTINUITY|FACTUAL|GRAMMATICAL|SPELLING|STYLE|STYLISTIC"
         r"|MAJOR|MINOR|OBVIOUS|REAL|SIGNIFICANT|FURTHER|REMAINING|OTHER|NEW|MORE)\s+"
     )
-    _EN_PROBLEM_NOUN_EXTRA = r"|GAP(?:S)?|HOLE(?:S)?"
+    _EN_PROBLEM_NOUN_EXTRA = r"|GAP(?:S)?|HOLE(?:S)?|RED\s+FLAGS?"
     _EN_NO_PROBLEM = _re.compile(
         r"^NO\b\s+(?:" + _EN_PROBLEM_QUALIFIER + r")?"
         r"(?:" + _EN_PROBLEM_NOUNS + _EN_PROBLEM_NOUN_EXTRA + r")\b"
@@ -1092,11 +1092,18 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"\s+(?:ARE\s+|IS\s+)?(?:NEEDED|REQUIRED|NECESSARY)\b"
         r"|^NO\s+NEED\s+(?:FOR\s+(?:ANY\s+)?(?:CHANGE|REVISION|EDIT|REWRITE|FIX|CORRECTION)(?:S|ES)?"
         r"|TO\s+(?:CHANGE|REVISE|EDIT|REWRITE|FIX|CORRECT)\b(?:\s+ANYTHING)?)\b"
+        # REL-49: the shape, not a closed noun list — "No rework needed.", "No faults
+        # found.", "No hallucinations found." One to three plain words, no comma or stop,
+        # so "No time, errors remain" and "No. Errors found." stay out.
+        r"|^NO\s+(?:[A-Z][A-Z'-]*\s+){0,2}[A-Z][A-Z'-]*\s+(?:WERE\s+|WAS\s+|ARE\s+|IS\s+)?"
+        r"(?:FOUND|DETECTED|SPOTTED|IDENTIFIED|NEEDED|REQUIRED|NECESSARY)\b"
     )
 
     #: The articles and qualifiers that stand between "NOT" and the verdict word
     #: ("NOT A PROBLEM", "NOTHING COMPLETELY WRONG", "NOTHING VERY BAD").
-    _EN_NOT_FILLERS = frozenset(("A", "AN", "ANY", "VERY", "COMPLETELY", "QUITE", "ALL", "TOO", "AT ALL", "SINGLE"))
+    _EN_NOT_FILLERS = frozenset(("A", "AN", "ANY", "VERY", "COMPLETELY", "QUITE", "ALL", "TOO", "AT ALL", "SINGLE",
+                                 "OBVIOUSLY"))
+    _EN_NOTHING_CALM = _re.compile(r"^NOTHING\s+(?:TO\s+WORRY\s+ABOUT|(?:JUMPS|STANDS|STICKS)\s+OUT(?:\s+AS\s+(?:A\s+)?(?:PROBLEM|ISSUE|WRONG))?)\b")
 
     def _explicit_en_approval(upper: str) -> bool:
         """Whether *upper* says the opposite of a NOT/NOTHING rejection."""
@@ -1127,7 +1134,9 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         # CC review fixes 50: each in its exception sense only — "Save the
         # file", "Bar none the best chapter", "Beyond that, great work" and
         # "Besides, it reads well" are not exceptions, and rejected an approval.
-        r"BESIDES(?![^\S\n]*,)|BEYOND(?!\s+(?:THAT|THIS)\b)|BARRING|SAVE\s+FOR|"
+        # REL-61: "beyond reproach", "beyond a doubt", "besides being consistent"
+        # are praise — only a determiner after the word names the exception.
+        r"BESIDES(?=\s+(?:THE|THAT|THESE|THOSE)\b)|BEYOND(?=\s+THE\b)|BARRING|SAVE\s+FOR|"
         r"BAR(?!\s+NONE\b)|UNLESS|"
         r"WITH\s+THE\s+EXCEPTION\s+OF|"
         r"PLEASE\s+(?:FIX|CHANGE|CORRECT|UPDATE|REVISE|ADD|REMOVE|ADDRESS|RENAME|REWRITE))\b"
@@ -1512,11 +1521,20 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             # "NOT IN CONFLICT (WITH …)": the preposition stands between NOT and the
             # problem word, so the shape is matched on its own.
             return None
+        # REL-1: "Nothing to worry about." / "Nothing jumps out as a problem." deny any
+        # problem the way "Nothing wrong" does; a contrast after them is still the complaint.
+        m_calm = _EN_NOTHING_CALM.match(upper)
+        if m_calm is not None:
+            tail = upper[m_calm.end():]
+            if _EN_CLAUSE_CAVEAT.search(tail) or _names_a_problem(tail):
+                return line.strip()
+            return None
         words = m.group(1).split()
         # "NOT A PROBLEM", "NOTHING COMPLETELY WRONG" — the article or the qualifier is not
         # the verdict word, so step past them to the word "NOT" really negates.
-        while words and words[0] in _EN_NOT_FILLERS:
-            words = words[1:]
+        # REL-1: "AT ALL" is two words, so it was never stepped past ("Not at all problematic").
+        while words and (words[0] in _EN_NOT_FILLERS or words[:2] == ["AT", "ALL"]):
+            words = words[2:] if words[:2] == ["AT", "ALL"] else words[1:]
         head = words[0] if words else ""
         if head.rstrip(".,;:") in _EN_NOT_PROBLEM_WORDS:
             # A negation of a problem: "nothing to fix", never a rejection.
@@ -1538,6 +1556,10 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"|INCORRECT"
         r"|NEED(?:S|ING)?\s+(?:A\s+|ANOTHER\s+|ANY\s+|MORE\s+|SOME\s+|FURTHER\s+|TO\s+BE\s+)?(?:REVISIONS?|REWRITE|REWRITTEN|WORK|CHANGES?|FIX(?:ES|ING)?|EDITS?)"
         r"|REWRITE(?:N)?|REWROTE|FAIL(?:ED|S|ING|URE)?|DISAPPROVED|UNACCEPTABLE"
+        # REL-4 B/E: the noun-first form and DENIED — "REVISION NEEDED.", "Changes required:
+        # …", "Denied — plot hole." matched nothing and passed on fail-open.
+        r"|(?:REVISIONS?|REWRITE|CHANGES?|FIX(?:ES)?|EDITS?)\s+(?:IS\s+|ARE\s+)?(?:NEEDED|REQUIRED|NECESSARY)"
+        r"|DENIED"
     )
     _EN_REJECT_HEAD = _re.compile(
         r"^(?:" + _EN_REJECT_HEAD_WORDS + r")\b(?:[\s]*[:;,.!?\-–—]*)?"
@@ -1555,6 +1577,43 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     #: A directive whose object denies — "reject nothing.", "revise none.", "fix no issues." —
     #: is the withdrawal of the directive, so it carries no verdict (HARDEN-25 B).
     _EN_DIRECTIVE_DENIAL_OBJECT = _re.compile(r"^(?:NOTHING|NONE|NO\s+\S+)\b")
+
+    #: REL-4 C/D/E: the reviewed thing named as rejected in the middle of a sentence —
+    #: "The chapter is REJECTED", "Changes are REJECTED", "Request DENIED". The subject is
+    #: a closed list of what a validator reviews, so a story sentence ("the king's offer is
+    #: rejected") is not read as the verdict; a NOT / NEVER / NO before the word denies it.
+    _EN_BURIED_REJECTED = _re.compile(
+        r"\b(?:CHAPTER|SCENE|DRAFT|TEXT|SUBMISSION|REQUEST|CHANGES?|EDITS?|PATCH|DIFF|REVISION"
+        r"|VERSION|ANSWER|VERDICT|STORY|THIS|IT)\b[^\S\n]+"
+        r"(?:(?:IS|ARE|WAS|WERE|HAS\s+BEEN|HAVE\s+BEEN)[^\S\n]+)?(?:HEREBY[^\S\n]+)?"
+        r"(?P<word>REJECTED|DENIED|DISAPPROVED)\b"
+    )
+    _EN_SENTENCE_SPLIT = _re.compile(r"(?<=[.!?])[^\S\n]+|\n+")
+
+    def _en_buried_rejection(text: str) -> "str | None":
+        """The reason when a reply with no verdict at a line head rejects mid-text (REL-4).
+
+        Called on the fail-open path only. A sentence after the first that opens with a
+        rejection head ("…consistent. Needs revision for the date.") rejects, unless its
+        object denies it ("Reject nothing."); so does a reviewed thing named as rejected or
+        denied anywhere in the reply.
+        """
+        stripped = text.strip()
+        sentences = [x for x in _EN_SENTENCE_SPLIT.split(stripped) if x.strip()]
+        for sent in sentences[1:]:
+            up = _re.sub(r"^PLEASE\s+", "", sent.strip().upper())
+            hm = _EN_REJECT_HEAD.match(up)
+            if hm is None or _EN_DIRECTIVE_DENIAL_OBJECT.match(up[hm.end():].strip()):
+                continue
+            rest = sent.strip()[hm.end():].lstrip(" \t:;,.!?–—-").strip()
+            return rest if rest else sent.strip()
+        upper = stripped.upper()
+        for m in _EN_BURIED_REJECTED.finditer(upper):
+            if _re.search(r"\b(?:NOT|NEVER|NO|N'T)\b[^\S\n]*$", upper[max(0, m.start("word") - 40):m.start("word")]):
+                continue
+            rest = stripped[m.end():].lstrip(" \t:;,.!?–—-").strip()
+            return rest if rest else stripped
+        return None
 
     #: HARDEN-25 C: the words that name the problem a "Nope," clause opens with. The problem
     #: nouns and phrases are the shared lists of HARDEN-22 A, checked through
@@ -1831,6 +1890,14 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             continue
         # whole-text pass also found nothing
         break
+
+    # REL-4 A–E: a rejection in the middle of a one-line reply — "The story is consistent.
+    # Needs revision for the date.", "The chapter is REJECTED — wrong character.", "Request
+    # DENIED — plot hole." — matched no line head and passed on fail-open. Only the
+    # fail-open path reads it, so no reply that was parsed before changes its verdict.
+    _buried = _en_buried_rejection(text or "")
+    if _buried is not None:
+        return False, _buried, False
 
     # Empty response or no matching token found anywhere
     note = "verdict unparseable — passed on fail-open"
