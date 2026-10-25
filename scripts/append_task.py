@@ -15,8 +15,8 @@ work.
     ALREADY-OK  verified against live code, no defect / already handled  (no commit)
     SKIPPED     deliberately deferred (out of scope, latent-only, blocked)  (--note required)
 
-Writes tasks/PROGRESS.csv (header on first use), refuses a duplicate ticket,
-flushes to disk before returning.
+Writes tasks/PROGRESS.csv (header on first use), refuses a duplicate ticket
+(exit 2) and a file that is not UTF-8 (exit 3), flushes to disk before returning.
 """
 import argparse
 import csv
@@ -28,6 +28,28 @@ from tools import file_lock  # noqa: E402
 
 COLUMNS = ["ticket", "finding", "outcome", "commit", "note"]
 OUTCOMES = {"FIXED", "ALREADY-OK", "SKIPPED"}
+
+
+def _not_utf8(path) -> str:
+    """CSV-ANSI: why *path* is not UTF-8 (a BOM is fine), or "" when it is.
+
+    Excel's plain "CSV" saves the notes as cp1251/cp1252; reading that file as UTF-8 died
+    with a traceback before the duplicate check, and appending a UTF-8 row to it would
+    leave two encodings in one file. The file is refused instead, with what to do.
+    """
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        return f"{exc.reason} at byte {exc.start}"
+    return ""
+
+
+def _refuse_not_utf8(path, why) -> int:
+    print(f"refused: {path} is not UTF-8 ({why}) - a UTF-8 row would mix two encodings in one "
+          f"file; re-save it as \"CSV UTF-8\" and record again", file=sys.stderr)
+    return 3
 
 
 def main():
@@ -74,6 +96,9 @@ def main():
     # append_verdict.py — two agents recording one ticket both passed the check.
     with file_lock.locked(a.progress):
         existed = os.path.exists(a.progress) and os.path.getsize(a.progress) > 0
+        why = _not_utf8(a.progress) if existed else ""
+        if why:
+            return _refuse_not_utf8(a.progress, why)
         if existed and not a.allow_duplicate:
             with open(a.progress, newline="", encoding="utf-8-sig") as fh:   # REL-2: a spreadsheet's BOM
                 for prev in csv.DictReader(fh):

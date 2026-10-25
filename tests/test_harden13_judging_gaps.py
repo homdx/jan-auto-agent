@@ -68,4 +68,3 @@ def test_a_key_line_the_model_edited_around_keeps_its_key():
         out = restore_masked_secrets(original, reply)
         assert "here_your_key" not in out and KA in out
         assert unrestored_masked_lines(original, reply) == []
-

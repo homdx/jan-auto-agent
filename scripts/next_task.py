@@ -70,20 +70,36 @@ def _field(body, label):
     return m.group(1).strip() if m else ""
 
 
-def recorded(progress_path):
+def recorded(progress_path, warn=None):
+    """`{ticket: outcome}` of *progress_path*; *warn* gets one line when the file is not UTF-8.
+
+    Silent by default: `tools/arena/tickets.py` reads it too, inside a refusal whose stderr
+    shape is fixed (§7), and this script passes its own stderr printer.
+    """
     if not os.path.exists(progress_path) or os.path.getsize(progress_path) == 0:
         return {}
-    # A file that will not decode, has an over-limit csv field, or contains a NUL byte reads as empty, as `run start`'s intake and the harvest read it.
+    # A file with an over-limit csv field or a NUL byte reads as empty, as `run start`'s intake and the harvest read it; one that is not UTF-8 is read with a warning (CSV-ANSI).
     try:
         # REL-2: utf-8-sig — with a spreadsheet's BOM the first header was "\ufeffticket",
         # every row's ticket read as None, and recorded tickets were handed out again.
-        with open(progress_path, newline="", encoding="utf-8-sig") as fh:
-            text = fh.read()
+        with open(progress_path, "rb") as fh:
+            raw = fh.read()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            # CSV-ANSI: Excel's plain "CSV" saves the notes as cp1251/cp1252, and "will not
+            # decode" read as "nothing recorded" — the loop silently handed out every FIXED
+            # ticket again. The ticket and outcome columns are ASCII, so they read the same
+            # with the notes' bytes replaced; the caller says so, since append_task.py refuses it.
+            if warn is not None:
+                warn(f"warning: {progress_path} is not UTF-8 ({exc.reason} at byte {exc.start}); "
+                     f"read with the undecodable bytes replaced - re-save it as \"CSV UTF-8\"")
+            text = raw.decode("utf-8", errors="replace").removeprefix("\ufeff")
         if "\x00" in text:  # newer csv modules parse a NUL; older ones raise
             return {}
         return {(r.get("ticket") or "").strip(): (r.get("outcome") or "").strip()
                 for r in csv.DictReader(io.StringIO(text, newline=""))}
-    except (UnicodeDecodeError, csv.Error, OSError):
+    except (csv.Error, OSError):
         return {}
 
 
@@ -106,7 +122,7 @@ def main():
               file=sys.stderr)
         return 1
 
-    done = recorded(progress)
+    done = recorded(progress, warn=lambda line: print(line, file=sys.stderr))
     skipped = [t for t in tickets if not t["offered"]]
     tickets = [t for t in tickets if t["offered"]]
     todo = [t for t in tickets if t["name"] not in done]

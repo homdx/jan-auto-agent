@@ -125,5 +125,3 @@ def test_a_command_without_a_secret_is_logged_byte_for_byte(command):
 def test_a_secret_in_a_command_is_still_redacted(command, secret):
     logged = _redact_command(command)
     assert secret not in logged and "[REDACTED]" in logged
-
-

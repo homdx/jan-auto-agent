@@ -39,6 +39,27 @@ SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"}
 TRISTATE = {"YES", "NO", "UNKNOWN"}
 
 
+def _not_utf8(path) -> str:
+    """CSV-ANSI: why *path* is not UTF-8 (a BOM is fine), or "" when it is.
+
+    Excel's plain "CSV" saves the notes as cp1251/cp1252; reading that file as UTF-8 died
+    with a traceback before the duplicate check, and appending a UTF-8 row to it would
+    leave two encodings in one file. The file is refused instead, with what to do.
+    """
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        return f"{exc.reason} at byte {exc.start}"
+    return ""
+
+
+def _refuse_not_utf8(path, why) -> int:
+    print(f"refused: {path} is not UTF-8 ({why}) - a UTF-8 row would mix two encodings in one "
+          f"file; re-save it as \"CSV UTF-8\" and record again", file=sys.stderr)
+    return 3
+
 def _missing_final_newline(path) -> str:
     """The line end to write first when *path* does not end with one, else "".
 
@@ -131,6 +152,9 @@ def main():
     with file_lock.locked(out):
         # --- dedupe against what is already on disk --------------------------
         existed = os.path.exists(out) and os.path.getsize(out) > 0
+        why = _not_utf8(out) if existed else ""
+        if why:
+            return _refuse_not_utf8(out, why)
         if existed and not a["allow_duplicate"]:
             with open(out, newline="", encoding="utf-8-sig") as fh:   # REL-2: a spreadsheet's BOM
                 for prev in csv.DictReader(fh):

@@ -571,8 +571,21 @@ def is_fresh(
     if hashes is not None:
         return hashes == manifest.file_hashes
     root = Path(root)
-    current_files = list(files) if files is not None else discover_files(root)
+    if files is not None:
+        current_files = list(files)
+    else:
+        # MANIFEST-SKIP: the walk skips what the manifest was built skipping; the defaults
+        # alone put `out/b.py` of a `skip_dirs = out` build back and an unchanged tree was stale.
+        current_files = discover_files(root, skip_dirs=_recorded_skip_dirs(manifest, skip_dirs))
     return hash_tree(root, current_files) == manifest.file_hashes
+
+
+def _recorded_skip_dirs(manifest: Manifest, skip_dirs: Optional[Iterable[str]] = None):
+    """*skip_dirs* when given, else the list *manifest* recorded; ``None`` (the defaults) for an
+    older manifest that recorded none."""
+    if skip_dirs is not None:
+        return list(skip_dirs)
+    return list(manifest.skip_dirs) or None
 
 
 @dataclass(frozen=True)
@@ -626,8 +639,11 @@ def refresh_manifest(root: Path, previous: Manifest) -> Manifest:
     the files that already existed.
     """
     root = Path(root)
-    discovered = set(discover_files(root))
+    # MANIFEST-SKIP: discover under the skip_dirs `previous` was built with, and record them again —
+    # the defaults alone re-added every file of a skipped `out/` and dropped the setting.
+    skip = _recorded_skip_dirs(previous)
+    discovered = set(discover_files(root, skip_dirs=skip))
     tracked = set(previous.file_hashes.keys())
     file_list = sorted(discovered | tracked)
     # Stamp the current COLLECTOR_VERSION, not the previous one, so a refreshed manifest is fresh (BUGFIX).
-    return build_manifest(root, file_list, collector_version=COLLECTOR_VERSION)
+    return build_manifest(root, file_list, collector_version=COLLECTOR_VERSION, skip_dirs=skip)
