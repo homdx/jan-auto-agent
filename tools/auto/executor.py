@@ -869,6 +869,14 @@ class Executor:
                 except subprocess.TimeoutExpired:
                     pass
                 raise
+            # REL-RUNTIME follow-up: with the output in files, nothing waits for the shell's
+            # children any more, so `sleep 99 & echo ok` returned at once — right — and left the
+            # sleep running — wrong: `python app.py & curl …` kept its server on the port and the
+            # next task's check failed with "address in use". The group outlives its leader while
+            # any member runs, so killing it now ends what the command left behind; a group already
+            # empty is a no-op. Before REL-RUNTIME the pipes kept such a command until the timeout,
+            # which killed the group too.
+            _kill_process_group(proc)
             stdout = _read_capped(out_file)
             stderr = _read_capped(err_file)
             if over_cap:

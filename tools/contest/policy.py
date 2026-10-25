@@ -477,6 +477,17 @@ def _pathlike(text: str) -> bool:
     — is not a path at all: dropping it makes the mechanical layer refuse
     to decide (``None``, the gate's) rather than answer "no path outside
     the worktree" for a command it cannot read.
+
+    POLICY-CLIMB: a relative path is a path wherever its slash is. Only the
+    four leading prefixes counted, so ``subdir/../../wt-b/app.py`` — any real
+    subdirectory, then up — named no path at all, and ``echo x >
+    subdir/../../wt-b/app.py``, ``cp``, ``mv``, ``ln`` and ``tee`` into a
+    sibling worktree or ``~/.bashrc`` were approved as "no path outside
+    worktree/tmp_roots" with neither the forbidden list nor the gate asked.
+    Any token with a ``/`` (a URL's ``://`` aside) and a bare ``.`` or ``..``
+    is now resolved against the worktree like a ``./…`` one: inside, it is
+    approved as before; out through ``..`` or a link inside the worktree, it
+    is judged. A bare word without a slash is still a command (``reboot``).
     """
     if any(ch in text for ch in _NOT_A_PATH):
         return False
@@ -484,7 +495,9 @@ def _pathlike(text: str) -> bool:
         return True
     if text.startswith(("$HOME/", "${HOME}/", "$PWD/", "${PWD}/")):
         return True
-    return False
+    if text.startswith("$"):
+        return False        # any other $VAR/…: `_unresolved_var` hands the command to the gate
+    return text in (".", "..") or ("/" in text and "://" not in text)
 
 
 #: Asks whose patterns name one file relative to the session directory, never a command.
