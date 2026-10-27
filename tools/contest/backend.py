@@ -58,11 +58,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import json
 import logging
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -1528,6 +1530,29 @@ def _agent_tools() -> list:
     ]
 
 
+@contextlib.contextmanager
+def _sigint_held():
+    """Hold a SIGINT that arrives inside the block; yields a list, non-empty if one did.
+
+    The caller re-raises it (``signal.raise_signal``) once it can clean up, so the
+    handler that was in place still runs, just later. Off the main thread, where
+    no handler can be set, or with SIGINT ignored, nothing is held.
+    """
+    held: list = []
+    if threading.current_thread() is not threading.main_thread():
+        yield held
+        return
+    previous = signal.getsignal(signal.SIGINT)
+    if previous in (signal.SIG_IGN, None):
+        yield held
+        return
+    signal.signal(signal.SIGINT, lambda signum, frame: held.append(signum))
+    try:
+        yield held
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
     """``bash -c command`` in its own process group: ``(returncode, stdout, stderr)``.
 
@@ -1546,17 +1571,26 @@ def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
 
     posix = os.name != "nt"
     with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
-        proc = subprocess.Popen(["bash", "-c", command], cwd=cwd,
-                                stdout=out_f, stderr=err_f,
-                                stdin=subprocess.DEVNULL,
-                                start_new_session=posix)
+        proc = None
         try:
+            # CTRL-C-START: bash may already run while Popen has not returned (or
+            # `try:` is not reached yet); a Ctrl-C there escaped the kill below and
+            # left the command running. It is held until `proc` is known.
+            with _sigint_held() as held:
+                proc = subprocess.Popen(["bash", "-c", command], cwd=cwd,
+                                        stdout=out_f, stderr=err_f,
+                                        stdin=subprocess.DEVNULL,
+                                        start_new_session=posix)
+            if held:
+                signal.raise_signal(signal.SIGINT)
             proc.wait(timeout=timeout)
         except BaseException:
             # CC review fixes 49: not only a timeout — a Ctrl-C (KeyboardInterrupt)
             # or any other exit of the wait kills the group too. In its own session
             # the command no longer gets the terminal's SIGINT, so it kept running
             # after the round was stopped, with no timeout left to end it.
+            if proc is None:
+                raise
             try:
                 if posix:
                     os.killpg(proc.pid, 9)

@@ -167,6 +167,36 @@ def test_ctrl_c_in_the_agent_kills_its_command(tmp_path):
                 pass
 
 
+def test_ctrl_c_while_the_command_starts_still_kills_it(tmp_path):
+    # The flake behind the test above, made certain: bash has started (its pid is
+    # written) but Popen has not returned yet, so the Ctrl-C lands before `try:`.
+    pid_file = tmp_path / "bash.pid"
+    code = (
+        f"import os, signal, sys, time; sys.path.insert(0, {str(REPO)!r})\n"
+        "from tools.contest import backend\n"
+        "real = backend.subprocess.Popen\n"
+        "def late(*a, **k):\n"
+        "    proc = real(*a, **k)\n"
+        f"    while not os.path.getsize({str(pid_file)!r}) if os.path.exists({str(pid_file)!r}) else True:\n"
+        "        time.sleep(0.01)\n"
+        "    os.kill(os.getpid(), signal.SIGINT)\n"
+        "    return proc\n"
+        "backend.subprocess.Popen = late\n"
+        f"backend._run_bash_group('echo $$ > {pid_file}; sleep 30', {str(tmp_path)!r}, 60)\n"
+    )
+    agent = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    bash_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    try:
+        assert "KeyboardInterrupt" in agent.stderr, agent.stderr
+        with pytest.raises(ProcessLookupError):                          # was left running
+            os.kill(bash_pid, 0)
+    finally:
+        try:
+            os.killpg(bash_pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 # ── AUDIT-10: a workspace root above the repo still mirrors it ─────────────
 
 def test_a_workspace_root_above_the_repo_mirrors_the_repo(tmp_path):
