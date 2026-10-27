@@ -53,8 +53,7 @@ def test_broker_returns_empty_for_unresolvable():
 # ───────────────────────── CoderResult contract ──────────────────
 
 def test_coder_result_missing_context_field_retained():
-    # The field is kept on the dataclass (default empty) for the validator
-    # side-channel / future use; the coder no longer populates it itself.
+    # The field stays on the dataclass for the validator side-channel; the coder no longer fills it.
     assert CoderResult().missing_context == []
     assert CoderResult(missing_context=["Foo"]).missing_context == ["Foo"]
 
@@ -133,9 +132,7 @@ class _CoderReportsGap:
 
 
 def test_context_satisfied_false_when_coder_reports_gap():
-    # Guard: the test only makes sense if a CoderResult with error set
-    # and no files written is treated as not succeeded.  If this assertion
-    # fails, fix CoderResult.succeeded before debugging this test.
+    # Guard: a CoderResult with an error and no files written counts as not succeeded.
     _sentinel = CoderResult(task_id="T", files_written=[], error="need ctx",
                             context_satisfied=False)
     assert _sentinel.succeeded is False, (

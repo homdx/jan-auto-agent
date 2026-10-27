@@ -15,16 +15,41 @@ work.
     ALREADY-OK  verified against live code, no defect / already handled  (no commit)
     SKIPPED     deliberately deferred (out of scope, latent-only, blocked)  (--note required)
 
-Writes tasks/PROGRESS.csv (header on first use), refuses a duplicate ticket,
-flushes to disk before returning.
+Writes tasks/PROGRESS.csv (header on first use), refuses a duplicate ticket
+(exit 2) and a file that is not UTF-8 (exit 3), flushes to disk before returning.
 """
 import argparse
 import csv
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import file_lock  # noqa: E402
+
 COLUMNS = ["ticket", "finding", "outcome", "commit", "note"]
 OUTCOMES = {"FIXED", "ALREADY-OK", "SKIPPED"}
+
+
+def _not_utf8(path) -> str:
+    """CSV-ANSI: why *path* is not UTF-8 (a BOM is fine), or "" when it is.
+
+    Excel's plain "CSV" saves the notes as cp1251/cp1252; reading that file as UTF-8 died
+    with a traceback before the duplicate check, and appending a UTF-8 row to it would
+    leave two encodings in one file. The file is refused instead, with what to do.
+    """
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        return f"{exc.reason} at byte {exc.start}"
+    return ""
+
+
+def _refuse_not_utf8(path, why) -> int:
+    print(f"refused: {path} is not UTF-8 ({why}) - a UTF-8 row would mix two encodings in one "
+          f"file; re-save it as \"CSV UTF-8\" and record again", file=sys.stderr)
+    return 3
 
 
 def main():
@@ -39,9 +64,7 @@ def main():
     a = ap.parse_args()
 
     outcome = a.outcome.strip().upper()
-    # The epic-round prompt (docs/collect-epics/RUN-THE-EPIC-COMPETITION.md)
-    # says `--outcome DONE`; it means FIXED. Rejecting it left the agent's
-    # ticket unrecorded and next_task.py handing it out again.
+    # The epic-round prompt (docs/collect-epics/RUN-THE-EPIC-COMPETITION.md) says `--outcome DONE`; it means FIXED. Rejecting it left the ticket unrecorded.
     if outcome == "DONE":
         outcome = "FIXED"
     row = {
@@ -66,41 +89,44 @@ def main():
             print(f"  x {p}", file=sys.stderr)
         return 1
 
-    existed = os.path.exists(a.progress) and os.path.getsize(a.progress) > 0
-    if existed and not a.allow_duplicate:
-        with open(a.progress, newline="", encoding="utf-8") as fh:
-            for prev in csv.DictReader(fh):
-                if (prev.get("ticket") or "").strip() == row["ticket"]:
-                    print(f"skipped: {row['ticket']} is already recorded as "
-                          f"{prev.get('outcome')} — move to the next ticket "
-                          f"(--allow-duplicate to override)", file=sys.stderr)
-                    return 2
-
     d = os.path.dirname(a.progress)
     if d:
         os.makedirs(d, exist_ok=True)
-    # csv writes where the file ends: a PROGRESS.csv an editor or a hand left
-    # without its final newline got the new row glued onto its last line, so
-    # next_task.py read one row and handed the new ticket out again. The file's
-    # own line ending ends that line first, and the row keeps that ending too.
-    eol, tail = "\r\n", ""
-    if existed:
-        with open(a.progress, "rb") as fh:
-            data = fh.read()
-        eol = "\r\n" if b"\r\n" in data else "\n"
-        if not data.endswith((b"\n", b"\r")):
-            tail = eol
-    with open(a.progress, "a", newline="", encoding="utf-8") as fh:
-        fh.write(tail)
-        w = csv.DictWriter(fh, fieldnames=COLUMNS, lineterminator=eol)
-        if not existed:
-            w.writeheader()
-        w.writerow(row)
-        fh.flush()
-        os.fsync(fh.fileno())
+    # AUDIT3-C4: the duplicate check and the append are one locked step, as in
+    # append_verdict.py — two agents recording one ticket both passed the check.
+    with file_lock.locked(a.progress):
+        existed = os.path.exists(a.progress) and os.path.getsize(a.progress) > 0
+        why = _not_utf8(a.progress) if existed else ""
+        if why:
+            return _refuse_not_utf8(a.progress, why)
+        if existed and not a.allow_duplicate:
+            with open(a.progress, newline="", encoding="utf-8-sig") as fh:   # REL-2: a spreadsheet's BOM
+                for prev in csv.DictReader(fh):
+                    if (prev.get("ticket") or "").strip() == row["ticket"]:
+                        print(f"skipped: {row['ticket']} is already recorded as "
+                              f"{prev.get('outcome')} — move to the next ticket "
+                              f"(--allow-duplicate to override)", file=sys.stderr)
+                        return 2
+
+        # csv writes at the end of the file; if the last line has no final newline, the new row would be glued onto it. Use the file's own line ending first.
+        eol, tail = "\r\n", ""
+        if existed:
+            with open(a.progress, "rb") as fh:
+                data = fh.read()
+            eol = "\r\n" if b"\r\n" in data else "\n"
+            if not data.endswith((b"\n", b"\r")):
+                tail = eol
+        with open(a.progress, "a", newline="", encoding="utf-8") as fh:
+            fh.write(tail)
+            w = csv.DictWriter(fh, fieldnames=COLUMNS, lineterminator=eol)
+            if not existed:
+                w.writeheader()
+            w.writerow(row)
+            fh.flush()
+            os.fsync(fh.fileno())
 
     # rows, not lines: a note may hold a quoted line break
-    with open(a.progress, newline="", encoding="utf-8") as fh:
+    with open(a.progress, newline="", encoding="utf-8-sig") as fh:
         n = sum(1 for _ in csv.DictReader(fh))
     print(f"recorded #{n}: {row['outcome']} {row['ticket']}"
           + (f" @ {row['commit']}" if row["commit"] else "") + f" -> {a.progress}")

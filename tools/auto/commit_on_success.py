@@ -7,7 +7,9 @@ Called by the controller (or outer_loop caller) immediately after
 
     cos = CommitOnSuccess(git_manager, state_store)
     commit_hash = cos.commit(task, outer_result)
-    # → "abc123def456…"  or  None if nothing was staged
+    # → "abc123def456…"  or  None if nothing was staged or git failed
+    outcome = cos.commit_result(task, outer_result).outcome
+    # → "committed" / "nothing_to_commit" / "git_error"  (B2)
 
 Responsibilities
 ----------------
@@ -45,10 +47,17 @@ Responsibilities
 4. Never raises on a git failure; wraps ``GitError`` and returns ``None``,
    leaving the task status unchanged so the caller can decide what to do.
 
+B2: a git failure and "nothing staged" are both a ``None`` sha, so
+:meth:`CommitOnSuccess.commit_result` reports which one happened
+(:class:`CommitResult`). The controller counts a task done only when a commit
+actually happened or the tree had nothing new; on a git failure it keeps the
+work as a patch, logs it, and marks the task so a resume sees it.
+
 Public surface
 --------------
     CommitOnSuccess(git_manager, state_store)
-        .commit(task, outer_result)   -> Optional[str]   # commit hash or None
+        .commit(task, outer_result)        -> Optional[str]   # commit hash or None
+        .commit_result(task, outer_result) -> CommitResult   # the same, classified (B2)
 
     make_commit_on_success(config, repo_dir, state_store) -> CommitOnSuccess
 
@@ -69,11 +78,48 @@ from tools.agent_trace import tracer
 from tools.auto.git_manager import GitError, GitManager, make_git_manager
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
 
-# AUTO-CR-5: SummaryMemory is imported lazily inside commit() to keep the
-# import graph acyclic and to avoid a hard dependency on the LLM stack for
-# callers (tests) that don't need creative-mode synopsis updates.
+# SummaryMemory is imported lazily in commit() to keep the import graph acyclic and avoid the LLM stack in tests.
 
 logger = logging.getLogger(__name__)
+
+# B2: the two ways ``commit_task`` can hand back no sha, told apart. They used to
+# share one ``None``, so the controller counted a task whose commit *failed* as
+# done, ran the regression check on a tree that was never committed, and left the
+# received work in the tree to be swept into the next commit or wiped by a reset.
+COMMIT_OK = "committed"
+COMMIT_NOTHING_TO_COMMIT = "nothing_to_commit"
+COMMIT_GIT_ERROR = "git_error"
+
+
+class CommitResult:
+    """What one :meth:`CommitOnSuccess.commit` call actually did (B2).
+
+    ``sha`` keeps its historical meaning — the full commit hash, or ``None``
+    when no commit was made — so every existing caller is unchanged.
+    ``outcome`` is what a caller that must tell the two ``None`` cases apart
+    reads: :data:`COMMIT_NOTHING_TO_COMMIT` when the tree simply had nothing
+    new (a quiet success, exactly as before), :data:`COMMIT_GIT_ERROR` when
+    git failed and the work is still uncommitted.
+    """
+
+    __slots__ = ("sha", "outcome", "error")
+
+    def __init__(self, sha: Optional[str], outcome: str, error: str = "") -> None:
+        self.sha = sha
+        self.outcome = outcome
+        self.error = error
+
+    @property
+    def committed(self) -> bool:
+        return self.outcome == COMMIT_OK
+
+    @property
+    def git_error(self) -> bool:
+        """True only when git failed — the case the run must account for."""
+        return self.outcome == COMMIT_GIT_ERROR
+
+    def __repr__(self) -> str:  # pragma: no cover — diagnostics only
+        return f"CommitResult(sha={self.sha!r}, outcome={self.outcome!r})"
 
 
 class CommitOnSuccess:
@@ -125,6 +171,19 @@ class CommitOnSuccess:
         str or None
             The full SHA-1 commit hash on success, or ``None`` if the commit
             was skipped (nothing staged) or a :class:`GitError` was raised.
+
+        B2: the two ``None`` cases are no longer indistinguishable —
+        :meth:`commit_result` returns a :class:`CommitResult` naming which one
+        happened, and the controller does not count a task whose commit failed
+        as done.
+        """
+        return self.commit_result(task, outer_result).sha
+
+    def commit_result(self, task: dict, outer_result=None) -> CommitResult:
+        """Stage, commit, and report *what happened* (B2).
+
+        The same work as :meth:`commit`, but classified: see
+        :class:`CommitResult`. This is what the controller calls.
         """
         task_id = task.get("id", "UNKNOWN")
         title   = task.get("title", "")
@@ -146,21 +205,17 @@ class CommitOnSuccess:
                 params={"task": task_id},
                 content=str(exc),
             )
-            return None
+            # B2: the work is still in the tree and uncommitted. The task status
+            # is deliberately left unchanged here so every existing caller (and
+            # its tests) keeps the old behaviour; the controller is the one that
+            # marks it, from the outcome reported here.
+            return CommitResult(None, COMMIT_GIT_ERROR, str(exc))
 
         if sha:
             logger.info(
                 "CommitOnSuccess: committed task %s → %s", task_id, sha[:12]
             )
-            # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): this
-            # state write used to be unguarded — a failure here (the same
-            # root-cause class as state.py's atomic-write gap) happened
-            # *after* the git commit had already succeeded, desyncing
-            # StateStore's view of the task (still not marked DONE) from
-            # what git history actually shows. Logging and continuing here
-            # means the commit itself — the durable, important half of this
-            # method — still stands even if the local status bookkeeping
-            # couldn't be updated.
+            # A state write failure after a successful commit is logged; the commit itself still stands (AUTO-FIX).
             try:
                 self._state.set_task_status(task_id, STATUS_DONE, commit=sha)
                 self._state.log(
@@ -182,34 +237,21 @@ class CommitOnSuccess:
             self._update_synopsis(task)
             # AUTO-CR-23-1: update story bible after synopsis (same chapter).
             self._update_story_bible(task)
+            # AUDIT-8: both hooks rewrite tracked files after the commit; left
+            # in the tree, the next task's stage_all() commits them under its id.
+            self._commit_memory_files(task_id, title)
         else:
             if self._task_mode == "creative" and self._is_trivial_acceptance_check(
                 task.get("acceptance_check")
             ):
-                # AUTO-CR-DELTA-2: nothing staged AND the acceptance check
-                # is a no-op — the "check passed, so the code must already
-                # be correct" assumption in the other branch does not hold
-                # here, because a check that can't fail proves nothing
-                # about whether the coder did any work. Mark BLOCKED
-                # (same terminal, honestly-not-done status outer_loop.py
-                # already uses for exhausted-attempts failures) instead of
-                # silently reporting success.
+                # Nothing staged and a no-op check proves nothing: mark BLOCKED rather than report success (AUTO-CR-DELTA-2).
                 logger.warning(
                     "CommitOnSuccess: nothing staged for task %s and its "
                     "acceptance_check is trivial (%r) — this task produced "
                     "no real change; marking BLOCKED instead of DONE.",
                     task_id, task.get("acceptance_check"),
                 )
-                # AUTO-FIX (medium-priority audit): this branch called
-                # set_task_status()/log() unguarded while the sibling
-                # `if sha:` branch above explicitly wraps the identical
-                # calls in try/except (with a comment explaining exactly
-                # why: a StateStore write hiccup here must not propagate
-                # and abort the whole run). Apply the same guard here so a
-                # disk/permission issue while marking BLOCKED can't take
-                # down the run either — the module's documented "never
-                # raises" contract should hold in every branch, not just
-                # the success path.
+                # The BLOCKED write is guarded like the success path's, so a disk error cannot abort the run (AUTO-FIX).
                 try:
                     self._state.set_task_status(
                         task_id, STATUS_BLOCKED,
@@ -231,17 +273,13 @@ class CommitOnSuccess:
                     params={"task": task_id},
                 )
             else:
-                # Nothing new to commit — acceptance check is a real,
-                # non-trivial check and it already passed, so the working
-                # tree is in the correct state from a prior commit.
+                # Nothing new to commit: the tree already matches a prior commit, and the check passed.
                 logger.warning(
                     "CommitOnSuccess: nothing staged for task %s; "
                     "marking DONE with empty commit hash",
                     task_id,
                 )
-                # AUTO-FIX (medium-priority audit): same unguarded-write gap
-                # as the BLOCKED branch above — guard it the same way as the
-                # `if sha:` branch's set_task_status()/log() calls.
+                # Guarded like the other status writes (AUTO-FIX).
                 try:
                     self._state.set_task_status(task_id, STATUS_DONE, commit="")
                     self._state.log(
@@ -259,8 +297,9 @@ class CommitOnSuccess:
                     "commit_on_success", "controller", "nothing_staged",
                     params={"task": task_id},
                 )
+            return CommitResult(None, COMMIT_NOTHING_TO_COMMIT)
 
-        return sha
+        return CommitResult(sha, COMMIT_OK)
 
     @staticmethod
     def _is_trivial_acceptance_check(check: Optional[str]) -> bool:
@@ -280,6 +319,40 @@ class CommitOnSuccess:
             return True
         normalized = check.strip().rstrip(";").strip()
         return normalized in {"true", ":", "exit 0", "/bin/true"}
+
+    def _memory_file_paths(self) -> list:
+        """The files the synopsis / story-bible hooks write (AUDIT-8)."""
+        out = []
+        synopsis = getattr(self._summary_memory, "_synopsis_path", None)
+        if isinstance(synopsis, Path):
+            out.append(synopsis)
+        bible = getattr(self._story_bible, "_path", None)
+        if isinstance(bible, Path):
+            out.append(bible)
+            out.append(bible.with_suffix(bible.suffix + ".pending.json"))
+        return out
+
+    def _commit_memory_files(self, task_id: str, title: str) -> None:
+        """Commit what the post-commit hooks changed as a follow-up commit of
+        the same task (AUDIT-8). Never raises: a failure is logged, and the
+        files are then simply left in the tree as they were before this fix."""
+        if self._task_mode != "creative":
+            return
+        commit_paths = getattr(self._git, "commit_paths", None)
+        paths = self._memory_file_paths()
+        if not paths or not callable(commit_paths):
+            return
+        try:
+            sha = commit_paths(f"auto({task_id}): update story memory — {title}", paths)
+        except Exception as exc:  # noqa: BLE001 — never disrupt the task's outcome
+            logger.error(
+                "CommitOnSuccess: could not commit synopsis/story-bible updates "
+                "for task %s — %s (they stay in the working tree)", task_id, exc,
+            )
+            return
+        if isinstance(sha, str) and sha:
+            logger.info("CommitOnSuccess: story memory for %s committed → %s",
+                        task_id, sha[:12])
 
     # ── AUTO-CR-5: synopsis hook ─────────────────────────────────────────────
 
@@ -319,14 +392,7 @@ class CommitOnSuccess:
                 "cannot update synopsis for %s.", target_files,
             )
             return
-        # AUTO-FIX (medium-priority audit): each file's failure was already
-        # logged individually, but for a multi-chapter creative task (a
-        # supported, tested shape — see AUTO-CR-16 in the docstring above)
-        # a second/third chapter's silently-failed synopsis update was easy
-        # to miss among per-file log lines. Collect failures and log one
-        # aggregate summary at the end so a partial failure is visible at a
-        # glance, without changing the fail-open behavior (a synopsis error
-        # still never disrupts the commit).
+        # Failed synopsis updates are collected and logged once, so a partial failure is visible; the commit is never disrupted.
         failed: list[str] = []
         for chapter_file in target_files:
             try:
@@ -381,15 +447,7 @@ class CommitOnSuccess:
                 "cannot update bible for %s.", target_files,
             )
             return
-        # novel14 experiment fix: BOOTSTRAP the bible from pre-existing
-        # chapters. The documented Creative.MD workflow starts from a
-        # hand-written chapter_1.txt; it never passes through this hook, so
-        # every fact established ONLY there (инструмент, мамины смены, ...)
-        # never enters the bible — the continuity gate has nothing to defend,
-        # the first generation window without a recent mention confabulates,
-        # and the wrong value self-perpetuates through later chapters. Run
-        # extraction once over the seed chapters before the first update.
-        # (Same class of bug as the creative language pre-gate bootstrap fix.)
+        # Bootstrap the bible from the pre-existing seed chapters once, so facts established only there are known (novel14 fix).
         try:
             bible_path = getattr(self._story_bible, "_path", None)
             bible_empty = (bible_path is None
@@ -443,9 +501,7 @@ class CommitOnSuccess:
                 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_commit_on_success(
     config: configparser.ConfigParser,
@@ -467,35 +523,20 @@ def make_commit_on_success(
     state_store:
         The active ``StateStore`` for this run.
     """
-    # AUTO-BUG: this used to read task_mode with a plain config.get() and
-    # compare it with `== "creative"` — an exact, case-sensitive match. Every
-    # other entry point (controller.py) normalises task_mode through
-    # normalize_task_mode() so a config typo/case variant like "Creative" or
-    # "creativ" still resolves to "creative". This factory's raw read did
-    # not, so if it is ever reached with an unnormalised value (e.g. this
-    # factory called directly, or the controller's own commit_on_success is
-    # None and make_bug_fix_loop falls back to building one here) the
-    # summary_memory / story_bible wiring below would silently never fire —
-    # the run proceeds in creative mode everywhere else but synopsis.md and
-    # story_bible.md are never updated after a chapter commit, with no
-    # error logged. Route through the same normaliser everyone else uses.
+    # Normalise task_mode like every other entry point, so "Creative" still wires synopsis and bible updates.
     from tools.auto.utils import normalize_task_mode
     _raw_task_mode = config.get("auto", "task_mode", fallback="code")
     task_mode, _ = normalize_task_mode(_raw_task_mode)
     gm = make_git_manager(repo_dir, config)
 
-    # AUTO-CR-5: wire SummaryMemory for creative mode so synopsis.md is
-    # updated after every accepted chapter commit.
+    # SummaryMemory is wired for creative mode, so synopsis.md is updated per accepted chapter (AUTO-CR-5).
     summary_memory = None
     if task_mode == "creative":
         try:
             from tools.auto.summary_memory import make_summary_memory
             summary_memory = make_summary_memory(config, base_dir=repo_dir, task_mode=task_mode)
         except ValueError:
-            # resolve_llm_profile deliberately raises ValueError for a
-            # misconfigured [summary] llm_profile — a missing section or
-            # missing base_url/api_key/model. This is an operator error that
-            # must surface at construction time, not be silently swallowed.
+            # A misconfigured [summary] profile is an operator error: it surfaces at construction, not silently.
             raise
         except Exception as exc:
             logger.warning(

@@ -61,9 +61,7 @@ from tools.contest import runner as runner_mod  # noqa: E402
 from tools.contest.harvest import harvest  # noqa: E402
 from tools.contest.workspace import Workspace  # noqa: E402
 
-#: The five worktrees round 64 left holding something. The other three agents of
-#: the eight ended clean (or with a tree the operator had already thrown away),
-#: and the ticket's table is about these five.
+#: The five worktrees that round 64 left holding work; the ticket's table covers these.
 ROUND_64_AGENTS = (
     "mimo-v2-5",
     "agnes-2-5-flash",
@@ -72,10 +70,7 @@ ROUND_64_AGENTS = (
     "glm-4-7-flash",
 )
 
-#: The ticket's *Source* table, verbatim: what the 2026-09-22 hand pass found.
-#: `verdict` and `tests` are what the replay has to reproduce; the shas are the
-#: 2026-09-22 ones and are deliberately *not* compared — the replay's own
-#: deadline commits carry new ones, which is the point.
+#: Expected verdict and tests from the ticket's Source table; shas are not compared, since replay commits differ.
 EXPECTED = {
     "mimo-v2-5":     {"verdict": "READY",  "tests": "PASS"},
     "agnes-2-5-flash": {"verdict": "READY",  "tests": "PASS"},
@@ -84,9 +79,7 @@ EXPECTED = {
     "glm-4-7-flash": {"verdict": "REWORK", "tests": "FAIL"},
 }
 
-#: The reason a REWORK entry is expected to carry. `tests_failed` only: the
-#: deadline commit and the row are the runner satisfying the existing contract,
-#: so nothing mechanical about the commit itself may object.
+#: The only reason a REWORK entry may carry: tests_failed (the deadline commit is the runner's own contract).
 EXPECTED_REWORK_REASONS = ("tests_failed",)
 
 
@@ -171,19 +164,13 @@ def _replay_one(src: Path, agent: str, ticket: Path, base: str, scratch: Path,
     """
     work = scratch / f"64-{agent}"
     branch_name = f"replay64/{agent}"
-    # a second run of the script must start from the same place the first did,
-    # so the scratch clone and its worktree are torn down rather than reused
+    # A second run starts clean: the scratch clone and worktree are torn down, not reused.
     if work.exists():
         subprocess.run(["git", "worktree", "remove", "-f", str(work)],
                        cwd=str(scratch / "repo.git"), check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         shutil.rmtree(work, ignore_errors=True)
-    # A `copytree` of a worktree copies its `.git` *file*, whose `gitdir:` still
-    # points at the original repository — so a commit in the copy lands on the
-    # round-64 branch and the replay mutates the evidence it is scoring. It is
-    # therefore re-created as a worktree of a *clone* of the repository, off the
-    # source's own branch, and the source's uncommitted work is copied in. The
-    # clone is the scratch dir's, and nothing under `--rounds` is written.
+    # A copied worktree's .git file points at the source repo, so the replay works on a clone to keep the evidence untouched.
     repo = scratch / "repo.git"
     if not repo.exists():
         subprocess.run(["git", "clone", "-q", "--no-hardlinks",

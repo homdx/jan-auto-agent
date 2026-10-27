@@ -23,10 +23,7 @@ HEADER = ("**Status:** open\n**Severity:** 2\n**File:** pkg/x.py\n**Symbol:** x\
           "**Round:** 9\n**Size:** M\n**Also touches:** -\n\n")
 
 
-# ── set_status_text, the pure part ───────────────────────────────────────────
-# Bug: closing then reopening a ticket whose `**Status:**` line is followed by a
-# blank line took the blank line with it (`_CLOSED_LINE_RE` already ends in `\n?`,
-# and the code then skipped one more `\n`).
+# Regression: close then reopen dropped the blank line after the Status line.
 
 S = tickets.set_status_text
 
@@ -51,8 +48,7 @@ def test_close_then_reopen_gives_back_the_ticket_it_started_from(text):
     assert S(closed, word, note) == text
 
 
-# Bug: on a CRLF ticket the status line lost its `\r` and the `**Closed:**` line
-# was written with a bare `\n`.
+# Regression: on a CRLF ticket the status line lost its CR and the Closed line used a bare LF.
 
 def test_a_crlf_ticket_keeps_crlf_on_the_status_line():
     text = "# t\r\n\r\n**Status:** open\r\n\r\nbody\r\n"
@@ -71,9 +67,7 @@ def test_an_lf_ticket_is_unchanged_behaviour():
         "# t\n\n**Status:** closed\n**Closed:** done\n\nbody\n"
 
 
-# Bug: a `**Closed:**` line ABOVE the `**Status:**` line moved the status line when
-# it was removed, and the stale offsets of the first search then cut the text in
-# the wrong place: `**Status:** clos**Status:** open`.
+# Regression: a Closed line above Status made the stale offsets cut the text in the wrong place.
 
 def test_a_closed_line_above_the_status_line_does_not_corrupt_the_text():
     text = "**Closed:** why\n**Status:** closed\nbody\n"
@@ -87,10 +81,7 @@ def test_closing_again_with_the_closed_line_above_the_status_line():
     assert again.count("**Closed:**") == 1
 
 
-# ── the verbs, end to end ────────────────────────────────────────────────────
-# Bug: the verbs read the ticket through `printable()` — "never feed it back to git
-# as content" — and committed what they had set the status on, so a byte that is not
-# UTF-8 came back as U+FFFD: `arena issue queue` rewrote the body of the ticket.
+# Regression: the verbs read through printable() and wrote back U+FFFD for non-UTF-8 bytes.
 
 NN = 9
 LATIN1 = b"latin1 byte here: caf\xe9 and more\n"
@@ -163,11 +154,7 @@ def test_edit_keeps_every_byte_it_was_not_asked_to_change(repo, capsys, tmp_path
     assert _blob(repo) == RAW + b"appended line\n"
 
 
-# ── bug: `_uncommitted` / `_modified` cut the first path's first letter ───────
-# The same strip of `git status --porcelain` as `rounds._dirty_tasks`: ` M path`
-# lost its leading space, then `line[3:]` took the path's first character. The
-# refusal that says which of the ticket's edits are uncommitted named a path that
-# does not exist.
+# Regression: _uncommitted and _modified cut the first path character (same strip as _dirty_tasks).
 
 def test_uncommitted_names_the_modified_ticket_in_full(repo):
     with open(repo / REL, "ab") as handle:
@@ -200,10 +187,7 @@ def test_a_verb_refuses_on_a_dirty_ticket_and_names_its_real_path(repo, capsys):
     assert b"an uncommitted edit" in (repo / REL).read_bytes()      # never overwritten
 
 
-# ── bug: the status verbs and intake could not see a non-ASCII ticket name ────
-# `_on_branch` and `blocking_tickets` listed `epic-tasks/` with `ls-tree --name-only`
-# and no `-z`, so git's octal quoting hid `12-café.md`: `issue queue 12` said "no
-# ticket 12", and a lower-numbered open ticket of that name never blocked intake.
+# Regression: status verbs and intake could not see a non-ASCII ticket name (ls-tree octal quoting).
 
 CAFE = "12-café.md"
 CAFE_RAW = ("# AR-12 \u2014 café\n\n" + HEADER).encode("utf-8") + b"body\n"

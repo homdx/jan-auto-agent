@@ -61,8 +61,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TARGET = "pkg/hub.py"
 _SYMBOLS_PREFIX = "public_symbols: "
 
-# The three rows that carry a `+N` tail: a count the row leads with, then a
-# courtesy list of names. These are the rows L6 makes shrinkable.
+# The three rows with a `+N` tail, which L6 makes shrinkable.
 _FACT_ROWS = {
     _row_callers: _CALLERS_PREFIX,
     _row_calls_into: _CALLS_INTO_PREFIX,
@@ -70,8 +69,7 @@ _FACT_ROWS = {
 }
 _FACT_PREFIXES = tuple(_FACT_ROWS.values())
 
-# How much data this hub carries, so an assertion reconciles a rendered count
-# against the model instead of hard-coding a number that will drift.
+# Hub size read from the model, not hard-coded.
 _N_CALLERS = 24
 _N_CALLS = 20
 _N_TESTS = 24
@@ -475,10 +473,7 @@ def test_live_coder_py_keeps_every_fact_row_at_the_ticket_budgets(live_model):
                     f"budget={budget}: public_symbols displaced {prefix.strip()}"
                 )
 
-    # Whatever it lost in names, the row keeps its total. `callers` and
-    # `tests` lead with it, so their rendered line starts with the count-only
-    # form; `calls_into` states it as names plus announced remainder, which must
-    # still reconcile with the model.
+    # A row keeps its total when names are dropped; the rendered line must reconcile.
     for budget in (1717, 900, 600, 400, 250):
         block = build_collect_context_block(live_model, target, budget=budget)
         for render, prefix in _FACT_ROWS.items():

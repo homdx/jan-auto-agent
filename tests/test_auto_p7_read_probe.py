@@ -68,8 +68,7 @@ def repo(tmp_path: Path) -> Path:
     (tmp_path / "tools" / "small.py").write_text("a\nb\nc\n", encoding="utf-8")
     (tmp_path / "tools" / "empty.py").write_text("", encoding="utf-8")
     (tmp_path / "tools" / "blob.bin").write_bytes(b"\xff\xfe\x00\x01binary")
-    # A source file with an embedded invalid UTF-8 byte (lone continuation byte
-    # \x80 is illegal as a leading byte in UTF-8). Used by Bug-16 regression.
+    # A source file with an invalid UTF-8 byte (a lone continuation byte); used by the Bug-16 regression.
     (tmp_path / "tools" / "latin1.py").write_bytes(
         b"def hello():\n    # caf\x80\n    pass\n"
     )
@@ -83,9 +82,7 @@ def _probe(repo: Path, batch=(), **kw) -> ArchProbe:
                      max_total_chars=kw.pop("max_total_chars", 20000))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Reading
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestReadOp:
 
@@ -224,9 +221,7 @@ class TestRangeParsing:
         assert ArchProbe._parse_read_arg(raw) == expect
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Out-of-batch marker
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestOutOfBatchMarker:
 
@@ -276,9 +271,7 @@ class TestOutOfBatchMarker:
         assert "will end your probing" in out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Integration with the existing machinery
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestWiring:
 
@@ -336,9 +329,7 @@ class TestWiring:
         assert "ALWAYS give a range" in p
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # End to end
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg() -> configparser.ConfigParser:
     c = configparser.ConfigParser()
@@ -394,8 +385,7 @@ def test_read_result_reaches_the_reask(repo, tmp_path) -> None:
     reask = next(m["content"] for m in payload["messages"] if m["role"] == "user")
     assert "file: tools/backoff.py  lines 10-12" in reask
     assert "   10  line_10" in reask
-    # tools/backoff.py is not in this batch (tools/small.py is), so the model
-    # must be told not to cite it.
+    # tools/backoff.py is outside this batch (tools/small.py is inside), so the model must be told not to cite it.
     assert "NOT IN YOUR BATCH" in reask
     assert [x.title for x in results] == ["Grounded"]
 

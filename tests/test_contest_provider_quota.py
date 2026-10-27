@@ -79,8 +79,7 @@ from tools.contest.runner import (  # noqa: E402
 )
 from tools.contest.workspace import Workspace  # noqa: E402
 
-# Hermetic: the committed contest.ini alone, copied where no contest.local.ini sits next to
-# it, so an operator's local overrides never change what these tests see.
+# Hermetic: the committed contest.ini alone, so operator overrides never change these tests.
 _COMMITTED_DIR = Path(tempfile.mkdtemp(prefix="committed-ini-"))
 atexit.register(shutil.rmtree, _COMMITTED_DIR, ignore_errors=True)
 shutil.copy(REPO_ROOT / "contest.ini", _COMMITTED_DIR / "contest.ini")
@@ -95,8 +94,7 @@ QUOTA_MESSAGE = (
 RETRY_AT_MS = 1_790_380_800_370
 UTC_AT_RESET = time.strftime("%Y-%m-%d %H:%M", time.gmtime(RETRY_AT_MS / 1000))
 
-#: The committed `quota_patterns`, phrase by phrase. Every phrase a round
-#: matches lives in contest.ini, and this is where the runner's is asserted.
+#: The committed quota_patterns, phrase by phrase; the runner's list is asserted here.
 QUOTA_PHRASES = (
     "daily limit",
     "limit reached",
@@ -109,15 +107,13 @@ QUOTA_PHRASES = (
     "would exceed your available credits",
     "top up",
     "billing",
-    # round 145: an empty wallet ("Your ... wallet balance is insufficient.
-    # Recharge at ...") ended a plain session.error instead of provider_quota
+    # Round 145: an empty wallet ended as session.error instead of provider_quota.
     "wallet balance",
     "recharge",
 )
 QUOTA_DEFAULT = " | ".join(QUOTA_PHRASES)
 
-#: Every provider text on record as a quota, provider by provider (the ticket's
-#: table), matched against the committed default list.
+#: Every provider quota text on record, matched against the committed default list.
 QUOTA_TEXTS = (
     QUOTA_MESSAGE,
     "Rate limit exceeded: free-models-per-day",
@@ -129,9 +125,7 @@ QUOTA_TEXTS = (
     "You exceeded your current quota. Please check your plan and billing details.",
 )
 
-#: What is not a quota. The bynara 503 first: on 2026-09-25 it was also what an
-#: exhausted plan looked like, so it cannot be a quota signal. The rest are
-#: KC-19's transients, which keep their own retry path.
+#: Not quotas: the bynara 503 (also an exhausted plan on 2026-09-25) and KC-19's transients, which keep their retry path.
 NOT_QUOTA_TEXTS = (
     "The model service is temporarily unavailable. Please try again.",
     "Server is busy",
@@ -407,9 +401,7 @@ def test_the_bound_fires_on_the_wall_clock_too(monkeypatch):
 
 # ── round 146: Kilo's own backoff is not a quota ──────────────────────────────
 
-#: Shaped after round 146's apertus-8b-instruct (`retry` events 4..12 of its
-#: `events.jsonl`): one 400 repeated, `attempt` counting up, the seconds to the next
-#: try growing as Kilo's doubling grows them, the last one 519 s — past the 300 s bound.
+#: Shaped after round 146's apertus-8b-instruct: one 400 repeated, attempts counting up, waits doubling to 519 s (past the 300 s bound).
 REJECTED = ("litellm.APIConnectionError: APIConnectionError: OpenAIException - "
             "The request was rejected as invalid. Please check your request parameters.")
 BACKOFF_STREAK = ((1, 11), (2, 20), (3, 25), (4, 39), (5, 71), (6, 137), (7, 182),

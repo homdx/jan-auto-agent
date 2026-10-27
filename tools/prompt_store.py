@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import configparser
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,8 +11,7 @@ from tools.config_safe import safe_getint
 
 logger = logging.getLogger(__name__)
 
-# Lazy imports of the hardcoded constants — imported at call time to avoid
-# circular imports if agent modules ever import from prompt_store in the future.
+# Lazy imports of the hardcoded prompts, so a future circular import is avoided.
 def _get_hardcoded(agent_name: str) -> str:
     """Return the module-level hardcoded constant for the given agent."""
     if agent_name in ("validator_agent", "validator"):
@@ -21,6 +21,39 @@ def _get_hardcoded(agent_name: str) -> str:
         from tools.improvement_agent import IMPROVEMENT_PROMPT_HARDCODED
         return IMPROVEMENT_PROMPT_HARDCODED
     raise ValueError(f"PromptStore: no hardcoded constant registered for agent '{agent_name}'")
+
+
+# A stack record with no ``version`` (a hand-edited or older-format prompts.json) is
+# shown as this, so one such record cannot take the whole /prompts table down (HARDEN-1 A3).
+_NO_VERSION_LABEL = "v?"
+
+
+def _version_label(item) -> str:
+    """The display label of one stack *item*: ``v<n>``, or ``v?`` when the
+    record carries no version at all (HARDEN-1 A3)."""
+    version = item.get("version") if isinstance(item, dict) else None
+    return f"v{version}" if version is not None else _NO_VERSION_LABEL
+
+
+def _usable_stack(entry) -> list:
+    """The stack of *entry* as a list of mapping records, or ``[]``.
+
+    AUDIT-9: ``_load`` accepts any JSON object, so an agent entry that is not
+    a mapping, a ``stack`` that is not a list, or a record that is not a
+    mapping reached ``get_current``/``push``/``rollback``/``get_store_summary``
+    and raised there. Each of them reads the stack through this instead.
+    """
+    if not isinstance(entry, dict):
+        return []
+    stack = entry.get("stack")
+    if not isinstance(stack, list):
+        return []
+    return [item for item in stack if isinstance(item, dict)]
+
+
+def _int_version(item) -> "int | None":
+    version = item.get("version") if isinstance(item, dict) else None
+    return version if isinstance(version, int) and not isinstance(version, bool) else None
 
 
 class PromptStore:
@@ -54,17 +87,7 @@ class PromptStore:
         else:
             self.store_path = Path("prompts.json")
 
-        # AUTO-FIX (high-priority audit, DeepSeek-plan finding): max_versions
-        # <= 0 used to reach push() unclamped. push() appends the new entry
-        # THEN evicts down to max_versions, so max_versions=0 emptied the
-        # stack back to zero right after adding to it — the very next line,
-        # `data[agent_name]["current_version"] = stack[-1]["version"]`, then
-        # raised IndexError on the empty list. A concrete, reproducible
-        # crash (not just defense-in-depth), and also inconsistent with the
-        # "0 means no cap" convention this codebase uses elsewhere (e.g.
-        # RunLimits) — here 0 meant "always crash," not "unlimited." Clamp
-        # to a minimum of 1: a version history of at least the newest entry
-        # is the smallest value that keeps push()'s own indexing safe.
+        # max_versions is clamped to at least 1, since push() indexes the newest entry (AUTO-FIX).
         if max_versions is not None:
             self.max_versions = max(1, int(max_versions))
         elif config is not None:
@@ -72,21 +95,21 @@ class PromptStore:
         else:
             self.max_versions = 3
 
-    # ------------------------------------------------------------------ #
-    # Public API                                                           #
-    # ------------------------------------------------------------------ #
+    # Public API
 
     def get_current(self, agent_name: str) -> str:
         """Return the active prompt for agent_name, falling back to hardcoded."""
         data = self._load()
         entry = data.get(agent_name)
-        if not entry or not entry.get("stack"):
+        # Only records that carry a prompt string can answer (AUDIT-9).
+        stack = [item for item in _usable_stack(entry)
+                 if isinstance(item.get("prompt"), str)]
+        if not stack:
             return _get_hardcoded(agent_name)
-        stack = entry["stack"]
         current_version = entry.get("current_version", len(stack))
         # Find the entry matching current_version; fall back to top of stack.
         for item in reversed(stack):
-            if item["version"] == current_version:
+            if item.get("version") == current_version:
                 return item["prompt"]
         return stack[-1]["prompt"]
 
@@ -97,29 +120,39 @@ class PromptStore:
 
             validator_agent    v2  (score 0.87)  rollback: v1, hardcoded
             improvement_agent  hardcoded          rollback: —
+
+        A record with no ``version`` (a hand-edited or older-format
+        ``prompts.json``) is shown as ``v?`` rather than raising
+        (HARDEN-1 A3): the REPL's ``/prompts`` has no handler, so one such
+        record used to end the shell with a ``KeyError``. A missing or
+        ``null`` ``score`` was already shown as ``(no score)`` (fix 36);
+        ``version`` now gets the same treatment, and the other records are
+        still listed.
         """
         data = self._load()
         rows = []
         for name in agent_names:
             entry = data.get(name, {})
-            stack = entry.get("stack", [])
+            stack = _usable_stack(entry)
 
             # Current version label + score
             if stack:
-                current_version = entry.get("current_version", stack[-1]["version"])
+                current_version = entry.get("current_version", stack[-1].get("version"))
                 current = next(
-                    (item for item in reversed(stack) if item["version"] == current_version),
+                    (item for item in reversed(stack)
+                     if isinstance(item, dict) and item.get("version") == current_version),
                     stack[-1],
                 )
-                label = f"v{current['version']}"
-                score_str = f"(score {current['score']:.2f})"
+                label = _version_label(current)
+                score = current.get("score") if isinstance(current, dict) else None
+                score_str = f"(score {score:.2f})" if isinstance(score, (int, float)) else "(no score)"
             else:
                 label = "hardcoded"
                 score_str = ""
 
             # Rollback chain: everything below the top, then "hardcoded"
             below = stack[:-1] if stack else []
-            rollback_parts = [f"v{item['version']}" for item in reversed(below)]
+            rollback_parts = [_version_label(item) for item in reversed(below)]
             rollback_parts.append("hardcoded")
             rollback_str = "rollback: " + ", ".join(rollback_parts)
 
@@ -142,18 +175,28 @@ class PromptStore:
 
         Returns ``'v{n}'`` when a versioned prompt is active, or
         ``'hardcoded'`` when the stack is empty / agent is unknown.
+
+        HARDEN-8 E: the top of the stack is read with ``.get("version")``, the
+        way ``get_store_summary`` reads it, so a hand-edited or older-format
+        ``prompts.json`` whose top record has no ``version`` no longer raises
+        ``KeyError``: the label of the last record that still carries one is
+        answered, and ``hardcoded`` when no record does.
         """
         data = self._load()
         entry = data.get(agent_name)
-        if not entry or not entry.get("stack"):
+        # An entry that is not a mapping, or a stack that is not a list, is as unusable as an
+        # absent one: the label is answered, never raised (a hand-edited prompts.json).
+        stack = entry.get("stack") if isinstance(entry, dict) else None
+        if not stack or not isinstance(stack, list):
             return "hardcoded"
-        # Bugfix: raised KeyError when the stack is non-empty but
-        # current_version is absent (older store format, hand-edited file).
-        # get_current() and get_store_summary() already fall back to the top
-        # of the stack; this site — on main.py's per-turn path — did not.
-        stack = entry["stack"]
-        current_version = entry.get("current_version", stack[-1]["version"])
-        return f"v{current_version}"
+        # Falls back to the top of the stack when current_version is missing (bugfix).
+        current_version = entry.get("current_version")
+        if current_version is not None:
+            return f"v{current_version}"
+        for item in reversed(stack):
+            if isinstance(item, dict) and item.get("version") is not None:
+                return _version_label(item)
+        return "hardcoded"
 
     def push(self, agent_name: str, new_prompt: str, score: float) -> None:
         """
@@ -162,11 +205,19 @@ class PromptStore:
         prompts.json is created on first call.
         """
         data = self._load()
-        if agent_name not in data:
-            data[agent_name] = {"stack": [], "current_version": 0}
+        entry = data.get(agent_name)
+        if not isinstance(entry, dict) or not isinstance(entry.get("stack"), list) \
+                or len(_usable_stack(entry)) != len(entry.get("stack") or []):
+            if agent_name in data:
+                # AUDIT-9: a malformed entry is replaced, so its raw form is
+                # kept in a copy of the file before the save overwrites it.
+                self._backup_copy(f"malformed entry for {agent_name!r}")
+            entry = {"stack": _usable_stack(entry), "current_version": 0}
+            data[agent_name] = entry
 
-        stack = data[agent_name]["stack"]
-        next_version = (stack[-1]["version"] + 1) if stack else 1
+        stack = entry["stack"]
+        versions = [v for v in (_int_version(item) for item in stack) if v is not None]
+        next_version = (max(versions) + 1) if versions else 1
 
         stack.append({
             "version": next_version,
@@ -191,23 +242,34 @@ class PromptStore:
         """
         data = self._load()
         entry = data.get(agent_name)
+        if not isinstance(entry, dict) or not isinstance(entry.get("stack"), list):
+            return False    # AUDIT-9: a malformed entry has nothing to roll back
+        usable = _usable_stack(entry)
+        if len(usable) != len(entry["stack"]):
+            self._backup_copy(f"malformed records for {agent_name!r}")
+            entry["stack"] = usable
         if not entry or not entry.get("stack"):
             return False
 
         removed = entry["stack"].pop()
         stack = entry["stack"]
         data[agent_name]["stack"] = stack
+        if stack and "version" not in stack[-1]:
+            # a version-less record (HARDEN-1 A3) is now the top: no version to name
+            data[agent_name]["current_version"] = 0
+            self._save(data)
+            logger.info(f"PromptStore: rolled back '{agent_name}' from "
+                        f"{_version_label(removed)} → {_NO_VERSION_LABEL}")
+            return True
         data[agent_name]["current_version"] = stack[-1]["version"] if stack else 0
         self._save(data)
         logger.info(
-            f"PromptStore: rolled back '{agent_name}' from v{removed['version']} "
-            f"→ {'v' + str(stack[-1]['version']) if stack else 'hardcoded'}"
+            f"PromptStore: rolled back '{agent_name}' from {_version_label(removed)} "
+            f"→ {_version_label(stack[-1]) if stack else 'hardcoded'}"
         )
         return True
 
-    # ------------------------------------------------------------------ #
-    # Internal helpers                                                     #
-    # ------------------------------------------------------------------ #
+    # Internal helpers
 
     def _load(self) -> dict:
         """Load the store, or an empty dict if it is missing or unusable.
@@ -252,6 +314,28 @@ class PromptStore:
             return {}
         return data
 
+    def _backup_copy(self, reason: str) -> None:
+        """Copy the store aside before a save drops part of it (AUDIT-9).
+
+        Unlike :meth:`_quarantine` the file stays in place — the rest of it is
+        still good — only a copy is kept, as ``prompts.json.malformed-<stamp>``.
+        """
+        if not self.store_path.exists():
+            return
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        dest = self.store_path.with_suffix(f".json.malformed-{stamp}")
+        n = 0
+        while dest.exists():
+            n += 1
+            dest = self.store_path.with_suffix(f".json.malformed-{stamp}-{n:03d}")
+        try:
+            shutil.copy2(self.store_path, dest)
+            logger.warning("PromptStore: %s has a %s — copied to %s before "
+                           "rewriting it", self.store_path.name, reason, dest.name)
+        except OSError as exc:
+            logger.error("PromptStore: %s has a %s and could not be copied "
+                         "aside (%s)", self.store_path.name, reason, exc)
+
     def _quarantine(self, reason: str) -> None:
         """Move an unusable prompts.json aside and log why.
 
@@ -264,11 +348,7 @@ class PromptStore:
         """
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         dest  = self.store_path.with_suffix(f".json.corrupt-{stamp}")
-        # Same-second collision guard — see TicketStore._quarantine for the
-        # reasoning and the reproduction. Narrower here than the ticket case
-        # (there is only one store_path, not one per id), but reproducible
-        # the same way: two quarantines of this file within the same
-        # wall-clock second otherwise silently overwrite each other.
+        # A same-second quarantine gets a numbered name, so the files do not overwrite (BUGFIX).
         suffix_n = 0
         while dest.exists():
             suffix_n += 1
@@ -290,14 +370,7 @@ class PromptStore:
 
     def _save(self, data: dict) -> None:
         try:
-            # 0. Ensure the parent directory exists — mirrors
-            # MetricsCollector.record()'s atomic-write helper. Without this,
-            # a configured store_path whose directory doesn't exist yet
-            # (e.g. "state/prompts.json") makes mkstemp raise
-            # FileNotFoundError, which the except below only logs: push()
-            # returns normally, the file is never written, and the very next
-            # get_current() re-reads from disk, finds nothing, and silently
-            # serves the stale/hardcoded prompt as if the push never happened.
+            # Creates the parent directory first, so a missing folder does not silently drop the push (BUGFIX).
             self.store_path.parent.mkdir(parents=True, exist_ok=True)
 
             # 1. Create a temporary file in the same directory as the target
@@ -306,13 +379,7 @@ class PromptStore:
             # 2. Write the JSON data to the temp file
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-                # BUGFIX: flush + fsync before the rename — os.replace alone
-                # only guarantees the RENAME is atomic, not that the bytes
-                # written above are durable. A power loss / kernel panic /
-                # OOM-kill between json.dump and os.replace can otherwise
-                # produce a 0-byte or partially-flushed prompts.json, which
-                # the next run reads back as corrupt and quarantines,
-                # losing all prior A/B tuning history.
+                # Flush and fsync before the rename, so a crash does not leave a partial store (BUGFIX).
                 f.flush()
                 os.fsync(f.fileno())
 
@@ -327,8 +394,13 @@ class PromptStore:
                 except OSError:
                     pass
             logger.error(f"PromptStore failed to write {self.store_path}: {e}")
-            # 5. Re-raise so callers (push/rollback) know the save did not
-            # happen, instead of silently returning as if it succeeded —
-            # without this, the caller believes the new state is durable
-            # while the store still holds the stale/previous data on disk.
+            # Re-raise a failed save, so the caller does not think the new state is durable (BUGFIX).
             raise RuntimeError(f"PromptStore failed to write {self.store_path}") from e
+        except BaseException:
+            # Ctrl-C mid-write: the temp file is not left behind either
+            if 'tmp_path' in locals():
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise

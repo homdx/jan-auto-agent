@@ -94,9 +94,7 @@ class TestNonJsonBodyGoesThroughRetryLadder:
                 _call(port)
         finally:
             server.shutdown()
-        # A bare JSONDecodeError would mean it escaped the retry loop as an
-        # uncaught exception. After the retry budget is spent the failure
-        # surfaces as the same RuntimeError every other failure does.
+        # After the retry budget, a JSON error must surface as the usual RuntimeError, not escape.
         assert not isinstance(excinfo.value, json.JSONDecodeError)
         assert not isinstance(excinfo.value, ValueError)
         assert "JSONDecodeError" in str(excinfo.value)

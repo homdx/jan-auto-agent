@@ -55,8 +55,7 @@ TASKS_DIR = contest_cli.TASKS_DIR
 
 #: `07-x.md` is round 7 — the same match as `gates.ticket_for_round`.
 _TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
-# No `$`: in MULTILINE mode it only matches before a `\n`, so a CRLF line's `\r`
-# would have to be taken by the match and the replacement would drop it.
+# No $ anchor: in MULTILINE mode it matches only before \n, and a CRLF line would lose its \r.
 _STATUS_LINE = re.compile(r"^\*\*Status:\*\*[^\r\n]*", re.MULTILINE)
 #: A round folder: `06` or `06.2`.
 _ROUND_DIR = re.compile(r"^(\d+)(?:\.(\d+))?$")
@@ -80,8 +79,7 @@ class RoundError(Exception):
 # ── the roster's out_dir and the round folders ───────────────────────────────
 def load_config(repo: Path):
     """The roster `tools.contest run` reads, for its `out_dir`. `RoundError` on a bad ini."""
-    # the same default `cmd_run` sets: the committed ${CONTEST_GATE_API_KEY}
-    # reference must resolve for `load_roster` to read the file at all
+    # Same default as cmd_run, so load_roster can read the committed file (CONTEST_GATE_API_KEY).
     os.environ.setdefault("CONTEST_GATE_API_KEY", "unset-for-the-round")
     try:
         return roster.load_roster(Path(repo) / "contest.ini")
@@ -219,9 +217,7 @@ def integration_branch(repo: Path, flag: Optional[str], prof: dict[str, str]) ->
             branch = ""
         if not branch:
             raise RoundError("HEAD is detached — pass --branch or set the profile's branch")
-    # Bug 186: `show-ref --verify` takes an exact ref name. `rev-parse --verify`
-    # evaluates revision syntax, so `main~1`, `main^` or `main@{1}` "existed" and a
-    # round was built off an older commit than the branch's tip, without a word.
+    # Bug 186: show-ref --verify takes an exact ref name; rev-parse would also accept main~1 or main^.
     try:
         git(repo, "show-ref", "--verify", "-q", f"refs/heads/{branch}")
     except GitRefError:
@@ -303,8 +299,7 @@ def build_run_line(nn: int, prof: dict[str, str], passthrough: list[str]) -> lis
         flag = _owned(word)
         if flag:
             raise RoundError(f"{flag} is set by arena, not after --")
-    # AR-62: a flag both the profile and the passthrough give reaches the
-    # runner once — the passthrough's, since it comes last.
+    # A flag given by both the profile and the passthrough reaches the runner once, the passthrough's (AR-62).
     flags = profile.dedupe_flags([*profile.profile_flags(prof), *passthrough])
     return [sys.executable, "-m", "tools.contest", "run", "--ticket", str(nn),
             "--base", f"{REF_PREFIX}{nn}", *flags]
@@ -345,16 +340,24 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
     if started is None:
         # one second of slack: some filesystems keep mtimes in whole seconds
         started = time.time() - 1
+    # AUDIT-5: the lock is taken with O_EXCL, so the liveness check and the
+    # claim are one step. Two `run start NN` that both passed round_alive()
+    # used to overwrite one lock and start two runners; whichever exited
+    # first then unlinked the lock the other still depended on.
+    try:
+        claimed = _claim_lock(lock, nn)
+    except OSError as err:
+        return output.refuse(f"cannot start the runner: {err}")
+    if not claimed:
+        return output.refuse(f"round {nn} is already running in {repo}")
+    owned = {str(os.getpid())}
     try:
         try:
-            lock.write_text(str(os.getpid()), encoding="utf-8")
             child = SPAWN(line, cwd=str(repo))
         except OSError as err:
             return output.refuse(f"cannot start the runner: {err}")
-        # Bug 181: the runner is up from here on. A failed swap to its pid keeps
-        # arena's own pid in the lock and still waits the child out — never
-        # "cannot start" over a running, unlocked runner. An exception that is
-        # no OSError (from SPAWN too) leaves through the `finally`, lock gone (157).
+        owned.add(str(child.pid))
+        # Bug 181: once the runner is up, a failed pid swap still waits for the child; never "cannot start" over a running runner.
         try:
             lock_tmp.write_text(f"{child.pid}\n", encoding="utf-8")
             os.replace(lock_tmp, lock)
@@ -368,8 +371,125 @@ def _run_child(repo: Path, nn: int, line: list[str], state: Path,
                 # Ctrl-C reached the child too (same process group): wait it out
                 continue
     finally:
-        lock.unlink(missing_ok=True)
+        _release_lock(lock, owned)
     return _map_exit(code, state, started, written)
+
+
+def _pid_alive(pid: str) -> bool:
+    """True when process *pid* exists (a pid we may not signal still exists)."""
+    if not pid.isdigit() or int(pid) <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _holder_alive(holder: str, nn: Optional[int]) -> bool:
+    """True when *holder*, the pid in a round's lock, is a live owner of the lock.
+
+    CC review fixes 49: a live pid alone is no proof. After a crash or a reboot
+    the pid a lock names may belong to any other process; `round_alive` already
+    reads that as "not running", while the claim refused every later start as
+    "already running" until the lock was deleted by hand. The holder counts when
+    it is this process, the round's runner (`tools.contest run --ticket NN`, the
+    pid after the swap) or a `tools.arena` command (the starter between its claim
+    and the swap). With no readable cmdline (no /proc) a live pid is taken at
+    its word, as before.
+    """
+    if not _pid_alive(holder):
+        return False
+    if holder == str(os.getpid()):
+        return True
+    root = Path(PROC_ROOT)
+    deadline = time.monotonic() + _YOUNG_HOLDER_WAIT_SEC
+    while True:
+        words = _cmdline(root, holder)
+        if words is None:
+            return True
+        if (nn is not None and _matches(words, nn)) or "tools.arena" in words:
+            return True
+        # REL-7 AR-1: a process that has only just started may not show its own command
+        # yet — between fork and exec /proc shows the parent's words, and during the exec
+        # none — so a second claimer took the lock from a runner that was starting. A young
+        # process is read again for a moment; a zombie is dead at once.
+        state, age, ppid = _proc_state_and_age(root, holder)
+        if state == "Z" or age is None or age > _YOUNG_HOLDER_SEC or time.monotonic() >= deadline:
+            return False
+        # Only a process still mid-start is waited on: no words yet (the exec), or the
+        # very words of its parent (the fork before the exec). "sleep 30" is a stranger.
+        if words and words != _cmdline(root, ppid):
+            return False
+        time.sleep(0.05)
+
+
+#: REL-7 AR-1: how young a lock holder must be to be read again, and for how long.
+_YOUNG_HOLDER_SEC = 5.0
+_YOUNG_HOLDER_WAIT_SEC = 2.0
+
+
+def _proc_state_and_age(proc_root: Path, pid: str) -> "tuple[str, Optional[float], str]":
+    """The state letter of `/proc/<pid>/stat`, the process's age in seconds and its parent pid.
+
+    `("", None, "")` when they cannot be read — the caller then does not wait on it.
+    """
+    try:
+        stat = (proc_root / pid / "stat").read_text(encoding="utf-8", errors="replace")
+        uptime = float((proc_root / "uptime").read_text(encoding="utf-8").split()[0])
+        fields = stat[stat.rindex(")") + 2:].split()    # the name may hold spaces and ')'
+        state, ppid, start_ticks = fields[0], fields[1], int(fields[19])
+        return state, uptime - start_ticks / os.sysconf("SC_CLK_TCK"), ppid
+    except (OSError, ValueError, IndexError, AttributeError):
+        return "", None, ""
+
+
+def _claim_lock(lock: Path, nn: Optional[int] = None) -> bool:
+    """Create *lock* holding this process's pid, atomically; False when a live
+    owner already holds it (`_holder_alive`). A lock left by a dead process — or
+    naming a pid that is now some other program — is replaced. *nn* defaults to
+    the round number in the lock's name (``NN.pid``)."""
+    if nn is None:
+        nn = _as_int(lock.name.split(".", 1)[0])
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                holder = lock.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                holder = ""
+            if _holder_alive(holder, nn):
+                return False
+            if not holder:
+                # Empty: another claimer may be between its create and its
+                # write — only an old empty lock is a dead claimer's.
+                try:
+                    if time.time() - lock.stat().st_mtime < 5:
+                        return False
+                except OSError:
+                    pass
+            # stale: its process is gone, or the pid now names another program
+            lock.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        return True
+    return False
+
+
+def _release_lock(lock: Path, owned: set) -> None:
+    """Remove *lock* only while it still names one of *owned* — never another runner's."""
+    try:
+        holder = lock.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return
+    if holder in owned:
+        lock.unlink(missing_ok=True)
 
 
 # ── 211: the old round's uncommitted worktrees, and the one-shot `--fresh` ───
@@ -469,8 +589,7 @@ def run_start(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
         branch = integration_branch(repo, args.branch, prof)
         if round_alive(repo, nn, PROC_ROOT):
             raise RoundError(f"round {nn} is already running in {repo}")
-        # AR-14 §5: the lower open tickets intake would hand out first, named
-        # before `arena-round/NN` is built. Deferred import: tickets imports us.
+        # Lists the lower open tickets, named before the round branch (AR-14).
         from . import tickets as _tickets
         if _tickets.report_intake_blockers(repo, branch, nn,
                                            getattr(args, "output", "table")):
@@ -479,8 +598,7 @@ def run_start(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
         if dirty:
             raise RoundError(f"{TASKS_DIR}/ has uncommitted files: {', '.join(dirty)} — "
                              "move drafts to .arena/drafts/")
-        # 211: `--fresh` is a spoken word — this flag, or the profile's `fresh=yes`
-        # (named, never silent), or one after `--`; never stored by arena itself.
+        # --fresh counts only when it is spoken: as a flag, a profile fresh=yes, or after --.
         if getattr(args, "fresh", False) and "--fresh" not in line:
             line.append("--fresh")
         fresh = "--fresh" in line
@@ -544,8 +662,12 @@ def list_rows(repo: Path, config, now: Optional[float] = None,
     out = repo / config.out_dir
     now = time.time() if now is None else now
     groups: dict[int, list[tuple[int, Path]]] = {}
-    if out.is_dir():
-        for entry in out.iterdir():
+    try:
+        entries = list(out.iterdir()) if out.is_dir() else []
+    except OSError:
+        entries = []                     # an unreadable rounds folder lists nothing, never a traceback
+    if entries:
+        for entry in entries:
             match = _ROUND_DIR.match(entry.name)
             if match and entry.is_dir():
                 leg = int(match.group(2)) if match.group(2) else 0
@@ -553,10 +675,7 @@ def list_rows(repo: Path, config, now: Optional[float] = None,
     rows = []
     for nn, folders in groups.items():
         legs = sorted(f for f in folders if f[0])
-        # Bug 177: pick from the folders found, never a re-derived `NN` path —
-        # an unpadded `7/` or `8.1/` has no `07/` beside it. A base with a
-        # state.json wins (the padded one first), else the highest leg, as
-        # `round_folder` says.
+        # Bug 177: pick folders as found, not a re-derived NN path; a base with state.json wins, else the highest leg.
         bases = sorted((f for _leg, f in folders if not _leg),
                        key=lambda f: (not (f / "state.json").is_file(), f.name != f"{nn:02d}"))
         if bases and ((bases[0] / "state.json").is_file() or not legs):
@@ -575,7 +694,7 @@ def list_rows(repo: Path, config, now: Optional[float] = None,
         try:
             data = json.loads(state.read_text(encoding="utf-8"))
             agents = data["agents"]
-            ready = sum(1 for a in agents if a.get("state") == "READY")
+            ready = sum(1 for a in agents if isinstance(a, dict) and a.get("state") == "READY")
             counts = f"{ready}/{len(agents)}"
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             data, counts = None, ""
@@ -615,9 +734,7 @@ def run_list(repo: Path, args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-# ── run view ─────────────────────────────────────────────────────────────────
-#: `NN` or `NN.K`, digits only; `07.2` is round 7 leg 2. Bug 187: at most 18 digits
-#: a part — `int()` of a 4300+ digit string raises, and no round has such a number.
+# Run view: NN or NN.K, digits only, at most 18 digits per part (bug 187).
 _VIEW_ARG = re.compile(r"^(\d{1,18})(?:\.(\d{1,18}))?$")
 
 #: The `-o json` columns, one row per agent in `state.json` order.
@@ -675,8 +792,7 @@ def _view_header(repo: Path, nn: int, folder: Path, data: dict) -> str:
     match = _ROUND_DIR.match(folder.name)
     legs = leg_folders(folder.with_name(f"{nn:02d}"))
     if match and match.group(2) and legs:
-        # N is the last leg's number, not the folder count: a round whose
-        # `NN.1` was cleaned away still reads `leg 2/2`, never `leg 2/1`
+        # N is the last leg's number, not the folder count, so a cleaned leg does not shift it.
         last = int(legs[-1].name.rpartition(".")[2])
         parts.append(f"leg {int(match.group(2))}/{last}")
     parts.append("running" if round_alive(repo, nn, PROC_ROOT) else "done")
@@ -844,7 +960,16 @@ def run_rerun(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int
     try:
         shutil.copy2(state, state.with_name(BACKUP_NAME))
         body = json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8")
-        state.write_bytes(body)
+        # AUDIT-20: written beside it and swapped in, so a failed or
+        # interrupted write (a full disk) leaves the old state.json whole
+        # instead of a truncated one only a manual restore could fix.
+        tmp = state.with_name(f".{state.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_bytes(body)
+            os.replace(tmp, state)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         wrote = state.stat().st_mtime
     except OSError as err:
         return output.refuse(f"cannot write {state}: {err}")

@@ -87,9 +87,7 @@ from tools.auto.executor import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _task(
     *,
@@ -104,13 +102,7 @@ def _task(
     }
 
 
-# FL-1 (round 84, round 7): a hang guard, not an assertion. The tests that
-# are *about* the timeout build their own Executor with `timeout_sec=0.5`;
-# this shared helper only needs the command to finish. At 30 s it was a
-# wall-clock bound over whatever the acceptance check happens to be — and
-# `test_pytest_acceptance_check` spawns a nested `python -m pytest`, which
-# imports the whole plugin stack and this repo's conftest before it runs a
-# line. The operator's stress run timed it out at 30 s.
+# Shared helper: the command only needs to finish; the timeout tests build their own Executor (FL-1 hang guard).
 _EXEC_TIMEOUT_S = 300
 
 
@@ -128,9 +120,7 @@ def _setup_repo(tmp_path: Path) -> Path:
     return repo
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — structured result
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: structured result
 
 class TestStructuredResult:
     def test_success_exit_code_zero(self, tmp_path: Path) -> None:
@@ -187,9 +177,7 @@ class TestStructuredResult:
         assert result.task_id == "MY-TASK"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — timeout enforcement
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: timeout enforcement
 
 class TestTimeoutEnforcement:
     def test_timed_out_result(self, tmp_path: Path) -> None:
@@ -224,16 +212,12 @@ class TestTimeoutEnforcement:
             workspace_root = tmp_path / "ws",
             timeout_sec    = 0.5,
         )
-        # Print something, then sleep long.  On some systems partial stdout
-        # may or may not be captured depending on buffering, so we just check
-        # the result doesn't crash and timed_out is set.
+        # Partial stdout may or may not be captured; check only that the run does not crash and timed_out is set.
         result = ex.run(_task(acceptance_check="echo partial; sleep 10"))
         assert result.timed_out is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # ExecutionResult properties
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestExecutionResultProperties:
     def test_passed_true(self) -> None:
@@ -273,9 +257,7 @@ class TestExecutionResultProperties:
         assert r.task_id == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Workspace setup
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestWorkspaceSetup:
     def test_workspace_dir_created(self, tmp_path: Path) -> None:
@@ -330,9 +312,7 @@ class TestWorkspaceSetup:
         assert (ws / "b.py").exists()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Command resolution
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestCommandResolution:
     """Test _resolve_command() via a patched _execute()."""
@@ -407,9 +387,7 @@ class TestCommandResolution:
         assert cmd == "./run.sh"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Network suppression
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestNetworkSuppression:
     def test_proxy_vars_not_in_child_env(self, tmp_path: Path) -> None:
@@ -457,9 +435,7 @@ class TestNetworkSuppression:
         assert "MISSING" not in result.stdout
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Traceback extraction
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestTracebackExtraction:
     def test_no_traceback_returns_empty(self) -> None:
@@ -505,9 +481,7 @@ class TestTracebackExtraction:
         assert "ValueError" in result.traceback
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Output truncation
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestOutputTruncation:
     def test_short_text_not_truncated(self) -> None:
@@ -539,9 +513,7 @@ class TestOutputTruncation:
         assert "truncated" in result.stdout
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Error handling
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestErrorHandling:
     def test_missing_id_raises_value_error(self, tmp_path: Path) -> None:
@@ -559,7 +531,7 @@ class TestErrorHandling:
     def test_oserror_returns_result_no_raise(self, tmp_path: Path) -> None:
         _setup_repo(tmp_path)
         ex = _executor(tmp_path)
-        with patch("subprocess.run", side_effect=OSError("shell not found")):
+        with patch("subprocess.Popen", side_effect=OSError("shell not found")):
             result = ex.run(_task())
         assert result.exit_code == -1
         assert "shell not found" in result.stderr
@@ -575,9 +547,7 @@ class TestErrorHandling:
         assert "err" in result.stderr
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # run_raw()
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestRunRaw:
     def test_run_raw_passes_on_success(self, tmp_path: Path) -> None:
@@ -613,9 +583,7 @@ class TestRunRaw:
         assert result.task_id == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # make_executor() factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestMakeExecutor:
     def test_factory_returns_executor(self, tmp_path: Path) -> None:
@@ -650,9 +618,7 @@ class TestMakeExecutor:
         assert ex._python_bin == "/custom/python"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Integration
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestIntegration:
     def test_passing_python_script(self, tmp_path: Path) -> None:

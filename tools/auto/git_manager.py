@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import configparser
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -51,6 +52,33 @@ logger = logging.getLogger(__name__)
 # ── Defaults ────────────────────────────────────────────────────────────────
 _DEFAULT_GIT_USER  = "auto-agent"
 _DEFAULT_GIT_EMAIL = "auto-agent@localhost"
+
+
+def _normalised_task_mode(config: configparser.ConfigParser) -> str:
+    """The run's task mode, or ``"code"`` when unset/unreadable (B4).
+
+    Only ``creative`` mode writes the continuity files ``user_changes`` must
+    ignore, so anything that is not exactly ``creative`` — including a
+    malformed ``[auto] task_mode`` — is treated as ``code``.
+    """
+    try:
+        from tools.auto.utils import normalize_task_mode
+        mode, _warning = normalize_task_mode(
+            config.get("auto", "task_mode", fallback="code")
+        )
+    except Exception:   # noqa: BLE001 — an unreadable config degrades to code
+        return "code"
+    return mode if mode in ("code", "creative", "docs") else "code"
+
+
+class DirtyTreeError(RuntimeError):
+    """The target has uncommitted changes that are not the agent's: a failed task's reset would take them."""
+
+    def __init__(self, paths: "list[str]") -> None:
+        self.paths = list(paths)
+        shown = ", ".join(self.paths[:5]) + (f" and {len(self.paths) - 5} more" if len(self.paths) > 5 else "")
+        super().__init__(f"uncommitted changes in the target: {shown} — commit or stash them first "
+                         "(a task that fails resets the tree to HEAD)")
 
 
 class GitError(RuntimeError):
@@ -77,6 +105,11 @@ class GitManager:
     ) -> None:
         self.repo_dir = Path(repo_dir).resolve()
         self._config  = config or configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+        # Normalised [auto] task_mode, read once (B4): it decides whether the
+        # agent's own creative continuity files count as its own output. A
+        # malformed value degrades to "code", which is the safe default — the
+        # extra files are then never written, so they need no exclusion.
+        self.task_mode = _normalised_task_mode(self._config)
 
     # ── Properties ──────────────────────────────────────────────────────────
 
@@ -90,8 +123,7 @@ class GitManager:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    # Lines that must be present in the repo's .gitignore so the agent never
-    # accidentally commits internal state files or coder backup artefacts.
+    # Entries the repo's .gitignore must contain, so internal state and backups are never committed.
     _GITIGNORE_ENTRIES: tuple[str, ...] = (
         ".agent/",       # all agent state (plan.json, run.log, trace files, …)
         "*.coder.bak",   # per-file backups written by Coder before each edit
@@ -147,21 +179,162 @@ class GitManager:
             logger.warning("ensure_gitignore_committed: cannot write .gitignore: %s", exc)
             return
 
-        # Stage only .gitignore and commit immediately so stage_all() later
-        # never sees it as a pending change.
+        # Stage only .gitignore and commit it at once, so stage_all() never sees it as a pending change.
         try:
             self._run(["git", "add", ".gitignore"], "git add .gitignore failed")
             self._run(
-                ["git", "commit", "-m", "chore: add auto-agent safety .gitignore"],
+                ["git", "commit", "-m", "chore: add auto-agent safety .gitignore", "--", ".gitignore"],
                 "git commit .gitignore failed",
             )
             logger.info(
                 "ensure_gitignore_committed: committed .gitignore with entries: %s", missing
             )
         except GitError as exc:
-            # Non-fatal: the file was written; future commits may pick it up,
-            # but the entries are at least present for git to honour.
+            # Non-fatal: the file is written and the entries are present for git to honour.
             logger.warning("ensure_gitignore_committed: commit failed: %s", exc)
+
+    #: what the agent itself leaves in the target outside .agent/: not the user's changes
+    _OWN_OUTPUTS: tuple[str, ...] = (".agent/", "IMPROVEMENTS.md", "IMPROVEMENTS-FALSE.md")
+
+    def _collect_dir(self) -> Optional[str]:
+        """``[collect] dir`` relative to the repository (``.collect/``), or None when it lies outside it."""
+        try:
+            from tools.collect.cli import resolve_collect_dir
+            rel = resolve_collect_dir(self.repo_dir, self._config).resolve().relative_to(self.repo_dir)
+        except Exception:   # noqa: BLE001 — no collect dir to keep
+            return None
+        return rel.as_posix().rstrip("/") + "/" if rel.parts else None
+
+    def _creative_outputs(self) -> tuple[str, ...]:
+        """The creative-mode continuity files the agent itself writes into the
+        repo — the synopsis, the story bible, and the bible's pending-corrections
+        sidecar.
+
+        B4: ``CommitOnSuccess`` calls ``_update_synopsis`` / ``_update_story_bible``
+        *after* the task commit, so both files are left untracked when the run
+        ends. The next ``--auto`` start runs ``user_changes()`` before it commits
+        anything, saw them as the user's own uncommitted changes, and raised
+        ``DirtyTreeError`` — a second run on a creative folder was refused for
+        changes the agent itself made.
+
+        The names come from the objects that write them, exactly as
+        ``story_bible.py:562`` builds the sidecar
+        (``self._path.with_suffix(self._path.suffix + ".pending.json")``), and
+        fall back to the documented defaults: a renamed path must not silently
+        reappear in ``user_changes()``. Fail-open throughout — anything
+        unexpected returns ``()``, which is the pre-B4 behaviour.
+
+        Returns ``()`` outside creative mode: these files are never written
+        there, so listing them would be noise (and a user's own file of that
+        name would be wrongly ignored).
+        """
+        # task_mode is set in __init__; a subclass that does not call it simply
+        # has no creative outputs, which is the safe direction.
+        if getattr(self, "task_mode", "code") != "creative":
+            return ()
+        names: list[str] = ["synopsis.md", "story_bible.md"]
+        try:
+            synopsis = self._get_synopsis_path()
+            bible = self._get_bible_path()
+            pending = self._get_bible_pending_path(bible)
+            names = [
+                self._own_output_name(synopsis, "synopsis.md"),
+                self._own_output_name(bible, "story_bible.md"),
+                self._own_output_name(pending, "story_bible.md.pending.json"),
+            ]
+        except Exception:   # noqa: BLE001 — never let a config read break _setup_git
+            return ()
+        return tuple(
+            n for n in dict.fromkeys(names)
+            if n and not n.startswith(("/", "..")) and "/" not in n
+        )
+
+    def _own_output_name(self, path: "Optional[Path]", default: str) -> str:
+        """The repo-relative name of one creative output path (B4).
+
+        Read from the object that writes it, so a path moved in config is still
+        excluded. A path outside the repo cannot appear in ``git status`` at
+        all, so it falls back to *default* — harmless, since nothing in the
+        tree matches it.
+        """
+        if path is None:
+            return default
+        try:
+            return path.resolve().relative_to(self.repo_dir).as_posix()
+        except ValueError:
+            return default
+
+    # ── creative output paths, read from the objects that write them ───────────
+
+    def _get_synopsis_path(self) -> "Optional[Path]":
+        """``SummaryMemory``'s ``synopsis.md`` path, or ``None``."""
+        try:
+            from tools.auto.summary_memory import make_summary_memory
+            sm = make_summary_memory(self._config, self.repo_dir, task_mode="creative")
+            path = getattr(sm, "_synopsis_path", None)
+            return path if isinstance(path, Path) else None
+        except Exception:   # noqa: BLE001 — constructor can raise on a bad profile
+            return None
+
+    def _get_bible_path(self) -> "Optional[Path]":
+        """``StoryBible``'s ``_path`` (``story_bible.md``), or ``None``."""
+        try:
+            from tools.auto.story_bible import make_story_bible
+            bible = make_story_bible(
+                self._config, base_url="http://localhost/", api_key="",
+                model="", api_format="openai", base_dir=self.repo_dir,
+            )
+            if bible is None:
+                return None
+            path = getattr(bible, "_path", None)
+            return path if isinstance(path, Path) else None
+        except Exception:   # noqa: BLE001 — never let a config read break _setup_git
+            return None
+
+    @staticmethod
+    def _get_bible_pending_path(bible_path: "Optional[Path]") -> "Optional[Path]":
+        """The bible's pending-corrections sidecar, named the way
+        ``StoryBible._pending_corrections_path`` names it."""
+        if bible_path is None:
+            return None
+        return bible_path.with_suffix(bible_path.suffix + ".pending.json")
+
+    def user_changes(self) -> list[str]:
+        """The paths ``git status`` reports that are not the agent's own outputs (the collect artifact and the creative continuity files included)."""
+        collect = self._collect_dir()
+        out = self._run(["git", "-c", "core.quotepath=false", "--no-optional-locks", "status",
+                         "--porcelain", "-z", "--untracked-files=all"], "git status failed")
+        paths, entries = [], out.split("\0")
+        own = frozenset(self._OWN_OUTPUTS) | frozenset(self._creative_outputs())
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            if entry[0] in "RC":
+                i += 1          # -z: a rename's source is the next entry
+            path = entry[3:]
+            if path.startswith(".agent/") or path in own or path.endswith(".coder.bak") or \
+                    (collect is not None and path.startswith(collect)):
+                continue
+            paths.append(path)
+        return paths
+
+    def commit_existing_files(self) -> Optional[str]:
+        """Commit the files a repository without a commit already holds, .agent/ aside, so a reset to HEAD
+        has them to go back to; ``None`` when there is nothing to commit."""
+        # an ignored path named in an exclude pathspec is an error of `git add`: exclude only what is not ignored
+        keep_out = [] if self._agent_state_is_ignored() else [":(exclude).agent"]
+        collect = self._collect_dir()
+        if collect is not None and (self.repo_dir / collect).exists() and not self._is_ignored(collect):
+            keep_out.append(f":(exclude){collect}")
+        self._run(["git", "add", "-A", *(["--", ".", *keep_out] if keep_out else [])], "git add failed")
+        if not self.has_staged_changes():
+            return None
+        self._run(["git", "commit", "-m", "chore: the files as they were before the auto-agent"],
+                  "git commit of the existing files failed")
+        return self.get_current_hash()
 
     def configure_identity(self) -> None:
         """Set ``user.name`` and ``user.email`` locally in the repo.
@@ -209,26 +382,11 @@ class GitManager:
 
         No-op before the first commit (no HEAD to reset to).
         """
-        if self.get_current_hash() is None:
+        if not self._has_head():
             return
         self._run(["git", "reset", "--hard", "HEAD"], "git reset --hard failed")
 
-        # `git clean -fd` removes UNTRACKED files.  The docstring above assumes
-        # .gitignore shields internal agent state from it — but
-        # ensure_gitignore_committed() is best-effort: on OSError (read-only
-        # .gitignore, permissions, full disk) it logs a warning and returns,
-        # leaving ".agent/" un-ignored.  In that state this clean deletes the
-        # entire run: plan.json, tickets, feedback rounds, run.log.  Verified:
-        #
-        #   .agent/plan.json exists before: True
-        #   .agent/plan.json exists after : False
-        #   .agent dir exists after       : False
-        #
-        # `git reset --hard` above already reverts every TRACKED edit, which is
-        # the residue this method exists to remove.  So when the shield is not
-        # actually in place, skip the clean and keep the state: leaving some
-        # untracked residue behind is a far smaller harm than destroying the
-        # run's own bookkeeping mid-flight.
+        # `git clean -fd` deletes untracked files, so .agent/ must be ignored; if the .gitignore write failed, this clean would delete the whole run.
         if not self._agent_state_is_ignored():
             logger.warning(
                 "discard_working_changes: .agent/ is not covered by .gitignore "
@@ -237,7 +395,30 @@ class GitManager:
                 "writable."
             )
             return
-        self._run(["git", "clean", "-fd"], "git clean failed")
+        collect = self._collect_dir()
+        # an untracked collect artifact is an hour of Pass B, not a task's residue
+        keep = ["-e", f"/{collect}"] if collect is not None else []
+        self._run(["git", "clean", "-fd", *keep], "git clean failed")
+
+    def _has_head(self) -> bool:
+        """False only for a repository without a commit; any other failure raises ``GitError`` (a None from
+        get_current_hash skipped the reset, and the failed task's edits went into the next commit)."""
+        cmd = ["git", "rev-parse", "--verify", "-q", "HEAD"]
+        try:
+            proc = run_git(cmd, cwd=self.repo_dir, timeout=60, encoding="utf-8", errors="replace", retries=1)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise self._raise(cmd, "git rev-parse HEAD failed", exc) from exc
+        if proc.returncode == 1 and not proc.stdout.strip():
+            return False
+        self._decode(cmd, "git rev-parse HEAD failed", proc)
+        return True
+
+    def _is_ignored(self, rel: str) -> bool:
+        try:
+            return run_git(["git", "check-ignore", "-q", rel], cwd=self.repo_dir, timeout=30, encoding="utf-8",
+                           errors="replace", retries=1).returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
 
     def _agent_state_is_ignored(self) -> bool:
         """Return True only if git will actually ignore ``.agent/``.
@@ -268,24 +449,7 @@ class GitManager:
 
     def has_staged_changes(self) -> bool:
         """Return ``True`` if there is at least one staged change."""
-        # BUGFIX (report §4, item 10): missing an OSError catch (e.g. the
-        # git binary itself is missing, or unusable) for a subprocess call
-        # of the same class as _run()'s — inconsistent with the sibling
-        # method _agent_state_is_ignored() just above, which already
-        # catches (subprocess.TimeoutExpired, OSError).
-        #
-        # Deliberately NOT fail-closed like _agent_state_is_ignored(),
-        # though: that method guards a best-effort optional cleanup step
-        # (skip .agent/ cleaning if unsure), where returning False on
-        # failure is safe. has_staged_changes() gates whether commit()
-        # actually commits — commit() calls self._run(["git", "commit", ...])
-        # right after, which itself raises GitError (not caught) if git is
-        # genuinely unusable. Failing closed here would just relabel that
-        # same problem as "nothing to commit — skipping" and silently
-        # no-op the commit instead of surfacing that git is broken. Raise
-        # a GitError instead, matching _run()'s own established pattern
-        # for this exact class of subprocess failure (see the
-        # TimeoutExpired branch a few lines below).
+        # Raise GitError on failure, not False: a false answer would silently skip the commit instead of showing that git is broken.
         try:
             result = subprocess.run(
                 ["git", "diff", "--cached", "--quiet"],
@@ -334,6 +498,45 @@ class GitManager:
         logger.info("commit: %s  (%s)", sha[:12], message)
         return sha
 
+    def commit_paths(self, message: str, paths) -> Optional[str]:
+        """Commit only *paths* (repo-relative or absolute under the repo) with
+        *message*; ``None`` when none of them has a change (AUDIT-8).
+
+        Nothing else in the tree or the index is touched: ``git commit --
+        <paths>`` commits exactly those paths. Used for the files the agent
+        itself rewrites right after a task's commit (synopsis.md, the story
+        bible), so they land under that task's id instead of being swept into
+        whichever task commits next.
+        """
+        repo = Path(self.repo_dir).resolve()
+        rels: list[str] = []
+        for raw in paths or ():
+            p = Path(raw)
+            if p.is_absolute():
+                try:
+                    p = p.resolve().relative_to(repo)
+                except (ValueError, OSError):
+                    continue
+            rel = p.as_posix()
+            if rel and rel not in rels and not rel.startswith(".agent/"):
+                rels.append(rel)
+        if not rels:
+            return None
+        changed = [
+            rel for rel in rels
+            if self._run(["git", "status", "--porcelain", "--", rel],
+                         "git status failed").strip()
+        ]
+        if not changed:
+            return None
+        self._run(["git", "add", "-A", "--", *changed], "git add failed")
+        self._run(["git", "commit", "-m", message, "--", *changed],
+                  "git commit failed")
+        sha = self._run(["git", "rev-parse", "HEAD"],
+                        "git rev-parse HEAD failed").strip()
+        logger.info("commit_paths: %s  (%s)", sha[:12], message)
+        return sha
+
     def commit_task(self, task_id: str, title: str) -> Optional[str]:
         """Commit all staged changes with the conventional auto-task message.
 
@@ -346,6 +549,62 @@ class GitManager:
         """
         msg = f"auto({task_id}): {title}"
         return self.commit(msg)
+
+    def diff_working_tree(self) -> str:
+        """Every uncommitted change in the repo as one patch (B2).
+
+        Used to keep a task's received work when its commit fails: a patch is
+        the only copy that survives both the next task's ``stage_all()``
+        (which would sweep the work in under another id) and an exhausted
+        task's ``discard_working_changes()`` (which would delete it).
+
+        Covers tracked edits, staged changes AND untracked new files — the
+        coder's work is usually a new file, and a patch without it would save
+        nothing. Untracked paths are diffed against ``/dev/null`` with
+        ``--no-index``, whose non-zero exit is a normal "files differ" result,
+        not an error; the path is passed *relative* so the headers come out as
+        ``a/<path>`` / ``b/<path>`` and the patch applies from the repo root
+        like any other.
+
+        HARDEN-7 D: git's output is taken as BYTES and decoded with
+        ``surrogateescape``, so every byte git printed survives into the
+        returned string and back out of it. Decoding it as UTF-8 text instead
+        turned each ``\\r\\n`` line end into ``\\n`` and each non-UTF-8 byte into
+        U+FFFD, and ``git apply`` then refused the whole patch — one CRLF or
+        latin-1 file anywhere in the tree sank the recovery of every other file
+        too. The return type is still ``str`` for the existing callers; the
+        surrogate escapes are the one encoding that round-trips losslessly
+        through a ``str``.
+
+        ``GitError`` propagates only when git itself could not be run: the
+        caller treats a failed capture as "the work stays only in the working
+        tree", never as an empty patch.
+        """
+        # No HEAD yet (a repo with no commit): the index diff is the whole patch.
+        base = "HEAD" if self._has_head() else "--cached"
+        parts = [self._run_bytes(["git", "diff", base, "--binary", "--"],
+                                 "git diff failed").decode("utf-8", "surrogateescape")]
+        collect = self._collect_dir()
+        for path in self.untracked_paths():
+            if collect is not None and path.startswith(collect):
+                continue   # the discard keeps the collect artifact, and a patch that adds it again does not apply
+            # --no-index exits 1 when the files differ, which is the normal case.
+            proc = run_git(
+                ["git", "diff", "--no-index", "--binary", "--",
+                 os.devnull, path],
+                cwd=self.repo_dir, timeout=120, text=False, retries=1,
+            )
+            if proc.returncode in (0, 1) and proc.stdout:
+                parts.append(proc.stdout.decode("utf-8", "surrogateescape"))
+        return "".join(parts)
+
+    def untracked_paths(self) -> list[str]:
+        """The untracked (and not ignored) paths in the repo (B2)."""
+        out = self._run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            "git ls-files failed",
+        )
+        return [p for p in out.split("\0") if p.strip()]
 
     def get_current_hash(self) -> Optional[str]:
         """Return the current HEAD commit hash, or ``None`` if no commits yet."""
@@ -392,13 +651,14 @@ class GitManager:
         if not sha:
             return []
         try:
+            # -z: names as written. Without it git C-quotes non-ASCII names, so their collect facts were never marked stale.
             out = self._run(
-                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+                ["git", "diff-tree", "-z", "--root", "--no-commit-id", "--name-only", "-r", sha],
                 "git diff-tree failed",
             )
         except GitError:
             return []
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        return [name for name in out.split("\0") if name.strip()]
 
     def paths_changed_between(self, base: str, tip: str) -> list[str]:
         """Repo-relative paths changed in the ``base..tip`` range.
@@ -413,28 +673,53 @@ class GitManager:
             return []
         try:
             out = self._run(
-                ["git", "diff", "--name-only", f"{base}..{tip}"],
+                ["git", "diff", "-z", "--name-only", f"{base}..{tip}"],
                 "git diff base..tip failed",
             )
         except GitError:
             return []
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        return [name for name in out.split("\0") if name.strip()]       # -z: see paths_changed_in
 
     # ── Private ──────────────────────────────────────────────────────────────
 
-    # FL-2 (round 85): the ladder is no longer this class's. It is
-    # `tools.git_run.run_git`, shared with every other git caller in the tree —
-    # `workspace._git`, `gates.git`, `runner._dirty_tree`, `manifest._run_git`,
-    # `cli.export_patches`, `delta_validator` — so a held `.git/index.lock` costs
-    # the same two seconds for every command instead of being waited out by one
-    # module and fatal to the rest. FL-1 (round 84) put it here first, as the
-    # caller the 32-worker stress run happened to hit; it now lives once, and
-    # these aliases keep the names the class has always had. See `tools/git_run`
-    # for the rationale — why the lock is a transient, and why the ladder is
-    # bounded by the same error that already names stale locks as the likely cause.
+    # Lock retries are shared with the other git callers through tools.git_run.run_git (see there for why a held lock is transient).
     _LOCK_CONTENTION_RE = LOCK_CONTENTION_RE
     _LOCK_RETRIES = LOCK_RETRIES
     _LOCK_BACKOFF_S = LOCK_BACKOFF_S
+
+    def _run_bytes(self, cmd: list[str], error_msg: str) -> bytes:
+        """One attempt at *cmd*, returning git's stdout as raw ``bytes``.
+
+        HARDEN-7 D: the one caller that must reproduce git's output byte for
+        byte — ``diff_working_tree``'s patch — cannot go through ``_run``,
+        which decodes as UTF-8 with ``errors="replace"`` and so loses every
+        ``\\r`` and every non-UTF-8 byte. Everything else about the call is
+        ``_run``'s: the same held-index ladder, the same 60 s bound, the same
+        ``GitError`` on a failure.
+        """
+        try:
+            proc = run_git(
+                cmd,
+                cwd=self.repo_dir,
+                timeout=60,
+                text=False,
+                retries=self._LOCK_RETRIES,
+                backoff_s=self._LOCK_BACKOFF_S,
+                sleep=self._backoff,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise self._raise(cmd, error_msg, exc) from exc
+        if proc.returncode != 0:
+            # Decoded for the message only: an error text is never the bytes
+            # the caller was going to write out.
+            shown = (proc.stderr or b"").decode("utf-8", "replace")
+            raise GitError(
+                f"{error_msg}\n"
+                f"  cmd : {' '.join(cmd)}\n"
+                f"  code: {proc.returncode}\n"
+                f"  err : {shown.strip()}"
+            )
+        return proc.stdout or b""
 
     def _run(self, cmd: list[str], error_msg: str) -> str:
         """Run *cmd* inside *repo_dir*, capture output, raise on failure.
@@ -522,9 +807,7 @@ class GitManager:
         return proc.stdout
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience factory — used by AutoController
-# ─────────────────────────────────────────────────────────────────────────────
+# Convenience factory, used by AutoController
 
 def make_git_manager(
     repo_dir: str | Path,

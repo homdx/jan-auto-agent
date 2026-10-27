@@ -1,0 +1,21 @@
+EVIDENCE for the claim, at commit 9d8c7b6
+[[git:0b1c2d3:tools/run.py:17-19]]  (git)
+diff --git a/tools/run.py b/tools/run.py
+--- a/tools/run.py
++++ b/tools/run.py
+@@ -17,4 +17,4 @@
+ 17|  def check(cmd):
+   | -    run(cmd, check=True)
+ 18| +    run(cmd, check=False)
+ 19|      return cmd
+[[note:git:ffffff0]]  (note)
+commit ffffff0 is not in this repository
+[[src:tools/run.py:40-69]]  (source)
+ 40|     step_40(context)  # keep the order of the stages
+ 41|     step_41(context)  # keep the order of the stages
+ 42|     step_42(context)  # keep the order of the stages
+ 43|     step_43(context)  # keep the order of the stages
+ 44|     step_44(context)  # keep the order of the stages
+ 45|     step_45(context)  # keep the order of the stages
+# … 24 lines omitted (46-69)
+(evidence trimmed: 2 chunks omitted, 1 chunk cut)

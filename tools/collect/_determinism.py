@@ -36,9 +36,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Tuple
 
-#: Keys that must never appear inside a *structural* payload — they belong
-#: only in the manifest (COLLECT-2), which is explicitly clock-carrying so
-#: that structural JSON doesn't have to be.
+#: Keys forbidden in structural payloads; they belong only in the manifest (COLLECT-2).
 FORBIDDEN_STRUCTURAL_KEYS = frozenset({"generated_at", "timestamp", "collected_at"})
 
 

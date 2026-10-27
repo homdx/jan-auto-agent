@@ -54,9 +54,7 @@ from tools.auto.inner_loop import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(system_override: str | None = None) -> configparser.ConfigParser:
     """Build a minimal ConfigParser, optionally with a [validator_agent] system key."""
@@ -79,9 +77,7 @@ def _validator(task_mode: str = "code", config=None) -> LLMGate2Validator:
     return LLMGate2Validator(task_mode=task_mode, config=config)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Module-level constants
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPromptConstants:
 
@@ -117,8 +113,7 @@ class TestPromptConstants:
         assert "code" in _GATE2_SYSTEM_CODE.lower()
 
     def test_all_prompts_require_json_output(self) -> None:
-        # code and docs modes still use JSON verdict contracts.
-        # creative mode intentionally uses a line-oriented soft verdict (AUTO-CR-2).
+        # Code and docs use JSON verdict contracts; creative uses a line-oriented soft verdict (AUTO-CR-2).
         for name, prompt in _GATE2_SYSTEMS.items():
             if name == "creative":
                 # Soft verdict: APPROVED/REVISE, no JSON contract required.
@@ -130,9 +125,7 @@ class TestPromptConstants:
                 assert "feedback" in prompt, f"{name} prompt missing 'feedback'"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # LLMGate2Validator.__init__ prompt selection
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestValidatorSystemPromptSelection:
 
@@ -217,10 +210,7 @@ class TestValidatorSystemPromptSelection:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Medium #2 — mode-specific ini keys (system_docs / system_creative)
-# mirrors Coder / Architect: each mode can be overridden independently
-# ─────────────────────────────────────────────────────────────────────────────
+# Each mode can override its system prompt independently (system_docs, system_creative).
 
 def _cfg_mode_keys(
     system_docs: str | None = None,
@@ -316,9 +306,7 @@ class TestValidatorModeSpecificIniKeys:
         assert v_creative._system == "creative validator"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# approve() uses self._system, not the bare module constant
-# ─────────────────────────────────────────────────────────────────────────────
+# approve() uses self._system, not the module constant
 
 @dataclass
 class _FakeCoderResult:

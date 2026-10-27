@@ -270,8 +270,7 @@ def test_a_rendered_shrunk_row_still_suppresses_an_identical_later_line(monkeypa
     )
 
     def _shrunk(model_, target, remaining):
-        # A names-bearing form that fits only a small allowance: it renders,
-        # shrunk, and must still contribute its lines to `seen`.
+        # A names-bearing form that fits a small allowance still contributes its lines.
         return "shared line\npkg/module_number_00.py"
 
     def _duplicate(model_, target, remaining):

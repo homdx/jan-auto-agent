@@ -215,9 +215,7 @@ class TestTokenTemperatureEscalationSchedule:
         assert filt._presence_num_ctx == 0
         payloads = _run_and_capture_payloads(filt, repo)
 
-        # With only 6 retries (2 per tier), the highest tier reached is
-        # tier 2 (16384) — well under the flat 32768 ceiling, so nothing
-        # is capped yet; this just confirms the ceiling isn't 0.
+        # Six retries reach tier 2 (16384), below the flat 32768 ceiling, so nothing is capped yet.
         assert max(p["max_tokens"] for p in payloads[1:]) == 16384
 
     def test_recovers_when_a_later_attempt_produces_parseable_json(self, repo):

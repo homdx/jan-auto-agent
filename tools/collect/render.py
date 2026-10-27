@@ -41,8 +41,7 @@ from tools.collect.model import ContractRecord, ModuleRecord
 from tools.collect.registries import FailOpenEntry, _sort_key as _fail_open_sort_key
 from tools.collect.risk import RiskEntry
 
-#: The exact nine pages COLLECT-18's brief names, in the order `render_all`
-#: assembles them.
+#: The nine pages that render_all assembles, in order.
 PAGE_NAMES: Tuple[str, ...] = (
     "ARCHITECTURE.md",
     "MODULE_MAP.md",
@@ -191,9 +190,7 @@ def render_contracts(contracts: Iterable[ContractRecord]) -> str:
 def render_fail_open_registry(entries: Iterable[FailOpenEntry]) -> str:
     """One row per `FailOpenEntry` (COLLECT-9): location, exception type,
     and the literal source-comment rationale, if any."""
-    # AUTO-FIX: sorting "file.py:N" as a plain string put :100 before :20.
-    # registries.py already has the correct (path, int(line)) key used when
-    # building this registry (COLLECT-3); reuse it.
+    # Sort entries by (path, int line) so :100 does not sort before :20.
     entries = sorted(entries, key=_fail_open_sort_key)
     lines = [_h(1, "FAIL_OPEN_REGISTRY"), ""]
     if not entries:
@@ -365,13 +362,7 @@ def render_config_map(
     return "\n".join(lines) + "\n"
 
 
-# ── GLOSSARY.md ──────────────────────────────────────────────────────────────
-#
-# The one page that isn't a projection of a scanned repo's facts — there is
-# no "glossary fact" for Pass A to have extracted. It defines the fixed
-# vocabulary the other eight pages use, so it's fixed, deterministic text
-# that ships with this module rather than being computed per-run; two
-# renders are trivially byte-identical since there's no input to vary.
+# GLOSSARY.md: fixed text with no scanned input, so renders are byte-identical.
 
 _GLOSSARY_TERMS: Tuple[Tuple[str, str], ...] = (
     ("static", "A fact produced directly by Pass A's AST walk (EPIC B); ground truth, never LLM prose (COLLECT-1)."),

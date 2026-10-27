@@ -41,9 +41,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.auto.coder import Coder, CoderResult, make_coder
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _check(content: str, task_mode: str = "code") -> tuple[bool, str]:
     return Coder._check_content_safety(content, task_mode)
@@ -60,9 +58,7 @@ def _minimal_config() -> configparser.ConfigParser:
     return cfg
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Pattern set structure
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPatternSets:
     """_BLOCKED_ALWAYS and _BLOCKED_CODE_ONLY are properly defined and disjoint."""
@@ -76,8 +72,7 @@ class TestPatternSets:
         assert "fork bomb py" in labels
 
     def test_blocked_code_only_contains_sudo(self) -> None:
-        # sudo moved to _BLOCKED_CODE_WORD_BOUNDARY for word-boundary matching;
-        # verify it is still checked in code mode via that dedicated set.
+        # sudo is matched on word boundaries, so it is checked through that dedicated set.
         labels = {label for label, _ in Coder._BLOCKED_CODE_WORD_BOUNDARY}
         assert "sudo invocation" in labels
 
@@ -94,9 +89,7 @@ class TestPatternSets:
         assert code_only_labels.issubset(all_labels)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# code mode (default) — existing behaviour must be identical
-# ─────────────────────────────────────────────────────────────────────────────
+# Code mode (default): existing behaviour is unchanged
 
 class TestCodeMode:
 
@@ -135,9 +128,7 @@ class TestCodeMode:
         assert safe is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# docs mode
-# ─────────────────────────────────────────────────────────────────────────────
+# Docs mode
 
 class TestDocsMode:
     """In docs mode, prose patterns are allowed; catastrophic patterns are still blocked."""
@@ -190,9 +181,7 @@ class TestDocsMode:
         assert safe is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# creative mode
-# ─────────────────────────────────────────────────────────────────────────────
+# Creative mode
 
 class TestCreativeMode:
 
@@ -230,9 +219,7 @@ class TestCreativeMode:
         assert safe is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Coder instance / make_coder integration
-# ─────────────────────────────────────────────────────────────────────────────
+# Coder instance and make_coder integration
 
 class TestCoderInstanceTaskMode:
 
@@ -262,9 +249,7 @@ class TestCoderInstanceTaskMode:
         assert coder._task_mode == "creative"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # _write_files uses self._task_mode
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestWriteFilesUsesTaskMode:
 
@@ -329,9 +314,7 @@ class TestWriteFilesUsesTaskMode:
         assert err == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # RUN-1: an extra file outside target_files is a warning, not a verdict
-# ─────────────────────────────────────────────────────────────────────────────
 
 _TARGET  = "scripts/next_task.py"
 _EXTRA   = "tests/test_next_task.py"
@@ -399,8 +382,7 @@ class TestRun1TargetFilesSkips:
         assert result.files_skipped == [_EXTRA]
         assert result.error == ""
         assert (base_dir / _TARGET).exists()
-        # the guard still protects: the extra file was never written, not even
-        # partially
+        # The guard holds: the extra file is never written, not even partly.
         assert not (base_dir / _EXTRA).exists()
         assert not (base_dir / _EXTRA).parent.exists()
 

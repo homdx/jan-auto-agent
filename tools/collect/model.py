@@ -92,10 +92,7 @@ class ProvenanceViolation(RuntimeError):
     """
 
 
-# The complete LLM-writable surface for the whole `collect` model. If a
-# field name is not in this set, no code path in this package can ever
-# attach provenance="llm" to it — see LLMSummary below, which is the only
-# type that exposes these fields at all.
+# Complete LLM-writable surface of the collect model: only these fields can carry provenance "llm".
 LLM_WRITABLE_FIELDS: frozenset = frozenset({"purpose", "notes"})
 
 
@@ -119,12 +116,7 @@ def _require_provenance(instance: Any, allowed: frozenset) -> None:
         )
 
 
-# ── Pure AST facts: provenance is always exactly 'static' ─────────────────────
-#
-# These three record types are the direct output of Pass A (EPIC B). A
-# constructor call is the only way they come into existence, and that
-# constructor rejects anything but provenance="static". There is no update
-# path at all — treat instances as write-once.
+# Pass A records are write-once: only a constructor with provenance "static" creates them.
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -306,15 +298,7 @@ class FunctionRecord:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FunctionRecord":
-        # AUTO-MODEL-GUARD-1: LLMSummary(**summary_d) / cls(**d) raised a
-        # raw TypeError on a persisted artifact whose summary/record keys
-        # don't match this build's current schema (an older/newer
-        # collect_artifact.json after a tool version upgrade). Every
-        # caller of ModuleRecord.from_dict (which calls this per symbol)
-        # already catches ValueError around the equivalent manifest-read
-        # path — TypeError isn't a ValueError subclass, so it slipped
-        # past that existing guard. Re-raising as ValueError makes those
-        # existing guards work as intended, with no call-site changes.
+        # Re-raise a schema mismatch as ValueError, so existing manifest guards catch it.
         d = dict(d)
         summary_d = d.pop("summary", None)
         try:
@@ -334,11 +318,7 @@ class ModuleRecord:
     path: str
     public_symbols: Tuple[FunctionRecord, ...] = ()
     imports: Tuple[str, ...] = ()
-    # L4: `"pkg.name"` for every `from pkg import name` — the submodule-
-    # qualified candidates `graph.import_edges` resolves *in addition to*
-    # `imports`. Kept apart from `imports` so the Pass A facts block and
-    # the rendered `Imports:` line stay the coarse list they always were.
-    # Absent from an older artifact -> `()` -> the pre-L4 graph, fail open.
+    # from pkg import name: submodule-qualified candidates, kept apart from imports so the Imports line stays coarse; absent in an older artifact, so the graph fails open.
     from_imports: Tuple[str, ...] = ()
     config_reads: Tuple[ConfigRead, ...] = ()
     except_sites: Tuple[ExceptSite, ...] = ()
@@ -386,11 +366,7 @@ class ModuleRecord:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ModuleRecord":
-        # BUGFIX (audit): same class of bug as AUTO-MODEL-GUARD-1 above —
-        # FunctionRecord.from_dict was hardened against a schema-mismatched
-        # persisted artifact raising a raw TypeError past callers that only
-        # catch ValueError; this sibling method (constructing ConfigRead,
-        # ExceptSite, GuardedAccess, LLMSummary the same way) was not.
+        # Same as FunctionRecord.from_dict: schema mismatches raise ValueError, not TypeError.
         d = dict(d)
         try:
             symbols = tuple(FunctionRecord.from_dict(s) for s in d.get("public_symbols", ()))

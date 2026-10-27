@@ -1,16 +1,5 @@
 #!/usr/bin/env bash
-# contest_reset.sh — the operator's one-liner for staging a contest round.
-#
-# Usage:
-#   scripts/contest_reset.sh <round> [base_ref] [--clone name=path …] [--force-clone]
-#
-# Delegates to tools/contest/workspace.py (python3 -m tools.contest.workspace
-# prepare), which prepares one worktree (or clone) per agent at the base commit
-# and prints one line per agent:
-#   laguna  ../rounds/40-laguna  contest/40/laguna  @ <base_ref>  (worktree, fresh)
-# The last word is fresh | reset | clone.
-#
-# Never `git push`; never modifies the repo's own checkout.
+# Stages a contest round: one worktree or clone per agent at the base commit.
 
 set -euo pipefail
 

@@ -66,9 +66,7 @@ from tools.auto.architect import ClusterReviewer
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(**over: str) -> configparser.ConfigParser:
     arch = {
@@ -169,9 +167,7 @@ def _run_traced(reviewer, clusters, base_dir, tmp_path, responses, name="t.jsonl
     return _events(tp)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Defect 1 — the per-batch digest budget
-# ─────────────────────────────────────────────────────────────────────────────
+# Defect 1: the per-batch digest budget
 
 class TestDigestBudgetIsPerBatch:
 
@@ -209,11 +205,7 @@ class TestDigestBudgetIsPerBatch:
         first batch spends the run's whole budget and every later batch
         silently loses the feature."""
         cluster, base_dir = cluster_and_base
-        # One op must EXCEED the cap on its own, so that after batch 1 the
-        # budget is spent. A payload that merely approaches the cap leaves
-        # budget_exhausted False and the bug stays invisible — which is
-        # exactly how an earlier version of this test passed against a
-        # mutant with the reset deleted.
+        # One op must exceed the cap alone, so the budget is spent after batch 1; a near-cap payload hides the bug.
         r = _reviewer(
             _cfg(probe_max_chars="500", probe_max_total_chars="500"),
             bridge=_FakeBridge({"fn": "Y" * 900}),
@@ -230,9 +222,7 @@ class TestDigestBudgetIsPerBatch:
         assert mock_llm.call_count == 4
         assert sorted(x.title for x in results) == ["A", "B"]
 
-        # Call counts alone cannot tell the two behaviours apart — both spend
-        # two calls on batch 2. What differs is WHICH second call it is: a
-        # re-ask carrying the digest, or a forced "plan with what you have".
+        # Call counts cannot tell the behaviours apart; what differs is the second call's content (re-ask with digest, or forced plan).
         msgs = _msgs(mock_llm)
         assert "## Probe results" in msgs[3], (
             "batch 2's re-ask must carry a freshly resolved digest; a leaked "
@@ -254,9 +244,7 @@ class TestDigestBudgetIsPerBatch:
         assert p.budget_exhausted is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# probe_config — telling "never used" from "not installed"
-# ─────────────────────────────────────────────────────────────────────────────
+# probe_config: "never used" versus "not installed"
 
 class TestProbeConfigEvent:
 
@@ -306,9 +294,7 @@ class TestProbeConfigEvent:
         assert [e for e in ev if e.get("kind") == "probe_config"] == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# probe_declined — the four causes the old metric merged
-# ─────────────────────────────────────────────────────────────────────────────
+# probe_declined: the four causes the old metric merged
 
 class TestProbeDeclined:
 
@@ -389,9 +375,7 @@ class TestProbeDeclined:
         assert [x.title for x in out] == ["Forced"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # analyze_logs.py rendering
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _ev(kind: str, **params) -> dict:
     content = params.pop("_content", "")

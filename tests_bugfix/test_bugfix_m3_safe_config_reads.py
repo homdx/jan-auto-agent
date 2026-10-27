@@ -110,8 +110,7 @@ def test_every_helper_call_is_recorded_with_its_section_key_and_fallback() -> No
     reads = _reads(SOURCE)
     assert ("auto", "max_rounds") in reads
     assert ("inner_loop", "temperature") in reads
-    # Section given through the module's local-alias idiom, as several call
-    # sites in the tree do.
+    # Section via the module's local-alias idiom, as several call sites do.
     assert ("architect", "probe_enabled") in reads
     assert reads[("auto", "max_rounds")].fallback == 3
     assert reads[("inner_loop", "temperature")].fallback == 0.2

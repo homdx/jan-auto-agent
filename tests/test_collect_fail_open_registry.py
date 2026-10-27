@@ -5,8 +5,8 @@
 * A rationale comment sitting on the `except` line or the first line of
   its body is picked up verbatim; a fail-open site with no such comment
   gets `rationale=None` rather than a guess.
-* AC: `tools/auto/auto_metrics.py:255`, `tools/auto/coder.py:719`, and
-  `tools/auto/inner_loop.py:364` are all in the registry when built from
+* AC: `tools/auto/auto_metrics.py:228`, `tools/auto/coder.py:644`, and
+  `tools/auto/inner_loop.py:314` are all in the registry when built from
   this real repo.
 """
 
@@ -35,8 +35,7 @@ def test_only_fail_open_sites_are_registered():
 
     # read_optional's `except KeyError: pass` — fail-open, in the registry.
     assert "pkg/error_handling.py:14" in locations
-    # read_with_log's `except KeyError: logger.warning(...)` — logged, not
-    # silent, must NOT be in the registry.
+    # Logged (not silent) except sites must not be in the registry.
     assert "pkg/error_handling.py:22" not in locations
     # read_strict's `except KeyError: raise` — re-raised, not silent.
     assert "pkg/error_handling.py:31" not in locations
@@ -70,8 +69,7 @@ def test_fail_open_site_with_no_comment_has_no_rationale():
 
 
 def test_registry_without_root_still_registers_sites_with_no_rationale():
-    # Rationale extraction is best-effort: no `root` at all must not cost
-    # a fail-open site its membership in the registry.
+    # Missing root: sites still register, just without a rationale.
     modules = scan_repo(FIXTURE_ROOT)
     registry = build_fail_open_registry(modules)  # no root
     locations = fail_open_locations(registry)
@@ -134,8 +132,7 @@ def test_registry_skips_unreadable_module_without_crashing(tmp_path):
         encoding="utf-8",
     )
     modules = scan_repo(tmp_path)
-    # Wrong root: the file can't be found under it, so comment-extraction
-    # fails — the site must still be registered, just without a rationale.
+    # Wrong root: rationale extraction fails, but the site stays registered.
     registry = build_fail_open_registry(modules, root=tmp_path / "does-not-exist")
     by_location = {e.location: e for e in registry}
     assert "pkg/quiet.py:4" in by_location
@@ -149,6 +146,6 @@ def test_ac_real_repo_reference_sites_are_all_registered():
     modules = scan_repo(REPO_ROOT)
     registry = build_fail_open_registry(modules, root=REPO_ROOT)
     locations = fail_open_locations(registry)
-    assert "tools/auto/auto_metrics.py:263" in locations  # NOTE: line tracks _warn_if_contaminated's corrupt-file swallow (documented rationale); update if it shifts (250 → 259: RUN-7's unavailable= plumbing; → 263: RUN-8's unavailable_stage note)
-    assert "tools/auto/coder.py:1292" in locations  # NOTE: line tracks the dup_reject_ratio config-fallback bare except (was :834's _extract_missing_context, fixed — now logs, correctly dropped out); update if it shifts (→ 1290: RUN-8's error_kind docstrings; → 1292: RUN-10's retry kwargs)
-    assert "tools/auto/inner_loop.py:527" in locations  # NOTE: line tracks _fetch_needed_flat's bare except (449 → 488: RUN-7 docstring keys, defaults and the retry loop); update if it shifts (→ 513: RUN-8's InnerLoopResult fields; → 527: RUN-10's retry kwargs)
+    assert "tools/auto/auto_metrics.py:236" in locations  # NOTE: line tracks _warn_if_contaminated's corrupt-file swallow (documented rationale); update if it shifts (250 → 259: RUN-7's unavailable= plumbing; → 263: RUN-8's unavailable_stage note)
+    assert "tools/auto/coder.py:1308" in locations  # NOTE: line tracks the dup_reject_ratio config-fallback bare except (was :834's _extract_missing_context, fixed — now logs, correctly dropped out); update if it shifts (→ 1290: RUN-8's error_kind docstrings; → 1292: RUN-10's retry kwargs; → 1157: HARDEN-1 A7's strip_json_fence import; → 1243: HARDEN-5 D's codec helpers before _read_file_contents; → 1264: HARDEN-13 A's restore refusal and the first-write backup; → 1303: HARDEN-18 B's non-text `content` refusal; → 1308: AUDIT3-1's partial-view record)
+    assert "tools/auto/inner_loop.py:446" in locations  # NOTE: line tracks _fetch_needed_flat's bare except (449 → 488: RUN-7 docstring keys, defaults and the retry loop); update if it shifts (→ 513: RUN-8's InnerLoopResult fields; → 527: RUN-10's retry kwargs; → 440: HARDEN-1 A7's strip_json_fence import; → 444: HARDEN-7's reply_is_yes/reply_text import; → 446: VERDICT-ASK's STRICT_VERDICT_RULE import and prompt line)

@@ -43,8 +43,7 @@ MANIFEST = TESTS_DIR / "SLOW_TESTS.txt"
 SMOKE_DIR = REPO_ROOT / ".smoke_tests"
 REGRESSION_DIR = REPO_ROOT / ".regression_tests"
 
-#: Non-test files each tier needs to import the suite (conftest helpers,
-#: shared fixture trees). Linked into BOTH tiers.
+#: Non-test files every tier needs to import the suite (conftest helpers, shared fixture trees). Linked into BOTH tiers.
 SHARED_ENTRIES = ("_pass_a_stub.py", "_kilo_fake.py", "fixtures")
 
 
@@ -151,7 +150,9 @@ def check_tier(tier_dir: Path, names: set[str]) -> list[str]:
     for name, target in sorted(desired.items()):
         path = tier_dir / name
         if name not in current:
-            problems.append(f"{tier_dir.name}/{name}: missing")
+            if not path.exists():
+                problems.append(f"{tier_dir.name}/{name}: missing")
+            # else: a real file in the link's place — reported below
         elif current[name] != target:
             problems.append(
                 f"{tier_dir.name}/{name}: points at {current[name]!r}, expected {target!r}"
@@ -162,7 +163,21 @@ def check_tier(tier_dir: Path, names: set[str]) -> list[str]:
     for name in sorted(set(current) - set(desired)):
         problems.append(f"{tier_dir.name}/{name}: unexpected, not in this tier")
 
+    # AUDIT-19: real files are reported too. _current_links() sees links only,
+    # so a stray real file whose name was not a desired link passed --check —
+    # though write_tier's docstring says --check is what reports them.
+    for name in sorted(_real_entries(tier_dir)):
+        problems.append(f"{tier_dir.name}/{name}: a real file, not a link")
+
     return problems
+
+
+def _real_entries(tier_dir: Path) -> set[str]:
+    """Names in *tier_dir* that are not symlinks (``__pycache__`` aside)."""
+    if not tier_dir.is_dir():
+        return set()
+    return {p.name for p in tier_dir.iterdir()
+            if p.name != "__pycache__" and not p.is_symlink()}
 
 
 def main() -> int:

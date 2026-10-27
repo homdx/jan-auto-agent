@@ -42,34 +42,27 @@ _SUBJECT_RE = re.compile(r"^0*(\d+)(?::|\s)")
 #: A subject that names several tickets: `151, 152: …`.
 _LIST_SUBJECT_RE = re.compile(r"^\d+(?:\s*,\s*\d+)+\s*:")
 
-#: Where a ticket was read from; the checkout's file wins over the branch's,
-#: and either `epic-tasks/` file wins over a draft.
+#: Where a ticket was read from; the checkout's file wins over the branch, and both win over a draft.
 WHERE_DRAFT, WHERE_CHECKOUT, WHERE_BRANCH = "draft", "checkout", "branch"
 _PRECEDENCE = (WHERE_CHECKOUT, WHERE_BRANCH, WHERE_DRAFT)
 
 LIST_COLUMNS = ["NN", "STATE", "TITLE", "!"]
 
-#: Where a drafted ticket lands (AR-7): `rounds.find_ticket` already reads it,
-#: and it is never on the integration branch, so a draft cannot ride into a
-#: round's base ref.
+#: Where drafted tickets go (AR-7): never on the integration branch, so a draft cannot reach a round's base ref.
 DRAFTS_DIR = ".arena/drafts"
 
-#: The assembled brief's character limit: the source budget `draft` cuts a named
-#: file to, so a brief over it cannot reach the prompt either. Never cut quietly.
+#: The brief's character limit, the source budget draft cuts to; a brief over it is never cut quietly.
 BRIEF_LIMIT = contest_draft.SOURCE_BUDGET
 
-#: The operator's own words, first block of an assembled brief and above the
-#: material, so the ticket does the task and not the file the task came from.
+#: The operator's own words, first in an assembled brief, so the ticket does the task.
 TASK_HEADER = (
     "## Task (from the operator — this wins over anything in the material below)"
 )
 
 #: `# Title` to `###### Title`: a Markdown heading line.
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*)$")
 
-#: A fence line: a run of 3+ backticks or tildes, up to 3 spaces in (CommonMark).
-#: Bug 175: only ``` was a fence, so a `# comment` inside a `~~~` block was a
-#: heading, and a ``` line inside a ```` block closed it early.
+#: A fence is a run of 3+ backticks or tildes (CommonMark); tilde fences count too (bug 175).
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
 
@@ -102,8 +95,7 @@ def _folder_names(folder: Path) -> list[str]:
 
 
 def _branch_names(repo: Path, branch: str) -> list[str]:
-    # Bug 206: the names come from `ls-tree -z`, so a name with a non-ASCII letter,
-    # a `"` or a `\` is its own name, not the C-quoted escape git prints without `-z`.
+    # Names from ls-tree -z are literal, so a quote or backslash stays in the name (bug 206).
     return [name.rsplit("/", 1)[-1]
             for name in ls_tree_names(repo, branch, rounds.TASKS_DIR + "/")]
 
@@ -119,9 +111,7 @@ def subject_numbers(subject: str) -> set:
 
 def _commit_numbers(repo: Path, branch: str) -> set[int]:
     """The ticket numbers *branch*'s commit subjects name — one `git log` per scan."""
-    # The trailing `--` makes *branch* a revision even when a file of the same
-    # name sits in the worktree: this repo's own `./arena` script and branch
-    # `arena` made `git log arena` ambiguous and `issue list` refused.
+    # The trailing -- makes branch a revision even when a file of the same name exists.
     subjects = git(repo, "log", "--format=%s", branch, "--")
     found = set()
     for line in subjects.splitlines():
@@ -173,14 +163,13 @@ def scan(repo: Path, config, branch: str, proc_root: str = rounds.PROC_ROOT) -> 
             if len(places[place].get(nn, [])) > 1 and flag not in flags:
                 flags.append(flag)
         if nn in places[WHERE_DRAFT] and where != WHERE_DRAFT:
-            flags.append(f"draft and {rounds.TASKS_DIR} both hold {nn}")
+            held = rounds.TASKS_DIR if where == WHERE_CHECKOUT else f"{branch}'s {rounds.TASKS_DIR}"
+            flags.append(f"draft and {held} both hold {nn}")
         if nn in committed and status not in ("landed", "closed"):
             flags.append(f"commit {nn}: on {branch} but status {status or 'none'}")
         if status == "landed" and nn not in committed:
             flags.append(f"status landed but no {nn}: commit on {branch}")
-        # AR-14: `issue list` shows a closed ticket with its reason, the
-        # `**Closed:**` line `issue close` wrote under the status. It is not a
-        # flag: a closed ticket is not a mismatch, and `!` is for those.
+        # Closed tickets show their reason (AR-14); a closed ticket is not a mismatch.
         reason = closed_reason(text) if status == "closed" else ""
         tickets.append(Ticket(
             number=nn,
@@ -260,8 +249,7 @@ def _ref_numbers(repo: Path) -> set:
                  "refs/heads/" + rounds.REF_PREFIX)
     for line in listed.splitlines():
         name = line.rpartition(rounds.REF_PREFIX)[2]
-        # Bug 185: ASCII digits only, and a length `int()` takes — `'²'.isdigit()` is
-        # True, `int('²')` raises, and `arena run` never writes such a ref.
+        # Only ASCII digits of a length int() accepts count as a ref (bug 185).
         if re.fullmatch(r"[0-9]{1,18}", name):
             found.add(int(name))
     return found
@@ -461,7 +449,7 @@ def _chosen_number(repo: Path, config, branch: str, raw) -> int:
     if raw is None:
         return next_number(repo, config, branch)
     text = str(raw).strip()
-    if not re.fullmatch(r"\d+", text) or int(text) <= 0:
+    if not re.fullmatch(r"\d{1,18}", text) or int(text) <= 0:
         raise ValueError(f"--number {raw!r} is not a positive integer")
     number = int(text)
     taken = _held_by(repo, config, branch, number)
@@ -499,8 +487,7 @@ def issue_create(repo: Path, args: argparse.Namespace, prof: dict) -> int:
     except (rounds.RoundError, GitRefError, OSError, ValueError) as err:
         return output.refuse(str(err))
     try:
-        # AR-63: the role pair, resolved one role at a time — the `--writer` /
-        # `--reviewer` flag, then the profile's role, then AR-7's old keys.
+        # The writer and reviewer are resolved one role at a time, with the flags first (AR-63).
         llm_call, review_call, pair_info = models.draft_pair(repo, args, prof, config)
     except (models.ModelError, contest_cli.DraftSetupError, profile.ProfileError) as err:
         return output.refuse(str(err))
@@ -553,8 +540,7 @@ def _branch_and_scan(repo: Path, args: argparse.Namespace, prof: dict[str, str])
 
 
 def _row(t: Ticket) -> dict:
-    # a closed ticket reads `closed (why)`; `-o json` keeps `state` a bare word and
-    # carries the reason in its own key
+    # A closed ticket reads "closed (why)"; the JSON output keeps state a bare word.
     state = f"{t.state} ({t.reason})" if t.state == "closed" and t.reason else t.state
     return {"NN": t.number, "STATE": state, "TITLE": t.title, "!": "!" if t.flags else ""}
 
@@ -616,8 +602,7 @@ def issue_view(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> in
 
 # ── AR-14: the status verbs ───────────────────────────────────────────────────
 
-#: The four words a `**Status:**` line may hold. `landed` is `issue land`'s
-#: (AR-8): nothing in this module sets it, and it refuses every verb here.
+#: The four words a Status line may hold; landed is set only by issue land (AR-8).
 STATUS_WORDS = ("open", "queued", "closed", "landed")
 
 #: `verb → (the words it may come from, the word it writes)`.
@@ -628,9 +613,7 @@ TRANSITIONS: dict[str, tuple[tuple[str, ...], str]] = {
     "reopen": (("closed",), "open"),
 }
 
-#: The verbs that are a no-op on the word they write themselves: `queue` on
-#: `queued`, `open` on `open`, `close` on `closed`. `reopen` is not one of them —
-#: its target is `open`, and `reopen` of an open ticket is refused, not repeated.
+#: Verbs that are a no-op on the word they write: queue on queued, open on open, close on closed; reopen is not one of them.
 IDEMPOTENT = ("queue", "open", "close")
 
 #: The verb that writes *word* — a hint must name a verb, not a status word.
@@ -648,9 +631,7 @@ RUN_START_FLOW = ("branch found", "ticket found", "intake", "build arena-round/N
 
 #: The `**Status:**` line, the whole line — its word and the note after it.
 _STATUS_LINE_RE = re.compile(r"^[ \t]*\*\*Status:\*\*[ \t]*[^\n]*$", re.MULTILINE)
-#: The `**Closed:**` line `close` adds under it and `reopen` removes. Bug 200-13:
-#: no `\r?\n?` here — an ending the pattern claims is one the removal code stops
-#: taking a second of, which is what ate the blank line after the line.
+#: The Closed line close adds and reopen removes; its pattern does not claim a line ending (bug 200-13).
 _CLOSED_LINE_RE = re.compile(r"^[ \t]*\*\*Closed:\*\*[ \t]*[^\n]*$", re.MULTILINE)
 
 #: `git worktree list --porcelain` says *branch* is checked out in this checkout.
@@ -735,8 +716,7 @@ def set_status_text(text: str, word: str, note: str = "", reason: str = "") -> s
                      if i != status_i and _CLOSED_LINE_RE.match(body)), None)
 
     note = (note or "").strip()
-    # the line's indentation is the ticket's, not ours: `  **Status:** open` stays
-    # indented when it becomes `queued` (review bug 210)
+    # The line's indentation is kept when the status changes (review bug 210).
     head = lines[status_i][0]
     indent = head[:len(head) - len(head.lstrip(" \t"))]
     status = f"{indent}**Status:** {word}"
@@ -746,8 +726,7 @@ def set_status_text(text: str, word: str, note: str = "", reason: str = "") -> s
     block = [status]
     if word == "closed" and reason:
         block.append(f"**Closed:** {reason}")
-    # the status line's ending, or `\\n` when it was the file's last line and has
-    # none — a `**Closed:**` under it still needs a break of its own
+    # The status line's ending is kept, with a newline added when it was the last line.
     ending = lines[status_i][1] or "\n"
 
     out: list[str] = []
@@ -882,7 +861,7 @@ def _checkout_text(repo: Path) -> str:
     """`checkout /path on arena (clean)` — the place the operator is standing in."""
     head = _head_branch(repo)
     modified = _modified(repo)
-    clean = f" (clean)" if not modified else f" ({len(modified)} modified)"
+    clean = " (clean)" if not modified else f" ({len(modified)} modified)"
     return f"checkout {os.path.realpath(str(Path(repo)))} on {head or 'detached HEAD'}{clean}"
 
 
@@ -973,7 +952,7 @@ def _branch_refusal(err, repo: Path, args, prof: dict, verb: str, nn: int) -> in
         pass
     if wanted and _rev(repo, f"refs/remotes/origin/{wanted}") is not None:
         where += f" · target branch {wanted} @ ?, on origin only"
-        detail = f"only on origin"
+        detail = "only on origin"
         message = f"{wanted} is only on origin — a remote ref is never written"
         hints = [
             {"why": f"create {wanted} from origin", "command": f"git branch {wanted} origin/{wanted}"},
@@ -992,7 +971,7 @@ def _branch_refusal(err, repo: Path, args, prof: dict, verb: str, nn: int) -> in
     else:
         target = branches[0] if branches else wanted
         if target:
-            hints.append({"why": f"the last branch committed here",
+            hints.append({"why": "the last branch committed here",
                           "command": _cmd(verb, nn, target)})
         if branches:
             hints.append({"why": "or switch to one", "command": f"git switch {branches[0]}"})
@@ -1054,8 +1033,7 @@ def _commit_plumbed(repo: Path, branch: str, rel: str, content: str, subject: st
         raise GitRefError(f"git update-ref {tip}: the branch moved from {expect[:7]} to "
                           f"{current[:7]} and {rel} changed with it — the edit was made "
                           f"from {expect[:7]}'s text, so it would overwrite that change")
-    # built on the sha just checked, never on the ref name again: a commit landing
-    # between this line and `update-ref` is the compare-and-swap's to refuse
+    # The commit is built on the checked sha, so a commit landing in between is refused by update-ref.
     tree = tree_with_file(repo, current, rel, content)
     sha = git(repo, "commit-tree", tree, "-p", current, "-m", subject)
     git(repo, "update-ref", tip, sha, current)
@@ -1096,8 +1074,7 @@ def _write_and_commit(repo: Path, args, prof, verb, nn, branch, name, text, new_
             sha = _commit_plumbed(repo, branch, rel, new_text, subject)
     except GitRefError as err:
         message = str(err)
-        # `update-ref` refusing is the compare-and-swap: the branch moved between
-        # the read and the write, so a second arena call committed first.
+        # A refused update-ref is the compare-and-swap: the branch moved, so another call committed first.
         moved = "cannot lock ref" in message or "moved from" in message
         first = ({"why": f"what moved {branch}", "command": f"git log -3 --oneline {branch}"}
                  if moved
@@ -1129,7 +1106,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
     repo = Path(repo)
     out = getattr(args, "output", "table")
     raw = str(getattr(args, "number", "") or "")
-    if not re.fullmatch(r"\d+", raw) or int(raw) <= 0:
+    if not re.fullmatch(r"\d{1,18}", raw) or int(raw) <= 0:
         return output.refuse(f"issue {verb}: {raw!r} is not a ticket number")
     nn = int(raw)
     from_states, target = TRANSITIONS[verb]
@@ -1151,7 +1128,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
             f"{branch} is checked out in {wt} — its working tree would go stale",
             args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
             flow=_flow(STATUS_FLOW, 1, f"checked out in {wt}"),
-            hints=[{"why": f"run it there instead",
+            hints=[{"why": "run it there instead",
                     "command": f"cd {_hint_path(wt)} && arena issue {verb} {nn}{_verb_flags(verb, reason, note)}"}])
 
     names = _on_branch(repo, branch, nn)
@@ -1174,7 +1151,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
                 f"{nn} is only in {DRAFTS_DIR}/ — a draft has no **Status:** line yet",
                 args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
                 flow=_flow(STATUS_FLOW, 2, f"draft only: {DRAFTS_DIR}/{file}"),
-                hints=[{"why": f"publish it first",
+                hints=[{"why": "publish it first",
                         "command": f"arena issue create --file {_hint_path(f'{DRAFTS_DIR}/{file}')}"}])
         if checkout:
             file = checkout[0]
@@ -1209,7 +1186,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
         return _refuse(
             f"{nn} has no **Status:** line — a status verb does not invent where it goes",
             args, where=where, ticket=ticket, flow=_flow(STATUS_FLOW, 3, "no line"),
-            hints=[{"why": f"add `**Status:** open` under the title",
+            hints=[{"why": "add `**Status:** open` under the title",
                     "command": f"arena issue edit {nn} --branch {branch}"}])
     if word not in STATUS_WORDS:
         return _refuse(
@@ -1217,8 +1194,7 @@ def issue_status(repo: Path, args: argparse.Namespace, prof: dict, verb: str) ->
             args, where=where, ticket=ticket, flow=_flow(STATUS_FLOW, 3, f"unknown word {word!r}"),
             hints=[{"why": "fix the word", "command": f"arena issue edit {nn} --branch {branch}"}])
     if word == "landed":
-        # §7: both hints, always — `issue land` is the verb that owns this word, whether
-        # or not AR-8's handler is there yet (only §5's blocker report waits for it)
+        # Both hints are always given, since issue land owns the word (AR-8, section 7).
         hints = [{"why": "where it landed", "command": f"arena issue view {nn} --branch {branch}"},
                  {"why": "the verb that sets it (AR-8)",
                   "command": f"arena issue land {nn} --branch {branch}"}]
@@ -1333,7 +1309,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
     repo = Path(repo)
     out = getattr(args, "output", "table")
     raw = str(getattr(args, "number", "") or "")
-    if not re.fullmatch(r"\d+", raw) or int(raw) <= 0:
+    if not re.fullmatch(r"\d{1,18}", raw) or int(raw) <= 0:
         return output.refuse(f"issue edit: {raw!r} is not a ticket number")
     nn = int(raw)
     verb = "edit"
@@ -1353,7 +1329,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
             f"{branch} is checked out in {wt} — its working tree would go stale",
             args, where=where, ticket=_ticket_text_desc(repo, branch, nn, None),
             flow=_flow(EDIT_FLOW, 1, f"checked out in {wt}"),
-            hints=[{"why": f"run it there instead", "command": f"cd {_hint_path(wt)} && arena issue edit {nn}"}])
+            hints=[{"why": "run it there instead", "command": f"cd {_hint_path(wt)} && arena issue edit {nn}"}])
 
     names = _on_branch(repo, branch, nn)
     if len(names) > 1:
@@ -1396,17 +1372,12 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
     name = names[0]
     rel = f"{rounds.TASKS_DIR}/{name}"
     try:
-        # Bug 42: the compare-and-swap's base is taken here, with the read — not
-        # after `$EDITOR` closes. The tip, the ticket's blob in it, and the text are
-        # one snapshot (the text is read by the blob's sha, so a commit landing
-        # between two of these reads cannot split them); the writer below refuses
-        # when the ticket is no longer this blob.
+        # Bug 42: the compare-and-swap base is read with the text, as one snapshot; a commit landing mid-read cannot split them.
         base_sha = _rev(repo, f"refs/heads/{branch}")
         if base_sha is None:
             raise GitRefError(f"branch {branch!r} does not exist")
         base_blob = git(repo, "rev-parse", f"{base_sha}:{rel}")
-        # the blob's own bytes, as `_body_on_branch` returns them: `printable` is for
-        # the screen, and the edit commits back what it read
+        # The blob's own bytes are returned; printable is for the screen only.
         text = git(repo, "show", base_blob, strip=False)
     except GitRefError as err:
         return _refuse(str(err), args, where=where,
@@ -1433,8 +1404,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
                 hints=[{"why": "set one for this call",
                         "command": f"EDITOR=vi arena issue edit {nn} --branch {branch}"}])
         editor = "vi"
-    # the checked-out file's bytes as the editor opens: a write to it while the
-    # editor is open (a second terminal, another arena call) is a change too
+    # A change to the file while the editor is open counts as a change too.
     disk_before = _disk_bytes(repo, rel) if wt is _HERE else None
     path = _editor_path(repo, name)
     path.write_text(text, encoding="utf-8", errors="surrogateescape")
@@ -1460,9 +1430,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
         return rounds.EXIT_OK
     new_word = status_word(new_text)
     verb_for = VERB_FOR.get(new_word)
-    # §3, §6: a status that reads as one of the four words is the verbs' line, and
-    # `landed` is `issue land`'s; a missing or unknown word is exactly what the operator
-    # is sent here to fix, so `edit` may write it — to anything but `landed`
+    # §3/§6: landed is issue land's word; a missing or unknown word may be fixed by edit, but not to landed.
     hand_changed = (word in STATUS_WORDS and new_word != word) or \
                    (new_word == "landed" and word != "landed")
     if hand_changed:
@@ -1484,11 +1452,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
                    {"why": "then the same command again", "command": _cmd("edit", nn, branch)}])
 
     if wt is _HERE:
-        # Bug 42, the checked-out path: `git commit --only -- <rel>` commits the
-        # editor's text over whatever the branch and the file hold *now*. A commit
-        # that changed the ticket while the editor was open (its blob on the tip is
-        # not the one read) or a write to the file itself (its bytes are not the
-        # ones the editor opened over) is refused, before the file is touched.
+        # Bug 42, checked-out path: refuse when the branch or the file changed since the editor opened (the commit would overwrite it).
         if (_blob_at(repo, f"refs/heads/{branch}", rel) != base_blob
                 or _disk_bytes(repo, rel) != disk_before):
             return _changed_while_editing(repo, args, nn, branch, rel, path, where, ticket)
@@ -1520,11 +1484,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
                                   expect=base_sha, blob=base_blob)
         except GitRefError as err:
             message = str(err)
-            # Bug 43: the conditional picks one *dict*. It used to pick a dict or a
-            # one-item *list*, so any refusal but a moved branch (a corrupt index,
-            # `Author identity unknown`, a vanished branch) put a list among the
-            # hints and the printer's `.get` on it was a traceback on top of a
-            # refusal already decided — and the kept-text hint never printed.
+            # Bug 43: the conditional picks one dict, not a dict or a list, so the hint printer never sees a list.
             first = ({"why": "what moved the branch", "command": f"git log -3 --oneline {branch}"}
                      if "moved from" in message
                      else {"why": "what the commit refused",
@@ -1567,8 +1527,7 @@ def blocking_tickets(repo: Path, branch: str, number: int) -> list[dict]:
         names = ls_tree_names(repo, f"refs/heads/{branch}", rounds.TASKS_DIR + "/")
     except GitRefError:
         return []
-    # A progress file that will not decode is not a blocker: `run start` never
-    # dies on an unreadable CSV, it reads the file as if it were empty.
+    # An unreadable progress file is read as empty, so run start never dies on it.
     try:
         recorded = next_task_mod.recorded(repo / rounds.TASKS_DIR / "PROGRESS.csv")
     except (OSError, ValueError):

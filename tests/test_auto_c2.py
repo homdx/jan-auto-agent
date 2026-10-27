@@ -83,9 +83,7 @@ from tools.auto.coder import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Fixtures / helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Fixtures and helpers
 
 def _minimal_config(
     temperature: float = 0.2,
@@ -174,9 +172,7 @@ def _coder_with_mock_llm(
     return _make_coder(cfg), base_dir
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CoderResult
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestCoderResult:
     def test_succeeded_true(self) -> None:
@@ -209,9 +205,7 @@ class TestCoderResult:
         assert r.raw_response == ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # _strip_outer_fence
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestStripOuterFence:
     def test_no_fence_unchanged(self) -> None:
@@ -234,9 +228,7 @@ class TestStripOuterFence:
         assert '"a"' in result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # _strip_code_fence
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestStripCodeFence:
     def test_no_fence_adds_trailing_newline(self) -> None:
@@ -258,9 +250,7 @@ class TestStripCodeFence:
         assert result == "x = 1\n"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Response parsing
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestResponseParsing:
     """Tests for Coder._parse_response() via the full generate() path."""
@@ -332,9 +322,7 @@ class TestResponseParsing:
         assert r.raw_response
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Output cleanliness (AC: no commentary, fences stripped, think stripped)
-# ─────────────────────────────────────────────────────────────────────────────
+# Output is clean: no commentary, fences or think blocks
 
 class TestOutputCleanliness:
     def _written_content(self, tmp_path: Path, llm_text: str) -> str:
@@ -377,9 +365,7 @@ class TestOutputCleanliness:
         assert content == expected
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# File writing (AC: /edit write path)
-# ─────────────────────────────────────────────────────────────────────────────
+# File writing: the /edit write path
 
 class TestFileWriting:
     def test_file_written_to_base_dir(self, tmp_path: Path) -> None:
@@ -440,16 +426,13 @@ class TestFileWriting:
                 ]
             }
         )
-        # Fail the write for a.py only. _write_files now writes via
-        # atomic_write_text (see coder.py BUGFIX comment: plain write_text
-        # risked silent truncation on a mid-write kill), so patch that call
-        # instead of Path.write_text, which is no longer on the write path.
+        # Fail the write for a.py only: writes go through atomic_write_text, so that is the call to patch.
         original_atomic_write_text = coder_mod.atomic_write_text
 
-        def patched_atomic_write_text(path, content):
+        def patched_atomic_write_text(path, content, **kw):
             if Path(path).name == "a.py":
                 raise OSError("disk full")
-            return original_atomic_write_text(path, content)
+            return original_atomic_write_text(path, content, **kw)
 
         with (
             patch("tools.llm_stream.request_completion", return_value=response),
@@ -479,9 +462,7 @@ class TestFileWriting:
         assert "[new file" in captured_prompts[0]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Grounded prompt (AC: instruction + cited_location + file contents in prompt)
-# ─────────────────────────────────────────────────────────────────────────────
+# Grounded prompt: instruction, cited location and file contents
 
 class TestGroundedPrompt:
     def _capture_prompt(
@@ -591,9 +572,7 @@ class TestGroundedPrompt:
         assert "flat_sym" in prompt
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # LLM failure
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestLLMFailure:
     def test_network_error_returns_result_no_raise(self, tmp_path: Path) -> None:
@@ -623,9 +602,7 @@ class TestLLMFailure:
         assert not r.files_written
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # make_coder factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestMakeCoder:
     def test_returns_coder_instance(self) -> None:
@@ -667,9 +644,7 @@ class TestMakeCoder:
         assert "You are a robot." in c._system
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Integration
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestIntegration:
     def test_end_to_end_file_written(self, tmp_path: Path) -> None:

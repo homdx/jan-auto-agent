@@ -130,9 +130,7 @@ class _NoGitStub:
         return iter(self._paths)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. Untracked copies are not candidates
-# ─────────────────────────────────────────────────────────────────────────────
+# Untracked copies are not candidates
 
 class TestUntrackedCopiesAreNotCandidates:
     """A nested work tree or any loose file is not the repo's definition."""
@@ -177,9 +175,7 @@ class TestUntrackedCopiesAreNotCandidates:
         assert _rel(found[0], tmp_path) == "mmm/m.py"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. The citation's own package wins
-# ─────────────────────────────────────────────────────────────────────────────
+# The citation's own package wins
 
 class TestPackagePrecedence:
     """The cited file, then its package, before the rest of the tree."""
@@ -252,9 +248,7 @@ class TestPackagePrecedence:
         assert _rel(found[0], tmp_path) == "pkg/x.py"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Budget counts only real work
-# ─────────────────────────────────────────────────────────────────────────────
+# Budget counts only real work
 
     def test_an_untracked_scratch_copy_in_the_package_does_not_win(
         self, tmp_path: Path,
@@ -355,9 +349,7 @@ class TestBudget:
         assert _rel(found[0], tmp_path) == "zzz/target.py"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. Deterministic
-# ─────────────────────────────────────────────────────────────────────────────
+# Deterministic
 
 class TestDeterministic:
     def test_two_runs_agree(self, tmp_path: Path) -> None:
@@ -397,9 +389,7 @@ class TestDeterministic:
         assert _rel(next(iter(results)), tmp_path) == "pkg/impl.py"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. Fail-open
-# ─────────────────────────────────────────────────────────────────────────────
+# Fail-open
 
 class TestFailOpen:
     def test_directory_that_is_not_a_git_repo_still_walks(
@@ -507,9 +497,7 @@ class TestFailOpen:
         assert _find_def_in_repo("f", tmp_path) is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. callee_context cites the file the search resolved to
-# ─────────────────────────────────────────────────────────────────────────────
+# callee_context cites the file the search resolved to
 
 _CRASH_INSTRUCTION = (
     "use_it passes the argument to gadget() with no validation; a malformed "
@@ -606,9 +594,7 @@ class TestCalleeContext:
         assert "tools/lib.py" in note
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. The live tree — the incident this ticket exists for
-# ─────────────────────────────────────────────────────────────────────────────
+# The live tree: the incident this ticket exists for
 
 class TestLiveTree:
     def test_auto_t11_downstream_context_cites_the_live_loader(self) -> None:

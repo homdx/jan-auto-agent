@@ -80,8 +80,7 @@ LIMIT = _NEIGHBOURS_PURPOSE_MAX_CHARS
 def test_an_abbreviation_is_not_a_sentence_end_when_the_next_word_is_uppercase(text, want):
     got = _first_sentence(text, LIMIT)
     assert got == want
-    # the cut must still be a prefix of the flattened input, never a fragment
-    # reassembled from elsewhere in the string
+    # The cut must be a prefix of the flattened input, never reassembled from elsewhere.
     assert " ".join(text.split()).startswith(got)
 
 

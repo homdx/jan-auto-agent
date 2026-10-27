@@ -64,9 +64,7 @@ def test_chapter1_locks_russian_even_with_english_task_instruction(tmp_path):
         run_goal="Написать рассказ о встрече двух старых друзей.",
     )
 
-    # True cold start: no target content, no predecessor chapters, and an
-    # entirely English task instruction (this is what actually happened in
-    # the live simulation run).
+    # Cold start with an English instruction, as in the live simulation run.
     task = {
         "id": "AUTO-T1",
         "title": "Chapter 1",

@@ -8,16 +8,13 @@ import textwrap
 from pathlib import Path
 from typing import Dict, Any, List
 
-# Enable GNU Readline for input(): arrow keys, Ctrl+A/E, history (↑/↓), etc.
-# On Linux/macOS this is stdlib. On Windows: pip install pyreadline3
+# Enables GNU Readline for input() (stdlib on Linux/macOS).
 try:
     import readline  # noqa: F401
 except ImportError:
     pass  # Windows without pyreadline3 — input() degrades gracefully
 
-# ────────────────────────────────────────────────────────────────────────
-# DYNAMIC PATH RESOLUTION
-# ────────────────────────────────────────────────────────────────────────
+# Project-relative paths are resolved from this file.
 current_dir = Path(__file__).resolve().parent
 parent_dir = current_dir.parent
 
@@ -38,10 +35,14 @@ from tools.actions import OrchestratorActions, _ts
 from tools.faq_agent import FaqAgent
 import tools.backoff as backoff
 from tools.llm_stream import request_completion, strip_think, make_unverified_context
+# HARDEN-7 C: the shared reader of a reply field's type. The pipeline's
+# validator answers `feedback` itself, and a list or a number in that field
+# raised AttributeError out of `run_pipeline`, which catches only
+# KeyboardInterrupt and EOFError.
+from tools.llm_stream import reply_text
 from tools.ui import stream_tracker
 
-# Extensions that support AST/block extraction and code validation.
-# Everything else is treated as plain text and routed to run_text_qa.
+# Extensions with AST or block extraction and validation; the rest are plain text.
 _CODE_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".go", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
@@ -102,16 +103,16 @@ class MockFileUtilities:
     def get_context_lines(self, source: str, name: str) -> str: return ""
 
 
-# Real AST/text analysis lives in tools/. Import directly so block extraction,
-# imports, and cross-reference detection actually work (NOT the Mock stub).
+# Real AST and text analysis from tools/ (not the mock stub).
 try:
     from tools import file_reader as file_reader
     from tools import block_extractor as block_extractor
-    # sanity: the real block module must expose the analysis API
-    assert hasattr(block_extractor, "extract_block") and hasattr(file_reader, "read_file")
-except Exception:
-    logger.warning("tools.file_reader / tools.block_extractor unavailable — "
-                   "falling back to MockFileUtilities (block extraction disabled).")
+    # sanity: the real block module must expose the analysis API (not an assert: python -O drops it)
+    if not (hasattr(block_extractor, "extract_block") and hasattr(file_reader, "read_file")):
+        raise ImportError("tools.block_extractor / tools.file_reader lack extract_block / read_file")
+except Exception as _exc:
+    logger.warning("tools.file_reader / tools.block_extractor unavailable (%s: %s) — "
+                   "falling back to MockFileUtilities (block extraction disabled).", type(_exc).__name__, _exc)
     file_util = MockFileUtilities()
     file_reader = file_util
     block_extractor = file_util
@@ -122,14 +123,11 @@ class Orchestrator(OrchestratorActions):
         self._config_path = config_path
         self.config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
 
-        # Persistent components — created ONCE; they own on-disk state
-        # (prompts.json / metrics.json) and survive reloads.
+        # Persistent components, created once; they own the on-disk state.
         self.metrics_collector = MetricsCollector()
         self.prompt_store = PromptStore(config=None)
 
-        # Session-level direct-chat history; lives here (not in _build_agents)
-        # so it survives /reload, since refreshing config shouldn't wipe the
-        # user's conversation context. Reset explicitly by /new.
+        # Direct-chat history lives on the session, so /reload keeps it; /new clears it.
         self._direct_chat_history: List[Dict[str, str]] = []
 
         self._build_agents()
@@ -204,65 +202,15 @@ class Orchestrator(OrchestratorActions):
             config=self.config,
         )
 
-        # BUGFIX (verified-bugs audit #2, follow-up): these two used to run
-        # right after load_config(), mutating self.prompt_store IN PLACE
-        # (not by reassignment) before any of the agent constructors above
-        # had run. reload_agents()'s atomicity fix snapshots/restores
-        # self.__dict__, which is a SHALLOW copy — it captures the same
-        # prompt_store object reference, not a copy of its fields. So if
-        # SearchAgent/ValidatorAgent/.../FaqAgent construction above raised
-        # partway through, these two fields were already mutated and
-        # survived the "atomic" rollback even though every self.* attribute
-        # correctly rolled back to the old object. Confirmed live: reload
-        # failing after this point used to leave prompt_store.store_path /
-        # max_versions on the new (bad) values while self.model correctly
-        # reverted. Running this last — after every constructor that can
-        # raise has already succeeded — means it only ever executes once
-        # _build_agents() is guaranteed to complete, so there's nothing left
-        # to roll back. (Nothing above reads store_path/max_versions back
-        # off self.prompt_store during construction, so this reordering
-        # doesn't change behaviour on the success path.)
+        # Set prompt_store fields last, after every constructor that can raise, so a rollback never leaves them changed.
         self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
-        # BUGFIX: _getint returns the raw value — a present-but-zero
-        # max_versions (e.g. "max_versions = 0") is a valid int, not
-        # malformed, so it bypasses _getint's ValueError guard and reaches
-        # push() unclamped. PromptStore.__init__ clamps with max(1, …)
-        # but that branch only runs when config is passed to __init__;
-        # here the store was created with config=None (line 125) and this
-        # line overwrites max_versions after the fact. With 0, push()
-        # appends then evicts down to 0 and crashes on stack[-1].
+        # max_versions is clamped here too: a zero value bypasses the getint guard and would crash push().
         self.prompt_store.max_versions = max(1, self._getint("prompt_store", "max_versions", 3))
 
     def reload_agents(self) -> None:
         """Re-read agents.ini and rebuild all agents mid-session (no restart)."""
         logger.info("reload_agents: re-reading %s …", self._config_path)
-        # AUTO-FIX (medium-priority audit): _build_agents() is unguarded at
-        # __init__ too, but a raise there just fails object construction —
-        # normal "fail fast at startup" behaviour. Here it runs mid-session
-        # in response to the interactive /reload command; before this fix,
-        # a malformed agents.ini (or any other _build_agents failure —
-        # config.read() re-raises configparser.Error, and several nested
-        # constructors also read numeric config directly) crashed the
-        # entire chat session instead of just failing the reload. The
-        # previously-built agents are left exactly as they were on
-        # failure, so the session keeps working with the last-good config.
-        #
-        # BUGFIX (verified-bugs audit #2): the try/except above only
-        # covered the crash — it did NOT make the rebuild atomic.
-        # _build_agents() assigns self.config, self.model, self.base_url,
-        # self.search_agent, self.validator_agent, self.improvement_agent,
-        # self.faq_agent, etc. one attribute at a time via load_config()
-        # and its own body; if any assignment past the first raises (e.g.
-        # ImprovementAgent's constructor hitting a malformed
-        # [improvement_agent] max_tokens), self was left with a mix of
-        # already-rebuilt (new config, new search_agent/validator_agent)
-        # and not-yet-rebuilt (old improvement_agent/faq_agent) state —
-        # contradicting this method's own "previously-built agents are
-        # left exactly as they were on failure" claim. Snapshot every
-        # instance attribute before rebuilding and restore the snapshot
-        # wholesale on failure, so a partial rebuild can never be
-        # observed: either every attribute reflects the new config, or
-        # every attribute is back to exactly what it was before this call.
+        # A failed /reload restores the snapshot taken here, so a partial rebuild is never visible.
         snapshot = dict(self.__dict__)
         try:
             self._build_agents()
@@ -277,18 +225,9 @@ class Orchestrator(OrchestratorActions):
               f"(model={self.model}, api_format={self.api_format}, max_iter={self.max_iterations})")
 
     def load_config(self, config_path: str) -> None:
-        # AUTO-FIX (medium-priority audit): a malformed (not just missing)
-        # agents.ini used to raise a raw configparser.Error with no
-        # indication of which file was at fault — annoying with the ~8
-        # agents_*.ini variants in rotation (32k/64k/128k/256k/fast_cpu/
-        # slow_cpu/stub/base). Now a parse failure is reported with the
-        # path and re-raised as a clear, actionable error instead of a
-        # bare traceback from deep inside configparser.
+        # A malformed agents.ini is reported with its path and raised as one clear error.
         if os.path.exists(config_path):
-            # Bugfix: ConfigParser.read() MERGES, so a key deleted from
-            # agents.ini between two /reloads kept its stale value forever.
-            # Parse into a fresh instance and swap only on success — a
-            # malformed file then still leaves the last-good config intact.
+            # Parse into a fresh instance and swap only on success, so a bad file keeps the last-good config.
             _new_config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
             try:
                 _new_config.read(config_path, encoding="utf-8")
@@ -298,10 +237,7 @@ class Orchestrator(OrchestratorActions):
                 ) from exc
             self.config = _new_config
         
-        # AUTO-T1 FIX: fallback= only handles MISSING keys; a present-but-malformed
-        # value (e.g. max_iterations = abc) raises ValueError with a raw traceback.
-        # Use the typed helpers below for every getint/getfloat/getboolean call so
-        # malformed values degrade gracefully to the coded default instead of aborting.
+        # The typed helpers turn a malformed value into the coded default instead of an exception.
         self.max_iterations = self._getint("loop", "max_iterations", 3)
         self.timeout_seconds = self._getint("loop", "timeout_seconds", 240)
         self.new_chat_key = self.config.get("chat", "new_chat_key", fallback="/new").strip()
@@ -319,8 +255,7 @@ class Orchestrator(OrchestratorActions):
         self.api_format = self.config.get(section, "api_format", fallback="openai")
         self.num_ctx    = self._getint(section, "num_ctx", 0)
 
-        # SSL verification — set verify_ssl = false in [api] to skip cert checks.
-        # Applies to all HTTPS API calls (agents, optimizer, direct chat).
+        # SSL verification; set verify_ssl = false in [api] to skip certificate checks.
         verify_ssl = self._getboolean("api", "verify_ssl", True)
         if not verify_ssl:
             self.ssl_context = make_unverified_context()
@@ -341,11 +276,7 @@ class Orchestrator(OrchestratorActions):
         self.search_full_file_max_chars = self._getint("search", "full_file_max_chars", 12000)
         self.file_editor_max_tokens = self._getint("file_editor", "max_tokens", 0)
 
-    # ── Typed config helpers (AUTO-T1) ──────────────────────────────────────
-    # configparser's fallback= only handles ABSENT keys; a present-but-malformed
-    # value raises ValueError with no useful context (which key, which file).
-    # These helpers catch ValueError, emit a contextual warning, and return the
-    # coded default — so a single bad line in agents.ini never aborts startup.
+    # Typed config helpers: a malformed value logs a warning and returns the coded default.
 
     def _getint(self, section: str, key: str, fallback: int) -> int:
         try:
@@ -391,12 +322,9 @@ class Orchestrator(OrchestratorActions):
         Uses the [direct_chat] temperature from agents.ini (default 0.3).
         Streams the reply token-by-token to stdout, same as other agents.
         """
-        # Bugfix (config-crash audit): these bypassed this file's own
-        # _getfloat/_getint helpers, so a malformed [direct_chat] value
-        # raised ValueError and crashed every direct-chat turn.
+        # Read through the typed helpers, so a malformed [direct_chat] value cannot crash the chat turn (bug fix).
         temperature = self._getfloat("direct_chat", "temperature", 0.3)
-        # Clamp to >=0: a negative config value should not be interpreted as
-        # "unlimited" (it isn't — see the _max_msgs note below).
+        # A negative history limit is clamped to zero, not read as unlimited.
         history_max_turns = max(0, self._getint("direct_chat", "history_max_turns", 10))
 
         base = self.base_url.rstrip("/")
@@ -411,16 +339,10 @@ class Orchestrator(OrchestratorActions):
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        # Snapshot the history before appending so a failed API call can
-        # restore the exact pre-call state. Previously, pop() only removed
-        # the last element — the older messages that were trimmed by the
-        # cap during the append were permanently lost.
+        # Snapshot the history, so a failed API call restores the exact pre-call state (including trimmed messages).
         _saved_history = list(self._direct_chat_history)
 
-        # Append the new turn, then trim history to the rolling cap (1 user +
-        # 1 assistant = 2 entries/turn). _max_msgs uses max(1, ...) because
-        # list[-0:] returns the whole list, not empty — so history_max_turns=0
-        # would otherwise silently disable the cap instead of clearing it.
+        # Append the turn, then trim to the rolling cap; max(1, ...) keeps a zero cap from disabling the trim.
         self._direct_chat_history.append({"role": "user", "content": user_input})
         _max_msgs = max(1, history_max_turns * 2)
         if len(self._direct_chat_history) > _max_msgs:
@@ -454,20 +376,19 @@ class Orchestrator(OrchestratorActions):
         except Exception as exc:
             logger.error("execute_direct_chat failed: %s", exc)
             print(f"[{_ts()}] ❌ Chat request failed: {exc}")
-            # Restore the pre-call history — the exchange never completed,
-            # so history should not reflect a half-finished turn. This
-            # also restores any messages that were trimmed by the cap
-            # during the append, which pop() alone could not recover.
+            # Restore the pre-call history: the exchange did not complete.
             self._direct_chat_history = _saved_history
-            # B10: explicit, not implicit. The success path returns the reply
-            # string, so this branch returning None by falling off the end is
-            # the difference the annotation now documents -- callers have to
-            # handle it.
+            # Explicit None: the caller must handle a failed chat turn.
             return None
 
     def run_pipeline(self, user_input: str, base_dir: str,
-                     resume_state: dict = None) -> None:
-        """Executes pipelines with adaptive search, validation loops, and visual feedback."""
+                     resume_state: dict = None) -> "bool | None":
+        """Executes pipelines with adaptive search, validation loops, and visual feedback.
+
+        AUDIT3-6: returns ``False`` when the query could not run at all (a target
+        outside the project, a missing file, an unreadable source) so ``--once``
+        can exit 1 on it; ``None`` otherwise, as before.
+        """
         start_time = time.time()
 
         # Full-file search mode: bypass AST block-extraction entirely.
@@ -489,21 +410,20 @@ class Orchestrator(OrchestratorActions):
         target_path = resolve_target_path(base_dir, parsed.file_path)
         if target_path is None:
             print(f"Error: Target path is outside the project: '{parsed.file_path}'")
-            return
+            return False
         if not os.path.exists(target_path) or not os.path.isfile(target_path):
             print(f"Error: Target path is not a valid file: '{parsed.file_path}'")
-            return
+            return False
 
-        # Bugfix: _CODE_EXTENSIONS is all-lowercase, so "app.PY" was
-        # treated as a non-code file and routed to question-answering
-        # instead of block extraction.
+        # Lower-case the extension, so "app.PY" counts as code.
         ext = Path(parsed.file_path).suffix.lower()
 
         try:
             source = file_reader.read_file(target_path)
         except Exception as e:
             logger.error(f"Execution failed while reading targets: {e}")
-            return
+            print(f"Error: cannot read '{parsed.file_path}': {e}")
+            return False
 
         # Re-parse with source so parse_prompt can verify the target symbol exists.
         parsed = parse_prompt(user_input, source=source)
@@ -521,15 +441,13 @@ class Orchestrator(OrchestratorActions):
         context_lines = block_extractor.get_context_lines(source, parsed.target_name, file_ext=ext)
 
         iteration = 1
-        already_searched = [parsed.file_path]
+        # B3: the target file is seeded as (file, ref) pairs for the references of its own block, not as a whole file:
+        # a name the validator asks for later may well be defined in that same file, and it must stay reachable.
+        already_searched = [(parsed.file_path, ref) for ref in refs]
         search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
         validation: Dict[str, Any] = {}
 
-        # Cap total ref growth: no more than max_hints new symbols may be added
-        # across all iterations combined, or a struggling validator that keeps
-        # suggesting new names would compound the search scope instead of
-        # converging. One batch of suggestions is enough — more beyond that
-        # are unlikely to help and only slow down the search agent.
+        # Total ref growth is capped at max_hints new symbols across all iterations, so the search scope converges.
         _refs_cap = len(refs) + self.validator_agent.max_hints
         _api_err_count = 0  # consecutive API errors; reset on any non-error response
 
@@ -539,10 +457,7 @@ class Orchestrator(OrchestratorActions):
             refs             = resume_state.get("refs", refs)
             already_searched = resume_state.get("already_searched", already_searched)
             search_result    = resume_state.get("search_result", search_result)
-            # refs may have grown since the checkpoint was written, so the
-            # cap computed above (from the pre-resume refs) is stale —
-            # recompute it from the restored refs or new suggestions past
-            # this point are silently discarded for the rest of the run.
+            # Refs may have grown since the checkpoint, so recompute the cap from the restored refs.
             _refs_cap = len(refs) + self.validator_agent.max_hints
             print(f"[{_ts()}] ▶  Resuming run_pipeline from iteration {iteration} "
                   f"(checkpoint restored).")
@@ -583,7 +498,7 @@ class Orchestrator(OrchestratorActions):
                     if iteration >= self.max_iterations:
                         print(f"[{_ts()}] ⚠️  Validator unavailable — "
                               f"max iterations reached, stopping. "
-                              f"({validation.get('feedback', '')})")
+                              f"({reply_text(validation.get('feedback'))})")
                         break
                     _chk = {
                         "loop": "run_pipeline",
@@ -598,19 +513,28 @@ class Orchestrator(OrchestratorActions):
                     continue  # retry same iteration (do not increment)
 
                 _api_err_count = 0
-                feedback = validation.get("feedback", "").strip()
+                feedback = reply_text(validation.get("feedback"))
                 if feedback:
                     print(f"❗ Validation – {feedback}")
 
-                # Adaptive Scope: Expand search for next iteration
+                # Adaptive Scope: Expand search for next iteration.
+                # B3: extend with the (file, ref) pairs the search actually
+                # looked at, NOT with the files it merely opened. Skipping whole
+                # files blacklisted every file the previous iteration scanned, so
+                # a name the validator asked for next could only be found in a
+                # file that had never been opened — a definition sitting beside
+                # an earlier one became unreachable, and a reference found
+                # before regressed to missing. The pair is the unit of work;
+                # SearchAgent's _source_cache already avoids re-reading.
                 already_searched.extend(search_result.get("searched_files", []))
                 new_suggestions = validation.get("suggested_searches", [])
                 if isinstance(new_suggestions, list):
-                    # Count discards directly instead of inferring them from
-                    # the batch size, which over-counted when most of the
-                    # batch was added before the cap was hit.
+                    # Count discards directly rather than inferring them from the batch size.
                     _discarded = 0
                     for suggestion in new_suggestions:
+                        # A non-string is no reference name (AUDIT-17).
+                        if not isinstance(suggestion, str) or not suggestion.strip():
+                            continue
                         if suggestion in refs:
                             continue
                         if len(refs) < _refs_cap:
@@ -627,14 +551,7 @@ class Orchestrator(OrchestratorActions):
         else:
             print("ℹ️ Intent is 'show'. Skipping agent validation pipeline.")
 
-        # --- IMPROVEMENT AGENT (Intent-based) ---
-        # parsed.intent is always one of: "show", "improve", "explain",
-        # "show_and_improve", "show_imports" (see tools/prompt_parser.py).
-        # "optimize"/"fix" are user-typed *keywords* that map into "improve" —
-        # they are never themselves an intent value — and "show_and_improve"
-        # (the parser's own default fallback, produced whenever a prompt uses
-        # both a show-type and an improve-type verb) must run the improvement
-        # agent too, exactly like plain "improve" does.
+        # show_and_improve (the parser's fallback) also runs the improvement agent, as improve does.
         improvement: Dict[str, Any] = {}
         _improvement_ran = parsed.intent in ("improve", "explain", "show_and_improve")
         if _improvement_ran:
@@ -657,24 +574,12 @@ class Orchestrator(OrchestratorActions):
 
         # Record run metrics
         last_validation = validation if parsed.intent not in ("show", "show_imports") else {}
-        # RunRecord types improvement_json_ok as Optional[bool] and documents
-        # None as "not applicable (show/show_imports)"; summarize_failures
-        # honours that with an `is not None` filter. Passing False for a run
-        # that never invoked the improvement agent counted a stage that did not
-        # execute as a JSON parse failure, inflating json_parse_failure_rate —
-        # one of the two signals that trigger the PromptOptimizer.
+        # None means not applicable: a run that skipped the improvement agent must not count as a JSON failure.
         improvement_json_ok = (
             bool(improvement.get("improved_code") or improvement.get("explanation"))
             if _improvement_ran else None
         )
-        # BUGFIX: an exhausted validation loop (all max_iterations rejected)
-        # increments iteration one past max (iteration = max + 1) because the
-        # increment at the bottom of the loop runs before the while condition
-        # re-checks. Clamp to max_iterations so iterations_used and the
-        # formatter display don't show 4/3. Also, show/show_imports skip the
-        # validation loop entirely (iteration stays at 1 from the init at the
-        # top of run_pipeline) — record 0, not 1, so avg_iterations in the
-        # optimizer trigger is not diluted by non-validation runs.
+        # Clamp iterations to max_iterations, and record 0 for show runs that skip the validation loop.
         if parsed.intent in ("show", "show_imports"):
             iterations_used = 0
         else:
@@ -685,7 +590,7 @@ class Orchestrator(OrchestratorActions):
             prompt_version=self.prompt_store.get_version_label("validator_agent"),
             iterations_used=iterations_used,
             validator_status=last_validation.get("status", "skipped"),
-            validator_feedback=last_validation.get("feedback", ""),
+            validator_feedback=reply_text(last_validation.get("feedback")),
             improvement_json_ok=improvement_json_ok,
             elapsed_seconds=total_elapsed,
         ))
@@ -725,9 +630,7 @@ class Orchestrator(OrchestratorActions):
             elapsed_time=total_elapsed,
             iteration=iterations_used,
             output_config={
-                # Bugfix (config-crash audit): same helper bypass as the
-                # direct_chat reads above — a malformed [output] value
-                # crashed the render pipeline.
+                # Typed helper: a malformed [output] value no longer crashes the render pipeline.
                 "show_timing": self._getboolean("output", "show_timing", True),
                 "show_iteration_count": self._getboolean("output", "show_iteration_count", True),
                 "max_iterations": self.max_iterations
@@ -806,6 +709,19 @@ Knowledge base (FAQ resolver)
 """
 
 
+def _warn_missing_explicit_config(config_path: str) -> None:
+    """Warn on stderr when a ``--config`` the user named does not exist (AUDIT3-C3).
+
+    --faq, --once and the shell silently ran on the built-in localhost
+    defaults, so a typo'd path looked like a model failure. They still run on
+    the defaults (scripts and tests rely on that), but now say so. The default
+    ``agents.ini`` may be absent quietly: the defaults are its documented stand-in.
+    """
+    if config_path != _DEFAULT_CONFIG_PATH and not os.path.exists(config_path):
+        print(f"Warning: config file not found: {config_path} — using the built-in "
+              f"defaults", file=sys.stderr)
+
+
 def _parse_args():
     import argparse
     parser = argparse.ArgumentParser(
@@ -860,8 +776,7 @@ def _parse_args():
                              "--auto \"<goal>\" --dry-run (or a full run); does not "
                              "build one and does not execute any tasks itself. "
                              "e.g. --validate-plan --base /srv/app")
-    # KC-33: contest one-shot flag — same shape as --auto, but the value is a
-    # whole argument string handed to tools.contest.cli.main.
+    # KC-33: the contest one-shot flag; the value is a whole argument string.
     parser.add_argument(
         "--contest", metavar="ARGS", default=None,
         help="One-shot contest round: pass the rest of the argument string to "
@@ -873,9 +788,7 @@ def _parse_args():
                         help="One-shot FAQ lookup against the knowledge folder, then exit. "
                              "Exit code 0 = answer found, 1 = NOT FOUND. "
                              "e.g. --faq \"how do I reset my password?\"")
-    # COLLECT-19: `/collect` command / `--collect` flag + subcommands.
-    # Producer is read-only to the source tree; writes land only under
-    # [collect] dir (default .collect/).
+    # COLLECT-19: /collect and --collect; the producer is read-only and writes only under the [collect] dir.
     parser.add_argument("--collect", action="store_true", default=False,
                         help="One-shot: bring the structural project model in [collect] dir "
                              "up to date, then exit. Freshness-gated — a fresh tree is a "
@@ -926,41 +839,7 @@ def _parse_args():
     return parser.parse_args()
 
 
-# ── AUTO-FIX (cfg-crash-prevention): startup config validation ─────────────
-# `configparser`'s `fallback=` only covers a MISSING key — a *present-but-
-# empty* value (e.g. "verify_ssl =" with nothing after the "=") still
-# reaches `.getboolean()`/`.getint()`/`.getfloat()` and raises a bare
-# ValueError, deep inside whichever agent's `__init__` happens to read it
-# first. The traceback that results points at `configparser.py`, not at
-# the ini line that's actually wrong, so the fix took real digging to
-# track down each time it happened.
-#
-# Rather than hardening every call site by hand (a moving target — the
-# list grows as new agents are added), scan every .py file under tools/
-# plus main.py itself for every literal `config.getboolean(section, key,
-# ...)` / `.getint(...)` / `.getfloat(...)` call, then check the ini file
-# that's about to be loaded for any of those (section, key) pairs present
-# with a blank value. Fail once, loudly, up front, naming every offending
-# line — instead of crashing N different ways, N different times.
-#
-# NOTE — this check only catches a *blank* value, not a malformed one
-# (e.g. `max_iterations = abc`). It intentionally does NOT replace the
-# handful of pre-existing per-call `try/except ValueError` guards already
-# in this codebase (main.py's own Orchestrator._getint/_getfloat/
-# _getboolean, tools/search_agent.py, tools/faq_agent.py, etc.) — those
-# catch *any* malformed value, not just blank, and degrade gracefully to
-# the coded default rather than aborting the run (see tests/test_t1_load_
-# config_malformed.py). That's a stricter, and arguably better, contract
-# than "fail fast at startup", so it's kept rather than removed. This
-# scan's job is narrower: catch the one failure mode (blank value) that
-# used to have NO guard at all across most of tools/auto/, and say
-# clearly which ini line and which call site is at fault, before any
-# agent constructs.
-#
-# The one thing this scan can never catch, guarded or not: a call whose
-# *key* isn't a literal at the call site (e.g. a loop over field names, or
-# a small `_get_bool(config, key, default)`-style wrapper parameterized on
-# `key`) — there's no way to know statically which keys it'll read.
+# Startup check: a blank typed config value fails once, naming every offending line; malformed values use the typed helpers.
 _TYPED_CONFIG_METHODS = ("getboolean", "getint", "getfloat")
 
 
@@ -1039,11 +918,7 @@ def _validate_typed_config_values(config_path: str, base_dir: str) -> None:
     candidate_sections = probe.sections()
     resolve_root = base_dir if os.path.isdir(base_dir) else str(current_dir)
 
-    # (section, key) -> ["relpath:lineno (method)", ...] — a blank value can
-    # be read by more than one call site (e.g. several agents each read
-    # their own section's "think" via a variable, not a literal, section
-    # name), so collect every matching site rather than just the first one
-    # found, or the message could point at the wrong file entirely.
+    # Every call site reading a blank value is listed, so the message points at the right file.
     violations: Dict[tuple, List[str]] = {}
 
     for file_path, lineno, method, section, key in sites:
@@ -1144,6 +1019,12 @@ def main():
     args = _parse_args()
     base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
 
+    # AUDIT3-C9: --dry-run only means something with --auto; alone it fell
+    # through to the interactive shell, and a CI job reading EOF exited 0.
+    if args.dry_run and args.auto is None:
+        print("Error: --dry-run only applies together with --auto GOAL.", file=sys.stderr)
+        sys.exit(2)
+
     if not args.list_skills:
         _validate_typed_config_values(args.config, base_dir)
 
@@ -1177,17 +1058,7 @@ def main():
         if not goal:
             print("Error: --auto requires a non-empty goal string.", file=sys.stderr)
             sys.exit(1)
-        # A missing/misspelled --config path used to fail silently deep
-        # inside the pipeline (ConfigParser.read() on a nonexistent file
-        # is a no-op, not an error) and only surfaced several steps later,
-        # once the architect stage tried to read API settings from an
-        # empty config, as a confusing "NoSectionError: No section:
-        # 'api_local'" with a traceback pointing nowhere near the actual
-        # cause. Fail loudly here instead, at the one place that knows the
-        # path came straight from the user's command line — this check is
-        # deliberately NOT inside AutoController itself, since tests
-        # construct it directly with a nonexistent config_path on purpose
-        # (as shorthand for "use coded defaults").
+        # A missing --config fails here, loudly, since the path came from the user's command line.
         if not os.path.exists(args.config):
             print(
                 f"Error: --config file not found: {args.config!r}. "
@@ -1215,9 +1086,13 @@ def main():
         )
         from tools.collect.summarizer import make_summarizer_call_or_none, should_run_pass_b
 
-        # Same precedence table as `/collect`'s parse_collect_args — kept in
-        # one place so `--collect` and `/collect` never dispatch the same
-        # flag combination to different actions.
+        # AUDIT3-C8: `--module ""` is refused, as /collect refuses it; the empty
+        # string read as "no module" and silently ran a whole-tree collect.
+        if args.module is not None and not args.check and not args.module.strip():
+            print("Error: --module needs a file path, got an empty value.", file=sys.stderr)
+            sys.exit(2)
+
+        # Same precedence table as /collect, so --collect and /collect dispatch identically.
         action, _ = action_from_flags(
             check=args.check,
             module_path=args.module,
@@ -1225,9 +1100,7 @@ def main():
             refresh=args.refresh,
         )
 
-        # A missing config is only fatal when the user explicitly asked for a
-        # specific file: erroring out on the *default* path breaks every run
-        # that relied on built-in defaults (e.g. from outside the repo root).
+        # Only an explicit --config path is required to exist; the default may be absent.
         if not os.path.exists(args.config):
             if args.config != _DEFAULT_CONFIG_PATH:
                 print(
@@ -1244,31 +1117,10 @@ def main():
         config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
         config.read(args.config, encoding="utf-8")
 
-        # BUGFIX: `make_summarizer_call`/`should_run_pass_b` are the
-        # documented COLLECT-19 entry points `summarizer.py` describes
-        # ("Public entry point CLI code (COLLECT-19) uses to get a Pass B
-        # LlmCall from agents.ini") — but nothing here ever called them,
-        # so `collect_run` always received `llm_call=None` and Pass B
-        # (module summaries) / Pass C (their verification) silently never
-        # ran, regardless of `[collect] llm_summaries` (default true) or
-        # any flag, since `--no-llm` didn't even exist yet. A "full
-        # build" therefore finished in ~1s on a real repo — Pass B, the
-        # only part of the pipeline that makes a network call, was dead
-        # code from this entry point.
+        # Pass B and Pass C run only when a summarizer LLM call is built; this path used to pass None.
         llm_call = None
         if action != "check" and not args.no_llm and should_run_pass_b(config):
-            # BUGFIX (verified-bugs audit #3c): make_summarizer_call() reads
-            # several [collect]/[api] keys (verify_ssl, temperature,
-            # timeout, think, error_retries, ...) with raw config.getX()
-            # calls and no try/except of its own. Called here, outside any
-            # try/except, a single malformed value (e.g. `[collect]
-            # temperature = abc`) crashed the entire --collect invocation
-            # with a raw ValueError — including `--refresh` and `--module`
-            # runs that don't even need Pass B. make_summarizer_call_or_none
-            # is the guarded form, and both entry points (this one and the
-            # interactive /collect) use it so a bad key degrades to "Pass B
-            # skipped" instead of aborting the command — the inline copy
-            # that used to live here was never mirrored to /collect.
+            # Guarded builder: a malformed [collect] or [api] value skips Pass B instead of aborting --collect.
             llm_call = make_summarizer_call_or_none(config)
 
         try:
@@ -1293,11 +1145,7 @@ def main():
         json_mode: bool = getattr(args, "json", False)
 
         if json_mode:
-            # JSON mode must emit the JSON object and nothing else, so drop
-            # existing handlers and raise the threshold to ERROR to suppress
-            # informational lines (e.g. "SSL certificate verification
-            # DISABLED"). Genuine errors still go to stderr, never stdout,
-            # keeping the JSON output pristine.
+            # JSON mode: only the JSON object goes to stdout; logs are raised to ERROR and errors still go to stderr.
             for handler in logging.root.handlers[:]:
                 logging.root.removeHandler(handler)
             logging.basicConfig(
@@ -1306,6 +1154,7 @@ def main():
                 stream=sys.stderr,
             )
 
+        _warn_missing_explicit_config(args.config)
         orchestrator = Orchestrator(config_path=args.config)
 
         if json_mode:
@@ -1321,8 +1170,7 @@ def main():
                 sys.exit(0)
         else:
             print(f"[{_ts()}] 🗂  FAQ lookup: {question}")
-            # stream=False: this branch prints the formatted result itself,
-            # so streaming here would emit the answer twice (and leak rejected text).
+            # Streaming is off here, since this branch prints the result itself.
             result = orchestrator.faq_agent.answer(question, stream=False)
             llm_calls = orchestrator.faq_agent.llm_call_count
             print(f"[{_ts()}] 📊 LLM API calls: {llm_calls}")
@@ -1333,42 +1181,25 @@ def main():
                 print(f"\n✅ Answer:\n{result}")
                 sys.exit(0)
 
-    # ── CONTEST ONE-SHOT MODE (KC-33) ─────────────────────────────────
-    # Same shape as --auto: the value is a whole argument string, split with
-    # shlex so quotes round-trip, and forwarded to tools.contest.cli.main.
-    # Placed before the Orchestrator is constructed — a contest round never
-    # needs the agents — and before the checkpoint block, so a saved
-    # backoff checkpoint never prompts on a one-shot invocation.
+    # Contest one-shot mode (KC-33): forwarded to tools.contest.cli.main before the Orchestrator is built.
     if args.contest is not None:
         import shlex
         from tools.contest.cli import main as _contest_main
         sys.exit(_contest_main(shlex.split(args.contest)))
 
+    _warn_missing_explicit_config(args.config)
     orchestrator = Orchestrator(config_path=args.config)
 
-    # ── Issue 7: Resume interrupted backoff session ──────────────────────
-    # Skipped in non-interactive (--once) mode: prompting on stdin here
-    # would hang, or silently run the saved query instead of the one the
-    # caller just requested.
+    # Skip the resume prompt with --once: it would hang on stdin or run the saved query instead of the requested one.
     _saved = backoff.load_state() if args.once is None else None
     if _saved:
         _loop = _saved.get("loop", "unknown")
         _it   = _saved.get("iteration", "?")
         print(f"\n⚡ Checkpoint found: loop='{_loop}', iteration={_it}")
-        # BUGFIX: unlike the interactive REPL prompt below (which is inside
-        # a try/except (KeyboardInterrupt, EOFError) loop), this one runs
-        # unconditionally whenever a checkpoint exists — including under a
-        # piped/redirected/non-interactive stdin (CI, `cmd < /dev/null`,
-        # a TTY-less container). input() there raised a raw EOFError
-        # traceback instead of a clean fallback. Treat EOF as "no", the
-        # same as an explicit non-'y' answer.
-        # B6: KeyboardInterrupt was still uncaught here -- see
-        # _confirm_resume_checkpoint() for the full rationale.
+        # Non-interactive stdin: EOF at the resume prompt means "no" (no traceback); Ctrl-C is handled in _confirm_resume_checkpoint().
         _resume = _confirm_resume_checkpoint()
         if _resume is None:
-            # Ctrl-C at the prompt. Exit cleanly (no traceback) and leave the
-            # checkpoint on disk: an interrupt means "stop", not "discard my
-            # interrupted session and start over".
+            # Ctrl-C at the prompt exits cleanly and keeps the checkpoint on disk.
             print()
             sys.exit(130)
         if _resume:
@@ -1387,8 +1218,9 @@ def main():
             print("Error: --once requires a non-empty query string.", file=sys.stderr)
             sys.exit(1)
         try:
-            orchestrator.run_pipeline(query, base_dir)
-            sys.exit(0)
+            # AUDIT3-6: "0 ok / 1 error" — a query that could not run is an error.
+            ok = orchestrator.run_pipeline(query, base_dir)
+            sys.exit(1 if ok is False else 0)
         except Exception as e:
             logger.error("One-shot pipeline failed: %s", e)
             sys.exit(1)
@@ -1442,18 +1274,12 @@ def main():
                     from tools.auto.controller import run_auto
                     _rc = run_auto(goal=goal, base_dir=base_dir, config_path=args.config)
                     if _rc:
-                        # Interactive mode must NOT sys.exit (that would kill the
-                        # REPL); surface the failure as a visible warning instead.
+                        # Interactive mode warns instead of exiting, so the REPL keeps running.
                         print(f"⚠️  autonomous run finished with exit code {_rc} "
                               f"(see logs / .agent trace for details).")
                 continue
 
-            # COLLECT-19: /collect [--check|--refresh|--rebuild|--module <path>] —
-            # bring the structural project model up to date. Bare /collect is
-            # freshness-gated (no-op when fresh, incremental refresh when
-            # stale); /collect --rebuild is the unconditional full rebuild.
-            # Producer is read-only to the source tree; writes land only
-            # under [collect] dir (default .collect/).
+            # /collect [--check|--refresh|--rebuild|--module PATH]: the structural model; read-only to source, writes under the [collect] dir.
             if user_input.startswith("/collect"):
                 from tools.collect.cli import CollectCliError, parse_collect_args, run as collect_run
                 from tools.collect.summarizer import make_summarizer_call_or_none, should_run_pass_b
@@ -1462,20 +1288,11 @@ def main():
                 argv = body.split() if body else []
                 try:
                     kwargs = parse_collect_args(argv)
-                    # BUGFIX: same gap as --collect above — this never
-                    # passed llm_call either, so /collect's Pass B
-                    # (module summaries) silently never ran.
+                    # /collect has no summarizer call here, so Pass B is skipped (BUGFIX).
                     llm_call = None
                     no_llm = "--no-llm" in argv
                     if kwargs.get("action") != "check" and not no_llm and should_run_pass_b(orchestrator.config):
-                        # BUGFIX: this call site never had the guard the
-                        # --collect branch has. A malformed [collect]/[api]
-                        # key made make_summarizer_call raise straight out
-                        # of /collect — the only enclosing handler below is
-                        # CollectCliError and the one outside that is
-                        # KeyboardInterrupt/EOFError — so one bad config
-                        # value killed the whole interactive shell instead
-                        # of degrading to structural-only output.
+                        # Guarded builder: a malformed [collect] or [api] value degrades to structural-only /collect (bug fix).
                         llm_call = make_summarizer_call_or_none(orchestrator.config)
                     result = collect_run(
                         base_dir, config=orchestrator.config, config_path=args.config,
@@ -1519,11 +1336,7 @@ def main():
                 print()
                 continue
 
-            # KC-33: /contest — run one contest round from the interactive shell.
-            # Everything after "/contest" is forwarded verbatim to
-            # tools.contest.cli.main, so `/contest run --ticket 63 --no-tests`
-            # behaves exactly like `python3 -m tools.contest run --ticket 63
-            # --no-tests`. Bare /contest passes ["--help"].
+            # KC-33: /contest forwards everything after it to tools.contest.cli.main; a bare /contest prints its help.
             if user_input.startswith("/contest"):
                 body = user_input[len("/contest"):].strip()
                 argv = body.split() if body else ["--help"]
@@ -1531,20 +1344,7 @@ def main():
                 try:
                     _rc = _contest_main(argv)
                 except SystemExit as exc:
-                    # CORRECTION (review pass): argparse's OWN --help action and
-                    # its own usage-error path (e.g. a bare `/contest run`
-                    # missing the required --ticket) call sys.exit() directly —
-                    # they do not return an int. That raises SystemExit, which
-                    # is NOT an Exception subclass and is NOT caught by the
-                    # REPL's own `except (KeyboardInterrupt, EOFError):` further
-                    # down. Left unguarded, a bare `/contest` (or any malformed
-                    # one) would propagate out of `while True:` and kill the
-                    # whole main.py process — exactly the failure mode
-                    # /collect's own dispatch was built to avoid (see
-                    # parse_collect_args's docstring: "Kept separate from
-                    # stdlib argparse so main.py can add ... and just forward
-                    # here"). Catch it here and normalize to the same int
-                    # contract every other dispatch uses.
+                    # argparse calls sys.exit() on --help or a usage error; catch SystemExit so the REPL survives it (review fix).
                     _rc = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
                 if _rc:
                     print(f"[{_ts()}] ⚠️  contest finished with exit code {_rc}.")
@@ -1555,7 +1355,13 @@ def main():
                 print(f"Unknown command: {user_input.split()[0]}  —  type /help for the command list.")
                 continue
 
-            orchestrator.run_pipeline(user_input, base_dir)
+            # AUDIT3-14: one failed query is reported, not the end of the session
+            # (and of its chat history) — as --once already does.
+            try:
+                orchestrator.run_pipeline(user_input, base_dir)
+            except Exception as exc:  # noqa: BLE001 — the shell outlives one query
+                logger.exception("Pipeline failed for %r", user_input)
+                print(f"Error: {type(exc).__name__}: {exc}")
 
         except (KeyboardInterrupt, EOFError):
             print("\nShutting down runtime session shell.")

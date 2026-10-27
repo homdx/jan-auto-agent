@@ -109,9 +109,7 @@ from tools.auto.state import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared fakes (mirrors the style already used in tests/test_auto_c4.py)
-# ─────────────────────────────────────────────────────────────────────────────
+# Shared fakes (as in tests/test_auto_c4.py)
 
 @dataclass
 class _FakeInnerResult:
@@ -161,9 +159,7 @@ def _make_state(tmp_path: Path) -> StateStore:
     return st
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bug 1 — rewrite persists across a resumed session
-# ─────────────────────────────────────────────────────────────────────────────
+# Bug 1: a rewrite persists across a resumed session
 
 class TestRewritePersistsAcrossResume:
     def test_apply_rewrite_persists_instruction_and_original(self, tmp_path):
@@ -199,10 +195,7 @@ class TestRewritePersistsAcrossResume:
         ))
         task0 = st.get_task("T1")
 
-        # "Session 1": rounds 1-3 fail; round 3 triggers a rewrite
-        # (rewrite_every_n_rounds=2 -> fires at rnd>=3 where (rnd-1)%2==0).
-        # max_rounds=3 ends the session right after that rewrite takes
-        # effect — the same on-disk state a process kill would leave.
+        # Session 1: round 3 triggers a rewrite; max_rounds ends the session right after it, as a kill would.
         inner_1 = _ScriptedInnerLoop(fail_count=999)
         rewriter_1 = _CountingRewriter()
         loop_1 = OuterLoop(inner_1, st, max_rounds=3, rewrite_every_n_rounds=2,
@@ -211,8 +204,7 @@ class TestRewritePersistsAcrossResume:
         assert rewriter_1.calls == 1
         assert result_1.exhausted is True
 
-        # "Session 2": brand-new StateStore + OuterLoop (new process),
-        # exactly like controller._run_task_loop rebuilds both every call.
+        # A new process builds a fresh StateStore and OuterLoop, as the controller does on every call.
         st2 = _make_state(tmp_path)
         st2.set_task_status("T1", STATUS_TODO)  # controller's BLOCKED->TODO reset
         resumed_task = st2.get_task("T1")
@@ -227,9 +219,7 @@ class TestRewritePersistsAcrossResume:
         assert inner_2.seen_instructions == ["REWRITTEN v2"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bug 2 — max_rewrites is a true per-task, cross-resume cap
-# ─────────────────────────────────────────────────────────────────────────────
+# Bug 2: max_rewrites is a per-task cap that holds across resumes
 
 class TestMaxRewritesCapCrossResume:
     def test_cap_holds_across_a_resume(self, tmp_path):
@@ -249,9 +239,7 @@ class TestMaxRewritesCapCrossResume:
         loop_1.run_task(st.get_task("T1"), tmp_path)
         assert rewriter_1.calls == 1  # used up the entire budget
 
-        # Resume with a fresh OuterLoop/TaskRewriter, same config. Give it
-        # plenty of extra rounds so a second rewrite opportunity would recur
-        # if the cap didn't hold.
+        # Resume with a fresh OuterLoop and TaskRewriter; a second rewrite would recur if the cap did not hold.
         st.set_task_status("T1", STATUS_TODO)
         inner_2 = _ScriptedInnerLoop(fail_count=999)
         rewriter_2 = _CountingRewriter()
@@ -266,9 +254,7 @@ class TestMaxRewritesCapCrossResume:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bug 3 — BLOCKED-reset only resets tasks a reset can actually help
-# ─────────────────────────────────────────────────────────────────────────────
+# Bug 3: a BLOCKED reset only resets tasks a reset can help
 
 class TestBlockedResetRespectsRoundExhaustion:
     def _controller(self, tmp_path, max_rounds_per_task=3):
@@ -304,8 +290,7 @@ class TestBlockedResetRespectsRoundExhaustion:
             id="T2", title="t", instruction="x", target_files=["f.py"],
             acceptance_check="pytest", status=STATUS_BLOCKED,
         ))
-        # No feedback_round_*.md files at all: this task never ran a round —
-        # it's BLOCKED purely because of an unmet dependency.
+        # No feedback rounds exist: the task never ran and is blocked by an unmet dependency.
 
         controller._reset_resettable_blocked_tasks(controller._cfg())
 
@@ -328,9 +313,7 @@ class TestBlockedResetRespectsRoundExhaustion:
         assert controller.state.get_task("T3")["status"] == STATUS_TODO
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bug 4 — architect checkpoint is written atomically
-# ─────────────────────────────────────────────────────────────────────────────
+# Bug 4: the architect checkpoint is written atomically
 
 class TestArchitectCheckpointAtomicWrite:
     def test_atomic_write_text_never_corrupts_old_file_on_failure(
@@ -348,8 +331,7 @@ class TestArchitectCheckpointAtomicWrite:
         with pytest.raises(OSError):
             atomic_write_text(path, '{"new": "content-that-should-never-land"}')
 
-        # The OLD file must be completely untouched — never truncated,
-        # never partially overwritten.
+        # The old file must be left completely untouched, never truncated or partly written.
         assert path.read_text(encoding="utf-8") == '{"good": "old-content"}'
         # No leftover temp file either.
         assert list(tmp_path.glob(f".{path.name}.*.tmp")) == []
@@ -408,9 +390,7 @@ class TestArchitectCheckpointAtomicWrite:
         assert ckpt.exists()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bug 5 — PlanEmitter's staleness check is content-aware
-# ─────────────────────────────────────────────────────────────────────────────
+# Bug 5: PlanEmitter's staleness check is content-aware
 
 class TestClusterHashContentAware:
     def _emitter(self, tmp_path):
@@ -434,9 +414,7 @@ class TestClusterHashContentAware:
         emitter.emit(build_backlog([]), clusters=[cluster])
         assert emitter.changed_clusters([cluster]) == []  # unchanged right after emit
 
-        # Edit the SAME file (same path, same cluster) — no path-list change,
-        # but a real content change (different size, so this can't flake on
-        # coarse filesystem mtime granularity).
+        # Same path and cluster with a real content change (a different size, so coarse mtimes cannot hide it).
         (tmp_path / "a.py").write_text(
             "v2 - a completely different, much longer body than before",
             encoding="utf-8",
@@ -460,9 +438,7 @@ class TestClusterHashContentAware:
         assert len(_cluster_hash(c1)) == 64
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Minor fix — ticket ids are sanitized before touching the filesystem
-# ─────────────────────────────────────────────────────────────────────────────
+# Minor fix: ticket ids are sanitised before touching the filesystem
 
 class TestTicketStorePathSanitization:
     def test_traversal_id_cannot_escape_tickets_dir(self, tmp_path):
@@ -619,16 +595,10 @@ class TestPreexistingPatternGrandfathering:
         assert written == [] and "blocked" in err
 
 
-# ── Bug 7: word-boundary patterns (sudo/shutdown/reboot) were never given the
-#    same pre-existing-pattern grandfathering as the other two checks in
-#    _check_content_safety, so any file whose *legitimate* content contains
-#    one of those words as data (coder.py's own pattern tables, a devops
-#    README, ...) could never be written again — not even as a no-op rewrite.
+# Bug 7: word-boundary patterns (sudo, shutdown, reboot) get the same grandfathering as the other content checks.
 
 class TestWordBoundaryGrandfathering:
-    # Mirrors the real coder.py self-edit case: a file whose own content
-    # necessarily contains "sudo" as data (defining what to block), not as an
-    # actual invocation.
+    # A file whose own content must name "sudo" as data (the safety patterns themselves), not as an invocation.
     SELF_REFERENTIAL = (
         "SUDO_TOKENS = ('sudo ', '\"sudo\"')  # patterns this scanner blocks\n"
         "def greet(name):\n"
@@ -636,8 +606,7 @@ class TestWordBoundaryGrandfathering:
     )
 
     def test_noop_rewrite_of_self_referential_file_allowed(self):
-        # The exact real-world case: rewriting a file back to itself
-        # unchanged must not be permanently blocked by its own data.
+        # Rewriting a file to itself unchanged must not be blocked by its own data.
         safe, reason = Coder._check_content_safety(
             self.SELF_REFERENTIAL, "code", existing_content=self.SELF_REFERENTIAL)
         assert safe, reason
@@ -661,16 +630,13 @@ class TestWordBoundaryGrandfathering:
         assert not safe and "shutdown" in reason
 
     def test_new_file_with_word_boundary_pattern_still_blocked(self):
-        # No existing_content at all (brand-new file) — must never be
-        # grandfathered regardless of what the pattern is.
+        # A new file has no existing content, so it is never grandfathered.
         safe, reason = Coder._check_content_safety(
             "# reboot the host after install\n", "code", existing_content=None)
         assert not safe
 
     def test_identifier_names_still_exempt(self):
-        # Unrelated pre-existing behaviour must be untouched: underscore-
-        # joined identifiers embedding the keyword never match (\\b treats
-        # '_' as a word character), independent of grandfathering.
+        # Identifiers that embed a keyword (test_reboot_...) never match: \b treats "_" as a word character.
         clean = "def test_reboot_gracefully():\n    assert True\n"
         safe, reason = Coder._check_content_safety(clean, "code", existing_content=None)
         assert safe, reason
@@ -736,11 +702,7 @@ timeout_seconds = 5
     assert not any("UNREACHABLE" in r.message for r in caplog.records)
 
 
-# ── Bug 8: Gate1 had no way to accept a task that creates a brand-new file —
-#    the existence check unconditionally rejected any cited_location.file
-#    that didn't already exist, treating legitimate "create X" tasks the
-#    same as hallucinated paths. Fixed with an explicit, opt-in
-#    cited_location.new_file flag.
+# Bug 8: a task that creates a new file needs an explicit opt-in (new_file); the existence check stays strict by default.
 
 def _gate1(task_mode="code"):
     cfg = configparser.ConfigParser()
@@ -766,8 +728,7 @@ class TestNewFileCreation:
         assert loc.is_valid("code")
 
     def test_is_valid_still_false_without_anchor_when_not_new_file(self):
-        # Regression check: the pre-existing "must have symbol or line_start"
-        # rule for code mode must be completely unchanged for the default case.
+        # The symbol-or-line rule for code mode is unchanged for the default case.
         loc = CitedLocation(file="app.py")
         assert not loc.is_valid("code")
 
@@ -780,9 +741,7 @@ class TestNewFileCreation:
         assert "new file" in reason
 
     def test_existence_check_still_rejects_missing_file_by_default(self, tmp_path):
-        # The critical regression-safety test: new_file defaults to False,
-        # so an ordinary hallucinated path must be rejected exactly as
-        # before this fix.
+        # new_file defaults to False, so an ordinary hallucinated path is rejected as before.
         gate = _gate1()
         cand = _candidate(new_file=False, file="app.py")
         ok, reason, block = gate._check_existence(
@@ -806,14 +765,7 @@ class TestNewFileCreation:
         assert "directory" in reason
 
     def test_new_file_rejected_when_path_already_exists(self, tmp_path):
-        # BUGFIX: new_file=True used to return early — "existence check
-        # skipped" — for ANY path, including one that already exists as a
-        # real file with real content. That handed the coder a target file
-        # to overwrite with zero visibility into what was already there
-        # (block was always ""), silently clobbering it. new_file's whole
-        # premise is "this path does not exist yet"; if it does exist,
-        # that premise is false and the candidate must be rejected, not
-        # waved through.
+        # Bug fix: new_file on a path that already exists is rejected; new_file is only true for a path that is absent.
         (tmp_path / "app.py").write_text("def hello():\n    return 'hi'\n")
         gate = _gate1()
         cand = _candidate(new_file=True, file="app.py")
@@ -832,8 +784,7 @@ class TestNewFileCreation:
         assert restored[0].cited_location.new_file is True
 
     def test_presence_stage_skips_llm_for_new_file_candidate(self, tmp_path):
-        # A new_file candidate must not trigger an LLM presence check —
-        # mirrors the existing creative-mode exemption (AUTO-CR-8).
+        # A new file skips the LLM presence check, as creative mode does (AUTO-CR-8).
         gate = _gate1()
         cand = _candidate(new_file=True, file="app.py")
         with patch("tools.llm_stream.request_completion") as mock_call:
@@ -896,11 +847,7 @@ class TestBibleBootstrapFromSeedChapters:
         assert len(updates) == 1
 
 
-# ── Bug 9: story_bible.py's writes were downgraded from atomic_write_text to
-#    plain write_text() with the import removed entirely - a kill mid-write
-#    could corrupt the persisted fact set (or pending-corrections state)
-#    with no read-side detection, re-introducing exactly what Bug 4 already
-#    fixed once for a different file.
+# Bug 9: story_bible writes stay atomic; a kill mid-write must not corrupt the persisted facts.
 
 class TestStoryBibleAtomicWrite:
     def _bible(self, tmp_path):
@@ -922,8 +869,7 @@ class TestStoryBibleAtomicWrite:
         assert calls[0][1] == "• fact one\n• fact two\n"
 
     def test_write_does_not_call_plain_write_text_directly(self, tmp_path, monkeypatch):
-        # Belt-and-suspenders: even if atomic_write_text were left importable
-        # but bypassed, catch a direct Path.write_text call on the target path.
+        # Even if atomic_write_text is bypassed, a direct Path.write_text on the target is caught.
         from pathlib import Path
         sb = self._bible(tmp_path)
         original = Path.write_text
@@ -952,9 +898,7 @@ class TestStoryBibleAtomicWrite:
     def test_bible_write_survives_simulated_crash_without_corrupting_old_content(
         self, tmp_path, monkeypatch
     ):
-        # End-to-end version of the Bug-4-style crash test, but through
-        # StoryBible._write specifically, so this class regresses loudly if
-        # _write is ever pointed at a non-atomic path again.
+        # End-to-end version of the Bug-4 crash test, through StoryBible._write, so a regression to a non-atomic write fails here.
         sb = self._bible(tmp_path)
         sb._path.write_text("• old established fact\n", encoding="utf-8")
 
@@ -969,12 +913,7 @@ class TestStoryBibleAtomicWrite:
         assert list(tmp_path.glob(".story_bible.md.*.tmp")) == []
 
 
-# ── Bug 10 (and test-coverage restoration): the same "Tests not passed"
-#    commit that regressed story_bible.py's atomic writes also deleted these
-#    three test classes. Two of the three still have correct underlying
-#    code (verified independently) and just needed their coverage restored;
-#    CanonValidator's number-eating regex regression above needed an actual
-#    code fix.
+# Bug 10: restores test coverage that a bad commit removed; the CanonValidator regex needed a real code fix.
 
 class TestSearchAgentEmptyLLMResponseFailsOpen:
     """SearchAgent._evaluate_with_llm's documented contract is fail-open on
@@ -1090,11 +1029,7 @@ class TestCanonValidatorPreservesNumbers:
         assert claims == ["Anna is 42 years old"]
 
 
-# ── Bug 11: the upstream fix for subprocess+danger-token grandfathering
-#    (b0aabde) required both tokens to independently appear somewhere in the
-#    old file, but never verified they actually co-occurred as real combined
-#    usage - so two unrelated, separate mentions still grandfathered in a
-#    brand-new dangerous combination.
+# Bug 11: grandfathering needs both dangerous tokens to co-occur in real usage, not as separate mentions.
 
 class TestSubprocessDangerComboRequiresCooccurrence:
     def test_separate_unrelated_mentions_do_not_grandfather_new_combo(self):
@@ -1137,25 +1072,11 @@ class TestSubprocessDangerComboRequiresCooccurrence:
         assert not safe
 
 
-# ── Bug 11b: _preexisting_combo's own comment-stripper (_strip_py_line_
-#    comment, added alongside Bug 11) tracks quote state naively, with no
-#    concept of a backslash-escaped quote. A line with an ODD number of
-#    quote characters preceding the real "#" — e.g. an escaped quote inside
-#    a string literal — desyncs that tracking so the scanner still believes
-#    it is "inside a string" right when the actual comment starts, and
-#    returns the line completely unstripped. That silently reopens the
-#    exact hole Bug 11 exists to close: a comment on such a line can once
-#    again make an unrelated same-line mention count as genuine co-
-#    occurrence, letting a brand-new dangerous combo be grandfathered in.
+# Bug 11b: the comment stripper must handle an escaped quote, so a comment cannot hide or fake a co-occurrence.
 
 class TestPreexistingComboCommentStripHandlesEscapedQuotes:
     def test_escaped_quote_before_comment_does_not_grandfather(self):
-        # Both dangerous tokens appear ONLY inside this line's comment text,
-        # never in real code — but an escaped quote earlier on the SAME
-        # line (leaving an ODD count of quote characters before the "#")
-        # is what desyncs the naive tracker. If comment-stripping works,
-        # this line contributes nothing to the co-occurrence check; if it
-        # desyncs, the whole line (comment included) counts.
+        # The dangerous tokens appear only in the comment; an escaped quote must not desync the stripper.
         existing = (
             'y = "she said \\"hi"'
             '  # never combine subprocess with rm -rf\n'
@@ -1185,12 +1106,7 @@ class TestPreexistingComboCommentStripHandlesEscapedQuotes:
         assert safe, reason
 
 
-# ── Bug 12: a blocked acceptance_check used to fall back to bare `pytest`,
-#    which _prepare_workspace's whole-repo mirror (AUTO-FIX-1) means picks
-#    up and runs every OTHER pre-existing test too - so in any repo with a
-#    healthy existing test suite, a task whose real check was blocked for
-#    safety reasons could get marked passed and committed without its
-#    actual goal ever being verified.
+# Bug 12: a blocked acceptance_check must not fall back to bare pytest, which runs the whole mirrored suite.
 
 class TestBlockedAcceptanceCheckCannotSpuriouslyPass:
     def test_blocked_check_falls_back_to_guaranteed_failure(self, tmp_path):
@@ -1201,9 +1117,7 @@ class TestBlockedAcceptanceCheckCannotSpuriouslyPass:
 
     def test_blocked_check_does_not_spuriously_pass_via_unrelated_tests(self, tmp_path):
         from tools.auto.executor import Executor
-        # A repo with its own healthy, completely unrelated test suite -
-        # exactly the self-hosting scenario this codebase's own pilots
-        # exercise (this repo included).
+        # A repo with its own healthy, unrelated test suite: the self-hosting case.
         (tmp_path / "tests").mkdir()
         (tmp_path / "tests" / "test_unrelated.py").write_text(
             "def test_something_unrelated():\n    assert 1 + 1 == 2\n"
@@ -1215,9 +1129,7 @@ class TestBlockedAcceptanceCheckCannotSpuriouslyPass:
         task = {
             "id": "T1",
             "target_files": ["app.py"],
-            # A real check for the task's actual goal, but flagged unsafe -
-            # must never be silently replaced by something that can pass
-            # for unrelated reasons.
+            # A real check for the task's goal, flagged unsafe: it must never be replaced by something that passes for unrelated reasons.
             "acceptance_check": "python app.py && rm -rf /tmp/marker",
         }
         result = executor.run(task)

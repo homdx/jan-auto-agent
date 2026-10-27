@@ -65,11 +65,7 @@ def _where(sections: dict, finding: str) -> str:
 SCREEN = {"SPLIT": "SPLIT VERDICTS", "UNANIMOUS": "AGREED", "SOLO": "SEEN BY ONE REVIEWER"}
 
 
-# ── bug: a finding only one reviewer judged was reported as "AGREED" ─────────
-# The screen counted ROWS (`len(rs) == 1`), the pivot counts reviewers. A reviewer who
-# judged one symbol under two task-ids made two rows, so the screen printed it as agreed
-# — with only the last of her two verdicts, hiding that she contradicted herself — while
-# the pivot (and the script's own comments) call it SOLO with `CONFIRMED|FALSE_POSITIVE`.
+# Regression: a finding one reviewer judged twice was reported as AGREED instead of SOLO.
 
 def _alice_twice(tmp_path):
     alice = _csv(tmp_path / "validation-v1-alice.csv", [
@@ -118,11 +114,7 @@ def test_the_ordinary_cases_read_as_before(tmp_path):
     assert agreed.split()[0] == "CONFIRMED"
 
 
-# ── bug: a truncated row crashed the report ──────────────────────────────────
-# `csv.DictReader` fills the fields a short row lacks with None, and the report read
-# them with `r.get("verdict", "").strip()` — which returns that None. The script is
-# meant for CSVs written by models, which truncate rows, and it prints a "schema
-# problems" list for them instead of failing.
+# Regression: a truncated CSV row crashed the report (missing fields come back as None).
 
 def test_a_truncated_row_is_counted_not_a_traceback(tmp_path):
     short = _csv(tmp_path / "validation-v1-carol.csv", [_row("T9", "a.py", "f", "CONFIRMED")], width=4)

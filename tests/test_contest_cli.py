@@ -43,11 +43,7 @@ from tools.contest.roster import AgentSpec, load_roster  # noqa: E402
 from tools.contest.runner import AgentRun, AgentState, RoundState  # noqa: E402
 from tools.contest.workspace import Workspace, prepare_round  # noqa: E402
 
-# The tests that get as far as KiloServer.spawn start `kilo serve` (the stub)
-# on the port kilo_client._free_port picked and let go of: a port handed to
-# another process can be handed out again before it is bound, so the file
-# keeps to the one worker of the group. A server bound on port 0 in-process
-# needs no group.
+# Tests that start the stub kilo serve run in one xdist group: the port is handed out before it is bound.
 pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 ROUND = 1
@@ -56,9 +52,7 @@ TICKET_02 = "02-second.md"
 OUT = Path("contest-out") / f"{ROUND:02d}"
 PLANNED = ("ticket", "base", "agents", "parallel", "workers", "tmpdir", "tests", "gate", "out")
 
-#: KC-65: the env keys the round's server always gets besides
-#: `KILO_CONFIG_CONTENT` — the workers' file, the plugin that reads it, the
-#: plugin's one PYTHONPATH entry and xdist's own fallback for when it cannot load.
+#: Env keys the round's server always gets besides KILO_CONFIG_CONTENT (workers file, plugin, PYTHONPATH, fallback).
 KC65_ENV_KEYS = frozenset({"CONTEST_PYTEST_WORKERS_FILE", "PYTEST_PLUGINS",
                            "PYTHONPATH", "PYTEST_XDIST_AUTO_NUM_WORKERS"})
 
@@ -87,9 +81,7 @@ THING_CHANGED = "def thing():\n    return 42\n"
 TEST = "def test_thing():\n    assert 1 + 1 == 2\n"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the sandbox
-# ─────────────────────────────────────────────────────────────────────────────
+# The sandbox
 
 def _git(cwd, *args) -> str:
     result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
@@ -183,9 +175,7 @@ response_format = true
         return self.repo / OUT
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the agents' turn
-# ─────────────────────────────────────────────────────────────────────────────
+# The agents' turn
 
 def _commits(directory: str) -> int:
     base = _git(directory, "merge-base", "main", "HEAD")
@@ -247,9 +237,7 @@ SCENARIO_NO_TEST = {"turns": [{"on_prompt": work_no_test, "events": ["busy", "id
                               {"on_prompt": work_no_test, "events": ["busy", "idle"]}]}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# fixtures and read-outs
-# ─────────────────────────────────────────────────────────────────────────────
+# Fixtures and read-outs
 
 @pytest.fixture(autouse=True)
 def gate_key(monkeypatch):
@@ -321,9 +309,7 @@ def _patches(stdout: str) -> list:
     return [line[len("patch: "):] for line in stdout.splitlines() if line.startswith("patch: ")]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# intake
-# ─────────────────────────────────────────────────────────────────────────────
+# Intake
 
 def test_intake_rejects_a_ticket_that_is_not_the_lowest_open_one(sandbox, capsys):
     """`--ticket 2` with `01` still on offer: four lines, the two ways out,
@@ -404,9 +390,7 @@ def test_intake_names_a_server_that_does_not_answer(sandbox, capsys):
     assert "not healthy" in captured.err
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-24: the ticket on offer ahead, and the two ways out
-# ─────────────────────────────────────────────────────────────────────────────
 
 KC24_ROUND = 54
 KC53 = "53-kc14-harvest-accepts-only-a-hex-sha.md"
@@ -649,9 +633,7 @@ def test_intake_refuses_a_park_that_is_not_committed(tmp_path, monkeypatch, caps
     assert "epic-tasks/ has uncommitted or untracked changes" in captured.err
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-76: --target REPO_PATH and _roster_path resolution
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-76: --target REPO_PATH and roster path resolution
 
 def _target_sandbox(tmp_path):
     """A CWD dir (has contest.ini + no tickets) and a separate target repo
@@ -713,14 +695,11 @@ def test_target_flag_resolves_repo_to_the_given_path(tmp_path, monkeypatch, caps
     cwd_dir, target_dir = _target_sandbox(tmp_path)
     monkeypatch.chdir(cwd_dir)
 
-    # The target has the ticket; without --target, intake would look in CWD
-    # (which has no epic-tasks/) and fail with "no ticket numbered 1".
-    # With --target, intake finds it in the target.
+    # Intake finds the ticket in --target; without it, intake would look in the CWD and fail.
     code = cli.main(["run", "--ticket", "1", "--target", str(target_dir),
                      "--no-tests", "--no-gate"])
     captured = capsys.readouterr()
-    # intake finds no Kilo binary (the stub path) → fails at the server step,
-    # but it has already passed the ticket check — no "no ticket" line
+    # No Kilo binary fails at the server step, after the ticket check has already passed.
     assert "no ticket numbered 1" not in captured.err
 
 
@@ -750,9 +729,7 @@ def test_roster_resolves_against_cwd_not_target(tmp_path, monkeypatch):
     assert cli._roster_path(cwd_dir, abs_path) == Path(abs_path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-25: the roster's provider/model pairs against GET /provider
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _provider(provider_id, name, model_ids):
     """One entry of a `GET /provider` body, for `roster_on_offer` alone."""
@@ -768,9 +745,7 @@ def _offer(providers, connected=("kenary",)):
             "failed": []}
 
 
-#: The offer those tests read: one provider whose `id` is `kenary` and whose
-#: `name` is the display string `kenari` — the pair `kenari/hy3:free` is the
-#: mistake the round lost four slots to.
+#: Offer for those tests: provider "kenary" with display name "kenari"; a kenari/... roster entry is the mistake the round lost slots to.
 KC25_OFFER = _offer((_provider("kenary", "kenari",
                                ("hy3:free", "agnes-2-5-flash:free",
                                 "agnes-2-0-flash:free")),))
@@ -817,8 +792,7 @@ def test_roster_on_offer_is_one_line_per_bad_agent_in_roster_order():
     agents = cli.agents_from_models("kenari/hy3:free,hy3:free,agnes-2-5-flash")
     lines = cli.roster_on_offer(KC25_OFFER, agents)
     assert len(lines) == 2
-    # both hy3 ids are the same name, so KC-34's variant rule suffixes them:
-    # the names differ, the provider and model do not
+    # Two hy3 ids get KC-34 variant suffixes, so the names differ but provider and model do not.
     assert lines[0].startswith("[hy3-var1] kenari/hy3:free: no provider 'kenari'")
     assert lines[1].startswith("[agnes-2-5-flash] kenary/agnes-2-5-flash: no model")
 
@@ -1206,8 +1180,7 @@ def test_export_patches_gives_a_deadline_committed_agent_a_patch_not_a_diff(tmp_
             _write(path / "pkg" / "thing.py", THING_CHANGED)
         commit = None
         if deadline:
-            # what `_deadline_commit` leaves: one commit, and `run.commit` set by
-            # the harvest that scored it
+            # What _deadline_commit leaves: one commit, with run.commit set by the harvest.
             _git(path, "add", "-A")
             _git(path, "-c", "user.name=r", "-c", "user.email=r@x.invalid",
                  "commit", "-q", "-m", "WIP (deadline commit, no event for 3s)")
@@ -1285,16 +1258,10 @@ def test_a_stall_with_a_valid_commit_counts_as_ready_and_exits_zero(sandbox, cap
     so the run exports `agent-a.patch` and exits 0, while agent-b stalled with an
     empty branch stays STALLED with no patch and no harvest."""
     ini = sandbox.repo / "contest.ini"
-    # FL-1 (round 84): 5 s, not 1 s. The window only has to be short enough
-    # that the silent agent stalls inside the turn deadline — its exact value
-    # is not the claim — and agent-a commits from its hook, so a 1 s window
-    # was a real `git` commit racing a wall clock. FakeKiloServer heartbeats
-    # through the hook now, but a 1 s window leaves no room for that beat to
-    # be *delivered* late on a loaded box.
+    # 5 s window: short enough to stall inside the turn deadline; a 1 s window raced a real git commit (FL-1).
     ini.write_text(ini.read_text(encoding="utf-8").replace("idle_event_timeout_sec = 900",
                                                             "idle_event_timeout_sec = 5")
-                   # KC-9: a silence under the deadline is a `continue` now; this
-                   # test is about the terminal harvest of a stall, so no budget
+                   # A silence under the deadline is a continue (KC-9); this test checks the stall harvest.
                    .replace("idle_event_timeout_sec = 5",
                             "idle_event_timeout_sec = 5\nmax_continues_per_attempt = 0"),
                    encoding="utf-8")
@@ -1362,9 +1329,7 @@ def test_an_aborted_stall_with_a_valid_commit_writes_a_stalled_patch_and_exits_n
     assert run.turns[0]["harvest"]["verdict"] == "READY"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the round, end to end
-# ─────────────────────────────────────────────────────────────────────────────
+# The round, end to end
 
 def test_run_exports_a_patch_per_agent_and_exits_zero(sandbox, capsys, spawn_holder):
     """One READY and one GAVE_UP with a commit: exit 0, a `.patch` and a
@@ -1574,8 +1539,7 @@ def test_the_round_starts_without_a_resolvable_gate_key(sandbox, capsys, spawn_h
     code, fake = run_fake(sandbox, scenario, ["--ticket", "1", "--no-tests"], spawn_holder)
     captured = capsys.readouterr()
     assert code == 0
-    # KC-37 §3 / KC-55 §6: the plan names the model and the host the gate sits
-    # on, not just `on` — the host is what round 66 lost to
+    # The plan names the gate's host, not only "on" (KC-37, KC-55).
     assert _plan(captured.out)["gate"] == "test/gate @ 127.0.0.1"
     decisions = _jsonl(sandbox.out() / "agent-a" / "decisions.jsonl")
     (line,) = decisions
@@ -1614,9 +1578,7 @@ def test_module_entry_point_help_and_usage():
     assert "usage: tools.contest" in bare.stderr
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-34 §7 — a model listed twice runs as <name>-var1, <name>-var2
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-34 §7: a model listed twice runs as <name>-var1 and <name>-var2
 
 def test_agents_from_models_leaves_a_single_name_untouched():
     """§7 guard, green on the base: a name that appears once is today's name."""
@@ -1744,9 +1706,7 @@ def test_run_with_a_twice_listed_model_gives_each_variant_its_own_everything(
     assert (out / "x-var2.patch").read_text(encoding="utf-8").strip().startswith("From ")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-34 §4-§6 — `--backend openrouter`
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-34 §4-6: --backend openrouter
 
 OPENROUTER_ROSTER = """
 [contest]
@@ -1875,8 +1835,7 @@ def test_backend_flag_builds_an_openrouter_backend_without_a_kilo_server(
 
     (api_key, base_url, directory, kwargs) = built[0]
     assert (api_key, base_url) == ("test-openrouter-key", "http://127.0.0.1:9/v1")
-    # KC-65: the OpenRouter agents get the same env as the ones a `kilo serve`
-    # hosts, or the sizing rule would be a Kilo-only rule.
+    # OpenRouter agents get the same env as the Kilo-served ones (KC-65).
     assert set(kwargs) == {"extra_env"}
     assert set(kwargs["extra_env"]) == KC65_ENV_KEYS
     assert Path(kwargs["extra_env"]["CONTEST_PYTEST_WORKERS_FILE"]).name == "pytest-workers"
@@ -1993,9 +1952,7 @@ def test_backend_flag_without_a_profile_in_the_roster_is_a_server_line(
     assert list(sandbox.rounds.iterdir()) == [], "no worktree before the roster is valid"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-49 — the reasoning variant, named or `highest`, through `run`
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-49: the reasoning variant, named or highest, through run
 
 KC49_REJECTED = {"name": "APIError",
                  "data": {"message": "the model's provider rejected the request. check "
@@ -2215,16 +2172,13 @@ def test_run_variant_flag_answers_a_quota_at_intake_and_leaves_the_agent_out(san
     assert "free-models-per-day" in skipped[0] and skipped[0].endswith("not started")
     assert lines == ["intake: every agent is out of quota — nothing to start "
                      "(the variant: lines above name each one)"]
-    # the only session is the intake's own probe, and it was deleted: the agent
-    # never got a round of its own
+    # The only session is the intake probe, which was deleted, so the agent had no round of its own.
     (session,) = _sessions(fake)
     assert session["body"]["title"] == "variant-probe/glm-4-7-flash:free/medium"
     assert len(fake.calls(method="DELETE")) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-55: the gate shares an endpoint with the roster, and intake asks it once
-# ─────────────────────────────────────────────────────────────────────────────
 
 GATE_HOST = "kenari.id"
 
@@ -2408,9 +2362,7 @@ def test_a_silence_clock_shorter_than_the_gate_worst_case_refuses_the_round(
     assert not sandbox.out().exists()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-37 §2: the gate is never a model the round is competing
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-37 §2: the gate is never a model the round competes with
 
 KC37_SCENARIO = {
     "providers": _offer((_provider("kenary", "kenari", ("hy3:free", "x:free", "y:free")),
@@ -2533,19 +2485,14 @@ def test_the_placeholder_gate_model_is_not_checked(sandbox):
         config.agents) == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-35: a roster model missing from Kilo's own model list
-# ─────────────────────────────────────────────────────────────────────────────
 
-#: The offer the round-64 logs were run against: `hy3:free` and the two
-#: `agnes-2-x` ids are listed, `agnes-3-0-flash:free` and `nex-n2-5-pro:free`
-#: are not, so the two agents that ended `ERROR` ten seconds in are missing.
+#: Offer the round-64 logs were run against: two agents are missing from the list and end ERROR.
 KC35_OFFER = _offer((_provider("kenary", "kenari",
                                ("hy3:free", "agnes-2-5-flash:free",
                                 "agnes-2-0-flash:free")),))
 
-#: The same offer with the two ids added — what `kilo models` shows once
-#: `KILO_CONFIG_CONTENT` registers them (the ticket's live verification).
+#: The offer with the two ids added, as kilo models shows them after the overlay (live check).
 KC35_REGISTERED_OFFER = _offer((_provider("kenary", "kenari",
                                           ("hy3:free", "agnes-2-5-flash:free",
                                            "agnes-2-0-flash:free",
@@ -2557,8 +2504,7 @@ KC35_SCENARIO = {"providers": KC35_OFFER,
 KC35_REGISTERED_SCENARIO = {"providers": KC35_REGISTERED_OFFER,
                             "turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
 
-#: The `KILO_CONFIG_CONTENT` body registration writes for the ids named, under
-#: the `kenary` provider: `name` is the id, `reasoning` is on.
+#: The KILO_CONFIG_CONTENT body that registers the ids under the kenary provider.
 def _kc35_overlay(*model_ids):
     return {"provider": {"kenary": {"models": {
         model_id: {"name": model_id, "reasoning": True} for model_id in model_ids}}}}
@@ -2653,8 +2599,7 @@ def _content_spawn_holder(monkeypatch):
     """
     calls: list = []
     fakes: list = []
-    # no operator overlay unless a test says so: the flag's own merge starts
-    # from nothing here
+    # No operator overlay unless a test sets one.
     monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
 
     def spawn_server(binary, *, log_path, **kwargs):
@@ -2744,13 +2689,11 @@ def test_register_missing_registers_the_models_and_runs_the_round(
     captured = capsys.readouterr()
 
     assert code == 0, captured.err
-    # the first throwaway is the operator's own server; the overlay goes to the
-    # second and to the round's own server, the same string both times
+    # The first throwaway is the operator's server; the overlay goes to the second and to the round's server.
     assert not calls[0]
     assert len(calls) == 3
     assert calls[1] == {"KILO_CONFIG_CONTENT": json.dumps(KC35_TWO_ENTRIES)}
-    # the round's own server gets the same overlay, byte for byte, plus only
-    # KC-65's four entries on top of it
+    # The round's server gets the same overlay byte for byte, plus KC-65's four entries.
     assert calls[2]["KILO_CONFIG_CONTENT"] == calls[1]["KILO_CONFIG_CONTENT"]
     assert set(calls[2]) - {"KILO_CONFIG_CONTENT"} == KC65_ENV_KEYS
     models = json.loads(calls[1]["KILO_CONFIG_CONTENT"])["provider"]["kenary"]["models"]
@@ -2766,8 +2709,7 @@ def test_register_missing_registers_the_models_and_runs_the_round(
     assert lines[lines.index(agent_line) + 1] == (
         "registered for this round (kilo.jsonc untouched): "
         "kenary/agnes-3-0-flash:free, kenary/nex-n2-5-pro:free")
-    # the intake's first throwaway only read the offer; the sessions are the
-    # round's, on the server that carries the overlay
+    # The first throwaway only reads the offer; the sessions belong to the round's server.
     assert _sessions(plain) == []
     assert len(_sessions(registered)) == 3
 
@@ -2829,8 +2771,7 @@ def test_register_missing_fails_when_the_stub_ignores_the_variable(
 
     assert code == cli.EXIT_FAILED
     assert lines == ["intake: registration did not take: kenary/agnes-3-0-flash:free"]
-    # the overlay really was sent: the second throwaway got it and still answered
-    # without it
+    # The second throwaway got the overlay and still answered without it.
     assert len(calls) == 2 and not calls[0]
     assert "agnes-3-0-flash:free" in calls[1]["KILO_CONFIG_CONTENT"]
     assert not sandbox.out().exists()
@@ -2937,9 +2878,7 @@ def test_the_operator_s_own_kilo_config_content_survives_the_merge(
     assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
 
 
-#: The registered offer as Kilo 7.7.5 reports a reasoning model it lists: the
-#: variants come with the entry, so they exist only on the server that carries
-#: the overlay — the first throwaway does not list the model at all.
+#: Registered offer for a reasoning model: its variants exist only on the server with the overlay.
 KC35_REGISTERED_VARIANTS_SCENARIO = {
     "providers": _offer(({
         "id": "kenary", "name": "kenari", "source": "static",
@@ -2974,9 +2913,7 @@ def test_register_missing_checks_the_variant_on_the_registered_offer(
     assert code == 0, captured.err
     assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
     assert _plan(captured.out)["agents"] == "1: kenary/agnes-3-0-flash:free@medium"
-    # KC-61: the named variant is asked about once, so there are two sessions on
-    # the registered server — the probe and the round's — and neither is on the
-    # plain throwaway, which lists no variant for the model at all.
+    # KC-61: the named variant gets two sessions on the registered server, and neither is on the plain throwaway.
     sessions = _sessions(registered)
     assert len(sessions) == 2
     assert sessions[0]["body"]["title"] == "variant-probe/agnes-3-0-flash:free/medium"
@@ -3038,9 +2975,7 @@ def test_register_missing_is_no_refusal_when_the_round_is_refused_otherwise(
     assert len(calls) == 1 and not calls[0], "no second throwaway for a refused round"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-65 — the agents' pytest worker count
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-65: the agents' pytest worker count
 
 KC65_AGENTS = ("agent-a", "agent-b", "agent-c", "agent-d", "agent-e", "agent-f")
 
@@ -3371,9 +3306,7 @@ def test_an_uncreatable_agent_tmpdir_is_a_refusal_naming_the_path(
     assert calls == [{}], "only the offer check's throwaway; no round server of its own"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-43: `--legs N` — a round as numbered legs over one worktree per agent
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-43: --legs N: a round as numbered legs over one worktree per agent
 
 def _relay_turn(directory, text):
     """agent-a finishes on the first prompt that says it is leg 2; everything
@@ -3537,9 +3470,7 @@ def test_the_roster_legs_key_is_the_default_and_the_flag_overrides_it(sandbox):
         models="", variant=None, max_parallel=None, no_gate=False, legs=None)).legs == 3
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-44: the ticket's own `**Size:**` field decides how many legs it gets
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-44: the ticket's **Size:** field decides how many legs it gets
 
 def _ticket_with_size(size: str | None) -> str:
     """The sandbox's ticket with its `**Size:**` line set to *size* — or

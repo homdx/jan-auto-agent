@@ -14,6 +14,7 @@ the bar is higher: an opinion is not admissible, only something you can point at
         --severity LOW --fix "bind list(_DEFAULT_SKIP_DIRS)"
 """
 import argparse
+import contextlib
 import csv
 import os
 import sys
@@ -22,6 +23,38 @@ COLUMNS = ["finding", "truth", "checked_by", "confidence", "how", "evidence",
            "consequence", "severity", "fix", "notes"]
 TRUTH = {"REAL", "FALSE", "FIXED", "UNDECIDED"}
 SEV = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE", ""}
+
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import file_lock  # noqa: E402
+
+
+@contextlib.contextmanager
+def _locked(path):
+    """An exclusive lock on *path*'s directory (POSIX ``flock``; on Windows a sidecar ``.<name>.lock``): the
+    "is the file there" check, the "already decided" check and the append are one step. Eight first writers
+    at once wrote the header twice (the second header then read as a verdict "TRUTH" and settled), and two
+    writers of one finding both passed. AUDIT-13: `tools.file_lock.locked`, whose Windows retry is bounded
+    and limited to contention instead of looping on every ``OSError``."""
+    with file_lock.locked(path):
+        yield
+
+
+def _missing_final_newline(path) -> str:
+    """The line end to write first when *path* does not end with one, else "".
+
+    AUDIT3-19: a CSV whose last row has no line end (a spreadsheet export, an
+    interrupted write) had the next row glued onto it, destroying both — the
+    guard append_task.py already has.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return ""
+    if not data or data.endswith((b"\n", b"\r")):
+        return ""
+    return "\r\n" if b"\r\n" in data else "\n"
 
 
 def main():
@@ -33,11 +66,7 @@ def main():
     row = {c: str(a.get(c) or "").replace("\n", "; ").strip() for c in COLUMNS}
     out, t = a["out"], row["truth"].upper()
 
-    # Who wrote this row has to be trustworthy — it is how a disputed verdict
-    # gets traced back to whoever claimed a check they may not have run. Models
-    # leave it blank, or paste a neighbour's name from an example. The filename
-    # is the one reliable signal (truth-<name>.csv), so derive from it and warn
-    # loudly rather than silently accept a wrong attribution.
+    # The row's author must be trustworthy: it attributes a disputed verdict. Models leave it blank or copy a name from an example, so derive it from the filename (truth-<name>.csv) and warn rather than accept a wrong attribution.
     stem = os.path.basename(out).rsplit(".", 1)[0]
     from_name = stem[6:] if stem.lower().startswith("truth-") else ""
     if from_name:
@@ -85,23 +114,28 @@ def main():
                   file=sys.stderr)
             return 1
 
-    existed = os.path.exists(out) and os.path.getsize(out) > 0
-    if existed:
-        with open(out, newline="", encoding="utf-8") as fh:
-            for prev in csv.DictReader(fh):
-                if (prev.get("finding") or "").strip() == row["finding"]:
-                    print(f"skipped: {row['finding']} is already decided as "
-                          f"{prev.get('truth')} — move on.", file=sys.stderr)
-                    return 2
+    with _locked(out):
+        existed = os.path.exists(out) and os.path.getsize(out) > 0
+        if existed:
+            with open(out, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
+                for prev in csv.DictReader(fh):
+                    if (prev.get("finding") or "").strip() == row["finding"]:
+                        print(f"skipped: {row['finding']} is already decided as "
+                              f"{prev.get('truth')} — move on.", file=sys.stderr)
+                        return 2
 
-    with open(out, "a", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=COLUMNS)
-        if not existed:
-            w.writeheader()
-        w.writerow(row)
-        fh.flush()
-        os.fsync(fh.fileno())
-    n = sum(1 for _ in open(out, encoding="utf-8")) - 1
+        tail = _missing_final_newline(out) if existed else ""
+        with open(out, "a", newline="", encoding="utf-8") as fh:
+            fh.write(tail)
+            w = csv.DictWriter(fh, fieldnames=COLUMNS)
+            if not existed:
+                w.writeheader()
+            w.writerow(row)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # closed at once, and counted in CSV rows: a quoted cell over two lines is one verdict
+        with open(out, newline="", encoding="utf-8-sig") as fh:
+            n = sum(1 for _ in csv.reader(fh)) - 1
     print(f"decided #{n}: {row['truth']} {row['finding']} -> {out}")
     return 0
 

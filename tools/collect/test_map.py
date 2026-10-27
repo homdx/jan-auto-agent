@@ -61,8 +61,7 @@ from typing import Dict, Iterable, List, Set, Tuple
 
 from tools.collect.graph import build_module_index, resolve_import
 from tools.collect.model import ModuleRecord
-# `is_test_module` is defined in `test_paths` (L5) and re-exported here:
-# `risk.py` and callers outside the package import it from this module.
+# is_test_module lives in test_paths and is re-exported here for risk.py and other callers.
 from tools.collect.test_paths import canonical_test_path, is_test_module  # noqa: F401
 
 __all__ = [
@@ -91,10 +90,7 @@ def _rich_import_targets(source: str) -> Set[str]:
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
-        # ValueError: ast.parse raises this (not SyntaxError) when source
-        # contains a null byte, e.g. an accidentally-binary or truncated
-        # file — same "can't meaningfully parse this" outcome, same
-        # fail-open response as an actual syntax error.
+        # A null byte or truncated file makes ast.parse raise ValueError; treat it like a syntax error (no imports).
         return set()
     names: Set[str] = set()
     for node in ast.walk(tree):
@@ -102,11 +98,7 @@ def _rich_import_targets(source: str) -> Set[str]:
             for alias in node.names:
                 names.add(alias.name)
         elif isinstance(node, ast.ImportFrom):
-            # Bugfix: relative imports were rebuilt from node.module alone,
-            # dropping node.level, so a package-internal import looked
-            # absolute and either matched an unrelated top-level module or
-            # resolved to nothing. Same bug graph.py's extract_imports
-            # already fixed; this reimplementation never picked it up.
+            # Relative imports keep node.level, so a package-internal import is not mistaken for a top-level module.
             dots = "." * node.level
             module = node.module or ""
             if module:
@@ -115,8 +107,7 @@ def _rich_import_targets(source: str) -> Set[str]:
                 for alias in node.names:
                     names.add(f"{base}.{alias.name}")
             elif dots:
-                # `from . import X` / `from .. import X` — no module part;
-                # only the imported name itself is a resolvable candidate.
+                # from . import X: only the imported name is a candidate, with no module part.
                 for alias in node.names:
                     names.add(f"{dots}{alias.name}")
     return names
@@ -159,28 +150,18 @@ def build_test_map(
 
     seen: Set[str] = set()
     for t in test_modules:
-        # L5: a symlinked tier mirror collapses onto the file it points at
-        # and is credited once. The set makes the second name a no-op even
-        # when the mirror and its target both reached the scan.
+        # A symlinked mirror resolves to its target and is credited once, however many names reach the scan.
         real_path = canonical_test_path(root, t.path)
         if real_path in seen:
             continue
         seen.add(real_path)
         try:
-            source = (root / real_path).read_text(encoding="utf-8")
+            source = (root / real_path).read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
-            # BUGFIX: same class of bug as scanner.scan_repo/graph.
-            # build_call_edges/risk._loc/cli._sources_for — only OSError
-            # was caught here, so a test file that isn't valid UTF-8
-            # raised a bare UnicodeDecodeError out of build_test_map
-            # instead of being "silently skipped for matching purposes",
-            # exactly the contract this function's own docstring
-            # describes for a test file that fails to re-read/re-parse.
+            # A test file that is not valid UTF-8 is skipped for matching, as the docstring says, instead of crashing.
             continue
         for dotted in _rich_import_targets(source):
-            # Bugfix: importer_path was never passed, so every relative
-            # name hit resolve_import's `importer_path is None` early
-            # return and was dropped even when correctly formed.
+            # importer_path is passed, so relative names resolve correctly.
             resolved = resolve_import(dotted, index, importer_path=real_path)
             if resolved is not None:
                 covering[resolved].add(real_path)

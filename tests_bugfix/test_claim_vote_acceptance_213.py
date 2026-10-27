@@ -62,11 +62,14 @@ def test_an_unsure_run_among_decided_ones_does_not_hide_the_majority():
     assert out["by_model"]["a/m1"] == "TRUE" and out["unanimous"] is True
 
 
-def test_a_voter_with_no_votes_on_the_claim_spoils_unanimity():
+def test_a_voter_with_no_vote_in_the_whole_run_is_dead_not_a_dissenter():
+    """CC-6 (round 280, live): a model that answered nothing for any claim is out of the count,
+    or one model out of its free plan made 0 of 80 claims unanimous.  A voter that missed only
+    *some* claims still spoils those (the next-but-one test)."""
     out = _tally([_run("a/m1", 0, "TRUE"), _run("b/m2", 0, "TRUE"), _run("c/m3", 0, "TRUE"),
                   _run("d/m4", 0, None)])
     assert out["verdict"] == "TRUE", "three committed voters still reach the quorum"
-    assert out["unanimous"] is False, "the fourth voter never committed"
+    assert out["unanimous"] is True, "the fourth voter never committed anywhere: dead, not a dissenter"
 
 
 def test_every_voter_present_and_agreeing_is_still_unanimous():

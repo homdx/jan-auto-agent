@@ -50,8 +50,7 @@ def test_class_uses_its_own_init_minus_self_else_placeholder():
     assert sigs["WithInit"] == "WithInit(x, y=2)"
     assert sigs["NoArgs"] == "NoArgs()"
     assert sigs["Bare"] == "Bare(...)"
-    # `__init__` is not looked up through bases — only a direct definition
-    # is "trivially available" (the ticket's wording).
+    # __init__ is not inherited through bases: only a direct definition counts.
     assert sigs["Inherited"] == "Inherited(...)"
 
 

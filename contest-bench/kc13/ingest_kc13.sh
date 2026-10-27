@@ -1,6 +1,5 @@
 #!/bin/bash
-# ingest_kc13.sh <name> <patch>: worktree at 5ee8417 + git am + the ticket's mechanical checks.
-# Worktrees go to ../cb-kc13/<name> (outside the repo tree); logs to ../cb-kc13/logs.
+# ingest_kc13.sh <name> <patch>: worktree at 5ee8417, git am, then the ticket's checks.
 B=$(dirname "$(readlink -f "$0")"); R=$(git -C "$B" rev-parse --show-toplevel); BASE=5ee8417
 n=$1; p=$(readlink -f "$2"); W=$R/../cb-kc13/$n; L=$R/../cb-kc13/logs; mkdir -p "$L"
 rm -rf "$W"; git -C "$R" worktree prune

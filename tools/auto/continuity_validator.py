@@ -41,15 +41,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from tools.config_safe import safe_getboolean, safe_getint
+from tools.auto.verdict_followup import STRICT_VERDICT_RULE
 
 logger = logging.getLogger(__name__)
 
 # llm_call(system, user) -> str   (same callable contract used everywhere)
 LlmCall = Callable[[str, str], str]
 
-# Matches "chapter_07", "chapter_7", "Chapter_07.md", etc. — mirrors
-# context_assembler.py / canon_validator.py so "chapter index" means the
-# same thing everywhere in the creative pipeline.
+# Matches chapter_07, chapter_7 and similar, same as context_assembler and canon_validator.
 _CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
 
 _DEFAULT_BIBLE_PATH = "story_bible.md"
@@ -74,7 +73,8 @@ _CONTINUITY_SYSTEM = (
     "female (она / Ей / -ла endings) and the NEW chapter uses male forms (он / "
     "стоял / спросил), or vice-versa, that is a contradiction — REVISE with the "
     "concrete fix, e.g. 'change the captain from он/стоял to она/стояла'. "
-    "No JSON, no preamble."
+    "No JSON, no preamble.\n"
+    + STRICT_VERDICT_RULE   # VERDICT-ASK
 )
 
 
@@ -161,19 +161,14 @@ class ContinuityValidator:
             ``REVISE``.
         """
         # Import here to avoid a circular import; inner_loop imports us.
-        from tools.auto.inner_loop import _parse_verdict_soft  # noqa: PLC0415
+        from tools.auto.verdict_followup import settle_verdict  # noqa: PLC0415
 
         from tools.auto.utils import detect_language, language_instruction  # noqa: PLC0415
 
         lang_instr = language_instruction(detect_language(new_text))
         system = _CONTINUITY_SYSTEM + (("\n" + lang_instr) if lang_instr else "")
         if lang_instr:
-            # The LANGUAGE lock above can swallow the verdict token itself —
-            # observed as a Russian chapter producing "НЕОБХОДИМО ИЗМЕНИТЬ:"
-            # instead of "REVISE:", which _parse_verdict_soft can't recognize
-            # and silently lets a real contradiction through. So carve the
-            # verdict word out of the lock explicitly, stated last so it isn't
-            # overridden by the broader rule.
+            # The language lock could swallow the verdict word; carve it out explicitly, stated last.
             system += (
                 "\nEXCEPTION TO THE LANGUAGE RULE ABOVE: the verdict word "
                 "itself — APPROVED or REVISE — must always be written in "
@@ -192,7 +187,10 @@ class ContinuityValidator:
                 approved=True, reason="llm error — passed on fail-open", unparseable=False,
             )
 
-        approved, reason, unparseable = _parse_verdict_soft(raw)
+        # VERDICT-ASK: an unclear or self-contradicting reply is put back to the model once.
+        approved, reason, unparseable, raw = settle_verdict(
+            raw, lambda extra: self._llm(system, user_msg + extra) or "", who="ContinuityValidator",
+        )
 
         if unparseable:
             logger.warning(
@@ -236,7 +234,10 @@ def find_previous_chapter_text(chapter_file: str, base_dir: "str | Path") -> str
     * no earlier chapter file is found, or
     * the chosen file can't be read.
     """
-    base = Path(base_dir)
+    # REP-CHAPTER-DIR: the previous chapter lives next to this one — "chapters/chapter_03.md"
+    # checked from the project root scanned the root only, found nothing, and the gate judged
+    # the chapter against the bible alone while the Coder had been shown chapter 2.
+    base = Path(base_dir) / Path(chapter_file).parent
     idx = _chapter_index(chapter_file)
     if idx is None:
         return ""
@@ -301,8 +302,7 @@ def make_continuity_validator(config, *, settings=None) -> "ContinuityValidator 
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-        # GATE3-PROFILE-2: only pass settings= when a profile was actually
-        # resolved — see the identical comment in canon_validator.py.
+        # Pass settings= only when a profile was resolved (as in canon_validator.py).
         llm_call = (
             _make_llm_call(config, task_mode="creative", settings=settings)
             if settings is not None

@@ -56,13 +56,7 @@ def test_except_bare_raise_is_re_raise_not_fail_open():
 
 
 def test_except_raise_with_exc_is_not_fail_open():
-    # A `raise SomeException(...)` (with an exception expression, not a bare
-    # re-raise) propagates the exception — it is NOT a silent swallow.
-    # _classify_except_body used to only recognise bare `raise` (exc is None)
-    # as not-fail-open; a `raise ValueError(...)` fell through to "pass" /
-    # is_fail_open=True, which poisoned the FAIL_OPEN_REGISTRY and
-    # AlreadySafeIndex into suppressing real crash-site bug claims at
-    # re-raising except blocks.
+    # A raise with an exception expression propagates; it is not a silent swallow (fail open).
     tree = ast.parse(
         "def f():\n"
         "    try:\n"
@@ -77,9 +71,7 @@ def test_except_raise_with_exc_is_not_fail_open():
 
 
 def test_except_raise_with_exc_inside_if_still_not_fail_open():
-    # Same as above but the raise is inside an `if` — control-flow statements
-    # (if/for/while/try) are not a separate scope, so a raise nested in one
-    # must still count.
+    # A raise nested in an if still counts: control-flow statements are not a separate scope.
     tree = ast.parse(
         "def f(cond):\n"
         "    try:\n"
@@ -95,9 +87,7 @@ def test_except_raise_with_exc_inside_if_still_not_fail_open():
 
 
 def test_except_continue_is_not_silent():
-    # `except OSError: continue` is control flow, NOT a silent fail-open —
-    # this is the exact distinction COLLECT-6's AC calls out for
-    # `coder.py:867`.
+    # except OSError: continue is control flow, not a fail-open swallow (COLLECT-6).
     source = FIXTURE.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "pkg/error_handling.py")
     site = sites["pkg/error_handling.py:41"]
@@ -117,12 +107,8 @@ def test_all_four_mini_repo_sites_found():
 def test_coder_718_pass_is_classified_fail_open():
     source = CODER_PATH.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "tools/auto/coder.py")
-    # NOTE: was tools/auto/coder.py:834 (_extract_missing_context's bare
-    # `except Exception: pass`), fixed to narrow-and-log — it now correctly
-    # classifies as "log"/not-fail-open, so this AC re-points to another
-    # still-genuine bare `except: <fallback assignment>` site (dup_reject_ratio
-    # config fallback). Update if it shifts.
-    site = sites["tools/auto/coder.py:1292"]   # 1262 → 1290: RUN-8's error_kind docstrings; → 1292: RUN-10's retry kwargs
+    # Pinned to a still-genuine bare except site; update the line if the source shifts.
+    site = sites["tools/auto/coder.py:1308"]   # bare except; moved with the comment shortening (was 1165 → 1157: RUN-10's retry kwargs; → 1243: HARDEN-5 D's codec helpers before _read_file_contents; → 1264: HARDEN-13 A's restore refusal and the first-write backup; → 1303: HARDEN-18 B's non-text `content` refusal; → 1308: AUDIT3-1's partial-view record)
     assert site.body_kind == "pass"
     assert site.is_fail_open is True
 
@@ -130,7 +116,7 @@ def test_coder_718_pass_is_classified_fail_open():
 def test_coder_866_continue_is_not_silent():
     source = CODER_PATH.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "tools/auto/coder.py")
-    site = sites["tools/auto/coder.py:1257"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts (1227 → 1255: RUN-8's error_kind docstrings; → 1257: RUN-10's retry kwargs)
+    site = sites["tools/auto/coder.py:1273"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts (was 1130 → 1122: RUN-10's retry kwargs; → 1208: HARDEN-5 D's codec helpers before _read_file_contents; → 1229: HARDEN-13 A's restore refusal and the first-write backup; → 1268: HARDEN-18 B's non-text `content` refusal; → 1273: AUDIT3-1's partial-view record)
     assert site.body_kind == "continue"
     assert site.is_fail_open is False
 
@@ -166,8 +152,7 @@ def test_return_body_is_not_fail_open():
 
 
 def test_sites_are_sorted_by_line_numerically_not_lexically():
-    # Ten-plus handlers in one module must not have their order scrambled
-    # by string-sorting "...:10" before "...:9" (COLLECT-3 determinism).
+    # Ten or more handlers keep their numeric order, not string order (COLLECT-3).
     lines = "\n".join(
         f"try:\n    x()\nexcept ValueError:\n    pass\n" for _ in range(11)
     )
@@ -184,16 +169,7 @@ def test_all_sites_are_provenance_static():
     assert all(s.provenance == Provenance.STATIC for s in sites)
 
 
-# ── BUGFIX regression: a nested def/class inside the except body is a ──────
-# ── separate execution scope, not part of the handler's own reaction ──────
-#
-# `_classify_except_body` used to call plain `ast.walk(stmt)` over every
-# statement in the body, which visits descendants regardless of enclosing
-# scope. An except body that only *defines* a nested callback containing a
-# bare `raise` (or a `log`/`continue`/`return`) doesn't react that way at
-# the except site itself — the callback's body only runs later, if and when
-# something calls it — so the actual handler is a silent swallow (fail-open)
-# exactly like a bare `pass`, and was being misclassified as the opposite.
+# Regression: a nested def or class in an except body is deferred, not part of the handler's own reaction.
 
 
 def test_bare_raise_inside_nested_def_does_not_count_as_re_raise():
@@ -248,8 +224,7 @@ def test_log_call_inside_nested_class_method_does_not_count_as_log():
 
 
 def test_genuine_top_level_raise_still_detected():
-    # Regression guard: the fix above must not stop recognizing an actual
-    # bare `raise` that is a direct (non-nested-scope) statement.
+    # A bare raise that is a direct statement is still recognised after the fix above.
     source = (
         "def f():\n"
         "    try:\n"
@@ -264,9 +239,7 @@ def test_genuine_top_level_raise_still_detected():
 
 
 def test_return_nested_inside_a_real_if_block_still_detected():
-    # Regression guard: control-flow statements (`if`/`for`/`while`/`try`)
-    # are not a separate scope, unlike `def`/`class`/`lambda` — a `return`
-    # nested inside one must still count.
+    # A return nested in a real if block is still detected: control flow is not a separate scope.
     source = (
         "def f(cond):\n"
         "    try:\n"
@@ -281,16 +254,7 @@ def test_return_nested_inside_a_real_if_block_still_detected():
     assert site.is_fail_open is False
 
 
-# ── BUGFIX regression #2: a class body is NOT a deferred scope the way a ───
-# ── function/lambda body is — it executes immediately, to build the class ──
-#
-# The fix for the bug above initially stopped descending on `ClassDef`
-# exactly like `FunctionDef`/`Lambda`, which is itself wrong: a `class`
-# statement's body runs right where it sits (building the class's
-# namespace), not later when something is called. A log call directly in a
-# nested class's own body is a real, immediate reaction from the except
-# handler, not a deferred one — only a *further*-nested `def`/`lambda`
-# (an actual method) inside that class body is still deferred.
+# Regression #2: a class body runs immediately, so a log call in it is an immediate reaction; only a nested def or lambda is deferred.
 
 
 def test_log_call_directly_in_nested_class_body_counts_as_log():
@@ -308,8 +272,7 @@ def test_log_call_directly_in_nested_class_body_counts_as_log():
     assert site.is_fail_open is False
 
 
-# ── BUGFIX regression #3: decorators and default-argument values are ───────
-# ── evaluated eagerly (at def-statement time), not deferred with the body ──
+# BUGFIX regression #3: decorators and default values are evaluated when the def runs, not deferred.
 
 
 def test_log_call_in_decorator_expression_counts_as_log():
@@ -359,8 +322,7 @@ def test_log_call_in_lambda_default_argument_counts_as_log():
 
 
 def test_log_call_in_lambda_body_itself_is_still_deferred():
-    # The lambda BODY (as opposed to its default-argument values) is the
-    # deferred part — it only runs when the lambda is called.
+    # The lambda body is deferred; only its default values are evaluated eagerly.
     source = (
         "def f():\n"
         "    try:\n"

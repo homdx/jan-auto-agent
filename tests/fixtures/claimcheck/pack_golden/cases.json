@@ -1,0 +1,147 @@
+[
+ {
+  "name": "mixed",
+  "claim": "The `_declared_paths` helper reads one line, and `Policy._mechanical` is never called.",
+  "sha": "3f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39",
+  "budget": {
+   "chars": 6000,
+   "chunks": 6,
+   "per_chunk": 2400
+  },
+  "resolved": [
+   {
+    "kind": "symbol",
+    "text": "_declared_paths",
+    "found": true,
+    "path": "tools/contest/gates.py",
+    "qualname": "_declared_paths",
+    "lines": [
+     120,
+     143
+    ]
+   },
+   {
+    "kind": "symbol",
+    "text": "Policy._mechanical",
+    "found": false,
+    "path": "tools/contest/policy.py",
+    "qualname": "",
+    "lines": [
+     0,
+     0
+    ]
+   }
+  ],
+  "chunks": [
+   {
+    "id": "git:a73e389:header",
+    "kind": "git",
+    "path": "",
+    "start": 0,
+    "end": 0,
+    "text": "commit a73e3894f1c2b6d0e5a7c9b1d3f5e7a9b1c3d5e7\nAuthor: Ann <ann@example.com>\nDate:   2026-01-01T00:00:00+00:00\n\n    gates: read every declared path\n\n tools/contest/gates.py | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)",
+    "why": "commit a73e389"
+   },
+   {
+    "id": "src:tools/contest/gates.py:120-143",
+    "kind": "source",
+    "path": "tools/contest/gates.py",
+    "start": 120,
+    "end": 143,
+    "text": " 120| def _declared_paths(body):\n 121|     paths = []\n 122|     for line in body.splitlines():\n 123|         paths.append(line.strip())\n# … 20 lines omitted (124-143)",
+    "why": "_declared_paths"
+   },
+   {
+    "id": "note:dangling:Policy._mechanical",
+    "kind": "note",
+    "path": "",
+    "start": 0,
+    "end": 0,
+    "text": "`Policy._mechanical` does not exist at 3f2a9c1; the file `tools/contest/policy.py` exists and defines: `Policy`, `decide`.",
+    "why": "Policy._mechanical"
+   }
+  ]
+ },
+ {
+  "name": "trimmed",
+  "claim": "Since commit ffffff0 the runner calls `run(cmd, check=False)`, and `step_40` runs first in `tools/run.py`.",
+  "sha": "9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a39281706",
+  "budget": {
+   "chars": 1300,
+   "chunks": 3,
+   "per_chunk": 420
+  },
+  "resolved": [
+   {
+    "kind": "path",
+    "text": "tools/run.py",
+    "found": true,
+    "path": "tools/run.py",
+    "qualname": "",
+    "lines": [
+     0,
+     0
+    ]
+   }
+  ],
+  "chunks": [
+   {
+    "id": "src:tools/run.py:40-69",
+    "kind": "source",
+    "path": "tools/run.py",
+    "start": 40,
+    "end": 69,
+    "text": " 40|     step_40(context)  # keep the order of the stages\n 41|     step_41(context)  # keep the order of the stages\n 42|     step_42(context)  # keep the order of the stages\n 43|     step_43(context)  # keep the order of the stages\n 44|     step_44(context)  # keep the order of the stages\n 45|     step_45(context)  # keep the order of the stages\n 46|     step_46(context)  # keep the order of the stages\n 47|     step_47(context)  # keep the order of the stages\n 48|     step_48(context)  # keep the order of the stages\n 49|     step_49(context)  # keep the order of the stages\n 50|     step_50(context)  # keep the order of the stages\n 51|     step_51(context)  # keep the order of the stages\n 52|     step_52(context)  # keep the order of the stages\n 53|     step_53(context)  # keep the order of the stages\n 54|     step_54(context)  # keep the order of the stages\n 55|     step_55(context)  # keep the order of the stages\n 56|     step_56(context)  # keep the order of the stages\n 57|     step_57(context)  # keep the order of the stages\n 58|     step_58(context)  # keep the order of the stages\n 59|     step_59(context)  # keep the order of the stages\n 60|     step_60(context)  # keep the order of the stages\n 61|     step_61(context)  # keep the order of the stages\n 62|     step_62(context)  # keep the order of the stages\n 63|     step_63(context)  # keep the order of the stages\n 64|     step_64(context)  # keep the order of the stages\n 65|     step_65(context)  # keep the order of the stages\n 66|     step_66(context)  # keep the order of the stages\n 67|     step_67(context)  # keep the order of the stages\n 68|     step_68(context)  # keep the order of the stages\n 69|     step_69(context)  # keep the order of the stages",
+    "why": "tools/run.py"
+   },
+   {
+    "id": "git:0b1c2d3:tools/run.py:17-19",
+    "kind": "git",
+    "path": "tools/run.py",
+    "start": 17,
+    "end": 19,
+    "text": "diff --git a/tools/run.py b/tools/run.py\n--- a/tools/run.py\n+++ b/tools/run.py\n@@ -17,4 +17,4 @@\n 17|  def check(cmd):\n   | -    run(cmd, check=True)\n 18| +    run(cmd, check=False)\n 19|      return cmd",
+    "why": "commit 0b1c2d3"
+   },
+   {
+    "id": "note:git:ffffff0",
+    "kind": "note",
+    "path": "",
+    "start": 0,
+    "end": 0,
+    "text": "commit ffffff0 is not in this repository",
+    "why": "commit ffffff0"
+   },
+   {
+    "id": "ticket:275",
+    "kind": "ticket",
+    "path": "",
+    "start": 0,
+    "end": 0,
+    "text": "# 275 — CC-5: the pack\n**Status:** open\n\nThe pack decides what the voter reads.",
+    "why": "ticket 275"
+   },
+   {
+    "id": "gitlog:tools/run.py",
+    "kind": "git",
+    "path": "tools/run.py",
+    "start": 0,
+    "end": 0,
+    "text": "git log -n 5 -- tools/run.py\n0b1c2d3 2026-01-02 run: do not raise",
+    "why": "history of tools/run.py"
+   }
+  ]
+ },
+ {
+  "name": "empty",
+  "claim": "The sky is blue.",
+  "sha": "3f2a9c1e8b7d6a5f4e3d2c1b0a9f8e7d6c5b4a39",
+  "budget": {
+   "chars": 6000,
+   "chunks": 6,
+   "per_chunk": 2400
+  },
+  "resolved": [],
+  "chunks": []
+ }
+]

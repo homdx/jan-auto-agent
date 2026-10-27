@@ -49,8 +49,7 @@ def test_clear_stale_fix_rounds_removes_deadline_started_at(tmp_path):
     fix_id = "BUG-FIX-3"
     tdir = st.task_dir(fix_id)
 
-    # Simulate the state OuterLoop.run_task leaves after the first attempt:
-    # feedback rounds from a failed run, plus a deadline start time.
+    # State after the first attempt: a failed feedback round and a deadline start time.
     (tdir / "feedback_round_1.md").write_text("# Round 1 — failed\n")
     (tdir / "feedback_round_2.md").write_text("# Round 2 — failed\n")
     st.write_task_file(fix_id, "deadline_started_at.txt", "1700000000.0")
@@ -68,10 +67,7 @@ def test_clear_stale_fix_rounds_removes_deadline_started_at(tmp_path):
     ]
     assert len(archives) == 1, "feedback rounds should be archived"
 
-    # THE BUG: deadline_started_at.txt must NOT survive the clear —
-    # if it does, OuterLoop.run_task computes _elapsed from the old
-    # start time, leaving ~0 seconds of wall-clock budget, and the
-    # retry is immediately exhausted.
+    # deadline_started_at.txt must be removed, or the retry's budget is already spent.
     deadline_path = tdir / "deadline_started_at.txt"
     assert not deadline_path.exists(), (
         "deadline_started_at.txt must be removed by _clear_stale_fix_rounds "

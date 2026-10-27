@@ -1,0 +1,57 @@
+id,truth,note
+AUTO-T1,REAL,"patch 0001 applies at the sha: self.config is a live public ConfigParser (latent, MEDIUM ceiling)"
+AUTO-T2,FALSE,cited symbol is a test helper that builds a CandidateTask; the premise is about architect.py
+AUTO-T3,FALSE,test fixture clearing a module cache; not an accessor
+AUTO-T4,FALSE,test handler class attributes rebound per test; not an accessor
+AUTO-T5,FALSE,build() returns lists it built itself; nothing retained
+AUTO-T7,FALSE,"caller's list is read, never mutated downstream"
+AUTO-T6,FALSE,target_files is only iterated
+AUTO-T8,FALSE,"dataclass field, not an accessor"
+AUTO-T9,FALSE,"_progress holds scalars only, dict() is a complete copy"
+AUTO-T10,FALSE,"dataclass field, not an accessor"
+AUTO-T11,FALSE,lists are built from disk on every call; nothing shared
+AUTO-T12,FALSE,a str is immutable
+AUTO-T13,FALSE,"scalars and handles, no mutable container exposed"
+AUTO-T14,FALSE,already list(_DEFAULT_SKIP_DIRS) at the sha (fixed before)
+AUTO-T15,FALSE,dict is only json.dumps-ed
+AUTO-T16,FALSE,builds a fresh result list
+AUTO-T17,FALSE,sole caller copies the list before use (adjudicated FALSE in an earlier round)
+AUTO-T18,FALSE,failed builds a fresh list on every call
+AUTO-T19,FALSE,failed builds a fresh list on every call
+AUTO-T20,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T21,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T22,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T23,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T24,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T25,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T26,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T27,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T28,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T29,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T30,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T31,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T32,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T33,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T34,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T35,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T36,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T37,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T38,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T39,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T40,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T41,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T42,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T43,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T44,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T45,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T46,FALSE,cites a test file or fixture (test code is not an accessor returning internal state)
+AUTO-T47,FALSE,json.load returns a fresh dict on every call
+AUTO-T48,FALSE,builds a fresh parser on every call
+AUTO-T49,FALSE,ModuleRecord is a frozen dataclass
+AUTO-T52,FALSE,fresh lists of frozen records
+AUTO-T50,FALSE,returns list(...) of frozen records
+AUTO-T51,FALSE,returns list(...) of frozen records
+AUTO-T53,FALSE,public attribute holding a constant list; no accessor
+AUTO-R1,REAL,architect.py aliases target_files/raw in the checkpoint (patch 0004 applies at the sha)
+AUTO-R2,REAL,patch 0002 applies at the sha: os.walk dirnames are bare names
+AUTO-R3,REAL,patch 0002 applies at the sha: os.walk dirnames are bare names

@@ -53,9 +53,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.llm_stream import _is_retryable_status, _parse_retry_after, request_completion
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# _parse_retry_after — pure unit tests, no server needed
-# ─────────────────────────────────────────────────────────────────────────────
+# _parse_retry_after: pure unit tests, no server
 
 def _http_error(body: str, headers: "dict | None" = None, code: int = 429):
     """Build a real urllib.error.HTTPError the way urlopen() would raise it."""
@@ -130,9 +128,7 @@ class TestIsRetryableStatus:
         assert _is_retryable_status(404) is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# request_completion() end-to-end retry behavior — real local HTTP server
-# ─────────────────────────────────────────────────────────────────────────────
+# request_completion() retry behaviour against a real local HTTP server
 
 class _ScriptedHandler(http.server.BaseHTTPRequestHandler):
     """Serves a scripted sequence of responses, one per request received.
@@ -443,9 +439,7 @@ class TestNormalPathUnaffected:
     an extra `while True` iteration that exits on the first try."""
 
     def test_success_on_first_attempt_streaming(self):
-        # Reuses the streaming SSE path exercised by
-        # test_llm_stream_empty_choices.py; here only to confirm the retry
-        # wrapper didn't change its behavior.
+        # Streaming success path: the retry wrapper must not change its behaviour.
         import io
 
         class _SSEHandler(http.server.BaseHTTPRequestHandler):

@@ -50,9 +50,7 @@ def _rec(at, provider="kenary", model="hy3:free", variant="high") -> dict:
     return {"at": at, "provider": provider, "model": model, "variant": variant}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the memory file: read, age cut, eviction
-# ─────────────────────────────────────────────────────────────────────────────
+# Memory file: read, age cut, eviction
 
 def test_a_missing_file_is_no_memory(tmp_path):
     assert probe_memory.load(tmp_path / "none.json", now=NOW) == []
@@ -239,9 +237,7 @@ def test_hours_of_reads_the_key_and_zero_is_off(tmp_path, value, hours):
     assert probe_memory.hours_of(None) == probe_memory.DEFAULT_HOURS
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the retry: what is asked again, how long it waits, how many times
-# ─────────────────────────────────────────────────────────────────────────────
+# Retry: what is asked again, how long it waits, how many times
 
 QUOTA_RE = re.compile("free-models-per-day", re.IGNORECASE)
 
@@ -370,9 +366,7 @@ def test_no_retries_is_the_probe_itself(retries):
     assert with_retries(inner, retries=retries, wait_sec=15) is inner
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the pool: side by side, capped per provider, the same answers in roster order
-# ─────────────────────────────────────────────────────────────────────────────
+# Pool: side by side, capped per provider, same answers in roster order
 
 def _offer(models: dict) -> dict:
     """`GET /provider` with *models* = {provider: {model_id: [variants]}}."""
@@ -525,9 +519,7 @@ def test_a_pool_of_one_is_the_walk_itself_in_roster_order():
         "kenary/agnes-2-0-flash:free"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the roster keys
-# ─────────────────────────────────────────────────────────────────────────────
+# Roster keys
 
 def test_the_defaults(tmp_path):
     config = tc.Sandbox(tmp_path).config()
@@ -569,9 +561,7 @@ def test_hours_that_are_not_a_number_are_the_default_as_in_kc67(tmp_path):
     assert config.probe_memory_hours == 24.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# `run`: the file is created, used, and cleaned — and nothing is printed
-# ─────────────────────────────────────────────────────────────────────────────
+# run: the file is created, used and cleaned, and nothing is printed
 
 MEDIUM = ["--ticket", "1", "--models", "glm-4-7-flash:free", "--variant", "medium",
           "--no-gate", "--no-tests"]
@@ -632,8 +622,7 @@ def test_reprobe_asks_anyway_and_a_refusal_takes_the_success_out(sandbox, capsys
 
     code, fake = tc.run_fake(sandbox, scenario, ["--reprobe", *MEDIUM], spawn_holder)
     captured = capsys.readouterr()
-    # the fake rejects `medium` in the round's own session too, so the round
-    # ends with no READY (2); what matters here is that intake let it start
+    # The fake rejects medium in the round's own session too: the round ends with no READY, but intake must let it start.
     assert code != cli.EXIT_FAILED, captured.err
     assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
     assert _probe_titles(fake) == ["variant-probe/glm-4-7-flash:free/medium"], \

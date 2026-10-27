@@ -59,12 +59,10 @@ logger = logging.getLogger(__name__)
 # llm_call(system, user) -> str   (same callable contract as summary_memory)
 LlmCall = Callable[[str, str], str]
 
-# Matches chapter_07 / chapter_7 / Chapter_07.md … — mirrors context_assembler
-# and context_broker so "chapter index" means the same thing everywhere.
+# Matches chapter_07, chapter_7 and similar, same as context_assembler and context_broker.
 _CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
 
-# Reserve room for the model's own verdict output + instructions when sizing
-# the canon context we paste into a grounding prompt.
+# Tokens reserved for the verdict and instructions when sizing the canon context.
 _GROUNDING_OVERHEAD_TOKENS = 400
 
 
@@ -208,14 +206,7 @@ class CanonValidator:
         self.max_canon_revisions = max(0, int(max_canon_revisions))
         self._synopsis_path = synopsis_path
         self._max_claims = max(1, int(max_claims))
-        # Canon context budget: leave room for output + the claim. Stored as
-        # a token count — the char budget depends on the synopsis text's
-        # script (Cyrillic tokenizes ~2x denser than Latin — see
-        # chars_per_token()), so it's computed per-call in _load_canon().
-        #
-        # num_ctx=0 is the "server/API default" sentinel every api_* section
-        # and main.py's _getint pass. Taken literally it collapsed the canon
-        # budget to 0 tokens; ContextAssembler already guards this same case.
+        # Canon budget in tokens (the char budget depends on the script); num_ctx=0 means the server default, so use 4096.
         _effective_num_ctx = int(num_ctx) if num_ctx else 4096
         self._canon_budget_tokens = max(0, _effective_num_ctx - int(max_tokens) - _GROUNDING_OVERHEAD_TOKENS)
 
@@ -224,8 +215,7 @@ class CanonValidator:
     @staticmethod
     def chapter_index(chapter_file: str) -> "int | None":
         """Return the numeric chapter index from a filename, or ``None``."""
-        # AUTO-FIX: searching the full path let a directory segment win —
-        # "chapter_2_drafts/chapter_10.txt" matched chapter 2, not 10.
+        # Match the filename only, so a directory segment cannot win (AUTO-FIX).
         m = _CHAPTER_RE.search(Path(str(chapter_file)).name)
         return int(m.group(1)) if m else None
 
@@ -316,15 +306,7 @@ class CanonValidator:
             logger.warning("CanonValidator: claim extraction failed: %s", exc)
             return []
         claims: list[str] = []
-        # Bugfix: this used to be
-        #   line = raw.strip().lstrip("-*0123456789. \t").strip()
-        # str.lstrip(chars) removes ANY of the given characters from the
-        # left, repeatedly — it has no concept of "a marker" versus "the
-        # claim's own leading digits". A claim that legitimately starts
-        # with a number (an age, a year, a population count — precisely
-        # what a CANON validator exists to protect) had that number
-        # silently eaten: "3.5 million people lived there" became "million
-        # people lived there" before ever reaching the conflict check.
+        # Strip only bullet markers, not leading digits: an age or year is part of the claim (bug fix).
         _marker_re = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
         for raw in reply.splitlines():
             line = _marker_re.sub("", raw.strip(), count=1).strip()
@@ -376,16 +358,7 @@ class CanonValidator:
         """
         if self._broker is None:
             return ""
-        # Salient tokens: capitalised words (names/places) are the cheapest,
-        # most useful query terms for an entity-based prose pull.
-        # BUGFIX: [A-Z][a-zA-Z]{2,} is ASCII-only, so it matched nothing at
-        # all for Cyrillic character names (Иван, Мария, Андрей, ...) —
-        # every Russian-fiction claim hit the `if not tokens: return ""`
-        # guard below, silently dropping the earlier-chapter excerpt from
-        # every canon-conflict message. The coder was told WHAT conflicted
-        # but never WHERE the conflicting canon was established. Python 3's
-        # \b is already Unicode-aware, so adding the Cyrillic ranges to the
-        # character class is enough — no extra flags needed.
+        # Cyrillic-capable salient tokens: the ASCII-only pattern matched nothing for Russian names (BUGFIX).
         tokens = re.findall(r"\b[A-ZА-ЯЁ][a-zA-Zа-яёА-ЯЁ]{2,}\b", claim)
         if not tokens:
             return ""
@@ -409,28 +382,19 @@ class CanonValidator:
         """
         idx = CanonValidator.chapter_index(chapter_file)
         if idx is None:
-            # BUGFIX: this used to fall through to `idx is None or cidx < idx`
-            # below, which is trivially True for every file regardless of
-            # cidx — so a legitimately non-numeric filename (prologue.md,
-            # epilogue.md, notes.md; all common in creative-writing projects)
-            # got EVERY numbered chapter back as "earlier canon", including
-            # ones written much later in the story. Reproduced: checking
-            # "prologue.md" against chapter_01/02/10.md returned chapter_10
-            # (the twist ending) as established earlier canon — the exact
-            # inverse of this function's own contract, "canon = what came
-            # before". Without a reliable index for the current file, there's
-            # no safe way to know which chapters actually came before it, so
-            # return nothing rather than something actively backwards.
+            # A non-numeric filename (prologue.md) has no known position; return nothing rather than later chapters.
             return []
         out: list[tuple[int, str]] = []
-        for p in base_dir.glob("*"):
+        # REP-CHAPTER-DIR: the chapter's own folder, paths kept relative to *base_dir*.
+        folder = Path(chapter_file).parent
+        for p in (Path(base_dir) / folder).glob("*"):
             if p.suffix.lower() not in (".md", ".txt"):
                 continue
             cidx = CanonValidator.chapter_index(p.name)
             if cidx is None:
                 continue
             if cidx < idx:
-                out.append((cidx, p.name))
+                out.append((cidx, (folder / p.name).as_posix()))
         out.sort()
         return [name for _, name in out]
 
@@ -487,15 +451,7 @@ def make_canon_validator(
         except Exception:  # noqa: BLE001
             broker = None
 
-    # GATE3-PROFILE-2: only pass settings= when a profile was actually
-    # resolved, preserving the exact old call arity — not just the
-    # resulting values — when canon_llm_profile is unconfigured. This
-    # keeps a bare-signature stand-in for _make_llm_call (as tests may
-    # legitimately install) working unchanged in the default case.
-    # BUGFIX (audit): sibling factories (make_fact_validator,
-    # make_continuity_validator) wrap this call in try/except so invalid
-    # LLM config degrades to a disabled validator instead of crashing the
-    # caller; this one didn't.
+    # Pass settings= only when a profile is resolved; invalid config degrades to a disabled validator, as its siblings do.
     try:
         llm_call = (
             _make_llm_call(config, task_mode=task_mode, settings=settings)

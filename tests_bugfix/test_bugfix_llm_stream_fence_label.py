@@ -101,18 +101,7 @@ class TestPreviouslyWorkingPathsUnchanged:
         assert strip_json_fence(raw) == '{"Key": "Value"}'
 
 
-# ── 2nd pass: fence runs longer than three backticks ──────────────────────────
-#
-# The label fix matched EXACTLY three backticks, so a four-backtick opener --
-# valid markdown for a block that itself contains ``` (common when the JSON
-# payload carries a code sample) -- matched only its first three and left a
-# stray backtick glued to the body:
-#
-#     '````json\n{"a":1}\n````'  ->  '`json\n{"a":1}'
-#
-# json.loads rejects that, so the label fix was a strict regression against
-# the pre-audit code, which stripped this input correctly. Verified by
-# running origin/pullv3's strip_json_fence against this suite.
+# Regression: four-backtick fences must strip fully; the label fix had matched only three.
 
 class TestFencesLongerThanThreeBackticks:
     @pytest.mark.parametrize("n", [4, 5, 6])

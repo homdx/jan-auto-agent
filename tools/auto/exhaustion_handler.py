@@ -75,9 +75,7 @@ TICKET_TYPE_INVESTIGATION = "investigation"
 TICKET_STATUS_OPEN        = "open"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Result
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ExhaustionOutcome:
@@ -95,9 +93,7 @@ class ExhaustionOutcome:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # ExhaustionHandler
-# ─────────────────────────────────────────────────────────────────────────────
 
 class ExhaustionHandler:
     """Handles the aftermath of an exhausted task (AUTO-C6).
@@ -141,18 +137,7 @@ class ExhaustionHandler:
             params={"task": task_id},
         )
 
-        # AUTO-FIX (high-priority audit, NVIDIA/DeepSeek-plan findings):
-        # this whole method used to have zero error handling around any of
-        # its steps — a state-write failure at ANY point (status update,
-        # knowledge-file write, run.log append) crashed handle() itself,
-        # which is already the fallback-of-last-resort path for a task
-        # that exhausted every normal retry. Losing the exhaustion-handling
-        # step ALSO means losing the investigation ticket that would have
-        # let someone diagnose why the task failed in the first place —
-        # compounding the original failure instead of degrading gracefully.
-        # Each step below is now independently guarded: a failure is logged
-        # and the method proceeds with whatever it could still produce,
-        # rather than aborting entirely partway through.
+        # Each step is guarded: a failure is logged and handle() continues with what it can still produce, instead of aborting.
 
         # 1. Re-assert BLOCKED status (OuterLoop already sets this; idempotent).
         try:
@@ -179,9 +164,7 @@ class ExhaustionHandler:
                 "ExhaustionHandler: failed to write knowledge.md for %s — %s",
                 task_id, exc,
             )
-            # Fall back to the path the write *would* have used — keeps
-            # ExhaustionOutcome.knowledge_path a real Path (its own .summary()
-            # calls .name on it) even though the file itself may not exist.
+            # Fall back to the path the write would have used, so knowledge_path stays a real Path.
             try:
                 kpath = self._state.task_dir(task_id) / "knowledge.md"
             except Exception:
@@ -289,11 +272,7 @@ class ExhaustionHandler:
         """
         ts = make_ticket_store(self._state.agent_dir)
         try:
-            # BUGFIX (audit): make_ticket() itself used to run before this
-            # try/except — a malformed field (e.g. ticket_id is None)
-            # raises TicketSchemaError from make_ticket, not just from
-            # ts.create(), and that propagated straight out of this
-            # fallback-of-last-resort handler.
+            # make_ticket() runs inside the try, so a malformed field cannot escape the last-resort handler.
             ticket = make_ticket(
                 id=ticket_id,
                 type=TICKET_TYPE_INVESTIGATION,
@@ -316,10 +295,7 @@ class ExhaustionHandler:
         return ts.path(ticket_id)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_exhaustion_handler(state_store: StateStore) -> ExhaustionHandler:
     """Convenience factory — returns an :class:`ExhaustionHandler` for *state_store*."""

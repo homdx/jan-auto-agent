@@ -45,8 +45,7 @@ from tools.auto.inner_loop import LLMGate2Validator
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Pattern that matches the exact shape of the old bug:
-# a bare assignment onto the module-alias variable.
+# Matches the old bug's shape: a bare assignment onto the module-alias variable.
 _BARE_ASSIGN_RE = re.compile(
     r"^\s*ls\.(request_completion|strip_think|ollama_chat_url)\s*=",
     re.MULTILINE,
@@ -110,8 +109,7 @@ def test_monkeypatch_setattr_restores_llm_stream_after_test_ends(monkeypatch):
         assert approved is True
         assert ls.request_completion is not real_rc  # stub is live inside
 
-    # Once the context exits the real callables must be restored — exactly
-    # what the bare assignment never guaranteed.
+    # Real callables are restored on exit, which a bare assignment never guaranteed.
     assert ls.request_completion is real_rc
     assert ls.strip_think is real_st
     assert ls.ollama_chat_url is real_ocu

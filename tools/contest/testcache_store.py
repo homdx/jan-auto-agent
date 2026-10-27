@@ -28,8 +28,7 @@ log = logging.getLogger(__name__)
 
 # Every git call gets this long; a hung git must not hang the policy.
 GIT_TIMEOUT_S = 20
-# An untracked file bigger than this is hashed by (size, mtime-free) name only:
-# the fingerprint stays cheap, and a build artefact that large is not source.
+# Untracked files above this size are fingerprinted by name only: cheap, and build artefacts are not source.
 MAX_UNTRACKED_BYTES = 5 * 1024 * 1024
 # Path components whose changes never alter what pytest would report.
 _IGNORED_PARTS = ("runs", ".pytest_cache", "__pycache__")
@@ -136,8 +135,7 @@ class TestRunCache:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 size = os.fstat(fd).st_size
-                # A crashed writer may have left a torn last line without its
-                # newline; start a fresh line so ours is not glued onto it.
+                # Start a fresh line after a torn last line, so our record is not glued onto it.
                 if size and os.pread(fd, 1, size - 1) != b"\n":
                     line = b"\n" + line
                 os.write(fd, line)          # one write: whole line or nothing

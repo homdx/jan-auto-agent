@@ -43,8 +43,7 @@ from tools.collect.model import LLMSummary, ModuleRecord
 
 logger = logging.getLogger(__name__)
 
-# (system, user) -> response_text — same shape as summary_memory.LlmCall,
-# so any existing `_make_llm_call`-style factory can be used interchangeably.
+# (system, user) to response text, the same shape as summary_memory.LlmCall.
 LlmCall = Callable[[str, str], str]
 
 
@@ -152,13 +151,7 @@ def _budget_chars(num_ctx: int, max_tokens: int,
 
 
 def _truncate_source(source: str, budget_chars: int) -> str:
-    # BUGFIX (audit): budget_chars <= 0 means _budget_chars() determined
-    # there is NO room left for a source excerpt at all (num_ctx too
-    # small for max_tokens + the fixed prompt overhead) — returning the
-    # full, untruncated source in that case is the exact opposite of
-    # this function's purpose and can blow the context window it exists
-    # to protect. Only skip truncation when there's a real (non-empty)
-    # budget and the source already fits inside it.
+    # No room for an excerpt (budget <= 0) means empty output, never the full source (BUGFIX).
     if budget_chars <= 0:
         return ""
     if len(source) <= budget_chars:
@@ -213,14 +206,7 @@ def _parse_llm_summary(raw: str) -> LLMSummary:
         return LLMSummary(purpose="", notes="")
     purpose = data.get("purpose") or ""
     notes = data.get("notes") or ""
-    # AUTO-FIX (medium-priority audit): `str(purpose)`/`str(notes)` used to
-    # blindly coerce ANY JSON value — a list, a nested object, a number —
-    # into its Python str() representation (e.g. "[1, 2]" or "{'a': 1}")
-    # instead of treating a non-string value as the malformed reply it is.
-    # That let garbage silently pollute the cached collect artifact as if
-    # it were a legitimate purpose/notes string. Same fail-open philosophy
-    # as the rest of this function (degrade to empty, never raise) — just
-    # applied to type, not only shape.
+    # A non-string purpose or notes is malformed and treated as empty, not str()-coerced (AUTO-FIX).
     if not isinstance(purpose, str) or not isinstance(notes, str):
         return LLMSummary(purpose="", notes="")
     return LLMSummary(purpose=purpose, notes=notes)
@@ -298,20 +284,13 @@ def _load_collect_checkpoint(checkpoint_path: Path, hashes: Optional[Dict[str, s
         if not isinstance(entry, dict):
             dropped += 1
             continue
-        # `entry.get("sha")` is None for a pre-RUN-11 entry that never
-        # tagged one; `hashes.get(key)` is None only for a path no longer
-        # in the tree. Either way None != <real hash> lands the entry here
-        # and it gets re-summarized — the safe direction when the source a
-        # cached summary was grounded in cannot be verified.
+        # A missing or mismatched hash means the summary is re-made, the safe direction.
         if hashes is not None and entry.get("sha") != hashes.get(key):
             dropped += 1
             continue
         entries[key] = entry
         kept += 1
-    # `raw` empty (a hand-made file, or one whose entries were all rejected)
-    # is "no checkpoint" for the callback: there is nothing to report, and
-    # a "resumes: 0 module(s) kept" line would be pure noise at the top of
-    # the progress stream. Entries recorded is the test, not entries kept.
+    # An empty checkpoint is reported as no checkpoint, so no "0 kept" line is printed.
     return entries, bool(raw), kept, dropped
 
 
@@ -326,7 +305,7 @@ def summarize_repo(
     sleep_fn: Callable[[float], None] = time.sleep,
     on_error: Optional[Callable[[str, Exception, int], None]] = None,
     checkpoint_path: Optional[Path] = None,
-    progress_fn: Optional[Callable[[int, int, str], None]] = None,
+    progress_fn: Optional[Callable[[int, int, str, bool], None]] = None,
     hashes: Optional[Dict[str, str]] = None,
     on_resume: Optional[Callable[[int, int], None]] = None,
 ) -> List[ModuleRecord]:
@@ -359,10 +338,12 @@ def summarize_repo(
     `sleep_fn` defaults to `time.sleep` but is injectable so tests can run
     the retry path without actually waiting.
 
-    `progress_fn(done_count, total_count, module_path)` — if given, called
-    once after each module that actually needs an LLM call finishes (cached
-    or parse-error modules don't count toward the total, since nothing is
-    sent for them). Pass a no-op lambda to silence progress reporting.
+    `progress_fn(done_count, total_count, module_path, succeeded)` — if given,
+    called once after each module that actually needs an LLM call finishes
+    (cached or parse-error modules don't count toward the total, since nothing is
+    sent for them). `succeeded` is True when the module ended up with a summary,
+    False when the summarizer gave up. Pass a no-op lambda to silence progress
+    reporting.
     """
     from tools.backoff import retry_with_backoff, clear_state, save_state
 
@@ -374,14 +355,10 @@ def summarize_repo(
                 on_resume(kept, dropped)
             except Exception as exc:  # noqa: BLE001 — a resume notice must not kill the batch
                 logger.warning("collect summarizer: on_resume callback failed (%s)", exc)
-    # Kept as a dict-or-None the same way the loader normalizes it, so the
-    # entry's `sha` and the resume-time sha check read the same map.
+    # Hashes are a dict or None, as the loader normalises them, so the sha check reads the same map.
     save_hashes = hashes if isinstance(hashes, dict) else None
 
-    # Modules that will actually need an LLM call (used for progress totals).
-    # AUTO-FIX: `modules` is only required to be an iterable but is
-    # consumed here and again in the loop below, so a one-shot generator
-    # would leave the main loop with zero modules. Snapshot once.
+    # Snapshot modules once, since it is read twice (AUTO-FIX).
     modules = list(modules)
     total = sum(
         1 for m in modules
@@ -404,20 +381,21 @@ def summarize_repo(
 
         source = sources.get(module.path, "")
         result = module
+        last_error = ""
         try:
             result = retry_with_backoff(
-                lambda: summarize_module(
+                lambda module=module, source=source: summarize_module(
                     module, source, llm_call,
                     num_ctx=num_ctx, max_tokens=max_tokens,
                 ),
                 attempts=max_retries + 1,
                 sleep_fn=sleep_fn,
-                on_retry=lambda exc, n, wait: logger.warning(
+                on_retry=lambda exc, n, wait, _path=module.path: logger.warning(
                     "collect summarizer: %s failed (%s); retrying in %ds",
-                    module.path, exc, wait,
+                    _path, exc, wait,
                 ),
-                on_error=lambda exc, count: (
-                    on_error(module.path, exc, count) if on_error is not None else None
+                on_error=lambda exc, count, _path=module.path: (
+                    on_error(_path, exc, count) if on_error is not None else None
                 ),
             )
         except Exception as exc:  # noqa: BLE001 — one bad module must not abort the batch
@@ -426,20 +404,19 @@ def summarize_repo(
                 module.path, max_retries + 1, exc,
             )
             result = module
+            last_error = f"{type(exc).__name__}: {exc}"
 
         out.append(result)
         sent += 1
         if progress_fn is not None:
-            progress_fn(sent, total, module.path)
+            progress_fn(sent, total, module.path, result.summary is not None, last_error)
         if checkpoint_path is not None and result.summary is not None:
             entry = {
                 "purpose": result.summary.purpose,
                 "notes": result.summary.notes,
             }
             if save_hashes is not None:
-                # `.get` rather than `[]`: a path hash_tree could not read
-                # (deleted or unreadable between the scan and this point) is
-                # absent from the map, and the entry still lands.
+                # .get, not [], because a hash may be missing if the file vanished (BUGFIX).
                 entry["sha"] = save_hashes.get(result.path)
             done[result.path] = entry
             save_state({"loop": "collect_summarize", "modules": done}, checkpoint_path)
@@ -465,13 +442,7 @@ def collect_llm_budget(config, task_mode: str = "code") -> "tuple[int, int]":
     num_ctx_str = _cfg_mode(config, "collect", "num_ctx", task_mode, fallback=None)
     if num_ctx_str is None:
         num_ctx_str = config.get(api_sec, "num_ctx", fallback="0")
-    # BUGFIX: `fallback=` on configparser reads only covers a *missing* key,
-    # not a malformed *value* — a non-numeric num_ctx/max_tokens raised a raw
-    # ValueError straight out of this function, crashing both the `--collect`
-    # CLI action (unguarded call site) and the interactive `/collect` REPL
-    # command (whose `except CollectCliError` doesn't catch ValueError).
-    # Mirrors the existing try/except-around-int() pattern used by
-    # tools/auto/repo_ingest.py::_read_int.
+    # A malformed num_ctx or max_tokens value falls back to the default, not a crash (BUGFIX).
     try:
         num_ctx = int(num_ctx_str)
     except (ValueError, TypeError):
@@ -495,9 +466,7 @@ def should_run_pass_b(config) -> bool:
     """`[collect] llm_summaries` (default true) — the config-level twin of
     the CLI's `--no-llm` flag (COLLECT-19 wires the flag; this reads the
     config default it falls back to)."""
-    # BUGFIX (audit): unguarded — a malformed value (e.g.
-    # `llm_summaries = maybe`) raised ValueError straight out of this
-    # function instead of falling back to the documented default.
+    # A malformed llm_summaries value falls back to the documented default (BUGFIX).
     try:
         return config.getboolean("collect", "llm_summaries", fallback=True)
     except ValueError as exc:
@@ -524,12 +493,7 @@ def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
     api_key = config.get(api_sec, "api_key", fallback="ollama")
     model = config.get(api_sec, "model", fallback="llama3.1:8b")
     api_format = config.get(api_sec, "api_format", fallback="ollama")
-    # BUGFIX (audit): every getboolean/getfloat/getint read below was
-    # unguarded — any one malformed value (e.g. `verify_ssl = maybe`)
-    # raised ValueError straight out of this function, matching the same
-    # "Unguarded config.getint/getboolean/getfloat" pattern already fixed
-    # elsewhere in this codebase. Each now degrades to its documented
-    # default with a logged warning instead.
+    # Each typed config read degrades to its default with a warning, not a crash (BUGFIX).
     try:
         verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
     except ValueError as exc:
@@ -542,10 +506,7 @@ def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
     except ValueError as exc:
         logger.warning("config [collect] temperature is malformed (%s) — using default 0.1", exc)
         temperature = 0.1
-    # [collect] timeout_seconds first: a Pass B reply is a short JSON, while
-    # [loop] timeout_seconds is the agent's budget (4800 s in the big
-    # profiles) — borrowed here, a dropped connection held collect for over
-    # an hour before error_retries ever saw it. Unset → [loop], as before.
+    # Pass B reads [collect] timeout_seconds first, then falls back to [loop] (as before).
     timeout_section = "collect" if config.has_option("collect", "timeout_seconds") else "loop"
     try:
         timeout = config.getint(timeout_section, "timeout_seconds", fallback=300)
@@ -553,23 +514,14 @@ def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
         logger.warning("config [%s] timeout_seconds is malformed (%s) — using default 300",
                        timeout_section, exc)
         timeout = 300
-    # Thinking models (qwen3) prepend a <think> block; Pass B is a short,
-    # structured-JSON reply, so default this off the same way gate1/coder do
-    # — otherwise a small max_tokens cap can truncate mid-<think> and the
-    # reply never reaches a usable JSON object at all. [collect] think=true
-    # re-enables it (strip_think below still cleans up either way).
+    # Thinking is off by default for Pass B, so the JSON reply is not cut off by a <think> block.
     try:
         think = config.getboolean("collect", "think", fallback=False)
     except ValueError as exc:
         logger.warning("config [collect] think is malformed (%s) — using default False", exc)
         think = False
 
-    # Per-request HTTP retry (429/5xx) — was previously hardcoded to
-    # request_completion()'s own defaults (error_retries=2,
-    # error_retry_wait_sec=60.0, max_retry_after_sec=180.0) regardless of
-    # what a profile's .ini said. Now config-driven via [collect], falling
-    # back to those same defaults when unset so existing profiles behave
-    # exactly as before.
+    # Per-request retry settings come from [collect], with the old defaults when unset.
     try:
         error_retries = config.getint("collect", "error_retries", fallback=2)
     except ValueError as exc:
@@ -620,9 +572,7 @@ def collect_max_retries(config) -> int:
     was never read from any .ini — always the hardcoded default."""
     if config is None:
         return DEFAULT_MAX_RETRIES
-    # BUGFIX (audit): unguarded — same pattern as should_run_pass_b/
-    # _make_llm_call above; a malformed value raised ValueError instead
-    # of falling back to DEFAULT_MAX_RETRIES.
+    # A malformed max-retries value falls back to DEFAULT_MAX_RETRIES (BUGFIX).
     try:
         return config.getint("collect", "max_retries", fallback=DEFAULT_MAX_RETRIES)
     except ValueError as exc:

@@ -85,13 +85,7 @@ _THIS_TEST = "tests/test_gate1_corpus_precision.py"
 _FIXTURE_SIGNAL_WORDS = ("toy module", "deliberately", "negative case", "control case")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# The corpus
-# ─────────────────────────────────────────────────────────────────────────────
-# label: "false" = confirmed false positive, "legit" = confirmed real bug.
-# `note_kind` documents which grounding check (if any) is expected to fire —
-# used only by TestGroundingNotesUnit to assert the RIGHT reason fired, not
-# just any reason.
+# Corpus: "false" is a confirmed false positive, "legit" a confirmed real bug; note_kind names the expected grounding reason.
 
 _CORPUS: list[dict] = [
     # ── Confirmed false positives ───────────────────────────────────────────
@@ -153,19 +147,7 @@ _CORPUS: list[dict] = [
             "model.is_safe."
         ),
         file="tools/collect/bughunt_filter.py", symbol="suppress",
-        # note_kind=None: this is the one confirmed false positive that
-        # needs two call-hops (suppress -> is_safe -> query) to disprove,
-        # deeper than AUTO-H2-3's one-hop callee_context reaches. Left in
-        # the corpus deliberately UNCAUGHT by grounding-notes, so this test
-        # documents the known gap instead of silently pretending it's
-        # solved. TestCorpusPrecisionRecall's mock therefore treats this
-        # one as "confirmed" (Gate 1 does NOT catch it today) and recall is
-        # computed accordingly — see that class's docstring.
-        # FL-5: on the live tree it IS rejected today, and not because the
-        # gap closed — intentional_design_note (AUTO-H3-1, landed a day after
-        # this corpus) fires on suppress's own "deliberately failing closed".
-        # A word in the graded source moved this verdict; see
-        # TestCorpusPrecisionRecall.
+        # Needs two call hops to disprove, deeper than the one-hop grounding reaches: a known gap. Live, intentional_design_note now rejects it (FL-5).
     ),
     # ── Confirmed legitimate (must NOT be suppressed by grounding notes) ───
     dict(
@@ -281,9 +263,7 @@ def filt(minimal_config: configparser.ConfigParser) -> Gate1Filter:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Tier 1 — deterministic, no LLM: does grounding fire on the RIGHT reason?
-# ─────────────────────────────────────────────────────────────────────────────
+# Tier 1: deterministic, no LLM: does grounding fire for the right reason?
 
 def _resolve(filt: Gate1Filter, entry: dict, root: Path) -> str:
     """Stage A for one entry against *root*: its code block, or a failure
@@ -352,9 +332,7 @@ class TestGroundingNotesUnit:
         _check_legit_is_neutral(filt, entry, REPO_ROOT)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Tier 2 — full pipeline, Stage B mocked but prompt-aware
-# ─────────────────────────────────────────────────────────────────────────────
+# Tier 2: full pipeline, with Stage B mocked but prompt-aware
 
 def _prompt_aware_llm(*, payload: dict, **_kwargs) -> str:
     """Stand-in for a model that actually reads injected grounding evidence
@@ -382,11 +360,7 @@ def _prompt_aware_llm(*, payload: dict, **_kwargs) -> str:
         w in user_msg.lower() for w in _FIXTURE_SIGNAL_WORDS
     ):
         return json.dumps({"verdict": "rejected", "reason": "docstring marks this as an intentional fixture"})
-    # AUTO-H3: a "confirmed" verdict now has to back itself with a real
-    # quote from the code block Stage B was shown (see gate1_filter's
-    # evidence check) — pull the cited symbol's own def line straight out
-    # of the prompt so this mock satisfies the same contract a real,
-    # attentive model would.
+    # Pull the cited symbol's def line from the prompt, so the mock gives a quote a real model would.
     m = re.search(r"```\n(.*?)\n```", user_msg, re.S)
     code = m.group(1) if m else ""
     evidence = next((ln.strip() for ln in code.splitlines() if ln.strip()), "def ")
@@ -461,10 +435,7 @@ def _check_precision_recall(filt: Gate1Filter, root: Path) -> None:
     assert precision == 1.0, f"precision dropped: {precision:.0%} (fp={fp})"
     assert tn == legit_ids, f"expected all legit tasks kept, kept={tn}"
 
-    # Baseline: 5/6 false positives caught. If this regresses below 5,
-    # something broke. If it improves to 6 (AUTO-T11's gap gets closed
-    # some day), update this assertion to match — a stricter bound is
-    # a welcome failure here, not a bug.
+    # Baseline: 5 of 6 false positives caught; a stricter bound (6) is a welcome failure, not a bug.
     assert len(tp) >= 5, (
         f"recall regressed: only caught {sorted(tp)} (recall={recall:.0%}):\n"
         + named(fn, "a false positive was no longer rejected")
@@ -475,9 +446,7 @@ def _check_precision_recall(filt: Gate1Filter, root: Path) -> None:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FL-5 — the live-tree coupling is visible, for all twelve entries
-# ─────────────────────────────────────────────────────────────────────────────
+# FL-5: the live-tree coupling, for all twelve entries
 
 def _graded_copy(tmp_path: Path) -> Path:
     """A scratch root holding a copy of every graded file at its own path.
@@ -567,9 +536,7 @@ class TestLiveCoupling:
             assert needle in str(err.value), f"failure omits {needle!r}: {err.value}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Optional — real model, real network. Opt-in only.
-# ─────────────────────────────────────────────────────────────────────────────
+# Optional: real model and real network, opt-in only
 
 @pytest.mark.skipif(
     os.environ.get("GATE1_CORPUS_LIVE") != "1",

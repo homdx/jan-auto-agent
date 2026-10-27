@@ -395,8 +395,7 @@ def test_make_inner_loop_builds_continuity_validator_when_enabled(tmp_path):
 
     cfg = _base_config(continuity_check="true")
     loop = make_inner_loop(cfg, base_dir=tmp_path, task_mode="creative")
-    # continuity_validator may be None if _make_llm_call fails in test env
-    # (no real server), but the attribute must always exist on the loop object.
+    # continuity_validator may be None without a real server, but the attribute must exist.
     assert hasattr(loop, "continuity_validator")
 
 

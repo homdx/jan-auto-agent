@@ -26,6 +26,9 @@ import csv
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools import file_lock  # noqa: E402
+
 COLUMNS = [
     "variant", "task_id", "title", "file", "symbol", "line_start", "line_end",
     "verdict", "severity", "defect_class", "caller_mutates", "impact", "repro",
@@ -34,6 +37,44 @@ COLUMNS = [
 VERDICTS = {"CONFIRMED", "FALSE_POSITIVE", "ALREADY_FIXED", "UNVERIFIABLE", "OUT_OF_SCOPE"}
 SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"}
 TRISTATE = {"YES", "NO", "UNKNOWN"}
+
+
+def _not_utf8(path) -> str:
+    """CSV-ANSI: why *path* is not UTF-8 (a BOM is fine), or "" when it is.
+
+    Excel's plain "CSV" saves the notes as cp1251/cp1252; reading that file as UTF-8 died
+    with a traceback before the duplicate check, and appending a UTF-8 row to it would
+    leave two encodings in one file. The file is refused instead, with what to do.
+    """
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        return f"{exc.reason} at byte {exc.start}"
+    return ""
+
+
+def _refuse_not_utf8(path, why) -> int:
+    print(f"refused: {path} is not UTF-8 ({why}) - a UTF-8 row would mix two encodings in one "
+          f"file; re-save it as \"CSV UTF-8\" and record again", file=sys.stderr)
+    return 3
+
+def _missing_final_newline(path) -> str:
+    """The line end to write first when *path* does not end with one, else "".
+
+    AUDIT3-19: a CSV whose last row has no line end (a spreadsheet export, an
+    interrupted write) had the next row glued onto it, destroying both — the
+    guard append_task.py already has.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return ""
+    if not data or data.endswith((b"\n", b"\r")):
+        return ""
+    return "\r\n" if b"\r\n" in data else "\n"
 
 
 def main():
@@ -59,10 +100,7 @@ def main():
             return 1
         out = f"validation-v{row['variant']}-{a['reviewer'].strip().lower()}.csv"
 
-    # One reviewer, one file. A model that writes Kilo.csv on one call and
-    # kilo.csv on the next splits its own work in half and defeats the dedupe,
-    # which is per-file — so refuse the second spelling rather than silently
-    # starting a rival file.
+    # One reviewer, one file. Two spellings (Kilo.csv and kilo.csv) would split one reviewer's work and defeat the per-file dedupe, so refuse the second spelling.
     d, base = os.path.dirname(out) or ".", os.path.basename(out)
     if os.path.isdir(d):
         twins = [f for f in os.listdir(d)
@@ -86,12 +124,7 @@ def main():
         problems.append("--file is required — a finding with no location cannot be checked")
     elif not a.get("allow_missing_file") and not os.path.exists(
             os.path.join(a.get("repo_root") or ".", row["file"])):
-        # A reviewer that has not opened the file can still satisfy a non-empty
-        # --file by typing something. glm-4.5-flash filled 13 of its 45 rows with
-        # "tools/auto/x.py", which does not exist: those rows grouped under a
-        # path nobody else used, so they read as solo discoveries instead of
-        # merging with everyone else's verdict on the same symbol. A finding is
-        # about live code, so the path has to resolve.
+        # A reviewer can type any path for --file. Rows must name an existing file, or they group under a path nobody else used and look like solo discoveries.
         problems.append(f"--file {row['file']!r} does not exist under "
                         f"{a.get('repo_root') or '.'!r} — "
                         f"a finding is about live code, so give the real path you read "
@@ -113,26 +146,36 @@ def main():
     row["verdict"], row["severity"] = v, s
     row["caller_mutates"] = row["caller_mutates"].upper()
 
-    # --- dedupe against what is already on disk ------------------------------
-    existed = os.path.exists(out) and os.path.getsize(out) > 0
-    if existed and not a["allow_duplicate"]:
-        with open(out, newline="", encoding="utf-8") as fh:
-            for prev in csv.DictReader(fh):
-                if (prev.get("file"), prev.get("symbol")) == (row["file"], row["symbol"]):
-                    print(f"skipped: {row['file']}::{row['symbol']} is already recorded "
-                          f"as {prev.get('verdict')} — move on to the next finding "
-                          f"(--allow-duplicate to override)", file=sys.stderr)
-                    return 2
+    # AUDIT-15: the dedupe check, the header decision and the append are one
+    # locked step. Two reviewers' calls for one (file, symbol) both passed the
+    # check and both appended; two first writers both wrote a header.
+    with file_lock.locked(out):
+        # --- dedupe against what is already on disk --------------------------
+        existed = os.path.exists(out) and os.path.getsize(out) > 0
+        why = _not_utf8(out) if existed else ""
+        if why:
+            return _refuse_not_utf8(out, why)
+        if existed and not a["allow_duplicate"]:
+            with open(out, newline="", encoding="utf-8-sig") as fh:   # REL-2: a spreadsheet's BOM
+                for prev in csv.DictReader(fh):
+                    if (prev.get("file"), prev.get("symbol")) == (row["file"], row["symbol"]):
+                        print(f"skipped: {row['file']}::{row['symbol']} is already recorded "
+                              f"as {prev.get('verdict')} — move on to the next finding "
+                              f"(--allow-duplicate to override)", file=sys.stderr)
+                        return 2
 
-    with open(out, "a", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=COLUMNS)
-        if not existed:
-            w.writeheader()
-        w.writerow(row)
-        fh.flush()
-        os.fsync(fh.fileno())
+        tail = _missing_final_newline(out) if existed else ""
+        with open(out, "a", newline="", encoding="utf-8") as fh:
+            fh.write(tail)
+            w = csv.DictWriter(fh, fieldnames=COLUMNS)
+            if not existed:
+                w.writeheader()
+            w.writerow(row)
+            fh.flush()
+            os.fsync(fh.fileno())
 
-    n = sum(1 for _ in open(out, encoding="utf-8")) - 1
+        with open(out, encoding="utf-8") as fh:
+            n = sum(1 for _ in fh) - 1
     print(f"recorded #{n}: {row['verdict']}/{row['severity']} "
           f"{row['file']}::{row['symbol'] or '-'} -> {out}")
     return 0

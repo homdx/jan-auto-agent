@@ -17,12 +17,7 @@ def _text(**kwargs) -> tuple[int, list[str]]:
     return code, buf.getvalue().splitlines()
 
 
-# ── bug: the labels printed as `where::` and `ticket::` ──────────────────────
-# `_wrap` is handed a label that already ends in a colon and adds `: ` itself. The
-# spec (epic-tasks/150, §7) shows one colon and the three values in one column:
-#   where:  …
-#   ticket: …
-#   flow:   …
+# Regression: labels printed as `where::` and `ticket::`; _wrap adds the colon itself.
 
 FULL = dict(where="checkout /x on arena (clean)", ticket="148 (AR-7) epic-tasks/148.md",
             flow=[("branch found", "ok", ""), ("intake", "fail", "why"), ("start", "todo", "")],
@@ -53,9 +48,7 @@ def test_a_wrapped_value_continues_under_the_value_not_the_label():
     assert not cont.startswith(" " * 11), lines
 
 
-# ── bug: `refuse_ctx` raised TypeError when it was given no `flow` ───────────
-# `flow=None` is its default, the JSON branch handles it, and the text branch
-# iterated it. The docstring: a field not reached is `?`, never dropped.
+# Regression: refuse_ctx raised TypeError with no flow; a field not reached is `?`.
 
 def test_a_refusal_without_a_flow_prints_a_question_mark_not_a_traceback():
     code, lines = _text(where="here", ticket="there")
@@ -77,11 +70,7 @@ def test_the_json_refusal_without_a_flow_is_unchanged():
                                           "flow": [], "hints": []}
 
 
-# ── bug: a step whose output is not UTF-8 crashed `arena base check` ──────────
-# `run_steps` read each step with `text=True` and strict decoding and caught only
-# OSError: a test that printed a byte that is not UTF-8 ended the whole check in a
-# UnicodeDecodeError traceback instead of a row — and the verdict is never allowed
-# to fail open. `gitref.git` already decodes with a handler for the same reason.
+# Regression: a step with non-UTF-8 output crashed arena base check; it now gets a row.
 
 def _step(code: str, name: str = "tests", pytest_step: bool = True) -> basecheck.Step:
     return basecheck.Step(name, [sys.executable, "-c", code], pytest=pytest_step)

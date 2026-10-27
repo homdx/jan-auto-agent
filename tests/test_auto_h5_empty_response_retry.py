@@ -63,9 +63,7 @@ from tools.auto.architect import ClusterReviewer, review_clusters
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def cfg() -> configparser.ConfigParser:
@@ -171,9 +169,7 @@ def _payloads(mock_llm) -> list[dict]:
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H5-1 / AC-H5-2 / AC-H5-3 — unsalvageable responses are retried
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H5-1 to AC-H5-3: unsalvageable responses are retried
 
 class TestPlainRetryOnUnsalvageableResponse:
 
@@ -226,9 +222,7 @@ class TestPlainRetryOnUnsalvageableResponse:
         assert [r.title for r in results] == ["Recovered task"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H5-4 / AC-H5-5 / AC-H5-6 — retry exhaustion, disable, custom count
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H5-4 to AC-H5-6: retry exhaustion, disable, custom count
 
 class TestRetryExhaustionAndConfig:
 
@@ -299,14 +293,7 @@ class TestRetryExhaustionAndConfig:
         assert results == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-H5-ESCALATE-1 — max_tokens/temperature escalate across AUTO-H5
-# retries, mirroring Gate1Filter's own unparseable-retry escalation
-# (tools/auto/gate1_filter.py). An unsalvageable response is very often
-# the model's thinking channel consuming the entire ORIGINAL budget, not
-# a one-off decoding hiccup a same-settings retry can fix — see field
-# report in the ClusterReviewer class docstring.
-# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-H5-ESCALATE-1: max_tokens and temperature escalate across retries (an unsalvageable reply is often the thinking channel using the whole budget).
 
 class TestEmptyResponseRetryEscalation:
 
@@ -453,12 +440,10 @@ class TestEmptyResponseRetryEscalation:
             reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
         payloads = _payloads(mock_llm)
-        # retries 7-8 (tier 3) = 4096 * 8 = 32768 exactly — matches the
-        # flat ceiling without exceeding it, so no capping happens yet.
+        # Retries 7-8 are 32768 exactly, which is the flat ceiling, so nothing is capped yet.
         assert payloads[7]["max_tokens"] == 32768
         assert payloads[8]["max_tokens"] == 32768
-        # retries 9-10 (tier 4) would be 4096 * 16 = 65536 uncapped —
-        # THIS is where the flat ceiling actually clips something.
+        # Retries 9-10 would be 65536 uncapped, so this is where the ceiling clips.
         assert payloads[9]["max_tokens"] == 32768   # capped from 65536
         assert payloads[10]["max_tokens"] == 32768  # capped from 65536
 
@@ -484,9 +469,7 @@ class TestEmptyResponseRetryEscalation:
         assert [r.title for r in results] == ["Recovered task"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-H5-ESCALATE-1 must NOT leak into AUTO-H4's shrink-retry path
-# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-H5-ESCALATE-1 must not leak into the AUTO-H4 shrink-retry path
 
 class TestEscalationDoesNotAffectTruncatedRetries:
 
@@ -513,9 +496,7 @@ class TestEscalationDoesNotAffectTruncatedRetries:
         assert payloads[1]["temperature"] == pytest.approx(0.2)  # cfg's base
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H5-7 — max_tasks does NOT shrink across AUTO-H5 retries
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H5-7: max_tasks does not shrink across AUTO-H5 retries
 
 class TestMaxTasksStaysConstant:
 
@@ -532,14 +513,11 @@ class TestMaxTasksStaysConstant:
 
         msgs = _user_messages(mock_llm)
         assert len(msgs) == 3
-        # Base max_tasks (code mode) is 5 — must be identical on all three
-        # calls, never shrunk the way AUTO-H4 would.
+        # The base max_tasks is 5 in code mode, and it is the same on all three calls (AUTO-H4).
         assert all("up to 5 concrete tasks" in m for m in msgs)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H5-8 — mixed failure modes across attempts, independent budgets
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H5-8: mixed failure modes across attempts, with independent budgets
 
 class TestMixedFailureModes:
 
@@ -569,8 +547,7 @@ class TestMixedFailureModes:
         assert "up to 5 concrete tasks" in msgs[0]
         # shrunk after attempt 1's truncation: floor(5*0.5) = 2
         assert "up to 2 concrete tasks" in msgs[1]
-        # AUTO-H5 retry after attempt 2's empty response keeps the SAME
-        # (already-shrunk) budget — it doesn't shrink further itself.
+        # The AUTO-H5 retry keeps the already shrunk budget; it does not shrink further.
         assert "up to 2 concrete tasks" in msgs[2]
 
     def test_independent_attempt_budgets_for_each_failure_mode(
@@ -597,9 +574,7 @@ class TestMixedFailureModes:
         assert [r.title for r in results] == ["Done"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H5-9 — interaction with the existing transient-error retry loop
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H5-9: interaction with the transient-error retry loop
 
 class TestInteractionWithTransientErrorRetry:
 
@@ -629,9 +604,7 @@ class TestInteractionWithTransientErrorRetry:
         assert mock_llm.call_count == 5
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H5-10 — a clean, validly-empty array is a success, not a failure
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H5-10: a clean, validly empty array is a success, not a failure
 
 class TestCleanEmptyArrayIsNotAFailure:
 
@@ -647,9 +620,7 @@ class TestCleanEmptyArrayIsNotAFailure:
         assert results == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-H5-11 — checkpointing records only the final (post-retry) result
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-H5-11: checkpointing records only the final, post-retry result
 
 class TestCheckpointRecordsFinalResultOnly:
 

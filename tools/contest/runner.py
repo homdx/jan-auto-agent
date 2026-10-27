@@ -287,8 +287,7 @@ class _TestRunsLock:
     def __init__(self) -> None:
         self._inner = threading.Lock()
         self._guard = threading.Lock()
-        # agent -> {"waiting": t, "running": t}: when it asked for the lock and,
-        # once granted, when it got it. Absent once it has exited.
+        # Per agent: when it asked for the lock and when it got it; absent after it exits.
         self._entries: dict = {}
 
     def enter(self, agent: str = "") -> float:
@@ -348,59 +347,35 @@ class _TestRunsLock:
         return count
 
 
-#: The four pytest roots run one worktree at a time. The judge machine takes
-#: about 20 minutes for eight parallel suites and about 105 s for one, so two
-#: agents harvesting at once must not fan the roots out. KC-50: only the test
-#: run is slow, so the lock is held around `run_tests_detail` alone (see
-#: `_RootsHold`) — a harvest that runs no roots never asks for it.
+#: One worktree's pytest roots run at a time, since parallel suites are very slow (KC-50).
 _TEST_RUNS_LOCK = _TestRunsLock()
 
-#: KC-27: the heartbeat's git calls per worktree — a short budget, because a
-#: tick that waits on a held index is late, not failed.
+#: Git timeout per worktree for the heartbeat, short, since a late tick is not a failed one (KC-27).
 _TICK_GIT_TIMEOUT_S = 5.0
 _TICK_GIT_RETRIES = 1
 
-#: KC-48: how long a process in a finished worktree gets between the TERM and
-#: the KILL. Five seconds is enough for a suite's own cleanup to run, and
-#: pointless to wait out if it will not — the round 86 suites ran for about a
-#: minute past their agent's own STALLED. A module constant, patched in tests,
-#: because no test wants to spend five seconds on the grace.
+#: Seconds between TERM and KILL for a leftover process in a finished worktree (KC-48).
 REAP_GRACE_SEC = 5.0
 
-#: KC-48: the proc root the reap scans. A constant, not a literal inside the
-#: walkers, so a test can point the reap at a directory that is not there.
+#: The proc root the reap scans; a constant, so a test can point it at a missing directory (KC-48).
 _PROC_ROOT = "/proc"
 
-#: KC-48: how long the reap waits for a SIGKILLed process to be gone. KILL is
-#: not ignorable, so only a process in uninterruptible sleep gets near it.
+#: How long the reap waits for a SIGKILLed process to go; only an uninterruptible one takes long (KC-48).
 _REAP_KILL_WAIT_SEC = 2.0
 
 #: KC-48: how much of a reaped process's command line `state.json` keeps.
 _REAP_CMD_CHARS = 120
 
-# KC-48: guards the read-modify-write on `run.reaped`. An agent's own reap runs
-# in its pool worker while the round's end sweep runs in the main thread, so the
-# record must not be rebuilt from a torn read by two threads at once.
+# Guards the reap record, which two threads may update at once (KC-48).
 _REAPED_LOCK = threading.Lock()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-65: the agents' pytest worker count
-# ─────────────────────────────────────────────────────────────────────────────
 
-#: KC-65: the round's record of the pytest-xdist workers its agents' `-n auto`
-#: should use. `cmd_run` writes it once with the start value, `run_round.save`
-#: rewrites it after every transition, and the plugin
-#: (`tools/contest/pytest_plugin/contest_pytest_workers.py`) reads it at each
-#: pytest start. This file is the source of the count — nothing else in the tree
-#: decides it, so the count the file holds and the count a prompt names cannot
-#: drift apart.
+#: File holding the pytest-xdist worker count; the runner writes it and the plugin reads it (KC-65).
 WORKERS_FILE = "pytest-workers"
 
-#: KC-65: the last lines of every prompt the runner sends. `{n}` is the count
-#: the agents' `-n auto` reads at that moment. Last in the message on purpose:
-#: KC-22's "only the first prompt carries it" and every existing prompt test
-#: that checks the start of a message stay as they are.
+#: Last lines of every prompt, with the current worker count; kept last so older prompt tests still pass (KC-65, KC-22).
 _WORKERS_NOTE = (
     "\n\nThe box is shared: right now `-n auto` gives your pytest {n} workers.\n"
     "Do not pass a larger `-n`; a run is slower when many agents test at once.\n"
@@ -566,16 +541,14 @@ def agent_tmp_path(config: ContestConfig, round_no: "str | int") -> "Path | None
     return Path(os.path.expanduser(root)).resolve() / f"contest-{round_no}"
 
 
-#: The prompt sent after a retryable session error (KC-19).  The
-#: ``{reason}`` placeholder is filled with ``_brief(data["message"])``.
+#: The prompt sent after a retryable session error; {reason} is the brief error text (KC-19).
 RETRY_PROMPT = (
     "The provider dropped the connection mid-turn ({reason}). "
     "Your worktree and this conversation are intact — continue from where you "
     "were; do not start over."
 )
 
-#: KC-9: the prompt sent when a turn ended without finishing — cut off mid-stream
-#: or silent past the idle window.  Plain text; no ticket text repeated.
+#: The prompt sent when a turn ended unfinished: cut off, or silent past the idle window (KC-9).
 CONTINUE_PROMPT = (
     "Your previous reply stopped before the task was finished. Continue exactly "
     "where you left off in this same worktree: finish the change, make sure it "
@@ -591,11 +564,7 @@ _RETRYABLE_MSG_RE = re.compile(
     r"|interrupted the response|upstream unavailable", re.IGNORECASE
 )
 
-#: KC-62: Kilo's own store refusing a write — the round server's SQLite, shared
-#: with every other Kilo process of the same user. Not the provider, not the
-#: model: the session is intact and the same turn can go on. These texts are
-#: deliberately not in `_RETRYABLE_MSG_RE`: they need their own budget, and
-#: `_retryable` is also the gate-side rule for the provider's transients.
+#: Kilo's own store refusing a write (shared SQLite), retried on its own budget, not the provider's (KC-62).
 _LOCAL_STORE_RE = re.compile(
     r"Failed to execute statement|Failed query:|database is locked|database is busy"
     r"|SQLITE_BUSY|SQLITE_LOCKED|disk I/O error", re.IGNORECASE
@@ -633,72 +602,19 @@ def _is_quota(error, quota_re) -> bool:
     text = error if isinstance(error, str) else _error_message(error)
     return quota_re.search(text) is not None
 
-#: KC-45 §2/§2a: the provider's refusal of the request itself — no status code,
-#: no retry flag, no socket error. Refused on the session's *first* call, it is
-#: refused again when resent (§2). Once the session has had an assistant reply
-#: that finished, the model id and the request fields have just worked, and the
-#: refusal is the free tier refusing under load — the same class as the 429 two
-#: lines above it (§2a).
-#: A gateway's 403 ``request was blocked by a gateway or proxy`` is the same
-#: class (round 104: the three ``vercel_8080`` agents got it after ~30 min of
-#: work): retried only once the session has answered.
+#: Provider refusal of the request itself; retried on resend, and a gateway 403 is the same class (KC-45, round 104).
 _PROVIDER_REJECTED_RE = re.compile(
     r"provider rejected the request|blocked by a gateway or proxy", re.IGNORECASE)
 
-#: KC-54: a context overflow's payload — the provider's name for it, or either
-#: spelling of the message it carries. The name is in the pattern as well as
-#: the messages, so a payload that is just the string
-#: ``"ContextOverflowError"`` matches too.
+#: Context overflow payload, by its name or either spelling of its message (KC-54).
 _OVERFLOW_RE = re.compile(
     r"ContextOverflowError|maximum context length|context_length_exceeded", re.IGNORECASE
 )
 
-#: Round 146: Kilo's own end of a compaction that could not bring the session
-#: under the wall Kilo holds — ``Compaction exhausted: context still exceeds
-#: model limits after 3 attempts`` — under the same ``ContextOverflowError`` name
-#: a provider's refusal gets. It is *Kilo's* wall talking: the window the
-#: provider declares, or the one the runner pushed from this very memory
-#: (`context_memory.kilo_limit`, whose docstring already records that a wall cut
-#: too low ends turns in it). It names no limit, no prompt and no output, and
-#: ``last_ok`` of such a turn is only where the session stood when Kilo gave up,
-#: so it is an overflow for the turn and never a size for the memory: stored, the
-#: next agent of the model compacted at 80 % of it, Kilo's wall came down with
-#: it, the next compaction was exhausted sooner, and the record below that one
-#: was written — for seven days, for every round (apertus-70b's declared 32 000
-#: became 22 561 in round 157; in round 146 the agent, compacted at once, answered
-#: that the ticket was missing from its conversation).
+#: Kilo's own compaction-exhausted message, under the same overflow name, since Kilo's wall is the window (round 146).
 _KILO_WALL_RE = re.compile(r"compaction\s+exhausted", re.IGNORECASE)
 
-#: A request refused for its size, in whatever words the provider picked. The
-#: three spellings above are the ones Kilo and OpenAI-shaped gateways use; the
-#: rest of the providers each have their own (round 145's zai: ``Prompt exceeds
-#: max length``, a 400 with no name), and a list of exact strings is one more
-#: entry per new provider. So the shape is matched instead: a thing that has a
-#: size — the prompt, the context, the input, the tokens — and a word that says
-#: it is past one, in either order, within one clause.
-#:
-#: The heads stay narrow: ``request``, ``message`` and ``conversation`` are
-#: dropped because a gateway says ``Request too large`` for a rate cap,
-#: ``Request entity too large`` for a body, ``Request timed out`` for a timeout,
-#: and ``Your error message is too large to display`` for neither. ``exceed``
-#: alone is dropped the other way — it requires a size noun, so
-#: ``max_tokens exceeds the model's maximum output tokens`` (an output cap a
-#: compact cannot fix) stays out on its own. A bare ``too large`` keeps Groq's
-#: ``Request too large for model`` without a head, because the provider says
-#: the request is too large *for the model* — and it needs the same noun, so
-#: ``too large to display`` stays out.
-#:
-#: The provider naming its own limit is an overflow too, in either word order
-#: (round 152, xAI: ``This model's maximum prompt length is 131072 but the
-#: request contains 150000 tokens``) — a head, a size noun and a number, and
-#: the wall is the model's, not a plan's cap. It needs the number or a size
-#: noun near it: a bare ``maximum input size`` says nothing about this
-#: request. The number may not carry a byte unit — a body cap speaks in MB,
-#: not tokens, and ``maximum input size 1 MB`` is the upload limit. TGI states
-#: the same wall as an inequality over the sum of its two budgets
-#: (```inputs` tokens + `max_new_tokens` must be <= 4096``); a token count with
-#: a ``must be <= N`` is that shape, and the output half of the sum is a term
-#: of it, not a refusal.
+#: Matches a request refused for its size, by its shape (size noun plus overflow word) (round 152).
 _SIZE_REFUSAL_RE = re.compile(
     r"\b(?:prompt|context|input)s?\b[^.\n]{0,60}?"
     r"(?:\btoo\s+(?:long|large|big)\b|\bexceed\w*|\bover\s+the\s+(?:max\w*|limit)\b"
@@ -713,29 +629,7 @@ _SIZE_REFUSAL_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: What a size refusal never is: money, a plan, a key or a rate — and the other
-#: refusals that carry the size words too. ``rate limit exceeded`` and
-#: ``exceeded your quota`` carry them, and orcarrouter's free tier says ``This
-#: prompt is longer than the free tier allows`` — a plan's cap the next prompt
-#: hits again however small the session is, so it stays the quota it is (round
-#: 144's deepseek-free) and is never remembered as the model's window.
-#:
-#: The same goes for the rest of the refusals a gateway answers with a status:
-#: a rate cap names tokens per minute, a gateway times out, an upload limit
-#: speaks of an entity or a body, an output cap names ``max_tokens``, an
-#: attachment cap names images and a plan's allowance names a budget. Each is
-#: matched as a phrase, not a bare word — a real overflow can say ``the file
-#: you sent pushed the prompt past 131072 tokens``, and a lone ``file``,
-#: ``body`` or ``queue`` may not veto it. ``wallet`` and ``recharge`` are not
-#: here: they are one provider's phrases and belong in ``quota_patterns``
-#: (KC-61), where the committed ``contest.ini`` already has them.
-#:
-#: Four of the vetoes below give way when the message also names the window
-#: (`_CONTEXT_WALL_RE`, `_WALL_VETO_RE`): ``Your prompt with 3 images exceeds
-#: the context window`` is the window, the images are only what the prompt
-#: carried. They are the phrases the other refusals speak in — an attachment
-#: cap counts images, a rate cap counts a token budget, a plan counts an
-#: allowance — and none of them names the window.
+#: Refusals with size words that are not size refusals: quota, rate, upload, output and attachment caps.
 _NOT_SIZE_RE = re.compile(
     r"rate.?limit|too\s+many\s+requests|quota|credit|balance|payment"
     r"|free.?tier|unauthori[sz]ed|forbidden|api.?key"
@@ -748,61 +642,27 @@ _NOT_SIZE_RE = re.compile(
     re.IGNORECASE,
 )
 
-#: The vetoes a named context wall overrides (`_not_a_size`). `attachment`
-#: stays a veto even there: `image attachment too large` names no window, so
-#: the wall never gets to decide it.
+#: Vetoes that a named context wall overrides; attachment never is.
 _WALL_VETO_RE = re.compile(
     r"\bimages?\b|token\s+budget|budget\s+exceeded|allowance", re.IGNORECASE)
 
-#: The size verbs `_SIZE_REFUSAL_RE` hunts for, alone of their head and noun.
-#: A1 left ``Your error message is too large to display`` out of the wording
-#: path on purpose: a bare ``too large`` needs the model's own noun, and a
-#: display is not one. The inferred reading must agree — it takes a message
-#: the wording path found size words in and declined, and the size there was
-#: the response's, a body's or an output's, never the session's.
+#: Size verbs that _SIZE_REFUSAL_RE looks for; a display error is not a model size (A1).
 _SIZE_VERB_RE = re.compile(
     r"\btoo\s+(?:long|large|big)\b|\bexceed\w*\b|\bover\s+the\s+(?:max\w*|limit)\b"
     r"|\btoo\s+many\s+(?:input\s+|prompt\s+)?tokens\b",
     re.IGNORECASE,
 )
 
-#: A provider refusal with no size words at all is still read as an overflow
-#: when the session it refused already holds at least this share of the
-#: model's known window: the session worked, it grew, and the request it grew
-#: into was turned away. The same percent also gates a loose memory record
-#: (round 149: `context_memory.size_of`). The round's own number is ``[contest]
-#: context_full_refusal_percent`` (`context_memory.full_refusal_percent`); this
-#: is its default, for a caller with no config.
+#: Share of the known window at which a size-less refusal still counts as an overflow (round 149).
 FULL_REFUSAL_SHARE = context_memory.DEFAULT_FULL_REFUSAL_PERCENT / 100.0
 
-#: A second overflow in one run whose request was smaller than this share of the
-#: first one's is not the window again: the compact (or the fresh session)
-#: left far less than the wall, and the provider still refused — so the
-#: refusal is about something else, and another compact would only loop.
+#: A repeat overflow much smaller than the first is not the window again; another compact would only loop.
 REPEAT_OVERFLOW_SHARE = 0.5
 
-#: The statuses a provider refuses a request's *size* with: a 400 that turned
-#: the request away and a 413, which is literally a size status. 401/403 are the
-#: key, 429 the rate, 5xx the provider itself, 422 a schema — none of them a
-#: size, and none of them may teach the memory.
-#:
-#: The tuple stays closed on those two on purpose (round 152): a provider that
-#: answers `prompt too long` with a 422 or a 500 is refusing the request's
-#: shape or itself, not naming a window. The wording path and the inferred
-#: reading both gate on this one tuple, so widening it would let a 422 or a 5xx
-#: teach the memory the size of a model nobody ever said it had. The three
-#: fixed spellings (`_OVERFLOW_RE`) read before the status is looked at: the
-#: provider named the overflow itself there, and a 5xx that still says
-#: `ContextOverflowError` is the overflow it always was.
+#: HTTP statuses that can be a size refusal (400, 413); auth, rate, server and schema errors never are (round 152).
 _SIZE_REFUSAL_STATUSES = (400, 413)
 
-#: A 400 that names its own cause names one that is not the session's size: a
-#: body that is not JSON, a tool call or a schema the model got wrong, a
-#: safety filter. Only the wordless reading (`_is_full_refusal`) asks — a
-#: message with size words is the wording path's, and TGI's ``Input validation
-#: error: … tokens must be <= 4096`` is a real overflow there, matched by the
-#: `tokens ... must be <= N` shape of `_SIZE_REFUSAL_RE`; a message that
-#: counts tokens (`_TOKENS_RE`) is never vetoed by it.
+#: A 400 that names another cause (bad body, schema, safety filter) is not a size refusal (wordless reading only).
 _REQUEST_FAULT_RE = re.compile(
     r"\bjson\b|tool[\s_-]*call|function[\s_-]*call|\bschema\b|invalid\s+(?:argument|parameter|request\s+format)"
     r"|content[\s_-]*(?:policy|filter|management)|moderation|\bflagged\b|\bsafety\b"
@@ -813,42 +673,25 @@ _CONTEXT_WALL_RE = re.compile(r"\bcontext\s+(?:limit|length|window|size)\b", re.
 _OUTPUT_CAP_RE = re.compile(r"`?max_tokens`?|output\s+tokens", re.IGNORECASE)
 _TOKENS_RE = re.compile(r"\btokens?\b", re.IGNORECASE)
 
-#: KC-56: a reply cut off at ``finish: "length"`` whose tokens reach this share
-#: of the model's ``limit.context`` filled the context window rather than the
-#: output budget. One constant for the runner: KC-39 §7's check before a rework
-#: into a full session is the same 90 %, and reads it from here.
+#: Reply cut at the length limit at this share of the context is a full context, not an output cap (KC-56).
 CONTEXT_FULL_SHARE = 0.9
 
-#: KC-67: the prompt kinds that go into a session which already holds a
-#: conversation — the kinds the runner may compact first. The first prompt of a
-#: run and the first prompt of the fresh session an overflow's work continued in
-#: both start empty, so a fill for either would be a read of the new session,
-#: not the one that overflowed.
+#: Prompt kinds that go into a session already holding a conversation; only these may be compacted first (KC-67).
 _CONTEXT_GATE_KINDS = ("rework", "continue", "retry")
 
-#: KC-69: characters per token when a summary's size has to be read off its
-#: text — Kilo writes a chunked summary with no token count. English prose and
-#: code run close to 4 on the tokenizers these providers use (100 KB of our
-#: source was 27.7k tokens on laguna and sensenova alike, 3.6 per token).
+#: Characters per token when a summary is sized from its text (KC-69).
 SUMMARY_CHARS_PER_TOKEN = 4
 
-#: KC-69: the reason a permission asked at or past ``compact_at_percent`` of the
-#: session's size is refused with. The model reads it as the tool's error, so it
-#: says what happens next: the turn should end, the runner compacts, and the
-#: work goes on after the summary.
+#: Refusal text for a permission asked when the session is full, so the turn ends and the runner compacts (KC-69).
 CONTEXT_FULL_REJECT = (
     "Refused: this session's context is nearly full. Do not retry this call. "
     "Stop here and end your turn; the session will be summarized and you will "
     "continue the same task right after the summary.")
 
-#: KC-69: how long after a refusal for a full context the turn is aborted —
-#: time for the reply itself to reach the server first.
+#: Seconds after a full-context refusal before the turn is aborted, so the reply can reach the server (KC-69).
 CONTEXT_ABORT_DELAY_SEC = 0.5
 
-#: KC-69: what a new session gets after a compact that failed or left the
-#: context still at or past the threshold — the summary the old session wrote,
-#: and the instruction to carry the task on rather than start it again. It goes
-#: after the round prompt, which the new session has never seen.
+#: What a new session gets after a failed or still-full compact: the old summary and an instruction to carry on (KC-69).
 CONTEXT_CONTINUE_NOTE = (
     "## You are continuing unfinished work\n\n"
     "Your previous session ran out of context and was closed. Below is the summary "
@@ -857,54 +700,34 @@ CONTEXT_CONTINUE_NOTE = (
     "only the files you need for the next step.\n\n"
     "### Summary of the previous session\n\n{summary}")
 
-#: KC-69: the continue sent into the same session after an overflow was
-#: compacted away — the summary is already the session's history.
+#: The continue sent after an overflow was compacted; the summary is already the history (KC-69).
 OVERFLOW_CONTINUE = (
     "The context overflowed and the session was summarized: the summary above is "
     "what you did so far. The task is not finished. Continue it from where you "
     "stopped; do not start over, and read only the parts of files you need now.")
 
-#: KC-40: the prompt the runner sends into a session that is at or past
-#: `summary_at_percent` of a known size and already holds an uncommitted diff —
-#: before a compact shrinks the history that explains the diff. It goes out as a
-#: prompt of its own, in the same session, and it is answered with `session.idle`
-#: like any other prompt: the model's reply is read with `_last_assistant_text`
-#: and copied out to `<agent>.summary.md`. No `{}` placeholders, no note appended:
-#: the runner asks the question and nothing else, so the reply is the answer.
+#: Prompt sent before a compact when a session with an uncommitted diff is near full; the reply is the summary (KC-40).
 SUMMARY_PROMPT = (
     "Your context is nearly full and nothing is committed yet. Before anything "
     "else, write a short summary here in the chat of exactly what you changed, "
     "why, and what is left to do. Do not modify any files in this reply.")
 
-#: KC-40: the line the next prompt of a session that just wrote its own summary
-#: carries, so the model does not restate the ticket it was just asked about.
-#: Appended to the prompt that follows the summary turn, instead of repeating the
-#: ticket.
+#: Note added to the prompt after a summary turn, so the model does not restate the ticket (KC-40).
 SUMMARY_CONTINUES_NOTE = (
     "Your summary above still applies: it is what this conversation is about. "
     "Carry it on, do not restate it, and do not re-read what it already covers.")
 
-#: KC-40: what a fresh session that replaced one whose summary prompt failed gets
-#: before its round prompt — the partial answer the failed attempt managed to
-#: write, if it wrote any. The session has never seen the ticket or the diff, so
-#: the note is followed by `round_prompt(dirty=)` with the `git status` lines.
+#: Note for a fresh session that replaced one whose summary failed; carries the partial answer, if any (KC-40).
 SUMMARY_FELL_BACK_NOTE = (
     "## A previous attempt at this ticket ran out of context\n\n"
     "A previous session working this ticket ran out of context and was closed. It "
     "left this note before it did; it may be incomplete, so treat it as a lead "
     "and re-read the files it names.\n\n{note}")
 
-#: KC-73: how long a session whose turn ended in a context overflow may stay
-#: silent before the runner takes it that Kilo is not working in it. Kilo
-#: 7.6.2 compacts an overflowed session by itself and goes on with the agent
-#: loop — round 78's agnes-2-0-flash: `session.error` and the first `busy` of
-#: that compact in the same 160 ms. A session that sends nothing in this window
-#: is left to the runner's own recovery, as before.
+#: Seconds a session with an overflowed turn may stay silent before the runner takes over (KC-73).
 OVERFLOW_SETTLE_SEC = 3.0
 
-#: KC-56: the continue sent into the same session when the last reply hit the
-#: *output* limit before any text or tool call — not `continue_message`, which
-#: is about uncommitted files, and the tree may well be clean.
+#: Continue message for a reply cut at the output limit with no text or tool call (KC-56).
 CUT_OFF_MESSAGE = (
     "Your last reply hit the output limit before any text or tool call. Think "
     "less, and make the next step a tool call. Your worktree and this "
@@ -1002,8 +825,7 @@ def _retryable(error, finished: int = 0) -> bool:
     if _RETRYABLE_MSG_RE.search(msg):
         return True
     if _PROVIDER_REJECTED_RE.search(msg):
-        # fail-open: a count that cannot be trusted is no count, which is §2's
-        # answer — an unreadable transcript cannot prove the session answered
+        # A count that cannot be trusted is no count, so an unreadable transcript proves nothing (§2).
         return isinstance(finished, int) and not isinstance(finished, bool) and finished > 0
     return False
 
@@ -1121,9 +943,7 @@ def _is_full_refusal(error, last_ok: int, size, quota_re=None,
         return False
     if _REQUEST_FAULT_RE.search(text) is not None and _TOKENS_RE.search(text) is None:
         return False
-    # A size word the wording path looked for and declined is not the session's
-    # size: a body, a display or an output. This reading exists for the message
-    # that says nothing about one.
+    # A size word that the wording path declined is not the session's size; this reading covers the rest.
     if _SIZE_VERB_RE.search(text) is not None and _SIZE_REFUSAL_RE.search(text) is None:
         return False
     return last_ok >= share * float(size)
@@ -1141,9 +961,7 @@ def _is_provider_unavailable(error) -> bool:
     return isinstance(error, dict) and error.get("name") == "ProviderUnavailable"
 
 
-#: KC-64: bynara answers an exhausted plan with the same "temporarily
-#: unavailable" 503 as a real outage (KC-61, 2026-09-25), so the end says
-#: where to look instead of guessing which one it was.
+#: Hint appended when a provider's 503 may be an exhausted plan rather than an outage (KC-61).
 _PLAN_HINT = " (can be an exhausted plan — check the provider's site)"
 
 
@@ -1226,9 +1044,7 @@ def classify_idle(backend: ContestBackend, session: SessionRef,
         break
 
     if last_assistant is None:
-        # no assistant message at all is a transcript this backend does not
-        # keep (an `OpenRouterBackend` agent, a scripted test double), not a
-        # model that said nothing: harvest decides, as for any unreadable read
+        # No assistant message means the backend keeps no transcript, not that the model was silent.
         return IdleKind.FINISHED
 
     info = last_assistant.get("info") or {}
@@ -1334,10 +1150,7 @@ def _context_budget(spec, records, config=None) -> tuple:
         context_memory.min_window(config),
         declared=limit, fallback=fallback, share_pct=share_pct)
     if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
-        # Round 145: Kilo's number is what the provider *declares*; an overflow
-        # the memory holds is what it *did*. zai declares 131 072 for
-        # glm-4.5-flash and refused it at 98 777 — the runner's compact at 80 %
-        # of 131 072 came after the wall. The smaller of the two is the window.
+        # The smaller of Kilo's declared limit and a remembered overflow is the window (round 145).
         if size is not None and int(size) < limit:
             return int(size), "remembered"
         return int(limit), "kilo"
@@ -1626,8 +1439,7 @@ class _RootsHold:
             try:
                 held = _SUITE_SLOTS.acquire(key, self._path, ceiling=self._budget, scoped=True)
                 self._slot_held = True
-                # the wait for the slot, not how long it is held — and a wait under
-                # a second is no wait: round 69 printed "held 0s" for every harvest
+                # Only a wait of a second or more is shown, since "held 0s" was misleading (round 69).
                 if held >= 1:
                     _log.info("%s: HARVESTING — waited %s for a suite slot",
                               self._agent, _age(held))
@@ -1689,23 +1501,47 @@ def _commits_above(ws: Workspace) -> int:
     return int(count) if count.isdigit() else 0
 
 
+#: One `{old => new}` group of git's brace form for a rename, `{}`-free on both
+#: sides so two groups in one path (`a/{b => c}/{d => e}/f`) each stand alone.
+_RENAME_BRACE = re.compile(r"\{([^{}]*?)\s*=>\s*([^{}]*)\}")
+
+
 def _split_numstat(line: str) -> tuple[int, int, str]:
     """`(added, deleted, path)` of one `git diff --numstat` line.
 
     `(0, 0, "")` for anything that is not a numstat line: a binary file is a
     `-` where a number belongs, a rename arrives as `path => path`, and an
-    empty output has no lines at all.
+    empty output has no lines at all. A rename's path field is read by
+    `_rename_target`, which expands git's brace form of it (C2).
     """
     parts = line.split("\t")
     if len(parts) != 3:
         return 0, 0, ""
-    # a binary file is `-` where a number belongs: the path still counts as a
-    # touched file, its lines do not
+    # A binary file shows "-" for its counts, but the path still counts as touched.
     try:
         added, deleted = int(parts[0]), int(parts[1])
     except ValueError:
         added, deleted = 0, 0
-    return added, deleted, parts[2].strip().rsplit(" => ", 1)[-1]
+    return added, deleted, _rename_target(parts[2].strip())
+
+
+def _rename_target(path: str) -> str:
+    """The new side of one `--numstat` rename field (C2).
+
+    Git spells a rename two ways, and the brace form is the one it uses by
+    default: when the two paths share a head or a tail it writes
+    `a/{b => c}/d.txt` (and `{a => b}/x` for a rename in the root), and only a
+    rename with nothing shared comes out as the plain `old => new`. Taking the
+    last ` => ` of a brace field verbatim yields `c}/d.txt` — a path that exists
+    in no tree — so every `{old => new}` group is replaced by its own new side
+    first. A group with no ` => ` in it is not a rename and is left as it is.
+    """
+    expanded = _RENAME_BRACE.sub(lambda m: m.group(2), path)
+    if expanded != path:
+        # An emptied side leaves a doubled or a leading slash: `a/{b => }/c.txt` is `a//c.txt`, and `{b => }/c.txt`
+        # is `/c.txt` — a file lifted out of a directory is `a/c.txt`, `c.txt`.
+        return re.sub(r"/{2,}", "/", expanded).lstrip("/")
+    return path.rsplit(" => ", 1)[-1]
 
 
 def _line_count(path: Path) -> int:
@@ -1744,7 +1580,8 @@ def _churn(ws: Workspace) -> tuple[int, int]:
     """
     def out(*args: str) -> str:
         try:
-            r = run_git(["git", "--no-optional-locks", *args], cwd=ws.path,
+            # core.quotepath=false: an untracked non-ASCII file was a quoted name, and its lines counted 0
+            r = run_git(["git", "--no-optional-locks", "-c", "core.quotepath=false", *args], cwd=ws.path,
                         timeout=_TICK_GIT_TIMEOUT_S, retries=_TICK_GIT_RETRIES)
         except Exception:  # noqa: BLE001 — a sample must never raise
             return ""
@@ -1804,11 +1641,7 @@ class AgentState(str, Enum):
     GAVE_UP = "GAVE_UP"
     STALLED = "STALLED"
     ERROR = "ERROR"
-    #: KC-42: the agent never touched a file at all — no edit, no commit, for
-    #: the whole first-touch budget, its nudges and its one session reset.
-    #: Terminal and never harvested: there is nothing to harvest, and the round's
-    #: table shows it apart from the stalls, because "three agents never
-    #: started" is a different failure from "three agents ran out of time".
+    #: Agent never touched a file in its first-touch budget; terminal, not harvested, shown apart from stalls (KC-42).
     DEAD = "DEAD"
 
     @property
@@ -1854,83 +1687,37 @@ class AgentRun:
     permissions: dict = field(default_factory=_counters)
     questions: int = 0
     last_error: str | None = None
-    #: KC-62: the run ended `ERROR` on Kilo's own store and its worktree still
-    #: holds uncommitted work, so `--resume` may restart it. `False` for every
-    #: other terminal state, and for a `state.json` written before the key.
-    #: KC-41 also commits that tree (so the round keeps the work either way) and
-    #: leaves this flag standing: a deadline commit is not a claim that the agent
-    #: finished, and restarting it is a separate decision from keeping its work.
+    #: Run ended ERROR on Kilo's store with uncommitted work, so --resume may restart it (KC-62).
     resumable: bool = False
     commit: str | None = None
-    #: KC-41: this run's entry was committed by the runner at the end of a
-    #: terminal turn, not by the model. `False` for every other run and for a
-    #: `state.json` written before the key. A `READY` reached from here is not the
-    #: same signal as a `READY` the model claimed and finished, so the flag rides
-    #: on the run, on the turn and in `turns.jsonl` for every consumer to read.
+    #: Set when the runner committed this run's entry at the end of a terminal turn, not the model (KC-41).
     deadline_commit: bool = False
     cost: float | None = None
     tokens: dict | None = None
-    #: KC-48: `[{"pid": int, "cmd": str}]` of what the reap found in the
-    #: worktree at the terminal state, absent from `state.json` when the agent
-    #: left nothing running.
+    #: Processes the reap found in the worktree at the terminal state (KC-48).
     reaped: list | None = None
-    #: KC-9: the per-attempt counter of continues sent into the same session.
-    #: Bounded by `max_continues_per_attempt`; reset on rework and resume.
+    #: Per-attempt count of continues sent into the same session; reset on rework and resume (KC-9).
     continues: int = 0
-    #: KC-39: how many sessions this run has opened in all — the first one
-    #: `run_agent` made and every replacement since. What `state.json` and
-    #: SUMMARY's `sessions` column print, so the operator sees which agent spent
-    #: a second session. `0` for a run that opened none, and for a `state.json`
-    #: written before the key.
+    #: Sessions this run has opened in all, shown in SUMMARY's sessions column (KC-39).
     sessions: int = 0
-    #: KC-39: how many of them the attempt that is running now has opened.
-    #: `max_sessions_per_attempt` is the ceiling on *this* count, not on
-    #: `sessions`: a rework starts a new attempt and reuses the session, so the
-    #: allowance comes back with it. Reset to 1 at a rework, `0` for a run that
-    #: opened no session yet.
+    #: Sessions the running attempt has opened; reset on rework, capped by max_sessions_per_attempt (KC-39).
     sessions_this_attempt: int = 0
-    #: KC-39: `_diff_signature` of the worktree at the *previous* continue of
-    #: this attempt, so a continue may be told apart from the one before it by
-    #: the diff's content, not by its file list. Cleared on rework, on a KC-39
-    #: reset and on a resume, the way `continues` is; `""` for every other run.
+    #: Diff signature at the previous continue of this attempt, to tell a continue from the one before (KC-39).
     last_diff_signature: str = ""
-    #: KC-42: the first-touch nudge already spent and the session already reset
-    #: for this attempt — so the budget of `first_touch_nudges` is *per attempt*,
-    #: the way `continues` is, and not per turn. Without that the sequence would
-    #: be nudge, reset, nudge again in the new session, DEAD, and a round that
-    #: asked for one nudge would send two. Cleared on rework, beside
-    #: `continues` and `last_diff_signature`.
+    #: First-touch nudge and reset already spent for this attempt, so the budget is per attempt (KC-42).
     first_touch_nudges_used: int = 0
     first_touch_resets: int = 0
-    #: KC-10: how many times this run's session was summarised — one per
-    #: ``POST /session/{id}/summarize`` that went idle. ``0`` for every run that
-    #: never filled a window, and for a `state.json` written before the key.
-    #: `turns.jsonl` carries the same fact per turn as `compacted`.
+    #: Times this run's session was summarised by a compact; turns.jsonl has the same per turn (KC-10).
     compactions: int = 0
-    #: KC-40: the latest summary the runner asked for before a compact, the text
-    #: the session wrote in chat. Also in `<out_dir>/<agent>.summary.md`, which
-    #: accumulates the whole chain, so `run.summary` is only the newest of it.
-    #: `""` for every run that was never near a full context, that had a clean
-    #: tree, and for a `state.json` written before the key.
+    #: Latest summary asked for before a compact; the full chain is in the summary file (KC-40).
     summary: str = ""
-    #: KC-40: how many summaries the runner captured for this run — one per ask
-    #: that got a non-empty reply, so a run asked twice shows two, and `summaries`
-    #: and `summary` can be told apart. ``0`` for every run that never earned one.
+    #: Summaries captured for this run, one per non-empty reply (KC-40).
     summaries: int = 0
-    #: KC-40: the `run.attempt` that already asked for a summary. ``-1`` means
-    #: never, which is what a new run and a `state.json` written before the key
-    #: both read back as. Cleared on a restart (`_plan`), with `continues`; left
-    #: alone on a rework, which keeps the session and the fill that went with it.
+    #: Attempt that already asked for a summary; -1 means never. Kept on a rework (KC-40).
     summary_attempted_at_attempt: int = -1
-    #: KC-40: the session that last answered the summary ask, ``""`` when none did.
-    #: Remembered so a reset that opens a fresh session may ask again — the new
-    #: session is a new history, and the one ask is per session, not per attempt —
-    #: while a second crossing of the threshold inside one session is not asked.
+    #: Session that last answered the summary ask; a fresh session may be asked again (KC-40).
     summary_session_id: str = ""
-    #: KC-43: the paragraph this run's first prompt carries when it is a leg after
-    #: the first — which leg it is, the instruction to continue, the records the
-    #: earlier legs left. `""` for every run of a one-leg round; cleared once the
-    #: first prompt has taken it, and left out of `state.json` when empty.
+    #: Paragraph for a later leg's first prompt: leg number, continue instruction and earlier records (KC-43).
     leg_note: str = ""
 
     @property
@@ -1946,10 +1733,7 @@ class AgentRun:
         # KC-43: a round of one leg writes the state.json it always wrote
         if not data.get("leg_note"):
             data.pop("leg_note", None)
-        # KC-41: `deadline_commit` is written whenever the run has one, `true` or
-        # `false`, so `state.json` says plainly whether the entry was the model's
-        # claim or the runner's commit. Older files without the key read back as
-        # `False` in `from_dict`, which is what they were.
+        # deadline_commit is always written, so state.json says whether the entry was the model's or the runner's (KC-41).
         data["deadline_commit"] = bool(self.deadline_commit)
         return data
 
@@ -2023,19 +1807,12 @@ class RoundState:
     base_sha: str
     started_at: float
     agents: list = field(default_factory=list)
-    #: KC-43: which leg of the round this is (1, 2, ...), or `None` for a round
-    #: that is not a relay — the state.json every round wrote before the ticket.
+    #: Leg number of this round (1, 2, ...), or None for a round that is not a relay (KC-43).
     leg: int | None = None
-    #: KC-44: how many legs the round was chosen for and where the number came
-    #: from — `flag`, `size` or `config` — on a relay's state only. `None`
-    #: both: a round of one leg is the state KC-43 kept byte for byte, and so
-    #: writes no legs keys, and so does a state.json written before KC-44.
+    #: Legs chosen for a relay and where the number came from (flag, size or config); absent for one leg (KC-44).
     legs: int | None = None
     legs_from: str | None = None
-    #: KC-81: the last silent-server warning, as `{"seconds": window, "pid": n}`
-    #: — written by the heartbeat when it names the server as hung, so
-    #: `contest status` can show it. `None` for a round that never warned
-    #: (and for a state.json written before the key).
+    #: Last silent-server warning, written by the heartbeat so contest status can show it (KC-81).
     server_silent: dict | None = None
 
     @property
@@ -2049,14 +1826,12 @@ class RoundState:
                 "started_at": self.started_at, "agents": [run.to_dict() for run in self.agents]}
         if self.leg is not None:
             data["leg"] = self.leg
-        # KC-44: the chosen leg count and its source, on a relay's state only —
-        # a round of one leg is the state KC-43 kept byte for byte
+        # The leg count and its source are kept only on a relay's state; one leg keeps the old bytes (KC-44).
         if self.legs is not None:
             data["legs"] = self.legs
         if self.legs_from:
             data["legs_from"] = self.legs_from
-        # KC-81: only a round that actually warned carries the key — every
-        # earlier state.json is byte for byte what it was.
+        # Only a round that warned carries server_silent; every older state.json is unchanged (KC-81).
         if self.server_silent is not None:
             data["server_silent"] = self.server_silent
         return data
@@ -2090,8 +1865,7 @@ class RoundState:
             # KC-10: the context the run ended in, and how many compacts it took
             "fill": run.last_fill(),
             "compactions": run.compactions,
-            # KC-40: the summary the runner asked for before a compact, so the
-            # operator sees which agent wrote one without opening its file
+            # The summary is shown so the operator sees which agent wrote one (KC-40).
             "summary": run.summary,
             "summaries": run.summaries,
             "commit": run.commit,
@@ -2100,22 +1874,11 @@ class RoundState:
         } for run in self.agents]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the prompt
-# ─────────────────────────────────────────────────────────────────────────────
+# The prompt
 
-# KC-47 §5: `AGENT_TEST_TIMEOUT_MS` is the figure `_PROMPT` tells the agent to
-# give its own test run. It is the `kilo_client` constant, so the number the
-# prompt asks for and the number the silence clock reasons about cannot drift
-# apart. It must stay below `turn_timeout_sec` — `tests/test_contest_runner.py`
-# asserts it does, against the committed `contest.ini`.
+# AGENT_TEST_TIMEOUT_MS is shared with the Kilo client, so the prompt and the silence clock agree (KC-47).
 
-#: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md` §Stage 1, "PROMPT STARTS …
-#: PROMPT ENDS", with the blockquote markers dropped and `<YOUR NAME>` as
-#: `{name}`. A module string on purpose: the runbook is documentation and may
-#: drift; the text the agents are scored against must not. `{scratch_note}` is
-#: KC-53's scratch paragraph: `""` when the round names no scratch root, so a
-#: prompt without one is this text unchanged.
+# Prompt text the agents are scored on; {scratch_note} is the optional scratch-dir paragraph (KC-53).
 _PROMPT = """\
 You are implementing one ticket from an epic round. Every agent in this round
 is implementing the same ticket against the same starting tree; the best
@@ -2180,20 +1943,13 @@ rejection is final for that command — do not retry it.
 """
 
 
-#: KC-59: the sentence appended when the round derived a scratch dir for the
-#: agent — ``<tmp_root>/<agent>/``, the one place outside the worktree the
-#: policy lets it write and no other agent's. ``{tmp_dir}`` is that dir; an
-#: empty *tmp_dir* appends nothing, so a prompt without one is today's text.
+#: Sentence added when the round gives an agent a scratch dir; empty means no sentence (KC-59).
 _SCRATCH_DIR_NOTE = (
     "\n\nYour scratch dir is {tmp_dir} — put temporary files there. The policy "
     "allows that dir and not the other agents'."
 )
 
-#: KC-53: the root whose per-agent folder the prompt may name when the round
-#: derived no KC-59 scratch dir. The ticket sends the agents to
-#: `/tmp/contest/<agent>/`, so that is the one root the fallback may come from —
-#: any other root earns only its place in the list. Compared the way
-#: `tmp_root_dirs` reads a root, so `/tmp/contest/` counts as `/tmp/contest/*`.
+#: Root whose per-agent folder the prompt may name when no scratch dir was derived (KC-53).
 _CONTEST_ROOT = "/tmp/contest"
 
 
@@ -2284,8 +2040,7 @@ def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: st
     return text
 
 
-#: How many `git status` lines `continue_message` lists before it says "and N more":
-#: a tree with thousands of untracked files must not turn a nudge into a megabyte prompt.
+#: How many git status lines continue_message lists before it says "and N more".
 _DIRTY_LINES_SHOWN = 40
 
 
@@ -2341,8 +2096,7 @@ def _dirty_tree(ws: Workspace) -> str:
     tree with unstaged edits starts with a space that is part of the status.
     """
     try:
-        # --no-optional-locks: status only reads, so it never takes the index
-        # lock an agent's own `git add` in this worktree may need at that moment
+        # --no-optional-locks: status only reads, so it never takes the index lock an agent may need.
         r = run_git(["git", "--no-optional-locks", "status", "--porcelain",
                      "--untracked-files=all"], cwd=ws.path)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -2389,8 +2143,7 @@ def _diff_signature(ws: Workspace) -> str:
     try:
         staged = run_git(["git", "add", "-A", "-N"], cwd=ws.path)
         if staged.returncode != 0:
-            # the untracked files would be missing from the diff, and a diff that
-            # can never see them is a constant that looks like a repeat
+            # Untracked files would be missing from the diff, so such a diff is never a repeat.
             return ""
         diff = run_git(["git", "diff", "HEAD", "--no-color", "--", ":!runs"], cwd=ws.path)
     except (OSError, subprocess.SubprocessError):
@@ -2403,25 +2156,16 @@ def _diff_signature(ws: Workspace) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
-#: KC-41: the progress columns `scripts/append_task.py` writes, in the same
-#: order. The deadline row is that script's row, written by the runner.
+#: Progress columns of scripts/append_task.py, in order; the deadline row is written by the runner (KC-41).
 _PROGRESS_COLUMNS = "ticket,finding,outcome,commit,note"
 
-#: KC-41: what a deadline commit is called in the log and in the commit subject.
-#: The word `WIP` is the model's own: the runner is not claiming the work is
-#: finished, only that it is the work the turn left behind.
+#: What a deadline commit is called in the log; WIP is the model's word, not the runner's claim (KC-41).
 _DEADLINE_PREFIX = "WIP (deadline commit,"
 
-#: KC-41: a sha is a sha, and only a sha may go in the progress row: `HEAD`,
-#: `@`, a branch and a tag all resolve in git, so a name in that cell would
-#: stand for a different commit on every branch it is read from. The same shape
-#: `harvest` checks a claim against, kept in step by hand — it is one regex, and
-#: the two must agree on what "a commit" is written as.
+#: Only a sha may go in the progress row; the same shape harvest checks, kept in step by hand (KC-41).
 _SHA_RE = re.compile(r"[0-9a-f]{7,40}", re.IGNORECASE)
 
-#: KC-41: how long the reason in a deadline commit's subject may be. A commit
-#: subject is a header line — long ones are truncated by git itself, silently, so
-#: the runner cuts it to something git will store whole and read back.
+#: Max length of the reason in a deadline commit subject, so git stores it whole (KC-41).
 REASON_LIMIT = 120
 
 
@@ -2450,8 +2194,7 @@ def _write_progress_row(ws: Workspace, ticket_path, sha: str, *, note: str) -> b
     """
     path = ws.progress_csv
     ticket = Path(ticket_path).name
-    # the same quoting `csv` uses for a field with a comma or a quote in it; a
-    # ticket name has neither, and a note may have either
+    # Quoted like csv does for a comma or a quote; a ticket name has neither, a note may.
     def cell(text: str) -> str:
         if any(c in text for c in (",", '"', "\n", "\r")):
             return '"' + text.replace('"', '""') + '"'
@@ -2577,12 +2320,7 @@ def _deadline_commit(ws: Workspace, *, reason: str, ticket=None) -> str | None:
         subject += f": {name}"
     body = _deadline_body(reason, who, name)
     try:
-        # Round 48: `git add -A -- ':!runs'` exits 1 ("paths are ignored") as
-        # soon as `runs/` exists and is `.gitignore`d — the live shape, where the
-        # agent's own PROGRESS.csv sits there — so every deadline commit of the
-        # round returned None and six STALLED trees were left staged, harvested
-        # by nobody. Any pathspec that names an ignored path fails the same way,
-        # so `runs/` is added with the rest and taken out of the index after.
+        # runs/ is added with the rest and removed from the index after, since git add fails on ignored paths (round 48).
         add = run_git(["git", "add", "-A"], cwd=ws.path)
         if add.returncode != 0:
             _log.warning("%s: git add for the deadline commit exited %d: %s",
@@ -2593,10 +2331,7 @@ def _deadline_commit(ws: Workspace, *, reason: str, ticket=None) -> str | None:
             _log.warning("%s: could not keep runs/ out of the deadline commit (exit %d): %s",
                          who, unstage.returncode, _brief(unstage.stderr or unstage.stdout))
             return None
-        # -c rather than a config write: the worktree's own identity is the
-        # agent's business, and this commit must not need one to exist. --no-verify
-        # for the same reason in the other direction — a hook the agent's own
-        # work trips must not cost the round the commit that keeps that work.
+        # Commit with the runner's identity and --no-verify, so a hook cannot block the round's commit.
         commit = run_git(["git", "-c", "user.name=contest runner",
                           "-c", f"user.email={DEADLINE_COMMIT_EMAIL}",
                           "-c", "commit.gpgsign=false",
@@ -2644,9 +2379,7 @@ def _deadline_note(reason: str, agent: str, ticket: str) -> str:
             + "by the runner (KC-41), not claimed by the model")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# artifacts — every write fail-open
-# ─────────────────────────────────────────────────────────────────────────────
+# Artifacts: every write is fail-open
 
 def _append_jsonl(path: Path, entry: dict) -> None:
     try:
@@ -2718,9 +2451,7 @@ def _abort_quietly(backend: ContestBackend, session: SessionRef) -> None:
         _log.warning("abort(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the wait, with the round's stall edge
-# ─────────────────────────────────────────────────────────────────────────────
+# The wait, with the round's stall edge
 
 def _no_idle_error(config: ContestConfig, elapsed: float,
                    clock: "_TurnClock | None") -> str:
@@ -2769,8 +2500,7 @@ class _TurnClock:
     last_sample: tuple[int, int] = (0, 0)
     last_change_at: float = 0.0
     granted: float = 0.0
-    #: KC-66: the seconds this turn got back for the gate's own waits, and the
-    #: tries those waits cost.
+    #: Seconds this turn got back for the gate's own waits, and the tries those waits cost (KC-66).
     gate_added: float = 0.0
     gate_attempts: int = 0
     #: KC-58: the seconds this turn got back for its suite-slot waits.
@@ -2840,8 +2570,7 @@ def _turn_deadline(run: AgentRun, config: ContestConfig, working=None) -> _TurnC
     """
     extend = float(getattr(config, "turn_extend_sec", 0) or 0)
     clock = _TurnClock(on_deadline=None)
-    # `turn_extend_sec = 0` arms nothing and reads no git — today's path, for
-    # real, not just in the shape of the call.
+    # With turn_extend_sec = 0 nothing is armed and no git is read, as before.
     if extend <= 0:
         return clock
     sample = _churn(run.workspace)
@@ -2854,8 +2583,7 @@ def _turn_deadline(run: AgentRun, config: ContestConfig, working=None) -> _TurnC
 
     def on_deadline(elapsed: float) -> float | None:
         current = _churn(ws)
-        # against the *previous sample*, not the last granted one: a churn that
-        # stops after a refused read is what `unchanged for` has to show.
+        # The churn is compared with the previous sample, so a churn that stopped is seen.
         if current != clock.last_sample:
             clock.last_change_at = float(elapsed)
         clock.last_sample = current
@@ -2886,13 +2614,9 @@ def _turn_deadline(run: AgentRun, config: ContestConfig, working=None) -> _TurnC
     return clock
 
 
-#: KC-42: how often the first-touch watch asks the worktree whether anything has
-#: happened. Short enough that a deadline is not overshot by a wide margin on a
-#: loaded box, long enough that an eight-agent round is not running `git status`
-#: for an agent that is already working.
+#: How often the first-touch watch checks the worktree (KC-42).
 FIRST_TOUCH_POLL_SEC = 5.0
-#: KC-75: how long a session must stay silent after an idle for no queued
-#: nudge to be behind it — Kilo opens a queued prompt in the same millisecond
+#: Silence after an idle that means no queued nudge is behind it (KC-75).
 QUEUED_NUDGE_QUIET_SEC = 5.0
 
 
@@ -2935,16 +2659,9 @@ class _FirstTouch:
         self._nudge, self._reset, self._kill = nudge, reset, kill
         self.budget = float(budget)
         self.nudges = max(0, int(nudges))
-        #: KC-39's `max_sessions_per_attempt`, the same ceiling the repeated-diff
-        #: reset spends: a first-touch reset is a session like any other, and a
-        #: round that budgeted one session per attempt must not acquire a second
-        #: one here. 0 or already spent → the escalation is unavailable and the
-        #: turn goes straight to `DEAD`.
+        #: Ceiling shared with max_sessions_per_attempt; a first-touch reset is a session too (KC-39, KC-42).
         self.ceiling = max(0, int(ceiling))
-        #: What this turn's watch did, in order — `nudged` the prompts, `dead`
-        #: whether it ended the turn. Both are *this turn's*; the attempt's
-        #: running totals are on the run, because the budget is per attempt and
-        #: a fresh session must not be handed a second nudge.
+        #: What this turn's watch did (nudged, dead); the attempt's totals live on the run (KC-42).
         self.nudged = 0
         self.dead = False
         self._touched = False
@@ -3015,13 +2732,11 @@ class _FirstTouch:
 
     def _watch(self) -> None:
         while not self._stop.is_set():
-            # the stop wins even when the deadline has just passed, so a turn
-            # that ended on its own never gets a nudge after the fact
+            # The stop wins over the deadline, so a turn that ended on its own is never nudged afterwards.
             if self._stop.wait(timeout=max(0.2, FIRST_TOUCH_POLL_SEC)):
                 return
             if self._has_touched():
-                # disarmed for good: a `git checkout` by the model does not
-                # resurrect the deadline, and a rework starts its own watch
+                # Disarmed for good: a git checkout by the model does not restore the deadline.
                 self._touched = True
                 return
             if time.monotonic() < self._deadline:
@@ -3049,8 +2764,7 @@ class _FirstTouch:
         if spent < self.nudges:
             self.run.first_touch_nudges_used = spent + 1
             self.nudged += 1
-            # read before the re-arm below, which moves the origin `elapsed`
-            # measures from: after it, every nudge said "0s into this turn"
+            # Read before the re-arm moves the origin, so each nudge reports its real time into the turn.
             elapsed = self.elapsed()
             self._deadline = time.monotonic() + self.budget
             _log.info("%s: nothing modified after %s (nudge %d of %d)",
@@ -3092,12 +2806,7 @@ class _FirstTouch:
         return False
 
 
-#: KC-42: the nudge sent into a turn that has not written anything. Plain text,
-#: no ticket repeated, the same shape as KC-9's `CONTINUE_PROMPT`: the state
-#: named plainly, a list of what the ticket declares, and no critique of how
-#: the agent has spent the time — the runner cannot tell whether it is reading
-#: the ticket, stuck in a sub-agent, or looping on a refused provider, so any
-#: guess would be a guess in the model's face.
+#: Nudge sent into a turn that wrote nothing: plain text, no critique, the ticket's declared items (KC-42).
 FIRST_TOUCH_NUDGE = (
     "Nothing has been modified in this worktree yet — {elapsed} into this turn and "
     "not one file changed and no commit made. This ticket asks for changes to:\n\n"
@@ -3197,19 +2906,14 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
         wait_kwargs["since"] = since
     if quiet_after is not None:
         wait_kwargs["quiet_after"] = quiet_after
-    # KC-61: a retry scheduled further out than the bound is a quota reset, not
-    # a blip — the agent ends `ERROR provider_quota` at once instead of waiting
-    # for the silence clock. 0 arms nothing, which is today's behaviour.
+    # A retry scheduled past the bound is a quota reset; the agent ends at once (KC-61).
     max_retry_wait = float(getattr(config, "provider_retry_max_wait_sec", 0) or 0)
     if max_retry_wait > 0:
         wait_kwargs["max_retry_wait"] = max_retry_wait
     quota_re = _quota_re(config)
     if quota_re is not None:
         wait_kwargs["quota_re"] = quota_re
-    # KC-64: N retries in a row, with no model output between them, end the
-    # turn instead of Kilo's own retry loop resetting the silence clock for an
-    # hour. 0, a missing key or a negative value arms nothing — today's
-    # behaviour, bounded only by the turn deadline.
+    # N retries in a row with no output end the turn; 0 or a missing key turns it off (KC-64).
     attempts = int(getattr(config, "provider_retry_max_attempts", 0) or 0)
     if attempts > 0:
         wait_kwargs["max_retry_attempts"] = attempts
@@ -3251,8 +2955,7 @@ def _compact_session(backend: ContestBackend, session: SessionRef, config: Conte
         return False
 
 
-#: KC-40: `<agent>.summary.md`'s title line, written only when the file is new,
-#: so a second session of the same attempt appends instead of repeating it.
+#: The title line of <agent>.summary.md, written only for a new file, so later sessions append.
 SUMMARY_FILE_TITLE = (
     "# The agent's own account of its uncommitted work\n\n"
     "Written in chat by {agent} before its context was compacted, one section per "
@@ -3343,25 +3046,18 @@ def maybe_summarize_before_compact(backend: ContestBackend, session: SessionRef,
         return "", "", ""
     if (getattr(run, "summary_attempted_at_attempt", -1) == run.attempt
             and getattr(run, "summary_session_id", "") == session_id):
-        # already asked in this session: a second crossing of the threshold in
-        # the same history is not asked twice. A different session in the same
-        # attempt is a different history, and it is asked — the file appends
+        # One summary per session: a second crossing in the same history is not asked again (KC-40).
         return "", "", ""
     if not (isinstance(fill, (int, float)) and not isinstance(fill, bool)):
         return "", "", ""
     if fill < percent:
         return "", "", ""
     if fill >= 100:
-        # already at or past its own size: a prompt into this session overflows
-        # before it can answer, so the ask would only turn the turn's overflow
-        # into a summary failure and hand the work to a fresh session that has
-        # just as little. KC-69's compact is the edge that can still free it —
-        # it runs now, and the ask is left to a session that still fits.
+        # No summary ask at or past 100% fill; the compact runs first and the ask waits (KC-69).
         return "", "", ""
     dirty = _summary_read_tree(ws)
     if not dirty:
-        # nothing uncommitted: KC-10's plain compact is the right answer, and
-        # there is nothing to explain
+        # Nothing uncommitted means the plain compact is right, with nothing to explain.
         return "", "", ""
 
     run.summary_attempted_at_attempt = run.attempt
@@ -3382,9 +3078,7 @@ def maybe_summarize_before_compact(backend: ContestBackend, session: SessionRef,
         turn["summary_sec"] = round(time.monotonic() - started, 1)
         status = getattr(idle, "status", "") or ""
         text = _last_assistant_text(backend, session)
-        # the reply is what the ask is judged by, the ending only qualifies it:
-        # an idle turn with words is a summary, one without is an empty reply,
-        # and an error or silence keeps whatever it wrote as a partial
+        # The reply is judged by its ending: idle with text is a summary, silence keeps the partial (KC-40).
         outcome = "captured" if (status == "idle" and text) else (
             "empty" if status == "idle" else ("timeout" if status == "timeout" else "error"))
     except Exception as exc:  # noqa: BLE001 — a summary that cannot be asked is no ask
@@ -3395,9 +3089,7 @@ def maybe_summarize_before_compact(backend: ContestBackend, session: SessionRef,
         return "", "", ""
     turn["summary_outcome"] = outcome
     if text:
-        # written out either way: a captured summary and the partial one the
-        # attempt left before it ran out of context both belong in the file, and
-        # both are what a fresh session gets carried into
+        # Captured and partial summaries are both written to the file (KC-40).
         run.summary = text
         if outcome == "captured":
             run.summaries += 1
@@ -3408,9 +3100,7 @@ def maybe_summarize_before_compact(backend: ContestBackend, session: SessionRef,
     return text, outcome, (SUMMARY_FELL_BACK_NOTE.format(note=text) if text else "")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-48: the reap — an ended agent leaves no process in its worktree
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-48: the reap leaves no process in an ended agent's worktree
 
 def _stat_fields(proc_root: str, pid: int):
     """`(state, ppid)` off `/proc/<pid>/stat`, or `None` when it cannot be read.
@@ -3635,8 +3325,7 @@ def _reap_worktree(worktree, *, name: str, grace: float | None = None) -> list:
                 continue
             if _proc_uid(proc_root, pid) != ours:
                 continue
-            # Already dead: its parent only has to wait on it, and signalling or
-            # recording it would say we reaped something we never touched.
+            # Already dead: only its parent has to wait on it, and it is not recorded as reaped.
             if not _alive(proc_root, pid):
                 continue
             found.append((pid, _proc_cmd(proc_root, pid)[:_REAP_CMD_CHARS]))
@@ -3655,11 +3344,7 @@ def _reap_worktree(worktree, *, name: str, grace: float | None = None) -> list:
     killed = _wait_for_exit(proc_root, [pid for pid, _ in found], _grace(grace))
     for pid in killed:
         _signal_pid(pid, signal.SIGKILL)
-    # `kill` returns before the process is gone — the KILL is delivered, not yet
-    # acted on — so the reap waits for it: whoever reads the tree next (the
-    # salvage harvest, the export) must not find the stray still running. KILL
-    # cannot be ignored, so this ends in milliseconds; the cap is for a process
-    # stuck in uninterruptible sleep, which is logged rather than waited out.
+    # Wait for the KILLed process to exit, so the harvest does not see it still running (KC-48).
     stuck = _wait_for_exit(proc_root, killed, _REAP_KILL_WAIT_SEC)
     if stuck:
         _log.warning("%s: %d reaped %s still running %gs after SIGKILL: %s", name,
@@ -3708,25 +3393,15 @@ def _reap_round_worktrees(runs: list, grace: float | None = None) -> int:
     return total
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-58: a whole pytest root takes one of the round's suite slots
-# ─────────────────────────────────────────────────────────────────────────────
+# KC-58: a whole pytest root takes one suite slot
 
-#: The poll that decides a holder's pytest is gone and moves a slow holder out
-#: of the queue. Read at the call, so a test shortens it by patching the name.
+#: The poll that finds a holder's pytest gone and moves a slow holder out of the queue.
 _SUITE_POLL_SEC = 3.0
 
-#: The ceiling's default, in seconds — round 92's 33 minute suite is the reason
-#: there is a ceiling at all.
+#: Default ceiling for a suite holding a slot, in seconds (round 92).
 _SUITE_CEILING_SEC = 900.0
 
-#: How long a fresh holder keeps its slot before the scan has seen its pytest.
-#: The slot is taken *before* the reply goes out, so the first poll can run
-#: before Kilo has even spawned the shell — without this, that poll reads "no
-#: pytest" and frees the slot a second after granting it. Once the scan has seen
-#: the process, only the process decides; a command that never starts one (it
-#: failed at once, or the "pytest" was an alias) gives the slot back after this.
-#: Read at the call, so a test can shorten it.
+#: Seconds a fresh suite holder keeps its slot before the scan has seen its pytest (KC-58).
 _SUITE_START_GRACE_SEC = 30.0
 
 
@@ -4070,8 +3745,7 @@ class _SuiteSlots:
                 pass
 
 
-#: The round's suite slots. `_harvest` takes one as well, so the judge's roots
-#: and an agent's own `pytest tests -n 4` never run beside each other.
+#: The round's suite slots; the harvest takes one too, so roots never run side by side.
 _SUITE_SLOTS = _SuiteSlots()
 
 
@@ -4164,9 +3838,7 @@ def _is_working(working) -> bool:
         return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# one agent
-# ─────────────────────────────────────────────────────────────────────────────
+# One agent
 
 def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
               config: ContestConfig, ticket_path: Path, out_dir: Path,
@@ -4208,62 +3880,36 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     out_dir = Path(out_dir)
     ws, spec = run.workspace, run.agent
     agent_dir = out_dir / spec.name
-    # KC-59: the scratch dir is per agent. This agent's own dir is allowed and
-    # named in its prompt; the other agents' dirs are forbidden ground for it, so
-    # a write into one of them is a mechanical reject rather than a gate call.
-    # `getattr` for both: a config without a `tmp_roots` key degrades to "no
-    # scratch dir" instead of raising into a round.
+    # Each agent gets its own scratch dir, allowed to it and forbidden to the others (KC-59).
     tmp_roots = getattr(config, "tmp_roots", ()) or ()
     scratch_dir = agent_tmp_dir(tmp_roots, spec.name)
     scratch_arg = str(scratch_dir) if scratch_dir is not None else ""
     scratch_others = tuple(
         d for d in agent_tmp_dirs(tmp_roots, config.agents) if d.name != spec.name
     )
-    # KC-65: the round's own $TMPDIR is scratch for this agent too — the glob
-    # below, so a tmp_path fixture is not a gate call it did not cost under /tmp.
+    # The round's TMPDIR is scratch for the agent too, so tmp_path fixtures are not gate calls.
     agent_tmp_glob = f"{agent_tmp}/*" if agent_tmp is not None else ""
     session: SessionRef | None = None
-    # KC-39: the ids this run has already recorded with `_record_session`, so a
-    # session replaced mid-run is counted once and `finally` does not count the
-    # last one again
+    # Sessions already counted with _record_session, so a replaced one is counted once (KC-39).
     recorded_sessions: set = set()
     stalled: list = []          # the reason, once the runner's stall edge fired
     time_up: "threading.Timer | None" = None   # the agent's hard limit, `agent_max_sec`
-    # KC-58: `[seconds left, as of monotonic]` on that limit once armed — what a
-    # pause for the suite queue stops and a resume starts again from
+    # [seconds left, as of monotonic] once armed; a pause for the suite queue stops it and resume restarts it (KC-58).
     time_left: list = []
     questions_this_turn = [0]
-    # KC-69: a permission was refused because the context was full — the next
-    # prompt compacts first, whatever the size's source
+    # A permission refused for a full context means the next prompt compacts first (KC-69).
     context_full = [False]
-    # KC-40: the note the captured summary leaves for the next prompt of this
-    # session — `SUMMARY_CONTINUES_NOTE`, set by `_context_gate` when it just
-    # asked the question. Cleared on every prompt, so a note is never carried
-    # twice; `run.summary` carries the text itself into any fresh session.
+    # Note for the next prompt of this session after a captured summary (KC-40).
     carry_note = [""]
-    # KC-69: the pending abort of a turn refused for a full context — cancelled
-    # when the turn ends first, so it can never hit the compact that follows
+    # A pending abort for a full-context refusal is cancelled when the turn ends first (KC-69).
     context_stopper: list = []
-    # round 49: set when that abort was actually sent in this turn — the
-    # `MessageAbortedError` it may bring back is the runner's own stop, not
-    # Kilo's shutdown, so the turn ends as a plain idle and the next prompt
-    # compacts
+    # Set when the runner itself aborted the turn, so the stop is read as a plain idle (round 49).
     context_aborted = [False]
-    # set while the summary is being asked before a compact: a tool the model
-    # tries in that reply is still refused for a full context, but the stop is
-    # not armed — it would abort the very reply that carries the summary when
-    # that reply takes longer than CONTEXT_ABORT_DELAY_SEC
+    # Set while the summary is asked, so the tool stop is not armed for that reply (KC-40).
     summary_asking = [False]
-    # KC-42: what the first-touch watch has decided for the turn in flight —
-    # "" while the turn is ordinary, `"reset"` when the watch wants a fresh
-    # session, `"dead"` when the turn is over. Set on the watch's thread, read
-    # on this one right after the wait returns: a terminal state and a
-    # `POST /session` are this thread's to make, so the watch only asks, and it
-    # never writes the state of another thread.
+    # The first-touch watch's decision for this turn; the turn's own thread acts on it (KC-42).
     escalate = [""]
-    # KC-58: the round's suite slots, armed once per agent — the queue is shared
-    # round-wide, so every agent answers from one semaphore, and a config that
-    # names no key arms the ticket's default of one.
+    # Suite slots: one semaphore round-wide, one slot by default (KC-58).
     try:
         _SUITE_SLOTS.configure(_suite_slots_armed(config))
     except Exception:  # noqa: BLE001 — an unarmed queue answers every ask
@@ -4279,10 +3925,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             run.last_error = error
         detail = error if error is not None else note
         if error is not None and note:
-            # KC-29: a terminal turn the runner aborted carries the stall's
-            # reason as its error and the harvest's verdict as its note — the
-            # KC-18 line names both, and `last_error` keeps the reason alone,
-            # so nobody reads the verdict as the error or vice versa.
+            # The error keeps the stall reason alone; the verdict goes in the note (KC-29, KC-18).
             detail = f"{error} ({note})"
         _log.info("%s: %s%s", spec.name, state.value, f" — {detail}" if detail else "")
         on_transition(run)
@@ -4354,9 +3997,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         except Exception:  # noqa: BLE001 — a history that cannot be read is empty
             return False
 
-    # Ticket 212: the round's test-run cache, one gate per agent over one file.
-    # Off (`None`) unless `[contest] test_cache = on`; every failure of it is
-    # "run the command", so it never stands between an agent and its tests.
+    # Test-run cache, one gate per agent over one file; off unless enabled (ticket 212).
     test_cache_gate = None
     if getattr(config, "test_cache", False):
         try:
@@ -4380,32 +4021,22 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         spent = run.permissions["gated"] + run.permissions["gate_failed"]
         ctx = PolicyContext(
             worktree=ws.path,
-            # the round's globs, this agent's own scratch dir (KC-59), and the
-            # round's $TMPDIR (KC-65)
+            # The agent's tmp roots: the round's globs, its own scratch dir (KC-59), and the TMPDIR (KC-65).
             tmp_roots=tuple(tmp_roots) + agent_tmp_globs(tmp_roots, spec.name)
                       + ((agent_tmp_glob,) if agent_tmp_glob else ()),
-            # the rounds folder: this round's other worktrees and every earlier
-            # round's, plus the other agents' scratch dirs. The policy lets this
-            # agent's own worktree through (KC-46)
+            # Forbidden paths: the rounds folder, other agents' scratch dirs; this agent's own worktree is allowed (KC-46).
             forbidden=tuple(HARD_DENYLIST) + (ws.path.parent,) + scratch_others,
             ticket_title=Path(ticket_path).name,
             ticket_files=tuple(ticket_files),
             recent_tools=recent,
             gate_budget_left=max(0, int(config.gate_max_calls_per_session) - spent),
         )
-        # KC-69: how full the session is at this ask, read before the decision,
-        # so every ask's line — console and decisions.jsonl — carries it; at or
-        # past the threshold the ask is refused, and the next prompt compacts
+        # Fill is read before each decision, so every ask line shows it; at the threshold the ask is refused (KC-69).
         fill_now = _context_now()
         if _context_is_full(fill_now):
             decision = Decision(reply="reject", layer="context", reason=CONTEXT_FULL_REJECT)
             if not context_full[0] and not summary_asking[0]:
-                # the model reads the refusal and still goes on with the tools
-                # that need no ask (live, glm: four refusals at 60 %, the fill
-                # still growing), so the turn is stopped — once, after the reply
-                # is out. Kilo ends an aborted turn in a plain `session.idle`
-                # (`turn.close: interrupted`, live 7.6.2), and the next prompt
-                # compacts first.
+                # Once the model keeps using tools at a full context, the turn is stopped after its reply (live 7.6.2).
                 _log.info("%s: context full at a permission — stopping the turn to "
                           "compact before the next prompt", spec.name)
                 def _stop_for_context(target=session):
@@ -4434,18 +4065,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             run.permissions["gate_failed"] += 1
         _log.info("%s: permission %s -> %s (%s), %s", spec.name, props.get("permission"),
                   decision.reply, decision.layer, _context_words(fill_now))
-        # KC-58: a whole pytest root holds one of the round's suite slots before
-        # it is answered — a delay, never a refusal. The decision above is
-        # recorded first, so a reject never queues; `agent_suite_slots = 0`
-        # skips this for good, which is today's path. The slot is held by the
-        # `pytest` process, not by this part, so it is dropped when the
-        # worktree's last `pytest` is gone and released again when the agent
-        # ends. The wait is given back to the turn (`grant_suite` below): it
-        # blocked the very loop that runs the deadline and the silence clock,
-        # and it is the round's queue, not the agent's work — so is its hard
-        # limit, `agent_max_sec`, which is paused for the wait and resumed with
-        # what it had left. A waiter leaves the queue at once only when its
-        # agent was stopped by something else (the round was interrupted).
+        # A pytest root waits for a round suite slot before it is answered; the wait is given back to the turn (KC-58).
         queued = 0.0
         if decision.reply == "once":
             try:
@@ -4463,10 +4083,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                   spec.name, _age(queued))
             except Exception:  # noqa: BLE001 — the reply is never held by the queue
                 queued = 0.0
-        # KC-66: the gate waited inside this wait_idle loop, so the seconds it
-        # spent are granted back to this turn's deadline and counted on its
-        # clock — the agent never pays for the gate's 429. `back` is what the
-        # deadline moves by, so the turn records exactly what it was given.
+        # Gate seconds are given back to this turn's deadline, so the agent never pays for the gate's wait (KC-66).
         back = 0.0
         tries = int(getattr(decision, "gate_attempts", 1) or 1)
         turn_clock = getattr(run, "_turn_clock", None)
@@ -4487,8 +4104,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             stall(f"{questions_this_turn[0]} questions in one turn")
 
     def finish(state: AgentState, error: str | None = None, *, note: str | None = None) -> AgentRun:
-        # Round 151: only the file this run pushed for goes — one the agent wrote
-        # on purpose carries its own limit and survives to the harvest.
+        # Only the file this run pushed goes; a file the agent wrote on purpose survives (round 151).
         drop_stale_kilo_file(ws.path, expected_limit=pushed_spec[0])
         transition(state, error, note=note)
         return run
@@ -4541,8 +4157,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         turn["new_session"] = session.id
         run.session_id = session.id
         run.sessions += 1
-        # KC-39: the ceiling is per attempt, so a replacement spends one of the
-        # attempt's allowance and is remembered for the one it goes on in.
+        # The ceiling is per attempt, so a replacement spends one of its allowance (KC-39).
         run.sessions_this_attempt += 1
         return None
 
@@ -4642,12 +4257,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         turn["overflow_settle_sec"] = round(took, 1)
         turn["overflow_settle_status"] = status
         if status == "error":
-            # the loop Kilo went on with ended in a session.error of its own —
-            # a second overflow is compacted and gone on with the same way, so
-            # the session may be busy again. Stop it before the runner's own
-            # `summarize`, which Kilo answers only on a free session: that is
-            # round 78's 900 s, one error later. A timeout needs nothing here —
-            # `wait_idle` aborts the session before it returns one.
+            # A second overflow may leave the session busy, so it is stopped before the summarize call (round 78).
             _abort_quietly(backend, session)
         if status != "idle" or not getattr(settled, "compacted", False):
             _log.info("%s: after the overflow Kilo worked on for %.0f s and ended %s%s — "
@@ -4873,24 +4483,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         try:
             setter(spec.provider_id, spec.model_id, limit)
         except KiloLimitRefused as exc:
-            # structural: the checkout tracks .kilo, so it will refuse the
-            # same way again — remember it, the check is not re-run. Nothing
-            # went over, so the watch stays armed for a turn Kilo still sizes
-            # by its own 131 072.
+            # The checkout refuses the same way again, so the refusal is remembered and not re-run (KC-69).
             push_refused[0] = size
             _log.warning("%s: the remembered window was not handed to Kilo: %s",
                          spec.name, _brief(str(exc)))
             return
         except KiloLimitKept as exc:
-            # round 153: the patch answered 200 and the reload was followed, but
-            # the read-back still reports the limit the server's own config
-            # content carries — the spawn's `KILO_CONFIG_CONTENT`, or the
-            # operator's, which outranks a patch field by field. Kilo sizes the
-            # session by its own window, so nothing was handed over, and it will
-            # not change inside the round: remembered like a refusal, so the
-            # size is not re-patched — and Kilo reloaded — every prompt.
-            # `pushed_spec[0]` is still set: the file the patch wrote is ours and
-            # goes with `drop_stale_kilo_file` on the way out.
+            # The read-back still shows the server's own limit, so the size is remembered and not re-patched (round 153).
             push_refused[0] = size
             pushed_spec[0] = limit
             detail = _brief(str(exc))
@@ -4902,9 +4501,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                              "armed (%s)", spec.name, detail)
             return
         except KiloTapReconnectError as exc:
-            # the patch answered 200, so the window went over: only this
-            # round's stream of it is broken. Mark it pushed — Kilo compacts by
-            # it now — and report the reconnect on its own line.
+            # The patch was accepted and the window went over; only the stream is broken, so it is reported (KC-69).
             pushed_limit[0] = size
             pushed_spec[0] = limit
             _log.warning("%s: the window went to Kilo but its event stream was not "
@@ -4916,9 +4513,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             return
         pushed_limit[0] = size
         pushed_spec[0] = limit
-        # Kilo compacts after the step that reaches `input - min(20 000, output)`:
-        # that is the number to print, not `input`, which sits a reserve above it
-        # (round 146: for a small window `input` is above the size itself)
+        # Kilo compacts at input minus a reserve, so that is the figure printed (round 146).
         compact_point = max(0, int(limit.get("input") or 0)
                             - min(context_memory.KILO_COMPACT_RESERVE,
                                   int(limit.get("output") or 0)))
@@ -4986,8 +4581,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 except Exception:  # noqa: BLE001 — an unreadable fill is no fill
                     continue
                 if stop.is_set():
-                    # the read took long enough for the turn to end: its actions
-                    # would land on the wait that follows, not this one
+                    # The read took so long the turn ended, so its actions would land on the next wait.
                     return
                 fill = tokens * 100.0 / float(size)
                 if fill < percent or context_full[0]:
@@ -5001,8 +4595,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     _log.info("%s: context %s tokens = %.1f%% of %s (%s) inside the turn — "
                               "stopping it to compact before the next prompt", spec.name,
                               f"{tokens:,}", fill, f"{size:,}", source)
-                    # under the lock too: an abort sent after the turn's `finally`
-                    # set `stop` would land on the next turn
+                    # The abort is sent under the lock, so it cannot land on the next turn.
                     _abort_quietly(backend, target)
                 return
 
@@ -5033,9 +4626,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         if escalate[0]:
             escalate[0] = ""
         ceiling = _sessions_ceiling(config)
-        # a session is available only below KC-39's ceiling, which is per
-        # attempt; `0` (the ceiling off) and an attempt that has spent it both
-        # mean the escalation is unavailable, and the turn goes straight to DEAD
+        # A session is available only below the per-attempt ceiling; 0 or a spent attempt means DEAD (KC-39).
         room = 1 if 0 < ceiling > run.sessions_this_attempt else 0
         return _FirstTouch(
             run, ws, spec, config,
@@ -5126,24 +4717,14 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             return ""
         percent = context_memory.compact_at_percent(config)
         if forced and fill is not None and fill < percent:
-            # the refusal is older than this read: a compact since (Kilo's own,
-            # or the one before an earlier prompt) already freed the session
+            # A compact since the refusal already freed the session, so the refusal is stale.
             _log.info("%s: a permission was refused for a full context, but it is "
                       "%.1f%% of %s now — no compact before %s", spec.name, fill,
                       f"{size:,}", kind)
             forced = False
         if not forced and (not size or percent <= 0 or fill is None):
             return ""
-        # KC-40: the summary is its own edge, and it is meant to sit below the
-        # compact's — the tree already holds a diff no one but the model can
-        # describe, and the compact would erase the model's working knowledge
-        # without ever asking it to say it. So it is asked at
-        # `summary_at_percent`, before the compact is due: a fill between the
-        # two gets one ask and no compact at all, and a fill at or past the
-        # compact's gets the ask and the compact right after it. A compact forced
-        # by a refusal for a full context is asked first too — live, that is the
-        # way most sessions reach their compact (round 79: every one of
-        # sensenova-6-8's).
+        # The summary is asked below the compact threshold, so the model's own knowledge is kept (KC-40).
         asked = ""
         summary_percent = context_memory.summary_at_percent(config)
         if (size and fill is not None
@@ -5157,41 +4738,27 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     on_permission=on_permission, on_question=on_question)
             finally:
                 summary_asking[0] = False
-            # the ask is a turn of its own at a full context: a tool it tried was
-            # refused (KC-69), but `summary_asking` kept that refusal from arming
-            # the stop meant for a working turn — it would have aborted this very
-            # reply. A stop armed before the ask must not land on the compact or
-            # the prompt that follow either, and the refusal is not the next
-            # turn's — so both are undone here, the way the turn loop undoes them
-            # after its own wait.
+            # The summary ask is its own turn, so any stop it armed is undone before the compact (KC-69).
             while context_stopper:
                 context_stopper.pop().cancel()
             context_full[0] = False
             if outcome:
-                # the ask's own idle is on the stream: the caller takes a fresh
-                # mark, so the prompt that follows does not end on it (KC-63)
+                # The summary ask's own idle is on the stream; the caller takes a fresh mark (KC-63).
                 asked = "summarized"
             if note:
                 turn["summary_note"] = note
             if outcome == "captured":
-                # the next prompt of this session carries the one line, and a
-                # reset later in the attempt carries the text itself
+                # The next prompt carries the one-line note; a later reset carries the full text.
                 carry_note[0] = SUMMARY_CONTINUES_NOTE
                 _log.info("%s: the summary is out (%s chars) — the compact "
                           "waits for %g%% before %s", spec.name, len(text),
                           percent, kind)
             elif outcome == "":
-                # already asked in this session, or nothing uncommitted: the
-                # prompt gets whatever the compact decides, as before KC-40
+                # Already asked here, or nothing is uncommitted, so the prompt gets the compact's decision.
                 _log.info("%s: no summary to ask for at %.1f%% of %s", spec.name,
                           fill, f"{size:,}")
             else:
-                # no answer — an empty reply, a `session.error`, or silence — so
-                # there is no summary to carry: KC-39's fresh-session edge takes
-                # over, and whatever the attempt wrote goes with it, on
-                # `run.summary`. Only while the attempt has a session to spare
-                # (KC-39's ceiling, 0 = no resets at all): without one the
-                # session is kept and compacted, as it was before KC-40.
+                # No summary means the fresh-session edge takes over, only while a session is spare (KC-39, KC-40).
                 ceiling = _sessions_ceiling(config)
                 if ceiling > 0 and run.sessions_this_attempt < ceiling:
                     _log.info("%s: summary ask at %.1f%% of %s ended %s%s — no "
@@ -5202,8 +4769,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 _log.info("%s: summary ask at %.1f%% of %s ended %s — no answer, and "
                           "no session left in the attempt: compacting", spec.name,
                           fill, f"{size:,}", outcome)
-            # the summary turn added to the session: re-read, so the compact
-            # decision is made of the size the session holds now
+            # Re-read after the summary turn, so the compact is decided on the current size.
             try:
                 re_tokens = _context_tokens(backend, session)
                 tokens = re_tokens
@@ -5213,8 +4779,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 pass
         if not forced:
             if fill < percent:
-                # one console line per prompt of a sized model: the operator
-                # sees the fill grow towards the compact, not only the compact
+                # One console line per prompt of a sized model, so the fill is seen growing toward the compact.
                 _log.info("%s: context %s tokens = %.1f%% of %s (%s), below %g%% — "
                           "no compact before %s", spec.name, f"{tokens:,}", fill,
                           f"{size:,}", source, percent, kind)
@@ -5311,10 +4876,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         text = _error_texts(error)
         kilo_wall = _KILO_WALL_RE.search(text) is not None
         if _OVERFLOW_RE.search(text) is not None:
-            # The old path's verdict is unchanged; what changes is that it
-            # records the size too, so a second overflow far below it is not
-            # read as the window again. The guard's own unit is the refused
-            # request, so this path records it too, not `last_ok`.
+            # The old overflow path also records the size of the refused request (round 145).
             try:
                 last_ok, grew = _last_reply(backend, session)
             except Exception:  # noqa: BLE001 — no read, no record
@@ -5340,20 +4902,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             size, source = _context_budget(spec, _memory(), config)
         except Exception:  # noqa: BLE001 — no read, no guess: the error as before
             return False
-        # The request that was refused was the last reply plus what the reply's
-        # tools added after it, so both readings and the repeat guard compare
-        # that — the record keeps `last_ok`, the size that went through.
-        # `last_ok` alone refused a session that read a big batch in one step
-        # (round 145's glm) as a plan's cap, and nothing was remembered for it.
+        # The refused request is the last reply plus what its tools added, so that size is compared (round 145).
         requested = last_ok + (grew or 0)
         floor = context_memory.min_window(config)
         share = context_memory.full_refusal_percent(config) / 100.0
         if share > 0:
-            # round 149, as `context_memory.size_of`: a model Kilo declares at
-            # 32 768 and refuses at 28 000 is full, not a plan's cap. Round 152:
-            # when Kilo declares nothing the round's fallback is the wall to
-            # measure against, and with neither the floor stands, so a window
-            # under it stays unremembered.
+            # A declared window the session is refused below counts as full, else the fallback or the floor (round 149, 152).
             wall = _declared_window(spec)
             if wall is None:
                 wall = _context_limit_fallback(
@@ -5361,8 +4915,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             if wall > 0:
                 floor = min(floor, int(share * wall))
         if not last_ok or (floor and requested < floor):
-            # nothing went through yet, whatever the floor: a refusal of the
-            # session's first request cannot have filled a context
+            # A refusal of the first request cannot mean a full context, whatever the floor.
             _log.info("%s: %r at %s tokens — under context_min_window %s, not read "
                       "as a context overflow", spec.name,
                       _brief(_error_message(error)), f"{last_ok:,}",
@@ -5382,8 +4935,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                       _brief(_error_message(error)), f"{requested:,}",
                       f"{max(overflows_seen):,}")
             return False
-        # One unit: the refused request, as the comparison just made, not
-        # `last_ok` — the reply alone was half the request a big batch made.
+        # The unit is the refused request, not last_ok, since the reply alone was half of it.
         overflows_seen.append(requested)
         _log.info("%s: %r at %s tokens %s", spec.name, _brief(_error_message(error)),
                   f"{last_ok:,}", how)
@@ -5435,27 +4987,16 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             if not context_memory.add(context_memory.memory_path(config, out_dir),
                                       record, days=context_memory.days_of(config)):
                 _log.warning("%s: context memory: not written", spec.name)
-            # the window goes to Kilo before the next prompt, not here: Kilo may
-            # still be compacting this session itself, and a `PATCH /config`
-            # reloads the workspace's instance under it
+            # The window goes to Kilo before the next prompt, since Kilo may still be compacting (round 148).
         except Exception as exc:  # noqa: BLE001 — the overflow still ends the turn
             _log.warning("%s: context memory: %s", spec.name, _brief(str(exc)))
 
     try:
-        # Round 148: the project file a `PATCH /config` left in the worktree
-        # does not outlive the run that wrote it — a resumed agent's server
-        # reads it on spawn, and it is not this round's window. Untracked only:
-        # a file the checkout tracks is the agent's, and `policy` asks for it.
-        # Round 151: nothing has been pushed for this run yet, so `assume_stale`
-        # — a content compare here would compare against a limit this run has not
-        # chosen. `finish` drops this run's own file, by the limit it pushed.
+        # Remove the untracked project file a PATCH /config left, so a resumed agent does not read it (round 148, 151).
         drop_stale_kilo_file(ws.path, assume_stale=True)
         # ── CREATED: one session, kept for every turn ─────────────────────
         if not run.sessions:
-            # KC-39 appends each session's transcript to `<agent>.session.json`,
-            # so a run that has opened none must not append to the file an
-            # earlier run of the same round left: `--fresh` resets the worktrees,
-            # not `contest-out/<NN>/`. A `--resume` has sessions and keeps it.
+            # A run with no sessions must not append to an earlier run's transcript file (KC-39).
             try:
                 (out_dir / f"{spec.name}.session.json").unlink()
             except FileNotFoundError:
@@ -5469,17 +5010,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         except (ContestBackendError, ValueError) as exc:
             return finish(AgentState.ERROR, f"POST /session failed: {_brief(str(exc))}")
         run.session_id = session.id
-        # KC-39: one more session for this run — `+=` because a `--resume` here
-        # is the run's next session, not its first, and the number printed in
-        # `state.json` is how many sessions the agent spent in all. The attempt
-        # this session opens in counts it as its own first, so the ceiling is
-        # compared against `sessions_this_attempt` from one.
+        # One more session for this run; the attempt's own count starts at one (KC-39).
         run.sessions += 1
         run.sessions_this_attempt = 1
-        # The agent's hard limit: `agent_max_sec` from here, whatever the turns,
-        # retries and extensions add up to. At the limit the session is aborted
-        # the way a stall is, and the tree is left as it stands for the scoring.
-        # 0 = no limit.
+        # The agent's hard limit: agent_max_sec from here, 0 means no limit (KC-39).
         agent_max = float(getattr(config, "agent_max_sec", 0) or 0)
         if agent_max > 0:
             arm_time_up(agent_max)
@@ -5508,12 +5042,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             else:
                 kind = "initial"
                 dirty = getattr(run, "dirty_on_resume", "") or ""
-                # KC-43: a leg after the first opens with the relay so far — a
-                # continue, never a rework, so `run.attempt` is not touched
+                # A later leg opens with the relay so far, as a continue and never a rework (KC-43).
                 leg_note = getattr(run, "leg_note", "") or ""
                 if dirty:
-                    # KC-22, `--resume` into a worktree that still holds the
-                    # work: the fresh session learns of it on its first prompt.
+                    # The worktree may hold work from before a --resume; the fresh session is told (KC-22).
                     text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
                                         tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots),
                                         leg_note=leg_note)
@@ -5529,39 +5061,24 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             else:
                 note = f"attempt {run.attempt} ({kind})"
             transition(AgentState.PROMPTED, note=note)
-            # round 145: a remembered window below Kilo's goes to Kilo now —
-            # the session is between turns, and the backend's event stream is
-            # reconnected after the reload, before the mark below is taken
+            # A remembered window below Kilo's is sent to Kilo now, before the mark is taken (round 145).
             _push_remembered_limit()
-            # KC-63: the mark goes right before the POST, so no event of this
-            # turn can come before it and every event of an earlier one does
+            # The mark is taken just before the POST, so earlier events are seen and this turn's are not (KC-63).
             mark_fn = getattr(backend, "mark", None)
             since = mark_fn() if callable(mark_fn) else None
-            # KC-67: the session may already hold more than the model can take —
-            # the size came from the memory, not from Kilo, so Kilo will not
-            # compact it for us. A mark is re-taken when a compact did happen,
-            # so the compact's own idle is not this turn's idle.
+            # The session may already hold more than the model takes, so the first prompt is gated (KC-67).
             gated = _context_gate(turn, kind)
             if gated == "summary_fallback":
-                # KC-40: the summary ask got no answer — the same edge KC-39 has
-                # for a continue that adds nothing: the session is aborted, a
-                # fresh one opens, and its first prompt is the round prompt with
-                # the `git status` lines, preceded by whatever the failed ask
-                # wrote. The turn is recorded by `fresh_session`, with the flags
-                # `_context_gate` set on it.
+                # The summary ask got no answer: a fresh session takes the round prompt and the partial text (KC-40).
                 carry_note[0] = ""
-                # the partial answer the failed ask managed — written to the
-                # summary file already — goes to the front of the new prompt
+                # The partial answer of a failed ask goes at the front of the new prompt.
                 failed = fresh_session(turn, _summary_read_tree(ws),
                                        note=turn.pop("summary_note", ""))
                 if failed:
                     return finish(AgentState.ERROR, failed)
                 continue
             if gated == "swap":
-                # KC-69: the compact did not free the session — the work goes on
-                # in a new one, which has never seen the ticket: the round
-                # prompt with the tree, the old session's summary, then this
-                # turn's own text
+                # The compact did not free the session, so the work goes on in a new one (KC-69).
                 failed = swap_session(turn)
                 if failed:
                     run.turns.append(turn)
@@ -5580,18 +5097,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         + "\n\n" + text)
             if gated:
                 since = mark_fn() if callable(mark_fn) else None
-            # KC-40: a captured summary is carried once — the prompt right after
-            # the ask, not every prompt after it
+            # A captured summary is carried once, into the prompt right after the ask (KC-40).
             carry = carry_note[0]
             carry_note[0] = ""
             if carry:
                 text = carry + "\n\n" + text
             try:
-                # KC-65: the worker count of this moment, as the last lines of
-                # the message. This one send carries the first prompt, a
-                # `continue`, a `REWORK` and a `--resume` prompt alike, so a
-                # nudged agent reads the count it starts with, not the count it
-                # had an hour ago.
+                # The worker count of this moment is the last line of the message (KC-65).
                 backend.prompt(session, text + prompt_workers_note(out_dir, config))
             except ContestBackendError as exc:
                 return finish(AgentState.ERROR, f"prompt failed: {_brief(str(exc))}")
@@ -5599,18 +5111,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # ── WAITING ────────────────────────────────────────────────────
             transition(AgentState.WAITING)
             questions_this_turn[0] = 0
-            # KC-36: this turn's own deadline, decided from its own worktree.
-            # It sits on the run only so the heartbeat can read it mid-wait.
-            # KC-58 hands it `working` too: a suite running beside an idle
-            # churn is progress, not a stopped turn.
+            # This turn's deadline comes from its own worktree; the heartbeat reads it mid-wait (KC-36, KC-58).
             clock = _turn_deadline(run, config, working)
             run._turn_clock = clock
             context_aborted[0] = False
-            # KC-42: the watch on a turn that has written nothing yet. It is
-            # armed here, from the turn's own prompt, and stopped in the same
-            # `finally` as the wait — so a turn that ends on its own can never
-            # be nudged after the fact, and a nudge is never sent into a
-            # session this turn is not holding.
+            # The first-touch watch is armed from the turn's prompt and stopped with the wait (KC-42).
             touch = first_touch_watch(turn)
             watch = context_watch(turn)
             try:
@@ -5625,30 +5130,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     watch.stop()
                 while context_stopper:
                     context_stopper.pop().cancel()
-            # KC-75: a nudge is posted into a busy session, and Kilo 7.6.2 queues
-            # it: the running turn closes after its current step (`turn.close`,
-            # `session.idle`) and the queued prompt opens the next one at once.
-            # That first idle is the *old* turn's. Round 120 took it for the
-            # nudge's own, sent its continue into the nudge's running turn, which
-            # queued again — every later turn was cut to one step and read as
-            # SILENT, and eleven agents gave up in five minutes. One more idle is
-            # waited for per nudge the watch sent.
+            # Each nudge queues one more idle to wait for, since the first idle is the old turn's (KC-75).
             queued = int(getattr(touch, "nudged", 0) or 0) if touch is not None else 0
             while queued > 0 and not escalate[0] and getattr(idle, "status", "") == "idle":
                 queued -= 1
-                # No mark: the cursor stands right after the idle just read, and
-                # the queued turn's `turn.open`/`busy` land in the same
-                # millisecond — a mark taken now could already be past them. A
-                # session with nothing queued sends nothing: KC-73's quiet window
-                # says so, and the idle already read stands.
+                # No mark is taken here, since the queued turn may already be past it (KC-73).
                 again = _wait_turn(backend, session, config,
                                    on_permission=on_permission, on_question=on_question,
                                    on_deadline=clock.on_deadline,
                                    quiet_after=QUEUED_NUDGE_QUIET_SEC)
                 if getattr(again, "status", "") not in ("idle", "error"):
-                    # quiet: nothing was queued, the idle read stands. A timeout
-                    # or a closed stream is no better an ending than the idle
-                    # already in hand — the turn keeps it, as before KC-75.
+                    # A quiet or closed wait keeps the idle already read, as before KC-75.
                     break
                 turn["queued_waits"] = int(turn.get("queued_waits", 0)) + 1
                 _log.info("%s: that idle closed the turn before the nudge — the "
@@ -5656,37 +5148,26 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                           spec.name)
                 idle = again
             if getattr(idle, "compacted", False) and getattr(idle, "status", "") == "idle":
-                # Round 83: Kilo compacts a session on its own mid-turn and goes
-                # on, and the turn still ends idle. Only the overflow path counted
-                # that (an error, settled apart), so round 83's status table read
-                # `compactions 0` for all eleven agents over fourteen of Kilo's
-                # `session.compacted`. One per turn: the wait keeps a flag, not a count.
+                # The compacts Kilo runs mid-turn are counted once per turn (round 83).
                 run.compactions += 1
                 turn["compacted"] = True
                 turn["compacted_by"] = "kilo"
                 _log.info("%s: Kilo compacted the session itself during the turn",
                           spec.name)
             if escalate[0]:
-                # KC-42: the watch ended this turn — a fresh session, or DEAD.
-                # Read before anything else: the abort that woke the wait comes
-                # back as `MessageAbortedError` or as an idle, and left alone
-                # both of those would be scored as an ordinary ending.
+                # The watch ended this turn; read this first, before the abort is scored as an ending (KC-42).
                 wanted = escalate[0]
                 escalate[0] = ""
                 turn["first_touch_nudges"] = int(run.first_touch_nudges_used or 0)
                 if touch is not None and touch.touched():
-                    # the model wrote something in the window between the watch's
-                    # last read and the abort: the turn is an ordinary one again
+                    # The model wrote in the window before the abort, so the turn is ordinary again.
                     turn["first_touch_touched"] = True
                 elif wanted == "dead":
                     turn["first_touch_reset"] = int(run.first_touch_resets or 0)
                     turn["first_touch_dead"] = True
                     run.turns.append(turn)
                     _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
-                    # KC-42: DEAD releases the slot at once. It is never
-                    # harvested and never patched — there is nothing on disk to
-                    # score, which is the whole of the finding — and the round
-                    # does not wait for it any longer than the abort took.
+                    # DEAD releases the slot at once and is never harvested or patched (KC-42).
                     _log.info("%s: DEAD — nothing modified after %d nudge(s) and %d "
                               "fresh session(s); the slot is released", spec.name,
                               turn["first_touch_nudges"], turn["first_touch_reset"])
@@ -5715,14 +5196,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     continue
             if (context_aborted[0] and idle.status == "error"
                     and _is_external_abort(idle.error)):
-                # round 49 (sensenova-6-8-flash-lite-var1, at 82.5 %): the
-                # abort KC-69 sends after a refusal for a full context landed
-                # while Kilo had already started the next step, and Kilo
-                # answered it with `session.error: MessageAbortedError` before
-                # the idle — not the plain `session.idle` KC-69 saw live. That
-                # read as an ERROR (and as Kilo's own shutdown), and the agent
-                # ended there instead of compacting. It is the runner's own
-                # stop: the turn ended, and the next prompt compacts first.
+                # The runner's own stop can come back as MessageAbortedError; the turn is read as idle (round 49).
                 _log.info("%s: the turn stopped for a full context ended in "
                           "MessageAbortedError — the runner's own abort, a plain idle",
                           spec.name)
@@ -5745,23 +5219,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 turn["suite_wait_sec"] = int(clock.suite_waited)
             retry_waited = _retry_waited_of(idle)
             if retry_waited > 0:
-                # round 146: how long the provider kept Kilo retrying — time the
-                # deadline gave back to the turn
+                # How long the provider kept Kilo retrying is time the deadline gave back (round 146).
                 turn["provider_wait_sec"] = int(retry_waited)
             if stalled:
                 turn["idle_status"] = "stalled"
                 error, state = stalled[0], AgentState.STALLED
             elif idle.status == "timeout":
-                # KC-12 sends the silence stall back as "timeout" too, so the
-                # label comes from elapsed: under the overall deadline means
-                # the silence window fired, at it means the turn never idled.
-                # KC-36 moves that deadline when the churn earned it.
-                # KC-47 widens that window while a `bash` call is still
-                # running, and names the call in the stall when the widened
-                # bound is what fired, so the next reader does not have to dig
-                # in events.jsonl to learn the agent was running its tests.
-                # KC-66: the gate's waits moved the deadline too, so a silence
-                # inside that time is still a silence stall.
+                # A timeout is a silence stall or a never-idle turn, told apart by the deadline (KC-12, KC-36, KC-47, KC-66).
                 silence = float(config.idle_event_timeout_sec or 0)
                 limit = (float(config.turn_timeout_sec) + clock.granted + clock.gate_added
                          + clock.suite_waited + retry_waited)
@@ -5805,19 +5269,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 overflow = _overflow_of(idle.error)
                 if overflow:
                     _remember_overflow(idle.error, overflow)
-                    # KC-54: the overflow has filled this session's context, so
-                    # a prompt into it overflows again — never RETRY_PROMPT here,
-                    # even when the provider flags the error retryable. The work
-                    # is not lost, though: uncommitted edits go on in a *fresh*
-                    # session, which has never seen the ticket or the round
-                    # prompt, so it gets `round_prompt(dirty=)` (KC-22's
-                    # `--resume` shape) rather than `continue_message`.
+                    # An overflowed session is never retried; work goes on in a fresh session (KC-54).
                     budget = int(config.max_continues_per_attempt)
                     room = 0 < budget and run.continues < budget
-                    # KC-73: before the tree is read and before anything is
-                    # compacted, whatever Kilo still does in the session is
-                    # waited out — it compacts an overflow itself and goes on
-                    # working, and that work lands in the tree
+                    # Kilo is waited out before the tree is read or compacted, since it compacts on its own (KC-73).
                     if room and settle_overflow(turn):
                         continue_text = OVERFLOW_CONTINUE
                         run.continues += 1
@@ -5825,26 +5280,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                         continue
                     if stalled:
-                        # KC-73: the agent's time ran out (or a stall fired)
-                        # while Kilo was still working — no compact, no new
-                        # session: the stall below, and the harvest after it
+                        # A stall while Kilo still works: no compact and no new session (KC-73).
                         room = False
                     dirty = ""
                     tree_read = False
-                    # round 80's glm-4-7-flash: an overflow on a branch that
-                    # already holds commits (a REWORK in progress) used to skip
-                    # the tree read and the recovery both, and stalled as "no
-                    # uncommitted work" with a modified file in the tree. The
-                    # tree is read either way now.
+                    # The tree is read in every case, including a branch that already has commits (round 80).
                     above = _commits_above(ws)
                     try:
                         dirty = _dirty_tree(ws)
                         tree_read = True
                     except TreeReadError as exc:
-                        # FL-2: a status that could not be read is not "no
-                        # uncommitted work" — say so, and let the stall
-                        # below carry the "no work" reason rather than
-                        # raising into the round.
+                        # An unreadable tree is not "no work"; the stall says so (FL-2).
                         _log.warning("%s: tree unreadable — %s", spec.name,
                                      _brief(str(exc)))
                     if not above and dirty and room:
@@ -5853,24 +5299,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             return finish(AgentState.ERROR, failed)
                         continue
                     if tree_read and room and bool(above) == bool(dirty):
-                        # KC-69: nothing written yet — the model read past its
-                        # size (round 70's sn67-var2, live glm at 117 797) — or
-                        # the branch holds commits *and* more work on top, where
-                        # `round_prompt(dirty=)` would tell a new session nothing
-                        # was committed. Commits on a clean tree go to the KC-21
-                        # harvest below, which can end READY. The
-                        # size is remembered above; compact and go on: the
-                        # summary carries what the commits and the tree are.
+                        # Nothing written yet means a fresh prompt; commits on a clean tree go to the harvest (KC-69).
                         failed = recover_overflow(turn)
                         if failed is None:
                             continue
                         if failed != "stall":
                             return finish(AgentState.ERROR, failed)
-                    # A clean overflow is a model that spent its whole context
-                    # reading and produced nothing — a stall, not a crash. Do
-                    # not `return`: fall through to the KC-21 harvest below,
-                    # which scores a commit the model made and then overflowed
-                    # and can still end READY.
+                    # A clean overflow is a stall, not a crash; fall through to the harvest, which can still score it READY (KC-21).
                     if dirty:
                         error = "context overflow"
                     elif above:
@@ -5881,13 +5316,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     if stalled:
                         error = stalled[0]
                         turn["idle_status"] = "stalled"
-                # KC-61: the quota check comes first. `_RETRYABLE_MSG_RE`
-                # matches `429`, so a daily limit that resets at midnight would
-                # otherwise spend `max_error_retries` against a key that is
-                # empty until then and end `after 2 retries: session.error:`
-                # instead of naming the reason. The KC-21 harvest below still
-                # runs, so an agent that committed before its key ran dry is
-                # scored.
+                # The quota check runs first, so a daily limit is not retried as a 429 (KC-61).
                 if not overflow and _is_quota(idle.error, _quota_re(config)):
                     data = (idle.error or {}).get("data") or {}
                     at = data.get("retryAt")
@@ -5900,17 +5329,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     error = f"provider_quota: {reason}".rstrip()
                     state = AgentState.ERROR
                 else:
-                    # KC-64: never retried. `_RETRYABLE_MSG_RE` matches the provider's
-                    # "upstream unavailable" and "503" texts, so without this the
-                    # spent provider gets `max_error_retries` more rounds on top of
-                    # the `provider_retry_max_attempts` Kilo already spent.
+                    # A provider outage is never retried here, since Kilo already retried it (KC-64).
                     down = _is_provider_unavailable(idle.error)
-                    # KC-62: Kilo's own store refusing a write is neither the provider
-                    # nor the model: the session is intact and the same turn goes on.
-                    # It keeps its own budget and its own backoff — the provider's
-                    # `retries_used` is not touched, so a 429 and a store error in one
-                    # turn each spend their own counter. `max_local_store_retries = 0`
-                    # turns it off, exactly as `max_error_retries = 0` does.
+                    # A local store error keeps its own retry budget, not the provider's (KC-62).
                     local_budget = int(getattr(config, "max_local_store_retries", 5) or 0)
                     if (not overflow and not down and _is_local_store(idle.error)
                             and local_retries < local_budget):
@@ -5918,9 +5339,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         _append_jsonl(agent_dir / "turns.jsonl",
                                       {"agent": spec.name, **turn, "cause": "local_store"})
                         local_retries += 1
-                        # doubled per retry, then jittered ±30 %: four agents that hit
-                        # the locked database in the same second must not retry in the
-                        # same second again, and lock it back.
+                        # Backoff is doubled per retry and jittered, so agents do not retry in step (KC-62).
                         base = (float(getattr(config, "local_store_retry_backoff_sec", 10))
                                 * (2 ** (local_retries - 1)))
                         backoff = base * random.uniform(0.7, 1.3)
@@ -5937,11 +5356,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                 return finish(AgentState.STALLED, stalled[0])
                         retry_text = RETRY_PROMPT.format(reason="kilo store error")
                         continue
-                    # KC-45 §2a: KC-19's rules decide most `session.error`s. A
-                    # mid-session `provider rejected the request` needs the count of
-                    # the replies that already finished, so the transcript is read
-                    # for that payload only — fail-open to 0, which is §2's answer.
-                    # An overflow, a spent budget or any other error never reads it.
+                    # The count of finished replies is read only for a provider rejection (KC-45).
                     retryable = False
                     if not overflow and not down and retries_used < int(config.max_error_retries):
                         retryable = _retryable(idle.error)
@@ -5969,44 +5384,30 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         retry_text = RETRY_PROMPT.format(reason=_retry_reason(idle.error))
                         continue
                     if down:
-                        # KC-64: the provider's text is the reason, and the hint
-                        # sits after `_brief`'s cut, never inside it — an exhausted
-                        # plan reads the same as an outage, so the next reader has
-                        # to look at the provider's site.
+                        # The hint sits after the cut, since an exhausted plan reads like an outage (KC-64).
                         data = (idle.error or {}).get("data") or {}
                         error = (f"provider_unavailable after {data.get('attempts')} retries: "
                                  f"{_brief(data.get('message') or '')}"
                                  f"{_PLAN_HINT}")
                         state = AgentState.ERROR
                     elif not overflow:
-                        # an overflow already set its own `error` and `state` above;
-                        # this is the fallback for every other `session.error`
+                        # An overflow sets its own error above; this is the fallback for other session errors.
                         error = f"session.error: {_brief(idle.error)}"
                         if retries_used:
                             error = f"after {retries_used} retries: {error}"
-                        # KC-62: the budget is spent — say how hard the runner tried
-                        # the store, so the next reader does not read it as a model.
+                        # The store budget is spent, so the log says how hard the runner tried (KC-62).
                         if local_retries and _is_local_store(idle.error):
                             error = f"after {local_retries} kilo store retries: {error}"
                         state = AgentState.ERROR
             elif idle.status == "closed":
                 error, state = f"event stream closed: {_brief(idle.error)}", AgentState.ERROR
             elif idle.status == "idle":
-                # A turn that ended idle is a good answer: the error budget
-                # counts refusals in a row, so it starts over here — KC-62's
-                # store budget too.
+                # An idle turn is a good answer, so the error budgets start over (KC-62).
                 retries_used = 0
                 local_retries = 0
                 idle_kind = classify_idle(backend, session, turn["sent_at"], ws)
                 turn["idle_kind"] = idle_kind.value
-                # KC-75: a SILENT turn is an empty reply — round 120's eleven
-                # free models on one key hit `rate limit reached` together, Kilo
-                # ended each turn with an empty assistant message, and 15-second
-                # continues burned both attempts in five minutes. It is the
-                # provider, not the model: when this turn read a provider 4xx/5xx
-                # retry, wait longer each time and send the continue again, on
-                # its own budget, before a continue is spent. An empty turn with
-                # no provider error keeps KC-9's continue.
+                # A silent turn during a provider error is retried with a longer wait, on its own budget (KC-75).
                 if idle_kind is not IdleKind.SILENT:
                     silent_retries = 0
                 elif (int(getattr(idle, "provider_errors", 0) or 0) > 0
@@ -6028,10 +5429,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     continue
                 if idle_kind in (IdleKind.CUT, IdleKind.SILENT):
                     budget = int(config.max_continues_per_attempt)
-                    # KC-56 inside a CUT: a reply stopped at `finish: "length"`
-                    # keeps its own answer — a full window goes to a fresh
-                    # session (a continue into it is round 74's 4-second
-                    # overflow), an output cut gets `CUT_OFF_MESSAGE`.
+                    # A reply cut at the length limit: a full window gets a fresh session, an output cut gets a continue (KC-56).
                     cut = (_cut_off(backend, session, spec.context_limit)
                            if idle_kind is IdleKind.CUT else None)
                     if cut is not None:
@@ -6071,17 +5469,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     turn["continues_exhausted"] = True
                     error = state = None
                 else:
-                    # KC-22: a turn that ended idle with edits in the tree but no
-                    # commit is a model that has not handed in yet, not one that
-                    # handed in a wrong entry. Nudge it on in this same session —
-                    # do not harvest, which would fail every hard gate by
-                    # construction and burn the pytest roots on an unfinished tree.
-                    # A clean tree (the model did nothing) is *not* a continue: it
-                    # falls through to today's path (HARVESTING → REWORK/GAVE_UP),
-                    # which is the right answer for "you did nothing" — unless the
-                    # last reply was cut off at a token limit (KC-56). A rework
-                    # resets the counter; it is exhausted here only when the branch
-                    # still has no commit after the last nudge.
+                    # An idle turn with edits but no commit is nudged on in the same session, not harvested (KC-22).
                     budget = int(config.max_continues_per_attempt)
                     if 0 < budget and run.continues < budget:
                         dirty = ""
@@ -6089,48 +5477,26 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             try:
                                 dirty = _dirty_tree(ws)
                             except TreeReadError as exc:
-                                # FL-2: a status that could not be read is not "no
-                                # uncommitted work" — say so, and let the turn fall
-                                # through to the harvest, which reads git itself.
+                                # An unreadable tree falls through to the harvest, which reads git itself (FL-2).
                                 _log.warning("%s: tree unreadable — %s", spec.name,
                                              _brief(str(exc)))
-                        # KC-56: a reply cut off at `finish: "length"` is a model
-                        # stopped mid-thought, not one that did nothing — clean
-                        # tree or not, it goes on instead of being harvested.
+                        # A reply cut at the token limit goes on, clean tree or not (KC-56).
                         cut = _cut_off(backend, session, spec.context_limit)
                         if cut is not None:
                             turn["cut_off"] = cut
                         if cut == "context":
-                            # The window is full, so a continue here is the 4-second
-                            # `ContextOverflowError` of round 74. A deliberate
-                            # exception to KC-54's clean-overflow stall: the provider
-                            # cut a reply off, it did not reject a prompt.
+                            # A continue into a full window would overflow again, so a fresh session is used (round 74).
                             failed = fresh_session(turn, dirty)
                             if failed:
                                 return finish(AgentState.ERROR, failed)
                             continue
                         if cut == "output" or dirty:
-                            # the current turn keeps its own kind (initial/rework);
-                            # the continue becomes the *next* PROMPTED turn, whose
-                            # PROMPTED transition (with "(continue N of M)") runs at
-                            # the top of the loop. Record this idle turn as it stands.
-                            # KC-39: before the continue is granted, the diff's
-                            # content is hashed and compared with the previous
-                            # continue's — the file list alone cannot tell a model
-                            # that rewrote the same bytes from one that wrote new
-                            # ones. Only the *last* continue of the budget is
-                            # compared: that is the one whose grant would leave the
-                            # budget spent and the harvest inside this very
-                            # session. ``""`` is a tree that could not be read,
-                            # which is never a repeat.
+                            # A continue is granted and the diff signature is compared with the last one (KC-39).
                             signature = ""
                             repeat = False
                             ceiling = _sessions_ceiling(config)
                             if dirty and ceiling > 0:
-                                # `max_sessions_per_attempt = 0` turns the ticket
-                                # off: no diff is read and no signature written, so
-                                # `turns.jsonl` cannot be read as "this round was
-                                # comparing diffs"
+                                # Diff signature is written only when the repeated-diff check is on (KC-39).
                                 signature = _diff_signature(ws)
                                 turn["diff_signature"] = signature
                                 previous = getattr(run, "last_diff_signature", "") or ""
@@ -6138,11 +5504,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                           and run.continues + 1 >= budget
                                           and run.sessions_this_attempt < ceiling)
                             if repeat:
-                                # KC-39: the budget would be spent on a continue that
-                                # adds nothing, so the work goes on in a session
-                                # that has never seen the loop — `round_prompt` with
-                                # the `git status` lines, KC-22's `--resume` shape,
-                                # triggered live instead of only after a restart.
+                                # A continue that adds nothing ends in a fresh session with the status lines (KC-39).
                                 _log.info("%s: continue %d of %d would repeat the "
                                           "previous diff (%s) — new session %d of %d",
                                           spec.name, run.continues + 1, budget,
@@ -6150,10 +5512,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                           ceiling)
                                 failed = _replace_session(turn, reason="repeat")
                                 if failed is not None:
-                                    # the outgoing session is aborted and the
-                                    # replacement refused: the run ends here, and
-                                    # the worktree is left as it stands, so
-                                    # `--resume` restarts the agent in it
+                                    # A refused replacement ends the run here; the worktree stays for --resume.
                                     run.turns.append(turn)
                                     _append_jsonl(agent_dir / "turns.jsonl",
                                                   {"agent": spec.name, **turn})
@@ -6180,21 +5539,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             else:
                 error = state = None
             if state is not None:
-                # KC-21: a turn that died with a commit under it has finished work,
-                # so it is scored once before the terminal state lands — exactly as
-                # the HARVESTING step and `_plan`'s resume branch score it. The
-                # session is gone, the worktree is not; the verdict decides whether
-                # the run counts as READY or stays in the state the turn earned —
-                # and KC-29 qualifies who may be promoted: only a session that
-                # ended on its own, not one the runner asked to stop.
+                # A turn that died with a commit is scored once before the terminal state lands (KC-21).
                 note = None
-                # Round 87: Kilo shut down under four live agents; each turn
-                # ended ERROR on `MessageAbortedError` before the round's own
-                # Ctrl-C flag was up, and `--resume` 8 minutes later restarted
-                # every agent except those four. An abort the runner did not ask
-                # for is not the agent's end: no deadline commit and no harvest
-                # against a server that is gone, and `resumable` so `_plan`
-                # starts it again in the same worktree.
+                # An abort the runner did not ask for is not the agent's end; it is resumable (round 87).
                 external_abort = (state is AgentState.ERROR and idle.status == "error"
                                   and _is_external_abort(idle.error))
                 if external_abort:
@@ -6203,16 +5550,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                  "--resume restarts it", spec.name)
                 if state in (AgentState.STALLED, AgentState.ERROR) and not external_abort:
                     above = _commits_above(ws)
-                    # KC-41: a turn that ends with the work on disk and nothing
-                    # committed scores as though it had produced nothing, and
-                    # the round drops it — round 64 held two entries that pass
-                    # all four pytest roots and harvested none. So the runner
-                    # commits it for the model first (`deadline_commit` in
-                    # `contest.ini`), writes the progress row `harvest` asks for,
-                    # and the harvest below runs either way. Both writes are
-                    # fail-open and both answer `None`/`False` on any trouble, so
-                    # a tree that cannot be committed leaves today's behaviour
-                    # exactly: `above` stays 0, no row, no harvest, no verdict.
+                    # A turn that ends with uncommitted work is committed for the model, with a progress row (KC-41).
                     if above == 0 and _deadline_commit_enabled(config):
                         reason = _deadline_reason(state, error, stalled)
                         sha = _deadline_commit(ws, reason=reason, ticket=ticket_path)
@@ -6226,10 +5564,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             )
                             above = _commits_above(ws)
                     if above:
-                        # KC-48: the session is gone, so what its calls left
-                        # running goes before the harvest reads the tree and runs
-                        # its suites next to it; `finally` reaps again, for what
-                        # came after.
+                        # Stray processes are reaped before the harvest reads the tree (KC-48).
                         _record_reaped(run, spec.name, ws.path)
                         verdict = _harvest(ws, ticket_path, run_tests, config)
                         turn["harvest"] = {
@@ -6239,50 +5574,26 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             "waited": round(verdict.waited, 1),
                             "tests_run": _harvest_tests_run(verdict),
                         }
-                        # KC-74: the leg record is written after the session is
-                        # closed, so the last words are saved here, off the
-                        # transcript, not read back out of a live session
+                        # The last words are saved from the transcript, since the session is already closed (KC-74).
                         turn["last_message"] = _last_assistant_text(backend, session)
-                        # KC-30: the harvest names the branch's one commit itself
-                        # when no row claims it, so there is no fallback to add
-                        # here — the sha comes from the verdict, one line as the
-                        # HARVESTING step does, so the two cannot drift apart.
+                        # The harvest names the commit itself, so the verdict's sha is taken as it is (KC-30).
                         run.commit = verdict.commit
                         if verdict.verdict == "READY" and not stalled:
-                            # KC-21: the session ended on its own — a silence,
-                            # the turn clock, a `session.error` — with the work
-                            # committed and claimed: it counts as READY.
+                            # A session that ended on its own with claimed work counts as READY (KC-21).
                             note = f"{(run.commit or '')[:12]} after {error}"
                             state = AgentState.READY
                             error = None
                         elif stalled:
-                            # KC-29: the runner asked the stall itself — the
-                            # questions cap, the agent's hard limit — so the
-                            # agent did not finish: no promotion, whatever the
-                            # verdict. The harvest's verdict stays on the turn
-                            # and `run.commit` for the patch, the turn keeps
-                            # the state and the reason it earned, and the KC-18
-                            # line names the verdict after the reason.
+                            # A stall the runner asked for is never promoted, whatever the verdict (KC-29, KC-18).
                             note = f"harvest: {verdict.verdict}"
                 if state is AgentState.ERROR and _is_local_store(idle.error):
-                    # KC-62: the session is gone, the worktree is not — and with no
-                    # commit under it, no commit for `_plan` to restart from either.
-                    # The flag is what makes `--resume` start the agent again in this
-                    # tree instead of leaving the turn dropped.
+                    # A store-error run with no commit is restartable in its own tree (KC-62).
                     try:
-                        # KC-41 against KC-62, where they meet. A deadline commit
-                        # is *why* the tree may be clean here: the runner put the
-                        # work on the branch a moment ago, so `_dirty_tree` alone
-                        # would report the agent as having produced nothing and
-                        # `--resume` would stop restarting every agent whose turn
-                        # the store took down — the case KC-62 was filed for. The
-                        # flag asks "was there work at the end of the turn",
-                        # which a status read after the commit cannot answer.
+                        # A deadline commit makes the tree clean, so the flag asks whether there was work (KC-41, KC-62).
                         if run.deadline_commit or _dirty_tree(ws):
                             run.resumable = True
                     except TreeReadError as exc:
-                        # FL-2: a status that could not be read is not a clean tree —
-                        # no flag, and a warning so nobody reads it as one.
+                        # An unreadable status is not a clean tree; it is flagged with a warning (FL-2).
                         _log.warning("%s: tree unreadable — %s", spec.name,
                                      _brief(str(exc)))
                 run.turns.append(turn)
@@ -6291,11 +5602,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
 
             # ── HARVESTING ─────────────────────────────────────────────────
             transition(AgentState.HARVESTING, note="tests on" if run_tests else "tests off")
-            # Round 83: the harvest is the judge's time, not the agent's — its
-            # queue for the round's suite slots ran 27 min for one agent, and a
-            # limit that fired in there turned a REWORK into `time up`. So the
-            # hard limit is paused for the whole harvest, as it is for the
-            # agent's own queue (KC-58), and resumed with what it had left.
+            # The harvest is the judge's time, so the hard limit is paused for it (round 83, KC-58).
             paused = pause_time_up()
             try:
                 verdict = _harvest(ws, ticket_path, run_tests, config)
@@ -6306,12 +5613,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                "reasons": [r.code for r in verdict.reasons],
                                "elapsed": round(verdict.elapsed, 1),
                                "waited": round(verdict.waited, 1),
-                               # KC-74: the roots the judge ran, kept on the
-                               # turn so the leg record can name them after the
-                               # session is closed — it was dropped before
+                               # The judge's ran tests are kept on the turn for the leg record (KC-74).
                                "tests_run": _harvest_tests_run(verdict)}
-            # KC-74: as the salvage harvest above — the record cannot ask the
-            # session for this, the session is closed when it is written
+            # The last words are saved here, since the session is closed by the time the record is written (KC-74).
             turn["last_message"] = _last_assistant_text(backend, session)
             run.commit = verdict.commit
             label = "tests" if run_tests else "harvest"
@@ -6324,19 +5628,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 return finish(AgentState.GAVE_UP, "REWORK after the last attempt: "
                               + ", ".join(r.code for r in verdict.reasons if r.blocking))
             run.attempt += 1
-            # KC-22: a rework resets the per-attempt continue counter; KC-39's diff
-            # signature with it — the new attempt has nothing to compare a continue
-            # against. KC-62's local store budget is per turn, not per attempt, so
-            # it resets there too.
+            # A rework resets the per-attempt continue counter and the diff signature (KC-22, KC-39, KC-62).
             run.continues = 0
             run.last_diff_signature = ""
-            # KC-42: the attempt has just started, so the first-touch budget and
-            # the one reset come back with it — the same reasoning as
-            # `continues` and `last_diff_signature` above.
+            # A new attempt gets its first-touch budget back, as continues do (KC-42).
             run.first_touch_nudges_used = 0
             run.first_touch_resets = 0
-            # KC-39: the attempt has just started, so the session it holds is its
-            # first.
+            # The attempt has just started, so this session is its first.
             run.sessions_this_attempt = 1
             local_retries = 0
             silent_retries = 0
@@ -6344,9 +5642,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                        + ", ".join(r.code for r in verdict.reasons))
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
     finally:
-        # KC-58: a slot must not survive the agent that asked for it, whatever
-        # the agent left running. KC-48 reaps the processes a moment later; the
-        # next waiter is answered now, not on the next poll.
+        # A slot does not outlive its agent; the next waiter is answered at once (KC-58).
         try:
             _SUITE_SLOTS.release(spec.name)
         except Exception:  # noqa: BLE001 — the round goes on without the slot
@@ -6354,10 +5650,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         if time_up is not None:
             time_up.cancel()
         if run.terminal:
-            # KC-48: the turn is over — the session aborted, the stream closed,
-            # or the state is whatever the run earned — so nothing the agent's
-            # calls left standing may keep running in the tree the harvest and
-            # the export are about to read.
+            # The turn is over, so anything its calls left running is reaped before the harvest (KC-48).
             _record_reaped(run, spec.name, ws.path)
         if session is not None and run.terminal:
             _record_once(session)
@@ -6431,9 +5724,7 @@ def _record_session(run: AgentRun, backend: ContestBackend, session: SessionRef,
         _log.warning("messages(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the round
-# ─────────────────────────────────────────────────────────────────────────────
+# The round
 
 class _Stopped(Exception):
     """Raised inside a worker's `on_transition` once Ctrl-C asked the round to stop."""
@@ -6454,8 +5745,7 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
         if run is None:
             run = AgentRun(agent=specs.get(ws.agent) or AgentSpec(ws.agent, "", ""), workspace=ws)
         elif not run.terminal or run.resumable:
-            # mid-flight when the round died — or `ERROR` on Kilo's own store with a
-            # dirty tree (KC-62): the session is gone, the worktree is not
+            # Mid-flight at the round's death, or ERROR on Kilo's store with a dirty tree (KC-62).
             run.resumable = False      # spent on this restart, so a later plain ERROR is not
             run.workspace = ws
             verdict = _harvest(ws, ticket_path, run_tests, config)
@@ -6464,38 +5754,21 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
             else:
                 run.state, run.session_id, run.attempt = AgentState.CREATED, None, 0
                 run.continues = 0
-                # KC-40: the ask is one per session, and the restart opens a new
-                # session — so it is asked again there, and the answer appends to
-                # the summary file rather than overwriting the first.
+                # The summary is asked again in the restarted session; answers append to the file (KC-40).
                 run.summary_attempted_at_attempt = -1
                 run.summary_session_id = ""
-                # KC-39: the restart opens a new session in a new attempt, so the
-                # attempt's allowance comes back with it. The run's total is left
-                # as it is — those sessions were spent by this agent too — and
-                # the signature is cleared: a diff recorded before the round died
-                # must not be read as a repeat by the first continue of the
-                # restart, which would open a session the ticket did not ask for.
+                # A restart opens a new attempt, so its session allowance comes back; the total is kept (KC-39).
                 run.sessions_this_attempt = 0
                 run.last_diff_signature = ""
-                # KC-42: same reasoning for the first-touch budget — the restart
-                # is a new attempt, and a nudge already spent in the round that
-                # died must not be read as this one's.
+                # The first-touch budget is per attempt, so a nudge from the dead round does not count (KC-42).
                 run.first_touch_nudges_used = 0
                 run.first_touch_resets = 0
-                # KC-22, `--resume` into a worktree that still holds the agent's
-                # uncommitted work: the fresh session learns of it on its first
-                # prompt. A clean tree (or one with a commit under it) carries no
-                # `dirty_on_resume`, so the prompt is unchanged and the agent
-                # may not start over or discard the files.
-                # `max_continues_per_attempt = 0` turns the whole mechanism off — this
-                # half included: no tree read, no paragraph, today's prompt.
+                # A resumed worktree with uncommitted work is named in the first prompt; a clean one is not (KC-22).
                 if int(config.max_continues_per_attempt) > 0 and _commits_above(ws) == 0:
                     try:
                         dirty = _dirty_tree(ws)
                     except TreeReadError as exc:
-                        # FL-2: the tree is not clean, it is unreadable — no
-                        # paragraph, and a warning so nobody reads this as a
-                        # clean worktree.
+                        # An unreadable tree is not clean; the resume names it as unreadable (FL-2).
                         _log.warning("tree of %s unreadable — %s", ws.path,
                                      _brief(str(exc)))
                         dirty = ""
@@ -6505,24 +5778,15 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
     return runs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# KC-43: legs — a round that is a relay of whole turns in one worktree
-# ─────────────────────────────────────────────────────────────────────────────
+# Legs: a relay of whole turns in one worktree (KC-43)
 
-#: The states a leg can end an agent in that hand it to the next leg: it ran out
-#: — of clock, of context, of rework budget — with its work still in the worktree.
-#: Every other end stops the relay for that agent. READY is the entry itself, so a
-#: leg 3 would only be asked to redo it; DEAD (KC-42) never started, so a leg must
-#: not be spent on it; ERROR is the runner's or the provider's failure, and a
-#: fresh session would meet the same one — `--resume` is the way back from that.
+#: Ends that hand an agent to the next leg: ran out of clock, context or rework; others stop the relay (KC-43).
 RELAY_STATES = (AgentState.GAVE_UP, AgentState.STALLED)
 
-#: How many touched files a leg record lists before it says "and N more" — the
-#: records are pasted into the next leg's prompt, so they stay short by construction.
+#: Touched files a leg record lists before it says "and N more"; records stay short for the next prompt.
 _LEG_FILES_SHOWN = 30
 
-#: Paths the record never lists: the agent's queue and the test-tier links are the
-#: harness's own, not work.
+#: Paths a leg record never lists: the agent queue and the test-tier links.
 _LEG_SCRATCH = ("runs/", ".smoke_tests/")
 
 
@@ -6550,9 +5814,7 @@ def _leg_files(ws: Workspace) -> list:
     return [(path, *found[path]) for path in sorted(found)]
 
 
-#: KC-74: the record's line cap. The records are pasted into the next leg's prompt,
-#: so a leg that talked a lot must not cost the next leg a whole session of context:
-#: over the cap the two model fields are cut and the mechanical ones are never cut.
+#: Line cap of a leg record pasted into the next prompt; over it the model fields are cut (KC-74).
 LEG_RECORD_MAX_LINES = 80
 
 #: KC-74: the last message's own cap, applied before the record's cap.
@@ -6561,13 +5823,10 @@ _LEG_MESSAGE_LINES = 20
 #: KC-74: where a model field was cut to fit the record's cap.
 _LEG_CUT = "… cut"
 
-#: KC-74: pytest's short summary row — the node id, xdist's `@group` suffix and the
-#: ` - message` dropped, as the judge drops them in `gates._failures`.
+#: pytest's short-summary row for a leg record: the node id, without the group and the message (KC-74).
 _LEG_FAIL_LINE = re.compile(r"^(?:FAILED|ERROR) (\S+?)(?:@[^\s\[]+)?(?: - .*)?$")
 
-#: KC-74: the stats line is the one pytest prints with a duration,
-#: `=== 1 failed, 41 passed in 2.34s ===`. Searched, not anchored: the line carries
-#: its `===` frame, and under `-q` it starts at column one.
+#: Pytest stats line, found by its duration (KC-74).
 _LEG_STATS_LINE = re.compile(r"\bin [\d.]+[smh]?\b")
 
 #: KC-74: one `N passed` / `N failed` / `N errors` of that line.
@@ -6576,8 +5835,7 @@ _LEG_COUNT = re.compile(r"\b(\d+) (passed|failed|errors?)\b")
 #: KC-74: a shell token, for the roots a `bash` call named.
 _LEG_CMD_TOKEN = re.compile(r"[^\s;|&<>]+")
 
-#: KC-74: the wrappers and prefixes a pytest command is wrapped in — the agents run
-#: theirs `timeout 1500 python3 -m pytest tests` most often.
+#: Command wrappers and prefixes that a pytest command is wrapped in (timeout 1500 python3 -m pytest).
 _LEG_PIECE_SPLIT = re.compile(r"\s*(?:&&|\|\||[;|&])\s*")
 _LEG_WRAPPER = frozenset({
     "timeout", "nohup", "env", "nice", "time", "exec", "command", "stdbuf", "ionice",
@@ -6586,16 +5844,14 @@ _LEG_WRAPPER = frozenset({
 _LEG_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _LEG_PYTHON = re.compile(r"^python\d*(?:\.\d+)?$")
 
-#: KC-74: pytest options that swallow the next token, which is their value, not a
-#: root — `-n 4` is a worker count, `.smoke_tests` is the root.
+#: pytest options that take a value, so the next token is not a test root (KC-74).
 _LEG_VALUE_FLAGS = frozenset({
     "-n", "--workers", "--dist", "--dist-load", "--timeout", "--durations",
     "--maxfail", "--max-fail", "--maxprocesses", "-k", "--keywords", "-m",
     "--markers", "--deselect", "--stepwise", "--max-worker-restart", "--new-first",
 })
 
-#: KC-74: an option that narrows the selection — with it a run is a slice of a root,
-#: not the root, so it names none.
+#: pytest options that narrow the selection, so the run names no whole root.
 _LEG_SELECT_FLAGS = frozenset({
     "-k", "--keywords", "-m", "--markers", "--deselect", "--co", "--collect-only",
     "--lf", "--last-failed", "--nf", "--new-first", "--ff", "--failed-first",
@@ -6892,8 +6148,7 @@ def leg_record(run: AgentRun, ws: Workspace, out_dir, ticket_path=None) -> Path:
             lines.append(f"  ... and {len(files) - _LEG_FILES_SHOWN} more")
     else:
         lines.append("files: none")
-    # where the branch ended, for the record only — KC-30's rule stands: the runner
-    # never reads a sha to stand in for a claim, and no verdict is built from this one
+    # The branch end is recorded for the record only; no verdict is built from this sha (KC-30).
     commit = git(ws.path, "log", "-1", "--format=%H") if _commits_above(ws) > 0 else ""
     verdict = ""
     for turn in reversed(getattr(run, "turns", None) or []):
@@ -6909,11 +6164,7 @@ def leg_record(run: AgentRun, ws: Workspace, out_dir, ticket_path=None) -> Path:
         lines += [f"  {root}: {counts}" for root, counts, _ in tests]
     else:
         lines.append("tests: none")
-    # the mechanical fields are whole now — the title, files, commit, harvest,
-    # tests, and the "what is left" line below — so they alone set the cap the two
-    # model fields may take. They are never cut: the records are pasted into the
-    # next leg's prompt, and a chatty leg must not cost the next one a session of
-    # context.
+    # The mechanical fields set the cap for the model fields, and they are never cut (KC-74).
     failing = [node for _, _, nodes in tests for node in nodes]
     touched = {path for path, *_ in files}
     left = [path for path in _leg_declared(ticket_path) if path not in touched] + failing
@@ -7051,18 +6302,15 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
     stop = threading.Event()
     since: dict = {run.agent.name: time.monotonic() for run in runs}   # state entered at
 
-    # KC-65: the last worker count `save` wrote, so a save that sees the same
-    # count does no I/O. `save` holds `lock`, so the memo needs none of its own.
+    # The last worker count written is remembered, so an unchanged save does no I/O (KC-65).
     _workers_memo: dict = {}
-    # KC-65: the round's share of `[contest] agent_tmpdir` — where the CLI
-    # pointed the agents' $TMPDIR — is scratch the policy lets through.
+    # The round's share of agent_tmpdir is scratch the policy lets through (KC-65).
     agent_tmp = agent_tmp_path(config, round_no)
 
     def save() -> None:
         with lock:
             _write_json(out_dir / "state.json", state.to_dict())
-            # KC-65: the worker file follows the round too — a slot that just
-            # freed is workers the next pytest can have.
+            # The worker file follows the round too, since a freed slot is a worker the next pytest can have (KC-65).
             refresh_pytest_workers(out_dir, config, state, _workers_memo)
 
     def on_transition(run: AgentRun) -> None:
@@ -7074,9 +6322,7 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
     heartbeat = _Heartbeat(state, since, float(config.progress_every_sec or 0),
                            server_pid=server_pid,
                            neighbour_warn=int(getattr(config, "neighbour_kilo_warn", 4) or 0),
-                           # KC-81: `getattr` so a config written before the key
-                           # degrades to "check off", never a raise into a round.
-                           # An OpenRouter round has no `kilo serve` to hang.
+                           # Health checks read their config with getattr, so an old config means "off" (KC-81).
                            kilo_silent_sec=(float(getattr(config, "kilo_silent_sec", 0) or 0)
                                             if getattr(config, "backend", "kilo") == "kilo"
                                             else 0.0),
@@ -7120,9 +6366,7 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
     except KeyboardInterrupt:
         interrupted = True
         stop.set()  # from here on a worker's transition raises instead of saving
-        # KC-48: the round's own sweep over every worktree, before the interrupt
-        # below wakes the workers — so the save right after carries `reaped`
-        # while the mid-flight agents are still saved mid-flight for --resume.
+        # The round sweeps every worktree before the interrupt, so the save records what was reaped (KC-48).
         _reap_round_worktrees(state.agents)
         save()      # the round as it stood, carrying the reap records
         for run, backend in live:
@@ -7137,11 +6381,7 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
     finally:
         heartbeat.stop()
         pool.shutdown(wait=False, cancel_futures=True)
-        # KC-48: the same sweep on a normal return, when every agent has ended and
-        # the round's exit is the last chance to close the gap after one of them.
-        # On Ctrl-C the handler already ran it and saved the round as it stood — a
-        # second `save()` here would write the states the just-woken workers are
-        # still dragging on, and turn a mid-flight agent into an ERROR for --resume.
+        # The sweep also runs on a normal return; a second save on Ctrl-C would overwrite the agents' states (KC-48).
         if not interrupted:
             _reap_round_worktrees(state.agents)
             save()
@@ -7180,9 +6420,7 @@ def _lock_status(run: AgentRun) -> tuple | None:
         return None
 
 
-#: Round 153: the server's cpu share (percent of one core) from which a silent
-#: spell also carries the "delete Kilo's store" advice — a hung `kilo serve`
-#: sat at ~200 %, an idle wait on a slow provider sits near 0.
+#: Server CPU percent above which a silent spell also advises deleting Kilo's store (round 153).
 HUNG_STORE_CPU_PERCENT = 50.0
 
 
@@ -7198,19 +6436,14 @@ def _proc_cpu_ticks(pid: int, proc_root: str = "/proc") -> int | None:
     try:
         with open(f"{proc_root}/{pid}/stat", "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
-        # `comm` may itself contain spaces and parens: everything after the
-        # last `)` is the stable tail — state ppid pgrp session tty tpgid
-        # flags minflt cminflt majflt cmajflt utime stime …
+        # The command name may hold spaces, so the stable fields are read after its last ")".
         fields = text.rsplit(")", 1)[-1].split()
         return int(fields[11]) + int(fields[12])
     except (OSError, ValueError, IndexError):
         return None
 
 
-#: KC-81: the states of an agent with a turn in flight — the ones waiting on
-#: `kilo serve` for their next event. HARVESTING is not among them: the session
-#: is over and the work is pytest in the worktree, so a quiet server then is
-#: idle by design. (From round 128's sensenova-6-7-flash-lite-var1.)
+#: Agent states that wait on kilo serve for an event; HARVESTING is left out (round 128).
 _EVENT_WANTED = (AgentState.PROMPTED, AgentState.WAITING, AgentState.REWORK)
 
 
@@ -7308,8 +6541,7 @@ class _Heartbeat:
         now = time.monotonic()
         parts = []
 
-        # First pass: collect files for all non-terminal agents; the median
-        # is over the agents currently working (WAITING/REWORK), floor 1.
+        # The median is taken over the agents currently working (WAITING or REWORK), with a floor of 1.
         files_by_name = {}
         working_files = []
         for run in self.state.agents:
@@ -7320,8 +6552,7 @@ class _Heartbeat:
                     working_files.append(f)
         median = max(1.0, statistics.median(working_files)) if working_files else 1.0
 
-        # One agent per line, name and state padded to the widest so the ages
-        # and the bars stand in one column down the round.
+        # One agent per line, padded to the widest name and state so the ages line up.
         name_w = max((len(run.agent.name) for run in self.state.agents), default=0)
         state_w = max((len(run.state.value) for run in self.state.agents), default=0)
         for run in self.state.agents:
@@ -7336,9 +6567,7 @@ class _Heartbeat:
                 pct = _progress(run.state, files, median, committed)
                 if pct is not None:
                     part += f" {_bar(pct)} {pct:>3}% {files}f"
-                # KC-36: a turn running past its nominal clock says so, so an
-                # extended agent is not mistaken for a hung round. The suffix
-                # rides the attempt marker when there is one.
+                # A turn past its nominal clock is shown as extended, not as a hung round (KC-36).
                 live_clock = getattr(run, "_turn_clock", None)
                 granted = float(live_clock.granted) if live_clock is not None else 0.0
                 if run.attempt:
@@ -7355,8 +6584,7 @@ class _Heartbeat:
         text = f"round {self.state.label} {age}, {live} live:" + "".join(f"\n  {p}" for p in parts)
         count = self._kilo_neighbours()
         if count is not None:
-            # KC-62: a store this busy is what ends agents on `Failed to execute
-            # statement` — the operator needs to see the crowd, not just the states.
+            # A busy store is what ends agents on "Failed to execute statement", so the crowd is shown (KC-62).
             text += f"\n  kilo neighbours {count}"
         return text
 
@@ -7463,8 +6691,7 @@ class _Heartbeat:
         if not waiting:
             return self._end_spell()
         wall = time.time()
-        # The log is checked only when the events have gone quiet; one quiet
-        # agent among busy ones is the stall logic's business, not this one.
+        # The log is checked only once events have gone quiet; one quiet agent is the stall logic's job.
         silent_for = None
         for run in waiting:
             idle = self._event_idle(run, wall)
@@ -7496,14 +6723,7 @@ class _Heartbeat:
         kill_pid = str(pid) if pid else "<pid>"
         count = len(waiting)
         plural = "agent" if count == 1 else "agents"
-        # Round 153: a server that is silent *and* pinned on the CPU (a busy
-        # loop, not an idle wait) is usually Kilo's own store grown huge — every
-        # round worktree shares one project id, so `kilo.db` and `snapshot/` only
-        # get bigger (live: 1.4 GB and 2 GB, two hangs in a row at 8 and at 4
-        # parallel at ~200 % cpu; a clean store ran the same round for 2.5 h).
-        # Only a line of advice, like the rest of this warning: nothing is
-        # deleted or killed here. The path is the one this server's own
-        # environment resolves (`kilo_neighbours`), not a hard-coded one.
+        # A silent, CPU-pinned server is usually Kilo's store grown huge; the advice names the path only (round 153).
         advice = ""
         try:
             busy = float(str(cpu).rstrip("%")) >= HUNG_STORE_CPU_PERCENT

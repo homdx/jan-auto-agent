@@ -42,8 +42,7 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 
 logger = logging.getLogger(__name__)
 
-# Module-level sentinel — callers can use `faq_agent.NOT_FOUND_MARKER` for
-# equality checks independent of any ini customisation.
+# Sentinel for "not found"; compare against faq_agent.NOT_FOUND_MARKER, independent of the ini.
 NOT_FOUND_MARKER = "NOT FOUND"
 
 # ── English stop-words removed during keyword fallback word-split ────────────
@@ -122,6 +121,64 @@ _DEFAULT_KEYWORD_SYSTEM = (
 )
 
 
+
+def make_kw_pattern(kw: str) -> "re.Pattern[str]":
+    """A compiled regex that finds whole occurrences of `kw` in free text.
+
+    Keyword matches must respect word boundaries on both sides — for a
+    plain-word keyword that is exactly what `\\b` gives, but `\\b` also
+    refuses to match at either end of a hyphenated keyword (`ansible-playbook`),
+    because a hyphen is a non-word character. The ticket that used to hide
+    this called a match only when the neighbours were one of a small set
+    (`/`, `.`, whitespace), which made commas, colons, brackets and
+    question marks — the punctuation of both documentation and questions —
+    fail to match, and the best-scoring file could score zero and fall
+    under the `_answer_smart` cutoff.
+
+    The generalisation here is "no word character next to the keyword" —
+    `(?<!\\w)` / `(?!\\w)` — which is the same meaning `\\b` has for plain
+    keywords, and which keeps the slash and period cases working
+    (those characters are still non-word characters). It also handles
+    keywords that carry non-word characters at their edges (`c++`,
+    `.env`): the boundary is checked against the character OUTSIDE the
+    keyword, so a leading or trailing punctuation is a valid edge, not a
+    signal to skip.
+
+    A keyword containing a literal space (e.g. `"install node"`) is still
+    matched as a whole phrase; `re.escape` turns it into `install\\snode`,
+    and the two lookarounds still apply at the phrase edges.
+
+    Moved to module scope (from `_rank_candidates._make_kw_pattern`) so it
+    can be tested in isolation.
+    """
+    if not kw:
+        return re.compile(r"(?!x)x")
+    escaped = re.escape(kw)
+    if re.search(r"\W", kw):
+        # Exclusion set = word chars plus each unique NON-WHITESPACE non-word
+        # char appearing inside the keyword.  Whitespace inside the keyword
+        # (e.g. `"install node"`) is a separator, not part of a token, so it
+        # is not in the exclusion set and the phrase can still sit next to a
+        # space.  A hyphen or period inside the keyword IS part of a token
+        # (`ansible-playbook`, `foo.bar`), so it is excluded and a joining
+        # hyphen in `run-ansible-playbook` does not satisfy the lookbehind.
+        extras = sorted({c for c in kw
+                         if not c.isalnum() and c != "_" and not c.isspace()})
+        exclusion = r"[\w" + "".join(re.escape(c) for c in extras) + r"]"
+        return re.compile(r"(?<!" + exclusion + r")" + escaped + r"(?!" + exclusion + r")")
+    return re.compile(r"\b" + escaped + r"\b")
+
+
+def _normalise_extensions(raw) -> list[str]:
+    """Each configured extension as ``.ext`` in lower case: "md", "*.md", ".MD" are all ".md"."""
+    out: list[str] = []
+    for e in raw:
+        e = str(e).strip().lower().lstrip("*").lstrip(".")
+        if e and "." + e not in out:
+            out.append("." + e)
+    return out
+
+
 class FaqAgent:
     """
     Scans a knowledge folder and answers a single question against its content.
@@ -165,22 +222,17 @@ class FaqAgent:
         self.api_format  = api_format
         self.timeout     = timeout
         self.ssl_context = ssl_context
-        # AUTO-FIX (fable follow-up 3): forward the profile's context window.
-        # Without it every FAQ call ran at Ollama's server default regardless
-        # of the 32K/128K profile in agents.ini.
+        # The profile's context window is forwarded to Ollama, not left at the server default (AUTO-FIX).
         self.num_ctx = 0
 
         cfg = config
         if cfg is not None:
-            # AUTO-FIX (medium-priority audit): wrapped per-call, not
-            # delegated to a shared helper, so extract_config_reads
-            # (COLLECT-5) still recognizes the literal config.getX(...)
-            # call shape.
+            # Wrapped per call so extract_config_reads still sees the literal config.getX call (AUTO-FIX).
             self.knowledge_dir = Path(
                 cfg.get("faq_agent", "knowledge_dir", fallback="./knowledge")
             )
             raw_ext = cfg.get("faq_agent", "extensions", fallback=".txt,.md")
-            self.extensions = [e.strip() for e in raw_ext.split(",") if e.strip()]
+            self.extensions = _normalise_extensions(raw_ext.split(","))
             try:
                 self.temperature = cfg.getfloat("faq_agent", "temperature", fallback=0.0)
             except ValueError as exc:
@@ -228,10 +280,7 @@ class FaqAgent:
                 "faq_agent", "validate_system", fallback=_DEFAULT_VALIDATE_SYSTEM
             )
 
-            # ── two-stage smart-search ──────────────────────────────────────
-            # BUGFIX: same missing-guard pattern as keyword_max_tokens/
-            # max_candidates above — a non-boolean smart_search value crashed
-            # FaqAgent.__init__() outright instead of degrading to the default.
+            # Smart search flag: a non-boolean value falls back to the default, not a crash (BUGFIX).
             try:
                 self.smart_search = cfg.getboolean(
                     "faq_agent", "smart_search", fallback=False
@@ -244,12 +293,7 @@ class FaqAgent:
             self.keyword_system = cfg.get(
                 "faq_agent", "keyword_system", fallback=_DEFAULT_KEYWORD_SYSTEM
             )
-            # BUGFIX: matches the try/except ValueError pattern already used
-            # three lines above (temperature/max_tokens/etc. in this same
-            # constructor) — fallback= only covers a missing key, not a
-            # malformed value, so a non-numeric keyword_max_tokens crashed
-            # FaqAgent.__init__() outright, taking down the /faq REPL
-            # command and any --auto startup path that builds the FAQ agent.
+            # A malformed keyword_max_tokens falls back to the default, not a crash (BUGFIX).
             try:
                 self.keyword_max_tokens = cfg.getint(
                     "faq_agent", "keyword_max_tokens", fallback=64
@@ -259,8 +303,7 @@ class FaqAgent:
                     "config [faq_agent] keyword_max_tokens invalid (%s) — using 64", exc
                 )
                 self.keyword_max_tokens = 64
-            # Maximum number of top-ranked candidates tried in Stage 1.
-            # 0 means unlimited (try all candidates with score > 0).
+            # Top-ranked candidates tried in Stage 1; 0 means all candidates with a score above 0.
             try:
                 self.max_candidates = cfg.getint(
                     "faq_agent", "max_candidates", fallback=5
@@ -270,20 +313,12 @@ class FaqAgent:
                     "config [faq_agent] max_candidates invalid (%s) — using 5", exc
                 )
                 self.max_candidates = 5
-            # auto_pull: when (and whether) to POST /api/pull before inference.
-            #   "auto"  (default) → only for a local Ollama daemon
-            #   "true"/"false"    → force on / off
+            # auto_pull: "auto" pulls only from a local Ollama, "true" or "false" forces it.
             self.auto_pull = cfg.get(
                 "faq_agent", "auto_pull", fallback="auto"
             ).strip().lower()
 
-            # ── grounding / intent revalidation ─────────────────────────────
-            # Dedicated extra LLM pass confirming the answer is DIRECTLY grounded
-            # in the KB for the question as asked. Related/opposite KB → answer
-            # returned with an explicit caveat; irrelevant KB → NOT FOUND.
-            # BUGFIX: same missing-guard pattern as smart_search above — a
-            # non-boolean revalidate_grounding value crashed __init__()
-            # instead of degrading to the default.
+            # Grounding check: a second pass confirms the answer is grounded in the KB (BUGFIX).
             try:
                 self.revalidate_grounding_enabled = cfg.getboolean(
                     "faq_agent", "revalidate_grounding", fallback=False
@@ -318,12 +353,10 @@ class FaqAgent:
             self.revalidate_grounding_enabled = False
             self.revalidate_grounding_system  = _DEFAULT_REVALIDATE_GROUNDING_SYSTEM
 
-        # Keep NOT_FOUND in sync with any ini-customised marker so callers can
-        # always use `agent.NOT_FOUND` regardless of ini customisation.
+        # NOT_FOUND follows the ini-customised marker, so callers can always use agent.NOT_FOUND.
         self.NOT_FOUND = self.not_found_marker
 
-        # Counter: total LLM API calls made during the last answer() invocation.
-        # Reset to 0 at the top of every answer() call.
+        # Total LLM calls in the last answer(); reset at the top of each answer() call.
         self.llm_call_count: int = 0
 
     # ── Connectivity helpers ─────────────────────────────────────────────────
@@ -397,9 +430,7 @@ class FaqAgent:
             logger.debug("FaqAgent: model %r is ready", self.model)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
-                # No /api/pull on this endpoint — a chat-only/hosted gateway,
-                # not a local daemon, so the model is already served and
-                # there's nothing to pull. Benign, so debug rather than warning.
+                # No /api/pull on a hosted gateway; the model is already served, so this is debug only.
                 logger.debug(
                     "FaqAgent: %s has no /api/pull (404) — model assumed served",
                     pull_url,
@@ -469,9 +500,7 @@ class FaqAgent:
 
     # ── Stage 1b — Candidate ranking ────────────────────────────────────────
 
-    # Multiplier separating the two scoring tiers.
-    # total_hits (popularity) can never realistically reach this value,
-    # so unique_hits always dominates the sort without affecting the tiebreaker.
+    # Tier multiplier: popularity can never reach it, so unique hits always sort first.
     _SCORE_MULTIPLIER = 100_000
 
     def _rank_candidates(
@@ -516,21 +545,7 @@ class FaqAgent:
         building the shortlist so they never receive a Stage-1 LLM call.
         """
         lower_kw = [k.lower().strip() for k in keywords if k.strip()]
-
-        def _make_kw_pattern(kw: str) -> "re.Pattern[str]":
-            escaped = re.escape(kw)
-            if re.search(r"\W", kw):
-                # \b fails for hyphenated keywords since "-" is itself a
-                # \w/\W boundary (\bansible-playbook\b wrongly matches inside
-                # "run-ansible-playbook"). So for non-word-char keywords we
-                # require whitespace or "/"/"." as the delimiter instead.
-                return re.compile(
-                    r"(?:(?:^|(?<=[/.\s])))" + escaped + r"(?=[/.\s]|$)",
-                    re.MULTILINE,
-                )
-            return re.compile(r"\b" + escaped + r"\b")
-
-        kw_patterns = [(kw, _make_kw_pattern(kw)) for kw in lower_kw]
+        kw_patterns = [(kw, make_kw_pattern(kw)) for kw in lower_kw]
 
         def _score(name: str, content: str) -> int:
             combined = (name + " " + content).lower()
@@ -547,9 +562,7 @@ class FaqAgent:
             (name, content, _score(name, content))
             for name, content in docs
         ]
-        # Sort highest-score-first; stable sort preserves input order for ties.
-        # Zero-score docs land at the tail — _answer_smart filters them before
-        # building the shortlist so they never receive an LLM call in Stage 1.
+        # Highest score first; zero-score docs are dropped before the shortlist (Stage 1).
         return sorted(scored, key=lambda t: t[2], reverse=True)
 
     # ── Validation pass ──────────────────────────────────────────────────────
@@ -591,8 +604,7 @@ class FaqAgent:
             self.llm_call_count += 1  # validation call
             verdict = strip_think(verdict).strip().upper()
             logger.debug("FaqAgent validate verdict: %r", verdict)
-            # Strict: only an explicit VALID verdict passes. "INVALID: …" and any
-            # unexpected/garbled verdict are treated as not-valid (conservative).
+            # Only an explicit VALID passes; INVALID and any garbled verdict count as not valid.
             return verdict.startswith("VALID")
         except Exception as exc:
             logger.warning(
@@ -734,7 +746,9 @@ class FaqAgent:
             return docs
 
         for fpath in sorted(kdir.rglob("*")):
-            if fpath.is_file() and fpath.suffix in self.extensions:
+            # REP-FAQ-EXT: README.MD / FAQ.TXT were skipped without a word — the suffix is
+            # compared case-blind, against the normalised list.
+            if fpath.is_file() and fpath.suffix.lower() in _normalise_extensions(self.extensions):
                 rel = str(fpath.relative_to(kdir))
                 try:
                     docs.append((rel, fpath.read_text(encoding="utf-8")))
@@ -770,7 +784,11 @@ class FaqAgent:
         keeps the old unlimited behavior.
         """
         parts: list[str] = []
-        budget_chars = 0
+        # None = no limit (num_ctx unknown, or the estimate failed). AUDIT-16:
+        # a computed budget of 0 — a num_ctx no larger than the output
+        # reserve — used to read as "no limit" through ``if budget_chars``
+        # and appended the whole knowledge base; it is a real (tiny) limit.
+        budget_chars = None
         if self.num_ctx:
             try:
                 from tools.auto.utils import chars_per_token
@@ -778,26 +796,15 @@ class FaqAgent:
                 usable_tokens = max(0, self.num_ctx - (self.max_tokens or 1024) - 400)
                 budget_chars = int(usable_tokens * chars_per_token(sample))
             except Exception:
-                budget_chars = 0  # estimation failed → old unlimited behavior
+                budget_chars = None  # estimation failed → old unlimited behavior
 
         used = 0
         skipped: list[str] = []
         for i, (name, content) in enumerate(docs):
             block = f"=== {name} ===\n{content.strip()}"
-            if budget_chars and used + len(block) > budget_chars:
+            if budget_chars is not None and used + len(block) > budget_chars:
                 if not parts:
-                    # BUGFIX (verified-bugs audit #9): the `and parts`
-                    # guard below exists so we never skip/break on the
-                    # very first doc — but that meant when the single
-                    # most-relevant doc alone exceeds budget_chars, this
-                    # branch was never entered at all: the whole `if` was
-                    # False (parts is falsy), so the oversized doc fell
-                    # straight through to the normal append below with NO
-                    # warning and no entry in `skipped`, silently blowing
-                    # past num_ctx for the whole request. There's nothing
-                    # better to include instead of the top-ranked doc, so
-                    # still include it (some grounded context beats none)
-                    # — but warn, so this isn't silent.
+                    # The top doc is kept even when it alone exceeds the budget, with a warning (BUGFIX).
                     logger.warning(
                         "FaqAgent._build_context: the single most relevant "
                         "document (%r, %d chars) alone exceeds the ~%d char "
@@ -806,19 +813,7 @@ class FaqAgent:
                         name, len(block), budget_chars, self.num_ctx,
                     )
                 else:
-                    # BUGFIX: this used to be `skipped.append(name); continue`,
-                    # which only skips THIS doc and keeps probing later ones in
-                    # the ranked list. Since docs are passed in relevance order,
-                    # that let a lower-ranked-but-small doc later in the list
-                    # get included while a higher-ranked-but-large one right
-                    # here gets dropped — e.g. [small#2, LARGE#1, small#3] could
-                    # end up keeping #2 and #3 while dropping #1, the single
-                    # most relevant document, purely because of its size and
-                    # position. That breaks this function's own promise above
-                    # ("the tail we drop is the least relevant part"): the
-                    # dropped set is only guaranteed to be a relevance-ordered
-                    # tail if we stop here entirely, so every kept doc remains
-                    # provably more relevant than every dropped one.
+                    # Stop at the first doc that does not fit, so the dropped docs are always the least relevant (BUGFIX).
                     skipped.extend(n for n, _ in docs[i:])
                     break
             parts.append(block)
@@ -946,8 +941,7 @@ class FaqAgent:
         # ── rank candidates — zero-score docs are already filtered out ───────
         ranked = self._rank_candidates(docs, keywords)
 
-        # Keep only docs with at least one keyword hit for Stage 1.
-        # Zero-score docs fall through to the full-KB Stage-2 fallback.
+        # Stage 1 keeps only docs with a keyword hit; zero-score docs go to the Stage 2 fallback.
         candidates = [(n, c, s) for n, c, s in ranked if s > 0]
 
         if not candidates:
@@ -1027,9 +1021,7 @@ class FaqAgent:
             len(shortlist),
             len(docs),
         )
-        # AUTO-FIX (fable follow-up 3): pass docs in RANKED order so that if
-        # _build_context has to drop files to fit the window, it drops the
-        # least relevant ones — not whichever happened to sort last on disk.
+        # Docs go in ranked order, so a window overflow drops the least relevant ones (AUTO-FIX).
         _ranked_docs = [(n, c) for n, c, _s in ranked]
         return self._answer_legacy(question, _ranked_docs, stream=stream)
 
@@ -1052,21 +1044,7 @@ class FaqAgent:
         context  = self._build_context(docs)
         url, headers, payload = self._build_qa_request(question, context)
 
-        # AUTO-BUG: same asymmetric-resilience bug as tools/actions.py's
-        # _ask_over_text / _answer_from_file / _edit_file_content (see their
-        # comments) — a transient network/API error on THIS call used to be
-        # caught by the blanket except below and returned as
-        # self.not_found_marker, which is indistinguishable from the model's
-        # own legitimate "nothing relevant in the knowledge base" verdict.
-        # _answer_legacy is the last-resort Stage-2 fallback (called after
-        # every Stage-1 candidate is exhausted in smart-search mode, or
-        # directly in legacy mode) — there is no further fallback after it,
-        # so a single dropped connection here used to make a real, present
-        # answer come back as "not found" with no second try. Give the call
-        # itself a small bounded number of retries before giving up, same
-        # spirit as the chunk-retry fix in actions.py, scoped to just the
-        # request_completion call so a genuine model NOT_FOUND (which
-        # returns normally, no exception) still short-circuits immediately.
+        # A transient error in the legacy answer is retried a few times, not read as "not found" (AUTO-BUG).
         _LEGACY_RETRY_ATTEMPTS = 3
 
         def _safe_write(t: str) -> None:
@@ -1081,6 +1059,10 @@ class FaqAgent:
             try:
                 sys.stdout.write(t)
                 sys.stdout.flush()
+            except UnicodeEncodeError:
+                # AUDIT3-18: a non-UTF-8 stdout must not kill a paid streaming call.
+                from tools.ui import safe_stdout_write
+                safe_stdout_write(t)
             except (BrokenPipeError, OSError):
                 pass
 
@@ -1105,10 +1087,7 @@ class FaqAgent:
             return reply
 
         def _on_retry(exc: Exception, attempt: int, wait: int) -> None:
-            # AUTO-FIX (bug 45): on_token writes straight to stdout with no
-            # separator, so a stream dropped mid-answer was followed by the
-            # retry's answer from word one — reading as one garbled
-            # generation. Mark the restart.
+            # A retry after a dropped stream is marked, so the two answers are not read as one (AUTO-FIX, bug 45).
             if stream:
                 sys.stdout.write(
                     f"\n[…retrying — previous stream was interrupted; "
@@ -1134,18 +1113,7 @@ class FaqAgent:
             return self.not_found_marker
 
         if stream:
-            # BUGFIX (audit, bug 45 — reintroduced by the retry_with_backoff
-            # refactor): this print() used to sit inside _one_call(), which
-            # is the function retry_with_backoff() wraps in try/except and
-            # retries on ANY exception — so a stdout failure (e.g.
-            # BrokenPipeError) here, AFTER the LLM call had already
-            # succeeded, was indistinguishable from a failed API call. It
-            # triggered a wasted duplicate request_completion retry, and
-            # once attempts were exhausted, discarded an answer that had
-            # already streamed successfully in favour of not_found_marker.
-            # Moved outside the retried closure entirely: a failure here is
-            # now just a best-effort trailing newline, never a reason to
-            # retry the whole call or lose the answer.
+            # Printing sits outside the retried call, so a stdout failure is not retried (BUGFIX, bug 45).
             try:
                 print()  # newline after streamed output
             except OSError as exc:

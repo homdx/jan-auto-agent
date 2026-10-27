@@ -357,9 +357,7 @@ def test_every_fact_the_old_block_carried_is_still_carried():
     reads = [
         ConfigRead(section="coder", key=f"k{i:02d}", fallback=i) for i in range(15)
     ]
-    # 5 of these are byte-identical to the first 5 — 24 duplicate
-    # config_read lines exist in today's tree per the ticket; the
-    # unique facts are 15, not 20.
+    # Five of these duplicate the first five; the unique facts count 15, not 20.
     reads += [
         ConfigRead(section="coder", key=f"k{i:02d}", fallback=i) for i in range(5)
     ]
@@ -392,8 +390,7 @@ def test_every_fact_the_old_block_carried_is_still_carried():
     assert "contract" not in lines[-1]
     assert "config_read" not in lines[-1]
 
-    # With a budget that fits the whole block, facts are byte-identical
-    # to the no-budget case — the budget cut is never triggered.
+    # A budget that fits the whole block leaves facts byte-identical to no budget.
     assert build_collect_context_block(
         model, "pkg/a.py", budget=len(block) + 1000
     ) == block

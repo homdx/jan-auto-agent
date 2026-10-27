@@ -28,6 +28,7 @@ tree — even rebuilt at a different timestamp — compares equal.
 
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 import logging
@@ -43,11 +44,61 @@ logger = logging.getLogger(__name__)
 
 COLLECTOR_VERSION = "2"  # V10: real parameter lists in `signature` — forces one full rebuild
 
-#: Default directories skipped when discovering files for a manifest —
-#: mirrors the spirit of `[search] skip_dirs` used elsewhere in this repo.
+#: Directories skipped when discovering manifest files, as [search] skip_dirs does elsewhere.
 DEFAULT_SKIP_DIRS = frozenset(
     {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv", ".collect"}
 )
+
+
+def skip_dirs_from_config(
+    config: Optional["configparser.ConfigParser"] = None,
+) -> frozenset:
+    """`[collect] skip_dirs` of *config* added to `DEFAULT_SKIP_DIRS`.
+
+    CC-13: before this there was no setting — a checkout that keeps round output
+    (`contest-out/` with thousands of `.py` files, or a `rounds/` sandbox) was
+    scanned whole. The value is a comma-separated list of *extra* directory
+    names, added to the default list rather than replacing it, so
+    `skip_dirs = contest-out` never re-enables `node_modules`. Empty (the
+    default, and an absent key) is exactly today's list. A malformed value,
+    a parser that is not one, or a key that is not a string degrades to the
+    defaults — the manifest is built, never aborted, on a wrong setting.
+    """
+    out = set(DEFAULT_SKIP_DIRS)
+    if config is None:
+        return frozenset(out)
+    try:
+        # Raw, since a % in a directory name would fail interpolation.
+        raw = config.get("collect", "skip_dirs", raw=True, fallback="")
+    except (AttributeError, TypeError, ValueError, configparser.Error):
+        return frozenset(out)
+    if not isinstance(raw, str):
+        return frozenset(out)
+    for name in raw.split(","):
+        name = name.strip()
+        if "/" in name or "\\" in name:
+            # the walk compares a directory's name: "rounds/sandbox" never matched and skipped nothing
+            logger.warning("[collect] skip_dirs: %r is a path, not a directory name — ignored", name)
+            continue
+        if name:
+            out.add(name)
+    return frozenset(out)
+
+
+def effective_skip_dirs(
+    config: Optional["configparser.ConfigParser"] = None,
+    extra: Optional[Iterable[str]] = None,
+) -> frozenset:
+    """`DEFAULT_SKIP_DIRS` plus `[collect] skip_dirs` of *config* plus *extra*:
+    the one place the effective list is computed, so the walk, the manifest and
+    the freshness check cannot disagree about it."""
+    out = set(skip_dirs_from_config(config))
+    if extra is not None:
+        for name in extra:
+            name = str(name).strip()
+            if name:
+                out.add(name)
+    return frozenset(out)
 
 
 def _utc_iso_now() -> str:
@@ -68,16 +119,22 @@ def discover_files(
     root: Path,
     *,
     suffixes: Iterable[str] = (".py",),
-    skip_dirs: Iterable[str] = DEFAULT_SKIP_DIRS,
+    skip_dirs: Optional[Iterable[str]] = None,
+    config: Optional["configparser.ConfigParser"] = None,
 ) -> List[str]:
     """Walk `root`, returning sorted POSIX-relative paths of matching files.
 
     Self-contained on purpose: COLLECT-2 must not depend on the AST scanner
     (COLLECT-4, EPIC B) which doesn't exist yet. The scanner is free to hand
     `build_manifest` its own file list instead of relying on this walk.
+
+    `skip_dirs` is the effective list in force: `DEFAULT_SKIP_DIRS` plus
+    `[collect] skip_dirs` of *config* (`effective_skip_dirs` is the one place
+    it is computed). Passing `None` means "the defaults plus whatever *config*
+    says", which is the same as today for a config that does not set the key.
     """
     root = Path(root)
-    skip = set(skip_dirs)
+    skip = effective_skip_dirs(config, None if skip_dirs is None else skip_dirs)
     suffix_set = tuple(suffixes)
     out: List[str] = []
     for dirpath, dirnames, filenames in _walk(root, skip):
@@ -161,6 +218,7 @@ def _run_git(root: Path, *args: str) -> Optional[str]:
             cwd=str(root),
             timeout=10,
             encoding="utf-8",
+            errors="surrogateescape",   # a name that is not UTF-8 is a name, as os.walk gives it
         )
     except subprocess.TimeoutExpired:
         # still "nothing to report", but not silently: the git was killed
@@ -170,7 +228,7 @@ def _run_git(root: Path, *args: str) -> Optional[str]:
         return None
     if proc.returncode != 0:
         return None
-    return proc.stdout.strip()
+    return proc.stdout.rstrip("\n")       # not strip(): porcelain's first " M path" lost its leading space
 
 
 def get_git_sha(root: Path) -> Optional[str]:
@@ -204,12 +262,12 @@ def is_dirty(root: Path, exclude_dir: Optional[Path] = None) -> bool:
     `capture_provenance`, which callers should use instead of calling
     `get_git_sha`/`is_dirty` directly, to make this ordering hard to get
     wrong."""
-    # --no-optional-locks: a plain `status` takes .git/index.lock to write back
-    # refreshed stat data, and the 10 s timeout above ends it with SIGKILL — no
-    # cleanup, so the lock stays and every later `git add` in the repo exits
-    # 128 (a 32-worker stress run: all four task commits of one controller test
-    # lost). With the flag, status never writes the index, so it never locks it.
-    status = _run_git(root, "--no-optional-locks", "status", "--porcelain")
+    # --no-optional-locks: status never writes .git/index.lock, so a timeout kill cannot leave it behind.
+    # --untracked-files=all (HARDEN-4 D7): without it git collapses a whole untracked directory into
+    # one `?? out/` entry, which is not under `out/collect/`, so the exclusion below could not
+    # recognise the collector's own output and `dirty` was True on every build of a nested collect
+    # dir. With it every entry is a file, so the path filter works for any layout.
+    status = _run_git(root, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all")
     if not status:
         return False
     if exclude_dir is None:
@@ -217,14 +275,11 @@ def is_dirty(root: Path, exclude_dir: Optional[Path] = None) -> bool:
     try:
         rel = Path(exclude_dir).resolve().relative_to(Path(root).resolve())
     except ValueError:
-        # Collect dir configured outside the repo — nothing it writes can
-        # show up in this repo's porcelain output, so no filtering needed.
+        # A collect dir outside the repo cannot appear in its porcelain output, so no filter is needed.
         return True
     prefix = rel.as_posix().rstrip("/") + "/"
     for line in status.splitlines():
-        # Porcelain v1: 2-char status, space, then the path. Renames are
-        # `old -> new`; either side under the collect dir is the
-        # collector's own doing.
+        # Porcelain v1 line: two status chars, a space, then the path (rename: "old -> new").
         payload = line[3:] if len(line) > 3 else ""
         paths = payload.split(" -> ") if " -> " in payload else [payload]
         for p in paths:
@@ -267,6 +322,24 @@ class Manifest:
     git_sha: Optional[str]
     dirty: bool
     file_hashes: Dict[str, str] = field(default_factory=dict)
+    # Effective skip_dirs when built; a changed list reads as stale, and old manifests read as default.
+    skip_dirs: Tuple[str, ...] = field(default_factory=tuple)
+    # CC-15: modules whose Pass B produced no summary (gave up or reply never parsed).
+    # A --no-llm build records () — no summary is expected there. Older manifests
+    # without the key read as () and are unaffected.
+    unsummarized: Tuple[str, ...] = field(default_factory=tuple)
+    # HARDEN-21 C: the `.ini` files `CONFIG_MAP.md` is built from — the primary config and every
+    # `[collect] sibling_profiles` entry. A separate map, not extra keys in `file_hashes`, so a
+    # profile edit shows as "one file changed" to nothing but this comparison and never appears as
+    # an added or removed *module* in `--refresh`'s diff. Older manifests read as {} — and are
+    # fresh for the setting's own purposes, since a tree without profiles hashes nothing.
+    profile_hashes: Dict[str, str] = field(default_factory=dict)
+    # HARDEN-24 B: the files the walk skipped and why — `("path", "too deep")`,
+    # `("path", "too large")`, `("path", "unreadable")`. Before this the collect stage
+    # borrowed the Architect's depth and size limits and dropped a file with no word of it,
+    # so a deep tree or a large generated file was missing from the model and from here.
+    # Older manifests read as () and are unaffected.
+    skipped_files: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         return {
@@ -275,36 +348,26 @@ class Manifest:
             "git_sha": self.git_sha,
             "dirty": self.dirty,
             "file_hashes": dict(self.file_hashes),
+            "skip_dirs": sorted(self.skip_dirs),
+            "unsummarized": sorted(self.unsummarized),
+            "profile_hashes": dict(self.profile_hashes),
+            "skipped_files": [list(pair) for pair in self.skipped_files],
         }
 
     def to_json(self, *, indent: int = 2) -> str:
-        # sort_keys for the same reason Pass A JSON is canonicalized
-        # (COLLECT-3): a stable, diffable manifest.
+        # sort_keys keeps the manifest stable and diffable, as Pass A JSON is (COLLECT-3).
         return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Manifest":
-        # AUTO-MANIFEST-GUARD-2: d["collector_version"]/d["generated_at"]
-        # used to raise a raw KeyError on a truncated/malformed manifest.
-        # Every read_manifest() call site already catches (OSError,
-        # ValueError) and treats the manifest as stale/absent — KeyError
-        # isn't a ValueError subclass, so it slipped past that existing
-        # guard at 3 of 4 call sites and crashed instead. Raising
-        # ValueError here (json.JSONDecodeError from from_json() below is
-        # already a ValueError subclass, so that half was already covered)
-        # makes every existing call site's guard work as originally
-        # intended, with no call-site changes needed.
+        # Malformed manifests raise ValueError, which every read_manifest() call site already catches (AUTO-MANIFEST-GUARD-2).
         try:
             collector_version = d["collector_version"]
             generated_at = d["generated_at"]
         except KeyError as exc:
             raise ValueError(f"manifest is missing required field {exc}") from exc
         except TypeError as exc:
-            # BUGFIX (audit): a valid-JSON-but-non-dict payload (a list,
-            # null, a bare number) raises TypeError on d["..."], not
-            # KeyError — every call site's (OSError, ValueError) guard
-            # missed this the same way it missed KeyError before the fix
-            # above. Re-raise as ValueError so those guards work here too.
+            # A valid JSON non-object also raises ValueError, so the call-site guards catch it (BUGFIX).
             raise ValueError(f"manifest is not a JSON object: {exc}") from exc
         return cls(
             collector_version=collector_version,
@@ -312,6 +375,33 @@ class Manifest:
             git_sha=d.get("git_sha"),
             dirty=bool(d.get("dirty", False)),
             file_hashes=dict(d.get("file_hashes", {})),
+            # A missing or malformed skip_dirs key falls back to the default; the manifest is stale, not unreadable.
+            skip_dirs=tuple(sorted(d["skip_dirs"]))
+            if isinstance(d.get("skip_dirs"), (list, tuple))
+            and all(isinstance(x, str) for x in d["skip_dirs"])
+            else tuple(sorted(DEFAULT_SKIP_DIRS)),
+            # A missing or malformed unsummarized key falls back to [] (older manifests); the manifest is not unreadable.
+            unsummarized=tuple(sorted(d.get("unsummarized", [])))
+            if isinstance(d.get("unsummarized"), (list, tuple))
+            and all(isinstance(x, str) for x in d.get("unsummarized", []))
+            else tuple(),
+            # HARDEN-21 C: a missing or malformed profile_hashes key reads as {} (older
+            # manifests, and the common case of a tree with no sibling_profiles).
+            profile_hashes=dict(d["profile_hashes"])
+            if isinstance(d.get("profile_hashes"), dict)
+            and all(isinstance(k, str) and isinstance(v, str) for k, v in d["profile_hashes"].items())
+            else {},
+            # HARDEN-24 B: a missing or malformed skipped_files key reads as () — an older
+            # manifest never recorded skips, and a half-broken one must not make the manifest
+            # unreadable. A pair that is not a two-string tuple is dropped, not raised on.
+            skipped_files=tuple(
+                (str(pair[0]), str(pair[1]))
+                for pair in d.get("skipped_files", [])
+                if isinstance(pair, (list, tuple)) and len(pair) == 2
+                and all(isinstance(x, str) for x in pair)
+            )
+            if isinstance(d.get("skipped_files"), (list, tuple))
+            else tuple(),
         )
 
     @classmethod
@@ -326,6 +416,11 @@ def build_manifest(
     collector_version: str = COLLECTOR_VERSION,
     provenance: Optional[Tuple[Optional[str], bool]] = None,
     file_hashes: Optional[Dict[str, str]] = None,
+    config: Optional["configparser.ConfigParser"] = None,
+    skip_dirs: Optional[Iterable[str]] = None,
+    unsummarized: Optional[Iterable[str]] = None,
+    profile_hashes: Optional[Dict[str, str]] = None,
+    skipped_files: Optional[Iterable[Tuple[str, str]]] = None,
 ) -> Manifest:
     """Build a `Manifest` for `root`. If `files` isn't given, discovers
     `*.py` files under `root` via `discover_files`.
@@ -347,9 +442,22 @@ def build_manifest(
     this a single `--collect` on a stale tree hashed the same files twice
     (once to decide what changed, once here, after `_write_artifact` had
     already touched disk).
+
+    CC-13: `config` / `skip_dirs` set the effective `skip_dirs` the walk above
+    uses, and that list is recorded on the manifest itself (see `Manifest.skip_dirs`)
+    so a change of the setting is a change of the artifact, visible to
+    `is_fresh` — without it, a manifest built with one list compared against a
+    tree walked with another would drift silently.
+    CC-15: `unsummarized` records the paths of modules whose Pass B produced no
+    summary; a --no-llm build passes () so the manifest is fresh, and an older
+    manifest without the key is read as () (below).
+    HARDEN-21 C: `profile_hashes` is the `{path: sha256}` map of the `.ini` files
+    `CONFIG_MAP.md` depends on, built with `hash_tree` over the same path list the
+    caller hashes its modules with — `is_fresh(..., profile_hashes=...)` compares it.
     """
     root = Path(root)
-    file_list = list(files) if files is not None else discover_files(root)
+    effective = effective_skip_dirs(config, skip_dirs)
+    file_list = list(files) if files is not None else discover_files(root, skip_dirs=effective)
     if provenance is not None:
         git_sha, dirty = provenance
     else:
@@ -360,13 +468,21 @@ def build_manifest(
         git_sha=git_sha,
         dirty=dirty,
         file_hashes=file_hashes if file_hashes is not None else hash_tree(root, file_list),
+        skip_dirs=tuple(sorted(effective)),
+        unsummarized=tuple(sorted(unsummarized)) if unsummarized is not None else tuple(),
+        profile_hashes=dict(profile_hashes) if profile_hashes is not None else {},
+        # HARDEN-24 B: the skipped files are recorded as the walk named them, sorted by path
+        # so the manifest stays diffable. `None` records nothing, as `None` does for the other
+        # optional maps.
+        skipped_files=tuple(sorted(skipped_files)) if skipped_files is not None else tuple(),
     )
 
 
 def write_manifest(manifest: Manifest, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(manifest.to_json() + "\n", encoding="utf-8")
+    from tools.auto.utils import atomic_write_text
+    atomic_write_text(path, manifest.to_json() + "\n")
 
 
 def read_manifest(path: Path) -> Manifest:
@@ -379,6 +495,8 @@ def is_fresh(
     *,
     files: Optional[Iterable[str]] = None,
     hashes: Optional[Dict[str, str]] = None,
+    skip_dirs: Optional[Iterable[str]] = None,
+    profile_hashes: Optional[Dict[str, str]] = None,
 ) -> bool:
     """True iff `manifest` was built by the CURRENT collector_version AND
     `root`'s current content hashes exactly match `manifest`'s.
@@ -416,6 +534,15 @@ def is_fresh(
     rather than needing four separate fixes (action_refresh already got its
     own version check separately, since it doesn't call is_fresh at all).
 
+    CC-13: `skip_dirs`, when given, is the *effective* list in force now
+    (`effective_skip_dirs` of the caller's config) and is compared against the
+    list the manifest recorded. The file hashes already catch most of it — a
+    changed list hashes a different file set — but the explicit comparison is
+    what makes "the setting changed and nothing else did" report stale rather
+    than fresh, and it holds on the `hashes=` path too, where the caller's own
+    hash map may already have been built with the new list. Omitting it (the
+    older call sites) keeps today's behaviour exactly.
+
     Pass `files` explicitly to freshness-check against a specific file set
     instead of a fresh directory walk (e.g. when the caller already has the
     scanner's own file list from EPIC B). Pass `hashes` to skip the hash
@@ -423,14 +550,42 @@ def is_fresh(
     that same `files` — `action_collect` did, and hashing the tree here and
     then again inside the `action_refresh` it delegates to was the second of
     the three full tree hashes one stale `--collect` used to cost.
+    HARDEN-21 C: `profile_hashes` is the `{path: sha256}` map of the `.ini` files
+    `CONFIG_MAP.md` depends on — the primary config and every `[collect]
+    sibling_profiles` entry. Those are not in `file_hashes`, which holds modules only,
+    so without this an edit to a sibling profile left the artifact reporting "up to
+    date" until some `.py` file happened to change, and `CONFIG_MAP.md` kept the
+    gap the profile was written to fix. Omitting it (the older call sites) keeps
+    today's behaviour exactly.
     """
     if manifest.collector_version != COLLECTOR_VERSION:
+        return False
+    if skip_dirs is not None and tuple(sorted(skip_dirs)) != tuple(manifest.skip_dirs):
+        return False
+    if profile_hashes is not None and dict(profile_hashes) != dict(manifest.profile_hashes):
+        return False
+    # CC-15: a manifest with unsummarized modules is stale — they will be retried
+    # at the next --collect / --refresh instead of being reported up to date.
+    if manifest.unsummarized:
         return False
     if hashes is not None:
         return hashes == manifest.file_hashes
     root = Path(root)
-    current_files = list(files) if files is not None else discover_files(root)
+    if files is not None:
+        current_files = list(files)
+    else:
+        # MANIFEST-SKIP: the walk skips what the manifest was built skipping; the defaults
+        # alone put `out/b.py` of a `skip_dirs = out` build back and an unchanged tree was stale.
+        current_files = discover_files(root, skip_dirs=_recorded_skip_dirs(manifest, skip_dirs))
     return hash_tree(root, current_files) == manifest.file_hashes
+
+
+def _recorded_skip_dirs(manifest: Manifest, skip_dirs: Optional[Iterable[str]] = None):
+    """*skip_dirs* when given, else the list *manifest* recorded; ``None`` (the defaults) for an
+    older manifest that recorded none."""
+    if skip_dirs is not None:
+        return list(skip_dirs)
+    return list(manifest.skip_dirs) or None
 
 
 @dataclass(frozen=True)
@@ -484,15 +639,11 @@ def refresh_manifest(root: Path, previous: Manifest) -> Manifest:
     the files that already existed.
     """
     root = Path(root)
-    discovered = set(discover_files(root))
+    # MANIFEST-SKIP: discover under the skip_dirs `previous` was built with, and record them again —
+    # the defaults alone re-added every file of a skipped `out/` and dropped the setting.
+    skip = _recorded_skip_dirs(previous)
+    discovered = set(discover_files(root, skip_dirs=skip))
     tracked = set(previous.file_hashes.keys())
     file_list = sorted(discovered | tracked)
-    # BUGFIX (audit): this stamped previous.collector_version instead of
-    # the current COLLECTOR_VERSION — since is_fresh() rejects any
-    # manifest whose collector_version != COLLECTOR_VERSION, a manifest
-    # refreshed after a collector-version bump was immediately stale
-    # again despite refresh_manifest's own purpose being to bring it
-    # up to date. build_manifest's own default already covers the normal
-    # case; passed explicitly here so this fix's intent isn't lost as
-    # implicit.
-    return build_manifest(root, file_list, collector_version=COLLECTOR_VERSION)
+    # Stamp the current COLLECTOR_VERSION, not the previous one, so a refreshed manifest is fresh (BUGFIX).
+    return build_manifest(root, file_list, collector_version=COLLECTOR_VERSION, skip_dirs=skip)

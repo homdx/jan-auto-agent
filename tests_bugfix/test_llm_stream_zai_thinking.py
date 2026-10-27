@@ -96,8 +96,7 @@ def _serve_script(script):
 
 _OK_BODY = {"choices": [{"message": {"content": '{"ok": true}'}}]}
 
-# Modeled on the real GLM-5.2-via-router symptom: an unrecognised
-# top-level field rejected outright rather than silently ignored.
+# Modelled on a GLM router that rejects an unknown top-level field outright.
 _REJECT_THINKING_400 = json.dumps({
     "error": {
         "code": 400,
@@ -106,20 +105,7 @@ _REJECT_THINKING_400 = json.dumps({
     }
 })
 
-# AUTO-NVIDIA-UNSUPPORTED-1: field report — a real NVIDIA NIM endpoint
-# (integrate.api.nvidia.com, meta/llama-3.3-70b-instruct AND
-# nvidia/nemotron-3-ultra-550b-a55b) rejects the `thinking` field with
-# this exact phrasing on every single call, permanently, for both the
-# Architect (plan_llm_profile) and Gate 1 (presence_llm_profile). Unlike
-# _REJECT_THINKING_400 above, the message says "Unsupported parameter(s)"
-# — one word, no space — which none of the five detection heuristics in
-# this module matched (they all checked for "not supported", with a
-# space, as a substring). Confirmed live: architect review_one_cluster
-# logged "HTTP 400 ... Unsupported parameter(s): `thinking`" on both
-# clusters of a 2-cluster repo, 0 grounded candidates were produced, and
-# the run silently completed in a few seconds having done zero work —
-# the strip-and-retry never fired because the match failed, so the same
-# 400 repeated on every call for the rest of the process.
+# NVIDIA NIM rejects `thinking` with "Unsupported parameter(s)" (one word): the detector missed it, so the 400 repeated on every call.
 _REJECT_THINKING_400_NVIDIA_STYLE = json.dumps({
     "error": {
         "message": "Validation: Unsupported parameter(s): `thinking`",

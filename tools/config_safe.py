@@ -36,9 +36,16 @@ add its name to ``_SAFE_CONFIG_HELPERS`` there in the same change.
 from __future__ import annotations
 
 import logging
-from configparser import ConfigParser
+from configparser import ConfigParser, InterpolationError
 
 logger = logging.getLogger(__name__)
+
+#: What a present-but-unreadable value raises. CONFIG-PCT: `main.py`'s parser keeps configparser's
+#: `%` interpolation, so `canon_check_every = 50%` raised InterpolationSyntaxError and
+#: `%(missing)s` InterpolationMissingOptionError — neither a ValueError, so both escaped the helper
+#: and aborted the run these helpers exist to keep going. A missing section or key is still the
+#: fallback's own case (configparser returns it), never this one.
+_MALFORMED = (ValueError, InterpolationError)
 
 __all__ = ["safe_getint", "safe_getfloat", "safe_getboolean"]
 
@@ -49,7 +56,7 @@ def safe_getint(
     """``config.getint`` that degrades to *fallback* on a malformed value."""
     try:
         return config.getint(section, key, fallback=fallback)
-    except ValueError as exc:
+    except _MALFORMED as exc:
         logger.warning(
             "config [%s] %s is malformed (%s) — using %r", section, key, exc, fallback,
         )
@@ -62,7 +69,7 @@ def safe_getfloat(
     """``config.getfloat`` that degrades to *fallback* on a malformed value."""
     try:
         return config.getfloat(section, key, fallback=fallback)
-    except ValueError as exc:
+    except _MALFORMED as exc:
         logger.warning(
             "config [%s] %s is malformed (%s) — using %r", section, key, exc, fallback,
         )
@@ -75,7 +82,7 @@ def safe_getboolean(
     """``config.getboolean`` that degrades to *fallback* on a malformed value."""
     try:
         return config.getboolean(section, key, fallback=fallback)
-    except ValueError as exc:
+    except _MALFORMED as exc:
         logger.warning(
             "config [%s] %s is malformed (%s) — using %r", section, key, exc, fallback,
         )

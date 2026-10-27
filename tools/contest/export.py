@@ -23,13 +23,14 @@ writes no `entrants.json` — its `SUMMARY.md` is still written.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tools.contest.runner import AgentState
 
 __all__ = [
     "ENTRANTS_FILE",
@@ -40,8 +41,7 @@ __all__ = [
     "write_summary",
 ]
 
-#: The two files the round's folder gains. `contest-bench` reads the first, the
-#: operator reads the second.
+#: The two files a round folder gains: contest-bench reads entrants.json, the operator reads SUMMARY.md.
 ENTRANTS_FILE = "entrants.json"
 SUMMARY_FILE = "SUMMARY.md"
 
@@ -51,30 +51,119 @@ _PATCH_EXTENSIONS = (".patch", ".diff")
 #: The terminal states whose file name carries them, `<agent>.<STATE>.patch`.
 _STATED_SUFFIXES = ("GAVE_UP", "STALLED", "ERROR")
 
-#: `From <sha> <date>` — the first line of every `git format-patch` commit, and
-#: the one that differs between two agents that made the same commit.
+#: The From-sha line that starts every format-patch commit, the same for agents that made one commit.
 _FROM_SHA_RE = re.compile(r"^From [0-9a-fA-F]{7,40}(?:\s|$)")
 
 #: `Date: <rfc2822>` — the same commit's author date, formatted by git.
 _DATE_RE = re.compile(r"^Date:\s")
 
-#: The `decisions.jsonl` layers SUMMARY's "Decisions worth a look" reads: the
-#: gate's own verdicts, the allowed ones and the failed ones alike, because the
-#: operator reads the section to see whether the gate blocked what the ticket
-#: needed. `mechanical` never gets here — the mechanical layer is policy, not
-#: judgement.
+#: Gate verdicts that SUMMARY's "Decisions worth a look" reads (allowed and failed alike).
 _GATE_LAYERS = ("gate", "gate-failed")
 
-#: The two commands SUMMARY ends with — `contest-bench`'s own entry point and
-#: the scorer that reads the worktrees it builds. `scripts/contest_reset.sh` is
-#: deliberately absent: it prepares a round's worktrees and cleans nothing up.
+#: The two commands SUMMARY ends with; contest_reset.sh is not one of them.
 _SETUP_WORKTREES = "python3 contest-bench/harness/setup_worktrees.py"
 _JUDGE = "python3 scripts/judge_epic_round.py"
 
+#: The folder the round's ticket comes from, relative to the repo root.
+TASKS_DIR = "epic-tasks"
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the paths
-# ─────────────────────────────────────────────────────────────────────────────
+#: `scripts/judge_epic_round.py`, from this module's own place in the tree.
+_JUDGE_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "judge_epic_round.py"
+_JUDGE_MODULE = None
+_JUDGE_TRIED = False
+
+
+def _write_atomically(target: Path, text: str) -> None:
+    """*text* to *target* through a temp file and one rename (AUDIT3-C5).
+
+    A plain write_text truncates first, so a crash, Ctrl-C or full disk in
+    the middle left a cut file — the one the next step reads.
+    """
+    import os
+    import tempfile
+    target = Path(target)
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:    # mkstemp makes 0600; keep the file's mode, or write_text's usual 0644
+            os.chmod(tmp, target.stat().st_mode & 0o777 if target.exists() else 0o644)
+        except OSError:
+            pass
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _judge_claims_section(text):
+    """`(heading line, [(lineno, line)])` of *text*'s Claims section — from the judge's own
+    reader — or ``None``.
+
+    HARDEN-20 E: this module used to keep its own copy of the heading pattern, `^##\\s+Claims`
+    split on `\\n`, and the two disagreed with the judge's: a `#### Claims` ticket was judged but
+    never announced here, and on a CRLF ticket the judge saw no claims at all while the summary
+    added its `--claims` line. One reader now, so the summary's line and the claims phase cannot
+    disagree. Fail-open: a judge that cannot be loaded, or a reader that raises on a mangled
+    ticket, is no claims section — never an exception into the round.
+    """
+    global _JUDGE_MODULE, _JUDGE_TRIED
+    if not _JUDGE_TRIED:
+        _JUDGE_TRIED = True
+        try:
+            spec = importlib.util.spec_from_file_location("_judge_for_export", _JUDGE_SCRIPT)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules["_judge_for_export"] = module
+                spec.loader.exec_module(module)
+                _JUDGE_MODULE = module
+        except Exception:
+            _JUDGE_MODULE = None
+    try:
+        return _JUDGE_MODULE._claims_section(text)
+    except Exception:
+        return None
+
+
+def _has_claims_heading(text: str) -> bool:
+    """Whether *text* carries a Claims heading the judge will read (HARDEN-8 C, HARDEN-20 E).
+
+    The judge's own reader decides, so a `## Claims` written inside a code block — a ticket that
+    documents the section, or a prompt that quotes one — is not the section, and the summary never
+    adds a `--claims` line for it.
+    """
+    return _judge_claims_section(text) is not None
+
+
+def ticket_has_claims(out_dir, ticket, repo=None):
+    """Whether the round's ticket carries a `## Claims` section — `False` when it has none.
+
+    `write_summary` adds `--claims` to the printed judge line only when the answer is true, so the
+    command the round ends with is the one that runs the claims phase. The ticket is looked up as
+    *out_dir* + `epic-tasks/` + its name, then beside *out_dir*, then in *out_dir* itself, because
+    a round's out folder sits anywhere relative to the ticket folder. Fail-open: a ticket that is
+    missing, unreadable or empty is no claims section, and a summary never fails over a claims line.
+    """
+    if not isinstance(ticket, str) or not ticket.strip():
+        return False
+    root = _repo_root(out_dir, repo)
+    out = Path(out_dir)
+    for path in (root / TASKS_DIR / ticket, out.parent / TASKS_DIR / ticket,
+                 out / ticket, out.parent / ticket):
+        try:
+            if _has_claims_heading(path.read_text(encoding="utf-8")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+# The paths
 
 def _repo_root(out_dir, repo=None) -> Path:
     """The repo root *out_dir* sits under: *repo* when given, else walked up.
@@ -210,9 +299,7 @@ def _files_by_agent(paths) -> dict:
     return files
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # entrants.json
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _read_text(path: Path):
     """The text of *path*, or `None` when it cannot be read.
@@ -281,13 +368,11 @@ def write_entrants(out_dir, base_sha, state, paths, *, repo=None) -> Path | None
     payload = {"base": str(base_sha or ""), "entrants": entrants}
     out.mkdir(parents=True, exist_ok=True)
     target = out / ENTRANTS_FILE
-    target.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_atomically(target, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return target
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # SUMMARY.md
-# ─────────────────────────────────────────────────────────────────────────────
 
 #: The table's columns, in order: `state.table_rows()`'s keys, one per cell.
 _TABLE_COLUMNS = (
@@ -305,7 +390,8 @@ def _cell(value) -> str:
         text = f"{value:g}"
     else:
         text = str(value)
-    return text.replace("|", "\\|").replace("\n", " ")
+    # REP-CELL-CR: a CRLF value kept its "\r", and a bare CR splits the markdown row.
+    return re.sub(r"[^\S\r\n]*[\r\n]+[^\S\r\n]*", " ", text).replace("|", "\\|")
 
 
 def _number(value) -> int:
@@ -346,9 +432,7 @@ def _fill_cell(fill) -> str:
     return "-"
 
 
-#: KC-40: how much of a run's summary a SUMMARY cell holds — one line of it, so
-#: the row says which agent wrote one and what it started with, and the rest
-#: stays in `<agent>.summary.md` where the whole chain is.
+#: Characters of an agent's summary shown in a SUMMARY cell; the rest stays in the summary file (KC-40).
 _SUMMARY_CELL_CHARS = 60
 
 
@@ -594,6 +678,10 @@ def write_summary(out_dir, state, base_sha, paths, *, repo=None, gate="") -> Pat
     judge_parts = [f"{_JUDGE} --round {round_no}", f"--base {base_sha or '-'}"]
     for name, path in worktrees:
         judge_parts.append(f"--worktree {name}={path}")
+    # The claims phase is the question the round ends with, so it is named only when the ticket
+    # carries the section: a ticket without it would print a flag the phase would judge nothing.
+    if ticket_has_claims(out, ticket, repo):
+        judge_parts.append("--claims")
     next_part = ["## Next", "", "```bash"]
     if paths:
         next_part.append(f"{_SETUP_WORKTREES} {entrants} --wt {_display_of(out, root)}/wt")
@@ -601,5 +689,5 @@ def write_summary(out_dir, state, base_sha, paths, *, repo=None, gate="") -> Pat
 
     out.mkdir(parents=True, exist_ok=True)
     target = out / SUMMARY_FILE
-    target.write_text("\n".join(header + body + decision_part + next_part), encoding="utf-8")
+    _write_atomically(target, "\n".join(header + body + decision_part + next_part))
     return target

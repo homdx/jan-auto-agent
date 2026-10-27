@@ -78,9 +78,7 @@ def test_parse_pattern_matching_switch():
 
 
 def test_parse_broken_java_does_not_raise_and_is_flagged():
-    # tree-sitter is error-tolerant by design: garbage input still comes
-    # back as *a* tree (never an exception), with the bad region marked via
-    # has_error rather than the whole parse being refused.
+    # Broken Java still parses to a tree (error-tolerant), never an exception.
     result = parse_java(BROKEN_JAVA, "Broken.java")
     assert result.error is None
     assert result.tree is not None
@@ -94,10 +92,7 @@ def test_scan_java_module_valid_file_has_no_parse_error():
 
 
 def test_scan_java_module_broken_file_has_parse_error_not_exception():
-    # scan_java_module turns tree-sitter's has_error signal into the same
-    # parse_error contract scan_module already uses for a Python
-    # SyntaxError — the broken file is recorded, not silently accepted, and
-    # the surrounding scan is never aborted by it.
+    # A broken Java file is recorded as a parse_error, not silently accepted, and the scan continues.
     record = scan_java_module(BROKEN_JAVA, "com/example/Broken.java")
     assert record.parse_error is not None
     assert record.language == "java"

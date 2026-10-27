@@ -56,12 +56,12 @@ import configparser
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from tools.collect import cli as cli_mod
 from tools.collect import manifest as manifest_mod
 from tools.collect import registries as registries_mod
-from tools.collect.model import ContractRecord, ModuleRecord
+from tools.collect.model import ContractRecord, ModuleRecord, ProvenanceViolation
 from tools.collect.registries import FailOpenEntry, SafetyAnswer
 from tools.collect.gates import GateEntry
 from tools.collect.risk import RiskEntry
@@ -76,16 +76,15 @@ STATUS_ABSENT = "absent"
 STATUS_STALE = "stale"
 STATUS_FRESH = "fresh"
 
-#: Which paths are test code is `tools.collect.test_paths`'s call (L5) — the
-#: same list `test_map.build_test_map` splits the scan by, so the producer
-#: and this reader cannot disagree about a directory again (this reader used
-#: to keep its own six roots while `test_map` knew one, `tests/`). `callers_of`
-#: still pairs that rule with the test paths the artifact itself recorded in
-#: `test_map`'s values: the artifact's own list is authoritative but indexes
-#: coverage rather than the test tree, and a stale artifact can omit whole
-#: test directories, so the path rule is the fallback for anything it did not
-#: record. `tools/collect/test_map.py` matches neither signal: it is shipped
-#: code whose name merely contains "test".
+#: Staleness cause codes (HARDEN-6 E). `unsummarized` is the only one that leaves every static fact
+#: in the artifact true — a module whose Pass B failed has no summary, not wrong facts — so it is the
+#: only cause a reader may keep serving the pack for (see `CollectModel.stale_causes`).
+STALE_CAUSE_FILES = "files"
+STALE_CAUSE_COLLECTOR = "collector_version"
+STALE_CAUSE_SKIP_DIRS = "skip_dirs"
+STALE_CAUSE_UNSUMMARIZED = "unsummarized"
+
+#: Test-code paths come from tools.collect.test_paths, the same rule test_map uses, so producer and reader agree. tools/collect/test_map.py is shipped code.
 
 
 def _staleness_policy(config: Optional[configparser.ConfigParser]) -> str:
@@ -96,6 +95,55 @@ def _staleness_policy(config: Optional[configparser.ConfigParser]) -> str:
         return DEFAULT_STALENESS
     raw = config.get("collect", "staleness", fallback=DEFAULT_STALENESS).strip().lower()
     return raw if raw in VALID_STALENESS else DEFAULT_STALENESS
+
+
+def _stale_cause_labels(manifest, skip_dirs: Iterable[str]) -> Tuple[str, ...]:
+    """The causes a stale artifact has besides its files, in the words CC-13's operator line uses.
+    The wording is pinned by tests and out of scope for change; the codes `_stale_causes` returns are
+    what a consumer that can serve part of a stale artifact asks instead."""
+    labels: List[str] = []
+    if manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+        labels.append("collector version")
+    if tuple(sorted(skip_dirs)) != tuple(manifest.skip_dirs):
+        labels.append("skip_dirs changed")
+    if manifest.unsummarized:
+        n = len(manifest.unsummarized)
+        labels.append(f"{n} module{'' if n == 1 else 's'} without a summary")
+    return tuple(labels)
+
+
+def _stale_reason(manifest, changed: int, skip_dirs: Iterable[str]) -> str:
+    """The one-line reason a stale artifact is stale, naming every cause (CC-13).
+
+    HARDEN-6 E: shared by `load` and `load_readonly` so the operator sees the same line whichever
+    reader was used — and so the pack's own log line names the cause that actually kept it off. A
+    manifest whose only cause is a module without a summary says exactly that, instead of the
+    "a tracked file changed" `load` used to hard-code for every staleness.
+    """
+    reasons = [f"{changed} tracked file(s) changed"] if changed else []
+    reasons += [
+        f"manifest was built by collector_version={manifest.collector_version!r}, "
+        f"current is {manifest_mod.COLLECTOR_VERSION!r}" if c == "collector version" else
+        f"manifest recorded skip_dirs {list(manifest.skip_dirs)}, "
+        f"the config says {sorted(skip_dirs)}" if c == "skip_dirs changed" else c
+        for c in _stale_cause_labels(manifest, skip_dirs)
+    ]
+    return "artifact is stale (" + "; ".join(reasons or ["a tracked file changed"]) + ")"
+
+
+def _stale_causes(manifest, changed: int, skip_dirs: Iterable[str]) -> Tuple[str, ...]:
+    """Which causes a stale artifact has, as codes (HARDEN-6 E). `files` is appended when the tree
+    itself moved, since that is a cause of its own for every consumer."""
+    causes: List[str] = []
+    if manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+        causes.append(STALE_CAUSE_COLLECTOR)
+    if tuple(sorted(skip_dirs)) != tuple(manifest.skip_dirs):
+        causes.append(STALE_CAUSE_SKIP_DIRS)
+    if manifest.unsummarized:
+        causes.append(STALE_CAUSE_UNSUMMARIZED)
+    if changed:
+        causes.append(STALE_CAUSE_FILES)
+    return tuple(causes)
 
 
 @dataclass(frozen=True)
@@ -109,6 +157,11 @@ class CollectModel:
 
     status: str  # "absent" | "stale" | "fresh"
     collect_dir: Optional[Path] = None
+    # HARDEN-4 D6: the repo root this artifact was read for. `is_safe()` needs it to look a cited
+    # module's source up; before this the fallback was `collect_dir`, an artifact directory that
+    # holds no module files, so a query with no `root=` of its own could never narrow a
+    # method-level contract and answered "unknown".
+    repo_root: Optional[Path] = None
     modules: Tuple[ModuleRecord, ...] = ()
     contracts: Tuple[ContractRecord, ...] = ()
     fail_open_registry: Tuple[FailOpenEntry, ...] = ()
@@ -118,18 +171,16 @@ class CollectModel:
     thin_coverage_list: Tuple[str, ...] = ()
     risk_index: Tuple[RiskEntry, ...] = ()
     config_map: Tuple[ConfigMapEntry, ...] = ()
-    # V1: the import graph the producer has always written (13 artifact keys,
-    # this was the first batch dropped on read). Both tables are keyed by
-    # relative module path: `import_edges` is first-party only — `graph.
-    # import_edges` resolves names against the scanned module set and drops
-    # anything outside the repo — and `imported_by` is its reverse index.
-    # `entry_points` is a denormalised copy of "keys of `imported_by` with an
-    # empty value"; kept because the artifact carries it, so a caller does not
-    # have to rebuild it. Empty containers, never `None`.
+    # V1: the import graph the producer always wrote. import_edges is first-party only; imported_by is its reverse index; entry_points is the keys with no importer. Empty containers, never None.
     import_edges: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     imported_by: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     entry_points: Tuple[str, ...] = ()
     reason: str = ""
+    # HARDEN-6 E: why this model is stale, as `_stale_causes` codes. Empty on a fresh or absent
+    # model, and on a stale one whose only difference from the tree is its files — which the
+    # manifest's own hashes already say. A consumer that can serve part of a stale artifact asks
+    # this which part; one that cannot ignores it.
+    stale_causes: Tuple[str, ...] = ()
 
     # ── availability ────────────────────────────────────────────────────
 
@@ -149,8 +200,12 @@ class CollectModel:
         return {m.path: m for m in self.modules}
 
     def _already_safe_index(self, root: Optional[Path] = None) -> registries_mod.AlreadySafeIndex:
+        # HARDEN-4 D6: the repo root, not the artifact directory, is where a cited module's source
+        # lives. An explicit root still wins; a model built by hand (no repo_root) keeps the old
+        # fallback rather than losing the narrowing it can still get.
         return registries_mod.build_already_safe_index(
-            self.modules, self.fail_open_registry, self.contracts, root=root or self.collect_dir,
+            self.modules, self.fail_open_registry, self.contracts,
+            root=root or self.repo_root or self.collect_dir,
         )
 
     # ── "запись модуля X" ────────────────────────────────────────────────
@@ -364,12 +419,15 @@ def _test_map_table(value: object) -> Dict[str, Tuple[str, ...]]:
     return out
 
 
-def _absent(collect_dir: Optional[Path], reason: str) -> CollectModel:
-    return CollectModel(status=STATUS_ABSENT, collect_dir=collect_dir, reason=reason)
+def _absent(collect_dir: Optional[Path], reason: str, root: Optional[Path] = None) -> CollectModel:
+    return CollectModel(status=STATUS_ABSENT, collect_dir=collect_dir, repo_root=root, reason=reason)
 
 
 # Gate 1 corpus AUTO-T12 grades `_load_from_dir` live: tests/test_gate1_corpus_precision.py
-def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> CollectModel:
+def _load_from_dir(
+    collect_dir: Path, *, status: str, reason: str = "", root: Optional[Path] = None,
+    stale_causes: Tuple[str, ...] = ()
+) -> CollectModel:
     """Read `artifact.json` out of `collect_dir` into a `CollectModel`.
     Any missing file, unreadable JSON, or missing/malformed key is treated
     as "no model" — a half-written or corrupted artifact must never raise
@@ -406,11 +464,7 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
             )
             for g in payload.get("gates", [])
         )
-        # V1: the three graph tables the producer has always written but this
-        # reader dropped. Each is normalised through a helper that raises
-        # TypeError on a wrong shape — the guard below already turns that into
-        # an absent model — while a missing or null key yields an empty
-        # container, so an older artifact still loads with the rest of its data.
+        # V1: the three graph tables; a wrong shape counts as absent, a missing key as an empty container.
         test_map = _test_map_table(payload.get("test_map"))
         zero_coverage_list = _string_tuple(payload.get("zero_coverage"), "zero_coverage")
         thin_coverage_list = _string_tuple(payload.get("thin_coverage"), "thin_coverage")
@@ -434,15 +488,16 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
             )
             for c in payload.get("config_map", [])
         )
-    except (AttributeError, KeyError, TypeError, ValueError):
-        # Bugfix: a valid-JSON-but-non-dict artifact.json made
-        # payload.get(...) raise AttributeError, which this tuple missed —
-        # breaking the docstring's "must never raise out of the loader".
+    except (AttributeError, KeyError, TypeError, ValueError, ProvenanceViolation):
+        # AUDIT3-C6: a record the model rejects (ProvenanceViolation, a RuntimeError)
+        # is an artifact problem too — "never raises for the artifact itself".
+        # A valid JSON non-dict (e.g. a list) must not escape the loader; it is treated as absent.
         return _absent(collect_dir, "artifact has an unexpected shape — treated as absent")
 
     return CollectModel(
         status=status,
         collect_dir=collect_dir,
+        repo_root=root,
         modules=modules,
         contracts=contracts,
         fail_open_registry=fail_open,
@@ -456,6 +511,7 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
         imported_by=imported_by,
         entry_points=entry_points,
         reason=reason,
+        stale_causes=stale_causes,
     )
 
 
@@ -477,23 +533,151 @@ def load(
     artifact_path = collect_dir / cli_mod.ARTIFACT_FILENAME
 
     if not manifest_path.exists() or not artifact_path.exists():
-        return _absent(collect_dir, "no manifest/artifact — collect has never run")
+        return _absent(collect_dir, "no manifest/artifact — collect has never run", root=root)
 
     try:
         existing_manifest = manifest_mod.read_manifest(manifest_path)
     except (OSError, ValueError):
-        return _absent(collect_dir, "manifest is unreadable — treated as absent")
+        return _absent(collect_dir, "manifest is unreadable — treated as absent", root=root)
 
     current_paths = [m.path for m in scan_repo(root, config=config)]
-    fresh = manifest_mod.is_fresh(existing_manifest, root, files=current_paths)
+    # The effective skip_dirs list is recorded, so changing only that setting reports stale.
+    skip_dirs = manifest_mod.skip_dirs_from_config(config)
+    hashes = manifest_mod.hash_tree(root, current_paths)
+    fresh = manifest_mod.is_fresh(existing_manifest, root, files=current_paths,
+                                  hashes=hashes, skip_dirs=skip_dirs)
     if fresh:
-        return _load_from_dir(collect_dir, status=STATUS_FRESH)
+        return _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
+
+    diff = manifest_mod.diff_files(existing_manifest.file_hashes, hashes)
+    changed = len(diff.added | diff.modified | diff.removed)
+    causes = _stale_causes(existing_manifest, changed=changed, skip_dirs=skip_dirs)
+    reason = _stale_reason(existing_manifest, changed, skip_dirs)
 
     policy = _staleness_policy(config)
     if policy == "ignore":
-        return _absent(collect_dir, "stale artifact, staleness=ignore — treated as absent")
+        return _absent(collect_dir, "stale artifact, staleness=ignore — treated as absent", root=root)
     if policy == "refresh":
         cli_mod.action_refresh(root, config=config, config_path=config_path)
-        return _load_from_dir(collect_dir, status=STATUS_FRESH)
+        return _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
     # policy == "warn" (default / fallback)
-    return _load_from_dir(collect_dir, status=STATUS_STALE, reason="artifact is stale (a tracked file changed)")
+    return _load_from_dir(collect_dir, status=STATUS_STALE, reason=reason, root=root,
+                          stale_causes=causes)
+
+
+@dataclass(frozen=True)
+class CollectRead:
+    """What one read of the artifact produced for a consumer that may not write.
+
+    `status` is what the artifact said (`fresh` / `stale` / `absent`); `model`
+    is what the caller may actually hand to its evidence builder — `None`
+    means "no model, the pack is today's". The two can differ, and that is the
+    point: `staleness = refresh` on a stale artifact is reported `stale` with
+    `model=None`, because this reader does not rebuild anything. `changed` is
+    how many files differ from the manifest (0 when fresh or absent), so the
+    caller can say *how* stale it is rather than just *that* it is.
+
+    `causes` is what makes a stale artifact stale besides the files: `collector
+    version` (built by another collector) and `skip_dirs changed` (the manifest
+    recorded another list than the config's). Both are stale with `changed = 0`,
+    and a line that said "0 modules changed" sent the operator looking at files
+    that had not moved; empty when fresh or absent.
+    """
+
+    status: str = STATUS_ABSENT
+    model: Optional[CollectModel] = None
+    changed: int = 0
+    reason: str = ""
+    causes: Tuple[str, ...] = ()
+
+    @property
+    def used(self) -> bool:
+        """True when this read gives a usable model: a fresh artifact, or a
+        stale one `[collect] staleness = warn` allows."""
+        return self.model is not None and self.model.available
+
+
+def artifact_present(root: Path, *, config: Optional[configparser.ConfigParser] = None) -> bool:
+    """True when `root` has a collect manifest and artifact on disk. CC-13: a label for the
+    one line Gate 1 prints when neither judge uses the model — two `is_file` calls, no
+    scan and no hashing (`load_readonly` costs a full `scan_repo`, 14 s on this tree)."""
+    try:
+        collect_dir = cli_mod.resolve_collect_dir(Path(root), config)
+        return (collect_dir / cli_mod.MANIFEST_FILENAME).is_file() and \
+            (collect_dir / cli_mod.ARTIFACT_FILENAME).is_file()
+    except Exception:   # noqa: BLE001 — a label never stops a run
+        return False
+
+
+def load_readonly(
+    root: Path,
+    *,
+    config: Optional[configparser.ConfigParser] = None,
+) -> CollectRead:
+    """The collect model of `root` by `load`'s own freshness test, without ever
+    writing anything to disk.
+
+    CC-13: the Gate 1 vote asks for this. It must use exactly the freshness
+    test `main.py --collect --check` reports (the manifest's hashes against the
+    tracked files, the current `collector_version`) and it must never rebuild —
+    a run cannot pay an hour of Pass B in the middle of Stage B, and a vote is
+    not the collector. `[collect] staleness` is still honoured, with one
+    difference:
+
+      * `ignore`  — never a model (exactly as in `load`).
+      * `warn`    — the stale model is used and flagged, `changed` says how many
+                     files moved.
+      * `refresh` — **not** honoured here: the artifact is left on disk and no
+                     model is returned, `status` stays `stale`.
+
+    Nothing here raises: an absent, unreadable, truncated or malformed artifact
+    is `absent`, and the caller's pack is exactly what it is today.
+    """
+    try:
+        root = Path(root)
+        collect_dir = cli_mod.resolve_collect_dir(root, config)
+        manifest_path = collect_dir / cli_mod.MANIFEST_FILENAME
+        artifact_path = collect_dir / cli_mod.ARTIFACT_FILENAME
+        if not manifest_path.is_file() or not artifact_path.is_file():
+            return CollectRead(reason="no collect artifact — collect has never run")
+        try:
+            man = manifest_mod.read_manifest(manifest_path)
+        except (OSError, ValueError):
+            return CollectRead(reason="manifest is unreadable — treated as absent")
+
+        skip = manifest_mod.skip_dirs_from_config(config)
+        paths = [m.path for m in scan_repo(root, config=config)]
+        hashes = manifest_mod.hash_tree(root, paths)
+
+        if manifest_mod.is_fresh(man, root, files=paths, hashes=hashes, skip_dirs=skip):
+            model = _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
+            if not model.available:
+                return CollectRead(reason=model.reason or "artifact is unreadable — treated as absent")
+            return CollectRead(status=STATUS_FRESH, model=model)
+
+        diff = manifest_mod.diff_files(man.file_hashes, hashes)
+        changed = len(diff.added | diff.modified | diff.removed)
+        # Names every cause of staleness, not only the changed files (CC-13).
+        causes = _stale_cause_labels(man, skip)
+        reason = _stale_reason(man, changed, skip)
+        stale_causes = _stale_causes(man, changed=changed, skip_dirs=skip)
+
+        policy = _staleness_policy(config)
+        if policy == "ignore":
+            # The artifact is there and stale: say so (not absent), and give no model, as load does.
+            return CollectRead(status=STATUS_STALE, changed=changed, causes=causes,
+                               reason=f"{reason}, staleness=ignore — not used")
+        if policy == "refresh":
+            return CollectRead(status=STATUS_STALE, changed=changed, causes=causes,
+                               reason=f"{reason}, staleness=refresh: this reader does not "
+                                      f"write, so the artifact was left alone")
+        # policy == "warn" (default / fallback): the stale model is used and flagged
+        model = _load_from_dir(collect_dir, status=STATUS_STALE, reason=reason, root=root,
+                               stale_causes=stale_causes)
+        if not model.available:
+            return CollectRead(status=STATUS_ABSENT, changed=changed,
+                               reason=model.reason or "artifact is unreadable — treated as absent")
+        return CollectRead(status=STATUS_STALE, model=model, changed=changed, causes=causes,
+                           reason=model.reason)
+    except Exception:   # noqa: BLE001 — a consumer of collect never dies on collect
+        return CollectRead(reason="collect could not be read — treated as absent")

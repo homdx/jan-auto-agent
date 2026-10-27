@@ -71,16 +71,11 @@ from tools.contest.kilo_client import (  # noqa: E402
     find_kilo_binary,
 )
 
-# The spawn tests start the stub binary on the port kilo_client._free_port
-# picked and let go of, so the module shares the xdist_group with the other
-# files that do (test_contest_cli.py): pytest.ini's --dist=loadgroup pins them
-# to one worker, so no two such spawns race for one port.
+# Spawn tests share the port_bound_http_servers xdist group with test_contest_cli.py, so no two spawns race for a port.
 pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the session rules the probe sent, and the permission payloads it recorded
-# ─────────────────────────────────────────────────────────────────────────────
+# Session rules sent by the probe, and the permission payloads it records
 
 RULES = [
     {"permission": "*", "pattern": "*", "action": "allow"},
@@ -130,13 +125,7 @@ def _probe(tmp_path, scenario, *, reply_timeout: float = _kilo_fake.REPLY_TIMEOU
     server = KiloServer.attach(fake.url)
     client = KiloClient(server, directory)
     tap = EventTap(fake.url, directory, str(tmp_path / "events.jsonl")).start()
-    # a tap only receives events after its /event connection is open, on the
-    # fake as on a real server — wait for it so session.created is not lost.
-    # FL-1 (round 84): this used to poll for a fixed 2 s. That is a deadline,
-    # and on the operator's 32-worker box a thread opening an HTTP connection
-    # can need longer; missing the handshake loses every event the turn
-    # emits, which surfaces as a bewildering `status == "timeout"` somewhere
-    # far from here. 30 s, and it still fails loudly if the tap never comes.
+    # A tap only receives events after its /event connection is open: wait for it (30 s; a fixed 2 s was too short, FL-1).
     deadline = time.monotonic() + 30
     while not fake.subscribers and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -162,9 +151,7 @@ class _Probe:
         self.directory = directory
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1 — two turns into one session
-# ─────────────────────────────────────────────────────────────────────────────
+# 1: two turns in one session
 
 def test_turn_one_idle_is_not_turn_two_idle(tmp_path):
     """The exact bug the probe hit: a wait that rescaned the event list from
@@ -185,13 +172,10 @@ def test_turn_one_idle_is_not_turn_two_idle(tmp_path):
                                   on_question=lambda event: None)
         assert res1.status == "idle"
         assert res1.permissions == []
-        # FL-1 (round 84): the deadline is far away and the bound is in the
-        # middle of the gap, so a loaded box cannot blur "idled" into "hit
-        # the deadline" the way a 5 s deadline under a 3 s bound could.
+        # The deadline is far away and the bound sits in the middle of the gap, so a loaded box cannot confuse idle with timeout (FL-1).
         assert 0.0 <= res1.elapsed < 30.0
 
-        # turn 1's idle is consumed, not just matched: a fresh wait with the
-        # same predicate finds nothing, and turn 2 has not gone idle yet.
+        # Turn 1's idle is consumed, so a fresh wait with the same predicate finds nothing.
         idle_pred = lambda e: e.get("type") == "session.idle"  # noqa: E731
         assert h.tap.wait(idle_pred, 0.3) is None
         assert len(h.fake.events_of("session.idle")) == 1
@@ -201,8 +185,7 @@ def test_turn_one_idle_is_not_turn_two_idle(tmp_path):
         res2 = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                   on_question=lambda event: None)
         assert res2.status == "idle"
-        # turn 2's idle was held back by 0.6 s, so returning faster proves the
-        # wait answered with a stale event.
+        # Turn 2's idle is held back by 0.6 s, so an early return proves a stale event was taken.
         assert res2.elapsed >= 0.55
         assert len(h.fake.events_of("session.idle")) == 2
 
@@ -211,8 +194,7 @@ def test_turn_one_idle_is_not_turn_two_idle(tmp_path):
 
 
 
-# KC-63 (round 106, mimo-v2-5): Kilo follows a session.error with two
-# session.idle for the same session. The next turn's wait must not read them.
+# KC-63 (round 106): Kilo follows a session.error with two idles; the next wait must not read them.
 _ERROR_THEN_TURN = {"turns": [
     {"error": "UnknownError", "idles_after_error": 2},
     {"events": ["busy", "file.edited", "idle"], "assistant": "done", "delay": 0.6},
@@ -326,9 +308,7 @@ def test_tap_closed_wakes_a_waiting_caller(tmp_path):
     assert h.tap.events[-1]["type"] == "tap.closed"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2 — a permission in the middle, both recorded variants
-# ─────────────────────────────────────────────────────────────────────────────
+# 2: a permission in the middle, both recorded variants
 
 @pytest.mark.parametrize("variant", sorted(RECORDED_PERMISSIONS))
 def test_permission_in_the_middle_is_answered_and_idle_is_reached(tmp_path, variant):
@@ -425,9 +405,7 @@ def test_reply_permission_always_raises_before_any_http(tmp_path):
         assert h.fake.calls(method="POST") == made
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3 — session.error, timeout
-# ─────────────────────────────────────────────────────────────────────────────
+# 3: session.error and timeout
 
 def test_session_error_yields_error_status_with_the_payload(tmp_path):
     error = {"name": "ModelError", "data": {"message": "the model exploded"}}
@@ -460,8 +438,7 @@ def test_timeout_aborts_the_session(tmp_path):
         elapsed = time.monotonic() - started
     assert res.status == "timeout"
     assert res.error is None
-    # FL-1 (round 84): a bound that only says "it did not hang" — the 0.5 s
-    # deadline is what is under test and `status` already reports it.
+    # FL-1: the 0.5 s deadline is what is under test, and status already reports it.
     assert 0.0 <= res.elapsed < 30.0
     assert elapsed < 30.0
 
@@ -473,9 +450,7 @@ def test_timeout_aborts_the_session(tmp_path):
     assert h.fake.sessions()[0].aborted is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3b — KC-12: the silence clock, separate from the overall timeout
-# ─────────────────────────────────────────────────────────────────────────────
+# 3b: KC-12: the silence clock, separate from the overall timeout
 
 def test_wait_idle_aborts_on_stall(tmp_path):
     """A session silent for longer than ``idle_event_timeout`` is aborted
@@ -551,8 +526,7 @@ class _ScriptedTap:
         deadline = self._clock.now + max(0.0, float(timeout))
         while True:
             if not self._events or self._next_at > deadline:
-                # nothing more is due inside what the caller will wait for:
-                # the stream is silent for the whole of it
+                # Nothing more is due inside the caller's wait; the stream stays silent for all of it.
                 self._clock.now = deadline
                 return None
             self._clock.now = self._next_at
@@ -560,8 +534,7 @@ class _ScriptedTap:
             event = self._events.pop(0)
             if pred(event):
                 return event
-            # consumed, not returned — exactly what EventTap does with an
-            # event its caller's predicate rejects
+            # An event the caller's predicate rejects is consumed, not returned.
 
 
 class _FakeClock:
@@ -610,8 +583,7 @@ def test_events_of_the_session_keep_wait_idle_alive(monkeypatch):
                                window=window, every=every, aborts=aborts)
 
     assert res.status == "idle"
-    # it really waited the beats out — 21 events at 0.4 s is 8.4 s, more than
-    # eight times the window it would have been cut at without them
+    # The beats are waited out in full: 21 events at 0.4 s is more than eight windows.
     assert res.elapsed > window * 8, res.elapsed
     assert aborts == []
 
@@ -661,9 +633,7 @@ def test_the_silence_clock_is_off_when_no_idle_event_timeout_is_given(monkeypatc
     assert aborts == ["ses_probe"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3c — KC-36: the turn deadline asks before it kills
-# ─────────────────────────────────────────────────────────────────────────────
+# 3c: KC-36: the turn deadline asks before it kills
 
 def _deadline_clock_probe(monkeypatch, events, *, timeout, every, on_deadline,
                           idle_event_timeout=None, aborts=None):
@@ -772,16 +742,13 @@ def test_an_extension_never_resurrects_a_session_that_went_quiet(monkeypatch):
     assert res.status == "timeout"
     # asked once, at the deadline — never again, at the extended one
     assert calls == [60.0], calls
-    # the silence clock won: 70 s of beats plus the 10 s window, 10 s inside
-    # the deadline the grant had just moved to
+    # The silence clock wins: 70 s of beats plus the 10 s window, 10 s inside the moved deadline.
     assert res.elapsed == 80.0, res.elapsed
     assert res.elapsed < 60.0 + 30.0, res.elapsed
     assert aborts == ["ses_probe"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # KC-66: the gate's 429 is the agent's time, granted back to the turn
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _gate_back_probe(monkeypatch, on_permission, *, timeout=60.0, every=1.0):
     """`wait_idle` over one scripted `permission.asked`, on a fake clock, no idle.
@@ -918,9 +885,7 @@ def test_a_turn_with_no_event_at_all_is_cut_at_the_window(tmp_path):
     assert h.fake.recorded_abort_for(h.session.id)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3c — KC-47: a `bash` call that is still running is not silence
-# ─────────────────────────────────────────────────────────────────────────────
+# 3c: KC-47: a running bash call is not silence
 
 class _TimedScriptedTap:
     """A scripted stream at absolute times, on the fake clock.
@@ -1226,9 +1191,7 @@ def test_a_non_numeric_timeout_falls_back_to_the_module_default(monkeypatch):
     assert res.open_tool["running_for"] == pytest.approx(1.5)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4 — reading the turn back
-# ─────────────────────────────────────────────────────────────────────────────
+# 4: reading the turn back
 
 def test_tool_parts_and_last_assistant_text(tmp_path):
     """The tool call and its result come from GET /message, not from /event:
@@ -1303,9 +1266,7 @@ def test_on_prompt_mutates_the_session_directory(tmp_path):
     assert (tmp_path / "hello.txt").read_text() == "Hello world\n"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5 — KiloServer: spawn, attach, close
-# ─────────────────────────────────────────────────────────────────────────────
+# 5: KiloServer: spawn, attach, close
 
 STUB_KILO = '''#!/usr/bin/env python3
 import http.server
@@ -1350,17 +1311,14 @@ def test_spawn_waits_for_health_and_close_kills_the_child(tmp_path):
     binary = _write_executable(tmp_path / "kilo", STUB_KILO)
     log = tmp_path / "serve.log"
     started = time.monotonic()
-    # FL-1 (round 84): the gate is generous and the bound is in the middle —
-    # spawn returning at all is the claim, and a health poll that needs 12 s
-    # on a 32-worker box is still a pass, not a failure.
+    # Spawn returning at all is the claim; a slow health poll is still a pass (FL-1).
     server = KiloServer.spawn(str(binary), log_path=str(log), health_timeout=60.0)
     assert time.monotonic() - started < 60.0
     try:
         assert server.base_url.startswith("http://127.0.0.1:")
         assert server.pid is not None
         pid = server.pid
-        # it really is serving on the port it picked, and malformed data from
-        # it degrades to "no data" instead of raising
+        # The fake serves on the port it picked, and malformed data degrades to no data.
         client = KiloClient(server, str(tmp_path))
         ref = SessionRef(id="anything", provider_id="p", model_id="m",
                          directory=str(tmp_path))
@@ -1383,9 +1341,7 @@ def test_spawn_of_a_binary_that_exits_raises_with_the_log_tail(tmp_path):
     started = time.monotonic()
     with pytest.raises(KiloServerError) as exc:
         KiloServer.spawn(str(binary), log_path=str(log), health_timeout=60.0)
-    # FL-1 (round 84): "must not wait out the whole timeout" is the claim, so
-    # the timeout moves out to 60 s and the bound sits at 30 s — the child
-    # exits at once and spawn notices at once, on any box.
+    # The claim is "does not wait out the timeout"; the child exits at once, so the bound is 30 s (FL-1).
     assert time.monotonic() - started < 30.0
     message = str(exc.value)
     assert "exited with code 3" in message
@@ -1400,8 +1356,7 @@ def test_spawn_of_a_missing_binary_is_a_file_not_found(tmp_path):
                          log_path=str(tmp_path / "serve.log"), health_timeout=1.0)
 
 
-# KC-35: the stub records the environment it was started with, so a spawn
-# without `env` and one with it can be compared.
+# KC-35: the stub records its environment, so a spawn with env and one without can be compared.
 STUB_KILO_ENV = '''#!/usr/bin/env python3
 import http.server
 import os
@@ -1542,8 +1497,7 @@ def test_compact_posts_to_summarize_with_the_prompt_async_model_shape(tmp_path):
 
     assert call["body"] == {"providerID": "kenary", "modelID": "hy3:free", "auto": False}
     assert call["query"]["directory"] == h.directory
-    # nothing comes back to the caller: the session compacts, then goes idle, and
-    # a caller waiting on the tap sees them in that order
+    # The session compacts, then goes idle, and a waiting caller sees the events in that order.
     kinds = [event.get("type") for event in h.fake.events
              if event.get("type") in ("session.compacted", "session.idle")]
     assert kinds == ["session.compacted", "session.idle"]
@@ -1567,9 +1521,7 @@ def test_create_session_with_agent_sends_the_agent(tmp_path):
         assert info["agent"] == "build"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6 — the event tap on disk, in the probe's format
-# ─────────────────────────────────────────────────────────────────────────────
+# 6: the event tap on disk, in the probe's format
 
 def test_tap_writes_the_probe_event_log_format(tmp_path):
     scenario = {"turns": [{"events": ["busy", "idle"], "assistant": "done"}]}
@@ -1588,8 +1540,7 @@ def test_tap_writes_the_probe_event_log_format(tmp_path):
                                on_question=lambda event: None)
         assert res.status == "idle"
         tap.stop()
-        # a hang guard on the reader unwinding, not a claim about how fast
-        # it does (FL-1, round 84, round 7)
+        # A hang guard on the reader unwinding, not a speed claim (FL-1, round 84).
         assert tap.join(60) is True
     finally:
         fake.stop()
@@ -1620,9 +1571,7 @@ def test_tap_keeps_every_event_for_its_whole_life(tmp_path):
         assert h.tap.events == h.fake.events
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7 — find_kilo_binary
-# ─────────────────────────────────────────────────────────────────────────────
+# 7: find_kilo_binary
 
 def _extension(home: Path, version: str) -> Path:
     folder = home / ".vscode" / "extensions" / f"kilocode.kilo-code-{version}-linux-x64"
@@ -1675,9 +1624,7 @@ def test_find_kilo_binary_falls_back_to_path_then_raises(tmp_path, monkeypatch):
     assert "which" in message
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8 — a scenario bug shows up, it does not hang the test
-# ─────────────────────────────────────────────────────────────────────────────
+# 8: a scenario bug shows up as a failure, not a hang
 
 def test_an_unscripted_prompt_goes_idle_and_leaves_a_trace(tmp_path):
     scenario = {"turns": [{"events": ["busy", "idle"], "assistant": "one"}]}
@@ -1708,9 +1655,7 @@ def test_a_turn_hook_that_raises_becomes_a_recorded_error(tmp_path):
     assert assistant == "done"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9 — GET /provider: the offer, as the server sees it
-# ─────────────────────────────────────────────────────────────────────────────
+# 9: GET /provider: the offer, as the server sees it
 
 def _offered(provider_id: str, name: str, model_ids, *, limits=None):
     """One entry of a `GET /provider` body, in the shape the live server sends.

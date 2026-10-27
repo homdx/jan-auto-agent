@@ -76,9 +76,7 @@ from tools.auto.plan_validator import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 _SAMPLE_PY = """\
 def parse_config(raw):
@@ -287,9 +285,7 @@ def _task_kwargs(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-REMOVE — StateStore.remove_task
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-REMOVE: StateStore.remove_task
 
 class TestRemoveTask:
 
@@ -339,9 +335,7 @@ class TestRemoveTask:
         assert store.get_progress()["done_count"] == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-CANDIDATE — _task_to_candidate
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-CANDIDATE: _task_to_candidate
 
 class TestTaskToCandidate:
 
@@ -400,9 +394,7 @@ class TestTaskToCandidate:
         assert c.cited_location.new_file is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-STRIP — IMPROVEMENTS.md section removal
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-STRIP: IMPROVEMENTS.md section removal
 
 class TestRemoveFromImprovementsMd:
 
@@ -488,9 +480,7 @@ class TestRemoveFromImprovementsMd:
         assert (tmp_path / IMPROVEMENTS_FILENAME).read_text(encoding="utf-8") == text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-IDEMPOTENT — IMPROVEMENTS-FALSE.md writer
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-IDEMPOTENT: IMPROVEMENTS-FALSE.md writer
 
 class TestAppendFalsePositives:
 
@@ -524,9 +514,7 @@ class TestAppendFalsePositives:
         assert _already_recorded_ids(text) == {"AUTO-T1", "AUTO-T2"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AC-NOPLAN
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestNoPlanYet:
 
@@ -543,9 +531,7 @@ class TestNoPlanYet:
         assert "No plan found" in captured.err
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-VALIDATE — full integration
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-VALIDATE: full integration
 
 class TestValidatePlanIntegration:
 
@@ -688,9 +674,7 @@ class TestValidatePlanIntegration:
         with patch("tools.llm_stream.request_completion", side_effect=_fake_gate1_llm):
             validate_plan(repo, config_path=str(ini))
         after = _git_log(repo)
-        # A fresh repo also picks up GitManager's own one-time ".gitignore"
-        # safety commit (see git_manager.ensure_gitignore_committed), so
-        # assert on the newest commit's message rather than an exact count.
+        # A fresh repo gets GitManager's own .gitignore commit too; assert on the newest commit, not an exact count.
         assert len(after) > len(before)
         assert "AUTO-H1" in after[0]
 
@@ -712,9 +696,7 @@ class TestValidatePlanIntegration:
         assert mock_llm.call_count == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-REMOVE-GUARD-1 — a technical failure must never delete a task
-# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-REMOVE-GUARD-1: a technical failure must never delete a task
 
 class TestValidatePlanTechnicalFailureHandling:
     """A candidate whose presence check exhausts every
@@ -914,8 +896,7 @@ class TestValidatePlanTechnicalFailureHandling:
 
         assert report.removed == []
         assert [r.task_id for r in report.inconclusive] == ["AUTO-T-OUTAGE"]
-        # Only GitManager's own one-time .gitignore safety commit (if
-        # any) may appear — never an "AUTO-H1" validation commit.
+        # Only the GitManager's own .gitignore commit may appear, never an AUTO-H1 validation commit.
         assert not any("AUTO-H1" in line for line in after)
         assert len(after) - len(before) <= 1
 
@@ -939,18 +920,7 @@ class TestValidatePlanNoPendingTasks:
         assert not (repo / IMPROVEMENTS_FALSE_FILENAME).exists()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-SKIPWARN — Gate 1 presence-check-disabled warning
-#
-# Regression coverage for a real incident: agents_32k.ini / agents_64k.ini /
-# agents_128k.ini / agents_stub.ini all ship with [auto] task_mode = creative
-# by default (unlike agents.ini / agents_4k.ini's task_mode = code). Running
-# --validate-plan with one of those configs against an ordinary code plan
-# silently skips Gate 1's entire LLM presence check (AUTO-CR-8's rule:
-# task_mode != "code" -> existence-only) and returns "N/N confirmed" in well
-# under a second — a result that reads exactly like a real check completed
-# and found nothing, when in fact nothing was semantically checked at all.
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-SKIPWARN: Gate 1 presence-check-disabled warning (creative-default configs skip the LLM check silently; regression).
 
 class TestPresenceCheckSkipWarning:
 
@@ -1061,9 +1031,7 @@ class TestPresenceCheckSkipWarning:
         assert "confirmed above" in out or "not that anything was" in out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-EXITCODE — run_validate() console summary
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-EXITCODE: run_validate() console summary
 
 class TestRunValidateExitCodes:
 
@@ -1101,9 +1069,7 @@ class TestRunValidateExitCodes:
         assert "nothing to do" in capsys.readouterr().out.lower()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-CLI — argparse + main.py dispatch
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-CLI: argparse and main.py dispatch
 
 class TestCLIWiring:
 

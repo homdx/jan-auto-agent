@@ -63,50 +63,34 @@ from typing import Callable, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-#: The bar POSTMORTEM-FL-1 and RUNBOOK §3 set: 12 passes of the stress shape is
-#: 48 suite runs. ``e500d40`` looked finished below that and was not. Under the
-#: bar the script says so on one line, green or not — a 2-pass run is a coin
-#: that has not landed yet.
+#: The pass bar from POSTMORTEM-FL-1 and RUNBOOK §3: 12 passes (48 suite runs); a shorter run is reported as not landed.
 BAR_PASSES = 12
 
-#: pytest-timeout's default here: the value KC-38's acceptance gate uses, since
-#: ``pytest.ini`` sets none. Passed through, never raised to make a pass green.
+#: Default pytest-timeout for the suites; passed through and never raised to make a pass green (KC-38).
 DEFAULT_TIMEOUT = 180
 
-#: Default workers per suite, per shape: e500d40's 32 workers (4 x ``-n 8``)
-#: and FL-1's ``-n 4`` loop.
+#: Default workers per suite and shape (the stress shape and the serial loop).
 DEFAULT_WORKERS = {"stress": 8, "serial": 4}
 
 #: The two roots. Never one invocation.
 DEFAULT_ROOTS = ("tests", "tests_bugfix")
 
-#: The stress shape runs each root twice at once — the ~4x oversubscription on
-#: 8 cores that every margin in FL-1 had to survive.
+#: The stress shape runs each root twice at once, which every margin had to survive (FL-1).
 DEFAULT_SUITES_PER_ROOT = 2
 
-#: argv entries that could otherwise be mistaken for a test root. Tier
-#: directories count too, since ``.smoke_tests`` and ``.regression_tests`` are
-#: just symlink views onto ``tests/``.
+#: Argv entries that could be mistaken for a test root, including the tier directories (symlink views onto tests/).
 TIER_DIRS = frozenset({".smoke_tests", ".regression_tests"})
 
-#: A pytest-timeout kill under the default ``signal`` method: the worker is
-#: signalled and the summary line names the test as ``Failed: Timeout >N s``.
-#: ``pytest-timeout`` 2.x prints the same line with parentheses,
-#: ``Failed: Timeout (>5.0s) from pytest-timeout``; both forms are read.
+#: Pytest-timeout kill lines (signal method, with or without parentheses).
 RE_TIMEOUT_FAILED = re.compile(r"Timeout\s*\(?>\s*\d+(?:\.\d+)?\s*s")
 
-#: The other face of the same kill. With ``timeout_method = thread`` the worker
-#: ``os._exit``s, so xdist reports a node that died rather than a test that
-#: failed, and often no ``FAILED`` line at all. Both forms count as *killed*,
-#: never as a plain failure.
+#: Worker killed by a thread-method timeout: a dead node, not a failed test; counted as killed.
 RE_CRASHED_WORKER = re.compile(
     r"node down|replacing crashed worker|crashed worker|worker\s+\w+\s+crashed|"
     r"\*\*\* Killed \d+ workers|INTERNALERROR>\s*\n?Crashed"
 )
 
-#: The stack dump a kill leaves behind. It is kept as evidence, not a verdict:
-#: reading that dump is what identified FL-1's family A, and pytest-timeout's
-#: thread method dumps every live frame under a ``~~~~ Stack of ...`` header.
+#: The stack dump a kill leaves; kept as evidence, not as a verdict.
 RE_STACK_DUMP = re.compile(
     r"Timeout\s*\(?>\s*\d+(?:\.\d+)?\s*s|"
     r"Stack of <|Current thread|Thread 0x|~{5,}.*~{5,}"
@@ -518,14 +502,11 @@ def run_pass(
             if not concurrent:
                 reap(process)
         for _invocation, process in live:
-            # A serial pass already reaped every suite in the loop above; only
-            # reap once, so a suite's finish stays before the next one spawns.
+            # Each suite is reaped once, so its finish happens before the next one spawns.
             if id(process) not in reaped:
                 reap(process)
     finally:
-        # A pass is never abandoned half-spawned: on a box this script
-        # saturates, three orphaned pytest workers left behind are the whole
-        # bench re-run twice.
+        # Never abandon a pass half-spawned: orphaned workers would re-run the whole bench.
         for _invocation, process in live:
             if id(process) not in reaped:
                 _stop(process)
@@ -780,8 +761,7 @@ def main(argv=None, spawner: Optional[Callable] = None) -> int:
 
     run_one = spawner if spawner is not None else _default_spawner(cwd)
 
-    # Passes run in this loop and nowhere else. There is no concurrency here by
-    # construction, so two passes cannot overlap whatever happens inside one.
+    # Passes run one after another, so two passes cannot overlap.
     outcomes = []
     for pass_index in range(1, args.passes + 1):
         invocations = build_invocations(shape, pass_index, log_dir, timeout)

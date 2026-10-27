@@ -62,8 +62,7 @@ def test_loader_and_test_map_read_the_same_list():
 def test_every_root_the_loader_knows_is_a_test_root_for_the_map(root):
     assert test_paths.is_test_path(f"{root}test_x.py")
     assert test_paths.is_test_module(f"{root}test_x.py")
-    # Location alone is not coverage: scaffolding in a test root still
-    # covers nothing, and a conftest is plumbing wherever it sits.
+    # Location alone is not coverage: scaffolding in a test root covers nothing.
     assert test_paths.is_test_path(f"{root}helper.py")
     assert not test_paths.is_test_module(f"{root}helper.py")
     assert not test_paths.is_test_module(f"{root}conftest.py")
@@ -130,8 +129,7 @@ def test_every_root_counts_and_scaffolding_still_does_not(tmp_path):
         "stub-test/test_here.py", "tests/test_here.py",
         "tests_bugfix/test_here.py", "tests_slow/test_here.py",
     )
-    # Scaffolding is not coverage: not credited, and not a covering key
-    # either — a conftest.py is test plumbing, so it is not shipped code.
+    # Scaffolding (conftest.py) is test plumbing: not credited, and not a covering key.
     assert "tests/_helper.py" in tmap          # helper stays a source module
     assert "tests_bugfix/conftest.py" not in tmap["m.py"]
     assert "conftest.py" not in tmap["m.py"]
@@ -229,8 +227,7 @@ def test_a_dangling_or_escaping_link_fails_open(tmp_path):
     assert test_paths.canonical_test_path(tmp_path, "tests/test_out.py") == "tests/test_out.py"
     modules = [_module("m.py"), _module("tests/test_gone.py"), _module("tests/test_out.py")]
     tmap = build_test_map(tmp_path, modules)   # never raises
-    # The escaping link is still read and credited under its own name; the
-    # dangling one contributes no edges.
+    # The escaping link is credited under its own name; the dangling one adds no edges.
     assert tmap["m.py"] == ("tests/test_out.py",)
 
 

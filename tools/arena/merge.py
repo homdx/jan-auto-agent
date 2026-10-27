@@ -61,9 +61,7 @@ MERGED_RECORD = ".arena/merged.json"
 #: The bench folder a round's acceptance bench lands in.
 BENCH_DIR = "contest-bench"
 
-#: `tools/contest/export.write_entrants` names a file after the agent and, when the
-#: exporter had to put a terminal state in the name, after that state too:
-#: `glm-4-7.patch`, `glm-4-7.STALLED.diff`, `glm-4-7.ERROR.patch`.
+#: Entry file names: `agent.patch`, with the terminal state in the name when there is one (`agent.STALLED.diff`).
 _ENTRY_NAME = re.compile(r"^(?P<agent>.+?)\.(?:(?P<state>GAVE_UP|STALLED|ERROR)\.)?"
                          r"(?P<kind>patch|diff)$")
 #: A subject that already names a round or a ticket; `NN: ` is prepended otherwise.
@@ -328,6 +326,7 @@ def subject_of(mail: str) -> str:
 
 def body_of(mail: str) -> str:
     """The commit message in a mail's body: the text up to the diffstat, as it is."""
+    mail = mail.replace("\r\n", "\n")          # a CRLF patch has no "\n\n": its body came back empty
     text = mail.split("\n\n", 1)[1] if "\n\n" in mail else ""
     lines = text.split("\n")
     for index, line in enumerate(lines):
@@ -455,8 +454,7 @@ def _commit(repo: Path, message: str, paths: list[str]) -> str:
         raise MergeError("no paths to commit")
     fd, name = tempfile.mkstemp(prefix="arena-msg-", suffix=".txt")
     try:
-        # surrogateescape keeps a latin-1 subject's bytes in the commit (Bug 174);
-        # `newline=""` keeps CRLF a body carries on the branch (Bug 185).
+        # surrogateescape keeps latin-1 subject bytes (Bug 174); newline="" keeps CRLF in the body (Bug 185).
         with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape",
                        newline="") as handle:
             handle.write(message)
@@ -481,13 +479,14 @@ def write_merged_record(repo: Path, nn: int, agent: str, sha: str, subject: str)
     Written atomically through a sibling temp file, so a torn write cannot leave the
     other rounds' records unreadable.
     """
-    records = read_merged_record(repo)
-    records[str(nn)] = {"agent": agent, "sha": sha, "subject": subject}
+    from tools.auto.utils import atomic_write_text
+    from tools.claimcheck.truth import locked
     target = repo / MERGED_RECORD
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"{target.name}.tmp")
-    tmp.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(tmp, target)
+    # two merges at once each read, added and replaced: one round's record was lost
+    with locked(target):
+        records = read_merged_record(repo)
+        records[str(nn)] = {"agent": agent, "sha": sha, "subject": subject}
+        atomic_write_text(target, json.dumps(records, indent=2, sort_keys=True) + "\n")
 
 
 # ── entry merge: the winner, as it is ─────────────────────────────────────────
@@ -582,8 +581,7 @@ def read_ticket(repo: Path, nn: int) -> Optional[tuple[str, str]]:
     """
     ref = f"{rounds.REF_PREFIX}{nn}"
     try:
-        # Bug 206: the shared `ls-tree -z` reader — a name git would have quoted here
-        # was invisible to `merge` too, not only to `find_ticket`.
+        # Bug 206: the shared ls-tree -z reader sees names git would quote, so merge sees them too.
         names = [name.rsplit("/", 1)[-1]
                  for name in ls_tree_names(repo, ref, TASKS_DIR + "/")]
     except GitRefError:
@@ -750,8 +748,7 @@ def issue_land(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> in
                              f"{TASKS_DIR}/ or .arena/drafts/")
         name, text = found
         ticket_rel = f"{TASKS_DIR}/{name}"
-        # The text above may come from `arena-round/NN`, and the commit writes it over the
-        # checkout's copy: an edit of that copy not yet committed would be lost without a word.
+        # Uncommitted edits to the ticket file would be lost if the commit overwrote it; checked first.
         if (repo / ticket_rel).is_file():
             if _status_lines(repo, ticket_rel):
                 raise MergeError(f"{ticket_rel} has uncommitted changes — commit or drop them first")
@@ -766,8 +763,8 @@ def issue_land(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> in
         note = landed_note(nn, record, score, follow_up)
         try:
             new_text = tickets.set_status_text(text, f"{LANDED_WORD} {note}")
-        except ValueError:
-            raise MergeError(f"{ticket_rel} has no **Status:** line to land")
+        except ValueError as err:
+            raise MergeError(f"{ticket_rel} has no **Status:** line to land") from err
         word = _landed_word_of(new_text)
         index_path = repo / INDEX_FILE
         new_rows = update_index_row(read_utf8(index_path), nn, word) if index_path.is_file() else None

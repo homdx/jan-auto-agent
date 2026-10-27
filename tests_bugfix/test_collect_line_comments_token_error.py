@@ -23,8 +23,7 @@ from tools.collect.registries import _line_comments
 
 
 def test_line_comments_survives_unterminated_string():
-    # Valid enough for callers to pass through, but tokenize.generate_tokens
-    # raises TokenError on the unterminated string literal at EOF.
+    # Valid enough to pass through, but tokenize raises TokenError on an unterminated string at EOF.
     source = 'x = "unterminated\n'
     # Must not raise (previously: AttributeError from the bad except tuple).
     assert _line_comments(source) == {}

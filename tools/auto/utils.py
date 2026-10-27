@@ -12,12 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tools.actions import _edit_line_ends
+
 logger = logging.getLogger(__name__)
 
 
-# Longest sanitised name component we will hand to the filesystem. NAME_MAX is
-# 255 bytes on ext4/xfs/APFS; the headroom covers caller suffixes and the
-# temp-file name atomic_write_text derives from it.
+# Longest file-name component: keeps room for suffixes and temp-file names on common filesystems.
 _MAX_FILENAME_COMPONENT = 200
 
 
@@ -51,30 +51,14 @@ def safe_filename_component(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_\-]", "_", value)
     safe = safe.strip("_") or "task"
 
-    # Bugfix: sanitising for *characters* was not enough — nothing capped
-    # *length*. A runaway id (see the BUG-FIX- prefix cascade fixed in
-    # bug_fix_loop._root_task_id) grew past the 255-byte NAME_MAX and
-    # atomic_write_text died with `OSError: [Errno 36] File name too long`,
-    # taking down the entire run. The budget is deliberately conservative:
-    # callers append a suffix (".json") and atomic_write_text writes a
-    # sibling temp file with a leading "." and a ~14-char random tail.
-    # Truncation is made collision-safe by appending a digest of the full
-    # original value, and stays deterministic so repeated calls for the same
-    # id always resolve to the same path.
+    # Over-long names are truncated with a digest of the full value, so they stay unique and deterministic (bugfix).
     if len(safe) > _MAX_FILENAME_COMPONENT:
         digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
         safe = f"{safe[:_MAX_FILENAME_COMPONENT - len(digest) - 1]}_{digest}"
     return safe
 
 
-# ── Shared round-file accounting ─────────────────────────────────────────────
-# OuterLoop writes one ``feedback_round_<N>.md`` file per failed attempt and
-# uses the highest N found on disk to decide where a resumed task should pick
-# up. AutoController needs to ask the *same* question — "has this task
-# actually used up all its rounds, or would resetting it to TODO give it a
-# genuine new attempt?" — before resetting a BLOCKED task back to TODO.
-# Sharing one implementation means the two can never disagree about what
-# "already exhausted" means (see the BLOCKED-reset bugfix in controller.py).
+# Shared count of finished feedback rounds, so the executor and the controller agree on exhaustion (BLOCKED reset).
 _FEEDBACK_ROUND_RE = re.compile(r"feedback_round_(\d+)\.md$")
 
 
@@ -86,13 +70,7 @@ def highest_completed_round(task_dir: "str | Path") -> int:
     """
     best = 0
     for p in Path(task_dir).glob("feedback_round_*.md"):
-        # B3: glob() yields DIRECTORIES as well as files, and the check
-        # below is only a name match -- a directory literally named
-        # feedback_round_5.md counted as a completed round. This value is
-        # load-bearing: controller._reset_resettable_blocked_tasks compares it
-        # against max_rounds to decide whether a BLOCKED task may be reset to
-        # TODO, so a phantom round parked the task in BLOCKED forever with
-        # nothing in any log explaining why.
+        # Only real files count as rounds; a directory with a round-like name would park a task forever (B3).
         if not p.is_file():
             continue
         m = _FEEDBACK_ROUND_RE.search(p.name)
@@ -161,7 +139,32 @@ def fsync_directory(directory: "str | Path") -> None:
         )
 
 
-def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = False) -> None:
+def _read_umask_once() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+#: the umask at import, for a system without /proc: set and put back once, before any thread
+_UMASK_AT_IMPORT = _read_umask_once()
+
+
+def _umask() -> int:
+    """The process umask, read without changing it (os.umask is process-wide: a file another thread made
+    in between got none); /proc/self/status on Linux, else the value read at import."""
+    try:
+        with open("/proc/self/status", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    return _UMASK_AT_IMPORT
+
+
+def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = False,
+                      newline: "str | None" = None, encoding: str = "utf-8",
+                      errors: str = "strict") -> None:
     """Write *content* to *path* atomically (temp file + ``os.replace``).
 
     ``os.replace`` is a single filesystem rename, which POSIX and Windows both
@@ -178,7 +181,20 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
     hard-linked into place (``os.link`` fails if *path* exists), so of two
     racing writers exactly one wins and the other gets ``FileExistsError``
     instead of silently replacing the winner's file. A filesystem without
-    hard links falls back to the plain replace.
+    hard links creates *path* with ``O_EXCL`` and copies the content into it (create-only still holds;
+    a reader may see the file before it is complete).
+
+    The file keeps the mode it had, and a new one gets what ``open()`` would
+    give it (0666 less the umask): mkstemp's temporary file is 0600, and the
+    rename made a 0644 IMPROVEMENTS.md and a 0755 script 0600. *newline* is
+    ``open()``'s: ``""`` writes *content*'s line ends as they are.
+
+    *errors* is ``open()``'s too, and matters only for a caller whose *content*
+    holds lone surrogates — HARDEN-7 D: a patch captured from git with
+    ``surrogateescape``, where each surrogate is one byte git actually printed.
+    ``errors="surrogateescape"`` turns each back into that byte and
+    ``newline=""`` keeps ``\\r\\n`` as it was, so the file on disk is the bytes
+    git produced.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,7 +202,11 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
         dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        try:
+            os.chmod(tmp_name, (path.stat().st_mode & 0o7777) if path.exists() else 0o666 & ~_umask())
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline, errors=errors) as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
@@ -196,9 +216,14 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
             except FileExistsError:
                 raise
             except OSError:
-                os.replace(tmp_name, path)
-            else:
-                os.unlink(tmp_name)
+                # No hard links: O_EXCL is the atomic "fail if it exists" (check-then-replace would let two writers win).
+                import shutil
+                out = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, os.stat(tmp_name).st_mode & 0o7777)
+                with os.fdopen(out, "wb") as dst, open(tmp_name, "rb") as src:
+                    shutil.copyfileobj(src, dst)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+            os.unlink(tmp_name)
         else:
             os.replace(tmp_name, path)
         fsync_directory(path.parent)
@@ -208,6 +233,28 @@ def atomic_write_text(path: "str | Path", content: str, *, exclusive: bool = Fal
         except OSError:
             pass
         raise
+
+
+def in_style_of(dest: Path, content: str) -> str:
+    """*content* with *dest*'s line ends and its BOM. The model writes LF and no BOM.
+
+    HARDEN-20 B: this calls the one shared rule, `_edit_line_ends` (tools/actions.py), instead
+    of keeping its own copy. That copy had flattened a mixed file: every line took the file's
+    majority ending, so a single LF line among CRLF lines edited on one line produced a diff
+    of every line that did not match the majority. Now a reply line that still equals an
+    original line keeps that line's own ending, used once, and a changed or a new line takes
+    the majority ending — which for a uniform file is the whole old rule, unchanged.
+
+    Fail-open: a file that cannot be read comes back as *content*, and an empty one as LF, so
+    a missing destination never raises into a run.
+    """
+    try:
+        raw = dest.read_bytes()
+    except OSError:
+        return content
+    if not raw:
+        return content.replace("\r\n", "\n")
+    return _edit_line_ends(str(dest), content)
 
 
 def _cfg_mode(
@@ -262,25 +309,13 @@ def _cfg_mode(
 
 # ── Input-side token budgeting: chars-per-token varies by script ────────────
 
-# English/Latin prose in llama3.1/qwen tokenizers runs close to ~4 chars per
-# token; this is the default, conservative-for-English estimate used
-# throughout the project's *input* budget math (context_assembler,
-# summary_memory, canon_validator).
+# Default characters per token for Latin-script prose; the input budget math uses it.
 _CHARS_PER_TOKEN_DEFAULT = 4.0
 
-# Cyrillic tokenizes far more densely in these tokenizers — commonly
-# ~1.5-2.5 chars/token rather than ~4, since many Cyrillic characters cost
-# their own BPE token(s). Using the Latin ratio for Cyrillic text
-# *under*-counts real token usage, so a context assembler sized with the
-# default budget silently overflows num_ctx and Ollama truncates the start
-# of the prompt (system prompt / story bible) — the root cause of a class of
-# continuity errors that Gate-2 then catches only as a downstream symptom.
+# Cyrillic is much denser per token, so the ratio is measured for it, or the budget silently overflows the context (chars_per_token).
 _CHARS_PER_TOKEN_CYRILLIC = 2.2
 
-# Fraction of alphabetic characters that must be Cyrillic before we switch
-# to the denser ratio. Mirrors the confidence threshold used by
-# detect_language() below, kept as a separate constant since the two
-# functions answer different questions (script ratio vs. dominant language).
+# Share of Cyrillic letters above which the Cyrillic ratio is used (matches detect_language's threshold).
 _CYRILLIC_RATIO_THRESHOLD = 0.30
 
 
@@ -353,9 +388,7 @@ def detect_language(text: str) -> "str | None":
     max_n = max(counts.values())
     if max_n == 0 or (max_n / total) < 0.30:
         return None
-    # AUTO-FIX (bug 44): max(counts.items(), ...) breaks ties by insertion
-    # order, so an exact Russian/English tie always returned "Russian". A
-    # tie is the ambiguous case this docstring says returns None.
+    # An exact tie in language counts is ambiguous, so it returns None rather than an arbitrary winner (bug 44).
     tied = [name for name, n in counts.items() if n == max_n]
     if len(tied) > 1:
         return None
@@ -472,28 +505,17 @@ def human_duration(seconds: float) -> str:
     return sign + " ".join(parts)
 
 
-# ── RUN-3: is this command a pytest invocation? ──────────────────────────────
-#
-# Shared by ``Executor._serialise_pytest`` (which appends the in-process flag)
-# and ``inner_loop._build_exec_detail`` (which reads a failed run's tail
-# instead of its head), so the two can never disagree about what a pytest
-# run is. Token-position matching, never a substring: ``echo pytest`` and
-# ``bash pytest_runner.sh`` are script runs.
+# Pytest detection: shared by the executor and the failure detail, matched by command position, never by substring (RUN-3).
 
 PYTEST_TOKENS = ("pytest", "py.test")
 
-# Shell tokens that end one command and start the next — a pytest invocation
-# is recognised at a command position: the first token, or the one after
-# any of these (``cd sub && pytest``, and unspaced ``cd sub&&pytest`` — the
-# command is split with ``punctuation_chars`` so a glued separator is a token).
+# Separators that end one command: a pytest invocation is recognised after any of them (RUN-3).
 _COMMAND_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")", "{", "!"})
 
 #: A shell variable set for one command: ``PYTHONPATH=. pytest tests``.
 ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 
-#: Commands that run the rest of their line as the command: the suite behind
-#: them is still the suite. ONE list for ``is_pytest_command`` and the contest
-#: policy's ``_past_wrappers`` (they answer the same question and drifted once).
+#: Wrapper commands that run the rest of the line; one list for the pytest check and the contest policy.
 COMMAND_WRAPPERS = frozenset({"timeout", "nohup", "env", "nice", "time", "exec", "command",
                               "stdbuf", "ionice"})
 
@@ -504,9 +526,7 @@ WRAPPER_VALUE_FLAGS = ("-n", "-s", "-k", "--signal", "--kill-after", "-o", "-e",
 #: Project runners: ``uv run pytest``, ``poetry run pytest`` — ``run`` is theirs.
 _RUNNERS = frozenset({"uv", "poetry", "pipenv", "pdm", "hatch", "rye"})
 
-# An xdist flag in every spelling: ``-n 4`` / ``-n4`` / ``-nauto`` / ``--dist=loadgroup``
-# / ``--numprocesses 4`` / ``--numprocesses=4``. Anchored, so ``--no-header``
-# and other long options that merely begin with "-n" do not match.
+# Xdist flags in every spelling; anchored, so long options that only begin with -n do not match.
 _XDIST_FLAG_RE = re.compile(r"^(?:-n(?:\d+|auto|logical)?|--numprocesses(?:=.*)?|--dist(?:=.*)?)$")
 
 
@@ -564,10 +584,7 @@ def pytest_argv_start(seg: list[str]) -> int | None:
     base = _basename(seg[i])
     if base in PYTEST_TOKENS or base in ("pytest.exe", "py.test.exe"):
         return i + 1
-    # ``python -m pytest``: the interpreter is matched by name (``python``,
-    # ``python3``, ``python3.11``, ``python.exe``, the ``py`` launcher) so the
-    # absolute-path rewrite the executor performs does not defeat it; options
-    # before ``-m`` (``-X dev``, ``-u``, ``-W ignore``) are skipped, ``-c`` is code.
+    # python -m pytest is recognised across interpreter names and options before -m (RUN-3).
     if base == "py" or base.startswith("python"):
         k = i + 1
         while k < len(seg):

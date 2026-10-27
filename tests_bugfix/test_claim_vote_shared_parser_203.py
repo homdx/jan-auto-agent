@@ -35,8 +35,7 @@ def test_two_voters_cannot_take_each_others_settings(monkeypatch):
     entered = threading.Event()
 
     def fake_resolve(config, section, key, *, defaults):
-        # the first resolution widens its own window: while it is inside,
-        # the other thread writes _pick into the same parser
+        # The first resolution holds its window open, so the other thread writes _pick into the same parser.
         if not entered.is_set():
             entered.set()
             time.sleep(0.2)

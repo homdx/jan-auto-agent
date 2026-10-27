@@ -23,9 +23,7 @@ from tools.auto.backlog_prioritiser import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_candidate(title: str, target_files: list[str]) -> CandidateTask:
     """Minimal CandidateTask for dependency-inference tests."""
@@ -56,9 +54,7 @@ def _deps_map(tasks: list[ReadyTask]) -> dict[str, list[str]]:
     return {t.task_id: list(t.dependencies) for t in tasks}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Unit: _chapter_number helper
-# ─────────────────────────────────────────────────────────────────────────────
+# Unit: _chapter_number
 
 class TestChapterNumber:
 
@@ -96,9 +92,7 @@ class TestChapterNumber:
         assert _chapter_number(t) == 7
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Unit: _chapter_dependencies function
-# ─────────────────────────────────────────────────────────────────────────────
+# Unit: _chapter_dependencies
 
 class TestChapterDependencies:
 
@@ -123,8 +117,7 @@ class TestChapterDependencies:
         edges = _chapter_dependencies([t2, t10])
 
         assert edges.get("T10") == ["T2"]
-        # Ensure chapter_1 would NOT be the predecessor if it were present
-        # (tested separately via three-task variant below)
+        # chapter_1 must not be the predecessor when present; covered by the three-task variant below.
 
     def test_numeric_three_tasks_10_depends_on_9_not_1(self):
         """With chapters 1, 9, 10 → chapter_10 depends on chapter_9."""
@@ -184,9 +177,7 @@ class TestChapterDependencies:
         assert edges.get("T3") == ["T2"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Integration: BacklogPrioritiser.build() wires chapter edges end-to-end
-# ─────────────────────────────────────────────────────────────────────────────
+# Integration: BacklogPrioritiser.build() wires chapter edges end to end
 
 class TestBacklogPrioritiserChapterIntegration:
 
@@ -207,8 +198,7 @@ class TestBacklogPrioritiserChapterIntegration:
             ["chapter_3.md"],
         )
         dm = _deps_map(tasks)
-        # Find the task_ids assigned to each chapter (ordered T1→T3 since build
-        # assigns IDs before sorting, then topo-sort preserves chapter order).
+        # Task IDs follow chapter order: IDs are assigned before the topological sort.
         id_ch1 = next(t.task_id for t in tasks if "chapter_1" in t.target_files[0])
         id_ch2 = next(t.task_id for t in tasks if "chapter_2" in t.target_files[0])
         id_ch3 = next(t.task_id for t in tasks if "chapter_3" in t.target_files[0])
@@ -232,9 +222,7 @@ class TestBacklogPrioritiserChapterIntegration:
         assert positions[id_ch2] < positions[id_ch3], "chapter_2 before chapter_3"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Blocked-successor behaviour
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestFailedDependencyBlocksSuccessor:
     """Simulate the controller's dependency-gate logic.

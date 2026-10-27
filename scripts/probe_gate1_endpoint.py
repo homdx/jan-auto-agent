@@ -46,9 +46,7 @@ import tools.llm_stream as _llm_stream  # noqa: E402
 import tools.auto.gate1_filter as G  # noqa: E402
 from tools.config_safe import safe_getboolean  # noqa: E402
 
-# A claim that is plainly NOT present in the code shown — every model should
-# answer ``rejected``; the text of the verdict is not what is measured, the
-# metadata around it is.
+# A claim plainly NOT present in the code shown: every model should answer ``rejected``. The verdict text is not measured; the metadata around it is.
 _PROBE_INSTRUCTION = "The function `add` returns `a - b` instead of `a + b`."
 _PROBE_LOCATION = "probe.py:1  add"
 _PROBE_CODE = "def add(a, b):\n    return a + b\n"
@@ -169,8 +167,7 @@ def report(flt, calls: list[dict], *, profile_note: str, out=None) -> int:
             row("usage chunk", "NO — the provider sends none; an empty reply is classified "
                                "by finish_reason / reasoning only")
             degraded.append("no usage chunk")
-    # The "stop sending it" memories are keyed by the request URL (the
-    # /chat/completions endpoint), not the base_url the profile names.
+    # "Stop sending it" memories are keyed by the request URL (the /chat/completions endpoint), not the profile's base_url.
     so_key = ((calls[0]["url"] if calls else url), model)
     if _llm_stream.stream_options_is_supported(*so_key):
         row("stream_options", "accepted")

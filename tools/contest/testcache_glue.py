@@ -19,7 +19,6 @@ import json
 import logging
 import re
 import time
-from pathlib import Path
 from typing import Callable, Optional
 
 from tools.contest import testcache
@@ -27,8 +26,7 @@ from tools.contest.testcache_store import TestRunCache, tree_fingerprint
 
 _log = logging.getLogger(__name__)
 
-#: the first word of a command part that has no effect on the tree or the world
-#: worth worrying about; a pytest call wrapped in these is still just pytest
+#: Harmless first words: no effect on the tree; a pytest call wrapped in them is still pytest.
 _HARMLESS = frozenset({
     "cd", "echo", "printf", "time", "date", "tail", "head", "true", "false",
     "exit", "set", "export", "unset", "wc", "grep", "cat", "ls", ":",
@@ -36,8 +34,7 @@ _HARMLESS = frozenset({
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _REDIRECT = re.compile(r"^\d*>+&?\d*(/dev/null)?$")
 _SPLIT = re.compile(r"&&|\|\||;|\||\n")
-#: text that makes a command worth asking the model about when the parser reads
-#: no pytest in it
+#: Words that make a command worth asking the model about when it reads no pytest.
 _MAYBE_TESTS = re.compile(r"test|check|suite|ci\b|verify", re.I)
 
 
@@ -125,9 +122,7 @@ class TestCacheGate:
                     return None
                 runs = parsed
             else:
-                # the parser reads no pytest: only a single plain command (a
-                # script, `make test`) may be put to the gate model — a chain
-                # could hide an effect behind the one name it is asked about
+                # No pytest found: only a single plain command may go to the gate model; a chain could hide an effect.
                 if _SPLIT.search(command.strip()):
                     return None
                 runs = self._runs_of(command)

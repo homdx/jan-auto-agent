@@ -10,8 +10,7 @@ def _ticket(title):
 
 def test_racing_creates_of_one_id_yield_exactly_one_winner(tmp_path, monkeypatch):
     store = TicketStore(tmp_path)
-    # Hold both threads between the exists() check and the write, so each has
-    # already seen "no such ticket" — the window the old code left open.
+    # Hold both threads between exists() and write, so each sees "no such ticket".
     barrier = threading.Barrier(2, timeout=10)
     real = TicketStore._ensure_dir
 

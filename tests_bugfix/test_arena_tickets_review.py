@@ -55,10 +55,7 @@ def repo(tmp_path, monkeypatch) -> Path:
     return repo
 
 
-# ── bug: `_dirty_tasks` cut the first path's leading character ────────────────
-# gitref.git() strips its output; the first `git status --porcelain` line of a
-# modified-but-unstaged file starts with the significant space of " M", so the
-# strip ate it and `line[3:]` then ate the path's first letter.
+# Regression: _dirty_tasks cut the first path's leading character (git strips the status space).
 
 def test_dirty_tasks_names_every_modified_file_in_full(repo):
     _write(repo / "epic-tasks" / "01-one.md", "# one\n")
@@ -89,10 +86,7 @@ def test_run_start_refusal_names_the_dirty_file_correctly(repo, capsys):
     assert " pic-tasks/" not in err
 
 
-# ── bug: `open_status` rewrote one line ending of a CRLF ticket ───────────────
-# `**Status:**.*$` in MULTILINE mode: `.` takes the `\r`, so the status line was
-# replaced without it while every other line kept `\r\n` (mixed endings, and a
-# base-ref blob that is not the ticket's bytes).
+# Regression: open_status replaced one line ending of a CRLF ticket, leaving mixed line endings.
 
 def test_open_status_keeps_the_crlf_of_the_status_line():
     text = "# t\r\n\r\n**Status:** queued\r\n\r\nbody\r\n"
@@ -112,10 +106,7 @@ def test_open_status_leaves_a_ticket_without_a_status_line_alone():
     assert rounds.open_status("# t\n\nbody\n") == "# t\n\nbody\n"
 
 
-# ── bug: tickets with non-ASCII names were unreadable on the branch ──────────
-# `git ls-tree --name-only` octal-quotes such names (`"epic-tasks/12-caf\303\251.md"`),
-# which no ticket pattern matches: `run start 12` said "no ticket 12", and
-# `next_number` handed 12 out again.
+# Regression: non-ASCII ticket names are octal-quoted by ls-tree and matched no pattern.
 
 NAME = "12-café.md"
 BODY = "# Café\n\n**Status:** open\n\nbody\n"
@@ -156,9 +147,7 @@ def test_next_number_does_not_reuse_a_non_ascii_branch_ticket(branch_only):
     assert tickets.next_number(branch_only, config, "arena") == 13
 
 
-# ── bug: `issue view` could not open a ticket whose file name holds a colon ───
-# It recovered the name with `Path(path).name.split(":")[-1]`, which is meant to
-# drop a `<branch>:` prefix and so also cut `12-fix: thing.md` down to ` thing.md`.
+# Regression: issue view could not open a ticket whose file name holds a colon.
 
 @pytest.mark.parametrize("where_branch", [False, True])
 def test_issue_view_opens_a_ticket_with_a_colon_in_its_name(repo, capsys, where_branch):

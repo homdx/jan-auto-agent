@@ -36,10 +36,12 @@ from __future__ import annotations
 
 import ast
 import configparser
+import logging
 from pathlib import Path
 from typing import FrozenSet, List, Optional
 
 from tools.auto.repo_ingest import RepoIngestor
+from tools.collect.manifest import skip_dirs_from_config as _collect_skip_dirs
 from tools.collect.ast_facts import (
     extract_config_reads,
     extract_except_sites,
@@ -57,6 +59,88 @@ from tools.collect.lang import (
     java_extensions_from_config,
 )
 from tools.collect.model import ModuleRecord
+
+
+#: The collect stage's own walk limits, read from `[collect]` (HARDEN-24 B). Both default at
+#: least as wide as the values the stage used to borrow from `[search]` (depth 2, 500 KB),
+#: so a `[collect]`-less config collects at least as much as before; a repo that nests its
+#: sources three folders deep or carries a generated 600 KB file no longer loses it. A config
+#: whose `[architect]`/`[search]` names a wider limit keeps it (`collect_walk_limits`).
+DEFAULT_COLLECT_MAX_DEPTH = 6
+DEFAULT_COLLECT_MAX_FILE_KB = 4096
+
+
+def _collect_int(config: Optional[configparser.ConfigParser], key: str, default: int) -> int:
+    """One `[collect]` int limit, fail-open: an absent key, a non-int or a negative value
+    gives the default rather than raising into a run (a malformed key is "no collect data",
+    never an abort)."""
+    if config is None:
+        return default
+    try:
+        raw = config.get("collect", key, fallback=None)
+    except (configparser.Error, KeyError, TypeError):
+        return default
+    if raw is None:
+        return default
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return default
+    if value <= 0:
+        # REP-COLLECT-LIMIT: "max_depth = 0" read as "no limit" was the default 6 without a word.
+        logging.getLogger(__name__).warning(
+            "[collect] %s = %s is not a positive number — using %d", key, value, default)
+        return default
+    return value
+
+
+def _architect_int(config: Optional[configparser.ConfigParser], key: str) -> Optional[int]:
+    """`key` the way the Architect's walk reads it — `[architect]` first, then `[search]`
+    (`RepoIngestor._read_int`) — or None when neither names a number. Fail-open like
+    `_collect_int`: a malformed value is no value."""
+    if config is None:
+        return None
+    try:
+        raw = (config.get("architect", key, fallback=None)
+               or config.get("search", key, fallback=None))
+    except (configparser.Error, KeyError, TypeError, AttributeError):
+        return None
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return None
+
+
+def _at_least_as_wide(default: int, architect: Optional[int]) -> int:
+    """The collect default, widened to the Architect's limit when that one is wider.
+
+    CC review fixes 45: every shipped profile sets `[search] max_depth = 8`, which the
+    collect walk read until HARDEN-24 B gave it a default of its own; at 6, a module seven or
+    eight folders deep left the model of every shipped profile. The Architect's limit may
+    widen the collect walk, never narrow it (the reason `[collect]` exists): 0 or less is the
+    walk's own "no limit", and stays one.
+    """
+    if architect is None:
+        return default
+    if architect <= 0:
+        return 0
+    return max(default, architect)
+
+
+def collect_walk_limits(config: Optional[configparser.ConfigParser]) -> tuple[int, int]:
+    """The `(max_depth, max_file_kb)` the collect walk uses: `[collect] max_depth` and
+    `[collect] max_file_kb` when set, else the collect defaults widened to the
+    `[architect]`/`[search]` values the stage used to read, so no config collects less than
+    it did before HARDEN-24 B. A narrower `[search]` limits the Architect only — this pair
+    is the collect stage's, and nothing else reads it."""
+    return (
+        _collect_int(config, "max_depth", _at_least_as_wide(
+            DEFAULT_COLLECT_MAX_DEPTH, _architect_int(config, "max_depth"))),
+        _collect_int(config, "max_file_kb", _at_least_as_wide(
+            DEFAULT_COLLECT_MAX_FILE_KB, _architect_int(config, "max_file_kb"))),
+    )
 
 
 def scan_module(source: str, module_path: str) -> ModuleRecord:
@@ -100,10 +184,7 @@ def scan_java_module(source: str, module_path: str) -> ModuleRecord:
     if result.error is not None:
         return ModuleRecord(path=module_path, parse_error=result.error, language=Language.JAVA)
     if result.has_error:
-        # tree-sitter recovered a tree but flagged internal ERROR nodes —
-        # record this as a parse_error too (extracting facts from an
-        # unreliable tree risks exactly the kind of unchecked claim
-        # COLLECT-1 exists to prevent).
+        # Tree-sitter recovered a tree but flagged error nodes: record a parse_error rather than trust facts from it.
         return ModuleRecord(
             path=module_path,
             parse_error=f"Java source has syntax errors: {module_path}",
@@ -221,9 +302,50 @@ def scan_repo(
     wasn't asked to look," which is exactly the point — a Python-only
     user sees zero behavior change whether or not `tree-sitter-java`
     happens to be installed.
+
+    HARDEN-24 B: the walk runs on the collect stage's own `[collect]`
+    limits, not on the Architect's `[search]` numbers. The files those
+    limits left out are returned by `scan_repo_ex` and recorded on the
+    manifest, so a depth or a size limit says so instead of dropping the
+    file from the model with no word of it.
     """
+    return _scan_repo(root, config)[0]
+
+
+def scan_repo_ex(
+    root: Path,
+    *,
+    config: Optional[configparser.ConfigParser] = None,
+) -> "tuple[List[ModuleRecord], List[tuple[str, str]]]":
+    """`scan_repo` plus `(path, reason)` for every file its walk skipped (HARDEN-24 B).
+
+    The reasons are the walk's own: `"too deep"` (past `[collect] max_depth`),
+    `"too large"` (past `[collect] max_file_kb`), `"unreadable"` (the walk
+    could not stat it) and `"outside repo"` (a symlink whose target leaves the
+    project root, AUDIT-2 — its target is never read). Sorted by path, and empty when nothing was skipped —
+    which is also what a config that names no limits gives, since a malformed
+    limit degrades to the default rather than raising.
+    """
+    modules, skipped = _scan_repo(root, config)
+    return modules, sorted(skipped)
+
+
+def _scan_repo(
+    root: Path,
+    config: Optional[configparser.ConfigParser],
+) -> "tuple[List[ModuleRecord], List[tuple[str, str]]]":
     root = Path(root)
-    ingestor = RepoIngestor(root, config)
+    # skip_dirs prunes the walk itself, so the artifact's module list and the manifest agree; no key means the defaults.
+    # The depth and size limits are the collect stage's own (HARDEN-24 B), and the walk is asked to
+    # name what it leaves out rather than drop it silently.
+    max_depth, max_file_kb = collect_walk_limits(config)
+    ingestor = RepoIngestor(
+        root, config,
+        extra_skip_dirs=_collect_skip_dirs(config),
+        max_depth=max_depth,
+        max_file_kb=max_file_kb,
+        collect_skips=True,
+    )
     enabled = enabled_languages(config)
     java_exts = java_extensions_from_config(config)
 
@@ -238,34 +360,14 @@ def scan_repo(
     modules: List[ModuleRecord] = []
     for rel in scannable:
         try:
-            source = (root / rel).read_text(encoding="utf-8")
+            # Read as utf-8-sig: a BOM-prefixed file (Notepad, some IDEs) must parse.
+            source = (root / rel).read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError) as exc:
-            # BUGFIX: an unreadable file (permission error, a broken
-            # symlink, a file deleted in a race between the walk above and
-            # this read, or — most commonly — a `.py`/`.java` file that
-            # simply isn't valid UTF-8) used to propagate straight out of
-            # `scan_repo`, aborting the *entire* scan and losing every
-            # already-collected module along with it. That directly
-            # contradicts this module's own documented contract (see the
-            # module docstring and `scan_module`'s `SyntaxError` handling):
-            # one broken file must never take down coverage of the rest of
-            # the tree. Record it the same way an unparseable file already
-            # is — `parse_error` set, empty structural fields — and keep
-            # going, instead of letting the read failure crash the run.
+            # An unreadable or non-UTF-8 file is recorded as a parse_error, not a scan abort; the other modules are kept.
             language = Language.JAVA if _language(rel) == Language.JAVA else Language.PYTHON
             modules.append(ModuleRecord(path=rel, parse_error=f"{rel}: {exc}", language=language))
             continue
-        # AUTO-FIX (high-priority audit): the file-read step above is
-        # guarded so one unreadable file can't take down the whole scan
-        # (see the BUGFIX comment on that except block), but the symbol-
-        # extraction call itself was NOT — an unexpected AST shape during
-        # _walk_type_body's recursive walk (java_facts.py) would propagate
-        # straight out of scan_repo, aborting coverage of every other file
-        # already collected. That directly contradicts this loop's own
-        # documented invariant. tree-sitter's own parse failure is already
-        # handled inside scan_java_module (via parse_java's fault-tolerant
-        # contract); this catches everything else — a bug in the Python-side
-        # symbol/import extraction walking an otherwise-valid tree.
+        # A bug in symbol extraction must not abort the scan of other files: catch it per file.
         try:
             if _language(rel) == Language.JAVA:
                 modules.append(scan_java_module(source, rel))
@@ -280,7 +382,15 @@ def scan_repo(
                     language=language,
                 )
             )
-    return modules
+    # CC review fixes 45: a skip is named only for a file this scan would have read. The walk
+    # yields every text file, so a deep README, a JSON fixture or a stylesheet came out
+    # "too deep" or "too large" too — a third of the 2,727 warnings on this repo, about
+    # files the model never holds.
+    skipped = [
+        (path, reason) for path, reason in ingestor.skipped_files
+        if (lang := _language(path)) is not None and lang in enabled
+    ]
+    return modules, skipped
 
 
 def scan_repo_payload(root: Path, *, config: Optional[configparser.ConfigParser] = None):

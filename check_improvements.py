@@ -111,17 +111,7 @@ def parse_improvements(path: Path) -> list[dict]:
     if tasks:
         return tasks
 
-    # AUTO-BUG (fixed): the block parser above only understands the
-    # "### AUTO-Txx: title" heading format used by IMPROVEMENTS.md /
-    # IMPROVEMENTS-FALSE.md. Curated ground-truth files
-    # (GROUND-TRUTH.md, GROUND-TRUTH-GOOGLE.md, GROUND-TRUTH-NVIDIA.md)
-    # use a *different* format — a "| ID | Location | Reason |" markdown
-    # table under a "## Confirmed FALSE POSITIVE" heading. Previously
-    # that meant parse_improvements() silently returned [] for every
-    # ground-truth file, so grade_folder() always saw "0 true false
-    # positives" and scored every agent-excluded task as a wrongly-
-    # excluded FP (0% precision), regardless of what the ground truth
-    # actually said. Fall back to the table parser before giving up.
+    # Fall back to the table parser for ground-truth files ("| ID | Location | Reason |" tables).
     return _parse_ground_truth_table(text)
 
 
@@ -204,22 +194,12 @@ def find_false_positive(task: dict, known_fps: list[dict], overlap_ratio: float)
                 ratio = len(shared) / max(len(task["target_files"]), len(fp["target_files"]))
                 if ratio >= overlap_ratio:
                     return fp, "file_overlap"
-                # BUGFIX (audit): this only ever recorded the FIRST weak
-                # overlap encountered (`if best_weak is None`), so a later,
-                # stronger-but-still-below-threshold match was ignored even
-                # though `ratio` is computed for every candidate — report
-                # the highest-ratio weak overlap, not just the first one.
+                # Keep the highest-ratio weak overlap, not the first one seen.
                 if ratio > best_weak_ratio:
                     best_weak = fp
                     best_weak_ratio = ratio
         elif not task["target_files"] or not fp["target_files"]:
-            # AUTO-FIX: this used to require BOTH sides to have zero
-            # target_files (`and`), contradicting the docstring's own
-            # "one/both sides have no target_files at all" — a task with
-            # no target files vs. a known-FP that does have some (or vice
-            # versa) fell through this branch entirely and silently
-            # matched nothing, even when the titles were identical.
-            # Neither side has target files to compare — fall back to title.
+            # Neither side has target files: compare titles instead.
             sim = _title_similarity(task["title"], fp["title"])
             if sim >= 0.6:
                 return fp, "title_fallback"
@@ -246,13 +226,7 @@ _FORMAT_WORDS = {
     "xml":  ("xml.etree", "ElementTree", "lxml"),
 }
 
-# ── Patterns confirmed real and recurring across multiple review rounds ────────
-# These two catch the two most common systematic hallucination classes found
-# in manual review: (1) claiming a config.getX() call can raise NoSectionError/
-# NoOptionError when it already passes fallback= (155 of 180 getX() calls in
-# this codebase already do — it is the dominant, expected style here), and
-# (2) "hardening" a deliberately-bad code sample used as a test fixture for a
-# static analyzer elsewhere in the repo (collect/dataflow.py & friends).
+# Known hallucination classes: config fallback claims, and test fixtures that are meant to be broken.
 
 _SECTION_ERROR_CUES = re.compile(
     r'NoSectionError|NoOptionError|missing \[?\w+\]? section|no \[?\w+\]? section',
@@ -300,10 +274,7 @@ def source_ground_task(task: dict, file_texts: dict[str, str], whole_repo: str) 
     target_text = "".join(file_texts.get(f, "") for f in task["target_files"])
     have_targets_on_disk = any(f in file_texts for f in task["target_files"])
 
-    # 1. Quoted "existing code line" that claims to be truncated/a syntax error, but is
-    #    actually a strict PREFIX of a real, complete line in the target — i.e. the file
-    #    is fine and the claim is fabricated. (A plain substring check can't catch this:
-    #    any prefix of real code is trivially "found" as a substring.)
+    # 1. A quoted "existing" line that is a strict prefix of a real line is a fabricated truncation claim.
     if have_targets_on_disk:
         for m in _BACKTICK_RE.finditer(instruction):
             span = m.group(1)
@@ -312,8 +283,7 @@ def source_ground_task(task: dict, file_texts: dict[str, str], whole_repo: str) 
             near_truncation_claim = bool(_TRUNCATION_CUES.search(
                 instruction[max(0, m.start() - 60):m.end() + 60]))
             if span in target_text:
-                # Exact match — fine, unless the surrounding claim says it's broken/truncated
-                # while the target shows a longer complete continuation on the same line.
+                # Exact match, unless the claim says the line is broken and the target shows a longer continuation.
                 if near_truncation_claim:
                     for line in target_text.splitlines():
                         if span in line and line.strip() != span.strip() and len(line) > len(span) + 3:
@@ -325,9 +295,7 @@ def source_ground_task(task: dict, file_texts: dict[str, str], whole_repo: str) 
             else:
                 flags.append(f"QUOTED_CODE_NOT_IN_TARGET: `{span}`")
 
-    # 2. Invented APIs: Class.method / module.function references, and bare private
-    #    helpers (_like_this), that don't exist anywhere in the repo — unless the
-    #    instruction itself says to create/define them.
+    # 2. Invented APIs: Class.method, module.function or private helpers that exist nowhere in the repo, unless the instruction creates them.
     seen = set()
     for m in _DOTTED_RE.finditer(instruction):
         cls, meth = m.group(1), m.group(2)
@@ -359,9 +327,7 @@ def source_ground_task(task: dict, file_texts: dict[str, str], whole_repo: str) 
             if fmt in instr_lower and not any(m.lower() in target_text.lower() for m in markers):
                 flags.append(f"FORMAT_MISMATCH: instruction mentions '{fmt}' but target file(s) show no {fmt} handling")
 
-    # 4. Config section-crash claims where the actual call already has fallback=.
-    #    ConfigParser.getX(section, key, fallback=X) never raises NoSectionError/
-    #    NoOptionError regardless of whether the section exists — it returns X.
+    # 4. A section-crash claim is false when the call already passes fallback=.
     if have_targets_on_disk and _SECTION_ERROR_CUES.search(instruction):
         for m in _CONFIG_GET_RE.finditer(target_text):
             section, key = m.group(1), m.group(2)
@@ -384,9 +350,7 @@ def source_ground_task(task: dict, file_texts: dict[str, str], whole_repo: str) 
                     f"static analyzer elsewhere; 'fixing' it may break that analyzer's tests")
                 break
 
-    # 6. "May crash downstream" claims — lower confidence: only checks that a named
-    #    downstream call site isn't obviously unguarded. Does not trace full call
-    #    graphs, so absence of a flag here is weak evidence, not proof of safety.
+    # 6. "May crash downstream" claims: a weak check that the call site is not obviously guarded.
     if _CRASH_CLAIM_CUES.search(instruction):
         named_calls = set(m.group(0) for m in _DOTTED_RE.finditer(instruction))
         for call in named_calls:
@@ -404,21 +368,7 @@ def source_ground_task(task: dict, file_texts: dict[str, str], whole_repo: str) 
     return flags
 
 
-# ─── Grading mode: agent's own IMPROVEMENTS-FALSE.md vs ground truth ──────────
-#
-# This is the actual workflow: IMPROVEMENTS.md in a folder is a FIXED candidate
-# list. Different validate-plan runs (different agents/models) each write their
-# own verdict into that same folder's IMPROVEMENTS-FALSE.md — which of the
-# candidates THEY think are false positives. This mode grades that verdict
-# against ground truth, rather than just scanning the candidate list in
-# isolation.
-#
-# Ground truth, in priority order:
-#   1. --ground-truth PATH given explicitly (applies to every folder)
-#   2. folder/GROUND-TRUTH.md if present (per-folder curated answer key)
-#   3. source-grounding scan used as an automatic proxy (lower confidence —
-#      it only catches the failure patterns it knows about; a clean scan is
-#      NOT proof a task is legitimate, just that no known red flag fired)
+# Grading mode: the agent's IMPROVEMENTS-FALSE.md against ground truth (explicit file, folder GROUND-TRUTH.md, or a source scan proxy).
 
 def _match_ground_truth_id(gt_task: dict, candidates: list[dict]) -> str | None:
     """A ground-truth entry should describe one of *candidates*. Match by ID
@@ -459,16 +409,7 @@ def grade_folder(label: str, folder: Path, overlap_ratio: float,
         print(c("  No candidate tasks found in IMPROVEMENTS.md or IMPROVEMENTS-FALSE.md.", YELLOW))
         return {}
 
-    # AUTO-BUG (fixed): a real --validate-plan run *removes* rejected tasks
-    # from IMPROVEMENTS.md and moves them into IMPROVEMENTS-FALSE.md — that
-    # file pair is the split of ONE original candidate pool, not "the fixed
-    # list" (IMPROVEMENTS.md alone) plus "some unrelated ground truth file"
-    # (IMPROVEMENTS-FALSE.md). Grading against IMPROVEMENTS.md alone was
-    # silently checking only the surviving ~25% of candidates and treating
-    # the agent's own removals as invisible — reconstruct the full original
-    # pool from both files, and take agent_false_ids directly from which
-    # ids ended up in IMPROVEMENTS-FALSE.md (that IS the agent's verdict,
-    # no separate "verdict file" concept needed).
+    # Rebuild the full candidate pool from IMPROVEMENTS.md and IMPROVEMENTS-FALSE.md; the agent's verdict is which ids ended up in the FALSE file.
     by_id: dict[str, dict] = {}
     for t in kept + removed:
         by_id.setdefault(t["id"], t)

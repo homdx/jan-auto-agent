@@ -200,8 +200,7 @@ class TestBudgetDoesNotTickWhileStopped:
             "next resume fold a whole night into consumed_s"
         )
 
-        # The overnight stop: wall clock only. monotonic has no fixed epoch and
-        # is not part of the ledger, so the resumed session must not see it.
+        # An overnight stop counts wall clock only; monotonic is not in the ledger.
         clock.advance_wall(NIGHT_SECONDS)
 
         # Session 2: a fresh process, same task, same ledger on disk.
@@ -226,8 +225,7 @@ class TestBudgetDoesNotTickWhileStopped:
 
         state = _store(tmp_path)
         before = _write_closed_ledger(state, clock, 200.0)
-        # SIGKILL / power loss: the marker was never cleared, and the session
-        # has been "dead" for 8 hours.
+        # SIGKILL or power loss: the marker was never cleared, and the session is dead for 8 hours.
         clock.advance(NIGHT_SECONDS)
         state.write_task_file(TASK_ID, BUDGET_FILE, render_budget_file(
             200.0, session_started_at=before,
@@ -289,8 +287,7 @@ class TestBudgetDoesNotTickWhileStopped:
         assert inner1.calls == 4
         assert _read_ledger(state)["consumed_s"] == pytest.approx(1600.0, abs=1.0)
 
-        # A stop between the sessions — harmless now, and must stay harmless if
-        # that stop is a night: nothing may be charged for it.
+        # A stop between sessions must charge nothing, even if it spans a night.
         clock.advance(NIGHT_SECONDS)
 
         inner2 = FakeInner(clock, sleep_s=400.0, passed=False)

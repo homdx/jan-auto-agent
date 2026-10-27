@@ -69,15 +69,7 @@ from typing import Optional
 # Matches "chapter 1", "chapter_02", "Chapter-3", etc. in task titles / IDs.
 _CHAPTER_RE = re.compile(r"chapter[\s_\-]?(\d+)", re.IGNORECASE)
 
-# Legacy (pre-AUTO-CR-27) creative gate sources. Before inner_loop.py grew
-# _trace_stage() / tools/auto/gate_registry.py, these validators surfaced
-# their verdict as a bare kind="result" event under their own module name
-# instead of the structured kind="decision" stage event every Gate-3 gate
-# emits today. Kept only so traces recorded before that change still parse
-# (see the kind == "result" branch below) — current and future gates
-# (canon, fact, continuity, theme, existence, prosody, ...) never need an
-# entry here; they're already handled generically via the live gate
-# registry import (GATES-SYNC, near _STAGE_ORDER below).
+# Legacy gate sources (before AUTO-CR-27): kept only so old traces still parse; current gates come from the live registry (GATES-SYNC).
 _CREATIVE_GATE_LABELS = {
     "validator_agent":      "Gate-2 (LLM)",
     "fact_validator":       "Gate-3 fact",
@@ -95,14 +87,7 @@ def _chapter_num(task: dict) -> int:
     return 9999
 
 
-# ── Docs-mode helpers (AUTO-CR-35) ────────────────────────────────────────────
-# Keeps analyze_logs.py's mode support in sync with agents.ini [auto] task_mode
-# (code | docs | creative — tools/auto/utils.py normalize_task_mode). Unlike
-# creative mode, docs tasks don't emit a distinguishing structural marker like
-# a chapter number: the architect/gate1/validator prompts differ (see
-# docs/archive/Readme.MD §4 "Task Modes"), but the trace shape is identical to plain
-# code tasks (coder → Gate-2, no Gate-3 prose gates). So detection here is a
-# best-effort heuristic based on which files a task actually touched.
+# Mode support in sync with agents.ini task_mode; docs tasks have no structural marker, so detection is a heuristic on touched files.
 _DOC_EXTENSIONS = (".md", ".mdx", ".rst", ".txt", ".adoc")
 
 
@@ -193,14 +178,7 @@ def magenta(s: str) -> str: return f"{c('magenta')}{s}{c('reset')}"
 
 def find_trace_files(path: str) -> list[Path]:
     """Return trace .jsonl files from a path (file or directory)."""
-    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): f.stat()
-    # inside sorted()'s key= was unguarded — a file deleted between the
-    # glob() and this stat() call (e.g. a still-actively-written trace
-    # directory, or a concurrent log-rotation) raised FileNotFoundError
-    # mid-sort and crashed the whole tool. Fall back to 0 for a file that
-    # vanished out from under us — sorting it first/oldest is harmless,
-    # analyze_logs.py's own per-file load already handles a since-deleted
-    # file gracefully.
+    # A file deleted during the sort sorts as mtime 0 instead of crashing (AUTO-FIX).
     def _safe_mtime(f: Path) -> float:
         try:
             return f.stat().st_mtime
@@ -224,11 +202,7 @@ def find_trace_files(path: str) -> list[Path]:
 
 def load_events(path: Path) -> list[dict]:
     events = []
-    # BUGFIX: same root cause as tools/auto/view_trace.py::load_events — a
-    # trace file truncated mid-write can end mid multi-byte UTF-8 character.
-    # `errors="replace"` avoids an uncaught UnicodeDecodeError that would
-    # otherwise kill analyze_logs.py at the CLI entry point instead of
-    # showing the partial run it was asked to analyze.
+    # A truncated UTF-8 tail is replaced, not fatal (bug fix shared with view_trace.py).
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
@@ -288,8 +262,7 @@ def _parse_validator_verdict(content) -> Optional[bool]:
     if content is None:
         return None
 
-    # Tracer._truncate converts dicts to JSON strings before writing to JSONL.
-    # json.loads() on the event record gives us the string back, so we re-parse it.
+    # The tracer writes dict fields as JSON strings; the record is parsed back here.
     data: dict | None = None
     if isinstance(content, dict):
         data = content
@@ -473,37 +446,15 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "events":         [],
                 "llm_calls":      0,
                 "context_requests": [],
-                # AUTO-P: architect context probes. `requests` counts
-                # ARCH_PROBE replies, `results` counts the ones the executor
-                # actually resolved. The gap between them IS the decision-gate
-                # signal: probes the collect model could not answer.
+                # AUTO-P: architect probe counts; the gap between requests and results is what the decision gate needs.
                 "probe_requests": [],
                 "probe_results":  [],
-                # AUTO-P4a: `declined` records WHY a request went unanswered
-                # (round_cap / digest_budget / unresolved / no_executor /
-                # post_forced) instead of leaving requests-minus-results to be
-                # misread as "collect did not know these symbols". `config` is
-                # emitted once per run when probing is enabled, which is the
-                # only way to tell "enabled and never used" — the number the
-                # Phase 0 decision gate actually turns on — from "not
-                # installed", which otherwise render identically.
+                # AUTO-P4a: why a request went unanswered, and whether probing was enabled at all (distinct from "not installed").
                 "probe_declined": [],
                 "probe_config":   None,
-                # AUTO-F1-followup / AUTO-P13: escalation events — the ladder
-                # widening a batch's digest cap mid-round (AUTO-P8), and
-                # whether the seeded/learned cap (AUTO-P9) was already in
-                # play when it fired. Without this the ladder is invisible
-                # to a human reading the report; it only ever showed up in
-                # the raw JSONL.
+                # AUTO-F1-followup / AUTO-P13: escalation events, so the digest-cap ladder shows up in the report.
                 "probe_escalated": [],
-                # M4: runtime counters. `collect_block` / `collect_shrink` /
-                # `collect_miss` are emitted per request by
-                # tools/auto/collect_bridge.py; `collect_summary` is one
-                # event per run, at the end of the task loop; `gate1_split`
-                # is one event per plan phase, from run_trace.py. The three
-                # per-event lists are what the summary is derived from when
-                # it is absent — a run that never reached the end of the
-                # task loop, or a trace from before the events existed.
+                # M4: runtime collect counters; the summary falls back to the per-event lists when it is absent.
                 "collect_blocks":  [],
                 "collect_shrinks": [],
                 "collect_misses":  [],
@@ -516,19 +467,9 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "_current_task":  None,      # task_id of the task currently in the loop
                 "_pending_old_prompt": None, # most recent prompt_optimizer llm_request "CURRENT PROMPT" text
                 "_pending_new_prompt": None, # most recent prompt_optimizer llm_response candidate text
-                # AUTO-F1-followup: last probe_result's out-of-batch state per
-                # cluster, so a "repeat" decline can be classified as "re-asked
-                # something it already had" vs. a genuine re-ask of nothing.
-                # See its use at kind == "probe_declined" below.
+                # AUTO-F1-followup: per cluster, whether the last out-of-batch result was seen, to classify "repeat" declines.
                 "_probe_last_out_of_batch": {},
-                # AUTO-F4: informed_facts/blind_facts are CUMULATIVE per
-                # batch (see ArchProbe.informed_facts) — every probe_result
-                # event for a cluster restates the running total for that
-                # whole batch, not just that round. Keeping only the latest
-                # value per cluster (like _probe_last_out_of_batch above) and
-                # summing those at report time avoids double-counting a
-                # batch's early rounds every time a later round re-reports
-                # the same growing total.
+                # AUTO-F4: informed/blind facts are cumulative per batch; keep the latest value per cluster and sum at report time.
                 "_probe_last_facts_seq": {},
             }
         return runs[rid]
@@ -548,11 +489,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
 
         # ── run lifecycle ──────────────────────────────────────────────────
         if kind == "run_start":
-            # FIX: outer_loop.py also emits kind="run_start" once per task with
-            # params like {"task": task_id, "start_round": ...} — no "goal" key.
-            # Only treat this as a real run-level start when the params carry a
-            # "goal" or "prompt" key, so per-task run_start events don't clobber
-            # the run's goal or timestamp.
+            # FIX: outer_loop's per-task run_start has no goal; only a run-level start (with goal or prompt) sets the run's goal.
             has_goal = bool(params.get("goal") or params.get("prompt"))
             if has_goal or run["start_ts"] is None:
                 if run["start_ts"] is None:
@@ -572,8 +509,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
 
         # ── task lifecycle ─────────────────────────────────────────────────
         elif kind == "call" and tgt == "outer_loop":
-            # run_trace.log_task_start() → source="controller", target="outer_loop",
-            # kind="call", params={"task_id": ..., "title": ...}
+            # run_trace.log_task_start(): source controller, target outer_loop, params task_id and title.
             task_id = params.get("task_id", "?")
             title   = params.get("title", "")
             task = run["tasks"].setdefault(task_id, {
@@ -595,9 +531,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             run["_current_task"] = task_id
 
         elif kind == "result" and src == "outer_loop":
-            # run_trace.log_task_done() → params={"task_id": ..., "commit": ...}, content="DONE"
-            # outer_loop.py result    → params={"task": ..., "passed": True/False, ...}
-            # Handle both param key names.
+            # run_trace.log_task_done() and outer_loop results use different keys (task_id vs task); both are read.
             task_id = params.get("task_id") or params.get("task", "?")
             if task_id == "?":
                 # Skip malformed / internal outer_loop events with no identifiable task.
@@ -655,26 +589,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "commit":     None,
             })
 
-        # ── AUTO-CR-27: inner-loop per-stage gate decisions ────────────────
-        #
-        # _trace_stage() in inner_loop.py emits:
-        #   kind="decision", target="inner_loop", source=<stage>,
-        #   params={"task": id, "attempt": N, "stage": <stage>, ...},
-        #   content=REJECTED|APPROVED|EXHAUSTED|ACCEPTED_AT_CAP|ERROR
-        #
-        # Stages (all modes):    coder, executor, gate2, overall
-        # Stages (Gate-3 gates): whatever tools/auto/gate_registry.GATES
-        #   declares for the run's task_mode — canon, fact, continuity,
-        #   theme, prosody for creative; existence for docs; a future
-        #   pipeline's own gate for whatever mode it registers under.
-        #   Handled generically below via the "stage" field, so a new
-        #   registry gate needs no change here — only its display label
-        #   in _STAGE_LABELS (GATES-SYNC, further down) needs the gate
-        #   registry to be importable to pick it up automatically.
-        #
-        # "overall APPROVED"  → the attempt fully passed every gate
-        # "overall EXHAUSTED" → all attempts used up, task fails
-        # All other stages    → a single gate rejected this attempt
+        # AUTO-CR-27: inner-loop gate decisions (kind=decision, target inner_loop); stages are read generically by the stage field.
         elif kind == "decision" and tgt == "inner_loop":
             task_id = params.get("task") or params.get("task_id", "?")
             stage   = params.get("stage", src or "?")
@@ -717,24 +632,12 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                     elif verdict == "EXHAUSTED":
                         target_task["rejected"] = target_task.get("rejected", 0) + 1
 
-        # ── validator decisions ────────────────────────────────────────────
-        #
-        # FIX: validator_agent emits kind="result" (NOT kind="decision").
-        # The content is a JSON-encoded dict, not a plain "APPROVED"/"REJECTED"
-        # string, so it must be parsed via _parse_validator_verdict().
-        #
-        # NOTE: creative-mode gates (fact, prosody, continuity) now ALSO emit
-        # kind="decision" target="inner_loop" stage=<gate> via _trace_stage()
-        # (AUTO-CR-27).  The block above handles those.  This block remains for
-        # the Gate-2 LLM validator (validator_agent) which still emits
-        # kind="result" with a JSON payload, and for backward-compat with older
-        # traces that pre-date AUTO-CR-27.
+        # Validator results come as kind=result with a JSON payload (validator_agent); older traces are covered too.
         elif kind == "result" and (
             "validator" in src
             or src in ("prosody", "story_bible")  # creative-mode gate sources
         ):
-            # Associate with the tracked current task first; fall back to
-            # heuristic scan of in-progress tasks if the tracker is empty.
+            # Attach to the tracked current task; fall back to the in-progress scan if none is tracked.
             current_id = run.get("_current_task")
             if current_id and current_id in run["tasks"]:
                 target_task = run["tasks"][current_id]
@@ -758,23 +661,12 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                     g["rejected"] += 1
                 # verdict is None → count the iteration but don't skew either bucket
 
-        # NOTE: creative/docs-mode detection for --mode auto is handled by
-        # _detect_task_mode() (chapter-number / doc-file-extension
-        # heuristics), not by which gate sources appear in the trace — a
-        # legacy "tag as creative if a creative gate source shows up" check
-        # used to live here, but every Gate-3 gate (old and new) surfaces
-        # through the generic kind="decision" stage handling above rather
-        # than a gate-specific kind="result" source, so that check could
-        # never fire for a trace recorded after AUTO-CR-27 and was dead
-        # weight. Removed rather than "synced", since there's nothing left
-        # to detect here that _detect_task_mode() doesn't already cover.
+        # Creative and docs mode come from _detect_task_mode(); the old gate-source check was removed as dead code.
 
         # ── llm calls ─────────────────────────────────────────────────────
         if kind == "llm_request":
             run["llm_calls"] += 1
-            # prompt_optimizer's meta-prompt embeds the CURRENT PROMPT text —
-            # stash it so a later prompt_denied/prompt_promoted event (which
-            # only carries score/reason) can be paired with the old prompt.
+            # Keep the current prompt from the optimizer's meta-prompt, to pair it with the later denied or promoted event.
             if src == "prompt_optimizer":
                 run["_pending_old_prompt"] = _extract_current_prompt_from_meta(str(content or ""))
 
@@ -783,18 +675,11 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             _syms = _extract_context_signals(src, content)
             if _syms:
                 run["context_requests"].append({"ts": ts, "src": src, "symbols": _syms})
-            # The candidate prompt the optimizer's LLM call returned — this is
-            # the "new prompt" half of a rewrite attempt.
+            # The candidate prompt returned by the optimizer: the new half of a rewrite attempt.
             if src == "llm" and tgt == "prompt_optimizer":
                 run["_pending_new_prompt"] = str(content or "")
 
-        # ── M4 runtime counters ──────────────────────────────────────────
-        # collect_block / collect_shrink / collect_miss / collect_summary
-        # come from tools/auto/collect_bridge.py; gate1_split from
-        # tools/auto/run_trace.py. The per-event lists are kept because
-        # collect_summary is best effort — it is emitted once at the end of
-        # the task loop, and a run that crashed before that has the events
-        # but not the summary.
+        # M4 runtime counters: per-event lists are kept because collect_summary is only written at the end of the task loop.
         elif kind == "collect_block":
             run["collect_blocks"].append({
                 "chars":     _int_or(params.get("chars"), 0),
@@ -821,11 +706,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
         elif kind == "gate1_split":
             run["gate1_split"] = dict(params)
 
-        # ── AUTO-P architect context probes ────────────────────────────────
-        # Emitted by tools/auto/architect.py: kind="probe_request" when the
-        # Architect asks for facts, kind="probe_result" when ArchProbe resolves
-        # them. Counting both is what lets a run answer "is this feature used
-        # at all?" without re-reading the raw trace.
+        # AUTO-P: probe requests and results are counted, to show whether probing is used at all.
         elif kind == "probe_request":
             run["probe_requests"].append({
                 "ts":      ts,
@@ -837,17 +718,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
         elif kind == "probe_declined":
             _cluster = params.get("cluster", "?")
             _reason = str(params.get("reason", "unknown"))
-            # AUTO-F4a: a decline can be the LAST event recorded for a
-            # cluster's batch — an all-miss round emits no probe_result at
-            # all (AUTO-P4b), which is exactly why AUTO-P6 had to teach the
-            # by_op tally below to read _declined too. Without this, any
-            # `facts` asks inside such a round reach the general by_op
-            # total (via _decline_by_op) but never reach the "facts
-            # sequencing" split, undercounting it — found reviewing a live
-            # run where a declined "unresolved" round's 2 blind misses were
-            # missing from the reported blind total. Same cumulative-per-
-            # batch caveat and (-1, -1) sentinel as the probe_result
-            # handling below — see _probe_last_facts_seq's own comment.
+            # AUTO-F4a: a decline can be the last event of a batch; it feeds the facts-sequencing split as well.
             _informed = _frac_or(params.get("informed_facts"), (-1, -1))
             _blind = _frac_or(params.get("blind_facts"), (-1, -1))
             if _informed != (-1, -1) or _blind != (-1, -1):
@@ -860,15 +731,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "round":   int(params.get("round", 0) or 0),
                 # AUTO-P6: empty on pre-P6 traces.
                 "by_op":   str(params.get("by_op", "") or ""),
-                # AUTO-F1-followup: for a "repeat" decline, was the request
-                # being repeated one that already resolved out-of-batch last
-                # round in this same cluster? A measured run
-                # (trace_8c83140453d5) found this was true of EVERY "repeat"
-                # decline it produced — the model re-asking for something it
-                # already had and could not cite, rather than a genuine
-                # repeated miss. False (not just absent) on any other
-                # decline reason, and on a "repeat" this cluster has no
-                # prior out-of-batch result recorded for.
+                # AUTO-F1-followup: a "repeat" decline is flagged when that request already resolved out of batch last round.
                 "out_of_batch_repeat": (
                     _reason == "repeat"
                     and run["_probe_last_out_of_batch"].get(_cluster, False)
@@ -888,21 +751,11 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
 
         elif kind == "probe_result":
             _cluster = params.get("cluster", "?")
-            # AUTO-F1-followup: remembered per cluster so a LATER "repeat"
-            # decline in the same cluster can tell whether it is re-asking
-            # something that already resolved out-of-batch. Overwritten on
-            # every result, not just non-empty ones — an in-batch or
-            # ordinary result correctly clears a stale out-of-batch flag
-            # from an earlier round of the same batch.
+            # AUTO-F1-followup: remember per cluster whether the last result was out of batch; overwritten on every result.
             run["_probe_last_out_of_batch"][_cluster] = bool(
                 content and "NOT IN YOUR BATCH" in str(content)
             )
-            # AUTO-F4: overwritten every event, same as the out-of-batch flag
-            # above — the latest event for a cluster carries that batch's
-            # full-so-far total, which is exactly what should survive to
-            # report time. Skipped when the trace predates AUTO-F4
-            # (sentinel (-1, -1)) so an old trace's absence of the field
-            # cannot overwrite a real value with "not recorded".
+            # AUTO-F4: keep the latest cumulative total per cluster; the (-1, -1) sentinel marks traces without the field.
             _informed = _frac_or(params.get("informed_facts"), (-1, -1))
             _blind = _frac_or(params.get("blind_facts"), (-1, -1))
             if _informed != (-1, -1) or _blind != (-1, -1):
@@ -912,35 +765,20 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "cluster":    _cluster,
                 "round":      int(params.get("round", 0) or 0),
                 "ops":        int(params.get("ops", 0) or 0),
-                # AUTO-P4b: absent on pre-P4b traces, hence the -1 sentinel —
-                # "not recorded" must not be silently reported as "zero found".
-                # NOT written as `int(params.get("hits", -1) or -1)`: an
-                # integer 0 is falsy, so that idiom turns the single most
-                # important value here — zero symbols found — back into
-                # "not recorded", which is the exact class of comfortable
-                # lie this ticket exists to remove.
+                # AUTO-P4b: -1 means not recorded (pre-P4b trace); zero hits stay zero.
                 "hits":       _int_or(params.get("hits"), -1),
                 "misses":     _int_or(params.get("misses"), -1),
                 # AUTO-P5: "facts=3/1 module=1/0". Empty on pre-P5 traces.
                 "by_op":      str(params.get("by_op", "") or ""),
                 "chars_used": int(params.get("chars_used", 0) or 0),
-                # AUTO-F1: requests answered from the run-level miss memo —
-                # zero bridge lookups, but still tallied as misses above
-                # (never as hits). Absent on pre-AUTO-F1 traces, hence -1.
+                # AUTO-F1: requests answered from the run-level miss memo: counted as misses, never as hits.
                 "memo_hits":  _int_or(params.get("memo_hits"), -1),
-                # AUTO-F4: was a `facts` ask informed by an earlier `module`
-                # hit this batch, or blind? Absent on pre-AUTO-F4 traces,
-                # hence the (-1, -1) sentinel — distinct from "(0, 0) facts
-                # asks this round", which is the common and honest case for
-                # a round that only asked `module`.
+                # AUTO-F4: whether a facts ask was informed by an earlier module hit this batch; (-1, -1) means not recorded.
                 "informed_facts": _frac_or(params.get("informed_facts"), (-1, -1)),
                 "blind_facts":    _frac_or(params.get("blind_facts"), (-1, -1)),
             })
 
-        # AUTO-F1-followup / AUTO-P13: the ladder widening a batch's digest
-        # cap mid-round. `seeded` distinguishes a learned-cap batch that
-        # STILL needed more room (a genuine outlier) from an unlearned batch
-        # climbing from the configured floor (the common, expected case).
+        # AUTO-F1-followup / AUTO-P13: the digest cap widening mid-round; "seeded" separates a learned cap from the floor.
         elif kind == "probe_escalated":
             run["probe_escalated"].append({
                 "ts":      ts,
@@ -989,7 +827,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                     "ts":            ts,
                     "task":          task_id_fp,
                     "file_count":    params.get("file_count", 0),
-                    "files":         params.get("files", []),
+                    "files":         _param_list(params.get("files", [])),
                     "files_copied":  None,   # filled in on "done"
                     "files_missing": None,
                     "status":        "started",
@@ -1005,28 +843,15 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                     if rec["task"] == task_id_fp and rec["status"] == "started":
                         rec["files_copied"]  = params.get("files_copied", 0)
                         rec["files_missing"] = params.get("files_missing", 0)
-                        rec["copied"]        = params.get("copied", [])
-                        rec["missing"]       = params.get("missing", [])
+                        rec["copied"]        = _param_list(params.get("copied", []))
+                        rec["missing"]       = _param_list(params.get("missing", []))
                         rec["status"]        = "done"
                         break
 
     return runs
 
 
-# ── Stage-breakdown renderer (AUTO-CR-27) ─────────────────────────────────────
-#
-# GATES-SYNC: the Gate-3 stage names below used to be hand-copied from
-# tools/auto/gate_registry.py and silently drifted out of sync — "theme"
-# and "existence" were added to the registry (GATES-1 / GATES-3) but never
-# made it into this file, so those gates rendered with a raw, unlabeled
-# stage name and sorted after "overall" instead of alongside the other
-# gates. Importing GATES directly means any gate added, renamed, or
-# reordered in the registry from here on — including one belonging to a
-# future custom pipeline — is picked up automatically, with no further
-# edit to this file. The import is best-effort: this script is also used
-# standalone (e.g. copied out on its own to analyze a trace file without
-# the rest of the repo present), so a failed import falls back to a fixed
-# snapshot of today's six gates rather than crashing.
+# GATES-SYNC: stage names come from tools/auto/gate_registry.GATES, so a new gate is labelled and ordered automatically.
 try:
     from tools.auto.gate_registry import GATES as _REGISTRY_GATES
 except Exception:  # pragma: no cover — standalone-script fallback
@@ -1046,10 +871,7 @@ _STAGE_LABELS = {
     "executor": "Executor",
     "gate2":    "Gate-2 (LLM)",
     "overall":  "Overall",
-    # Registry gate names are single lowercase words today (canon, fact, …)
-    # so title-casing is a correct, maintenance-free label for any gate a
-    # future pipeline adds too; override here only if a gate ever needs a
-    # display name that isn't just its name capitalized.
+    # Gate names are single lowercase words, so title-casing labels any gate a future pipeline adds.
     **{name: name.replace("_", " ").title() for name in _GATE_STAGE_NAMES},
 }
 
@@ -1232,10 +1054,7 @@ def render_runtime_counters(run: dict) -> None:
         )
 
     if probes or run.get("probe_config"):
-        # Only non-zero fields. `declined 0` on a pre-AUTO-P4a trace would read
-        # as "declines are recorded and there were none" when the truth is
-        # that declines were not recorded at all — and the detailed
-        # "Architect probes" block below is where the zeros are stated.
+        # Non-zero fields only: "declined 0" on a pre-AUTO-P4a trace would look like "nothing declined", not "not recorded".
         _res = run.get("probe_results") or []
         _hits = sum(r["hits"] for r in _res if r.get("hits", -1) >= 0)
         _miss = sum(r["misses"] for r in _res if r.get("misses", -1) >= 0)
@@ -1260,9 +1079,7 @@ def render_runtime_counters(run: dict) -> None:
             f"re-ask {_int_or(split.get('presence_reask'), 0)} · "
             f"duplicate {_int_or(split.get('duplicate'), 0)} · "
             f"non-py {_int_or(split.get('non_py'), 0)}"
-            # RUN-5 / RUN-9: candidates that ended without a verdict, and why
-            # the empty replies were empty. Only when the split carries the
-            # keys, so a pre-RUN-9 trace renders exactly as before.
+            # RUN-5 / RUN-9: candidates with no verdict, and why the empty replies were empty (only for traces that carry the keys).
             + (
                 f" · unknown {_int_or(split.get('presence_unknown'), 0)}"
                 if "presence_unknown" in split else ""
@@ -1327,9 +1144,7 @@ def render_run_summary(run: dict) -> None:
         _probe_res = run.get("probe_results", [])
         _declined = run.get("probe_declined", [])
         if _probe_cfg and not _probe_cfg["usable"]:
-            # Enabled, but nothing could ever have answered — worth saying out
-            # loud, because a run in this state produces zero probes for a
-            # reason that has nothing to do with whether the model wants them.
+            # Enabled but nothing could answer: say so, since zero probes then have nothing to do with the model.
             _why = {
                 "no_artifact":  "no fresh collect artifact ([collect] use_in_auto)",
                 "stale_artifact": "collect artifact is stale (run --collect --refresh)",
@@ -1348,11 +1163,7 @@ def render_run_summary(run: dict) -> None:
             _asked = sum(r["ops"] for r in _probe_reqs)
             _clusters = len({r["cluster"] for r in _probe_reqs})
             _rounds = max((r["round"] for r in _probe_res), default=0)
-            # AUTO-P4b: "resolved" now counts SYMBOLS the collect model
-            # actually returned, not probe_result events. Counting events
-            # reported two real runs — 60 lookups, 60 "(not found)" — as
-            # "22 resolved" and "8 resolved", which is how a completely
-            # non-functional lookup path survived three measured runs.
+            # AUTO-P4b: "resolved" counts symbols the collect model returned, not events; counting events hid a non-working lookup path.
             _hits = sum(r["hits"] for r in _probe_res if r["hits"] >= 0)
             _has_hits = any(r["hits"] >= 0 for r in _probe_res)
             if _has_hits:
@@ -1360,22 +1171,16 @@ def render_run_summary(run: dict) -> None:
                 if _hits == 0:
                     _found = yellow(f"{_found} — collect resolved nothing")
             else:
-                # Pre-AUTO-P4b trace: the counters do not exist. Say so rather
-                # than inventing a number.
+                # Pre-AUTO-P4b trace: no hit counts exist, so none are shown.
                 _found = f"{len(_probe_res)} round(s) answered (hit counts not recorded)"
             print(
                 f"  {bold('Architect probes')}: {cyan(str(len(_probe_reqs)))} "
                 f"request(s) over {_clusters} cluster(s), {_asked} op(s), "
                 f"{_found} (max round {_rounds})"
             )
-            # AUTO-P5: per-op breakdown. With one op it is redundant; with
-            # two or more it is the only way to see whether a newly added op
-            # is earning the round-trip it costs, which is the number the
-            # next scope decision turns on.
+            # AUTO-P5: per-op breakdown; needed to see whether an added op earns its round trip.
             _by_op: dict = {}
-            # AUTO-P6: declines carry tallies too. An all-miss round emits no
-            # probe_result (its digest is empty), so summing results alone
-            # reported a run with 17 real misses as having none.
+            # AUTO-P6: declines carry tallies too; an all-miss round has no probe_result, so declines must be counted.
             for r in list(_probe_res) + list(_declined):
                 for part in r.get("by_op", "").split():
                     if "=" not in part or "/" not in part:
@@ -1392,13 +1197,7 @@ def render_run_summary(run: dict) -> None:
                 )
                 print(f"  {' ' * len('Architect probes')}  by op: {_parts}")
 
-            # AUTO-F1: memo hits — `facts` requests served from the
-            # run-level miss memo instead of a fresh bridge lookup. Zero
-            # bridge cost, but still tallied as misses above (never
-            # inflates the hit rate above) — this line is where the
-            # SAVING becomes visible, since the hit-rate line by itself
-            # cannot show it (AC-F1-5's own point: a memo hit must not
-            # read as a success).
+            # AUTO-F1: memo hits are shown separately: zero bridge cost, still counted as misses, never as hits.
             _memo_hits = sum(
                 r["memo_hits"] for r in _probe_res if r["memo_hits"] >= 0
             )
@@ -1415,21 +1214,14 @@ def render_run_summary(run: dict) -> None:
                     f"call(s)) — {_memo_pct:.0f}% of {_total_misses} miss(es)"
                 )
 
-            # AUTO-F4: is the model checking `module` before guessing at
-            # `facts`, the way PROBE_INSTRUCTIONS now says to? Summed from
-            # the LAST recorded (informed, blind) pair per cluster — see the
-            # comment at "_probe_last_facts_seq" — so a batch's growing
-            # per-round total is counted once, not once per round.
+            # AUTO-F4: does the model check module before guessing facts? Summed from the last (informed, blind) pair per cluster.
             _seq = run.get("_probe_last_facts_seq", {})
             if _seq:
                 _tot_i_h = sum(v[0][0] for v in _seq.values())
                 _tot_i_a = sum(v[0][1] for v in _seq.values())
                 _tot_b_h = sum(v[1][0] for v in _seq.values())
                 _tot_b_a = sum(v[1][1] for v in _seq.values())
-                # AC-F4-3/4: omit entirely when no `facts` op was ever asked
-                # this run — a run that only used `module`/`read` has
-                # nothing to report here, and a 0/0 rate would misread as
-                # "facts never resolves" rather than "facts was never asked".
+                # AC-F4-3/4: omitted when no facts op was asked, so a missing rate is not read as "facts never resolves".
                 if _tot_i_a or _tot_b_a:
                     _i_pct = (100.0 * _tot_i_h / _tot_i_a) if _tot_i_a else None
                     _b_pct = (100.0 * _tot_b_h / _tot_b_a) if _tot_b_a else None
@@ -1447,10 +1239,7 @@ def render_run_summary(run: dict) -> None:
                         f"blind {yellow(_b_str)}"
                     )
 
-            # AUTO-F1-followup / AUTO-P13: the escalation ladder widening a
-            # batch's digest cap mid-round. Previously invisible here —
-            # only in the raw JSONL — so "did the budget/median tuning do
-            # anything" had no answer short of hand-parsing the trace.
+            # AUTO-F1-followup / AUTO-P13: the digest-cap escalation ladder, shown in the report instead of only the raw JSONL.
             _esc = run.get("probe_escalated", [])
             if _esc:
                 _seeded_esc = sum(1 for e in _esc if e["seeded"])
@@ -1477,14 +1266,7 @@ def render_run_summary(run: dict) -> None:
                 for r, n in sorted(_by_reason.items(), key=lambda kv: -kv[1]):
                     _lbl = _label.get(r, r)
                     if r == "repeat":
-                        # AUTO-F1-followup: a measured run
-                        # (trace_8c83140453d5) found every single "repeat"
-                        # decline was the model re-asking for something it
-                        # ALREADY HAD, out of batch — a different failure
-                        # from re-asking a genuine miss, with a different
-                        # fix (see _out_of_batch_note's wording). Surfacing
-                        # the split here is what makes that fixable without
-                        # re-deriving it by hand from the raw trace.
+                        # AUTO-F1-followup: "repeat" declines split by cause (re-asking an out-of-batch result vs a real miss).
                         _oob = sum(
                             1 for d in _declined
                             if d["reason"] == "repeat"
@@ -1504,8 +1286,7 @@ def render_run_summary(run: dict) -> None:
                 and e.get("params", {}).get("cluster")
             })
             if _batches:
-                # The decision-gate numerator/denominator, computed here so it
-                # does not have to be reconstructed by hand from the trace.
+                # Decision-gate rate, computed here rather than by hand from the trace.
                 _rate = 100.0 * len(_probing) / _batches
                 print(
                     f"  {' ' * len('Architect probes')}  request rate: "
@@ -1840,11 +1621,9 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
             file_count = params.get("file_count", 0)
             files_raw  = params.get("files", [])
             if isinstance(files_raw, str):
-                # Tracer._sanitize() JSON-stringifies list params before writing
-                # to JSONL, so it usually comes back here as a string, not a list.
+                # Tracer JSON-stringifies list params, so files usually arrive as a string here.
                 if "…[+" in files_raw:
-                    # Truncated mid-JSON — can't recover the real list, just
-                    # show the count we do have and skip the preview.
+                    # Truncated mid-JSON: the list cannot be recovered; show the count only.
                     files = []
                 else:
                     try:
@@ -2220,11 +1999,7 @@ def main() -> int:
     if len(runs) > 1 and not args.run_id and not args.rewrites_only:
         render_multi_run_overview(runs)
         print()
-        # BUGFIX: input() with no try/except EOFError crashed with a raw
-        # traceback under any non-interactive invocation (piped stdout,
-        # `analyze_logs.py < /dev/null`, CI, a TTY-less container) — exactly
-        # the environments where a log-analysis tool is most likely to be
-        # run. Treat EOF as the default answer ("Y", i.e. show details).
+        # EOF-safe: input() on a closed stdin (piped, CI, no TTY) defaults to Y instead of a traceback (BUGFIX).
         try:
             ans = input(bold("Show details for each run? [Y/n] ")).strip().lower()
         except EOFError:
@@ -2246,6 +2021,25 @@ def main() -> int:
         render_auto_prompts(args.path)
 
     return 0
+
+
+def _param_list(value) -> list:
+    """A list-valued trace param as a list (AUDIT3-C2).
+
+    The tracer JSON-stringifies list params, so ``files`` arrives as the text
+    '["docs/a.md", …]'. Stored verbatim it was iterated character by
+    character: docs-mode runs read as code mode and the file list printed one
+    character per row. A string cut mid-JSON by the tracer's cap is no list.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
 
 
 if __name__ == "__main__":

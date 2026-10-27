@@ -71,9 +71,7 @@ def _model() -> CollectModel:
     `OTHER_NEIGHBOUR` has none, so `OTHER_TARGET`'s block quotes nobody."""
     modules = (
         ModuleRecord(path=TARGET, public_symbols=(_symbol("pkg.a.foo"),)),
-        # `NEIGHBOUR` carries symbols too, so its own block renders and memoizes
-        # — a block that returned "" would never be cached, and this file tests
-        # the cache.
+        # NEIGHBOUR has symbols, so its block renders and memoizes; the cache is what this file tests.
         ModuleRecord(
             path=NEIGHBOUR,
             public_symbols=(_symbol("pkg.hub.run"),),

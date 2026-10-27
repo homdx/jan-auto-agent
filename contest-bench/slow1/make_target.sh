@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
-# contest-bench/slow1/make_target.sh — build the SLOW-1 target: our own repo
-# cut at BASE, with NO commit after it anywhere (no branches, remotes, tags,
-# reflog) so an agent cannot find the reference fix in `git log --all`.
-# Ancestors stay, so bisecting backwards works. Then the ticket is committed.
-#
-# usage: contest-bench/slow1/make_target.sh [TARGET]   (default ../slow1-target)
+# Builds the SLOW-1 target: the repo cut at BASE, with the ticket committed last.
 set -euo pipefail
 JAN=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BASE=${BASE:-b5257cf}

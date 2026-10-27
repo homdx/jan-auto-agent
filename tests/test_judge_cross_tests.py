@@ -146,8 +146,7 @@ def _repo(root: Path) -> tuple[Path, str]:
     _write(root / "pkg" / "__init__.py", "")
     _write(root / "pkg" / "mod.py", _MOD_BASE)
     _write(root / "tests" / "test_base.py", _TEST_BASE)
-    # An empty root conftest puts the repo root on sys.path, so a copied test
-    # can `import pkg.mod` the way an entry's own test does.
+    # An empty root conftest puts the repo root on sys.path, so copied tests can import pkg.mod.
     _write(root / "conftest.py", "")
     _git(root, "init", "-q")
     _git(root, "config", "user.email", "cross@example.com")
@@ -443,11 +442,7 @@ def test_no_entry_with_tests_is_an_empty_matrix_and_no_error(trees, tmp_path):
     assert (out / "cross.json").is_file() and (out / "cross.md").is_file()
 
 
-# ── 202: a round whose tests are in tests_bugfix/ ─────────────────────────────
-#
-# A bug-fix ticket ships its tests in `tests_bugfix/`, and the matrix looked in
-# `tests/` only: round 198's six entries each committed 1-5 files there, the
-# judge printed "cells: 0 × 7" and "no cell failed", and exit code 0.
+# Regression (ticket 202): a round whose tests live in tests_bugfix/ must be judged, not reported as 0 cells.
 
 
 _TEST_ONE = """\

@@ -14,15 +14,7 @@ logger = logging.getLogger(__name__)
 
 METRICS_PATH = Path("metrics.json")
 
-# FL-1 (round 84): fsync is a disk barrier — a real round trip to the
-# storage layer, not microseconds. Calling it on every single record()
-# turns N back-to-back writers (e.g. AutoMetricsStream's concurrent
-# Gate-2 callers) into N sequential disk round trips with zero overlap,
-# which is enough on a loaded box to exceed a bounded test's --timeout
-# even though nothing is actually deadlocked (see epic-tasks/84). Sync at
-# most once per this many seconds instead — the file on disk is correct
-# (atomically replaced) after every record() call regardless; only the
-# crash-durability window widens from "one record" to this bound.
+# fsync runs at most once per this many seconds, since it is a slow disk round trip (FL-1).
 _FSYNC_INTERVAL_S = 0.5
 
 
@@ -57,33 +49,12 @@ class RunRecord:
 class MetricsCollector:
     def __init__(self, metrics_path: Path = METRICS_PATH):
         self.metrics_path = metrics_path
-        # Perf cache for record(): avoids a full read+parse of the whole
-        # file on every single call. Without this, N sequential record()
-        # calls (e.g. from many worker threads serialised through a caller's
-        # lock, as in AutoMetricsStream) cost O(N^2) instead of O(N), which
-        # is slow enough under CPU contention (parallel test runners, etc.)
-        # to look like a hang/deadlock even though no lock is actually
-        # circularly held.
-        # Invalidated automatically if the file's mtime changes underneath
-        # us (e.g. another process writes it), so correctness for
-        # multi-process access is unaffected — this only skips the re-read
-        # when we already know the in-memory copy matches disk.
+        # Cache of the parsed records, reloaded when the file's mtime changes (FL-1).
         self._cache: Optional[list] = None
         self._cache_mtime: Optional[float] = None
-        # FL-1 follow-up: each cached record's encoded text, index for index
-        # with _cache. json.dump with indent= runs Python 3.12's pure-Python
-        # encoder and one write() per token, so re-encoding the whole list on
-        # every record() was 96% of its time — 18M writes for 1000 records,
-        # 19 s unloaded, past pytest-timeout at 32 workers on 8 cores. Now a
-        # record is encoded once and the file goes out in one write(). None
-        # whenever _cache was (re)loaded from disk; rebuilt from it then.
+        # Each cached record's encoded text, so a write does not re-encode the whole list (FL-1).
         self._cache_items: Optional[list] = None
-        # FL-1: record() is now thread-safe on its own — this lock is a
-        # MetricsCollector-owned implementation detail (not a caller's lock,
-        # like AutoMetricsStream._lock used to be) that serialises the
-        # read-modify-write cycle so concurrent callers produce a
-        # consistent record count. It is held across the disk write, but
-        # never across a blocking fsync — see _FSYNC_INTERVAL_S above.
+        # Serialises the read-modify-write of the file; never held across an fsync (FL-1).
         self._write_lock = threading.Lock()
         self._last_fsync_monotonic: Optional[float] = None
 
@@ -140,11 +111,7 @@ class MetricsCollector:
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
                         f.write(_encode_array(items))
-                        # BUGFIX: same missing-fsync bug as PromptStore._save —
-                        # without flush+fsync here, a crash between the write and
-                        # os.replace can lose metrics history on an unclean
-                        # shutdown, which the operator sees as metrics silently
-                        # "resetting to zero" with no explanation.
+                        # Flush and fsync before the replace, so a crash does not lose the history (BUGFIX).
                         f.flush()
                         now = time.monotonic()
                         fsync_due = (
@@ -206,8 +173,7 @@ class MetricsCollector:
         in this file (_load_all's per-file quarantine).
         """
         records = self._load_all()
-        # AUTO-FIX: for n=0 the slice was `records[-0:]`, and -0 == 0, so
-        # it returned the FULL list instead of an empty one.
+        # n=0 used to slice records[-0:], which is the whole list; now it gives an empty list (AUTO-FIX).
         recent = records[-n:] if n > 0 else []
         _fields = {f.name for f in fields(RunRecord)}
         out: List[RunRecord] = []
@@ -233,8 +199,7 @@ class MetricsCollector:
           worst_intent        - intent with the highest avg iteration count
         """
         records = self._load_all()
-        # AUTO-FIX: same `records[-0:]` issue as load_recent() above — n=0
-        # meant "the entire history" instead of an empty window.
+        # Same records[-0:] issue as load_recent: n=0 means an empty window, not the whole history (AUTO-FIX).
         window = records[-n:] if n > 0 else []
         total = len(window)
 
@@ -269,13 +234,7 @@ class MetricsCollector:
         meaningful = [w.lower() for w in words if w.lower() not in stop_words]
         top_phrases = [phrase for phrase, _ in Counter(meaningful).most_common(3)]
 
-        # Intent with the highest average iteration count
-        # AUTO-METRICS-GUARD-1: direct r["intent"]/r["iterations_used"]
-        # raised KeyError on a partial/old-shape record — record() already
-        # quarantines corrupt *files*, but a stored record missing a key
-        # (e.g. after a schema change) is a different failure shape that
-        # wasn't covered. "<unknown>" groups any such records together
-        # rather than crashing the whole summary.
+        # Records missing a key group under "<unknown>" instead of crashing the summary (AUTO-METRICS-GUARD-1).
         intent_iters: Dict[str, List[int]] = {}
         for r in window:
             intent_iters.setdefault(
@@ -338,18 +297,7 @@ class MetricsCollector:
         if not isinstance(data, list):
             self._quarantine(f"expected a JSON array, got {type(data).__name__}")
             return []
-        # BUGFIX (verified-bugs audit #10): this only validated that the
-        # top-level parsed value is a list — it did not validate that each
-        # ITEM in that list is a dict. A scalar/null entry in metrics.json
-        # (e.g. `[{"a": 1}, null, {"b": 2}]`, from a hand edit or a
-        # partial/corrupted write) sailed through here unchanged, then blew
-        # up downstream: load_recent()'s `r.items()` raised AttributeError
-        # (only TypeError was caught there), and summarize_failures()'s
-        # `r.get(...)` calls raised the same — either way, one bad item
-        # crashed the WHOLE call, contradicting this method's own "one bad
-        # item must not take down the batch" contract (see the class
-        # docstring above). Filtering here protects every caller at once
-        # instead of duplicating an isinstance check in each of them.
+        # Non-dict items are dropped, so one bad item does not fail the whole batch (BUGFIX).
         clean = [r for r in data if isinstance(r, dict)]
         if len(clean) != len(data):
             logger.warning(
@@ -369,11 +317,7 @@ class MetricsCollector:
         """
         stamp = __import__("datetime").datetime.now().strftime("%Y%m%dT%H%M%S")
         dest  = self.metrics_path.with_suffix(f".json.corrupt-{stamp}")
-        # Same-second collision guard — see TicketStore._quarantine for the
-        # reasoning and the reproduction. Narrower here than the ticket case
-        # (there is only one metrics_path, not one per id), but reproducible
-        # the same way: two quarantines of this file within the same
-        # wall-clock second otherwise silently overwrite each other.
+        # A same-second quarantine gets a numbered name, so two files do not overwrite each other (BUGFIX).
         suffix_n = 0
         while dest.exists():
             suffix_n += 1

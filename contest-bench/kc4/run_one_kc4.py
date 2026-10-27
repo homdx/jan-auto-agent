@@ -143,10 +143,7 @@ def run(scenario: str) -> dict:
             r.ck("status_clean", sh(p2, "status", "--porcelain").stdout.strip() == "")
 
         elif scenario == "foreign_folder_refused":
-            # Learn this entrant's own <label>-<agent> naming (padded or not)
-            # from a real round instead of guessing it, then reuse that exact
-            # naming for the NEXT round number so the probe never depends on
-            # one entrant's zero-padding convention.
+            # Learn this entrant's own <label>-<agent> naming (padded or not) from a real round, then reuse it for the next round number, so the probe does not depend on one entrant's zero-padding.
             probe = call_prepare_round(mod, repo, config, 20, "main")
             p20 = Path(probe[0].path)
             sh(repo, "worktree", "remove", "--force", str(p20))

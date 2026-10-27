@@ -42,9 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 _SYMBOLS_PREFIX = "public_symbols: "
 _CONFIG_PREFIX = "config_read ["
 _CUT_NOTE = "cut for budget"
-# A handful of budgets spanning the row's own size to its full size. Enough to
-# catch an invented line anywhere in the row, cheap enough to run over every
-# module in the tree.
+# A few budgets from the row's size to its full size, to catch an invented line.
 _BUDGETS = (200, 400, 600, 900, 1200, 1717, 3000)
 
 
@@ -162,15 +160,11 @@ def test_the_live_config_read_duplicates_collapse_to_one_line_each(live_model):
             f"{module.path}: the block repeats a config_read line"
         )
     assert modules_with_reads > 0
-    # The guard against this test drifting into a state where it proves
-    # nothing: today's tree genuinely carries the duplicates V2.4 was written
-    # for. Counted, not hard-coded — the ticket's 24 is still 24 here, but it
-    # is the duplicates' *presence* the assertion needs, not their number.
+    # Guard: the tree must still carry duplicate config_read lines for V2.4 to be meaningful.
     assert raw_duplicates > 0, "no duplicate config_read lines left in the tree for V2.4 to fix"
 
 
-# ── V2 acceptance: the cut changes which facts are shown, never which facts
-# ────────────────────────────────────────────────────────────────────────
+# V2 acceptance: the cut changes which facts are shown, never which facts exist.
 
 
 def test_cutting_never_invents_a_config_read_line(live_model):

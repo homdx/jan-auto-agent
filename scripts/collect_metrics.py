@@ -75,18 +75,13 @@ import re
 import statistics
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Two imports from `tools/`, both read-only. `build_collect_context_block` is
-# the renderer EPIC A/B/C all argue about; `_load_from_dir` is the loader's
-# artifact-only read path (`loader.load()` would `scan_repo` to decide
-# freshness — a repo scan this script must never do). The renderer is fed the
-# same `CollectModel` the coder gets, so "as rendered today" is the shipping
-# block, not a stand-in's answer to the renderer's questions.
+# Imports: the renderer under test and the artifact-only loader (no repo scan).
 from tools.auto.context_assembler import build_collect_context_block  # noqa: E402
 from tools.collect.loader import (  # noqa: E402
     STATUS_FRESH, CollectModel, _load_from_dir,
@@ -95,29 +90,14 @@ from tools.collect.loader import (  # noqa: E402
 ARTIFACT_FILENAME = "artifact.json"
 MANIFEST_FILENAME = "collect_manifest.json"
 
-# `[collect] max_context_chars_auto` in agents.ini — the per-task budget
-# `CollectBridge._shrink` is measured against. A CLI flag, because this script
-# reads no config file: the budget is a property of the run, not of the
-# artifact, and hard-coding one repo's config into a baseline would make two
-# baselines differ for a reason nobody can see in the diff.
+# Per-task budget in characters; a CLI flag, since the budget is a property of the run.
 DEFAULT_MAX_CONTEXT_CHARS = 1200
 
-# `name(…)` is the whole point of EPIC C4: every symbol's parameter list is
-# unknowable from the artifact while the signature is elided. Matched on the
-# tail, so a real signature like `f(a: int, *args) -> str` does not count.
+# The elided signature suffix; only the tail counts, so real signatures with arguments are not matched.
 _ELIDED_SUFFIX = "(...)"
 
 
-# M2's classification — the one dict EPIC A's number comes from. `redundant`
-# = visible by reading the target file, which the coder already has in full in
-# the same prompt; `new` = the fact lives outside that file (the artifact's
-# graph, the test tree, a registry, another module's summary). One fixed dict on
-# purpose: it has to be stable, not clever, so a before/after pair is
-# comparable. The value is ``(class, line prefix)`` — the class and the prefix
-# that names the row in the rendered block — so a kind is labelled in exactly
-# one place; `ROW_KIND_CLASS` and `ROW_KIND_BY_PREFIX` below are views of it.
-# V4's three rows are pinned before they render (their prefix is the row name
-# the ticket gives them): landing V4 must not move the line between the classes.
+# M2 classification: each row is redundant (visible in the target file) or new (lives outside it); V4 rows are pinned here.
 ROW_KIND: "Dict[str, tuple]" = {
     # ── redundant: the target file says this itself ──────────────────────────
     "module": ("redundant", "module: "),                  # the file path itself
@@ -200,9 +180,7 @@ def read_collect_dir(collect_dir: Path) -> "tuple[dict, dict]":
         if isinstance(manifest, dict) and isinstance(manifest.get("collector_version"), (str, int)):
             meta["collector_version"] = str(manifest["collector_version"])
             meta["collector_version_source"] = f"{MANIFEST_FILENAME}:collector_version"
-    # The ticket asks for "the artifact's `collector_version`"; that key does
-    # not exist in artifact.json. Check it anyway, so an artifact that starts
-    # carrying it is picked up without another edit to this script.
+    # Accept collector_version from the artifact if it ever carries it, without another edit.
     if isinstance(payload.get("collector_version"), (str, int)):
         meta["collector_version"] = str(payload["collector_version"])
         meta["collector_version_source"] = f"{ARTIFACT_FILENAME}:collector_version"
@@ -230,8 +208,7 @@ def _artifact_metrics(payload: dict, meta: dict) -> "Dict[str, Any]":
     modules = [m for m in payload.get("modules") or [] if isinstance(m, dict)]
     symbols = [s for m in modules for s in (m.get("public_symbols") or []) if isinstance(s, dict)]
     elided = sum(1 for s in symbols if (s.get("signature") or "").endswith(_ELIDED_SUFFIX))
-    # A method is a qualname whose module-side part is dotted: `path:Class.method`.
-    # 0 today — the scanner indexes top-level names only, which is C4's scope.
+    # A method is a dotted qualname; the scanner indexes top-level names only, so this is 0 today.
     methods = sum(1 for s in symbols if "." in (s.get("qualname") or "").split(":", 1)[-1])
     return {
         "modules": len(modules),
@@ -296,9 +273,7 @@ def _table_metrics(payload: dict) -> "Dict[str, Any]":
 
     test_map = payload.get("test_map")
     test_map = test_map if isinstance(test_map, dict) else {}
-    # An entry can be recorded with nothing covering it — `zero_coverage` is
-    # exactly those — so "covered" means an entry with at least one test file,
-    # not merely a key. 301 entries, 78 of them actually covering something.
+    # covered = entries with at least one test file, not merely a key.
     covered = len({k for k, v in test_map.items() if isinstance(k, str) and v} & module_paths)
 
     fail_open = [e for e in payload.get("fail_open_registry") or [] if isinstance(e, dict)]
@@ -442,10 +417,7 @@ def _block_metrics(model: CollectModel, max_context_chars: int) -> "Dict[str, An
     for block, module in zip(raw_blocks, model.modules):
         if not block:
             continue
-        # Counted on the module's own read sites, not on the rendered block:
-        # the renderer's V2.4 dedupe pass already throws these lines away, so a
-        # rendered block can never show its own duplicates. 24 across 11
-        # modules — the same fact, read where it is still visible.
+        # Duplicate config lines are counted on the module's read sites, since the renderer's dedupe hides them.
         config_lines = _config_read_lines(module)
         dup = len(config_lines) - len(set(config_lines))
         if dup > 0:
@@ -456,11 +428,7 @@ def _block_metrics(model: CollectModel, max_context_chars: int) -> "Dict[str, An
         unknown_rows += tally["unknown_rows"]
         chars_redundant += tally["redundant"]
         chars_new += tally["new"]
-        # A block, not a row: three new rows in one block are one block. V3's
-        # `callers` row is unconditional (an importless module still says
-        # `entry point — nothing imports this`, which the file cannot say), so
-        # this saturates at every block today; the ticket's "4 of 477" is the
-        # pre-V3 pack, and the number that still moves is the mean.
+        # Counted per block, not per row: one block with new rows counts once.
         if tally["new_rows"] > 0:
             blocks_with_new_row += 1
         if any(_kind_of(line) == "public_symbols" for line in block.split("\n")):
@@ -527,8 +495,7 @@ def compute_metrics(
 
 # ── presentation ─────────────────────────────────────────────────────────────
 
-# The table, in the ticket's shape. Values marked with `/` are display-only
-# compounds (the flat JSON keeps the two keys separate).
+# The table in the ticket's shape; values marked with / are display-only compounds.
 _ROWS = (
     ("artifact", [
         "modules", "artifact_bytes", "public_symbols", "public_symbols_unique_qualnames",

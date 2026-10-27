@@ -1,6 +1,5 @@
 #!/bin/bash
-# One tree at a time: copy the suite in, run it, print pass/fail per test.
-# usage: run_all_kc10.sh <wt dir> [tree ...]
+# Runs each tree one at a time, copying the suite in, and prints pass/fail per test.
 set -u
 WT=$1; shift
 HERE=$(cd "$(dirname "$0")" && pwd)

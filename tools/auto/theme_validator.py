@@ -33,6 +33,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from tools.auto.verdict_followup import STRICT_VERDICT_RULE
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,7 +44,8 @@ _THEME_SYSTEM = (
     "Judge ONLY against the guidelines — do not critique style, plot, or "
     "consistency. Reply ONE line. APPROVED if the chapter respects the "
     "guidelines. Otherwise reply exactly 'REVISE: <one concrete instruction "
-    "describing what violates the guidelines and how to fix it>'."
+    "describing what violates the guidelines and how to fix it>'.\n"
+    + STRICT_VERDICT_RULE   # VERDICT-ASK
 )
 
 
@@ -95,14 +98,13 @@ class ThemeValidator:
             return ThemeVerdict(approved=True, reason="no guidelines configured")
 
         # Imported here to avoid circular import; inner_loop imports us.
-        from tools.auto.inner_loop import _parse_verdict_soft  # noqa: PLC0415
+        from tools.auto.verdict_followup import settle_verdict  # noqa: PLC0415
         from tools.auto.utils import detect_language, language_instruction  # noqa: PLC0415
 
         lang_instr = language_instruction(detect_language(new_text))
         system = _THEME_SYSTEM + (("\n" + lang_instr) if lang_instr else "")
         if lang_instr:
-            # Same carve-out as the continuity validator: the language lock
-            # must never swallow the English verdict token itself.
+            # Same carve-out as the continuity validator: the language lock never swallows the verdict word.
             system += (
                 "\nEXCEPTION TO THE LANGUAGE RULE ABOVE: the verdict word "
                 "itself — APPROVED or REVISE — must always be written in "
@@ -118,7 +120,10 @@ class ThemeValidator:
             logger.warning("ThemeValidator: LLM call failed — %s", exc)
             return ThemeVerdict(approved=True, reason="llm error — passed on fail-open")
 
-        approved, reason, unparseable = _parse_verdict_soft(raw)
+        # VERDICT-ASK: an unclear or self-contradicting reply is put back to the model once.
+        approved, reason, unparseable, raw = settle_verdict(
+            raw, lambda extra: self._llm(system, user_msg + extra) or "", who="ThemeValidator",
+        )
         if unparseable:
             logger.warning(
                 "ThemeValidator: unparseable reply %r — passed on fail-open.", raw[:120]
@@ -139,9 +144,7 @@ def make_theme_validator(config, *, settings=None) -> "ThemeValidator | None":
     build_validators` passes a resolved value, via ``[validator_agent]
     theme_llm_profile``.
     """
-    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
-    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
-    # the literal config.getX(...) call shape.
+    # Each config read is wrapped separately, so extract_config_reads still sees the literal calls.
     try:
         enabled = config.getboolean(
             "validator_agent", "theme_check_creative", fallback=False
@@ -173,8 +176,7 @@ def make_theme_validator(config, *, settings=None) -> "ThemeValidator | None":
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-        # GATE3-PROFILE-2: only pass settings= when a profile was actually
-        # resolved — see the identical comment in canon_validator.py.
+        # Pass settings= only when a profile was resolved (as in canon_validator.py).
         llm_call = (
             _make_llm_call(config, task_mode="creative", settings=settings)
             if settings is not None

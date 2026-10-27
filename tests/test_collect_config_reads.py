@@ -66,8 +66,7 @@ def test_config_reads_are_provenance_static():
 
 
 def test_non_config_get_calls_are_not_misattributed():
-    # A plain dict.get(...) with no `fallback=` keyword must not be
-    # mistaken for a ConfigParser read.
+    # A plain dict.get(...) without fallback= is not a ConfigParser read.
     source = "def f(d):\n    return d.get('key', 'default')\n"
     record = scan_module(source, "pkg/x.py")
     assert record.config_reads == ()
@@ -83,8 +82,7 @@ def test_dynamic_section_is_skipped_not_guessed():
 
 
 def test_local_literal_alias_for_section_is_resolved():
-    # The `arch = "architect"` idiom used throughout this codebase's real
-    # modules: a section variable assigned exactly one literal string.
+    # A section variable assigned one literal string (arch = "architect") is resolved.
     source = (
         "def f(config):\n"
         "    arch = 'architect'\n"
@@ -133,31 +131,12 @@ def test_real_repo_config_read_coverage_does_not_regress():
         src = p.read_text(encoding="utf-8", errors="replace")
         grep_total += len(_GREP_PATTERN.findall(src))
 
-    # Every extracted read must correspond to an actual `fallback=` call
-    # site (no over-counting), and coverage should be a healthy majority
-    # of the regex estimate — the remaining gap is dynamic
-    # section/key expressions genuine static analysis can't resolve
-    # without real dataflow (out of scope for COLLECT-5).
+    # Each extracted read matches a real fallback= call; coverage is a majority of the regex count (dynamic keys are out of scope).
     assert extracted_total <= grep_total
     assert extracted_total >= 0.7 * grep_total
 
 
-# ── _cfg_mode helper recognition (the mode-override blind spot) ────────────
-#
-# This codebase's actual `{key}_{task_mode}` mode-override convention
-# almost never appears as a literal `config.get(section, f"{key}_
-# {task_mode}", ...)` at the call site — it goes through the shared
-# `_cfg_mode(config, section, key, task_mode, fallback=...)` helper
-# instead (`tools.auto.utils`), which does that same `config.get` call
-# one module away, inside its own body, with a non-literal key expression
-# `extract_config_reads` correctly can't resolve from there. A version of
-# this extractor that only recognized literal `config.get*()` shapes
-# recorded exactly zero mode-override reads anywhere on the real repo —
-# not because the convention isn't used, but because every real call site
-# (`coder.py`, `architect.py`, `inner_loop.py`, `summary_memory.py`,
-# `canon_validator.py`, `progress_display.py`, `tools/collect/
-# summarizer.py` itself — 13+ sites) goes through `_cfg_mode`, and none of
-# them is a literal `.get(...)` call at all.
+# _cfg_mode is the mode-override helper: a literal-only extractor sees none of its 13+ real call sites.
 
 
 def test_cfg_mode_call_is_recognized_as_mode_override():
@@ -197,10 +176,7 @@ def test_cfg_mode_call_with_section_alias_is_resolved():
 
 
 def test_cfg_mode_call_with_dynamic_key_is_skipped_not_guessed():
-    # Real instance in this repo (repo_ingest.py): `key` is a loop
-    # variable taking on multiple literal values, not a single-assignment
-    # alias — genuinely unresolvable statically, same as the direct-call
-    # dynamic-key case already tested above.
+    # repo_ingest's key is a loop variable with several literal values: not statically resolvable, so skipped.
     source = (
         "def f(config, task_mode):\n"
         "    for key in ('a', 'b'):\n"
@@ -211,8 +187,7 @@ def test_cfg_mode_call_with_dynamic_key_is_skipped_not_guessed():
 
 
 def test_unrelated_function_named_similarly_is_not_matched():
-    # Only the exact helper name is recognized — a same-shaped call to a
-    # different function must not be misattributed as a config read.
+    # Only the exact helper name counts as a config read.
     source = (
         "def f(config, task_mode):\n"
         "    return _cfg_mode_other(config, 'coder', 'max_tokens', task_mode, fallback='1')\n"

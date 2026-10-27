@@ -83,31 +83,26 @@ from tools.contest.runner import (  # noqa: E402
 from tools.contest.workspace import Workspace  # noqa: E402
 
 
-# Hermetic: the committed contest.ini alone, copied where no contest.local.ini sits next to
-# it, so an operator's local overrides never change what these tests see.
+# Hermetic: only the committed contest.ini is read, so local overrides never change these tests.
 _COMMITTED_DIR = Path(tempfile.mkdtemp(prefix="committed-ini-"))
 atexit.register(shutil.rmtree, _COMMITTED_DIR, ignore_errors=True)
 shutil.copy(REPO_ROOT / "contest.ini", _COMMITTED_DIR / "contest.ini")
 COMMITTED = _COMMITTED_DIR / "contest.ini"
 
-#: The round's own limit: ten short retries in a row is ~12 min on round 106's
-#: cadence, instead of the 60 min both bynara agents sat WAITING.
+#: The round's limit of ten short retries, about 12 minutes on round 106's cadence.
 LIMIT = 10
 
 SESSION = SessionRef(id="ses_retry", provider_id="bynara", model_id="laguna-s-2-1",
                      directory="/nowhere")
 
-#: Round 106's `laguna-s-2-1`, verbatim from events.jsonl. The plan on the
-#: bynara site was used up, and the provider answered the same text for that as
-#: for a real outage, so the end says where to look instead of guessing.
+#: Round 106's laguna-s-2-1 reply: the plan was used up, and the message says where to look.
 LAGUNA_RETRY = (
     "Upstream temporarily unavailable (was malformed body: upstream sent an error "
     "chunk inside a 200 stream: The model service is temporarily unavailable. "
     "Please try again.). Retry after 10s."
 )
 
-#: A provider text that would otherwise spend `max_error_retries`:
-#: `_RETRYABLE_MSG_RE` matches `503` and `upstream unavailable`.
+#: A provider text that would spend max_error_retries (matched by _RETRYABLE_MSG_RE).
 RETRYABLE_TEXT = "503 upstream unavailable"
 
 RULES = [
@@ -170,9 +165,7 @@ def _retry_pairs(count, attempt_offset=0, attempt=None,
     return events
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the fake, for a turn over the real HTTP and SSE transport
-# ─────────────────────────────────────────────────────────────────────────────
+# The fake, for a turn over the real HTTP and SSE transport
 
 class _Probe:
     def __init__(self, fake, client, tap, session):
@@ -192,8 +185,7 @@ def _probe(tmp_path, scenario, *,
     server = KiloServer.attach(fake.url)
     client = KiloClient(server, directory)
     tap = EventTap(fake.url, directory, str(tmp_path / "events.jsonl")).start()
-    # a tap only receives events after its /event connection is open, on the
-    # fake as on a real server — wait for it so nothing is lost.
+    # A tap receives events only after its /event connection is open, so wait for it.
     deadline = time.monotonic() + 30
     while not fake.subscribers and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -209,9 +201,7 @@ def _probe(tmp_path, scenario, *,
         fake.stop()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# a scripted tap, for the counting arithmetic
-# ─────────────────────────────────────────────────────────────────────────────
+# A scripted tap, for the counting arithmetic
 
 class _FakeClock:
     """`time.monotonic` that only moves when a test moves it."""
@@ -274,9 +264,7 @@ def _wait(monkeypatch, events, *, max_retry_attempts=None, max_retry_wait=None,
     return client, result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1 — ten retries in a row end the wait
-# ─────────────────────────────────────────────────────────────────────────────
+# 1: ten retries in a row end the wait
 
 def test_ten_retries_without_output_end_the_wait(tmp_path):
     """A turn that only retries, with `max_retry_attempts = 10`: `error`,
@@ -449,9 +437,7 @@ def test_a_retry_inside_the_bound_is_a_beat(monkeypatch):
     assert client.aborts == [SESSION.id]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2 — off by default
-# ─────────────────────────────────────────────────────────────────────────────
+# 2: off by default
 
 def test_off_by_default(tmp_path):
     """`max_retry_attempts` not armed: twelve retries are twelve beats, exactly
@@ -490,9 +476,7 @@ def test_a_negative_limit_arms_nothing():
     assert "max_retry_attempts" not in backend.kwargs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3 — the runner
-# ─────────────────────────────────────────────────────────────────────────────
+# 3: the runner
 
 class _WaitSpy:
     """`ContestBackend` with one scripted answer and every call recorded."""
@@ -689,9 +673,7 @@ def test_the_plan_hint_is_not_cut_with_the_provider_text(tmp_path):
     assert len(run.last_error) < 420, run.last_error
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4 — the roster key
-# ─────────────────────────────────────────────────────────────────────────────
+# 4: the roster key
 
 def test_the_keys_are_exported():
     """The key is in `CONTEST_KEYS` and on `ContestConfig`, default 10."""

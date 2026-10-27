@@ -1,0 +1,1323 @@
+{
+ "goal": "Find every accessor method that returns a mutable object taken directly from internal state instead of a copy, and change it to return a copy. A caller that mutates the returned object corrupts the owner's state without going through any validation.",
+ "base_dir": "/home/renat/Project/opensource/github/agent-offline/jan-to-fix",
+ "created_at": "2026-09-08T21:20:29Z",
+ "tasks": [
+  {
+   "id": "AUTO-T1",
+   "title": "Make AutoController.config return a defensive copy instead of the live ConfigParser",
+   "instruction": "In tools/auto/controller.py, the AutoController instance attribute `self.config` (assigned at line 346 in `__init__`) is a live `configparser.ConfigParser` that is exposed directly to every caller (e.g. `controller.config.get(...)` in tests/test_skills_cli.py, and `controller.config` passed to `resolve_gate_order` and to `make_story_bible`/`make_outer_loop`/`make_auto_tuner` inside `run()` and `_run_task_loop`). Because `ConfigParser` is mutable, any caller can mutate the controller's parsed configuration (add/remove sections, set keys, change `task_mode`) without going through any validation, silently corrupting the owner's state mid-run. Add a property-based accessor (e.g. rename the raw attribute to `self._config` and expose `@property def config(self) -> configparser.ConfigParser` that returns a defensive copy via `configparser.ConfigParser()` populated from `self._config.items(...)`/`sections()`, or `copy.deepcopy(self._config)`), so that reads still work but writes to the returned object cannot affect the controller. Update every internal read site in controller.py that currently uses `self.config` to keep working (they will, since the property returns a copy each time \u2014 but note that `apply_skill(self.config, ...)` in `__init__` and the `self.config.get(...)` calls in `run()`/`_run_task_loop` must still see the authoritative values, so those internal call sites should use the private `self._config` directly). Add tests to tests/test_skills_cli.py that (a) assert `controller.config` is not the same object identity as the controller's internal store, (b) mutate the returned config (e.g. `controller.config.set('auto', 'task_mode', 'bogus')`) and assert `controller.task_mode` is unchanged and a second `controller.config.get('auto','task_mode')` still returns the original value, and (c) assert the existing skill-overlay behaviour still lands (reuse the existing `test_skill_base_becomes_the_task_mode` coverage).",
+   "target_files": [
+    "tools/auto/controller.py",
+    "tests/test_skills_cli.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_skills_cli.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/controller.py",
+     "symbol": "AutoController",
+     "line_start": 346,
+     "line_end": 385,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T2",
+   "title": "Make CandidateTask.target_files return a defensive copy",
+   "instruction": "In tools/auto/architect.py, the dataclass `CandidateTask` (line 344) declares `target_files: list[str]` with no default factory and no accessor. Because it is a plain mutable list stored directly on the instance, any caller that does `task.target_files.append(...)` or `task.target_files.clear()` silently corrupts the owner's state without going through any validation. Add a `__post_init__` to `CandidateTask` that deep-copies the incoming `target_files` list into `self.target_files` (so the caller's original list is not aliased), and add a `target_files_copy()` accessor method that returns `list(self.target_files)` so consumers that need to iterate or mutate a working copy cannot reach the internal list. Also make `raw: dict` defensive: in `__post_init__` store `self.raw = dict(raw)` so a caller mutating `task.raw` cannot corrupt the original parsed LLM dict. Add tests to tests/test_cr20_3_plan_validator.py that (a) construct a CandidateTask with a list, mutate the original list after construction, and assert `task.target_files` is unchanged; (b) call `task.target_files_copy()`, mutate the returned list, and assert `task.target_files` is unchanged; (c) mutate `task.raw` and assert the original dict passed at construction is unchanged.",
+   "target_files": [
+    "tests/test_cr20_3_plan_validator.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_cr20_3_plan_validator.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_cr20_3_plan_validator.py",
+     "symbol": "_candidate",
+     "line_start": 46,
+     "line_end": 55,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T3",
+   "title": "Add regression test that _REASONING_UNSUPPORTED_KEYS is not exposed as a mutable alias to callers",
+   "instruction": "The goal targets accessors that return mutable internal state directly. In tests_bugfix/test_llm_stream_reasoning_field_fallback.py the autouse fixture `_reset_reasoning_cache` reaches into `llm_stream_mod._REASONING_UNSUPPORTED_KEYS` and calls `.clear()` on it \u2014 i.e. the module's internal cache set is reachable and directly mutable from outside the module, with no validation. Add a test to that same file that documents and guards the intended contract: assert that `llm_stream_mod._REASONING_UNSUPPORTED_KEYS` is a `set`, that clearing it does not break a subsequent `request_completion` call (the cache is rebuilt lazily), and \u2014 the key assertion for this goal \u2014 that the module does NOT expose a public accessor (e.g. `get_reasoning_cache()` / `reasoning_cache()`) that returns the live set object itself. Concretely: assert `not hasattr(llm_stream_mod, 'get_reasoning_cache')` and `not hasattr(llm_stream_mod, 'reasoning_cache')`, so any future refactor that adds a convenience accessor returning the live set is caught here. If a public accessor already exists and returns the live set, the fix is to make it return `set(...)` (a copy) instead. Keep the existing fixture and tests intact.",
+   "target_files": [
+    "tests_bugfix/test_llm_stream_reasoning_field_fallback.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_llm_stream_reasoning_field_fallback.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_llm_stream_reasoning_field_fallback.py",
+     "symbol": "_reset_reasoning_cache",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T4",
+   "title": "Add regression test that _RecordingHandler.received_bodies is a fresh list per handler class, not shared mutable state",
+   "instruction": "The goal is to catch mutable internal state handed out without a copy. In tests_bugfix/test_llm_stream_reasoning_field_fallback.py, `_RecordingHandler` declares class-level mutable attributes (`script: list = []`, `received_bodies: list = []`, `request_count = 0`) and `_serve_script` rebinds them per handler class via `type(...)`. Because `do_POST` appends to `type(self).received_bodies`, any test that forgets to rebind (or that shares a handler class across two servers) silently corrupts the other test's recorded bodies \u2014 exactly the 'caller mutates the returned object and corrupts the owner's state' failure mode. Add a test to that file that proves the isolation contract: build two handler classes via `_serve_script` with distinct scripts, run one request through each, and assert each class's `received_bodies` contains only its own request (length 1 each, distinct content). Also assert that the two classes' `received_bodies` are distinct list objects (`A.received_bodies is not B.received_bodies`). If the test fails, the fix is to have `_serve_script` (or `do_POST`) use a per-instance list instead of a class-level mutable default. Keep the existing tests intact.",
+   "target_files": [
+    "tests_bugfix/test_llm_stream_reasoning_field_fallback.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_llm_stream_reasoning_field_fallback.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_llm_stream_reasoning_field_fallback.py",
+     "symbol": "_RecordingHandler",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T5",
+   "title": "Return a copy from BacklogPrioritiser.build's auto_tasks / manual_suggestions lists",
+   "instruction": "In tools/auto/backlog_prioritiser.py, `BacklogPrioritiser.build()` returns a `PrioritisedBacklog` whose `auto_tasks` and `manual_suggestions` fields are the same list objects the prioritiser built internally. Any caller that appends to, sorts, or mutates `backlog.auto_tasks` (or `manual_suggestions`) corrupts the prioritiser's internal state and any other references it holds. Change `build()` (or the `PrioritisedBacklog` construction site) so the returned dataclass holds fresh copies of both lists (e.g. `list(self._auto_tasks)` / `list(self._manual_suggestions)`), and if the dataclass exposes any accessor methods that hand out the internal lists, make those return copies too. Add tests in tests/test_backlog_prioritiser.py that (a) call `build()`, mutate the returned `auto_tasks` list, and assert a second call to `build()` on the same prioritiser returns the original ordering/contents; and (b) mutate `manual_suggestions` and assert the prioritiser's internal state is unaffected.",
+   "target_files": [
+    "tools/auto/backlog_prioritiser.py",
+    "tests/test_backlog_prioritiser.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_backlog_prioritiser.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/backlog_prioritiser.py",
+     "symbol": "BacklogPrioritiser.build",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T7",
+   "title": "Return a copy from Executor.run target_files extraction",
+   "instruction": "In tools/auto/executor.py, the Executor.run method at line 268 does `target_files = task.get(\"target_files\") or []`, which returns the caller's list object directly from the task dict. If any downstream code in the executor mutates this list (appends, sorts, filters in-place), it corrupts the caller's task dict without going through any validation. Change line 268 to `target_files = list(task.get(\"target_files\") or [])` so the executor always operates on its own copy. Add a test in tests/test_executor.py that constructs a task dict with a target_files list, calls executor.run(), and then verifies that the original task dict's target_files list has not been mutated (same length, same elements, same identity of the list object in the task dict).",
+   "target_files": [
+    "tools/auto/executor.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_executor.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/executor.py",
+     "symbol": "Executor.run",
+     "line_start": 267,
+     "line_end": 268,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T6",
+   "title": "Return a copy from Executor._prepare_workspace target_files loop",
+   "instruction": "In tools/auto/executor.py, the Executor._prepare_workspace method (starting at line 321) iterates over the caller-supplied `target_files` list and, in the tracer.event call at lines 383-394, passes `target_files` directly into the `params` dict under the \"files\" key. This exposes the caller's mutable list object to the tracer, which may retain or mutate it. Change the tracer.event call to pass a copy of the list (e.g. `list(target_files)`) so that the caller's list cannot be corrupted by downstream consumers of the trace event. Additionally, in the `run` method (line 268), `target_files = task.get(\"target_files\") or []` returns the caller's list object directly from the task dict; if the executor later mutates this list (e.g. appends or reorders), it corrupts the caller's task dict. Change line 268 to `target_files = list(task.get(\"target_files\") or [])` so the executor works on its own copy. Add a test in tests/test_executor.py that (a) calls executor.run() with a task dict whose target_files is a list, then mutates the returned ExecutionResult or inspects the trace event, and verifies the original task dict's target_files list is unchanged; and (b) verifies that the tracer received a list that is not the same object as the caller's list.",
+   "target_files": [
+    "tools/auto/executor.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_executor.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/executor.py",
+     "symbol": "Executor._prepare_workspace",
+     "line_start": 321,
+     "line_end": 394,
+     "new_file": false
+    }
+   ],
+   "dependencies": [
+    "AUTO-T7"
+   ]
+  },
+  {
+   "id": "AUTO-T8",
+   "title": "Make InnerLoopResult.records return a defensive copy",
+   "instruction": "In tools/auto/inner_loop.py, the dataclass InnerLoopResult exposes its mutable `records` list directly (declared as `records: list = field(default_factory=list)`). Any caller that reads `result.records` can append, mutate, or clear the owner's internal attempt history without going through any validation. Change the dataclass so that external reads of `records` return a copy: keep the internal storage in a private field (e.g. `_records`) and expose a read-only `records` property that returns `list(self._records)` (a shallow copy of the list; the AttemptRecord items are themselves effectively immutable value objects). Update every internal site that currently reads or writes `result.records` / `self.records` (e.g. the append sites in `InnerLoop.run_task` and any `records_used`/`attempts_used` bookkeeping) to use the private field or a dedicated internal mutator. Add a test in tests/test_inner_loop.py that constructs an InnerLoopResult, appends to the returned `records` list, and asserts the owner's internal list is unchanged (and that a second read still returns the original contents).",
+   "target_files": [
+    "tools/auto/inner_loop.py",
+    "tests/test_inner_loop.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_inner_loop.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/inner_loop.py",
+     "symbol": "InnerLoopResult",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T9",
+   "title": "Deep-copy the progress dict returned by StateStore.get_progress",
+   "instruction": "In tools/auto/state.py, StateStore.get_progress (line 426-427) returns `dict(self._progress)`, which is only a shallow copy. The progress dict contains nested mutable values (e.g. the `done_ids` set and any list-valued counters written by _refresh_progress), so a caller that mutates a nested value corrupts the owner's internal state without going through update_progress. Change the body to `return copy.deepcopy(self._progress)` (copy is already imported at line 39). Add a test in tests/test_state.py that builds a StateStore, initialises it, calls get_progress(), mutates a nested mutable value on the returned dict, and asserts that a second get_progress() call still returns the original nested value unchanged (and that the on-disk progress.json is unaffected).",
+   "target_files": [
+    "tools/auto/state.py",
+    "tests/test_state.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_state.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/state.py",
+     "symbol": "StateStore.get_progress",
+     "line_start": 426,
+     "line_end": 427,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T10",
+   "title": "Return a detached copy from RepoIngestor's cluster file-list accessor",
+   "instruction": "In tools/auto/repo_ingest.py, the RepoCluster.files attribute (populated by RepoIngestor.ingest) is exposed as the live list object held by the ingestor, so a caller that appends to or reorders cluster.files mutates the ingestor's internal state without any validation. Change the accessor path so that reading a cluster's files returns a detached copy (e.g. `list(self._files)` in a property, or wrap the dataclass field with a copy on read) while keeping the existing glob-matching and catch-all behaviour intact. Add a test in tests/test_repo_ingest.py that runs ingest() on a temp tree, reads a cluster's files, mutates the returned list, and asserts the ingestor's stored cluster still holds the original file list.",
+   "target_files": [
+    "tools/auto/repo_ingest.py",
+    "tests/test_repo_ingest.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_repo_ingest.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/repo_ingest.py",
+     "symbol": "RepoCluster",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T11",
+   "title": "Make TicketStore.list_all and list_by_status return deep copies",
+   "instruction": "In tools/auto/ticket_store.py, TicketStore.list_all() and TicketStore.list_by_status() build and return lists of ticket dicts read from disk. Each inner dict is mutable and is returned by reference, so a caller that mutates any element (e.g. all_[0]['status'] = 'bogus') corrupts the caller's view without any validation and can silently diverge from what is on disk. Change both methods to return deep copies of the ticket dicts (copy.deepcopy each dict when assembling the list). Add tests in tests/test_auto_d1.py that call list_all() and list_by_status('open'), mutate an element of the returned list, and assert that a fresh call to the same method returns the original unmodified values.",
+   "target_files": [
+    "tools/auto/ticket_store.py",
+    "tests/test_auto_d1.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_auto_d1.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/ticket_store.py",
+     "symbol": "TicketStore.list_all",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T12",
+   "title": "Make ThemeValidator.guidelines a private attribute with a copy-returning property",
+   "instruction": "In tools/auto/theme_validator.py, ThemeValidator.__init__ stores the guidelines string on self.guidelines as a public attribute. Although str is immutable, the attribute is exposed publicly and any subclass or caller can reassign self.guidelines = '' to bypass the .strip() normalisation and the empty-guidelines fail-open path in check(). Convert self.guidelines to a private _guidelines attribute and expose it through a read-only property that returns a copy of the string (str is immutable so a plain return is fine, but the property must not allow assignment). Update check() to read self._guidelines. Add a test in tests/test_theme_validator.py that constructs a ThemeValidator, attempts to assign validator.guidelines = 'new' and asserts it raises AttributeError (or that the value is unchanged), and that check() still behaves correctly with the original guidelines.",
+   "target_files": [
+    "tools/auto/theme_validator.py",
+    "tests/test_theme_validator.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_theme_validator.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/theme_validator.py",
+     "symbol": "ThemeValidator.__init__",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T13",
+   "title": "Make ImprovementAgent expose config fields as read-only properties returning copies",
+   "instruction": "In tools/improvement_agent.py, ImprovementAgent.__init__ stores model, base_url, api_key, timeout, temperature, max_tokens, prompt_store, api_format, num_ctx, and ssl_context as public mutable attributes. A caller can reassign any of them (e.g. agent.api_key = '' or agent.prompt_store = None) after construction, bypassing the config-validation and fallback logic in __init__ and silently breaking the LLM call path. Convert these to private attributes (_model, _base_url, _api_key, _timeout, _temperature, _max_tokens, _prompt_store, _api_format, _num_ctx, _ssl_context) and expose each through a read-only property that returns a copy of the value (for str/int/float the value is already immutable; for prompt_store and ssl_context return the object but forbid reassignment via the property). Update all internal references in process() and any other methods to use the private attributes. Add a test in tests/test_improvement_agent.py that constructs an ImprovementAgent, attempts to assign agent.model = 'other' and asserts it raises AttributeError, and that agent.model still returns the original value.",
+   "target_files": [
+    "tools/improvement_agent.py",
+    "tests/test_improvement_agent.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_improvement_agent.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/improvement_agent.py",
+     "symbol": "ImprovementAgent.__init__",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T14",
+   "title": "Return a copy of skip_dirs from SearchAgent.skip_dirs property",
+   "instruction": "In tools/search_agent.py, the SearchAgent class stores self.skip_dirs as a mutable list (initialized from _DEFAULT_SKIP_DIRS or the caller's list). Any accessor or direct attribute read that hands out this list lets a caller mutate the agent's exclusion set without validation. Add a skip_dirs property (or a get_skip_dirs() method) that returns list(self._skip_dirs) \u2014 a shallow copy \u2014 and rename the internal attribute to _skip_dirs so callers cannot reach the raw list. Update all internal uses of self.skip_dirs to self._skip_dirs. Add a test in tests/test_search_agent.py that constructs a SearchAgent, retrieves the copy, mutates the returned list (e.g. appends 'secret_dir'), and asserts the agent's internal skip_dirs is unchanged.",
+   "target_files": [
+    "tools/search_agent.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_search_agent.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/search_agent.py",
+     "symbol": "SearchAgent",
+     "line_start": 78,
+     "line_end": 95,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T15",
+   "title": "Return a copy of failure_summary from PromptOptimizer.generate_candidate",
+   "instruction": "In tools/prompt_optimizer.py, PromptOptimizer.generate_candidate() receives a failure_summary dict and passes it directly to json.dumps(). While json.dumps does not mutate, the method should defensively copy the input dict before use to prevent any future code path from mutating the caller's dict. More importantly, if generate_candidate ever returns or exposes the failure_summary (e.g. in a result object), it must return a copy. Add a defensive copy at the start of generate_candidate (failure_summary = dict(failure_summary)) and add a test in tests/test_prompt_optimizer.py that passes a dict, calls generate_candidate with a mocked LLM, and asserts the original dict is unchanged.",
+   "target_files": [
+    "tools/prompt_optimizer.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_prompt_optimizer.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/prompt_optimizer.py",
+     "symbol": "PromptOptimizer.generate_candidate",
+     "line_start": 55,
+     "line_end": 100,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T16",
+   "title": "Return a copy from list_source_files and harden skip_dirs handling",
+   "instruction": "In tools/file_reader.py, list_source_files() shares the same pattern as list_py_files: it wraps the caller's `skip_dirs` in a set and mutates os.walk's `dirnames` in place. Add a defensive copy of `skip_dirs` (e.g. `skip_set = set(skip_dirs)`) is already present, but ensure the returned `results` list is a fresh list (it is) and that no internal mutable object is ever returned. The concrete improvement: make both list_py_files and list_source_files copy the input `skip_dirs` explicitly with `list(skip_dirs)` before deriving the set, so a caller that mutates their list concurrently cannot affect the walk. Add a test in tests_bugfix/test_metrics_collector_corrupt.py (append a new test class TestFileReaderDefensiveCopies) that calls list_source_files with a skip_dirs list, mutates that list after the call, and asserts a second call with the original list still skips the same directories; also assert that mutating the returned results list does not affect a subsequent call.",
+   "target_files": [
+    "tools/file_reader.py",
+    "tests_bugfix/test_metrics_collector_corrupt.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_metrics_collector_corrupt.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/file_reader.py",
+     "symbol": "list_source_files",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T17",
+   "title": "Return a copy from MetricsCollector._load_all_cached instead of the cached list",
+   "instruction": "In tools/metrics_collector.py, the method MetricsCollector._load_all_cached returns `self._cache` directly when the mtime matches. This is a mutable list held in internal state; any caller that mutates the returned list (e.g. `records.append(...)`, `records.sort()`, `records[0] = ...`) corrupts the cache without going through any validation, and the corruption persists across subsequent calls because the same list object is reused. Change the hit path to return a shallow copy of the cached list (e.g. `return list(self._cache)`), and also make the miss path store a fresh list in the cache while returning a separate copy so the caller can never mutate the cache in place. Keep the existing mtime-based invalidation semantics. Add tests to tests/test_metrics_collector.py that (a) call _load_all_cached twice and assert the two returned lists are distinct objects (`is not`), (b) mutate the first returned list (append an element) and assert a second call still returns the original length, and (c) confirm record() still appends correctly after such mutation. Use a tmp_path fixture for the metrics file.",
+   "target_files": [
+    "tools/metrics_collector.py",
+    "tests/test_metrics_collector.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_metrics_collector.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/metrics_collector.py",
+     "symbol": "MetricsCollector._load_all_cached",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T18",
+   "title": "Make Report.failed return a copy of the filtered findings list",
+   "instruction": "In scripts/check_runbook.py, the `Report.failed` property (lines 108-110) already builds a NEW list via a list comprehension, so it is safe. However, the `Report.findings` attribute itself (line 100) is a mutable list exposed directly on the dataclass, and there is no accessor that returns a defensive copy of it. Add a `findings` property that returns `list(self._findings)` (rename the backing field to `_findings` with `field(default_factory=list)`), so that any caller that does `report.findings.append(...)` or `report.findings.clear()` cannot corrupt the Report's internal state. Keep `add()` appending to the private backing list. Update every internal reference to `self.findings` (e.g. in `failed`, `render`, `compute_score`, `main`) to use the private field or the new property as appropriate. Add tests in tests/test_check_runbook.py that (a) construct a Report, append findings via `add()`, read `report.findings`, mutate the returned list (append, clear, sort), and assert `report.failed` / `report.passed` and a second read of `report.findings` are unchanged; and (b) assert `report.findings is not report.findings` (two distinct list objects).",
+   "target_files": [
+    "scripts/check_runbook.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_check_runbook.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "scripts/check_runbook.py",
+     "symbol": "Report",
+     "line_start": 96,
+     "line_end": 114,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T19",
+   "title": "Make Report.failed return a defensive copy instead of a fresh-but-rebuildable list",
+   "instruction": "In scripts/check_runbook.py, `Report.failed` (lines 108-110) returns a freshly built list each call, which is correct for immutability of the owner but means callers cannot rely on identity and the property is inconsistent with the rest of the API. More importantly, once `findings` is exposed as a copy-returning property (see the sibling task), `failed` should be documented and tested as returning a copy too. Update `failed` to explicitly `return list(...)` and add a test in tests/test_check_runbook.py that mutates the list returned by `report.failed` (e.g. `report.failed.append(Finding(True, 'x'))`) and asserts a subsequent `report.failed` read is unchanged and `report.passed` still reflects the original findings.",
+   "target_files": [
+    "scripts/check_runbook.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_check_runbook.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "scripts/check_runbook.py",
+     "symbol": "Report.failed",
+     "line_start": 108,
+     "line_end": 110,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T20",
+   "title": "Make Greeter.greet return a defensive copy of the prefix",
+   "instruction": "In tests/fixtures/collect_mini_repo_java/com/example/Greeter.java, the `greet` method currently concatenates `this.prefix` directly into the returned string. While String is immutable in Java, the class also exposes `longestOf` and the `prefix` field is the only mutable-looking internal state. To satisfy the goal of never leaking internal mutable state, refactor `Greeter` so that (a) the constructor stores a defensive copy of the incoming `prefix` (e.g. `this.prefix = new String(prefix);`), and (b) add a new accessor `public String getPrefix()` that returns `new String(this.prefix)` rather than the raw field, so callers cannot observe or mutate the owner's internal reference. Update the golden fixture tests/fixtures/collect_mini_repo_golden.json is not applicable here (Java), but add a JUnit test in a new file tests/fixtures/collect_mini_repo_java/com/example/GreeterTest.java that (1) constructs a Greeter, calls getPrefix(), mutates the returned String via StringBuilder, and asserts the internal prefix is unchanged; and (2) asserts two consecutive getPrefix() calls return distinct String objects (`assertNotSame`).",
+   "target_files": [
+    "tests/fixtures/collect_mini_repo_java/com/example/Greeter.java"
+   ],
+   "acceptance_check": "true",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/fixtures/collect_mini_repo_java/com/example/Greeter.java",
+     "symbol": "Greeter",
+     "line_start": 14,
+     "line_end": 30,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T21",
+   "title": "Add defensive-copy accessor for Greeter.prefix",
+   "instruction": "In tests/fixtures/collect_mini_repo_java/com/example/Greeter.java, add a new public accessor `public String getPrefix()` that returns a defensive copy (`new String(this.prefix)`) instead of the raw field reference. This is the canonical accessor pattern the goal asks for: any caller that receives the prefix cannot corrupt the owner's state. Also update the constructor to defensively copy the incoming argument (`this.prefix = new String(prefix);`) so the owner's state is never aliased to a caller-supplied object. Add a JUnit test file tests/fixtures/collect_mini_repo_java/com/example/GreeterTest.java with a test `getPrefix_returnsDefensiveCopy` that verifies `greeter.getPrefix() != greeter.getPrefix()` (distinct objects) and that mutating the returned value does not affect subsequent calls.",
+   "target_files": [
+    "tests/fixtures/collect_mini_repo_java/com/example/Greeter.java"
+   ],
+   "acceptance_check": "true",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/fixtures/collect_mini_repo_java/com/example/Greeter.java",
+     "symbol": "Greeter",
+     "line_start": 14,
+     "line_end": 22,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T22",
+   "title": "Make Point record expose defensive copies via a factory accessor",
+   "instruction": "In tests/fixtures/collect_mini_repo_java/com/example/Point.java, the record's canonical accessors `x()` and `y()` return primitive ints (already safe), but the record itself is the only object a caller can hold. To satisfy the goal's spirit for this cluster, add a `public Point copy()` method that returns `new Point(this.x, this.y)` so callers that need a fresh instance get a defensive copy rather than the same reference. Add a JUnit test in tests/fixtures/collect_mini_repo_java/com/example/PointTest.java with `copy_returnsDistinctInstance` asserting `p != p.copy()` and `p.equals(p.copy())`.",
+   "target_files": [
+    "tests/fixtures/collect_mini_repo_java/com/example/Point.java"
+   ],
+   "acceptance_check": "true",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/fixtures/collect_mini_repo_java/com/example/Point.java",
+     "symbol": "Point",
+     "line_start": 8,
+     "line_end": 12,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T23",
+   "title": "Add regression tests proving get_task/all_tasks/resume_info return detached copies",
+   "instruction": "StateStore.get_task (line 402-412), all_tasks (line 414-418) and resume_info (line 381-400) in tools/auto/state.py now return copies via the `_detached` helper (line 362-379), but the existing suite in tests/test_auto_2.py never asserts the detachment contract, so a future refactor could silently reintroduce the live-reference bug the helper's docstring describes (a caller writing `get_task(id)['status'] = 12345` and having it persist into plan.json). Add a new test class to tests/test_auto_2.py that, for each of get_task, all_tasks, and resume_info, (a) retrieves the object, (b) mutates a nested mutable field on the returned copy (e.g. append to `target_files`, or set `status` to a bogus value), and (c) asserts that a fresh read of the same task from the store still holds the original value AND that the on-disk plan.json is unchanged. This locks the copy-on-read contract in place.",
+   "target_files": [
+    "tests/test_auto_2.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_auto_2.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_auto_2.py",
+     "symbol": "sample_task",
+     "line_start": 88,
+     "line_end": 96,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T24",
+   "title": "Verify StateStore accessor copies survive a reload across the smoke suite",
+   "instruction": "tests/test_auto_1.py drives the full --auto entry point end to end and asserts on .agent/ artefacts, but it never verifies that the state accessors used by that path hand back detached copies. Add a test to tests/test_auto_1.py that, after a successful `--auto` run in a temp dir, opens the resulting .agent/plan.json and .agent/progress.json, constructs a StateStore over that directory, calls get_task/all_tasks/get_progress, mutates the returned objects (including a nested list field), and asserts that re-reading the JSON files from disk shows no change. This closes the loop between the CLI-level smoke coverage and the copy-on-read contract of the accessors the CLI depends on.",
+   "target_files": [
+    "tests/test_auto_1.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_auto_1.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_auto_1.py",
+     "symbol": "test_auto_creates_agent_dir",
+     "line_start": 68,
+     "line_end": 72,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T25",
+   "title": "Make FakeInnerLoop.seen_prior return a defensive copy",
+   "instruction": "In tests/test_auto_c4.py, FakeInnerLoop stores `self.seen_prior = []` and appends `list(prior_feedback or [])`. The outer list is exposed directly, so any test that mutates `inner.seen_prior` corrupts the fake. Add a `seen_prior_copy()` accessor returning `list(self.seen_prior)` and update the bounded-context assertions (the test that verifies prior_feedback on round N is exactly the N-1 compact summaries) to use it. Add a new test that appends to the returned list and asserts `inner.seen_prior` is unchanged.",
+   "target_files": [
+    "tests/test_auto_c4.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_auto_c4.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_auto_c4.py",
+     "symbol": "FakeInnerLoop",
+     "line_start": 40,
+     "line_end": 50,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T26",
+   "title": "Make Gate1Filter._check_existence return a copy of any mutable block content",
+   "instruction": "In tools/auto/gate1_filter.py, the `_check_existence` method returns a tuple `(ok, reason, block)` where `block` is a string (immutable), so this is already safe. However, the method reads file content and returns it directly. Add a test in tests/test_bugfix_gate1_path_traversal.py in a new class `TestCheckExistenceReturnsIsolatedBlock` that: (1) creates a legitimate cited path that resolves, (2) calls `_check_existence`, (3) verifies the returned `block` is a string (immutable), (4) verifies that calling `_check_existence` again returns the same content (no caching side-effects). This locks in the contract that the returned block is a fresh string each time.",
+   "target_files": [
+    "tests/test_bugfix_gate1_path_traversal.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_bugfix_gate1_path_traversal.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_bugfix_gate1_path_traversal.py",
+     "symbol": "TestGate1FilterPathTraversalBlocked",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T27",
+   "title": "Make Coder._BLOCKED_ALWAYS / _BLOCKED_CODE_ONLY / _BLOCKED_CODE_WORD_BOUNDARY class-level tuples return copies",
+   "instruction": "In tools/auto/coder.py, the Coder class exposes its safety pattern sets as class-level tuples (`_BLOCKED_ALWAYS`, `_BLOCKED_CODE_ONLY`, `_BLOCKED_CODE_WORD_BOUNDARY`) that are read directly by callers (see tests/test_coder_safety_domain.py which iterates `{label for label, _ in Coder._BLOCKED_ALWAYS}`). Because these are tuples of tuples, the outer tuple is immutable but the inner tuples are also immutable \u2014 however, if any of these are ever changed to lists (or if a caller does `Coder._BLOCKED_ALWAYS[0] = ...` on a subclass that overrides with a list), the class state is corrupted. Add classmethod accessors `blocked_always()`, `blocked_code_only()`, and `blocked_code_word_boundary()` that return `tuple(self._BLOCKED_ALWAYS)` (a shallow copy of the outer container) so callers cannot mutate the class-level registry. Update the existing tests in tests/test_coder_safety_domain.py (TestPatternSets class) to call the new accessors instead of reading the class attributes directly, and add a new test that mutates the returned tuple and asserts the class attribute is unchanged.",
+   "target_files": [
+    "tests/test_coder_safety_domain.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_coder_safety_domain.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_coder_safety_domain.py",
+     "symbol": "TestPatternSets",
+     "line_start": 70,
+     "line_end": 100,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T28",
+   "title": "Add regression tests proving ExceptSite fields returned by extract_except_sites are not shared mutable state",
+   "instruction": "In tests/test_collect_except_sites.py, `extract_except_sites` (tools/collect/ast_facts.py) returns a list of `ExceptSite` dataclass instances whose fields are all scalars (str/bool/Provenance) \u2014 so there is no mutable-object leak today. However, the tests never assert this, so a future change that adds a mutable field (e.g. a `comments: list` or `annotations: dict`) and returns it by reference would reintroduce the exact bug the goal describes. Add tests to tests/test_collect_except_sites.py that (a) call `extract_except_sites` on the fixture, take one `ExceptSite`, and assert every field is immutable (str/bool/Enum) by attempting in-place mutation and expecting TypeError; and (b) assert that two independent calls to `extract_except_sites` on the same source produce distinct `ExceptSite` objects (not the same cached instance), so a caller mutating one result cannot corrupt another caller's result.",
+   "target_files": [
+    "tests/test_collect_except_sites.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_collect_except_sites.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_collect_except_sites.py",
+     "symbol": "test_except_pass_is_fail_open",
+     "line_start": 33,
+     "line_end": 41,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T29",
+   "title": "Add regression tests proving fail_open_locations returns a fresh set, not the registry's internal set",
+   "instruction": "In tools/collect/registries.py, `fail_open_locations(registry)` (line 224) returns 'the bare set of `location` strings in `registry`'. The tests in tests/test_collect_fail_open_registry.py use this function but never assert that the returned set is a defensive copy rather than a reference to internal state. If `fail_open_locations` ever returns the registry's own internal set (or a set that aliases the registry's entries), a caller doing `locations.add('bogus')` would corrupt the registry. Add tests to tests/test_collect_fail_open_registry.py that (a) build the registry, call `fail_open_locations` twice, and assert the two returned sets are distinct objects (`is not`); (b) mutate the returned set (`.add('injected')`, `.remove(...)`) and assert the registry's entries are unchanged (re-derive locations from the registry and confirm the injected value is absent); and (c) assert that mutating a `FailOpenEntry` field (e.g. `entry.location = 'x'`) does not affect the set returned by a prior call to `fail_open_locations`.",
+   "target_files": [
+    "tests/test_collect_fail_open_registry.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_collect_fail_open_registry.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_collect_fail_open_registry.py",
+     "symbol": "test_only_fail_open_sites_are_registered",
+     "line_start": 30,
+     "line_end": 46,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T30",
+   "title": "Add regression tests proving CollectSettings fields are not shared mutable state across read_collect_settings calls",
+   "instruction": "In tests/test_collect_config_section.py, `read_collect_settings` (tools/collect/cli.py) returns a `CollectSettings` dataclass. The tests assert equality of returned settings but never assert that two independent calls return distinct objects, nor that mutating one returned `CollectSettings` does not affect another. If `CollectSettings` ever gains a mutable field (e.g. a `defaults: dict` or `overrides: list`) and `read_collect_settings` returns a shared instance or a shared mutable sub-object, a caller mutating the returned settings would corrupt the owner's state. Add tests to tests/test_collect_config_section.py that (a) call `read_collect_settings(None)` twice and assert the two results are distinct objects (`is not`); (b) mutate a field on one returned `CollectSettings` (e.g. `s1.enabled = False`) and assert the other is unaffected; and (c) assert that `read_collect_settings` with a `configparser.ConfigParser` that has a `[collect]` section returns a fresh `CollectSettings` each call (not a cached singleton).",
+   "target_files": [
+    "tests/test_collect_config_section.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_collect_config_section.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_collect_config_section.py",
+     "symbol": "test_no_config_object_returns_all_defaults",
+     "line_start": 82,
+     "line_end": 90,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T31",
+   "title": "Add regression tests proving ConfigRead objects returned by scan_module are not shared across calls",
+   "instruction": "In tests/test_collect_config_reads.py, `scan_module` (tools/collect/scanner.py) returns a `ModuleRecord` whose `config_reads` is a tuple of `ConfigRead` dataclass instances. The tests assert the contents of `config_reads` but never assert that two independent calls to `scan_module` on the same source produce distinct `ConfigRead` objects, nor that mutating a returned `ConfigRead` does not affect a subsequent call. If `ConfigRead` ever gains a mutable field (e.g. `metadata: dict`) and `scan_module` caches or shares instances, a caller mutating the returned object would corrupt the owner's state. Add tests to tests/test_collect_config_reads.py that (a) call `scan_module` twice on the same source and assert the returned `ConfigRead` objects are distinct (`is not`); (b) mutate a field on one returned `ConfigRead` (e.g. `c.fallback = 'x'`) and assert a fresh `scan_module` call returns the original fallback; and (c) assert that `record.config_reads` is a tuple (immutable) so in-place mutation raises TypeError.",
+   "target_files": [
+    "tests/test_collect_config_reads.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_collect_config_reads.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_collect_config_reads.py",
+     "symbol": "test_config_reader_fixture_all_four_methods_recognized",
+     "line_start": 36,
+     "line_end": 38,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T32",
+   "title": "Make CollectModel.is_safe() immune to mutation of returned records",
+   "instruction": "In tools/collect/loader.py, CollectModel.is_safe() reads guarded_accesses / fail_open / contracts from the ModuleRecord it looks up internally. Because module() hands out the live record, a caller can mutate the record's guarded_accesses (e.g. flip a status from GUARDED to UNGUARDED, or append a bogus entry) and thereby flip the safety verdict without any validation. After module() returns a defensive copy, add a regression test in tests/test_collect_loader_static_only.py that: (1) loads the model, (2) calls model.module('pkg/a.py') and mutates the returned record's guarded_accesses[0].status to 'UNGUARDED', (3) re-queries model.is_safe(location) and asserts the verdict is still safe=True / reason=='guarded', proving the mutation did not leak into the owner's state.",
+   "target_files": [
+    "tests/test_collect_loader_static_only.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_collect_loader_static_only.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_collect_loader_static_only.py",
+     "symbol": "test_llm_notes_claiming_unsafe_do_not_flip_a_guarded_verdict",
+     "line_start": 53,
+     "line_end": 96,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T33",
+   "title": "Make FunctionRecord.with_llm_summary() return a copy that does not share mutable sub-objects",
+   "instruction": "In tools/collect/model.py, FunctionRecord.with_llm_summary() returns an updated FunctionRecord. The existing test test_with_llm_summary_only_touches_summary_field asserts the original is untouched, but does not verify that the returned record's mutable sub-objects (e.g. summary, or any list-valued field) are independent copies rather than shared references. Ensure with_llm_summary() constructs a fully independent FunctionRecord (no shared mutable sub-objects between the original and the returned copy). Add a test in tests/test_collect_model_provenance.py that calls with_llm_summary(summary), then mutates the returned record's summary.notes in place, and asserts the original record's summary is still None (unchanged) and that a second with_llm_summary call on the original yields a record whose summary.notes is the pristine value \u2014 proving no shared mutable state leaks between the original and the copy.",
+   "target_files": [
+    "tests/test_collect_model_provenance.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_collect_model_provenance.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_collect_model_provenance.py",
+     "symbol": "test_with_llm_summary_only_touches_summary_field",
+     "line_start": 84,
+     "line_end": 96,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T34",
+   "title": "Add regression tests that verify_module/verify_repo reattach independent LLMSummary copies",
+   "instruction": "In tests/test_collect_verifier_provenance.py, the tests test_surviving_claim_remains_llm_after_verify_module and test_verify_repo_reattaches_plain_llmsummary_not_a_static_type (lines ~60-100) assert provenance but do not assert copy semantics. Add tests that (1) build a summarized module via module.with_llm_summary(summary), (2) run verify_module, (3) mutate the *input* summary's purpose string object is immutable but mutate a mutable attribute if any exists, and more importantly mutate the verified module's summary and assert the original `summary` object passed in is unchanged \u2014 proving verify_module did not hand back the same LLMSummary instance. Also assert `verified.summary is not summary` (identity check) to pin down that a copy is returned rather than the same object reference. Do the same for verify_repo's returned modules.",
+   "target_files": [
+    "tests/test_collect_verifier_provenance.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_collect_verifier_provenance.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_collect_verifier_provenance.py",
+     "symbol": "test_surviving_claim_remains_llm_after_verify_module",
+     "line_start": 60,
+     "line_end": 82,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T35",
+   "title": "Add regression tests that citation_check does not mutate the known_symbols frozenset or line_counts dict",
+   "instruction": "In tests/test_collect_verifier_citations.py, citation_check is called with a `known` frozenset and a `line_counts` dict (see test_claim_citing_unknown_symbol_fails_citation_check, lines ~44-50). Add a test that captures `known` and `line_counts` before calling citation_check, calls it, then asserts `known` and `line_counts` are bit-for-bit identical to their pre-call values (e.g. `assert known == original_known` and `assert line_counts == original_line_counts`). Also add a test that the Claim object passed in is not mutated by citation_check (its `.text`, `.symbol`, `.location` attributes are unchanged after the call). These tests pin down that the verifier's accessors never leak or mutate caller-owned mutable state.",
+   "target_files": [
+    "tests/test_collect_verifier_citations.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_collect_verifier_citations.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_collect_verifier_citations.py",
+     "symbol": "test_claim_citing_unknown_symbol_fails_citation_check",
+     "line_start": 44,
+     "line_end": 50,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T36",
+   "title": "Make ContinuityValidator.check() return a fresh ContinuityVerdict each call",
+   "instruction": "In tools/auto/continuity_validator.py, ContinuityValidator.check() (lines 145-200) constructs and returns a new ContinuityVerdict on every call, which is correct, but the fail-open branches (lines 191-193 and the unparseable branch around line 197-200) should be verified to never cache or reuse a verdict object. Add a regression test to tests/test_cr23_3_continuity.py named test_check_returns_fresh_verdict_each_call: build a validator with a stub llm that always returns 'APPROVED', call verdict1 = v.check('facts', 'text') and verdict2 = v.check('facts', 'text'), assert verdict1 is not verdict2 (distinct objects), and assert verdict1.approved is verdict2.approved is True. This documents and locks in the invariant that check() never hands back a shared mutable verdict. Keep existing tests intact.",
+   "target_files": [
+    "tests/test_cr23_3_continuity.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_cr23_3_continuity.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_cr23_3_continuity.py",
+     "symbol": "test_check_never_raises",
+     "line_start": 95,
+     "line_end": 108,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T37",
+   "title": "Add tests proving _parse_verdict_soft returns a defensive copy of its reason string",
+   "instruction": "In tools/auto/inner_loop.py, _parse_verdict_soft returns a (approved, reason, unparseable) tuple where reason is a string derived from the LLM reply (see tests/test_cr2_gate2_soft.py, TestParseVerdictSoft.test_revise_with_reason, which asserts 'duel in para 3' in reason). The goal requires that no accessor hands out a mutable object taken directly from internal state. Add a new test class TestParseVerdictSoftDefensiveCopy to tests/test_cr2_gate2_soft.py that: (1) calls _parse_verdict_soft('REVISE: the duel in para 3 contradicts the setup') twice and asserts the two returned reason strings are equal but that mutating one (e.g. reason = reason + 'tampered') does not affect the second call's reason; (2) asserts that the returned tuple is a fresh tuple each call (is not) and that the reason string is not the same object as any substring of the input reply (proving it is a copy, not a slice alias). These tests pin the copy-on-return contract for the verdict parser's accessor.",
+   "target_files": [
+    "tests/test_cr2_gate2_soft.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_cr2_gate2_soft.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_cr2_gate2_soft.py",
+     "symbol": "TestParseVerdictSoft",
+     "line_start": 60,
+     "line_end": 90,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T38",
+   "title": "Make resolve_gate_order return a fresh list, not the shared GATES registry slice",
+   "instruction": "In tools/auto/gate_registry.py, resolve_gate_order can return a list that aliases the module-level GATES registry (or a slice of it) when no [gates] override is present. Because GATES is module-level mutable state, a caller that mutates the returned list (e.g. order.append(...), order.sort(), order[0] = other) corrupts the registry for every subsequent call in the process. Change resolve_gate_order so it always returns a brand-new list (list(...) / copy) rather than a slice or the registry itself. Add a regression test in tests/test_gates_2_config_order.py that (a) calls resolve_gate_order twice with the same config, (b) mutates the first result (append a sentinel, sort, or reassign an element), and (c) asserts the second result is unaffected and still equals the registry default. Also assert the two returned lists are not the same object (is not) and that GATES itself is unchanged after mutation.",
+   "target_files": [
+    "tests/test_gates_2_config_order.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_gates_2_config_order.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests/test_gates_2_config_order.py",
+     "symbol": "test_no_gates_section_falls_back_to_registry_order",
+     "line_start": 130,
+     "line_end": 135,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T39",
+   "title": "Add a test that run_gates does not leak mutable task/revisions state to callers",
+   "instruction": "tests_bugfix/test_bugfix_gate_feedback_fail_open.py drives run_gates() with a task dict and a revisions dict passed by reference. If run_gates (or any helper it calls) returned or mutated those caller-owned objects in place, a caller could corrupt its own task/revisions state without going through any validation. Add a new test class TestRunGatesDoesNotMutateCallerState to that file, reusing the existing _boom_spec(), _loop(), and _run() helpers. Add: (1) test_run_gates_does_not_mutate_the_task_dict \u2014 build task = {\"id\": \"T-1\"}, take a deep copy before the call, run _run(tmp_path, [\"good.md\"], _boom_spec()), then assert task == the pre-call copy (no keys added, no values changed). (2) test_run_gates_does_not_mutate_the_revisions_dict \u2014 build revisions = {\"boom\": 0}, deep-copy it, run _run(tmp_path, [\"good.md\"], _boom_spec()), then assert revisions == the pre-call copy. (3) test_run_gates_does_not_mutate_target_files_list \u2014 build files = [\"good.md\"], deep-copy it, run _run(tmp_path, files, _boom_spec()), then assert files == the pre-call copy (no elements added, removed, or renamed). (4) test_repeated_runs_are_independent \u2014 run _run twice on the same tmp_path with the same task/revisions dicts and assert both runs return the same result and that the dicts are still equal to their original copies afterwards. Note in the class docstring that these tests pin the fail-open contract's sibling invariant: run_gates must be a pure reader of caller state, so a raise inside a gate cannot leave the caller's task/revisions dicts half-updated.",
+   "target_files": [
+    "tests_bugfix/test_bugfix_gate_feedback_fail_open.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_bugfix_gate_feedback_fail_open.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_bugfix_gate_feedback_fail_open.py",
+     "symbol": "_run",
+     "line_start": 88,
+     "line_end": 104,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T40",
+   "title": "Add regression tests for StateStore.resume_info returning detached task dicts",
+   "instruction": "The goal is to ensure every accessor that returns a mutable object taken directly from internal state returns a copy. In tools/auto/state.py, StateStore.resume_info() returns a dict whose 'pending' and 'in_progress' values are lists of task dicts. The existing tests in tests_bugfix/test_bugfix_m1_get_task_reference_leak.py cover get_task, all_tasks, and resume_info['pending'/'in_progress'] element detachment, but they do not cover the container lists themselves: resume_info()['pending'] and resume_info()['in_progress'] are currently the live lists held inside self._plan, so a caller can do store.resume_info()['pending'].append(fake_task) or .clear() and corrupt the plan without any validated setter. Change resume_info() so the returned 'pending' and 'in_progress' values are fresh lists (not the live plan lists), each holding detached task dicts. Add tests to tests_bugfix/test_bugfix_m1_get_task_reference_leak.py: (1) test_resume_info_lists_are_not_the_live_plan_lists \u2014 assert store.resume_info()['pending'] is not store._plan['tasks'] and is not any live list held in the plan; (2) test_mutating_a_resume_info_list_cannot_reach_disk \u2014 append a bogus task dict to store.resume_info()['pending'], then call a validated setter such as store.increment_task_counters('T1', round_delta=1), and assert the bogus task is not present in the on-disk plan (use the existing _on_disk helper); (3) test_two_resume_info_reads_are_independent \u2014 two calls to resume_info() must return independent lists so one caller's append does not appear in another caller's result. Keep the existing tests intact.",
+   "target_files": [
+    "tests_bugfix/test_bugfix_m1_get_task_reference_leak.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_bugfix_m1_get_task_reference_leak.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_bugfix_m1_get_task_reference_leak.py",
+     "symbol": "test_mutating_a_resume_info_task_cannot_reach_disk",
+     "line_start": 66,
+     "line_end": 74,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T41",
+   "title": "Add regression tests for StateStore.get_task returning a deep copy of nested mutable values",
+   "instruction": "The goal is to ensure every accessor that returns a mutable object taken directly from internal state returns a copy. In tools/auto/state.py, StateStore.get_task() returns a detached task dict, but the existing test test_nested_values_are_copied_too in tests_bugfix/test_bugfix_m1_get_task_reference_leak.py is truncated and its coverage of nested mutable values (the 'target_files' list, the 'cited_locations' list, and the 'dependencies' list) is not fully pinned. A shallow dict copy would still let a caller mutate store.get_task('T1')['target_files'].append('evil.py') or store.get_task('T1')['cited_locations'][0]['file'] = 'x' and corrupt the plan, because those nested lists/dicts are still the live objects from self._plan. Change get_task() (and the shared _detached helper it uses) so nested mutable values are deep-copied as well. Add tests to tests_bugfix/test_bugfix_m1_get_task_reference_leak.py: (1) test_mutating_a_get_task_target_files_list_cannot_reach_disk \u2014 append to store.get_task('T1')['target_files'], call store.increment_task_counters('T1', round_delta=1), and assert the on-disk target_files is unchanged (use the existing _on_disk helper); (2) test_mutating_a_get_task_cited_location_cannot_reach_disk \u2014 mutate a nested cited_locations entry and assert the on-disk value is unchanged; (3) test_mutating_a_get_task_dependencies_list_cannot_reach_disk \u2014 append to the dependencies list and assert the on-disk value is unchanged. Keep the existing tests intact.",
+   "target_files": [
+    "tests_bugfix/test_bugfix_m1_get_task_reference_leak.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_bugfix_m1_get_task_reference_leak.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_bugfix_m1_get_task_reference_leak.py",
+     "symbol": "test_nested_values_are_copied_too",
+     "line_start": 92,
+     "line_end": 100,
+     "new_file": false
+    }
+   ],
+   "dependencies": [
+    "AUTO-T40"
+   ]
+  },
+  {
+   "id": "AUTO-T42",
+   "title": "Add regression tests proving strip_json_fence returns a fresh string object",
+   "instruction": "The goal is to ensure every accessor that returns a mutable object taken from internal state returns a copy rather than the live object. In tools/llm_stream.py, strip_json_fence(raw) is the fence-stripping helper exercised by tests_bugfix/test_bugfix_strip_json_fence_generic_label.py and tests_bugfix/test_bugfix_strip_json_fence_label.py. Add tests to tests_bugfix/test_bugfix_strip_json_fence_generic_label.py (which already imports strip_json_fence and has the BODY constant) that prove the helper does not return or mutate a live internal object: (1) call strip_json_fence on a raw string, mutate the returned value in place where possible (e.g. via a list of characters or by confirming the returned object is not the same identity as the input), and assert the input raw string is unchanged; (2) assert the returned object is not the same identity as the input when the input is returned unchanged (the no-fence plain JSON case), documenting that the function returns a copy rather than the caller's object. Each test must fail if the helper hands back the live input object. Keep the existing tests intact.",
+   "target_files": [
+    "tests_bugfix/test_bugfix_strip_json_fence_generic_label.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_bugfix_strip_json_fence_generic_label.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_bugfix_strip_json_fence_generic_label.py",
+     "symbol": "test_no_fence_plain_json_untouched",
+     "line_start": 100,
+     "line_end": 103,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T43",
+   "title": "Add regression tests proving StateStore read accessors return detached copies",
+   "instruction": "The goal is to guarantee that no accessor returns a mutable object taken directly from internal state. The StateStore read accessors (get_task, all_tasks, resume_info, get_progress) already return copies via _detached()/dict(), but the cluster has no test that pins that contract down. Add a new test class to tests_bugfix/test_bugfix_upsert_task_merge.py (which already imports StateStore, make_task, STATUS_DONE, STATUS_TODO and has a _store(tmp_path) helper) named TestAccessorsReturnDetachedCopies with these tests: (1) test_get_task_mutation_does_not_corrupt_store \u2014 upsert a task, call get_task(id), mutate the returned dict's status to an invalid value (e.g. 12345) and mutate its nested target_files list in place, then assert store.get_task(id)[\"status\"] is still the original valid status and store.get_task(id)[\"target_files\"] is unchanged, and that store._plan's stored task is untouched. (2) test_all_tasks_mutation_does_not_corrupt_store \u2014 upsert two tasks, call all_tasks(), mutate every element's status and append to an element's target_files, then assert store.all_tasks() still shows the original values and len(store.all_tasks()) is unchanged. (3) test_resume_info_mutation_does_not_corrupt_store \u2014 upsert a DONE task and an IN_PROGRESS task, call resume_info(), mutate the dicts in the returned \"in_progress\" and \"pending\" lists, then assert store.get_task() for those ids is unchanged. (4) test_get_progress_mutation_does_not_corrupt_store \u2014 call update_progress(status=\"running\"), then get_progress(), mutate the returned dict, and assert a second get_progress() call returns the unmutated values. (5) test_get_task_returns_deep_copy_of_nested_lists \u2014 upsert a task with cited_locations containing a dict, mutate that nested dict through the returned copy, and assert the stored task's cited_locations is unchanged (this specifically guards against a shallow-copy regression, since list() alone would still leak nested dicts). Keep the existing tests untouched.",
+   "target_files": [
+    "tests_bugfix/test_bugfix_upsert_task_merge.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_bugfix_upsert_task_merge.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_bugfix_upsert_task_merge.py",
+     "symbol": "TestUpsertMergesInsteadOfReplacing",
+     "line_start": 44,
+     "line_end": 120,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T44",
+   "title": "Make ContextBroker._resolved_cache accessors return copies",
+   "instruction": "In tools/auto/context_broker.py, ContextBroker exposes its internal `_resolved_cache` dict (line 110) directly to callers \u2014 the existing tests in tests_bugfix/test_context_broker_stale_cache.py (e.g. `test_target_file_is_not_cached_even_on_a_single_call`, `test_non_target_file_still_resolves_and_caches_normally`) read `broker._resolved_cache` directly, and any caller that mutates that dict corrupts the broker's cache without going through reset_cache(). Add a public accessor method `get_cache()` (or `snapshot_cache()`) to ContextBroker that returns `dict(self._resolved_cache)` \u2014 a shallow copy \u2014 and update the existing tests in tests_bugfix/test_context_broker_stale_cache.py to use the new accessor instead of touching `_resolved_cache` directly. Add a new test asserting that mutating the dict returned by the accessor does NOT affect subsequent resolve() calls (i.e. the broker's cache is unaffected by caller mutation).",
+   "target_files": [
+    "tests_bugfix/test_context_broker_stale_cache.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_context_broker_stale_cache.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_context_broker_stale_cache.py",
+     "symbol": "test_target_file_is_not_cached_even_on_a_single_call",
+     "line_start": 50,
+     "line_end": 60,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T45",
+   "title": "Add test that Coder._creative_is_edit does not expose mutable internal state",
+   "instruction": "Add a new test to tests_bugfix/test_cr16_edit_mode_and_cleanup.py that verifies Coder._creative_is_edit returns a plain bool (not a mutable object aliased to internal state) and that repeated calls with the same inputs do not accumulate or leak state. The test should: (1) create a tmp_path with chapter_1.txt containing RU1 and chapter_2.txt empty; (2) instantiate the coder via the existing _coder() helper; (3) call c._creative_is_edit(['chapter_1.txt'], tmp_path) and assert the result is exactly `True` (identity check via `is True`, not just truthiness, to catch accidental return of a mutable truthy object); (4) call c._creative_is_edit(['chapter_2.txt'], tmp_path) and assert `is False`; (5) mutate the input list between calls (append a bogus entry) and re-call, asserting the return value is still a plain bool and the coder's internal state is unaffected (a subsequent call with the original list returns the same bool). This locks in the invariant that the accessor returns a value, not a reference into the coder's internals.",
+   "target_files": [
+    "tests_bugfix/test_cr16_edit_mode_and_cleanup.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_cr16_edit_mode_and_cleanup.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_cr16_edit_mode_and_cleanup.py",
+     "symbol": "test_is_edit_detection",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T46",
+   "title": "Add test that ClusterReviewer._parse_candidates returns fresh target_files lists",
+   "instruction": "Add a new test to tests_bugfix/test_cr17_creative_acceptance.py verifying that ClusterReviewer._parse_candidates does not return candidate objects whose `target_files` attribute is the same list object as the caller's input list (which would let a caller mutate the candidate's target_files and corrupt the caller's list, or vice versa). The test should: (1) build a payload JSON with a single task whose target_files is `['chapter_1.txt', 'chapter_2.txt']`; (2) keep a reference to that input list (`input_targets = ['chapter_1.txt', 'chapter_2.txt']`); (3) call `_arch('creative')._parse_candidates(payload, 'support', input_targets)`; (4) assert `cands[0].target_files is not input_targets` (distinct list objects \u2014 the candidate holds its own copy); (5) mutate `cands[0].target_files` (append 'chapter_99.txt'); (6) assert `input_targets` is unchanged (still exactly `['chapter_1.txt', 'chapter_2.txt']`); (7) also mutate `input_targets` and assert `cands[0].target_files` is unchanged. This directly encodes the goal: no accessor may return a mutable object taken directly from internal state.",
+   "target_files": [
+    "tests_bugfix/test_cr17_creative_acceptance.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_cr17_creative_acceptance.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tests_bugfix/test_cr17_creative_acceptance.py",
+     "symbol": "test_creative_overrides_diff_acceptance",
+     "line_start": null,
+     "line_end": null,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T47",
+   "title": "Make load_state() return a copy of the parsed checkpoint dict",
+   "instruction": "In tools/backoff.py, load_state() (lines 187-210) returns the dict produced by json.load(f) directly (line 210: `return data`). That dict is a fresh parse, but the function's documented contract is 'Return saved checkpoint dict' \u2014 and callers (main.py's resume path, tools/collect/summarizer.py, tools/faq_agent.py, tools/actions.py) treat the return as their own working copy and mutate it (e.g. incrementing 'iteration', updating per-module progress) before passing it to save_state(). Because the dict is freshly parsed per call this is not yet a cross-call aliasing bug, but the function is a public accessor over persisted internal state and returning the raw parse result means any future caching or memoisation of the parse would silently leak mutable state to every caller. Harden it to match the accessor-copy rule: change line 210 to `return dict(data)` so the caller always owns a private copy. Add tests to tests_bugfix/test_t37_ticket_store_oserror.py in a new class (e.g. TestLoadStateReturnsDefensiveCopy) that: (1) write a checkpoint with save_state({'loop': 'pipeline', 'iteration': 3, 'modules': {'a.py': 1}}) to a tmp_path file, call load_state(path) twice, mutate the first result (set iteration to 999 and add a key), then assert the second result still has iteration == 3 and lacks the injected key; (2) assert the two results are not the same object (`assert d1 is not d2`); (3) assert the corrupt/absent/non-dict cases still return None (regression guard). Keep all existing tests passing.",
+   "target_files": [
+    "tests_bugfix/test_t37_ticket_store_oserror.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix/test_t37_ticket_store_oserror.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/backoff.py",
+     "symbol": "load_state",
+     "line_start": 187,
+     "line_end": 210,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T48",
+   "title": "Make _read_ini return a defensive copy of the parsed ConfigParser",
+   "instruction": "In tools/collect/config_map.py, _read_ini (lines 187-200) returns the configparser.ConfigParser object directly. ConfigParser is mutable (callers can add/remove sections and options via parser.set / parser.remove_option / parser.remove_section), so a caller that mutates the returned parser corrupts the shared parse result. Change _read_ini to return a deep copy of the parser (e.g. `import copy; return copy.deepcopy(parser)`) so each caller gets an independent, mutable snapshot that cannot corrupt the source. Add a test in tests/test_config_map.py that writes a temp .ini, calls _read_ini twice on the same path, mutates the first returned parser (parser.set('sec','k','v')), and asserts the second parser does not contain that change.",
+   "target_files": [
+    "tools/collect/config_map.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_config_map.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/collect/config_map.py",
+     "symbol": "_read_ini",
+     "line_start": 187,
+     "line_end": 200,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T49",
+   "title": "Make CollectModel.module() return a defensive copy of the ModuleRecord",
+   "instruction": "In tools/collect/loader.py, CollectModel.module() (line 122-125) returns the live ModuleRecord object stored in self.modules directly. Because ModuleRecord is a mutable dataclass (its fields such as imports, symbols, guarded_accesses are lists/dicts), a caller that mutates the returned record silently corrupts the owner's internal state without going through any validation. Change module() to return a deep copy of the record (use copy.deepcopy) so callers cannot mutate the model's internal state. Add a test in tests/test_loader.py that constructs a CollectModel with a ModuleRecord containing a mutable list field, calls module(path), mutates the returned record's list, and asserts the original record inside the model is unchanged.",
+   "target_files": [
+    "tools/collect/loader.py",
+    "tests/test_loader.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_loader.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/collect/loader.py",
+     "symbol": "CollectModel.module",
+     "line_start": 122,
+     "line_end": 125,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-T52",
+   "title": "Make CollectModel.contracts_for() and fail_open_for() return copies of their records",
+   "instruction": "In tools/collect/loader.py, CollectModel.contracts_for() (line 129-133) and CollectModel.fail_open_for() (line 137-141) return the live ContractRecord and FailOpenEntry objects from self.contracts and self.fail_open_registry directly. Both are mutable dataclasses, so a caller mutating a returned record corrupts the model's internal state without validation. Change both methods to return deep copies (copy.deepcopy) of each matching record. Add tests in tests/test_loader.py that build a CollectModel with a ContractRecord and a FailOpenEntry, call contracts_for() and fail_open_for(), mutate the returned records, and assert the model's stored records are unchanged.",
+   "target_files": [
+    "tools/collect/loader.py",
+    "tests/test_loader.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_loader.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/collect/loader.py",
+     "symbol": "CollectModel.contracts_for",
+     "line_start": 129,
+     "line_end": 141,
+     "new_file": false
+    }
+   ],
+   "dependencies": [
+    "AUTO-T49"
+   ]
+  },
+  {
+   "id": "AUTO-T50",
+   "title": "Make CollectModel.gates_for() return copies of GateEntry objects",
+   "instruction": "In tools/collect/loader.py, CollectModel.gates_for() (line 165-168) returns the live GateEntry objects from self.gates directly (both the name-is-None branch via list(self.gates) and the filtered branch). GateEntry is a mutable dataclass, so a caller mutating a returned entry corrupts the model's internal state. Change both branches to return deep copies of each GateEntry (copy.deepcopy). Add a test in tests/test_loader.py that builds a CollectModel with a GateEntry, calls gates_for() with and without a name, mutates a returned entry, and asserts the model's stored GateEntry is unchanged.",
+   "target_files": [
+    "tools/collect/loader.py",
+    "tests/test_loader.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_loader.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/collect/loader.py",
+     "symbol": "CollectModel.gates_for",
+     "line_start": 165,
+     "line_end": 168,
+     "new_file": false
+    }
+   ],
+   "dependencies": [
+    "AUTO-T49",
+    "AUTO-T52"
+   ]
+  },
+  {
+   "id": "AUTO-T51",
+   "title": "Make CollectModel.config_map_for() return copies of ConfigMapEntry objects",
+   "instruction": "In tools/collect/loader.py, CollectModel.config_map_for() (line 176-179) returns the live ConfigMapEntry objects from self.config_map directly (both the section-is-None branch via list(self.config_map) and the filtered branch). ConfigMapEntry is a mutable dataclass whose readers/fallbacks/concrete_keys are tuples of mutable content, so a caller mutating a returned entry corrupts the model's internal state. Change both branches to return deep copies of each ConfigMapEntry (copy.deepcopy). Add a test in tests/test_loader.py that builds a CollectModel with a ConfigMapEntry, calls config_map_for() with and without a section, mutates a returned entry, and asserts the model's stored ConfigMapEntry is unchanged.",
+   "target_files": [
+    "tools/collect/loader.py",
+    "tests/test_loader.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_loader.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/collect/loader.py",
+     "symbol": "CollectModel.config_map_for",
+     "line_start": 176,
+     "line_end": 179,
+     "new_file": false
+    }
+   ],
+   "dependencies": [
+    "AUTO-T49",
+    "AUTO-T50",
+    "AUTO-T52"
+   ]
+  },
+  {
+   "id": "AUTO-T53",
+   "title": "Make Spinner.frames return a defensive copy",
+   "instruction": "In tools/ui.py, the Spinner class exposes its internal `self.frames` list directly. Any caller that does `spinner.frames.append('X')` or `spinner.frames[0] = 'Z'` mutates the owner's state without going through any validation, and the next `spin()` call will render the corrupted frame. Add a property (or accessor method) named `frames` that returns a copy of the internal list (e.g. `list(self._frames)`), rename the internal attribute to `_frames`, and update `spin()` to read from `_frames`. Keep the existing braille-dot sequence as the default. Add a test in tests/test_ui.py that constructs a Spinner, calls the accessor, mutates the returned list, and asserts that a subsequent `spin()` still writes the original first frame (use `capsys` or a monkeypatched `sys.stdout` to capture output). Also assert that the returned object is not `spinner._frames` (identity check) so future regressions are caught.",
+   "target_files": [
+    "tools/ui.py",
+    "tests/test_ui.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests/test_ui.py -q",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/ui.py",
+     "symbol": "Spinner",
+     "line_start": 14,
+     "line_end": 22,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-R1",
+   "title": "Detach target_files and raw in _serialise_candidates from the live candidates",
+   "instruction": "In tools/auto/architect.py, _serialise_candidates stores c.target_files (and c.raw) in the checkpoint entry by reference, and _deserialise_candidates hands the entry's own list and dict back into the restored candidates. A later in-place change of a candidate's target_files rewrites an already-serialised checkpoint entry. Copy target_files and deepcopy raw in both directions.",
+   "target_files": [
+    "tools/auto/architect.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix -q -k auto_r1",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/auto/architect.py",
+     "symbol": "_serialise_candidates",
+     "line_start": 2473,
+     "line_end": 2500,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-R2",
+   "title": "list_source_files never matches a path-qualified skip_dirs entry",
+   "instruction": "In tools/file_reader.py, list_source_files compares skip_dirs entries with the bare directory names that os.walk yields (`d not in skip_set`), so an entry such as 'tools/auto' never matches and the excluded directory is walked and offered anyway. Split skip_dirs into bare names and relative paths and match both.",
+   "target_files": [
+    "tools/file_reader.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix -q -k auto_r2",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/file_reader.py",
+     "symbol": "list_source_files",
+     "line_start": 95,
+     "line_end": 125,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  },
+  {
+   "id": "AUTO-R3",
+   "title": "list_py_files never matches a path-qualified skip_dirs entry",
+   "instruction": "In tools/file_reader.py, list_py_files compares skip_dirs entries with the bare directory names that os.walk yields (`d not in skip_set`), so an entry such as 'tools/auto' never matches and the excluded directory is walked and offered anyway. Split skip_dirs into bare names and relative paths and match both.",
+   "target_files": [
+    "tools/file_reader.py"
+   ],
+   "acceptance_check": "python3 -m pytest tests_bugfix -q -k auto_r3",
+   "status": "todo",
+   "round": 0,
+   "attempt": 0,
+   "impl_version": 1,
+   "cited_locations": [
+    {
+     "file": "tools/file_reader.py",
+     "symbol": "list_py_files",
+     "line_start": 62,
+     "line_end": 93,
+     "new_file": false
+    }
+   ],
+   "dependencies": []
+  }
+ ]
+}

@@ -180,10 +180,7 @@ def make_roster(root: Path, url: str | None) -> Path:
 def draft(cfg: Path, repo: Path, *extra, brief=BRIEF):
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
     env.pop("CONTEST_GATE_API_KEY", None)
-    # KC79_ROSTER_FLAG=1: a second, diagnostic pass that names the roster
-    # explicitly — the scored pass relies on the default (`contest.ini` in
-    # the CWD, as `run` does); this one shows what else works in an entry
-    # that misses the default.
+    # KC79_ROSTER_FLAG=1: a second, diagnostic pass that names the roster explicitly; the scored pass uses the default (contest.ini in the CWD).
     if os.environ.get("KC79_ROSTER_FLAG"):
         extra = ("--roster", str(cfg / "contest.ini"), *extra)
     return subprocess.run(
@@ -194,10 +191,7 @@ def draft(cfg: Path, repo: Path, *extra, brief=BRIEF):
 def ticket(*, round_no=7, status="open", file="pkg/calc.py", symbol="add",
            also="tests/test_calc_more.py", acceptance=True, title="Cover add in calc",
            block="both"):
-    # Markdown has two code blocks: the 4-space indent (the KC tickets' house
-    # style, this ticket's own Acceptance) and the fence. The drafts carry
-    # both, so one reading missed does not fail every test; G1 and G6 score
-    # each kind alone.
+    # Drafts may use either code-block style (4-space indent or fence); G1 and G6 score each style alone.
     cmd = "python3 -m pytest tests/test_calc_more.py -q"
     indented, fenced = f"    {cmd}\n", f"```\n{cmd}\n```\n"
     block = {"both": indented + "\n" + fenced, "indented": indented,
@@ -233,8 +227,7 @@ def env(tmp_path):
 
 
 def written(repo: Path) -> list[Path]:
-    # `.rejected.md` is saved "next to the output" — for the default output
-    # that is epic-tasks/ itself, so it is not a written ticket.
+    # `.rejected.md` goes next to the output; for the default output that is epic-tasks/ itself, so it is not a written ticket.
     return sorted(p for p in (repo / "epic-tasks").glob("*.md")
                   if not p.name.endswith(".rejected.md"))
 

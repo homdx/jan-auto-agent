@@ -73,7 +73,7 @@ from tools.auto.gate1_filter import filter_candidates, _is_technical_failure
 from tools.auto.git_manager import GitError, make_git_manager
 from tools.auto.plan_emitter import IMPROVEMENTS_FILENAME
 from tools.auto.state import STATUS_IN_PROGRESS, STATUS_TODO, StateStore
-from tools.auto.utils import _ts, atomic_write_text, normalize_task_mode
+from tools.auto.utils import _ts, atomic_write_text, in_style_of, normalize_task_mode
 from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
@@ -84,9 +84,7 @@ IMPROVEMENTS_FALSE_FILENAME = "IMPROVEMENTS-FALSE.md"
 _COMMIT_TASK_ID = "AUTO-H1"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Data model
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class RemovedTask:
@@ -126,18 +124,11 @@ class ValidationReport:
     removed: list[RemovedTask]
     presence_check_skipped: bool = False
     presence_check_skip_reason: str = ""
-    # AUTO-REMOVE-GUARD-1: tasks Gate 1 could not reach a verdict on this
-    # run (an LLM-call technical failure survived every retry — see
-    # gate1_filter.py's AUTO-RETRY-BACKOFF-1) — left completely untouched
-    # in plan.json (still `todo`), NOT removed. Reusing RemovedTask's
-    # shape purely for its title/instruction/target_files/reason fields;
-    # nothing in this list was actually removed from anywhere.
+    # Tasks Gate 1 could not judge (technical failure) stay in plan.json untouched, not removed (AUTO-REMOVE-GUARD-1).
     inconclusive: "list[RemovedTask]" = field(default_factory=list)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Task dict <-> CandidateTask
-# ─────────────────────────────────────────────────────────────────────────────
+# Task dict and CandidateTask conversion
 
 def _task_to_candidate(task: dict) -> CandidateTask:
     """Reconstruct the :class:`CandidateTask` Gate 1 expects from a plan.json task dict.
@@ -163,10 +154,7 @@ def _task_to_candidate(task: dict) -> CandidateTask:
             new_file=bool(loc0.get("new_file", False)),
         )
     else:
-        # No citation at all, OR a malformed cited_locations[0] that isn't
-        # the expected dict shape (e.g. a bare string from a hand-edited
-        # plan.json). Either way, fall back to the first target_files entry
-        # with no anchor rather than crashing on loc0.get(...).
+        # A missing or malformed citation falls back to the first target file with no anchor, instead of crashing.
         target = task.get("target_files") or [""]
         cited_location = CitedLocation(file=target[0])
 
@@ -180,9 +168,7 @@ def _task_to_candidate(task: dict) -> CandidateTask:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Core validation
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _presence_check_skip_reason(
     cfg: configparser.ConfigParser, task_mode: str,
@@ -248,12 +234,7 @@ def validate_plan(
         )
 
     cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
-    # AUTO-FIX (medium-priority audit): a malformed (present but broken)
-    # config file used to raise a raw configparser.Error mid-validate-plan
-    # with no path context. Fall back to defaults (same as a missing file
-    # already did) rather than letting the whole --validate-plan run die
-    # on a config typo — this call only re-checks an existing plan, it
-    # doesn't need [auto]/[gate1_validate] to be perfect to do that.
+    # A broken config file falls back to defaults: this command only re-checks an existing plan (AUTO-FIX).
     if Path(config_path).exists():
         try:
             cfg.read(config_path, encoding="utf-8")
@@ -268,24 +249,11 @@ def validate_plan(
         logger.warning("validate_plan: %s", mode_warning)
 
     state = StateStore(agent_dir)
-    # StateStore.initialise() only ever compares the incoming goal against
-    # the one already on disk (see its docstring) — reusing the stored goal
-    # here always takes the resume/load path and never raises the
-    # "different goal" guard, regardless of what goal the plan was built
-    # under.
-    # AUTO-FIX (high-priority audit): reading plan.json here used to be
-    # completely unguarded, so a corrupted plan.json (interrupted write,
-    # manual edit gone wrong) crashed --validate-plan itself — the exact
-    # command an operator runs to check a plan's health — with a bare,
-    # path-less JSONDecodeError instead of a clear, actionable message.
+    # The stored goal is reused, so the load path runs and the different-goal guard is not hit; a corrupt plan.json gives a clear message (AUTO-FIX).
     try:
         stored_goal = json.loads(plan_path.read_text(encoding="utf-8")).get("goal", "")
     except (OSError, json.JSONDecodeError, AttributeError) as exc:
-        # BUGFIX (audit): AttributeError added — a plan.json that is valid
-        # JSON but not a dict (e.g. a bare list) raises AttributeError on
-        # .get("goal", ...), which this guard didn't catch, producing the
-        # same unclear/unhandled crash this fix already exists to prevent
-        # for the "not valid JSON at all" case.
+        # A plan.json that is valid JSON but not an object is also reported clearly (BUGFIX).
         raise RuntimeError(
             f"validate_plan: {plan_path} could not be read as JSON ({exc}). "
             f"The plan file may be corrupted or was interrupted mid-write. "
@@ -305,11 +273,7 @@ def validate_plan(
         return ValidationReport(checked=0, kept=[], removed=[])
 
     candidates = [_task_to_candidate(t) for t in pending]
-    # Gate 1 works on CandidateTask objects and knows nothing about plan.json
-    # task ids. filter_candidates() preserves object identity for every
-    # candidate it accepts or wraps in a FilterResult (see gate1_filter.py:
-    # Stage A/B/C all append the SAME object references, never copies), so
-    # mapping by id() back to the originating task is exact.
+    # Gate 1 keeps the same candidate objects, so results map back to plan.json task ids by identity.
     task_id_of = {id(c): t["id"] for c, t in zip(candidates, pending)}
 
     skip_reason = _presence_check_skip_reason(cfg, task_mode)
@@ -327,16 +291,7 @@ def validate_plan(
         logger.warning("validate_plan: %s", warning)
         print(f"⚠️  {warning}")
 
-    # AUTO-H2-4: optional independent verification model. Re-confirming a
-    # candidate with the SAME model that proposed it (the default — no
-    # [gate1_validate] section) is a consistency check, not independent
-    # verification: a model's own systematic blind spot (this session found
-    # three false positives from one such blind spot, see AUTO-H2 epic)
-    # reproduces identically on a second call with the same weights and
-    # temperature=0. Setting [gate1_validate] model (and optionally active)
-    # in the config passed to --validate-plan points this specific re-check
-    # at a different model without touching live --auto's Gate 1 at all —
-    # tools/auto/pipeline.py's call site never passes these overrides.
+    # Optional independent verification model: the default re-checks with the same model, which repeats its own blind spots (AUTO-H2-4).
     model_override  = cfg.get("gate1_validate", "model",  fallback=None)
     active_override = cfg.get("gate1_validate", "active", fallback=None)
     if model_override or active_override:
@@ -347,12 +302,7 @@ def validate_plan(
         )
 
     print(f"\n🔎 Re-validating {len(pending)} pending task(s) against current code...")
-    # GATE1-CTX-1/-2: same collect wiring as --auto's live Gate 1 call site
-    # (tools/auto/pipeline.py via AutoController._get_collect_bridge) — a
-    # single bridge built once for this whole validate-plan run, never per
-    # candidate. None when [collect] use_in_auto/use_in_doc is off or the
-    # artifact is unavailable/stale — every note it feeds degrades to "" in
-    # that case, identical to today's behavior.
+    # The collect bridge for validate-plan is built once per run, as in the live Gate 1 (GATE1-CTX-1, -2).
     from tools.auto.collect_bridge import make_collect_bridge
     collect_bridge = make_collect_bridge(base_path, cfg, config_path, task_mode=task_mode)
     accepted, rejected = filter_candidates(
@@ -374,19 +324,7 @@ def validate_plan(
             reason=fr.reason,
         )
         if _is_technical_failure(fr.reason):
-            # AUTO-REMOVE-GUARD-1: a technical failure (LLM call/parse
-            # error surviving every retry — see gate1_filter.py's
-            # AUTO-RETRY-BACKOFF-1) is NOT evidence the task is already
-            # fixed; it just means Gate 1 couldn't reach a verdict this
-            # run, e.g. a provider outage. Removing it from plan.json
-            # here would be indistinguishable from a genuine "confirmed
-            # already fixed" rejection, but WRONG — the task might still
-            # be fully real and unaddressed. Leave it completely
-            # untouched (still `todo`, no plan.json/IMPROVEMENTS.md/
-            # IMPROVEMENTS-FALSE.md writes at all) so the next
-            # --validate-plan run re-checks JUST this one instead of
-            # either silently discarding it or forcing a full re-run of
-            # the whole plan from scratch.
+            # A technical failure is not evidence the task is fixed: the task stays todo and untouched for the next run (AUTO-REMOVE-GUARD-1).
             inconclusive.append(record)
             continue
         removed.append(record)
@@ -394,9 +332,10 @@ def validate_plan(
     kept = [task_id_of[id(c)] for c in accepted]
 
     if removed:
+        known_ids = [t.get("id") for t in state.all_tasks() if t.get("id")]
         for r in removed:
             state.remove_task(r.task_id)
-        _remove_from_improvements_md(base_path, [r.task_id for r in removed])
+        _remove_from_improvements_md(base_path, [r.task_id for r in removed], known_ids)
         _append_false_positives(base_path, removed)
         _commit_validation(base_path, cfg, removed)
 
@@ -424,99 +363,64 @@ def validate_plan(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IMPROVEMENTS.md — strip the false positive's section
-# ─────────────────────────────────────────────────────────────────────────────
+# IMPROVEMENTS.md: removing a false positive's section
 
-# Matches an entire task entry — from its "### <id>: ..." heading through
-# its own trailing "---" separator — so it can be deleted as one clean block.
-# DOTALL so it spans the whole multi-line entry (including fenced code
-# blocks).
-#
-# FIX-2 #8: the interior boundary used to be the bare "\n### ", which matches
-# ANY line starting with "### " — including one *inside* the task's own
-# instruction or acceptance_check (a markdown heading quoted in an example,
-# a "### Notes:" sub-section the author wrote, a "###"-style shell comment).
-# That truncated the removal at the interior heading and left the rest of
-# the entry behind as orphaned text. A colon-terminated variant ("### <x>:")
-# is not a fix: an interior sub-heading almost always carries a colon too
-# ("### Notes:", "### Example Usage:"), so it still gets treated as a task
-# boundary; hardcoding the id's alphabetic prefix ("### AUTO-T\d+:") isn't
-# either, since it stops matching the moment a differently-prefixed id
-# (a custom [auto] task_id_prefix, a "BUG-FIX-*" entry) is the very next
-# section.
-#
-# The fix instead keys off something a task's own body cannot forge by
-# accident: to_improvements_md() (backlog_prioritiser.py) always closes
-# every rendered task -- auto or last-in-file -- with a literal "\n---\n"
-# separator before the next heading or "## Manual Suggestions" begins. That
-# separator is matched and CONSUMED here (not just looked ahead to), so the
-# whole entry -- body and its own trailing "---" -- comes out as one unit
-# and nothing is left orphaned between the previous entry and the next
-# heading.
-#
-# The separator is only accepted as a terminator when the next thing after
-# it is the next task heading, the Manual Suggestions section, or end of
-# file. Without that trailing lookahead the separator alternative has the
-# very defect it replaces, only with a different trigger: an instruction
-# containing a markdown horizontal rule ("...\n\n---\n\nmore prose") ends the
-# lazy match at its own interior "---", leaving "more prose" behind as
-# orphaned text. A real entry terminator is always followed by a heading,
-# an interior rule never is, so the lookahead separates the two exactly.
-# Note "### " / "## Manual Suggestions" must NOT be added to the *fallback*
-# lookahead below for the same reason the bare "\n### " boundary was removed
-# in the first place.
-#
-# The lookahead alternatives ("\n## Manual Suggestions" / end-of-string) are
-# kept as a fallback for a plan.json that was hand-edited or produced
-# outside to_improvements_md's own renderer and so may be missing that
-# trailing separator; the exact literal (not a generic "\n## ") is
-# deliberate for the same reason as above -- a task's own text can
-# legitimately contain a line starting with "## ".
-#
-# FIX-2 H4: the body is ".*?" no longer, but "(?:_FENCE_BLOCK|.)*?" — an
-# alternation that consumes a whole fenced code block as ONE atomic unit
-# whenever one opens, and a single character otherwise. Without it the
-# separator rule above has the same defect it was written to remove, only
-# reached through a different door: an instruction that quotes markdown
-# inside a fence
-#
-#     ```markdown
-#     ---
-#     ### Example heading
-#     ```
-#
-# contains a "\n---\n" whose next line really does start with "### ", so the
-# terminator (and its lookahead) both fire on text that is a code sample, not
-# structure. The entry was cut off mid-fence and its tail left behind in
-# IMPROVEMENTS.md as orphaned text — the exact failure the separator rule
-# exists to prevent. Because the loop is lazy, the engine tries to END the
-# section before it tries either alternative, so a fence is only entered when
-# no terminator matches at its opening line; consuming it whole then skips
-# every position inside it, and no interior "---" or "### " is ever offered
-# as a boundary. An UNCLOSED fence matches no block and degrades to the
-# per-character path, i.e. to the pre-H4 behaviour, rather than swallowing
-# the rest of the file.
-#
-# The closer must repeat the opener's own character (CommonMark: ``` closes
-# ```, ~~~ closes ~~~), which is why the run is captured and back-referenced
-# instead of being written as a literal — a "~~~" line inside a ``` block is
-# body text, not a terminator.
-_FENCE_BLOCK = (
-    r"(?m:^ {0,3})(?P<fence>`{3,}|~{3,})[^\n]*\n"   # opening fence line
-    r"[\s\S]*?"                                     # block body, verbatim
-    r"(?m:^ {0,3})(?P=fence)[^\n]*"                  # closing fence line
-)
+# A whole task entry, from its heading to its separator, so it can be removed as one block (FIX-2 #8).
+# HARDEN-8 F: the id is every word character, hyphen and dot, so an id of letters alone (`alpha`,
+# `FIX`) is a boundary like `AUTO-T1`. It used to be accepted only when it held a digit, which made
+# the letters-only entries run on into each other: removing the first of three took the other two
+# with it. Where a heading *stands* is what decides it is a next entry, not what it is called —
+# `_NEXT_ENTRY` is only ever read after a separator (or at `## Manual Suggestions`), so a
+# `### Note: …` line inside an entry's own text still does not end it.
+_NEXT_ENTRY = r"(?:### [\w.\-]+: |## Manual Suggestions)"
 
 
-def _task_section_pattern(task_id: str) -> re.Pattern:
+def _next_entry(known_ids=None) -> str:
+    """The next entry's heading. Without the plan's ids, any `### <id>: `. With them, a heading of one of
+    them or of an id shaped like one (a digit, `.`, `_` or `-` in it), so a letters-only id the plan holds
+    is a boundary and a `### Notes: …` sub-heading after a rule inside an entry is not."""
+    if not known_ids:
+        return _NEXT_ENTRY
+    ids = "|".join(re.escape(i) for i in sorted(set(known_ids), key=len, reverse=True))
+    return r"(?:### (?:(?:" + ids + r")|(?=[\w.\-]*[\d._\-])[\w.\-]+): |## Manual Suggestions)"
+
+
+def _fence_block(next_entry: str) -> str:
+    return (
+        r"(?m:^ {0,3})(?P<fence>`{3,}|~{3,})[^\n]*\n"   # opening fence line
+        r"(?:(?!\n-{3,}\n+" + next_entry + r")[\s\S])*?"  # block body, verbatim, within its entry
+        r"(?m:^ {0,3})(?P=fence)[^\n]*"                  # closing fence line
+    )
+
+
+_FENCE_BLOCK = _fence_block(_NEXT_ENTRY)
+
+
+def _task_section_pattern(task_id: str, known_ids=None) -> re.Pattern:
+    next_entry = _next_entry(known_ids)
+    # HARDEN-20 D: the heading is anchored at a line start, so an entry that *quotes* another
+    # entry's heading mid-line (``… see ### AUTO-2: title …``) is not cut by removing that other
+    # entry: the quote is prose inside this entry's body, not the heading itself.
     return re.compile(
-        r"### " + re.escape(task_id) + r":"
-        r"(?:" + _FENCE_BLOCK + r"|.)*?"
-        r"(?:\n-{3,}\n+(?=### |## Manual Suggestions|\Z)"
+        r"(?m)^### " + re.escape(task_id) + r":"
+        r"(?:" + _fence_block(next_entry) + r"|.)*?"
+        r"(?:\n-{3,}\n+(?=" + next_entry + r"|\Z)"
         r"|(?=\n## Manual Suggestions|\Z))",
         re.DOTALL,
     )
+
+
+def _without_section(text: str, task_id: str, known_ids=None) -> str:
+    """*text* without *task_id*'s entry; the blank lines where it was cut are made two at most. The whole
+    file's runs of blank lines were collapsed, and every other entry's code sample lost its two blank lines
+    (PEP 8's, before a def)."""
+    pattern = _task_section_pattern(task_id, known_ids)
+    while (m := pattern.search(text)) is not None:   # every copy, as the re.sub before it did
+        head, tail = text[:m.start()], text[m.end():]
+        if head.endswith("\n\n") and tail.startswith("\n"):
+            tail = tail.lstrip("\n")
+        text = head + tail
+    return text
 
 
 _AUTO_SECTION_EMPTY_NOTE = (
@@ -525,7 +429,7 @@ _AUTO_SECTION_EMPTY_NOTE = (
 )
 
 
-def _remove_from_improvements_md(base_dir: Path, removed_ids: "list[str]") -> None:
+def _remove_from_improvements_md(base_dir: Path, removed_ids: "list[str]", known_ids=None) -> None:
     """Strip each removed task's section out of IMPROVEMENTS.md, if present.
 
     IMPROVEMENTS.md (``plan_emitter.IMPROVEMENTS_FILENAME``) is rendered
@@ -553,16 +457,12 @@ def _remove_from_improvements_md(base_dir: Path, removed_ids: "list[str]") -> No
     original = md_path.read_text(encoding="utf-8")
     text = original
     for task_id in removed_ids:
-        text = _task_section_pattern(task_id).sub("", text)
+        text = _without_section(text, task_id, known_ids)
 
     if text == original:
         return  # none of removed_ids had a section here — nothing to write
 
-    # Collapse any run of 3+ blank lines left behind by a removed section.
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    # If every "### " entry under "## Autonomous Tasks" is now gone, leave a
-    # note instead of a heading with nothing under it.
+    # An emptied "## Autonomous Tasks" section gets a note instead of an empty heading.
     auto_section = re.search(
         r"## Autonomous Tasks\n\n(.*?)(?=\n## Manual Suggestions|\Z)",
         text, re.DOTALL,
@@ -579,16 +479,14 @@ def _remove_from_improvements_md(base_dir: Path, removed_ids: "list[str]") -> No
             1,
         )
 
-    atomic_write_text(md_path, text)
+    atomic_write_text(md_path, in_style_of(md_path, text), newline="")
     logger.info(
         "_remove_from_improvements_md: stripped %d section(s) from %s",
         len(removed_ids), md_path,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # IMPROVEMENTS-FALSE.md
-# ─────────────────────────────────────────────────────────────────────────────
 
 _FALSE_MD_HEADER = """\
 # IMPROVEMENTS-FALSE.md
@@ -647,16 +545,14 @@ def _append_false_positives(base_dir: Path, removed: "list[RemovedTask]") -> Non
         logger.debug("_append_false_positives: all task ids already recorded — no write")
         return
 
-    atomic_write_text(md_path, existing.rstrip() + "\n\n" + "".join(new_entries))
+    atomic_write_text(md_path, in_style_of(md_path, existing.rstrip() + "\n\n" + "".join(new_entries)), newline="")
     logger.info(
         "_append_false_positives: recorded %d new entr%s in %s",
         len(new_entries), "y" if len(new_entries) == 1 else "ies", md_path,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Git commit
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _commit_validation(
     base_dir: Path,
@@ -691,9 +587,7 @@ def _commit_validation(
     return commit_hash
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CLI entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_validate(
     base_dir: "str | Path" = ".",
@@ -748,8 +642,7 @@ def run_validate(
             f"{IMPROVEMENTS_FALSE_FILENAME}. Committed."
         )
     if report.inconclusive:
-        # AUTO-REMOVE-GUARD-1: these were left completely untouched in
-        # plan.json (still `todo`) — nothing to commit, nothing removed.
+        # Tasks left untouched stay todo in plan.json: nothing is committed or removed (AUTO-REMOVE-GUARD-1).
         print(
             f"⚠️  {len(report.inconclusive)} task(s) could not be checked "
             f"due to a technical failure (network/provider error surviving "

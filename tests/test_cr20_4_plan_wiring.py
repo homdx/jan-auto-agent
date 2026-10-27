@@ -122,8 +122,7 @@ def _stub_reviewer(verdicts: list[bool], reasons: list[str] | None = None):
     return stub
 
 
-# filter_candidates returns (list[CandidateTask], list[FilterResult]) per the
-# actual signature; the accepted list IS already CandidateTasks.
+# filter_candidates returns (candidates, filter results); accepted candidates are already CandidateTasks.
 def _noop_filter(candidates, base_dir, cfg, *, cluster_files=None, task_mode="creative", **_kwargs):
     """Pass all candidates; return (candidates, [])."""
     return list(candidates), []

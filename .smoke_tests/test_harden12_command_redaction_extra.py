@@ -1,0 +1,1 @@
+../tests/test_harden12_command_redaction_extra.py

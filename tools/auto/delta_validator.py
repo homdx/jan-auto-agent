@@ -97,18 +97,7 @@ class DeltaValidator:
         while the tree is perfectly fine.
         """
         try:
-            # AUTO-FIX: "HEAD:{rel_path}" resolves *rel_path* relative to
-            # the repo's top-level directory, not to base_dir — identical
-            # in production (each task sandbox is its own repo, so
-            # base_dir IS the top level) but silently wrong, not merely
-            # "no baseline", whenever base_dir is a subdirectory of a
-            # larger repo (confirmed while testing this file against
-            # examples/hello-world inside this very repo: it resolved to
-            # this project's OWN top-level file of the same name instead
-            # of failing safe). The "./" prefix is git's documented way to
-            # make a ":path" pathspec cwd-relative instead of
-            # top-level-relative — identical result in the common case,
-            # correct result in the uncommon one.
+            # HEAD:./path is cwd-relative; HEAD:path resolves from the repo root, a silent wrong baseline in a subdirectory.
             result = run_git(
                 ["git", "-C", str(base_dir), "show", f"HEAD:./{rel_path}"],
                 timeout=10,

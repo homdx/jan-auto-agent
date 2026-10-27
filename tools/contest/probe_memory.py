@@ -61,8 +61,7 @@ _LOG = logging.getLogger(__name__)
 DEFAULT_HOURS = 24.0
 #: The default memory file, next to the rounds' output and KC-67's memory.
 DEFAULT_FILENAME = "probe-memory.json"
-#: A record stamped further than this into the future is not trusted: a clock
-#: that was set back would otherwise keep it fresh for as long as the skew.
+#: Records stamped further in the future than this are not trusted (a clock set back).
 FUTURE_SLACK_SEC = 300.0
 _HOUR = 3600.0
 
@@ -208,8 +207,7 @@ def update(path, successes=(), failures=(), *, hours: float = DEFAULT_HOURS,
         records.extend(ProbeRecord(stamp, *key) for key in sorted(fresh))
         out = [record.to_dict() for record in records]
         target = Path(path)
-        # nothing to keep and no file yet: an intake that remembered nothing
-        # leaves no empty file behind
+        # Nothing to keep and no file yet: write nothing rather than an empty file.
         if (out == raw and target.is_file()) or (not out and not target.exists()):
             return True
         target.parent.mkdir(parents=True, exist_ok=True)

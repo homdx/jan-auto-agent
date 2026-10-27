@@ -43,16 +43,12 @@ sys.path.insert(0, str(REPO))
 from tools.contest.runner import _FirstTouch  # noqa: E402
 from tools.contest.workspace import Workspace  # noqa: E402
 
-#: the three agents the ticket says the clock must catch, and the five it must
-#: not. `touched` is each agent's real outcome for the round — read from the
-#: branch and the events, not from this file; it is what the assertion is about.
+#: KC-42 expected verdicts (agents the clock must catch, and those it must not). `touched` is each agent's real outcome, read from the branch and events.
 EXPECTED_DEAD = ("nex-n2-5-pro", "laguna-s-2-1", "agnes-3-0-flash")
 EXPECTED_ALIVE = ("agnes-2-5-flash", "glm-4-7-flash", "hy3", "mimo-v2-5",
                   "step-3-7-flash")
 
-#: The committed default. Replayed at the real values, so a change to
-#: `contest.ini` shows up here as a different verdict rather than as a test that
-#: still agrees with itself.
+#: Committed default, replayed at the real values, so a contest.ini change shows up as a different verdict, not as a test that still agrees with itself.
 FIRST_TOUCH_SEC = 420.0
 FIRST_TOUCH_NUDGES = 1
 SESSIONS_PER_ATTEMPT = 2
@@ -158,8 +154,7 @@ def replay(agent: str, events: list, touch_at: float | None,
     watch._has_touched = ws._touched
     ws.start = time.monotonic()
     watch.start()
-    # the recorded span, compressed by the same factor, so a turn that ended at
-    # 336 s really is shorter than one that ran 1357 s
+    # The recorded span, compressed by the same factor, so a turn that ended at 336 s really is shorter than one that ran 1357 s.
     time.sleep(max(0.2, span * scale))
     # and then three more deadlines' worth, which is nudge, reset and DEAD
     time.sleep(budget * (FIRST_TOUCH_NUDGES + 3))

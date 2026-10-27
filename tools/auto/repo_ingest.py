@@ -55,10 +55,7 @@ from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
-# ── Default cluster definitions ──────────────────────────────────────────────
-# Tuned for this codebase's layout (tools/, tools/auto/, main.py, agents.ini);
-# format is (name, [glob_patterns]), tried in order with first match winning.
-# The last cluster should be a broad catch-all.
+# Default cluster definitions for this layout; the first matching pattern wins, and the last is a catch-all.
 
 _DEFAULT_CLUSTERS: list[tuple[str, list[str]]] = [
     (
@@ -114,9 +111,7 @@ _DEFAULT_CLUSTERS: list[tuple[str, list[str]]] = [
     ),
 ]
 
-# AUTO-CR-28: agent-generated control/memory files. Read into context elsewhere,
-# but NEVER editable story content — excluded from the walk so the architect
-# can neither cite nor target them.
+# Agent-generated control and memory files: read elsewhere, never editable story content, so they are excluded from the walk (AUTO-CR-28).
 RESERVED_META_FILES: frozenset[str] = frozenset(
     {"synopsis.md", "improvements.md", "story_bible.md", "plan.json"}
 )
@@ -135,9 +130,7 @@ _BINARY_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
-# Backup / patch / editor-temp files: present in working trees but not real
-# source. Reviewing them wastes prompt budget and their near-duplicate names
-# (e.g. angie_ops.py.old) confuse the model into emitting non-verbatim paths.
+# Backup and editor-temp files are excluded: they waste prompt budget and their names confuse the model (AUTO-CR-28).
 _BACKUP_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".old", ".orig", ".rej", ".bak", ".patch", ".diff",
@@ -146,9 +139,7 @@ _BACKUP_EXTENSIONS: frozenset[str] = frozenset(
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Data model
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class RepoCluster:
@@ -177,9 +168,7 @@ class RepoCluster:
         return f"RepoCluster(name={self.name!r}, files={len(self.files)})"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # RepoIngestor
-# ─────────────────────────────────────────────────────────────────────────────
 
 class RepoIngestor:
     """Walks a project tree and groups files into logical review clusters.
@@ -199,16 +188,27 @@ class RepoIngestor:
         base_dir: str | Path,
         config: configparser.ConfigParser | None = None,
         task_mode: str = "code",
+        extra_skip_dirs: "frozenset[str] | set[str] | None" = None,
+        max_depth: int | None = None,
+        max_file_kb: int | None = None,
+        collect_skips: bool = False,
     ) -> None:
         self.base_dir  = Path(base_dir).resolve()
         self._config   = config or configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
         self._task_mode = task_mode
 
-        # Walk limits — prefer [architect] overrides, fall back to [search].
-        # AUTO-CR-3: max_file_kb_creative overrides max_file_kb in creative mode.
-        self._skip_dirs  = self._read_skip_dirs()
-        self._max_depth  = self._read_int("max_depth",  2)
-        self._max_file_kb = self._read_int_mode("max_file_kb", 500)
+        # Walk limits: [architect] overrides first, then [search]; creative mode uses its own size, and the collect skip list is added by the caller (AUTO-CR-3, CC-13).
+        # HARDEN-24 B: a caller may supply its own limits outright (`max_depth` / `max_file_kb`).
+        # The collect stage does exactly that, reading [collect] rather than sharing the
+        # Architect's [search] numbers; when it names none, the [architect]/[search] read below
+        # runs exactly as it always did.
+        self._skip_dirs  = self._read_skip_dirs() | (set(extra_skip_dirs) if extra_skip_dirs else set())
+        self._max_depth  = self._read_int("max_depth",  2) if max_depth is None else int(max_depth)
+        self._max_file_kb = self._read_int_mode("max_file_kb", 500) if max_file_kb is None else int(max_file_kb)
+        self._collect_skips = bool(collect_skips)
+        #: `(relative_path, reason)` for every file the walk left out on a depth or a size
+        #: limit. Empty unless `collect_skips` was passed, so the Architect's walk is untouched.
+        self.skipped_files: list[tuple[str, str]] = []
 
         # Cluster definitions — config-driven or built-in default.
         self._cluster_defs: list[tuple[str, list[str]]] = self._read_cluster_defs()
@@ -235,18 +235,37 @@ class RepoIngestor:
         Applies skip_dirs, max_depth, max_file_kb, and binary-extension
         filters.  Hidden files (starting with ``.``) are skipped unless they
         are inside a directory that was not itself skipped.
+
+        HARDEN-24 B: with ``collect_skips=True`` the depth limit stops being a
+        prune and becomes a per-file decision, so a file below the limit is still
+        visited, recorded on ``self.skipped_files`` as ``("too deep",)`` and not
+        yielded. A size-limit skip is recorded as ``("too large",)`` the same way,
+        and a file the walk cannot stat as ``("unreadable",)``. Without the flag
+        the walk is exactly as it was: those files never reach a log line or a
+        caller at all.
         """
         base = self.base_dir
+        # AUDIT-2: a file symlink whose target leaves the repository is not a
+        # source file of this repository. os.walk lists it among *filenames*
+        # (it does not follow directory links, but file links are reported
+        # like files), and every reader downstream — the collect scanner, the
+        # architect's ingest, the LLM summary pass — then read the target.
+        try:
+            base_real = Path(base).resolve()
+        except (OSError, RuntimeError):
+            base_real = Path(os.path.abspath(base))
         for dirpath, dirnames, filenames in os.walk(base):
             rel_dir = Path(dirpath).relative_to(base)
             depth   = len(rel_dir.parts)
 
-            # Prune directories that exceed max_depth or are on the skip list.
+            # Prune directories that exceed max_depth or are on the skip list. With skip
+            # reporting the depth limit cannot prune, or the files below it would never
+            # be visited to be named; the per-file test below takes them out instead.
             dirnames[:] = [
                 d for d in sorted(dirnames)
                 if d not in self._skip_dirs
                 and not d.startswith(".")
-                and (self._max_depth <= 0 or depth < self._max_depth)
+                and (self._max_depth <= 0 or depth < self._max_depth or self._collect_skips)
             ]
 
             for fname in sorted(filenames):
@@ -257,25 +276,39 @@ class RepoIngestor:
                     continue
                 if fname.endswith("~"):        # emacs/vim backup
                     continue
-                # AUTO-CR-15 / AUTO-CR-28: never ingest agent-generated control
-                # files. These are running MEMORY / plan state, not story
-                # content — ingesting them lets the architect cite or target
-                # them as if they were chapters, so the coder rewrites the bible
-                # as prose and the redundancy gate loops forever (observed: a
-                # "remove repetition" run spent ~1h editing story_bible.md).
+                # Agent-generated memory and plan files are never ingested, so the architect cannot cite them as chapters (AUTO-CR-15, AUTO-CR-28).
                 if fname.lower() in RESERVED_META_FILES:
                     continue
 
                 abs_path = Path(dirpath) / fname
+                rel_posix = (rel_dir / fname).as_posix()
+                if abs_path.is_symlink():
+                    try:
+                        abs_path.resolve().relative_to(base_real)
+                    except (ValueError, OSError, RuntimeError):
+                        logger.warning(
+                            "walk: skipping %s — symlink resolves outside %s",
+                            rel_posix, base_real,
+                        )
+                        if self._collect_skips:
+                            self.skipped_files.append((rel_posix, "outside repo"))
+                        continue
+                if self._max_depth > 0 and depth > self._max_depth:
+                    if self._collect_skips:
+                        self.skipped_files.append((rel_posix, "too deep"))
+                    continue
                 try:
                     size_kb = abs_path.stat().st_size / 1024
                 except OSError:
+                    if self._collect_skips:
+                        self.skipped_files.append((rel_posix, "unreadable"))
                     continue
                 if self._max_file_kb > 0 and size_kb > self._max_file_kb:
                     logger.debug("walk: skipping large file %s (%.1f KB)", abs_path, size_kb)
+                    if self._collect_skips:
+                        self.skipped_files.append((rel_posix, "too large"))
                     continue
 
-                rel_posix = (rel_dir / fname).as_posix()
                 yield rel_posix
 
     def cluster(self, files: list[str]) -> list[RepoCluster]:
@@ -328,15 +361,18 @@ class RepoIngestor:
         """
         filename = Path(rel_path).name
         for pat in patterns:
-            if fnmatch.fnmatch(rel_path, pat) or fnmatch.fnmatch(filename, pat):
-                return True
+            # REP-CLUSTER-GLOB: fnmatch has no "**", so "src/**/*.py" missed "src/a.py"; a
+            # trailing "/" ("tests/") and a leading "/" ("/src/*") matched nothing. Each file
+            # fell silently into the catch-all cluster.
+            pat = pat.lstrip("/")
+            if pat.endswith("/"):
+                pat += "*"
+            for variant in {pat, pat.replace("**/", "")}:
+                if fnmatch.fnmatch(rel_path, variant) or fnmatch.fnmatch(filename, variant):
+                    return True
         return False
 
-    # Well-known noise directories always pruned from the architect walk,
-    # mirroring tools/auto/context_broker._iter_project_files.  Without this,
-    # an empty/minimal [search] skip_dirs let node_modules/venv/dist/build be
-    # ingested and clustered for review (dot-dirs were already pruned by the
-    # walk's startswith('.') filter, but these non-dot ones were not).
+    # Dependency and build directories are always pruned from the walk, as in the context broker.
     _DEFAULT_SKIP_DIRS: frozenset[str] = frozenset({
         "__pycache__", ".git", ".hg", ".svn",
         "node_modules", "venv", ".venv", "dist", "build", ".tox",
@@ -439,9 +475,7 @@ class RepoIngestor:
         print()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience factory — used by AutoController / Architect
-# ─────────────────────────────────────────────────────────────────────────────
+# Convenience factory for AutoController and the architect
 
 def ingest_repo(
     base_dir: str | Path,

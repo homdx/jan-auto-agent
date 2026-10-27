@@ -37,9 +37,7 @@ from analyze_logs import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _evt(kind: str, params: dict | None = None, run_id: str = "run1", **kw) -> dict:
     return {
@@ -117,9 +115,7 @@ def _capture(fn, *a, **kw) -> str:
     return _strip_ansi(buf.getvalue())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 1. _extract_current_prompt_from_meta
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestExtractCurrentPromptFromMeta:
     def test_extracts_embedded_prompt(self) -> None:
@@ -142,9 +138,7 @@ class TestExtractCurrentPromptFromMeta:
         assert _extract_current_prompt_from_meta(meta) == "the whole rest of the text"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2 & 3. analyze() builds rewrite_attempts correctly
-# ─────────────────────────────────────────────────────────────────────────────
+# 2-3: analyze() builds rewrite_attempts correctly
 
 class TestAnalyzeRewriteAttempts:
     def test_denied_attempt_recorded(self) -> None:
@@ -205,8 +199,7 @@ class TestAnalyzeRewriteAttempts:
         assert runs["run1"]["rewrite_attempts"] == []
 
     def test_outcome_without_preceding_optimizer_pair_has_empty_prompts(self) -> None:
-        # e.g. a trace that was truncated mid-stream — should not crash and
-        # should not fabricate prompt text.
+        # A truncated trace with no optimizer pair: no crash and no invented prompt text.
         events = [_denied(0.5)]
         runs = analyze(events)
         attempts = runs["run1"]["rewrite_attempts"]
@@ -215,9 +208,7 @@ class TestAnalyzeRewriteAttempts:
         assert attempts[0]["new_prompt"] == ""
 
     def test_pending_prompt_pair_does_not_leak_across_unrelated_events(self) -> None:
-        # An optimizer pair followed by an unrelated event, then a denied
-        # outcome much later with no fresh pair, should NOT reuse the stale
-        # text from the first pair (it was already consumed once and reset).
+        # A consumed optimizer pair must not leak into a later, unrelated outcome.
         events = [
             *_optimizer_pair("old", "new"),
             _denied(0.6, ts="2024-01-01T00:01:10"),
@@ -247,9 +238,7 @@ class TestAnalyzeRewriteAttempts:
         assert runs["runB"]["rewrite_attempts"][0]["promoted"] is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 4. render_rewrite_report()
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestRenderRewriteReport:
     def _run(self, attempts: list[dict]) -> dict:
@@ -287,8 +276,7 @@ class TestRenderRewriteReport:
             "promoted": False, "reason": "no", "old_prompt": "old", "new_prompt": "new",
         }])
         text = _capture(render_rewrite_report, run)
-        # Even if old/new happen to be present, a denied attempt is not "ok"
-        # and shouldn't render the diff section.
+        # A denied attempt is not ok, so it renders no diff section, even with old and new present.
         assert "old → new prompt" not in text
 
     def test_summary_counts_promoted_and_denied(self) -> None:
@@ -305,9 +293,7 @@ class TestRenderRewriteReport:
         assert "1 denied" in text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 5. auto_tuner.py traces the promoted outcome too
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestAutoTunerTracesPromotion:
     def _make_tuner(self, score: float = 0.85):

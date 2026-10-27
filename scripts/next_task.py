@@ -26,18 +26,19 @@ import sys
 
 TICKET_RE = re.compile(r"^(\d+)-.*\.md$")
 
-# A ticket whose **Status:** line starts with one of these is not on offer:
-# `landed` — merged, the round is over; `queued` — written, but not this
-# round (INDEX.md "Next rounds" says when); `closed` — no longer wanted at all
-# (AR-14 `arena issue close`), its `**Closed:**` line says why. Everything else
-# (`open`, no status line at all — the tasks/ tickets have none) is handed out.
+# Skips tickets whose Status is landed, queued or closed; open or no-status tickets are handed out.
 SKIP_STATUS = ("landed", "queued", "closed")
 
 
 def load_tickets(tasks_dir):
     """Every NN-*.md in tasks/, in numeric order, with its finding key."""
     out = []
-    for name in sorted(os.listdir(tasks_dir)):
+    # AUDIT3-C1: numeric order, not text order — 2 before 10, 11 before 100.
+    def _order(name):
+        m = TICKET_RE.match(name)
+        return (int(m.group(1)) if m else -1, name)
+
+    for name in sorted(os.listdir(tasks_dir), key=_order):
         m = TICKET_RE.match(name)
         if not m:
             continue
@@ -69,19 +70,36 @@ def _field(body, label):
     return m.group(1).strip() if m else ""
 
 
-def recorded(progress_path):
+def recorded(progress_path, warn=None):
+    """`{ticket: outcome}` of *progress_path*; *warn* gets one line when the file is not UTF-8.
+
+    Silent by default: `tools/arena/tickets.py` reads it too, inside a refusal whose stderr
+    shape is fixed (§7), and this script passes its own stderr printer.
+    """
     if not os.path.exists(progress_path) or os.path.getsize(progress_path) == 0:
         return {}
-    # a file that will not decode, a field past the csv limit or a NUL byte reads
-    # as an empty file, the way `run start`'s intake and the harvest read it
+    # A file with an over-limit csv field or a NUL byte reads as empty, as `run start`'s intake and the harvest read it; one that is not UTF-8 is read with a warning (CSV-ANSI).
     try:
-        with open(progress_path, newline="", encoding="utf-8") as fh:
-            text = fh.read()
+        # REL-2: utf-8-sig — with a spreadsheet's BOM the first header was "\ufeffticket",
+        # every row's ticket read as None, and recorded tickets were handed out again.
+        with open(progress_path, "rb") as fh:
+            raw = fh.read()
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            # CSV-ANSI: Excel's plain "CSV" saves the notes as cp1251/cp1252, and "will not
+            # decode" read as "nothing recorded" — the loop silently handed out every FIXED
+            # ticket again. The ticket and outcome columns are ASCII, so they read the same
+            # with the notes' bytes replaced; the caller says so, since append_task.py refuses it.
+            if warn is not None:
+                warn(f"warning: {progress_path} is not UTF-8 ({exc.reason} at byte {exc.start}); "
+                     f"read with the undecodable bytes replaced - re-save it as \"CSV UTF-8\"")
+            text = raw.decode("utf-8", errors="replace").removeprefix("\ufeff")
         if "\x00" in text:  # newer csv modules parse a NUL; older ones raise
             return {}
         return {(r.get("ticket") or "").strip(): (r.get("outcome") or "").strip()
                 for r in csv.DictReader(io.StringIO(text, newline=""))}
-    except (UnicodeDecodeError, csv.Error, OSError):
+    except (csv.Error, OSError):
         return {}
 
 
@@ -104,7 +122,7 @@ def main():
               file=sys.stderr)
         return 1
 
-    done = recorded(progress)
+    done = recorded(progress, warn=lambda line: print(line, file=sys.stderr))
     skipped = [t for t in tickets if not t["offered"]]
     tickets = [t for t in tickets if t["offered"]]
     todo = [t for t in tickets if t["name"] not in done]
@@ -134,15 +152,15 @@ def main():
         print("Fix this one ticket, commit it, record it with append_task.py, "
               "then run this command again for the next.")
     print("=" * 72)
-    print(f"YOUR TASK: change the CODE so that the defect described below is fixed.")
+    print("YOUR TASK: change the CODE so that the defect described below is fixed.")
     print(f"  ticket file : {os.path.join(a.tasks, nxt['name'])}  (already exists — do NOT create,")
-    print(f"                edit or rewrite it; it is the description of your task, not the deliverable)")
+    print("                edit or rewrite it; it is the description of your task, not the deliverable)")
     print(f"  code to fix : {nxt['finding'] or '(see the ticket body)'}")
-    print(f"  deliverable : one local commit that changes that code + a test that fails without it")
+    print("  deliverable : one local commit that changes that code + a test that fails without it")
     print("=" * 72)
     print(nxt["body"].rstrip())
     print("=" * 72)
-    print(f"When the fix is committed, record it:")
+    print("When the fix is committed, record it:")
     print(f"  python3 scripts/append_task.py --progress {progress} \\")
     print(f"      --ticket {nxt['name']} --outcome FIXED --commit <sha> \\")
     print(f"      --finding {nxt['finding'] or '-'}")

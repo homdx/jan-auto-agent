@@ -27,17 +27,14 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-#: The step that proves a run sees the clean checkout, not the operator's tree:
-#: `marker.txt` is committed as "dirty" at `HEAD` and uncommitted as
-#: "uncommitted" in the working tree, and `untracked.txt` exists only there.
+#: Proves a run sees the clean checkout, not the operator's tree: `marker.txt` is committed as "dirty" at HEAD and uncommitted as "uncommitted" in the working tree; `untracked.txt` exists only there.
 MARKER = (
     "import pathlib; "
     "print('marker=%s; untracked=%s' % (pathlib.Path('marker.txt').read_text().strip(), "
     "pathlib.Path('untracked.txt').exists()))"
 )
 
-#: Nine failed tests and a counts line, pytest-shaped. A step carries `pytest=True`
-#: to have them listed; the command line itself is not read for it.
+#: Nine failed tests and a counts line, pytest-shaped. A step with `pytest=True` gets them listed; the command line is not read.
 FAILED_OUT = ("import sys; " + "; ".join("print('FAILED tests/t.py::test_%d')" % d
                                          for d in range(9))
               + "; print('9 failed in 0.01s'); sys.exit(1)")

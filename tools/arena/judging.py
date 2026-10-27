@@ -44,7 +44,10 @@ LOADAVG: Callable[[], tuple[float, float, float]] = os.getloadavg
 
 def _git(repo: Path, *words: str) -> str:
     """One `git` call's stdout, stripped; empty when git fails."""
-    done = subprocess.run(["git", "-C", str(repo), *words], capture_output=True, text=True)
+    try:
+        done = subprocess.run(["git", "-C", str(repo), *words], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ""
     return done.stdout.strip() if done.returncode == 0 else ""
 
 

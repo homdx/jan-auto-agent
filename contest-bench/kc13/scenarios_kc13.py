@@ -20,8 +20,7 @@ import pytest
 
 REPO = Path(os.environ["KC13_REPO"]).resolve()
 sys.path.insert(0, str(REPO))  # ahead of the base repo's conftest/pythonpath entries
-# the base repo's conftest.py already bound `tools` to the base checkout —
-# drop it so the import below is the entry's package, not the base's
+# The base repo's conftest.py already bound `tools` to the base checkout, so drop those modules so the import below uses the entry's package.
 for _name in [m for m in sys.modules if m == "tools" or m.startswith("tools.")]:
     del sys.modules[_name]
 

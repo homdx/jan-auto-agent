@@ -57,11 +57,14 @@ library plus ``tools.contest.kilo_client``; the agent loop is ``urllib``.
 from __future__ import annotations
 
 import argparse
+import collections
+import contextlib
 import json
 import logging
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -105,22 +108,17 @@ BACKENDS = ("kilo", "openrouter")
 #: The subprocess entry point ``OpenRouterBackend.spawn_agent`` runs: this file.
 AGENT_LOOP_MODULE = "tools.contest.backend"
 
-#: The stdin/stdout record that ends a turn. The agent loop writes it once the
-#: model returns a message with no tool calls left to run.
+#: The stdin/stdout record that ends a turn, written when the model has no tool calls left.
 IDLE_SENTINEL = "idle"
 
-#: One bash command the agent loop may run, before it gives up and returns
-#: ``timeout``. Longer than ``turn_timeout_sec`` is pointless: the runner
-#: aborts the session first.
+#: Bash timeout for one agent command; longer than turn_timeout_sec would be pointless.
 _AGENT_BASH_TIMEOUT = 300.0
 
 #: ``CONTEST_AGENT_BASH_TIMEOUT`` in the agent's environment overrides the above.
 _AGENT_BASH_TIMEOUT_ENV = "CONTEST_AGENT_BASH_TIMEOUT"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the protocol
-# ─────────────────────────────────────────────────────────────────────────────
+# Protocol
 
 class ContestBackendError(Exception):
     """A backend failure that cannot be retried (mirrors KiloHttpError's role).
@@ -363,35 +361,21 @@ class ContestBackend(Protocol):
         ...
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Kilo
-# ─────────────────────────────────────────────────────────────────────────────
 
-#: Round 148: the project config a `PATCH /config` writes into the workspace.
-#: Kilo keeps the patch there, so the file outlives the turn that wrote it.
+#: Round 148: the project config a PATCH /config writes; it outlives the turn that wrote it.
 KILO_PROJECT_FILE = ".kilo/kilo.jsonc"
 
-#: Round 151: the two names that config may sit under. They are the only paths
-#: a `PATCH /config` rewrites, and therefore the only ones the guards below
-#: refuse over: a tracked ``.kilo/rules/x.md`` is the agent's own file and
-#: never blocks the push — `.kilo/.gitignore` keeps the untracked file out of
-#: the diff, and only a tracked one can land in it.
+#: Project config files a PATCH /config rewrites; only tracked copies block the push (round 151).
 KILO_PROJECT_FILE_NAMES = (".kilo/kilo.jsonc", ".kilo/kilo.json")
 
-#: Round 151: the ignore file that keeps `KILO_PROJECT_FILE_NAMES` out of the
-#: agent's tree, inside the workspace — never in git's own exclude (see
-#: `_exclude_kilo_dir` for why there is no exclude ours alone to write to).
+#: Ignore file, kept in the workspace, that hides the project config files (round 151).
 _KILO_IGNORE_PATH = (".kilo", ".gitignore")
 
-#: Its whole content: the two names a `PATCH /config` writes, and its own name,
-#: so the file hides itself too and `git add -A` stages none of ours. A rule
-#: file the agent adds in `.kilo/` is not among those names and stays committable.
+#: Contents of the ignore file: the project config names and its own name (round 151).
 _KILO_IGNORE_LINES = ("kilo.jsonc", "kilo.json", ".gitignore")
 
-#: Round 151: how long the guards wait for `git`. The check runs once per
-#: remembered size per agent, so a short bound is enough — and a `git` that
-#: cannot read its own index will not answer in any time at all, which is
-#: exactly why the caller has to refuse rather than wait longer.
+#: Seconds the guards wait for git; a git that cannot read its index must refuse (round 151).
 _KILO_GIT_TIMEOUT = 10.0
 
 
@@ -626,12 +610,7 @@ def _exclude_kilo_dir(directory: str) -> None:
     the missing names are appended to it; one that is tracked, or does not hide
     itself, is still the agent's and is still only warned about.
     """
-    # round 155: no per-directory memory of a file already in place — the
-    # agent's `git clean -fdx` or `rm -rf .kilo`, or the drop at the end of a
-    # leg, removes it behind any cache, and Kilo's reload then writes its own
-    # without the project names. One read per push (once per size) is nothing.
-    # round 148's contract: a directory that is not a git checkout has no diff
-    # to keep anything out of, and nothing is written there
+    # Checked on every push, since the agent or a leg can remove the file behind any cache (round 155, round 148).
     ok, inside = _git(directory, "rev-parse", "--is-inside-work-tree",
                       timeout=_KILO_GIT_TIMEOUT)
     if not ok or inside != "true":
@@ -695,10 +674,7 @@ def _drop_kilo_ignore(directory) -> None:
         pass
 
 
-#: Round 160: the least time `_reconnect_tap` gives the old tap to exit after
-#: its stop — the stop shuts the socket, so the reader is gone well inside it.
-#: Not cut by the reconnect's deadline: a join of zero is what left two taps
-#: on one log.
+#: Least time the old tap gets to exit after its stop; a zero join left two taps on one log (round 160).
 _OLD_TAP_JOIN_SEC = 2.0
 
 
@@ -726,21 +702,14 @@ class KiloBackend:
             if not events_log:
                 raise ContestBackendError("KiloBackend needs an events_log path for its tap")
             tap = EventTap(base, directory, events_log).start()
-            # round 145/151: what a reconnect after `set_model_limit` needs to
-            # rebuild this backend's own tap. Only set when the backend built
-            # the tap: an injected `tap=` is the caller's, and `_tap_args is
-            # None` is the marker that leaves it alone instead of rebuilding
-            # over it — which also keeps `server.base_url` unread for one that
-            # has none to read.
+            # Arguments to rebuild this backend's tap after a reconnect; set only when it built the tap (round 145, round 151).
             tap_args = (base, directory, events_log)
         self._client = client
         self._tap = tap
         self._directory = directory
         self._tap_args = tap_args
         self._interrupted = False
-        # round 151: held by `_reconnect_tap` and `interrupt` alike, so a Ctrl-C
-        # between "stop the old tap" and "publish the new one" cannot leave two
-        # live readers on one stream and a wait that no one will wake
+        # Held by the tap reconnect and by interrupt, so two readers never share a stream (round 151).
         self._tap_lock = threading.Lock()
 
     # ── the protocol ────────────────────────────────────────────────────────
@@ -815,10 +784,7 @@ class KiloBackend:
             self._client.set_model_limit(provider_id, model_id, limit)
         except KiloHttpError as exc:
             raise ContestBackendError(str(exc)) from exc
-        # the patch landed, so Kilo now holds the window: only this round's
-        # stream of it is left to fix, and it comes back as
-        # `KiloTapReconnectError` — never as the plain error a caller would
-        # read as "the window was not handed over"
+        # After the patch lands, a tap failure is reported as KiloTapReconnectError (round 151).
         with self._tap_lock:
             before = self._tap
         try:
@@ -945,15 +911,11 @@ class KiloBackend:
             return
         deadline = time.monotonic() + max(0.0, float(settle))
         base, directory, log = self._tap_args
-        # round 159: the lock covers reading and publishing `self._tap` only.
-        # The waits and the start below run without it, so an `interrupt()`
-        # (Ctrl-C) never waits on a reload — 151 held it across all of them,
-        # up to *settle* seconds and the whole of a start that hangs.
+        # The lock covers only reading and publishing the tap, so an interrupt never waits on a reload (round 159).
         with self._tap_lock:
             old = self._tap
             if self._interrupted:
-                # a Ctrl-C before the reconnect: no new stream is opened for a
-                # backend that is being given up
+                # A Ctrl-C before the reconnect opens no new stream for a backend being given up.
                 old.stop()
                 return
         left = max(0.0, deadline - time.monotonic())
@@ -973,9 +935,7 @@ class KiloBackend:
         try:
             new_tap = self._start_tap(base, directory, log)
         except KiloTapReconnectError:
-            # the wait above consumed the old tap's one `tap.closed`: the
-            # next caller's wait on it must still wake at once, not sit out
-            # its silence clock. Memory only — its log is closed by now.
+            # Re-record the closed tap so the next wait on it still wakes at once (round 151).
             old._close_with("the event stream could not be reopened after "
                             "the config reload")
             raise
@@ -983,9 +943,7 @@ class KiloBackend:
             self._tap = new_tap
             interrupted = self._interrupted
             if interrupted:
-                # an interrupt that came while the new tap was being started
-                # stopped the old one; this one is stopped here, under the lock
-                # it would have taken
+                # An interrupt during the start stopped the old tap, so the new one is stopped here too.
                 new_tap.stop()
         if interrupted:
             # stopped above: when this returns, no tap thread of ours runs on
@@ -999,9 +957,7 @@ class KiloBackend:
         except Exception:  # noqa: BLE001 — the stream is open; the event is a courtesy
             seen = None
         if seen is not None and seen.get("type") == "tap.closed":
-            # an interrupt (or the stream's end) landed during this wait, which
-            # consumed its `tap.closed`: record it again, so the caller's next
-            # wait on this tap still wakes at once
+            # An interrupt during this wait consumed the close signal, so record it again.
             new_tap._close_with((seen.get("properties") or {}).get("error") or "stopped")
             return
         connected = seen is not None
@@ -1016,8 +972,7 @@ class KiloBackend:
             _LOG.warning("abort(%r) failed: %s", getattr(session, "id", session), exc)
 
     def interrupt(self, session: SessionRef | None = None) -> None:
-        # round 151: the same lock `_reconnect_tap` holds, so the tap being
-        # stopped is always the one that is or is about to be published
+        # The same lock as _reconnect_tap, so the tap being stopped is the one that is or will be published (round 151).
         with self._tap_lock:
             self._interrupted = True
             self._tap.stop()
@@ -1035,22 +990,19 @@ class KiloBackend:
                   quota_re: "re.Pattern | None" = None,
                   max_retry_attempts: int | None = None,
                   quiet_after: float | None = None) -> IdleResult:
-        # KC-36: the callback goes over only when it is armed — `None` keeps
-        # this call byte for byte what it was, for a client that predates it.
+        # The callback is sent only when armed, so an older client gets the same call (KC-36).
         client_kwargs = {"idle_event_timeout": idle_event_timeout,
                          "on_permission": on_permission, "on_question": on_question}
         if on_deadline is not None:
             client_kwargs["on_deadline"] = on_deadline
         if since is not None:
             client_kwargs["since"] = since
-        # KC-61: same — the retry bound and the quota phrases go over only when
-        # they are armed, so a client that predates them gets today's call.
+        # The retry bound and quota phrases are sent only when armed, for older clients (KC-61).
         if max_retry_wait is not None:
             client_kwargs["max_retry_wait"] = max_retry_wait
         if quota_re is not None:
             client_kwargs["quota_re"] = quota_re
-        # KC-64: the same way — a limit of 0 is off and goes over as no limit
-        # at all, so a client that predates it gets today's call.
+        # A limit of 0 is off and is not sent, so an older client gets the same call (KC-64).
         if max_retry_attempts:
             client_kwargs["max_retry_attempts"] = max_retry_attempts
         # KC-73: the same — armed only after an overflow, never on a turn
@@ -1073,16 +1025,7 @@ class KiloBackend:
             self._tap.join(2.0)
 
 
-#: How long `_wait_for_stream` waits for a tap's reader to open its stream.
-#:
-#: FL-1 (round 84) family C4: an event published before the stream is open is
-#: *lost*, and the first one is the session's own. A round that prompts and
-#: then emits into a tap nobody is reading gets a silence clock that has seen
-#: nothing at all — which is indistinguishable from a session that went quiet.
-#:
-#: 5 s was a wall-clock bet on how fast a thread opens an HTTP connection, and
-#: the operator's 32-worker stress run walks through bets that size. The
-#: equivalent handshake in the contest tests is 30 s for that reason.
+#: Seconds to wait for a tap's reader to open its stream; an early event would be lost (FL-1).
 STREAM_CONNECT_TIMEOUT_S = 30.0
 
 
@@ -1115,12 +1058,9 @@ def _wait_for_stream(tap: EventTap, timeout: float = STREAM_CONNECT_TIMEOUT_S) -
     return connected
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OpenRouter — a subprocess agent loop
-# ─────────────────────────────────────────────────────────────────────────────
+# OpenRouter agent loop (a subprocess)
 
-#: The queue item that means "the agent's stdout ended". Not ``None``: that is
-#: what ``_next_line`` already uses for "nothing in time".
+#: Queue item for the end of the agent's stdout; None is reserved for "nothing in time".
 _EOF = object()
 
 
@@ -1142,10 +1082,10 @@ class _AgentRecord:
         self.messages: list = []
         self.input_tokens = 0
         self.output_tokens = 0
-        # One line per turn of the agent's stdout, `None` when the process is
-        # gone. A queue and a reader thread, not a blocking `readline()`:
-        # `wait_idle` must be able to time out while a line is still coming.
+        # One line per agent stdout line, or None at exit; a queue, so wait_idle can time out.
         self.lines: "queue.Queue" = queue.Queue()
+        # AUDIT3-9b: the last lines the agent wrote to stderr, kept for diagnosis.
+        self.stderr_tail: "collections.deque" = collections.deque(maxlen=200)
         self.reader: "threading.Thread | None" = None
 
 
@@ -1196,9 +1136,7 @@ class OpenRouterBackend:
         self._timeout = float(timeout)
         self._max_steps = int(max_steps)
         self._spawn_agent = spawn_agent
-        #: KC-65: the round's env, applied after `dict(os.environ)` so the
-        #: agents' pytest reads the round's worker count too — without it the
-        #: rule is a Kilo-only rule, and this backend is the other half of it.
+        # Round environment, applied after os.environ so pytest sees the worker count (KC-65).
         self._extra_env = dict(extra_env) if extra_env else None
         self._records: dict = {}
         self._interrupted = False
@@ -1212,11 +1150,11 @@ class OpenRouterBackend:
                        rules: list, title: str,
                        agent: str | None = None,
                        variant: str | None = None) -> SessionRef:
-        # the subprocess agent loop has no reasoning-variant knob: the variant
-        # is kept on the ref, so the round's record says what was asked, and
-        # nothing else changes
+        # AUDIT-18: the variant reaches the model too, as OpenRouter's
+        # ``reasoning.effort`` (see `_reasoning_effort`); it used to be kept on
+        # the ref only, so the round record named a variant the run never used.
         sid = f"openrouter-{model_id or title or 'agent'}"
-        record = self._spawn_one(sid, provider_id, model_id, agent)
+        record = self._spawn_one(sid, provider_id, model_id, agent, variant=variant or None)
         self._records[sid] = record
         return SessionRef(id=sid, provider_id=provider_id, model_id=model_id,
                           directory=self._directory, agent=agent, variant=variant or None)
@@ -1230,16 +1168,11 @@ class OpenRouterBackend:
                                 "parts": [{"type": "text", "text": text}]})
 
     def compact(self, session: SessionRef) -> None:
-        # The subprocess agent holds its own transcript and there is no session on a
-        # server to compact: it keeps every message it has ever had, so the runner's
-        # context fill (KC-67) never sees a size for it and never compacts it.
-        # Nothing changes, by design — the runner reads no fill out of a session
-        # that reports no tokens, which is "no collect data", not a failure.
+        # No compaction: the subprocess agent keeps its whole transcript and reports no token fill (KC-67).
         return None
 
     def mark(self) -> int | None:
-        # KC-63: each session reads its own subprocess stdout, so no other
-        # turn's events can reach a wait; there is nothing to mark
+        # Each session reads its own stdout, so no other turn's events reach a wait (KC-63).
         return None
 
     def abort(self, session: SessionRef) -> None:
@@ -1313,13 +1246,11 @@ class OpenRouterBackend:
             else:
                 left = overall_left
             if left <= 0:
-                # KC-36: the turn deadline asks first; the silence clock never
-                # does — the same race as on a Kilo session.
+                # The turn deadline asks first; the silence clock never does (KC-36).
                 quiet = silence is not None and (silence - (now - last_seen)) <= 0
                 if not quiet and overall_left <= 0 and on_deadline is not None:
                     grant = _deadline_grant(on_deadline, time.monotonic() - started)
-                    # a grant that leaves the deadline in the past would just
-                    # ask again in a hot loop of churn reads — abort instead
+                    # A grant that leaves the deadline in the past aborts, rather than re-asking in a hot loop.
                     if grant is not None and deadline + grant > time.monotonic():
                         deadline += grant
                         continue
@@ -1352,8 +1283,7 @@ class OpenRouterBackend:
                     reply, message = "reject", f"policy failed: {type(exc).__name__}"
                     granted = 0.0
                 if granted > 0:
-                    # KC-66: the gate's own waits are the agent's time back;
-                    # KC-58: so is a suite's wait for its round-wide slot
+                    # The gate's waits and the round-wide suite waits are given back to the turn (KC-66, KC-58).
                     deadline += granted
                 # KC-58: never silent while the runner held the permission
                 last_seen = time.monotonic()
@@ -1417,7 +1347,7 @@ class OpenRouterBackend:
                 f"no session {session.id!r} on this backend") from exc
 
     def _spawn_one(self, sid: str, provider_id: str, model_id: str,
-                   agent: str | None) -> _AgentRecord:
+                   agent: str | None, *, variant: str | None = None) -> _AgentRecord:
         if self._spawn_agent is not None:
             spawned = self._spawn_agent(self._base_url, model_id, self._directory,
                                         self._api_key, self._timeout, self._max_steps)
@@ -1438,6 +1368,8 @@ class OpenRouterBackend:
                 "--base-url", self._base_url, "--model", str(model_id),
                 "--directory", self._directory, "--max-steps", str(self._max_steps),
                 "--request-timeout", f"{self._timeout:g}"]
+        if variant:
+            argv += ["--variant", str(variant)]
         env = dict(os.environ)
         if self._extra_env:
             env.update(self._extra_env)
@@ -1452,7 +1384,23 @@ class OpenRouterBackend:
                                   name="contest-agent-read")
         record.reader = thread
         thread.start()
+        # AUDIT3-9b: stderr is a pipe too, and nothing read it: once the agent
+        # had written a pipe's worth (~64 KiB of warnings or a traceback) its
+        # next write blocked forever and the turn hung until the silence clock.
+        threading.Thread(target=self._drain_stderr, args=(record, getattr(proc, "stderr", None)),
+                         daemon=True, name="contest-agent-stderr").start()
         return record
+
+    @staticmethod
+    def _drain_stderr(record: _AgentRecord, stream) -> None:
+        """Read the agent's stderr to its end, keeping the last lines."""
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                record.stderr_tail.append(line.rstrip("\r\n"))
+        except (OSError, ValueError):
+            pass
 
     @staticmethod
     def _write(record: _AgentRecord, payload: dict) -> None:
@@ -1521,9 +1469,7 @@ class OpenRouterBackend:
                 pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the agent loop — the subprocess OpenRouterBackend spawns
-# ─────────────────────────────────────────────────────────────────────────────
+# The agent loop run by the OpenRouter subprocess
 
 _AGENT_SYSTEM = """\
 You implement one ticket in this directory. It is the whole of your working
@@ -1584,14 +1530,131 @@ def _agent_tools() -> list:
     ]
 
 
+#: the signals that stop the agent: Ctrl-C, and the runner's abort (`proc.terminate()`)
+_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+@contextlib.contextmanager
+def _stop_signals_held():
+    """Hold a stop signal that arrives inside the block; yields the list of those that did.
+
+    The caller re-raises them (``signal.raise_signal``) once it can clean up, so the
+    handler that was in place still runs, just later. Off the main thread, where
+    no handler can be set, nothing is held; neither is a signal whose handler is not
+    Python's (ignored, or the default that ends the process anyway).
+    """
+    held: list = []
+    if threading.current_thread() is not threading.main_thread():
+        yield held
+        return
+    previous = {}
+    for signum in _STOP_SIGNALS:
+        handler = signal.getsignal(signum)
+        if callable(handler):
+            previous[signum] = handler
+            signal.signal(signum, lambda num, frame: held.append(num))
+    try:
+        yield held
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
+    """``bash -c command`` in its own process group: ``(returncode, stdout, stderr)``.
+
+    AUDIT-6: ``subprocess.run(..., capture_output=True, timeout=...)`` kills
+    only ``bash`` on a timeout and then waits for the pipes to close — and a
+    background child (``sleep 999 &``, a dev server) still holds them, so the
+    "timeout" waited as long as that child lived; with no timeout hit, a child
+    that kept the pipes open held the turn just the same. Output now goes to
+    temporary files, which nobody waits on, and the call returns when ``bash``
+    exits. On a timeout the whole process group is killed, then
+    ``TimeoutExpired`` is raised. A child that ``bash`` left running after a
+    normal exit is left alone, as before (a server the agent started on
+    purpose); it just no longer blocks the call.
+    """
+    import tempfile
+
+    posix = os.name != "nt"
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = None
+        try:
+            # CTRL-C-START: bash may already run while Popen has not returned (or
+            # `try:` is not reached yet); a Ctrl-C there escaped the kill below and
+            # left the command running. It is held until `proc` is known — and so
+            # is the runner's SIGTERM (AGENT-TERM).
+            with _stop_signals_held() as held:
+                proc = subprocess.Popen(["bash", "-c", command], cwd=cwd,
+                                        stdout=out_f, stderr=err_f,
+                                        stdin=subprocess.DEVNULL,
+                                        start_new_session=posix)
+            for signum in dict.fromkeys(held):
+                signal.raise_signal(signum)
+            proc.wait(timeout=timeout)
+        except BaseException:
+            # CC review fixes 49: not only a timeout — a Ctrl-C (KeyboardInterrupt)
+            # or any other exit of the wait kills the group too. In its own session
+            # the command no longer gets the terminal's SIGINT, so it kept running
+            # after the round was stopped, with no timeout left to end it.
+            if proc is None:
+                raise
+            try:
+                if posix:
+                    os.killpg(proc.pid, 9)
+                else:
+                    proc.kill()
+            except OSError:
+                pass
+            proc.wait()
+            raise
+        out_f.seek(0)
+        err_f.seek(0)
+        out = out_f.read().decode("utf-8", "replace")
+        err = err_f.read().decode("utf-8", "replace")
+    return proc.returncode, out, err
+
+
+#: Kilo-style variant names → OpenRouter ``reasoning.effort`` (AUDIT-18).
+_EFFORT_OF_VARIANT = {"minimal": "minimal", "low": "low", "medium": "medium",
+                      "high": "high", "xhigh": "xhigh", "max": "xhigh"}
+
+
+def _reasoning_effort(variant) -> "str | None":
+    """The ``reasoning.effort`` a session's *variant* asks for, or None.
+
+    ``None`` / empty / ``highest`` (resolved away before an openrouter round
+    starts) send nothing, as before. A name this table does not know is not
+    guessed at: it is reported on stderr and nothing is sent, so the round's
+    log says the variant was not applied rather than the run silently using
+    the provider default.
+    """
+    if not isinstance(variant, str) or not variant.strip():
+        return None
+    name = variant.strip().lower()
+    if name == "highest":
+        return None
+    effort = _EFFORT_OF_VARIANT.get(name)
+    if effort is None:
+        print(f"contest agent: reasoning variant {variant!r} has no OpenRouter "
+              f"reasoning.effort — the provider default is used", file=sys.stderr)
+    return effort
+
+
+class _AgentStopped(Exception):
+    """The runner aborted, or went away, while a turn waited on it (AGENT-ABORT)."""
+
+
 class _Agent:
     """The loop: read a prompt, call the model, run its tool calls, say ``idle``."""
 
     def __init__(self, base_url: str, api_key: str, model: str, directory: str, *,
-                 max_steps: int = 24, request_timeout: float = 300.0) -> None:
+                 max_steps: int = 24, request_timeout: float = 300.0,
+                 variant: str | None = None) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
+        self._effort = _reasoning_effort(variant)
         self._directory = directory
         self._max_steps = max(1, int(max_steps))
         self._timeout = float(request_timeout)
@@ -1620,6 +1683,11 @@ class _Agent:
         call, with the path in ``patterns`` — the same three sources
         ``policy._extract_paths`` reads, so the mechanical layer decides a
         write inside the worktree on its own and never costs a gate call.
+
+        AGENT-ABORT: an ``abort`` line, or the end of stdin, raises
+        ``_AgentStopped`` and ends the turn. Both used to be a refusal of this one
+        call, after which the turn went on asking the model (and the runner) for
+        up to ``max_steps`` more paid steps of an entrant already stopped.
         """
         pid = f"{call_id}-{name}"
         if name == "bash":
@@ -1638,13 +1706,13 @@ class _Agent:
         while True:
             line = self._ask()
             if line is None:
-                return "reject", "the runner went away"
+                raise _AgentStopped("the runner went away")
             if line.get("type") == "permission.reply":
                 reply = line.get("reply") if line.get("reply") in ("once", "reject") else "reject"
                 message = str(line.get("message") or "")
                 break
             if line.get("type") == "abort":
-                return "reject", "aborted"
+                raise _AgentStopped("aborted")
         return reply, message
 
     # ── the model ───────────────────────────────────────────────────────────
@@ -1657,6 +1725,8 @@ class _Agent:
         payload = {"model": self._model, "messages": self._messages,
                    "tools": _agent_tools(), "tool_choice": "auto",
                    "temperature": 0.2, "max_tokens": 4096}
+        if self._effort:
+            payload["reasoning"] = {"effort": self._effort}
         data = json.dumps(payload, ensure_ascii=False).encode()
         headers = {"Content-Type": "application/json"}
         if self._api_key:
@@ -1697,7 +1767,7 @@ class _Agent:
     # ── the tools ───────────────────────────────────────────────────────────
 
     def _tool_result(self, name: str, call_id: str, args: dict) -> tuple:
-        """One tool call: ``(status, output text)``. Never raises."""
+        """One tool call: ``(status, output text)``. Raises only ``_AgentStopped``."""
         if name == "bash":
             command = str(args.get("command") or "")
             if not command:
@@ -1706,19 +1776,18 @@ class _Agent:
             if reply != "once":
                 return "error", (message or "the reviewer refused this command")
             try:
-                proc = subprocess.run(["bash", "-c", command], cwd=self._directory,
-                                      capture_output=True, text=True,
-                                      timeout=_bash_timeout())
+                returncode, out, err = _run_bash_group(command, self._directory,
+                                                       _bash_timeout())
             except subprocess.TimeoutExpired:
                 return "error", f"timed out after {_bash_timeout():g}s: {command}"
             except (OSError, ValueError) as exc:
                 return "error", f"{type(exc).__name__}: {exc}"
-            text = proc.stdout or ""
-            if proc.stderr:
-                text += ("\n" if text else "") + "stderr:\n" + proc.stderr
-            if proc.returncode:
-                text = f"exit {proc.returncode}\n" + text.strip()
-            return ("completed" if proc.returncode == 0 else "error"), text
+            text = out or ""
+            if err:
+                text += ("\n" if text else "") + "stderr:\n" + err
+            if returncode:
+                text = f"exit {returncode}\n" + text.strip()
+            return ("completed" if returncode == 0 else "error"), text
 
         path = str(args.get("path") or "")
         if not path or path.startswith("/") or ".." in path.split("/"):
@@ -1787,7 +1856,10 @@ class _Agent:
                 except (json.JSONDecodeError, ValueError):
                     args = {}
                 call_id = str(call.get("id") or f"{step}.{index}")
-                status, output = self._tool_result(name, call_id, args)
+                try:
+                    status, output = self._tool_result(name, call_id, args)
+                except _AgentStopped:
+                    return False
                 self._say({"type": "tool", "tool": name,
                            "state": {"status": status, "input": args,
                                      "output": str(output)}})
@@ -1809,6 +1881,10 @@ def _loads(line) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _exit_on_sigterm(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def agent_loop(argv=None) -> int:
     """``python3 -m tools.contest.backend --agent-loop …`` — the subprocess."""
     parser = argparse.ArgumentParser(prog="tools.contest.backend --agent-loop")
@@ -1818,10 +1894,16 @@ def agent_loop(argv=None) -> int:
     parser.add_argument("--directory", required=True)
     parser.add_argument("--max-steps", type=int, default=24)
     parser.add_argument("--request-timeout", type=float, default=300.0)
+    parser.add_argument("--variant", default=None)
     args = parser.parse_args(argv)
+    # AGENT-TERM: the runner's abort is `proc.terminate()`. With the default SIGTERM the
+    # process ended on the spot and a command it was running — in its own session, so
+    # not signalled with it — lived on (a dev server, a test run). Raised as SystemExit,
+    # it goes through `_run_bash_group`'s cleanup, which kills the command's group.
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
     _Agent(args.base_url, os.environ.get("CONTEST_AGENT_API_KEY", ""), args.model,
            args.directory, max_steps=args.max_steps,
-           request_timeout=args.request_timeout).run()
+           request_timeout=args.request_timeout, variant=args.variant).run()
     return 0
 
 

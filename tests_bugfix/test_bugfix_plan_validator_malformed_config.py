@@ -96,8 +96,7 @@ api_format = openai
     def test_valid_config_still_builds_validator(self):
         """Sanity: the happy path must still build a validator."""
         cfg = _base_cfg()
-        # The validator is a ClusterReviewer; building it requires an LLM
-        # call only at validate_plan time, not at construction time.
+        # Building the validator needs no LLM call; that happens only at validate_plan time.
         result = _build_plan_validator(cfg, "creative")
         assert result is not None
 
@@ -121,10 +120,7 @@ class TestPlanMaxRevisionsMalformedMaxRewrites:
         cfg["architect"]["plan_max_revisions"] = "2"
         cfg["architect"]["max_rewrites"] = "not_a_number"
 
-        # _run_plan_phase needs a controller-like object; we only need
-        # to get past the plan_max_revisions read without crashing, so
-        # a minimal mock with the attributes _run_plan_phase accesses
-        # before that point is enough.
+        # A minimal mock with the attributes _run_plan_phase reads before the revision limit.
         agent_dir = tmp_path / ".agent"
         agent_dir.mkdir()
         state = MagicMock()
@@ -145,9 +141,7 @@ class TestPlanMaxRevisionsMalformedMaxRewrites:
             _get_collect_bridge=lambda mode: None,
         )
 
-        # The plan validator must return None so the revision loop is
-        # skipped — otherwise _run_plan_phase would try to call
-        # validate_plan on it and crash for a different reason.
+        # The plan validator returns None, so the revision loop is skipped.
         from tools.auto.backlog_prioritiser import PrioritisedBacklog
 
         def _noop_backlog(candidates, task_id_prefix="AUTO-T"):

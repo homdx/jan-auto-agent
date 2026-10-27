@@ -27,13 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.arena import tickets
 
 
-# A ticket that may hold a `**Closed:**` line above the `**Status:**` line: the shape that
-# cut the wrong text.
+# Regression: a `**Closed:**` line above `**Status:**` cut the wrong text.
 CLOSED_ABOVE = "# T\n**Closed:** superseded\n**Status:** closed\n**File:** pkg/a.py\n"
 
-#: The tickets `close` then `reopen` must return unchanged — with or without a blank line,
-#: with or without a trailing newline. A status note is out of the round trip on purpose:
-#: `close` writes the word alone, so the note goes with it (see the test below).
+#: close then reopen must round-trip unchanged, with or without a blank line or trailing newline.
 ROUND_TRIPS = [
     "# T\n**Status:** open\n\nbody\n",
     "# T\n**Status:** open\n**File:** pkg/a.py\n",

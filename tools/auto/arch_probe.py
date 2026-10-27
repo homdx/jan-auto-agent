@@ -65,85 +65,33 @@ from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
-# Recognised on its own line, at the end of an Architect response. Mirrors
-# coder.py's existing ``CONTEXT_REQUEST:`` convention rather than introducing a
-# second protocol shape.
+# The probe line, on its own line at the end of an Architect response (same convention as coder.py's CONTEXT_REQUEST).
 PROBE_PREFIX = "ARCH_PROBE:"
 
-# Upper bound on ops honoured from a single request — matches the cap
-# coder.py::_extract_context_request_prose applies to CONTEXT_REQUEST names.
-# A model that asks for 40 symbols has not understood the question; answering
-# the first 8 and letting it re-ask is both cheaper and more informative than
-# resolving all 40.
+# Max ops honoured per request; a model asking for dozens has not understood the question.
 _MAX_OPS = 8
 
-# AUTO-P7: lines returned by a `read` with no explicit range. Enough to see a
-# function and its neighbours, small enough that a whole-file read cannot
-# spend the batch's entire digest budget on one op.
+# Lines returned by a read with no range: enough for a function and its neighbours, not a whole file (AUTO-P7).
 _READ_MAX_LINES = 120
 
-# AUTO-P8: what to do when a probe round is cut short by the digest cap.
-# Each entry is (digest-cap multiplier, temperature) for one escalated
-# re-ask, applied in order. Modelled on AUTO-H5-ESCALATE-1, which already
-# escalates max_tokens/temperature for an unsalvageable response — this is
-# the same idea for a response that was fine but could not be *answered* in
-# full.
-#
-# The order is deliberate. Step 1 gives more room at temperature 0, because
-# what we need is the SAME request re-issued so the larger budget serves the
-# ops that were dropped; a re-roll at higher temperature would ask something
-# else and waste the room. Step 2 keeps the room and raises temperature,
-# because if step 1 produced a byte-identical loop the determinism is the
-# problem, not the budget. Step 3 goes back to temperature 0 with more room
-# still, for the case where step 2 broke the loop into a genuinely bigger
-# request.
+# Digest-cap escalation: each rung is (digest-cap multiplier, temperature); rung 1 keeps temperature 0 so the same request gets a larger budget (AUTO-P8).
 _BUDGET_ESCALATION_LADDER = (
     (2.0, 0.0),
     (2.0, 0.7),
     (4.0, 0.0),
 )
 
-# AUTO-P9: the ladder used once the run has measured a working cap
-# (ArchProbe.seeded_cap). Pure budget, no temperature rung — see the comment
-# at its use site in architect.py. Rungs are larger because a seeded batch
-# that still overflows is genuinely an outlier, not a mis-set floor.
+# Budget-only ladder, used once a working cap has been measured (AUTO-P9).
 _BUDGET_ONLY_LADDER = (
     (1.5, 0.0),
     (2.5, 0.0),
     (4.0, 0.0),
 )
 
-# Ops the Phase 0 executor can actually answer. Anything else parses to
-# nothing, so an unrecognised op degrades to "not a probe" rather than to a
-# probe the executor will silently no-op on.
+# Ops the Phase 0 executor can answer; an unknown op parses to nothing rather than a probe that silently no-ops.
 DEFAULT_ALLOWED_OPS: tuple[str, ...] = ("facts",)
 
-# Appended to the Architect's user message when probing is available. Kept
-# short on purpose: the surrounding prompt is already long, and every token
-# here competes with the file contents the model is meant to be reviewing.
-# AUTO-P4b: the shape rules below are not decoration. In the first two real
-# runs the model asked for 19 distinct names and only 2 existed: the rest were
-# config keys (`max_attempts_per_task`), module paths (`tools.llm_stream`),
-# methods (`InnerLoop.run_task`), and plain guesses at what a helper "should"
-# be called (`backoff`, `retry`, `_retry`, `attempt`, `retry_loop`). Collect
-# indexes TOP-LEVEL functions and classes only — no methods, no config keys —
-# so every one of those was unanswerable by construction, and the model had
-# never been told what kind of name it could ask for.
-#
-# AUTO-P5 then found that telling it was not enough for one whole class of
-# request: 7 of the 9 unresolved lookups across two later runs were
-# `facts backoff` or `facts retry`, where the model wanted a FILE
-# (tools/backoff.py) or a concept. Naming the restriction does not help when
-# the thing you need cannot be expressed at all, so `module <path>` was added
-# to make that question askable rather than merely forbidden.
-# AUTO-F1-followup: a measured run (trace_8c83140453d5) found EVERY single
-# "repeat" decline was a re-ask of something that had already come back
-# WITH an answer — specifically, an out-of-batch `module` hit the model
-# could not cite, re-asked verbatim next round. The line below used to warn
-# only about repeating an EMPTY result ("already came back empty"), which
-# is silent on the far more common real case: repeating something that DID
-# resolve. See _out_of_batch_note()'s own updated wording for the other
-# half of this fix.
+# Prompt text added to the Architect when probing is on: short, with the shape rules that stopped unanswerable names (AUTO-P4b, P5, F1-followup).
 PROBE_INSTRUCTIONS = (
     "\nIF — and only if — you cannot ground a task because you are missing a "
     "fact about a symbol that is NOT shown above, you may reply with a single "
@@ -186,9 +134,7 @@ PROBE_INSTRUCTIONS = (
     "returned."
 )
 
-# Appended instead of PROBE_INSTRUCTIONS on the final call, once the probe
-# budget is spent. Without this the model can keep probing forever; with it,
-# the harness — not the model — decides that asking is over.
+# Used instead of PROBE_INSTRUCTIONS once the probe budget is spent, so the harness, not the model, ends the probing.
 FORCED_SUFFIX = (
     "\nNOTE: the context-probe budget for this batch is spent. No further "
     "ARCH_PROBE requests will be answered. Produce the JSON array now using "
@@ -266,9 +212,7 @@ def extract_probe_request(
             item = part.strip().strip(".\"'`")
             if not item:
                 continue
-            # "<op> <arg>" — split on the FIRST run of whitespace only, so an
-            # arg that itself contains a space (a future "read path 10:20"
-            # form) survives intact for the executor to reject or handle.
+            # Split on the first whitespace only, so an argument that contains a space survives for the executor to judge.
             bits = item.split(None, 1)
             if len(bits) != 2:
                 continue
@@ -278,8 +222,7 @@ def extract_probe_request(
                 continue
             ops.append(ProbeOp(op, arg))
 
-    # Deduplicate, preserve order, cap — matches
-    # coder.py::_extract_context_request_prose.
+    # Deduplicates and caps the ops in order, as coder.py does.
     deduped: list[ProbeOp] = list(dict.fromkeys(ops))
     return deduped[:_MAX_OPS]
 
@@ -319,57 +262,24 @@ class ArchProbe:
         memo_max_entries: int = 200,
     ) -> None:
         self._bridge = collect_bridge
-        # AUTO-P7: `read` is the first op that touches the filesystem rather
-        # than the collect artifact, so it needs a root to contain paths
-        # against. None disables the op entirely — an unconstrained read is
-        # not a degraded feature, it is a path-traversal hole.
+        # read is the first op that touches the filesystem, so it needs a root; without one the op is disabled, not unconstrained (AUTO-P7).
         self._base_dir = Path(base_dir).resolve() if base_dir else None
-        # AUTO-P7: the files this batch was actually shown. Results sourced
-        # from anywhere else get a marker, because Gate-1 rejects a
-        # cited_location outside the batch as a hallucinated path — two such
-        # rejections in the last measured run, and the count doubled when
-        # AUTO-P5 widened out-of-batch knowledge.
+        # Results from outside the batch get a marker, since Gate 1 rejects citations outside the batch (AUTO-P7).
         self._batch_files = frozenset(str(f) for f in (batch_files or ()))
         self._max_chars = max(200, int(max_chars))
         self._max_total_chars = max(self._max_chars, int(max_total_chars))
-        # AUTO-P4a: per-BATCH, reset by reset() at the top of every batch.
-        # Before AUTO-P4a this counter was created once with the instance and
-        # never cleared, while the instance itself is memoized on the
-        # ClusterReviewer for the whole run — so `max_total_chars` silently
-        # behaved as a per-RUN cap. On a long run the probe stopped answering
-        # partway through and stayed off, which in the logs is indistinguishable
-        # from "the model stopped asking". The digest is appended to ONE batch's
-        # prompt, so the context-window budget it protects is per batch.
+        # Per-batch digest budget: reset() clears it, since the digest is appended to one batch's prompt (AUTO-P4a).
         self._chars_used = 0
-        # AUTO-P8: the configured cap, preserved so raise_budget() can multiply
-        # it rather than the current (possibly already-raised) value, and so
-        # reset() can restore it between batches.
+        # The configured cap, kept so raise_budget() multiplies the base and reset() can restore it (AUTO-P8).
         self._base_total_chars = self._max_total_chars
-        # AUTO-P4b: per-round outcome of the LAST execute() call, so callers
-        # can report "symbols found" instead of "digests produced" — the
-        # distinction that hid a 60/60 miss rate behind "22 resolved".
+        # Symbols found by the last execute(), not digests produced (AUTO-P4b).
         self._last_hits = 0
         self._last_misses = 0
-        # AUTO-P5: {op_name: [hits, misses]} for the last execute(). Aggregate
-        # hit/miss cannot answer "which op is pulling its weight" once there is
-        # more than one op, and that is precisely the question the next
-        # scope decision (refs? read?) turns on. Recording it per type costs
-        # one dict and makes the decision measurable instead of arguable.
+        # Per-op hits and misses for the last execute(), so each op's value is measurable (AUTO-P5).
         self._last_by_op: dict = {}
-        # AUTO-P8: ops the last execute() never ran because the digest cap was
-        # already spent. Before this they were dropped with only a log line —
-        # the model was never told, so it planned as though it had been
-        # answered. A real run lost `read main.py:100-200` exactly this way.
+        # Ops the last execute() skipped because the cap was spent; reported to the model so it does not plan as if answered (AUTO-P8).
         self._last_dropped: list = []
-        # AUTO-P9: what each COMPLETE round actually cost, across the whole
-        # run. Deliberately not cleared by reset() — one batch cannot learn
-        # anything, and the point is to stop every later batch re-discovering
-        # the same answer by climbing the ladder from scratch.
-        #
-        # Only rounds that finished without dropping an op are recorded. A
-        # truncated round tells you what the cap was, not what the round
-        # needed, and seeding from those would peg the estimate to the cap
-        # that was already too small.
+        # Cost of each complete round across the run, to seed later batches; truncated rounds are excluded (AUTO-P9).
         self._round_costs: list = []
         self._batch_floor = self._max_total_chars
         # AUTO-P11: hard ceiling from num_ctx; 0 = unset.
@@ -378,35 +288,17 @@ class ArchProbe:
         self._warmup = 3
         self._headroom = 2.0
         self._seed_ceiling = 0
-        # Never reset — reported only, so a run can still be judged on total
-        # probe cost without that total being able to switch the feature off.
+        # Never reset, so a run is judged on total probe cost without that total switching the feature off.
         self._run_chars_used = 0
-        # AUTO-F1: run-level miss memo — {(op, arg): times asked}. Deliberately
-        # NOT touched by reset(): a batch boundary teaches the memo nothing,
-        # and the collect artifact `make_collect_bridge` builds is immutable
-        # for the whole run (the same invariant reset() already relies on for
-        # not rebuilding the bridge), so a name that missed at batch 3 cannot
-        # resolve at batch 40. Only a fresh ArchProbe starts empty.
-        # OrderedDict so eviction can drop the oldest entry first (AC-F1-8).
+        # Run-level miss memo, kept across batches because the artifact is immutable for the run (AUTO-F1).
         self._miss_memo: "OrderedDict[tuple[str, str], int]" = OrderedDict()
         self._memo_max_entries = max(1, int(memo_max_entries))
-        # Memo hits for the last execute() call and across the whole run —
-        # reported the same way last_hits/last_misses and run_chars_used are,
-        # so the saving AUTO-F1 claims is visible in the trace, not asserted.
+        # Memo hits per execute() and per run, reported so the saving is visible (AUTO-F1).
         self._last_memo_hits = 0
         self._run_memo_hits = 0
-        # AUTO-F4: is a `facts` ask "informed" (the name was returned by a
-        # `module` hit earlier in THIS batch) or "blind" (the model is
-        # guessing)? `PROBE_INSTRUCTIONS` now tells the model to check
-        # `module` first; this is what measures whether that instruction is
-        # actually followed, rather than assuming it. Per-BATCH — cleared by
-        # reset() — because "earlier in this batch" is the whole definition;
-        # a name shown in a `module` result three batches ago tells you
-        # nothing about whether THIS batch's ask was informed.
+        # Whether a facts ask was informed by an earlier module hit in this batch, per batch (AUTO-F4).
         self._informed_symbols: set = set()
-        # [hits, asks] — asks counted the moment a `facts` op is seen, hits
-        # counted only on a genuine bridge hit (never on a memo hit, which is
-        # by definition never a hit at all).
+        # [hits, asks] for facts; a memo hit is never a hit (AUTO-F4).
         self._informed_facts = [0, 0]
         self._blind_facts = [0, 0]
 
@@ -426,8 +318,7 @@ class ArchProbe:
         """AUTO-P9 tuning, passed down from ``[architect]`` config."""
         self._warmup = max(0, int(warmup))
         self._headroom = max(1.0, float(headroom))
-        # 0 means "no explicit ceiling" — fall back to 4x the configured cap,
-        # so a pathological run cannot learn its way to an unbounded prompt.
+        # Zero means no explicit ceiling; it falls back to 4x the configured cap.
         self._seed_ceiling = int(ceiling) or (self._base_total_chars * 4)
 
     def set_window_budget(self, max_chars: int) -> None:
@@ -545,23 +436,12 @@ class ArchProbe:
         artifact cannot change mid-run.
         """
         self._chars_used = 0
-        # AUTO-P8: an escalation is scoped to one batch. Carrying a raised cap
-        # into the next batch would silently re-tune the profile.
-        # AUTO-P9: start where experience says, not at the configured floor.
-        # On the run that motivated this, 57 of 63 probing batches climbed the
-        # escalation ladder from 10 000 — each rung costing one architect
-        # call — to rediscover a number the first few batches had already
-        # established.
+        # A batch starts from the seeded cap when one is known, else the configured floor; escalations stay within the batch (AUTO-P8, P9).
         self._max_total_chars = self.seeded_cap or self._base_total_chars
-        # AUTO-P10: what this batch started with. raise_budget multiplies THIS,
-        # so an escalation is always relative to where the batch actually
-        # began — configured floor while learning, seeded cap afterwards.
+        # The batch's starting cap; raise_budget multiplies this, so an escalation is relative to where the batch began (AUTO-P10).
         self._batch_floor = self._max_total_chars
         self._last_dropped = []
-        # AUTO-F4: "informed by a `module` result" is a per-batch fact, not a
-        # per-run one — see the constructor comment. This is the "resets
-        # between batches" half of AC-F4 test plan; the miss memo just above
-        # is the deliberate opposite (AUTO-F1: never cleared here).
+        # "Informed" is per batch, so it is cleared on each reset (AUTO-F4).
         self._informed_symbols = set()
         self._informed_facts = [0, 0]
         self._blind_facts = [0, 0]
@@ -573,11 +453,7 @@ class ArchProbe:
         Mirrors ``CollectBridge.usable`` — a stale artifact counts as absent,
         exactly as it does everywhere else in the ``--auto`` path.
         """
-        # AUTO-P7: `read` answers from the working tree, not the artifact, so
-        # a base_dir alone makes this probe useful even with no collect model.
-        # Before this the whole probe went dark when the artifact was missing,
-        # which would have silently disabled the one op that never needed it.
-        # Each op still guards its own backing source independently.
+        # read works from the working tree, so the probe is useful with a base_dir even without a collect model (AUTO-P7).
         return bool(self._bridge_usable or self._base_dir is not None)
 
     @property
@@ -643,84 +519,7 @@ class ArchProbe:
         :attr:`run_chars_used` — never gates anything."""
         return self._run_memo_hits
 
-    # ─────────────────────────────────────────────────────────────────────
-    # AUTO-F4 / F4a / F4b — the informed/blind flow, pullv2 vs pullv3
-    #
-    # The module docstring above still describes Phase 0 (facts-only,
-    # no sequencing concept). This is what changed once `module` and
-    # `read` landed and AUTO-F4 taught the model to use them together:
-    #
-    #   pullv2 — no facts-sequencing concept at all
-    #   ──────────────────────────────────────────────
-    #   op = facts <name>  →  memo / bridge lookup
-    #           ↓
-    #     hit/miss folds into the generic per-op tally
-    #     only ("facts=23/40"). A `module` hit teaches
-    #     nothing to a `facts` ask — the two ops are
-    #     unrelated to every counter that exists.
-    #
-    #
-    #   pullv3 — AUTO-F4 (Part 1) + AUTO-F4a/F4b
-    #   ──────────────────────────────────────────────
-    #   Architect: "need X's exact name, not sure of it"
-    #           ↓
-    #   PROBE_INSTRUCTIONS (AUTO-F4, new sentence):
-    #     "ask `module <path>` first, then `facts`
-    #      for one of the names it returned"
-    #           ↓
-    #   ArchProbe.execute(ops) — this round, per op
-    #   ────────────────────────────────────────────
-    #   op = module <path>  →  bridge.module_symbols()
-    #           ↓ (on a hit)
-    #     AUTO-F4: _learn_module_names(capped_text)
-    #       → names actually shown → _informed_symbols
-    #         (this batch only — wiped on reset())
-    #
-    #   op = facts <name>
-    #           ↓
-    #     AUTO-F4 (checked BEFORE the lookup runs):
-    #     is <name> in _informed_symbols?
-    #           ↓                        ↓
-    #         yes                       no
-    #     informed ask +1           blind ask +1
-    #           ↓                        ↓
-    #     lookup runs exactly as before — memo hit,
-    #     bridge hit, or miss. Behavior UNCHANGED;
-    #     a blind guess still gets answered.
-    #   ────────────────────────────────────────────
-    #           ↓
-    #     did this round resolve anything at all?
-    #           ↓ yes                     ↓ no — every op missed
-    #     probe_result event          probe_declined event
-    #     informed_facts="41/45"      informed_facts / blind_facts
-    #     blind_facts="13/59"         (AUTO-F4a, then AUTO-F4b ★)
-    #     (AUTO-F4, original)
-    #           │                            │
-    #           └─────────────┬──────────────┘
-    #                          ↓
-    #     analyze_logs.py: keep the LATEST cumulative
-    #     pair per cluster — from whichever event kind
-    #     (result or declined) came last — sum across run
-    #                          ↓
-    #     printed once per run, only if facts was asked:
-    #       facts sequencing: informed 91% (41/45),
-    #                          blind   22% (13/59)
-    #
-    #   (91%/22% above are illustrative, not a specific real run — see
-    #   the ground file / commit history for actual measured figures.)
-    #
-    #   ★ AUTO-F4a first added informed_facts/blind_facts to
-    #   probe_declined, but computed them as a fresh "0/0 unless
-    #   unresolved" per-round value — correct for the neighboring by_op
-    #   tally (a per-round delta) and wrong here (a cumulative-for-the-
-    #   batch snapshot), so a `repeat` decline landing last in a batch
-    #   could overwrite and erase real data an earlier round in the same
-    #   batch had already established. AUTO-F4b fixed it by always
-    #   reading the live cumulative counters regardless of decline
-    #   reason, falling back to 0/0 only when no probe was ever built
-    #   at all. See tests/test_auto_f4a_declined_facts_seq.py's module
-    #   docstring for the full story with the real trace that found it.
-    # ─────────────────────────────────────────────────────────────────────
+    # AUTO-F4 flow: a facts ask is informed (a module hit taught the name this batch) or blind; probe_declined keeps the latest cumulative pair (F4a/F4b).
 
     @property
     def informed_facts(self) -> tuple:
@@ -809,9 +608,7 @@ class ArchProbe:
         self._last_memo_hits = 0
         for op in ops or ():
             if not unbounded and self.budget_exhausted:
-                # AUTO-P8: remember which ops went unanswered so execute() can
-                # SAY SO in the digest. Logging alone left the model believing
-                # its whole request had been served.
+                # AUTO-P8: remember the dropped ops, so execute() can tell the model they were not answered.
                 self._last_dropped = [o for o in (ops or ()) if o not in _done]
                 logger.info(
                     "ArchProbe: total digest budget (%d chars) reached — "
@@ -833,20 +630,7 @@ class ArchProbe:
         if not blocks:
             return ""
         if _hits == 0 and self._last_memo_hits == 0:
-            # AUTO-P4b: all-miss round — see the docstring. The characters are
-            # still charged against the batch budget: the lookups happened, and
-            # a model that burns its digest allowance on names that do not
-            # exist should not get an unlimited supply of retries for free.
-            #
-            # AUTO-F1 follow-up: a round that is ALL memo hits is exempt.
-            # Unlike a bare repeated "(not found)", a memo hit's message is
-            # NOT identical to what the model saw last time — the count in
-            # it just changed — so it is exactly the "new information" this
-            # check exists to require. Swallowing it here means AC-F1-2's
-            # escalating message never reaches the model in the common case
-            # of a batch re-asking a known-dead name on its own, which was
-            # measured live: every solo repeat of `facts retry` came back as
-            # an empty digest, count included.
+            # An all-miss round still counts its characters; a round that is all memo hits is exempt (AUTO-F1).
             logger.info(
                 "ArchProbe: all %d op(s) missed (%s) — returning an empty "
                 "digest so the caller stops re-asking.",
@@ -855,13 +639,10 @@ class ArchProbe:
             return ""
         out = "## Probe results\n" + "\n\n".join(blocks)
         if not unbounded and not self._last_dropped:
-            # AUTO-P9: a round that served everything it was asked. This is
-            # the only honest sample of "how much room a round needs".
+            # A round that served every request is the honest sample of the room it needs (AUTO-P9).
             self._round_costs.append(self._chars_used)
         if self._last_dropped:
-            # The model must be able to see the gap. Otherwise it plans as if
-            # the dropped op had come back empty, which is a different and
-            # much more misleading fact than "not answered yet".
+            # Tell the model about dropped ops: a dropped op is not the same as an empty answer.
             out += (
                 "\n\n[NOT ANSWERED — the digest budget for this batch ran out "
                 "before these: "
@@ -898,11 +679,7 @@ class ArchProbe:
         _tally = self._last_by_op.setdefault(op.op, [0, 0])
         memo_key = (op.op, op.arg) if op.op == "facts" else None
 
-        # AUTO-F4: bookkeeping only — never changes what gets looked up or
-        # what counts as a hit/miss above. A `facts` ask is tallied as
-        # "informed" or "blind" the moment it is seen, whether it goes on to
-        # hit the memo, the bridge, or nothing at all; only a genuine bridge
-        # hit below increments the hit side.
+        # AUTO-F4: bookkeeping only; a facts ask is tallied informed or blind when seen, and only a bridge hit counts as a hit.
         _facts_tally = None
         if op.op == "facts":
             _facts_tally = (
@@ -915,8 +692,7 @@ class ArchProbe:
         if memo_key is not None and memo_key in self._miss_memo:
             self._miss_memo[memo_key] += 1
             body = self._memo_miss_body(op, self._miss_memo[memo_key])
-            # AC-F1-5: a memo hit counts as a miss, exactly like a real one —
-            # it must not flatter the hit rate the memo exists to protect.
+            # A memo hit counts as a miss, so the memo does not flatter the hit rate (AC-F1-5).
             self._last_misses += 1
             self._last_memo_hits += 1
             self._run_memo_hits += 1
@@ -938,19 +714,7 @@ class ArchProbe:
             if _facts_tally is not None:
                 _facts_tally[0] += 1
             elif op.op == "module":
-                # AUTO-F4: teach the informed set from a real `module` hit —
-                # only names collect actually returned, never guessed or
-                # taken from a truncated/out-of-batch note.
-                #
-                # Learn from the CAPPED text, not the raw `body` above: this
-                # mirrors exactly what _format_block below is about to send
-                # to the model (`capped = body if unbounded else
-                # self._cap(body)`). `body` can be longer than `_max_chars`
-                # for a module with many symbols; a name that only appears
-                # past that cutoff was truncated out of the digest and never
-                # actually shown, so it must not be learned — otherwise a
-                # later `facts` ask for it would be counted "informed" for a
-                # name the model could not have seen.
+                # AUTO-F4: a module hit teaches the informed set, from the capped text the model actually sees.
                 self._learn_module_names(body if unbounded else self._cap(body))
         return self._format_block(op, body, unbounded=unbounded), is_hit
 
@@ -964,12 +728,7 @@ class ArchProbe:
         name = (arg or "").strip().strip("`\"'")
         return bool(name) and name in self._informed_symbols
 
-    # A line collect's `_format_module_block` emits for one symbol:
-    # "  name(...)  :12 — first docstring line" or a bare "  name". Anchored
-    # on the two-space indent `_format_module_block` uses for every symbol
-    # line so it never matches the leading "module: <path>" line or the
-    # "(no public top-level symbols)" / "… and N more" placeholder lines,
-    # both of which start with something other than a name character.
+    # A symbol line from collect's module block: two-space indent, then the name.
     _MODULE_NAME_RE = re.compile(r"^  (\w+)", re.M)
 
     def _learn_module_names(self, body: str) -> None:
@@ -1016,9 +775,7 @@ class ArchProbe:
             return self._module(op.arg)
         if op.op == "read":
             return self._read(op.arg)
-        # Unreachable while extract_probe_request enforces the allow-list;
-        # defensive so a future op added to the parser but not here degrades
-        # to "(not found)" rather than to an AttributeError mid-batch.
+        # Unreachable while the allow-list holds; defensive, so a new op without an executor degrades to not found.
         logger.warning("ArchProbe: no executor for op %r — skipping.", op.op)
         return ""
 
@@ -1078,8 +835,7 @@ class ArchProbe:
 
         try:
             target = (self._base_dir / rel).resolve()
-            # Containment BEFORE any I/O. `..` segments, absolute paths and
-            # symlinks out of the tree all collapse here.
+            # Containment is checked before any I/O; .., absolute paths and symlinks out are refused.
             target.relative_to(self._base_dir)
         except (ValueError, OSError) as exc:
             logger.warning(
@@ -1091,21 +847,7 @@ class ArchProbe:
         try:
             if not target.is_file():
                 return ""
-            # B7: a strict utf-8 decode turned one stray byte (a cp1251 or
-            # latin-1 source file) into UnicodeDecodeError, which the except
-            # clause below folded into "" -- the exact same value this method
-            # returns for "no such file". The Architect could not tell the
-            # two apart, so it was handed an empty context and left to assert
-            # whatever it had already guessed about the file: the
-            # hallucinated-premise failure this op exists to prevent.
-            #
-            # errors="replace" is what the rest of the codebase already uses
-            # to read repo source (LLMGate2Validator._read_changed_content,
-            # the context broker, the canon validator). Degraded context
-            # beats none: the model can see the file and say it is not valid
-            # UTF-8. UnicodeDecodeError is unreachable from here now, so it
-            # drops out of the except clause rather than lingering as a dead
-            # branch.
+            # errors="replace" for source reads, as elsewhere: a stray byte is not the same as a missing file (B7).
             text = target.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
             logger.debug("ArchProbe: read %r unreadable: %s", raw, exc)
@@ -1127,9 +869,7 @@ class ArchProbe:
         header = f"file: {rel}  lines {lo}-{hi} of {len(lines)}"
         omitted = len(lines) - hi
         if omitted > 0 and start is None:
-            # Say so. A silently head-truncated file reads as a complete one,
-            # which is precisely the kind of confident-but-wrong input this
-            # op exists to prevent.
+            # A head-truncated file says so, so it is not read as complete.
             body.append(
                 f"      … {omitted} more line(s) not shown — ask for a range, "
                 f"e.g. read {rel}:{hi + 1}-{min(len(lines), hi + _READ_MAX_LINES)}"
@@ -1184,8 +924,6 @@ class ArchProbe:
     def _cap(self, text: str) -> str:
         if len(text) <= self._max_chars:
             return text
-        # Same truncation style ContextBroker._cap and CollectBridge._shrink
-        # use, so a truncated block reads consistently to a human in the
-        # prompt log regardless of which component produced it.
+        # Same truncation style as ContextBroker and CollectBridge, so truncated blocks read the same everywhere.
         keep = self._max_chars
         return text[:keep] + f"\n… [truncated, {len(text) - keep} more chars]"

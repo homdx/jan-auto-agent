@@ -46,9 +46,7 @@ def _reset_caches():
 
 def _make_filter(*, llm_call_retry_max=None, llm_call_retry_wait_sec=None) -> Gate1Filter:
     cfg = configparser.ConfigParser()
-    # RUN-5: these tests assert the pre-existing "no verdict = dropped"
-    # behaviour, so they run the reject policy explicitly instead of the
-    # default keep. The retry budget itself is unaffected by the policy.
+    # RUN-5: these tests assert "no verdict = dropped", so they run the reject policy explicitly.
     gate1 = {"temperature": "0.0", "max_tokens": "512", "skip_llm": "false",
              "presence_unknown": "reject"}
     if llm_call_retry_max is not None:
@@ -149,8 +147,7 @@ class TestRetryBehaviorOnPersistentFailure:
 
         assert accepted == []
         assert len(rejected) == 1
-        # RUN-5: the reason says what it means — no verdict was obtained —
-        # and keeps the technical cause behind it.
+        # RUN-5: the reason says no verdict was obtained and keeps the technical cause.
         assert rejected[0].reason.startswith(UNKNOWN_PRESENCE_REASON)
         assert "LLM call failed: HTTP 400" in rejected[0].reason
         assert "(after 2 retries)" in rejected[0].reason

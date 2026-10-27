@@ -122,9 +122,7 @@ class TestNoRegressionOnExistingBehaviour:
         assert unparseable is False
 
     def test_english_verdict_behind_neutral_russian_preamble(self):
-        # A neutral (non-verdict) Russian preamble line followed by an explicit
-        # English REVISE is correctly rejected — the preamble carries no
-        # approval/rejection keyword, so the whole-text line scan finds REVISE.
+        # A neutral preamble has no verdict keyword, so the English REVISE line is found.
         approved, reason, unparseable = _parse_verdict_soft(
             "Мой вердикт по главе:\nREVISE: перепиши концовку"
         )

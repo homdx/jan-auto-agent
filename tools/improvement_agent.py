@@ -1,4 +1,3 @@
-import sys
 import time
 import json
 import ssl
@@ -9,26 +8,11 @@ import logging
 
 from tools.agent_trace import tracer
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
+from tools.ui import safe_stdout_write as _safe_stdout_write
 
 logger = logging.getLogger(__name__)
 
-
-def _safe_stdout_write(t: str) -> None:
-    """Write a streaming token to stdout, swallowing BrokenPipeError.
-
-    When stdout is piped to a command that closes early (e.g. ``head``),
-    ``sys.stdout.write`` raises BrokenPipeError — swallow it so the LLM
-    call result is not lost.
-    """
-    try:
-        sys.stdout.write(t)
-        sys.stdout.flush()
-    except (BrokenPipeError, OSError):
-        pass
-
-# Hardcoded prompt extracted to a named module-level constant — the canonical
-# fallback PromptStore can always return to. Runtime values are injected via
-# .format() in process(); do not use f-string here.
+# Hardcoded fallback prompt: PromptStore can always return to it. Values are injected via .format() in process(), not an f-string.
 IMPROVEMENT_PROMPT_HARDCODED = (
     "You are a senior codebase refactoring agent. Optimize the target source code "
     "according to the requested intent action matrix.\n"
@@ -87,18 +71,7 @@ class ImprovementAgent:
         self.num_ctx = num_ctx
         self.ssl_context = ssl_context
 
-        # Read temperature and max_tokens from [improvement_agent] in agents.ini.
-        # Fall back to the values the original code hardcoded if the section is absent.
-        #
-        # BUGFIX (verified-bugs audit #3a): these were raw config.getfloat/
-        # getint/getboolean calls with no try/except — the only site in
-        # this file, and unlike its siblings (search_agent.py's
-        # make_search_agent, tools/auto/*'s config readers), which all
-        # wrap each read individually and fall back to the coded default
-        # with a warning. A present-but-malformed value here (e.g.
-        # `[improvement_agent] temperature = abc`) raised a raw
-        # ValueError straight out of the constructor instead of
-        # degrading gracefully like every sibling agent.
+        # Read temperature and max_tokens from [improvement_agent]; defaults apply when the section is absent or a value is malformed.
         if config is not None and config.has_section("improvement_agent"):
             try:
                 self.temperature = config.getfloat("improvement_agent", "temperature", fallback=0.4)
@@ -139,9 +112,7 @@ class ImprovementAgent:
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        # Bugfix: get_current() can raise (corrupt prompts.json, missing
-        # directory) and a prompt-store outage must not kill the whole
-        # improvement pass. Matches validator_agent.py's guard.
+        # A prompt-store failure must not kill the improvement pass; it falls back to the hardcoded prompt (as validator_agent.py).
         try:
             template = (
                 self.prompt_store.get_current("improvement_agent")
@@ -155,9 +126,7 @@ class ImprovementAgent:
             )
             template = IMPROVEMENT_PROMPT_HARDCODED
 
-        # Bugfix: unguarded — a pushed prompt with a typo'd placeholder
-        # raises KeyError/ValueError from str.format and crashed the whole
-        # improvement pass. validator_agent.py already recovers from this.
+        # A pushed prompt with a bad placeholder must not crash the pass; it falls back to the hardcoded prompt (as validator_agent.py).
         try:
             prompt = template.format(
                 intent=intent,
@@ -166,7 +135,7 @@ class ImprovementAgent:
                 related_code=json.dumps(context.get("related_code"), indent=2),
                 context_lines=context.get("context_lines"),
             )
-        except (KeyError, ValueError) as fmt_err:
+        except (KeyError, ValueError, IndexError, AttributeError) as fmt_err:  # AUDIT3-13: "{}" / "{0}" raise IndexError
             logger.error(
                 "ImprovementAgent: prompt template has invalid placeholders (%s) — "
                 "rolling back to hardcoded prompt for this call", fmt_err
@@ -224,16 +193,7 @@ class ImprovementAgent:
 
             tracer.event("llm", "improvement_agent", "llm_response", content=content)
         except urllib.error.HTTPError as e:
-            # Kept for defense-in-depth: request_completion() currently
-            # normalizes HTTPError into RuntimeError before it reaches us
-            # (tools/llm_stream.py _open()), so in practice the branch below
-            # is what fires for HTTP failures today.
-            # Same defect as validator_agent.py (A5): e.read() is a second
-            # unguarded read on the same socket, and a sibling except clause
-            # does not nest — an exception raised here was never offered to the
-            # except Exception below, so it escaped process() and crashed the
-            # improve flow on the very path that exists to turn a failed call
-            # into a result dict.
+            # Defence in depth: e.read() is guarded too, so an error while draining the body still becomes a result.
             try:
                 body = e.read().decode("utf-8", errors="replace")
             except Exception as read_exc:
@@ -250,11 +210,7 @@ class ImprovementAgent:
             tracer.event("improvement_agent", "orchestrator", "error", content=_err)
             return _err
         except Exception as e:
-            # A genuine transport/connection failure (DNS, connection
-            # refused, read timeout, etc). A malformed-JSON reply is a
-            # separate failure domain handled below, so this message no
-            # longer gets shown for what is really just a formatting
-            # problem in the model's output.
+            # A transport failure (DNS, refused, timeout) is logged here; malformed JSON is handled separately below.
             logger.error(f"ImprovementAgent request failed: {e}")
             _err = {
                 "explanation": f"Request to the LLM failed: {e}",
@@ -269,11 +225,7 @@ class ImprovementAgent:
             content = strip_think(content)
             content = strip_json_fence(content)
             parsed_result = json.loads(content)
-            # Bugfix: json.loads() parses a bare `[]`/`null` fine, and the
-            # result was returned as-is. Callers (main.py's
-            # improvement.get("improved_code")) assume a dict, so this
-            # raised AttributeError deep in the render pipeline instead of
-            # taking the JSONDecodeError fallback below.
+            # A bare [] or null parses but is not a dict: treat it like a JSON decode failure, not as a result.
             if not isinstance(parsed_result, dict):
                 raise json.JSONDecodeError(
                     f"expected a JSON object, got {type(parsed_result).__name__}",

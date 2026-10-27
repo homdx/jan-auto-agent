@@ -76,8 +76,7 @@ class TestHTTPErrorReadWrapped:
             "tools.validator_agent.request_completion", _raise_http_error,
         )
 
-        # The sibling except Exception must not be reached; the verdict must
-        # come back as a dict with _api_error, not a raw traceback.
+        # The sibling except Exception must not run; the verdict comes back as a dict with _api_error.
         result = va.validate({"iteration": 1})
         assert isinstance(result, dict)
         assert result.get("_api_error") is True

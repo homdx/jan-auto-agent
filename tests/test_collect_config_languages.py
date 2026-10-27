@@ -78,9 +78,7 @@ def test_enabled_languages_malformed_value_falls_back_to_python_only():
 
 
 def test_enabled_languages_typo_falls_back_to_python_only():
-    # A typo like "pythn" (for "python") used to return frozenset({"pythn"}),
-    # which scan_repo's language filter never matches — silently disabling
-    # all scanning with no warning. The docstring promises this can't happen.
+    # A typo ("pythn") falls back to Python only, not a silent empty set.
     cfg = _config(languages="pythn")
     assert enabled_languages(cfg) == frozenset({Language.PYTHON})
 
@@ -98,8 +96,7 @@ def test_enabled_languages_typo_alongside_java_keeps_java():
 
 
 def test_enabled_languages_all_typos_falls_back_to_python_only():
-    # Every configured value unrecognized → fallback to default (Python only),
-    # not an empty set that would scan zero modules.
+    # All values unrecognised: fall back to Python only.
     cfg = _config(languages="pythn,jvaa")
     assert enabled_languages(cfg) == frozenset({Language.PYTHON})
 
@@ -192,12 +189,7 @@ def test_real_agents_ini_defaults_to_python_only():
 
 
 def test_real_repo_scan_with_default_config_has_no_java_modules():
-    # A real end-to-end backward-compat check: this repo *does* now
-    # contain real .java files (tests/fixtures/collect_mini_repo_java/,
-    # COLLECT-26) — scanning it with the actual shipped agents.ini must
-    # still produce zero Java-language modules, since languages=python
-    # is the default there. This is the genuine exclusion case, not a
-    # vacuous one.
+    # Real repo scan with defaults has zero Java modules (the genuine exclusion case).
     import configparser as cp
 
     cfg = cp.ConfigParser()

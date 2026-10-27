@@ -39,9 +39,7 @@ from tools.auto.state import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def tmp_agent(tmp_path):
@@ -62,9 +60,7 @@ def sample_task():
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — Fresh initialisation
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: fresh initialisation
 
 class TestFreshInit:
     def test_returns_true_on_fresh_run(self, tmp_path):
@@ -138,9 +134,7 @@ class TestFreshInit:
         assert store.get_goal() == "my goal"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — Resume (kill mid-run, restart → no repeated work)
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: resume after a kill restarts without repeated work
 
 class TestResume:
     def test_returns_false_on_resume(self, tmp_path):
@@ -238,9 +232,7 @@ class TestResume:
         assert s_final.get_task("AUTO-T1")["status"] == STATUS_IN_PROGRESS
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — plan.json task schema
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: plan.json task schema
 
 class TestTaskSchema:
     """make_task() produces schema-valid dicts; _validate_task_schema enforces it."""
@@ -315,9 +307,7 @@ class TestTaskSchema:
         assert t["commit"] == "abc123"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # upsert_task / get_task / all_tasks
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestUpsertAndGet:
     def test_upsert_new_task_appended(self, tmp_agent, sample_task):
@@ -361,9 +351,7 @@ class TestUpsertAndGet:
             store.upsert_task(bad)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # set_task_status
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestSetTaskStatus:
     def test_set_status_changes_persisted(self, tmp_agent, sample_task):
@@ -401,9 +389,7 @@ class TestSetTaskStatus:
         assert progress["pending_count"] == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # increment_task_counters
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestIncrementCounters:
     def test_increment_attempt(self, tmp_agent, sample_task):
@@ -431,9 +417,7 @@ class TestIncrementCounters:
             store.increment_task_counters("GHOST", attempt_delta=1)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # update_progress / get_progress
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestProgress:
     def test_update_progress_status(self, tmp_agent):
@@ -461,8 +445,7 @@ class TestProgress:
         assert p["done_count"] == 1
         assert p["pending_count"] == 1
 
-    # AUTO-BUG regression: resuming under a genuinely different goal must
-    # raise, never silently keep executing the old goal's leftover tasks.
+    # AUTO-BUG regression: resuming under a different goal must raise, not run the old tasks.
     def test_resume_with_different_goal_raises(self, tmp_path):
         agent_dir = tmp_path / ".agent"
         s1 = StateStore(agent_dir)
@@ -472,8 +455,7 @@ class TestProgress:
         with pytest.raises(RuntimeError):
             s2.initialise("goal B", tmp_path)
 
-    # Same-goal resume (the normal case) must be completely unaffected by
-    # the fix above: still returns False, still does not raise.
+    # Same-goal resume is unaffected by the fix above: it returns False and does not raise.
     def test_resume_with_same_goal_still_works(self, tmp_path):
         agent_dir = tmp_path / ".agent"
         s1 = StateStore(agent_dir)
@@ -484,9 +466,7 @@ class TestProgress:
         assert is_fresh is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # resume_info
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestResumeInfo:
     def test_empty_plan_returns_empty_info(self, tmp_agent):
@@ -522,9 +502,7 @@ class TestResumeInfo:
         assert not any(t["id"] == "T1" for t in info["pending"])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Per-task artefact files
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestTaskFiles:
     def test_task_dir_created(self, tmp_agent):
@@ -551,9 +529,7 @@ class TestTaskFiles:
         assert path.read_text() == "hello"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # run.log
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestLog:
     def test_log_appends_message(self, tmp_agent):

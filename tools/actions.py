@@ -10,10 +10,16 @@ OrchestratorActions is a mixin; Orchestrator inherits from it and supplies:
 import os
 import re
 import json
+import shlex
 import time
 import logging
+from typing import List, Tuple
 
-from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
+from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence, restore_masked_secrets, unrestored_masked_lines
+# HARDEN-7 C: the shared reader of a reply field's type. The validators this
+# module drives answer `feedback` themselves, and a list or a number in that
+# field raised AttributeError out of `/edit` and the text-QA loop.
+from tools.llm_stream import reply_text
 from tools.agent_trace import tracer
 from tools.file_reader import read_file
 from tools.ui import Spinner, stream_tracker
@@ -40,11 +46,473 @@ def _resolve_within_base(base_dir: str, file_path: str) -> "str | None":
     arbitrary files on the host. Returns the resolved absolute path if it
     stays within base_dir, else None.
     """
-    base_abs = os.path.abspath(base_dir)
-    target_abs = os.path.abspath(os.path.join(base_dir, file_path))
-    if target_abs == base_abs or target_abs.startswith(base_abs + os.sep):
-        return target_abs
+    # realpath: a symlink inside base_dir that points outside it passed the string test
+    base_real = os.path.realpath(base_dir)
+    target_real = os.path.realpath(os.path.join(base_dir, file_path))
+    try:
+        inside = os.path.commonpath([base_real, target_real]) == base_real
+    except ValueError:
+        return None
+    return target_real if inside else None
+
+
+#: The legacy codecs a non-UTF-8 file may be written back in, most faithful first.
+#: `cp1251` leads because it is this repository's own codec, and on a tie it wins.
+_LEGACY_WRITE_ENCODINGS: Tuple[str, ...] = ("cp1251", "cp1252")
+#: The PEP 263 coding cookie: `# coding: name`, `# coding=name`, `# -*- coding: name -*-`.
+_CODING_COOKIE_RE = re.compile(rb"coding[ \t]*[:=][ \t]*([A-Za-z0-9._-]+)")
+
+
+def _source_coding_cookie(raw: bytes) -> "str | None":
+    """The codec a coding cookie in the first two lines of *raw* names, or `None`.
+
+    HARDEN-9 C: a cookie is the author's declaration about this file, so it wins over
+    the script guess — but only where Python reads one: a `#` comment inside the first
+    two lines. The same words anywhere else are prose. Nothing here can raise, so a
+    malformed first line never reaches a run.
+    """
+    for line in raw.splitlines(True)[:2]:
+        if not line.lstrip().startswith(b"#"):
+            continue
+        match = _CODING_COOKIE_RE.search(line)
+        if match:
+            name = match.group(1).decode("ascii", "ignore").strip()
+            if name:
+                return name
     return None
+
+
+#: The Cyrillic letters, in their two Unicode blocks.
+_CYRILLIC_RANGE = (0x0400, 0x052F)
+#: An accented run this long, with no plain letter in it, is a Cyrillic word
+#: seen through the cp1252 table.
+_ACCENTED_RUN_MIN = 2
+
+
+def _letter_runs(text: str):
+    """The maximal runs of `isalpha()` characters of *text*, in order."""
+    run: List[str] = []
+    for ch in text:
+        if ch.isalpha():
+            run.append(ch)
+        elif run:
+            yield run
+            run = []
+    if run:
+        yield run
+
+
+def _legacy_symbol_score(text: str) -> int:
+    """How many of *text*'s non-ASCII characters read as a lone letter of another script
+    (HARDEN-14 C4) — the tie-break `_legacy_script_score` leaves open.
+
+    With no letters in it at all the script score is 0 for both cp1251 and cp1252, so
+    `cp1251` — this repository's own codec, and last in the tie-break — won every such file.
+    That is wrong for a cp1252 file whose only non-ASCII character is `€`: byte `0x80` is
+    `Ђ` in cp1251 and `€` in cp1252, and `/edit` wrote the `€` back as `0x88`, which reads
+    back as `ˆ`. A character of a script the rest of the text shows no trace of is a
+    mis-decode; a symbol or a digit is what a correctly-read file keeps. The score is 0 when
+    the text has a letter of its own, since there the script score already decided.
+    """
+    if not text:
+        return 0
+    # "A letter of its own" is a letter of the script the text is otherwise in: a
+    # non-Cyrillic non-ASCII letter (an accented Latin one, `é` of `Café`). A lone Cyrillic
+    # letter in an otherwise-plain-ASCII text is exactly the mis-decode being counted.
+    has_own = any(
+        not ch.isascii() and ch.isalpha()
+        and not (_CYRILLIC_RANGE[0] <= ord(ch) <= _CYRILLIC_RANGE[1])
+        for ch in text
+    )
+    if has_own:
+        return 0
+    bad = 0
+    for ch in text:
+        if ch.isascii():
+            continue
+        code = ord(ch)
+        if _CYRILLIC_RANGE[0] <= code <= _CYRILLIC_RANGE[1]:
+            bad += 1          # a Cyrillic letter in a text with none of its own
+    return bad
+
+
+def _legacy_script_score(text: str) -> int:
+    """How many of *text*'s word runs read as a neighbouring codec — 0 when every
+    run reads as one script, which is what a correctly-read file gives.
+
+    cp1251 and cp1252 agree on almost every byte, so a Western file decoded as
+    cp1251 round-trips (`text.encode("cp1251") == raw`) and the round-trip test
+    cannot tell the codecs apart — it is `Cafй`, not `Café`, and both are "fine"
+    (HARDEN-9 C). What does is the *run* of letters each table gives, because the
+    two codecs differ only in what they make of a high byte: cp1252's high bytes
+    are accented Latin, cp1251's are Cyrillic, so the same bytes land in different
+    buckets. A word is one run of letters, and there a letter is Cyrillic, accented
+    Latin, or plain ASCII Latin:
+
+    * a Western file read as cp1251 puts a Cyrillic letter *inside* a run of
+      plain ones (`GrьЯe цl`, `Cafй`, `fazade`), so a run that holds Cyrillic
+      next to a Latin letter is a mis-decode;
+    * a Cyrillic file read as cp1252 turns every letter of a word into an
+      accented Latin one, so the run is all accents with no plain letter among
+      them (`ÐÐÈÂÅÒ` for `Привет`, `ìèð` for `мир`). Two or more, because one
+      accent is what a Western word keeps — the `é` of `Café`, the `À` of `À la`
+      — and a real word always has a plain letter with it.
+    * everything else — a run of one script, or accents among plain letters —
+      is what a correctly-read file gives.
+
+    Counting over the whole text cannot do this: cp1251's А-Я / а-я are the same
+    bytes as cp1252's À-ß / à-ÿ, so the tables differ only in which bucket a
+    letter goes into and a text-level share of the letters does not separate
+    them — `Hello мир friend` scored like a Western file either way. A file with
+    no letters gives no evidence and scores 0.
+    """
+    bad = 0
+    for run in _letter_runs(text):
+        cyr = lat = asc = 0
+        for ch in run:
+            code = ord(ch)
+            if _CYRILLIC_RANGE[0] <= code <= _CYRILLIC_RANGE[1]:
+                cyr += 1
+            elif ch.isascii():
+                asc += 1
+            else:
+                lat += 1
+        if cyr and lat + asc:
+            bad += 1                    # Cyrillic inside a Latin run
+        elif lat >= _ACCENTED_RUN_MIN and asc == 0:
+            bad += 1                    # an all-accent word: a Cyrillic file
+    return bad
+
+
+def _edit_write_encodings(target: str) -> "Tuple[str, ...]":
+    """CC-16 (Part C): the encodings `/edit` may write *target* back in, most
+    faithful first — decided **once, from the file's own bytes, before the
+    model is asked**, so the whole run works from one decision instead of
+    re-deriving one at the write (where it is too late to matter).
+
+    Fix 34 chose the encoding at the write, by testing whether the bytes
+    decode as UTF-8 and otherwise falling back to `latin-1` — "write back
+    what it read". That is right while the model hands back what it was
+    shown (the file read as Latin-1, mojibake and all) and wrong the moment
+    it *fixes* the text, which is what it is asked to do for a legacy file:
+    a revision with real Cyrillic, or `“ ” — … → ✓`, cannot be encoded in
+    Latin-1, the write fails, and — because the failure is only discovered
+    after every LLM iteration has run — the whole edit is thrown away and
+    the user is told a codec could not encode, not that the file is not
+    UTF-8.
+
+    So: `utf-8` when the bytes decode as UTF-8 (unchanged, in every
+    respect — a UTF-8 BOM is valid UTF-8, so it stays on this path). Otherwise
+    the legacy encodings that both decode these bytes and can be written back,
+    tried in order — the file's own codec first (`cp1251` then `cp1252`, the
+    two this repository's creative pipeline actually holds, and whichever
+    round-trips wins), `latin-1` last since it decodes every byte and can
+    therefore always be written back to. A UTF-8 file returns exactly
+    `("utf-8",)`, so a UTF-8 edit is byte-identical to fix 34's.
+
+    HARDEN-9 C: "whichever round-trips wins" was the whole of the probe, and
+    `cp1251` and `cp1252` define almost every byte, so a Western file always
+    round-tripped as `cp1251` and `Café` went out to the model as `Cafй`.
+    The order is now judged by the script the codec gives back — a codec that
+    splits one file's letters between Cyrillic and Latin mis-read it, and
+    `cp1251`'s tie wins because it is this repository's own codec. A coding
+    cookie in the first two lines (`# -*- coding: latin-1 -*-`) names the
+    codec outright and overrides the guess.
+    """
+    try:
+        with open(target, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        # Unreadable here means unreadable at the write too, and run_edit
+        # already refused to read it before this point.
+        return ("utf-8",)
+
+    try:
+        raw.decode("utf-8")
+        return ("utf-8",)
+    except UnicodeDecodeError:
+        pass
+
+    # HARDEN-9 C: a coding cookie in the first two lines names the codec, and a
+    # named codec wins over the script guess below. Fail-open: an unknown name or a
+    # cookie that cannot round-trip the file is simply ignored, and the guess stands.
+    cookie = _source_coding_cookie(raw)
+
+    ranked: List[Tuple[int, int, str]] = []
+    for index, legacy in enumerate(_LEGACY_WRITE_ENCODINGS):
+        try:
+            text = raw.decode(legacy)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        # The codec has to describe *this* file, not merely accept the bytes:
+        # cp1251 and cp1252 both decode every byte, so the test is that
+        # encoding the decoded text reproduces the original.
+        try:
+            faithful = text.encode(legacy) == raw
+        except UnicodeEncodeError:
+            continue
+        if not faithful:
+            continue
+        # Then it has to *read* it: a codec that splits one file's letters
+        # between two scripts is the wrong one for it, whatever it round-trips.
+        ranked.append((_legacy_script_score(text), _legacy_symbol_score(text), index, legacy))
+    # Primary: the script score (HARDEN-9 C). Secondary (HARDEN-14 C4): with no letters at
+    # all the script score is 0 for both codecs and `cp1251` won every such tie, so a
+    # cp1252 file whose only non-ASCII character is `€` (byte `0x80`, cp1251's `Ђ`) was read
+    # as cp1251 and written back as `0x88`, which reads back as `ˆ`. The lower score wins:
+    # a decoding that leaves the text with a printable symbol beats one that reads it as a
+    # lone Cyrillic letter. The index stays last, so a genuine tie still falls to `cp1251`.
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    candidates: List[str] = [legacy for _, _, _, legacy in ranked]
+    candidates.append("latin-1")  # decodes anything, so always writable
+
+    if cookie:
+        try:
+            if raw.decode(cookie).encode(cookie) == raw:
+                # A named codec leads: it is the author's declaration, and it is still
+                # behind the list's other candidates, so a write the cookie cannot hold
+                # still has somewhere to go.
+                candidates = [cookie] + [enc for enc in candidates if enc != cookie]
+        except (UnicodeDecodeError, UnicodeEncodeError, LookupError):
+            pass
+    return tuple(candidates)
+
+
+def _pick_edit_encoding(encodings: "Tuple[str, ...]", revised: str) -> "Tuple[str | None, str]":
+    """CC-16 (Part C): the first of *encodings* that can hold *revised*, or
+    `(None, the characters that fit none of them)`.
+
+    The same list is walked in order at every revision, so one file has one
+    encoding for the whole run: a first attempt that fitted in cp1252 is
+    not followed by a retry that comes back in cp1251. The returned
+    characters are the reportable ones — printable, de-duplicated, in the
+    order they appear — so the refusal can name what is missing instead of
+    quoting a bare codec message, and they are the ones the file's own codec,
+    the first candidate, cannot hold.
+    """
+    for encoding in encodings:
+        try:
+            revised.encode(encoding)
+            return encoding, ""
+        except UnicodeEncodeError:
+            continue
+    # No candidate holds the revision. Name the characters that keep it out, so the
+    # message says what to drop rather than quoting a codec or saying "some
+    # characters": the file is written back in its own codec, the first candidate,
+    # so the characters it cannot hold are the ones a second try has to lose
+    # (HARDEN-9 C: a reply that added a genuine Western letter to a legacy file was
+    # refused as "missing some characters", with nothing named). A character that fits
+    # no codec at all is in this same set, so there is nothing else to look for.
+    if not encodings:
+        return None, ""
+    seen: List[str] = []
+    for ch in revised:
+        if ch in seen or not ch.isprintable():
+            continue
+        if _cannot_encode(ch, encodings[0]):
+            seen.append(ch)
+    return None, " ".join(seen[:12])
+
+
+def _cannot_encode(ch: str, encoding: str) -> bool:
+    """True when *ch* has no representation in *encoding*."""
+    try:
+        ch.encode(encoding)
+        return False
+    except UnicodeEncodeError:
+        return True
+
+
+#: The byte-order marks of the wide encodings `/edit` refuses by name (HARDEN-14 C3). A UTF-16
+#: or UTF-32 file read as latin-1 is a wall of NULs the model cannot work with, and the edit
+#: used to print `status=approved` with a backup anyway.
+_WIDE_BOMS = (
+    (b"\x00\x00\xfe\xff", "UTF-32 BE"),
+    (b"\xff\xfe\x00\x00", "UTF-32 LE"),
+    (b"\xfe\xff", "UTF-16 BE"),
+    (b"\xff\xfe", "UTF-16 LE"),
+)
+
+
+def _wide_bom_name(raw: bytes) -> "str | None":
+    """The name of the wide encoding *raw* starts with, or ``None``.
+
+    HARDEN-14 C3: the UTF-32 BOMs are tested before the UTF-16 ones, because a UTF-32 LE BOM
+    begins with the UTF-16 LE one. Fail-open by construction: an unreadable or empty file
+    has no BOM here and is read normally.
+    """
+    for bom, name in _WIDE_BOMS:
+        if raw.startswith(bom):
+            return name
+    return None
+
+
+def _text_encoding_of(raw: bytes, encodings: "Tuple[str, ...]") -> str:
+    """The first codec of *encodings* that decodes *raw* — the codec `_read_edit_target` chose.
+
+    HARDEN-20 B3: the line-ending match must read the same bytes the same way, and the caller
+    otherwise has no way to ask which codec that was. Fail-open: a codec name Python does not
+    know, or a list that none of it matches, yields the UTF-8 fallback `_read_edit_target`
+    falls back to, so nothing here can raise into a run.
+    """
+    for encoding in encodings:
+        try:
+            raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        return encoding
+    return "utf-8"
+
+
+def _decode_lenient(raw: bytes, encoding: str) -> str:
+    """*raw* in *encoding*, falling back to the lossy UTF-8 read when it no longer describes
+    the bytes (a file that changed between the read and the write, or a codec name Python
+    does not know). The same two-step read `_read_edit_target` makes."""
+    try:
+        return raw.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return raw.decode("utf-8", errors="replace")
+
+
+def _read_edit_target(target: str, encodings: "Tuple[str, ...]") -> str:
+    """Read *target* in the codec its own bytes say, for `/edit` to show the model (HARDEN-14 C1).
+
+    `run_edit` used to read the file with `tools.file_reader.read_file` — UTF-8, else
+    `latin-1` — while the write codec came from `_edit_write_encodings`, which puts `cp1251`
+    first. A cp1251 file was therefore *shown* to the model as `Ïðèâåò ìèð` and then written
+    back as cp1251, so an instruction in Russian about a Russian file could not be done: the
+    text the model was handed is not the text it was asked about. The Coder reads such a file
+    in its own codec (`_file_read_encoding`, HARDEN-9 C); this is the same one decision, made
+    once and taken from the same list the write walks.
+
+    Fail-open, as everywhere in this part: an undecodable file, an unreadable file or a codec
+    that no longer describes the bytes falls back to the lossy read, so `/edit` still has
+    something to work with rather than an exception into the run.
+    """
+    try:
+        with open(target, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    return _decode_lenient(raw, _text_encoding_of(raw, encodings))
+
+
+def _edit_line_ends(dest: str, content: str, encoding: "str | None" = None) -> str:
+    """*content* with *dest*'s line endings, decided per line (HARDEN-14 C2, HARDEN-20 B).
+
+    `in_style_of` (tools.auto.utils) takes CRLF for the whole file when more than half of its
+    `\\n` follow a `\\r`, so `a\\r\\nb\\r\\nc\\nd\\ne\\n` edited on `c` came out as
+    `a\\nb\\nC\\nd\\ne\\n` — the untouched `a` and `b` lost the `\\r` they were written with.
+    A line of the reply that equals a line of the original (after the line ending) keeps *that
+    line's own* ending, used once; a changed or a new line takes the file's majority style, so
+    an all-CRLF and an all-LF file are unchanged and only a genuinely mixed one is spared the
+    flattening. The BOM is put back at the end, so this also supplies the BOM.
+
+    This is the one shared rule: `/edit` and the Coder's `in_style_of` both call it, so the two
+    paths cannot drift apart again.
+
+    HARDEN-20 B2: an unterminated original last line has an **empty** ending, and only the
+    reply's own last line may take it. Handing it to a middle line glues two lines: the
+    original `alpha\\nbeta` edited to `beta\\nalpha\\nbeta\\n` would be written as
+    `betaalpha\\nbeta\\n`, and a source file whose last line an edit repeats (`return x`,
+    `}`, `pass`, a blank line) becomes invalid.
+
+    HARDEN-20 B3: the original is decoded in *encoding*, the codec `_read_edit_target` chose
+    for this file, or the same codec re-derived from the file's own bytes when the caller did
+    not say. A cp1251 file decoded as UTF-8 is U+FFFD text that never equals the reply's
+    correctly decoded line, so every original line looked changed and the file came out flat
+    LF. A leading BOM is stripped from the first original body before the match — otherwise it
+    stays in that body and `a = 1` never equals `\\ufeffa = 1`, and the first line loses its
+    ending. Fail-open: an unreadable file comes back as *content* untouched.
+    """
+    try:
+        with open(dest, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return content
+    if not raw:
+        return content.replace("\r\n", "\n")      # an empty file has no style: LF, as `in_style_of` always said
+    if encoding is None:
+        try:
+            encoding = _text_encoding_of(raw, _edit_write_encodings(dest))
+        except Exception:
+            encoding = "utf-8"
+    majority_crlf = raw.count(b"\r\n") * 2 > raw.count(b"\n")
+    changed_ending = "\r\n" if majority_crlf else "\n"
+    original_lines = _decode_lenient(raw, encoding).splitlines(keepends=True)
+    # HARDEN-20 B3: a BOM is not part of the first line's text, and the match is on the text.
+    if original_lines and original_lines[0].startswith("\ufeff"):
+        original_lines[0] = original_lines[0].removeprefix("\ufeff")
+    by_text: dict = {}
+    for line in original_lines:
+        body = line.rstrip("\r\n")
+        by_text.setdefault(body, []).append(line[len(body):])
+    # The reply may arrive with either ending (a faithful model echoes what it was shown), so
+    # it is normalised to LF first: a `\r` left in the body would be doubled when the line's
+    # own ending is put back.
+    parts = content.replace("\r\n", "\n").split("\n")
+    out: list = []
+    last = len(parts) - 1
+    for pos, body in enumerate(parts):
+        if pos == last and body == "":
+            out.append("")                    # the empty string after a trailing newline
+            continue
+        # HARDEN-20 B2: an empty ending (the original's unterminated last line) may only go to
+        # the reply's last line, or `beta` + `alpha` is written as `betaalpha`.
+        endings = by_text.get(body)
+        usable = [e for e in (endings or []) if e or pos == last]
+        if usable:
+            endings.remove(usable[0])
+            out.append(body + usable[0])       # the line's own ending, used once
+        elif pos == last:
+            out.append(body)                   # a last line with no ending of its own
+        else:
+            out.append(body + changed_ending)  # a changed or a new line: the majority
+    text = "".join(out)
+    # The BOM is this function's own half: the model writes no BOM, so a BOM the original had
+    # is put back rather than dropped on the floor.
+    if raw.startswith(b"\xef\xbb\xbf") and not text.startswith("\ufeff"):
+        text = "\ufeff" + text
+    return text
+
+
+def _remove_edit_backup(path: str) -> None:
+    """CC-16 (Part C): remove the `.bak` a failed `/edit` write made, so no backup of
+    an edit that did not happen is left behind.
+
+    Fail-open throughout — nothing here raises into a run. The interesting case is
+    the one where the *unlink* fails too: a write that failed because the directory
+    is not writable is blocked by the same permission from cleaning up after itself,
+    which is exactly when the stray backup matters most. The backup is this run's
+    own artifact and its name is known, so the directory's write bit is put back for
+    the single unlink and the original mode restored immediately afterwards.
+    """
+    try:
+        os.unlink(path)
+        return
+    except OSError:
+        pass
+
+    parent = os.path.dirname(path) or "."
+    try:
+        mode = os.stat(parent).st_mode & 0o7777
+    except OSError:
+        return
+    if mode & 0o200:
+        return  # writable, and the unlink still failed: nothing to gain here
+    try:
+        os.chmod(parent, mode | 0o700)
+        try:
+            os.unlink(path)
+        finally:
+            try:
+                os.chmod(parent, mode)
+            except OSError:
+                pass
+    except OSError as exc:
+        logger.warning("could not remove the backup of a failed edit %s: %s", path, exc)
 
 
 class _SearchChunkFailed(Exception):
@@ -79,9 +547,25 @@ class OrchestratorActions:
         return {"Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}"}
 
-    # ------------------------------------------------------------------ #
-    # Full-file search (/search)                                          #
-    # ------------------------------------------------------------------ #
+    # Full-file search (/search)
+
+    @staticmethod
+    def _unquote_path(value: str) -> str:
+        """The path a user typed, without the shell quotes they wrapped it in.
+
+        HARDEN-18 C: ``/edit "my notes.txt" :: …`` looked up
+        ``dir/"my notes.txt"`` — the quotes stayed in the name, and the error
+        named a file that does not exist. A matching pair of single or double
+        quotes around the whole path is the quoting of a name the user copied
+        from a listing; an unquoted path is unchanged, and a name that carries a
+        quote inside it (``it's a note.txt``, ``"my"file.txt``) is left alone,
+        since no pair surrounds it (`"a"b"` has the same quote inside: it is not a
+        quoted name, so it is not unwrapped).
+        """
+        if (len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"')
+                and value[0] not in value[1:-1]):
+            return value[1:-1]
+        return value
 
     @staticmethod
     def _parse_payload_and_file(user_input: str, command: str):
@@ -93,20 +577,17 @@ class OrchestratorActions:
         body = user_input.strip()[len(command):].strip()
         if not body:
             return None, None
-        # Bugfix: the bare substring "::" also matches inside identifiers
-        # ("std::vector"), so "/search std::vector in utils.cpp" was split
-        # on the symbol instead of falling through to the " in " form.
-        # The documented syntax has spaces around the separator.
+        # The separator is " :: " with spaces; a bare "::" would split identifiers like std::vector.
         if " :: " in body:                     # /<command> <file> :: <payload>
             file_path, payload = body.split(" :: ", 1)
-            return payload.strip(), file_path.strip()
+            return payload.strip(), OrchestratorActions._unquote_path(file_path.strip())
         if " in " in body:                     # /<command> <payload> in <file>
             payload, file_path = body.rsplit(" in ", 1)
-            return payload.strip(), file_path.strip()
+            return payload.strip(), OrchestratorActions._unquote_path(file_path.strip())
         # Fallback: first token is the file, the rest is the payload.
         parts = body.split(None, 1)
         if len(parts) == 2:
-            return parts[1].strip(), parts[0].strip()
+            return parts[1].strip(), OrchestratorActions._unquote_path(parts[0].strip())
         return None, None
 
     @staticmethod
@@ -170,19 +651,7 @@ class OrchestratorActions:
             tracer.event("search_fullfile", "orchestrator", "llm_response", content=answer)
             return strip_think(answer).strip()
         except Exception as e:
-            # AUTO-BUG: same asymmetric-resilience bug as _edit_file_content /
-            # _answer_from_file (see their comments) — a transient network/API
-            # error here used to come back as "" indistinguishable from the
-            # model's own legitimate "NONE" sentinel (no answer in this
-            # chunk). run_search() treated both identically: silently move
-            # on to the next chunk, no retry. If the chunk that hit the
-            # transient error was the one actually containing the answer,
-            # it is lost for good — the search reports "no answer found"
-            # even though the correct answer was sitting right there and
-            # simply never got a second try. None lets run_search retry
-            # the same chunk a bounded number of times before giving up on
-            # it, instead of conflating "no answer here" with "the call to
-            # ask about this chunk failed."
+            # A transient error is None, not "", so run_search retries the chunk instead of treating it as no answer.
             logger.error(f"/search model call failed: {e}")
             print(f"[{_ts()}] search failed: {e}")
             return None
@@ -251,13 +720,7 @@ class OrchestratorActions:
         budget = self.search_full_file_max_chars
         if len(source) <= budget:
             print(f"[{_ts()}] Full-file search over {file_path} ({len(source)} chars).")
-            # BUGFIX: the multi-chunk path below already retries a transient
-            # network/API error (None) up to 3 times before giving up on a
-            # chunk — this single-file path called _ask_over_text and threw
-            # the return value away entirely, so the exact same error on a
-            # SMALL file (one that fits the budget and never gets chunked)
-            # got zero retries: the search just printed nothing and
-            # returned silently. Same asymmetric-resilience bug, same fix.
+            # The single-file path retries transient errors (None) the same way the chunked path does.
             _RETRY = 3
 
             def _ask_full_file():
@@ -277,11 +740,7 @@ class OrchestratorActions:
                 print(f"[{_ts()}] ⚠️  Search unreachable after {_RETRY} attempts.")
                 return
 
-            # BUGFIX: returning on any non-None answer skipped both checks
-            # the chunked path below applies — the model's "NONE" sentinel
-            # was reported as a found answer, and _validate_text_answer
-            # never ran on single-chunk files. Whether an answer gets
-            # grounded must not depend on whether the file needed chunking.
+            # NONE is no answer, and the single-chunk path gets the same grounding check as the chunked one.
             if not ans or ans.strip().upper() == "NONE":
                 print(f"[{_ts()}] No answer found in {file_path} for: {query}")
                 return
@@ -293,7 +752,7 @@ class OrchestratorActions:
 
             if validation.get("_api_error") or validation.get("_unparseable"):
                 print(f"[{_ts()}] ⚠️  Validator unavailable — accepting answer as-is. "
-                      f"({validation.get('feedback', '')})")
+                      f"({reply_text(validation.get('feedback'))})")
                 print(f"[{_ts()}] ✅ Answer found in {file_path} (unvalidated).")
                 return
 
@@ -302,7 +761,7 @@ class OrchestratorActions:
                       f"(validated, grounded={validation.get('grounded')}).")
                 return
 
-            feedback = (validation.get("feedback") or "").strip()
+            feedback = reply_text(validation.get("feedback"))
             if feedback:
                 print(f"[{_ts()}] ❗ Answer rejected: {feedback}")
             print(f"[{_ts()}] No chunk contained a validated answer to: {query}")
@@ -313,18 +772,7 @@ class OrchestratorActions:
         print(f"[{_ts()}] {file_path} is {len(source)} chars > budget {budget}; "
               f"splitting into {len(chunks)} chunks and searching each.")
         for i, ch in enumerate(chunks, 1):
-            # AUTO-BUG: a transient network/API error asking about THIS
-            # chunk used to come back as "" — identical to the model's own
-            # legitimate "NONE" (no answer here) — and this loop treated
-            # both the same: silently move on to the next chunk. If the
-            # chunk that failed was the one actually containing the answer,
-            # it was lost for good; the search would report "no answer
-            # found" even though the correct answer was right there and
-            # simply never got a second try. Give a genuine failure (None)
-            # a small bounded number of retries before giving up on this
-            # chunk, same spirit as the retry logic elsewhere in this file
-            # but scoped to one chunk so a persistently broken connection
-            # can't stall the whole multi-chunk search.
+            # A transient error (None) on a chunk is retried a bounded number of times, not read as no answer.
             _CHUNK_RETRY_ATTEMPTS = 3
 
             def _ask_this_chunk(_ch=ch, _i=i, _n=len(chunks)):
@@ -355,7 +803,7 @@ class OrchestratorActions:
 
             if validation.get("_api_error") or validation.get("_unparseable"):
                 print(f"[{_ts()}] ⚠️  Validator unavailable — accepting answer as-is. "
-                      f"({validation.get('feedback', '')})")
+                      f"({reply_text(validation.get('feedback'))})")
                 print(f"[{_ts()}] ✅ Answer found in chunk {i}/{len(chunks)} (unvalidated).")
                 return
 
@@ -364,16 +812,14 @@ class OrchestratorActions:
                       f"(validated, grounded={validation.get('grounded')}).")
                 return
 
-            feedback = (validation.get("feedback") or "").strip()
+            feedback = reply_text(validation.get("feedback"))
             if feedback:
                 print(f"[{_ts()}] ❗ Chunk {i}/{len(chunks)} answer rejected: {feedback}")
 
         print(f"[{_ts()}] No chunk contained a validated answer to: {query}")
 
 
-    # ------------------------------------------------------------------ #
-    # Validated text Q&A (FAQ / documentation files)                      #
-    # ------------------------------------------------------------------ #
+    # Validated text Q&A (FAQ and documentation files)
 
     _GENERIC_VERBS = {"show", "view", "get", "answer", "ask", "explain",
                       "describe", "find", "tell", "please"}
@@ -441,15 +887,7 @@ class OrchestratorActions:
             tracer.event("text_answerer", "orchestrator", "llm_response", content=ans)
             return strip_think(ans).strip()
         except Exception as e:
-            # AUTO-BUG: same asymmetric-resilience bug as _edit_file_content
-            # (see its comment) — a transient network/API error here used
-            # to come back as "" indistinguishable from a legitimately
-            # empty answer, so run_text_qa() would validate an EMPTY
-            # answer, get an ordinary (misleading) needs_fix verdict about
-            # the answer's content rather than the real network failure,
-            # and burn a whole iteration + wrong feedback instead of
-            # retrying the generation call the way the validator call two
-            # lines later already retries on the identical failure mode.
+            # A transient error here is None, so the run retries the generation instead of validating an empty answer.
             logger.error(f"text answer call failed: {e}")
             print(f"[{_ts()}] answer generation failed: {e}")
             return None
@@ -503,18 +941,7 @@ class OrchestratorActions:
         tracer.event("orchestrator", "text_validator", "llm_request",
                      params={"question": question}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
-        # AUTO-BUG: same class of bug as _validate_edit (see its comment) —
-        # a network/API failure and a successfully-returned-but-malformed
-        # (non-JSON) response used to share one except clause and both came
-        # out as {"_api_error": True}. In run_text_qa(), _api_error takes
-        # the exponential-backoff retry path, which explicitly skips
-        # `iteration += 1` on `continue`, so `iteration >= self.max_iterations`
-        # never trips either — a validator that reliably answers with prose
-        # instead of STRICT JSON burns the entire timeout budget in
-        # escalating sleeps instead of counting as an ordinary needs_fix
-        # round. Only a genuine request_completion failure is a real API
-        # error; a parse failure on a response that DID arrive is a normal
-        # needs_fix with corrective feedback the model can act on.
+        # A network failure is an API error; a malformed reply is _unparseable and gets normal feedback, not a backoff retry.
         try:
             content = request_completion(url, headers, payload, self.timeout_seconds,
                                          stream=stream_mode,
@@ -531,20 +958,7 @@ class OrchestratorActions:
             return self._parse_llm_json(content)
         except Exception as e:
             logger.warning(f"text validator returned unparseable content: {e}")
-            # AUTO-BUG (follow-up): run_search() has NO retry loop — its
-            # docstring's own contract is "if the validator is unreachable,
-            # accept the candidate answer as-is rather than blocking the
-            # search," and it originally implemented that by checking this
-            # method's _api_error flag. When the fix above stopped labelling
-            # a parse failure as _api_error (correctly, for run_text_qa's
-            # retry loop), it silently broke that contract for run_search:
-            # a validator that never produces valid JSON now causes EVERY
-            # chunk to be rejected as needs_fix, so run_search reports "no
-            # answer found" even when a genuinely correct candidate answer
-            # was found in every single chunk. _unparseable lets run_search
-            # apply its own fail-open rule to this failure mode too, while
-            # run_text_qa's retry loop (which only checks _api_error) is
-            # unaffected and still advances iteration/feeds back correctly.
+            # A parse failure is _unparseable, so run_search's fail-open rule still applies to it.
             return {
                 "status": "needs_fix",
                 "grounded": False,
@@ -575,14 +989,7 @@ class OrchestratorActions:
             print(f"[{_ts()}] \U0001f4c4 No explicit question — treating the file content as the question.")
         knowledge = source
 
-        # AUTO-FIX (fable follow-up 3): this used to only PRINT "validating
-        # against chunks" and then pass the full document anyway — a no-op
-        # message. With the head-truncation behavior of an overfull Ollama
-        # context, the system prompt (not the document tail) is what got cut.
-        # Now the document is actually reduced to the budget, keeping the
-        # head and tail halves (question-relevant material in FAQs/docs tends
-        # to live near headings at the top or recent additions at the bottom)
-        # with an explicit elision marker so the model knows text is missing.
+        # Over-budget documents keep the head and tail, with an elision marker, instead of being passed whole.
         if len(knowledge) > self.search_full_file_max_chars:
             _budget = self.search_full_file_max_chars
             _half = max(1, _budget // 2)
@@ -617,11 +1024,7 @@ class OrchestratorActions:
             _new_answer = self._answer_from_file(question, file_path, knowledge, feedback)
 
             if _new_answer is None:
-                # AUTO-BUG: retry the transient generation failure the same
-                # way an _api_error from the validator is retried below,
-                # instead of validating an empty answer with misleading
-                # content-based feedback. Keep the previous best `answer`
-                # (if any) rather than clobbering it with the failure.
+                # Retry a transient generation failure, keeping the previous best answer.
                 _api_err_count += 1
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Answer generation unavailable — "
@@ -656,14 +1059,12 @@ class OrchestratorActions:
                 break
 
             if validation.get("_api_error"):
-                # Issue 7: exponential backoff instead of immediate break.
-                # Keep the current best answer; do NOT feed the error back as
-                # feedback (that derails the answerer on the next attempt).
+                # Back off on an API error; keep the current best answer and do not feed the error back as feedback.
                 _api_err_count += 1
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Validator unavailable — "
                           f"max iterations reached, keeping best answer. "
-                          f"({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
+                          f"({reply_text(validation.get('feedback'))}, {_val_elapsed:.1f}s)")
                     break
                 _chk = {
                     "loop": "run_text_qa",
@@ -678,35 +1079,22 @@ class OrchestratorActions:
                 continue  # retry same iteration (do not increment)
 
             _api_err_count = 0
-            feedback = (validation.get("feedback") or "").strip()
+            feedback = reply_text(validation.get("feedback"))
             if feedback:
                 print(f"[{_ts()}] ❗ Validator feedback: {feedback}")
             iteration += 1
 
-        # FIX: run_text_qa's own docstring (step 4) promises to "render the
-        # final, validated answer" — but the loop above only ever streamed
-        # each draft live during generation (via _answer_from_file's
-        # on_token callback) and printed one-line validator verdicts
-        # ("approved" / feedback). There was no concluding block: on
-        # multi-iteration runs the final answer is just whichever streamed
-        # draft happened to print last, with no clear marker of which draft
-        # is the validated one, and unlike run_edit there was no warning at
-        # all if the loop exhausted max_iterations/timeout without ever
-        # being approved. Neither caller (main.py) uses this method's
-        # return value, so this concluding print is the only place the
-        # user ever sees a clearly-labelled final answer.
+        # A concluding block prints the final validated answer, and a warning if the loop exhausted without approval.
         total = time.time() - start
         print(f"\n[{_ts()}] ── ANSWER — {file_path} — {total:.1f}s from request ──")
         if validation.get("status") != "approved":
             print(f"[{_ts()}] ⚠️  UNVALIDATED ANSWER — validator never approved "
                   f"after {self.max_iterations} iteration(s). Last feedback: "
-                  f"{validation.get('feedback', '(none)')!r}. Review carefully.")
+                  f"{reply_text(validation.get('feedback'))!r}. Review carefully.")
         print(answer.strip() if answer and answer.strip() else "(no answer produced)")
         print(f"\n[{_ts()}] status={validation.get('status', 'unknown')}  "
               f"grounded={validation.get('grounded')}")
-    # ------------------------------------------------------------------ #
-    # In-place file editing (/edit) — writes the file, with backup + diff  #
-    # ------------------------------------------------------------------ #
+    # In-place file editing (/edit): writes the file, with backup and diff
 
     @staticmethod
     def _parse_edit_command(user_input: str):
@@ -777,10 +1165,7 @@ class OrchestratorActions:
             trace_content = base_user
 
         elif previous_revised:
-            # Retry with context: previous output becomes an assistant message
-            # so the correction is a clean new turn. It deliberately re-includes
-            # the full DOCUMENT and INSTRUCTION — without it, weak models mistake
-            # the feedback text for the new document to edit.
+            # Retry with context: the previous output is an assistant turn, and the document and instruction are restated.
             correction = (
                 f"That edit was rejected.\n\n"
                 f"Error: {feedback}\n\n"
@@ -803,10 +1188,7 @@ class OrchestratorActions:
             )
 
         else:
-            # Clean/reset retry: single-turn with delimited correction, appended
-            # to the same user message when previous_revised isn't available. We
-            # reference the document by its label (not "above") and re-state the
-            # instruction, so the model doesn't have to scroll up mentally to find it.
+            # Clean retry: a single turn with a delimited correction, referring to the document by its label.
             correction_block = (
                 f"\n\n---CORRECTION---\n"
                 f"Error in previous attempt: {feedback}\n"
@@ -852,20 +1234,7 @@ class OrchestratorActions:
             tracer.event("file_editor", "orchestrator", "llm_response", content=out)
             return out
         except Exception as e:
-            # AUTO-BUG: this used to return "" on ANY exception here — same
-            # as a genuinely empty LLM reply — and run_edit() treated an
-            # empty result as fatal: "No content produced" and an immediate,
-            # unconditional return with NO retry, NO backoff, and NO
-            # checkpoint. That's a real asymmetry: the validator call two
-            # steps later gets full exponential-backoff retry (Issue 7) for
-            # this exact class of transient network/API error, but the
-            # generation call that produces the edit in the first place got
-            # none — a single dropped connection permanently kills the
-            # whole /edit command, misleadingly reported as "the model said
-            # nothing." Returning None (vs "" for a genuinely empty reply)
-            # lets run_edit tell the two apart and retry only the real
-            # transient-failure case, the same way it already retries a
-            # validator API error.
+            # A transient failure returns None, not "", so run_edit retries it instead of reporting no content.
             logger.error(f"file edit call failed: {e}")
             print(f"[{_ts()}] edit generation failed: {e}")
             return None
@@ -885,13 +1254,7 @@ class OrchestratorActions:
         )
         user = (f"ORIGINAL:\n{original}\n\nINSTRUCTION:\n{instruction}\n\n"
                 f"REVISED:\n{revised}")
-        # AUTO-FIX (fable follow-up 3): ORIGINAL + REVISED is two full copies
-        # of the file. If that exceeds the context window, Ollama silently
-        # drops the HEAD of the prompt — the system prompt and the start of
-        # ORIGINAL — and the validator issues a verdict on partial data
-        # without anyone knowing. Don't silently trust it: warn loudly.
-        # (chars/token ≈ 2 for Cyrillic-heavy text, 4 for Latin — use the
-        # project-wide estimator.)
+        # ORIGINAL plus REVISED can overflow the context window and silently lose the prompt head; warn when it does.
         _nc = getattr(self, "num_ctx", 0)
         if _nc:
             try:
@@ -914,25 +1277,7 @@ class OrchestratorActions:
         tracer.event("orchestrator", "edit_validator", "llm_request",
                      params={"instruction": instruction}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
-        # AUTO-BUG: network/API failure and a malformed (non-JSON) response
-        # from a server that DID respond used to share one try/except and
-        # both came out as {"_api_error": True}. In run_edit(), _api_error
-        # takes the exponential-backoff retry path, which explicitly does
-        # NOT advance `iteration` (`continue` skips `iteration += 1`) so
-        # the `iteration >= self.max_iterations` escape check can never
-        # trip either — nothing bounds that path except the overall task
-        # timeout. A validator that reliably replies with prose instead of
-        # STRICT JSON (a real, observed small-model failure mode elsewhere
-        # in this project — see gate1_filter's skip_llm and coder.py's
-        # AUTO-CR-13 JSON-wrapper salvage) then burns the entire
-        # [loop] timeout_seconds budget in escalating sleeps, retrying the
-        # exact same prompt with no corrective feedback, instead of
-        # counting as an ordinary "needs_fix" round that would advance
-        # iteration, feed the parse error back as feedback, and let the
-        # loop terminate normally at max_iterations. Only a genuine
-        # request_completion failure (network/HTTP) is a real API error;
-        # a JSON-parse failure on a response that DID arrive is validated
-        # separately below as a normal needs_fix.
+        # A network failure is an API error; a malformed reply is validated as a normal needs_fix (no unbounded backoff).
         try:
             content = strip_think(request_completion(url, headers, payload, self.timeout_seconds,
                                                       stream=stream_mode,
@@ -948,15 +1293,7 @@ class OrchestratorActions:
             return self._parse_llm_json(content)
         except Exception as e:
             logger.warning(f"edit validator returned unparseable content: {e}")
-            # BUGFIX: this was the only one of the three sibling validator
-            # methods (_validate_text_answer, ValidatorAgent.validate, and
-            # this one) that didn't set _unparseable on a parse failure —
-            # an inconsistency, not currently a live bug (run_edit doesn't
-            # check the flag), but any future caller that does — the way
-            # run_search already checks `_api_error or _unparseable` — would
-            # silently misroute this failure, and prompt_evaluator's
-            # json_ok_rate scoring would mis-classify it if this validator
-            # is ever wired into the evaluator.
+            # A parse failure sets _unparseable, like the other validators.
             return {
                 "status": "needs_fix",
                 "feedback": (
@@ -991,11 +1328,53 @@ class OrchestratorActions:
             return
         start = time.time()
         tracer.start_run(f"/edit {instruction} in {file_path}")
+
+        # ── HARDEN-14 C3: a UTF-16 / UTF-32 file is refused by name ───────────────
+        # Such a file read as latin-1 is a wall of NULs the model cannot work with: it
+        # cannot find its line, the edit applies nothing, and `/edit` still printed
+        # `status=approved` with a backup while the file lost its `\r`. Refused like a file
+        # with undecodable bytes today — and left byte-identical.
         try:
-            original = read_file(target)
-        except Exception as e:
-            print(f"[{_ts()}] Could not read {target}: {e}")
+            with open(target, "rb") as _fh:
+                _wide = _wide_bom_name(_fh.read())
+        except OSError:
+            _wide = None
+        if _wide:
+            print(f"[{_ts()}] ❌ {file_path} is {_wide} — convert it to UTF-8 first; "
+                  f"nothing was written.")
             return
+
+        # ── CC-16 (Part C): the write encoding, decided once ───────────────────────
+        # From the file's own bytes, before the model is asked, so the run has one
+        # decision rather than one derived at the write (where the edit is already
+        # spent). See `_edit_write_encodings`: a UTF-8 file is ("utf-8",), exactly
+        # what fix 34 chose; a legacy file gets the codecs it can be written back
+        # in, its own first and latin-1 last.
+        _edit_encodings = _edit_write_encodings(target)
+        _legacy_named = [e for e in _edit_encodings if e not in ("utf-8", "latin-1")]
+        _encoding = _edit_encodings[0] if len(_edit_encodings) == 1 else ""
+
+        # HARDEN-14 C1: the file is read in the codec it will be *written* back in, so the
+        # model is shown the text it is asked about — not latin-1 mojibake of a cp1251 file.
+        original = _read_edit_target(target, _edit_encodings)
+
+        def _refuse_unwritable(text: str) -> bool:
+            """True (after saying why) when *text* fits none of the file's write
+            encodings. Checked the moment a revision exists — so a legacy file
+            whose revision carries characters its codec cannot hold is refused
+            before the validator runs and long before a write is attempted,
+            instead of after every iteration has been spent."""
+            nonlocal _encoding
+            encoding, missing = _pick_edit_encoding(_edit_encodings, text)
+            if encoding is not None:
+                _encoding = encoding
+                return False
+            print(f"[{_ts()}] ❌ Cannot write {file_path}: the file is not UTF-8 "
+                  f"({_legacy_named[0] + '?' if _legacy_named else 'latin-1'}) and the "
+                  f"revised text has characters it cannot hold: {missing}. "
+                  f"Convert the file to UTF-8 first, or ask for a revision "
+                  f"without those characters — nothing was written.")
+            return True
 
         # ── prev-context window ─────────────────────────────────────────────────────────
         _prev_ctx_every   = 0
@@ -1020,9 +1399,13 @@ class OrchestratorActions:
             _is_reset_iter    = resume_state.get("_is_reset_iter", False)
             print(f"[{_ts()}] ▶  Resuming run_edit from iteration {iteration} "
                   "(checkpoint restored).")
+            # A resumed revision is checked before anything else is asked for: it
+            # is already known to be unwritable, and re-deriving it would cost
+            # another round of model calls for the same refusal.
+            if revised.strip() and _refuse_unwritable(revised):
+                return
 
-        # Use a while loop (not for-range) so API-error iterations can be
-        # retried without consuming the iteration counter.
+        # A while loop lets an API error retry without using up the iteration count.
         while iteration <= self.max_iterations:
             if time.time() - start >= self.timeout_seconds:
                 print(f"[{_ts()}] ⏳ timeout; using best edit so far.")
@@ -1055,14 +1438,7 @@ class OrchestratorActions:
             )
 
             if _new_revised is None:
-                # AUTO-BUG: a transient network/API error generating the
-                # edit used to fall through to the "no content produced"
-                # check below and return immediately — no retry, no
-                # backoff, no checkpoint — even though the validator call
-                # a few lines later gets full exponential-backoff retry
-                # for the identical failure mode. Apply the same treatment
-                # here so one dropped connection doesn't permanently kill
-                # the whole /edit command.
+                # A transient generation failure is retried, as the validator call is, instead of ending /edit.
                 _api_err_count += 1
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Edit generation unavailable — "
@@ -1087,6 +1463,14 @@ class OrchestratorActions:
             if not revised.strip():
                 print(f"[{_ts()}] No content produced — file left unchanged.")
                 return
+            # CC-16 (Part C): the revision is checked against the file's write
+            # encoding as soon as it exists, before the validator is called and
+            # before any backup is made. A legacy file the model has *fixed* —
+            # real Cyrillic, curly quotes, a dash — is written back in its own
+            # codec; a revision no codec here can hold is refused here, not after
+            # the last iteration has run and the whole edit is already spent.
+            if _refuse_unwritable(revised):
+                return
             print(f"[{_ts()}] ⏱  Edit generated in {time.time() - _step_start:.1f}s")
             print(f"[{_ts()}] 🤖 Validating edit ({iteration}/{self.max_iterations})...")
             _val_start = time.time()
@@ -1106,7 +1490,7 @@ class OrchestratorActions:
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Edit validator unavailable — "
                           f"max iterations reached, writing best effort. "
-                          f"({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
+                          f"({reply_text(validation.get('feedback'))}, {_val_elapsed:.1f}s)")
                     break
                 _chk = {
                     "loop": "run_edit",
@@ -1124,7 +1508,11 @@ class OrchestratorActions:
                 continue  # retry same iteration (do not increment)
 
             _api_err_count = 0
-            feedback = (validation.get("feedback") or "").strip()
+            # HARDEN-7 C: the feedback is read as text, so a validator that
+            # listed its complaints as a JSON array prints them instead of
+            # raising AttributeError out of `/edit` — and out of the shell with
+            # it, since nothing there catches it.
+            feedback = reply_text(validation.get("feedback"))
             if feedback:
                 print(f"[{_ts()}] ❗ Edit feedback: {feedback}")
 
@@ -1140,18 +1528,27 @@ class OrchestratorActions:
 
             iteration += 1
 
-        # Guard: if the loop never ran or every iteration returned empty
-        # content, revised is still "" — do NOT write an empty file.
+        # An empty revision is never written, so the target is not emptied.
         if not revised.strip():
             print(f"[{_ts()}] No content produced — file left unchanged.")
             return
 
-        # AUTO-FIX (fable follow-up 3): if the loop exhausted max_iterations
-        # with the validator still saying needs_fix, we are about to write
-        # content the validator NEVER approved. The gates exist to do their
-        # job — so say it loudly instead of writing in silence. (The write
-        # still happens: the timestamped .bak below makes it reversible, and
-        # the last attempt is usually closer to the goal than the original.)
+        # The model was shown the file with its secrets masked: a line it gave back masked is the original line.
+        revised = restore_masked_secrets(original, revised)
+        # HARDEN-13 A2: a line the restore could not put a real key back into is a
+        # placeholder written over a working key, and the write below would report
+        # success while doing it. The edit is refused, the file is left as it is,
+        # and the line that could not be restored is named.
+        for number, line in unrestored_masked_lines(original, revised):
+            print(f"[{_ts()}] ❌ {file_path}: line {number} still holds the masked "
+                  f"placeholder ({line.strip()}) — the original key it came from "
+                  f"could not be restored; the file is left unchanged. Ask for the "
+                  f"line exactly as it was given to you.")
+            return
+        if _refuse_unwritable(revised):
+            return
+
+        # If the loop ends with needs_fix, the file is written anyway (the .bak keeps it reversible), and the user is told.
         if validation.get("status") != "approved":
             print(f"[{_ts()}] ⚠️  WRITING UNAPPROVED EDIT — validator never "
                   f"approved after {self.max_iterations} iteration(s). "
@@ -1166,15 +1563,23 @@ class OrchestratorActions:
             _bak_n += 1
             backup = f"{target}.bak.{time.strftime('%H%M%S')}.{_bak_n}"
         try:
-            with open(backup, "w", encoding="utf-8") as b:
-                b.write(original)
-            # Atomic write (same pattern as state.py's _atomic_write): a
-            # process killed mid-write must not leave a truncated target.
-            _tmp = target + ".tmp-edit"
-            with open(_tmp, "w", encoding="utf-8") as f:
-                f.write(revised)
-            os.replace(_tmp, target)
+            import shutil
+            from tools.auto.utils import atomic_write_text
+            shutil.copy2(target, backup)        # the original's bytes and mode
+            # HARDEN-14 C2: `_edit_line_ends` decides each line's own ending, and keeps the
+            # BOM, so the write is not run through `in_style_of`'s whole-file majority pass —
+            # which is exactly the flattening this part removes.
+            atomic_write_text(
+                target, _edit_line_ends(target, revised), newline="", encoding=_encoding,
+            )
         except Exception as e:
+            # CC-16 (Part C): the backup was made for a write that never landed.
+            # `copy2` runs before anything can fail, so without this a refused or
+            # failed edit leaves a timestamped `.bak` behind — an artifact of an
+            # edit that did not happen, which is exactly the stray
+            # `note.txt.bak.135608` this part was filed over. A backup of a write
+            # that *succeeded* stays, as fix 34 left it.
+            _remove_edit_backup(backup)
             print(f"[{_ts()}] ❌ Failed to write {target}: {e}")
             return
 
@@ -1184,5 +1589,9 @@ class OrchestratorActions:
             fromfile=f"{file_path} (before)", tofile=f"{file_path} (after)"))
         print(f"\n[{_ts()}] ── FILE EDITED: {file_path} — {total:.1f}s from request ──")
         print(diff if diff.strip() else "(no textual changes)")
+        # HARDEN-18 C: a path may hold a space, so both sides of the hint are
+        # shell-quoted — `mv dir/my notes.txt.bak.105124 dir/my notes.txt` is
+        # four arguments and fails before it helps anyone.
         print(f"\n[{_ts()}] status={validation.get('status','unknown')}  "
-              f"backup={os.path.basename(backup)}  (restore with: mv {backup} {target})")
+              f"backup={os.path.basename(backup)}  "
+              f"(restore with: mv {shlex.quote(backup)} {shlex.quote(target)})")

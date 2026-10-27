@@ -145,17 +145,7 @@ class TestNothingStaged:
         assert "nothing staged" in log.lower() or "no new commit" in log.lower()
 
 
-# ── nothing staged + trivial acceptance_check → BLOCKED, not DONE ─────────────
-#
-# AUTO-CR-DELTA-2: confirmed in production — a creative task's
-# acceptance_check is routinely the literal string "true" (it can't fail,
-# so passing it proves nothing). When the coder also produces nothing new,
-# "nothing staged, but the check passed" used to still mean DONE, silently
-# indistinguishable from a real success. TASK above (acceptance_check =
-# "pytest -q") deliberately keeps every TestNothingStaged case above on the
-# old, still-correct DONE path — a real, non-trivial check that passed IS
-# independent evidence the tree is already correct. This class is the new
-# behaviour: only fires when the check itself could never have failed.
+# Nothing staged with a trivial acceptance_check (e.g. "true") is BLOCKED, not DONE.
 
 TRIVIAL_TASK = {**TASK, "acceptance_check": "true"}
 
@@ -424,11 +414,7 @@ class TestFactory:
         repo = tmp_path / "repo"
         repo.mkdir()
 
-        # Creative mode but with a config that will cause a non-ValueError
-        # in make_summary_memory — e.g. a non-numeric num_ctx triggers
-        # ValueError which SHOULD propagate; we use a missing api section
-        # to get a non-ValueError path. Actually, let's force an
-        # ImportError-like situation by monkeypatching make_summary_memory.
+        # Force an ImportError-like failure by monkeypatching make_summary_memory.
         original_make = None
         import tools.auto.summary_memory as sm_mod
 

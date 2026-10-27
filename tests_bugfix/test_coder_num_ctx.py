@@ -34,14 +34,15 @@ def _cfg(num_ctx, api_format="ollama"):
     return cfg
 
 
-def _capture_payload(coder):
+def _capture_payload(coder, monkeypatch):
     cap = {}
 
     def _fake(url, headers, payload, **kwargs):
         cap["payload"] = payload
         return '{"files": []}'
 
-    C._llm_stream.request_completion = _fake
+    # monkeypatch restores request_completion; a leaked fake broke a later real call in the same xdist worker.
+    monkeypatch.setattr(C._llm_stream, "request_completion", _fake)
     with tempfile.TemporaryDirectory() as d:
         try:
             coder.generate({"instruction": "x", "title": "t", "target_files": []}, d)
@@ -55,18 +56,18 @@ def test_coder_reads_num_ctx_from_config():
     assert coder._num_ctx == 8192
 
 
-def test_ollama_payload_carries_num_ctx():
+def test_ollama_payload_carries_num_ctx(monkeypatch):
     coder = C.make_coder(_cfg(8192))
-    payload = _capture_payload(coder)
+    payload = _capture_payload(coder, monkeypatch)
     opts = payload.get("options", {})
     assert opts.get("num_ctx") == 8192
     assert opts.get("num_predict") == 16384
 
 
-def test_num_ctx_zero_is_omitted():
+def test_num_ctx_zero_is_omitted(monkeypatch):
     # 0 means "use server default" — must NOT be sent.
     coder = C.make_coder(_cfg(0))
-    payload = _capture_payload(coder)
+    payload = _capture_payload(coder, monkeypatch)
     assert "num_ctx" not in payload.get("options", {})
 
 

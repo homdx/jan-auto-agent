@@ -50,22 +50,7 @@ def _dict_candidate(title: str, instruction: str) -> dict:
     return {"title": title, "instruction": instruction}
 
 
-# ── Regression: _build_llm_call fail-open contract ─────────────────────────
-#
-# Found via independent review, not by this file's existing tests: every
-# test above constructs a real ClusterReviewer and then immediately
-# overwrites reviewer._llm_call with a stub, so none of them exercise what
-# self._build_llm_call() actually returns during __init__ itself. A
-# refactor (GATE3-PROFILE-3) restructured _build_llm_call so only the
-# `from ... import` statements were guarded by try/except -- the
-# _default_llm_settings(...) and _make_llm_call(...) calls that follow ran
-# fully unguarded, so a config error with nothing to do with
-# plan_llm_profile (a malformed [coder] max_tokens, say) crashed
-# ClusterReviewer.__init__ outright, contradicting _build_llm_call's own
-# docstring ("so __init__ never raises for that reason"). These two tests
-# construct ClusterReviewer directly (no _llm_call override) to prove both
-# halves of the intended contract: general config errors fail open, a
-# genuinely malformed plan_llm_profile still raises loudly at construction.
+# Regression: general config errors in _build_llm_call fail open; a bad plan_llm_profile still raises.
 
 def test_build_llm_call_fails_open_on_unrelated_config_error() -> None:
     """A bad [coder] max_tokens (nothing to do with plan_llm_profile) must

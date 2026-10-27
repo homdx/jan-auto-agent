@@ -36,15 +36,10 @@ from typing import Callable, Mapping, Optional, Sequence
 
 from tools.arena import gitref, output
 
-# AR-1's table, the only codes `base check` returns: 0 every step passed (also a
-# cache hit), 1 a red step, 2 a refusal before anything ran. The 2 comes from
-# `output.refuse`, which prints the one line as well as returning it.
+# Exit codes: 0 all steps passed (or cache hit), 1 a red step, 2 refused before anything ran.
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
 
-#: The base's own checks, strictly in this order. Each is its own subprocess in
-#: the clean checkout. `-p no:cacheprovider` keeps the throwaway tree free of a
-#: `.pytest_cache`; the repository's own `pytest.ini` decides the parallelism,
-#: so the check adds no `-n`. `tests` and `tests_bugfix` are never run together.
+#: The base's checks, in order, each a subprocess in the clean checkout. tests and tests_bugfix are never run together.
 STEPS: tuple[tuple[str, list[str]], ...] = (
     ("tests", ["python3", "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider"]),
     ("tests_bugfix", ["python3", "-m", "pytest", "tests_bugfix", "-q", "-p", "no:cacheprovider"]),
@@ -79,8 +74,7 @@ class Step:
 
     name: str
     command: list[str]
-    #: A pytest step: a failed one carries its `FAILED …` lines. Named on the
-    #: step, not read off the command line, so a stand-in command is one too.
+    #: A pytest step: its FAILED lines are kept. Named on the step, not read from the command.
     pytest: bool = False
 
 
@@ -262,8 +256,7 @@ def _hit(cache: Mapping[str, dict], sha: str,
             "sha": sha,
             "cached": True,
         })
-    # A hit is a pass, so every stored step must have passed too: a mangled or
-    # red entry is no hit at all and is run for real.
+    # A cache hit only counts if every stored step passed; otherwise run for real.
     if not rows or not all(row["ok"] for row in rows):
         return None
     wanted = [name for name, _ in STEPS] if names is None else list(names)
@@ -360,7 +353,9 @@ def run_base_check(
     git checkout, `git worktree add` failing. No 3, no 4.
     """
     repo = Path(repo)
-    ref = getattr(args, "ref", None) or default_ref(profile)
+    ref = getattr(args, "ref", None)
+    if ref is None:
+        ref = default_ref(profile)       # an explicit --ref "" is refused below, not replaced
     if not isinstance(ref, str) or not ref.strip():
         return output.refuse("base check: --ref is empty")
     steps = list(steps) if steps else build_steps()

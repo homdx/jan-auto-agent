@@ -85,8 +85,7 @@ _BIBLE_SYSTEM = (
     "write a line like '<имя персонажа> — женщина' / '<имя персонажа> — мужчина')."
 )
 
-# AUTO-CR-24-3: compaction is now deterministic — no LLM call in this path.
-# (Old AUTO-CR-23 _COMPACT_SYSTEM prompt removed; see StoryBible._compact.)
+# Compaction is deterministic, with no LLM call (AUTO-CR-24-3; the old prompt is gone).
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -98,16 +97,26 @@ def _normalise(text: str) -> str:
     return text.lower().translate(_STRIP_TABLE)
 
 
+_WORD_TABLE = str.maketrans({c: " " for c in string.punctuation})
+_re_non_word = re.compile(r"[^\w\s]+")
+
+
+def _normalise_words(text: str) -> str:
+    """Lowercase, punctuation to spaces, whitespace collapsed — word boundaries kept.
+
+    AUDIT3-10: `_normalise` drops whitespace too, so a substring test on it
+    matched across words: "Ann is old." ('annisold') sat inside "Hannis Oldman
+    was the mayor…" ('hannisoldman…') and the fact was deleted from the bible.
+    """
+    # REL-2: every Unicode punctuation and symbol mark is a boundary, not only ASCII —
+    # «Анна», “Anna”, "Москве…" and "Paris—since" kept the mark on the word, so a fact
+    # that is a sub-phrase of a longer one was no longer seen inside it.
+    return " ".join(_re_non_word.sub(" ", text.lower().translate(_WORD_TABLE)).split())
+
+
 def _parse_bullets(text: str) -> list[str]:
     """Return raw bullet strings (without leading marker) from *text*."""
-    # BUGFIX: the numbered-marker alternative (\d+[.)]\s+) had no ^ anchor,
-    # so re.sub with count=1 stripped the FIRST "<digits>.<space>" or
-    # "<digits>)<space>" found anywhere in the line — not just a leading
-    # list marker. A fact like "Лена вернулась 1. мая в деревню" (an ordinal
-    # mid-sentence, not a bullet marker) was silently mangled to "Лена
-    # вернулась мая в деревню" before ever being stored or compared, since
-    # every _parse_bullets caller (_do_update, _compact, _dedup_substrings,
-    # the correction gate) works from this parsed-and-stripped text.
+    # Numbered bullets are stripped only at the start of a line, so a number inside a fact is kept (BUGFIX).
     marker = re.compile(r"^\s*[•\-\*]|^\d+[.)]\s+")
     result: list[str] = []
     for line in text.splitlines():
@@ -127,37 +136,21 @@ _GENDER_MALE_RE = re.compile(
     r"мужчин|мужского|парень|male|\bон\b", re.IGNORECASE
 )
 
-_AGE_RE = re.compile(r"(\d+)\s*(?:лет|год)", re.IGNORECASE)
-# BUGFIX (audit): unanchored — a duration-of-something phrase ("в браке 5
-# лет" = married for 5 years, "живёт здесь уже 10 лет" = has lived here
-# for 10 years already) matches the same "N лет/год" shape as a genuine
-# age statement ("Рейес — 40 лет"), and used to be misread as the
-# entity's age, which then falsely "conflicted" with a real age bullet
-# in _find_conflict. There is no positive age-context marker common
-# enough to require (the terse "Name — N лет" phrasing used throughout
-# this file's own tests has none), so this excludes the specific
-# duration-context words that immediately precede the number in a
-# non-age reading instead of requiring an age-context one.
+# (?<!\d) anchors the digit run at its first digit: without it, a line of thousands of
+# digits made every start position backtrack through the whole run (13.9 s at 20 000
+# digits — HARDEN-1 A6), and a match on ordinary text is unchanged, since the run is
+# read from its first digit either way.
+_AGE_RE = re.compile(r"(?<!\d)(\d+)\s*(?:лет|год)", re.IGNORECASE)
+# Duration phrases ("married for 5 years") are excluded from age detection, so they are not read as an age (BUGFIX).
 _AGE_DURATION_CONTEXT_RE = re.compile(
     r"(?:в\s+браке|женат\w*|замужем|прошло|знаком\w*|живёт|живет|работает|"
     r"длилось|прожил\w*|проработал\w*|уже)\s*$",
     re.IGNORECASE,
 )
-# AUTO-BUG: no human age is >= 120, but a calendar-year reference like
-# "в 1990 году" / "к 2020 году" / "с 1985 года" matches _AGE_RE too — "год"
-# is an unanchored prefix of "году"/"года", so "1990 году" was being read as
-# age=1990. That false "age" then fed straight into the immutable-fact
-# conflict gate below, so a bullet stating a character's BIRTH YEAR and a
-# later bullet stating their AGE (two compatible facts) were flagged as a
-# contradiction and one of them silently dropped. Cap plausible human age.
+# A calendar-year reference is not a human age: ages are capped, so a birth year is not read as a conflicting age (AUTO-BUG).
 _MAX_PLAUSIBLE_AGE = 119
 
-# AUTO-BUG-2 (extended): a second example of a guarded, narrowly but
-# deterministically detectable "immutable-ish" attribute besides
-# gender/age -- recovery/health status. Full generalisation to arbitrary
-# contradicting facts would need semantic (LLM) comparison; this mirrors
-# the same narrow, false-positive-resistant pattern as gender/age instead
-# of attempting that.
+# Recovery and health status are a second narrow immutable-fact pattern, like gender and age (AUTO-BUG-2).
 _RECOVERY_FULL_RE = re.compile(
     r"полностью (?:выздоровел|восстановил(?:ся|ась)|поправил(?:ся|ась))", re.IGNORECASE,
 )
@@ -187,12 +180,7 @@ _AGE_WORD_RE = re.compile(
 )
 
 _NAME_RE = re.compile(r"\b[А-ЯЁ][а-яёА-ЯЁ]{2,}\b")
-# Common non-name capitalised words that should not be treated as entity names.
-# Includes pronouns/demonstratives and generic role nouns that are capitalised
-# only because they start a sentence (bugfix: these were being misread as
-# character names, e.g. "Она сказала..." -> name "Она", "Главный герой..."
-# -> name "Главный" — which corrupted the entity-scoping in
-# _conflicts_with_established below).
+# Capitalised words that start a sentence (pronouns, role nouns) are not entity names (bugfix).
 _NAME_STOPWORDS = {
     "Капитан", "Команда", "Корабль", "Мостик", "Возраст",
     "Она", "Его", "Ему", "Себя", "Этот", "Эта", "Это",
@@ -234,18 +222,12 @@ def _age_of(bullet: str) -> "int | str | None":
     """
     if _AGE_UNKNOWN_RE.search(bullet):
         return "unknown"
-    # AUTO-BUG fix: a bullet can contain BOTH a calendar year ("в 1990
-    # году") and a genuine age ("ей было 45 лет") — scan every match and
-    # take the first one that is a plausible human age instead of just the
-    # first match found, so the calendar year no longer shadows the real
-    # age (or gets misread as one when it's the only \d+ (лет|год) hit).
+    # A bullet is scanned for every age match; the first plausible human age is used, so a year does not hide the real age (AUTO-BUG).
     for m in _AGE_RE.finditer(bullet):
         value = int(m.group(1))
         if value > _MAX_PLAUSIBLE_AGE:
             continue
-        # BUGFIX (audit): reject a match immediately preceded by a
-        # duration-context word ("в браке 5 лет") — see
-        # _AGE_DURATION_CONTEXT_RE above.
+        # A match preceded by a duration word is rejected (BUGFIX).
         if _AGE_DURATION_CONTEXT_RE.search(bullet[:m.start()]):
             continue
         return value
@@ -270,6 +252,9 @@ def _dedup_substrings(bullets: list[str]) -> list[str]:
     wins, first-seen wins ties.
     """
     norms = [_normalise(b) for b in bullets]
+    # Containment is judged on whole words (AUDIT3-10); equality keeps the
+    # fully collapsed form, so spacing/punctuation variants are still duplicates.
+    words = [f" {_normalise_words(b)} " for b in bullets]
     keep = [True] * len(bullets)
 
     for i, norm_i in enumerate(norms):
@@ -283,8 +268,8 @@ def _dedup_substrings(bullets: list[str]) -> list[str]:
                 if j > i:
                     keep[j] = False
                 continue
-            if norm_i in norm_j:
-                # bullet i is a substring of the longer bullet j — drop i.
+            if words[i].strip() and words[i] in words[j]:
+                # bullet i is a whole-word substring of the longer bullet j — drop i.
                 keep[i] = False
                 break
 
@@ -328,12 +313,7 @@ class StoryBible:
         self._max_chars = max(100, int(max_chars))
         self._verify = bool(verify)
         self._immutable_guard = bool(immutable_guard)
-        # Litera-sim fix: LLM-backed semantic conflict gate on merge. The
-        # deterministic _find_conflict covers only gender/age/recovery; any
-        # other hallucinated fact that contradicts an established one (e.g.
-        # «долг полностью погашен» vs «долг за три месяца аренды») used to be
-        # APPENDED alongside it, leaving the bible self-contradictory forever
-        # and burning continuity-revision caps on perfectly correct chapters.
+        # The semantic conflict gate runs on merge, for facts the deterministic check does not cover (litera-sim fix).
         self._semantic_guard = bool(semantic_guard)
         self._fidelity: "SummaryFidelityVerifier | None" = None
         if self._verify:
@@ -346,10 +326,23 @@ class StoryBible:
 
     def load(self) -> str:
         """Return the current bible text, or ``""`` if the file does not exist."""
+        # AUDIT3-9 (same defect as synopsis.md): read in the file's own codec and
+        # remember it with the line end, so `_write` puts the bible back the way
+        # it was instead of re-encoding a cp1251 bible's facts as U+FFFD.
+        from tools.auto.summary_memory import _read_in_own_codec
         try:
-            return self._path.read_text(encoding="utf-8", errors="replace")
+            text, encodings, eol = _read_in_own_codec(self._path)
+        except FileNotFoundError:
+            self._codec = (("utf-8",), "\n", True)
+            return ""
         except OSError:
             return ""
+        except UnicodeError:
+            # Not decodable without loss: shown to the model, never written back.
+            self._codec = (("utf-8",), "\n", False)
+            return self._path.read_text(encoding="utf-8", errors="replace")
+        self._codec = (encodings, eol, True)
+        return text
 
     def extract(self, chapter_text: str, known_facts: str = "") -> list[str]:
         """Ask the LLM to extract durable facts from *chapter_text*.
@@ -439,21 +432,7 @@ class StoryBible:
         existing_bullets = _parse_bullets(existing_text)
         existing_norms = {_normalise(b) for b in existing_bullets}
 
-        # Litera-sim fix: ONE batched semantic conflict check for all genuinely
-        # new facts against the established bible, feeding the same
-        # correction-attempt machinery as the deterministic guard — so a
-        # hallucinated contradiction is dropped on arrival, while a REAL
-        # correction (proposed consistently by _CORRECTION_THRESHOLD
-        # independent chapters) still eventually replaces a bad established
-        # bullet.
-        # AUTO-FIX: gated on self._semantic_guard, NOT self._immutable_guard.
-        # These are two independent config flags (story_bible_immutable_guard
-        # / story_bible_semantic_guard) — the previous version gated this
-        # call on immutable_guard alone, so setting immutable_guard=false
-        # silently disabled the semantic gate too, regardless of its own
-        # flag. _semantic_conflicts() already no-ops when self._semantic_guard
-        # is false, so gating the call here on the same flag just skips the
-        # (redundant) LLM call in that case rather than changing behavior.
+        # One batched semantic check for the new facts; a hallucinated contradiction is dropped, while a repeated real correction still replaces the old bullet.
         _candidates = [f for f in new_facts if _normalise(f) not in existing_norms]
         _semantic_map = (
             self._semantic_conflicts(_candidates, existing_bullets)
@@ -465,47 +444,24 @@ class StoryBible:
         for fact in new_facts:
             if _normalise(fact) in existing_norms:
                 continue
-            # AUTO-FIX: each guard now checks independently — a fact can be
-            # dropped/corrected by the deterministic check, the semantic
-            # check, or both, and either guard alone is enough to enter this
-            # branch (previously the whole branch — including the semantic
-            # lookup — was nested under immutable_guard, so semantic_guard
-            # had no effect when immutable_guard was off).
+            # Each guard runs on its own flag, so either one alone is enough to enter this branch (AUTO-FIX).
             if self._immutable_guard or self._semantic_guard:
                 conflict_bullet = None
                 if self._immutable_guard:
                     conflict_bullet = self._find_conflict(fact, merged)
                 if conflict_bullet is None and self._semantic_guard:
                     _sem = _semantic_map.get(fact)
-                    # The semantic map was computed against the pre-merge
-                    # bible; only honour it if the flagged bullet is still
-                    # present (it may have been replaced by a correction
-                    # earlier in this same loop).
+                    # The semantic result is used only if the flagged bullet is still there, since an earlier correction may have replaced it.
                     if _sem is not None and _sem in merged:
                         conflict_bullet = _sem
                 if conflict_bullet is not None:
-                    # BUGFIX (audit): a new fact that explicitly says the age
-                    # is unknown (_age_of() == "unknown") must never win an
-                    # age conflict against an established REAL numeric age,
-                    # no matter how many times it's proposed — "we don't
-                    # know" can't legitimately "correct" "we know it's 40".
-                    # Without this, _register_correction_attempt's normal
-                    # escalate-after-N-consistent-proposals logic (correct
-                    # for genuine corrections, e.g. a real age typo) would
-                    # eventually accept a vague re-observation and silently
-                    # overwrite the real age with "unknown" — the data
-                    # corruption this guards against.
+                    # "Age unknown" never wins against a known numeric age, however often it is proposed (BUGFIX).
                     _unknown_cannot_correct_real_age = (
                         _age_of(fact) == "unknown"
                         and _age_of(conflict_bullet) not in (None, "unknown")
                     )
                     if not _unknown_cannot_correct_real_age and self._register_correction_attempt(fact, conflict_bullet):
-                        # AUTO-BUG-2 fix: the SAME correction has now been
-                        # proposed by _CORRECTION_THRESHOLD independent
-                        # chapters in a row — treat it as a genuine fix to
-                        # a bad first extraction rather than an attack /
-                        # one-off model slip, and replace the established
-                        # bullet instead of dropping the correction forever.
+                        # The same correction proposed by enough independent chapters is treated as a real fix and replaces the bullet (AUTO-BUG-2).
                         logger.warning(
                             "StoryBible: accepting correction %r -> %r after "
                             "%d consistent re-observations.",
@@ -636,10 +592,7 @@ class StoryBible:
             return {}
 
 
-    # AUTO-BUG-2: number of independent chapters that must propose the exact
-    # same correction before it overrides a previously "locked" immutable
-    # fact. Persisted to disk (not just in-memory) because in this pipeline
-    # each chapter is typically a separate `main.py --auto` process.
+    # Number of independent chapters that must agree before a correction replaces a locked fact; kept on disk across runs (AUTO-BUG-2).
     _CORRECTION_THRESHOLD = 2
 
     def _pending_corrections_path(self) -> Path:
@@ -716,8 +669,7 @@ class StoryBible:
             )
             return deduped_text
 
-        # Hard ceiling exceeded — drop the oldest bullets only, as a last
-        # resort, and log exactly what was dropped.
+        # Past the hard ceiling the oldest bullets are dropped as a last resort, and the drop is logged.
         kept: list[str] = []
         dropped: list[str] = []
         # Walk from newest to oldest, keep what fits, then restore order.
@@ -742,16 +694,24 @@ class StoryBible:
 
     def _write(self, text: str) -> None:
         """Write *text* to the bible file.  Creates parent dirs as needed."""
+        from tools.auto.summary_memory import _codec_write_kwargs, _first_codec_holding
+        encodings, eol, writable = getattr(self, "_codec", (("utf-8",), "\n", True))
+        if not writable:
+            logger.error("StoryBible: %s is not readable without loss — left "
+                         "untouched (AUDIT3-9)", self._path)
+            return
+        if eol != "\n":
+            text = text.replace("\r\n", "\n").replace("\n", eol)
+        encoding = _first_codec_holding(encodings, text)
+        if encoding is None:
+            # REL-2: as the synopsis — the update is written as UTF-8, not dropped.
+            logger.warning("StoryBible: the update holds characters %s's codec (%s) "
+                           "cannot store — the bible is rewritten as UTF-8", self._path, encodings[0])
+            encoding = "utf-8"
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            # Bugfix: was a plain path.write_text(), which truncates-then-
-            # writes. This file is rewritten WHOLESALE on every update (the
-            # full accumulated fact set, not an append), so a kill mid-write
-            # is the worst instance of this pattern in the module: unlike
-            # the JSON files elsewhere, there's no parse step to even detect
-            # a truncated bible, so it would just silently read back with
-            # however many bullets happened to make it out before the kill.
-            atomic_write_text(self._path, text)
+            # The bible is rewritten whole on every update, so the write is atomic: a kill mid-write cannot leave a half-written bible (bugfix).
+            atomic_write_text(self._path, text, **_codec_write_kwargs(encoding, eol))
             logger.info("StoryBible: wrote %d chars to %s", len(text), self._path)
         except OSError as exc:
             logger.error("StoryBible: cannot write %s: %s", self._path, exc)
@@ -775,22 +735,7 @@ def make_story_bible(
     re-parsed from config so the bible uses the same API endpoint as the rest
     of the pipeline.
     """
-    # AUTO-BUG-1 fix: default to enabled. The bible's continuity-anchoring
-    # was designed to always run in creative mode; requiring an opt-in flag
-    # that the shipped agents.ini never actually set left the whole
-    # subsystem (and its story_bible_verify / story_bible_immutable_guard
-    # sub-settings) silently inert out of the box.
-    #
-    # BUGFIX (verified-bugs audit #3d, corrected): these were raw
-    # config.getboolean/getint calls with no try/except — unlike
-    # search_agent.py's make_search_agent, which guards every read.
-    # Wrapped per-call (not via a shared helper) so extract_config_reads
-    # (tools/collect/ast_facts.py) still sees each literal config.getX(...)
-    # call — a shared helper's `getattr(config, method)(...)` call shape
-    # is invisible to that AST scanner, confirmed directly: 0 reads
-    # recognized through a helper vs. 1 recognized for the identical
-    # literal call. Matches the established pattern already used for
-    # gate1_filter.py's config reads.
+    # The bible's continuity features are on by default; their config reads are guarded per call (AUTO-BUG-1, audit 3d).
     try:
         enabled = config.getboolean("validator_agent", "story_bible_creative", fallback=True)
     except ValueError as exc:
@@ -825,9 +770,7 @@ def make_story_bible(
     except ValueError as exc:
         logger.warning("config [validator_agent] story_bible_immutable_guard is malformed (%s) — using True", exc)
         immutable_guard = True
-    # Litera-sim fix: LLM semantic conflict gate on merge (see StoryBible).
-    # Default ON — one extra LLM call per chapter is the accepted price for
-    # a bible that cannot hold two mutually exclusive facts.
+    # The LLM semantic conflict gate is on by default: one extra call per chapter is accepted (litera-sim fix).
     try:
         semantic_guard = config.getboolean(
             "validator_agent", "story_bible_semantic_guard", fallback=True
@@ -882,22 +825,9 @@ def _build_llm_call(
     except ValueError as exc:
         logger.warning("config [loop] timeout_seconds is malformed (%s) — using 300", exc)
         timeout = 300
-    # RUN-10: the [loop] HTTP retry budget, read next to the timeout above —
-    # one reader for every auto-mode caller, request_completion()'s built-in
-    # defaults when the keys are absent.
+    # The [loop] retry budget is read next to the timeout (RUN-10).
     retry_kwargs = _llm_stream.retry_kwargs_from_config(config)
-    # AUTO-FIX (fable follow-up 3): the bible generator used to borrow
-    # [validator_agent] max_tokens (a cap sized for a short JSON verdict /
-    # numbered critique). Raising the validator budget silently inflated the
-    # bible and vice versa, and the 200-token fallback is ~13 lines — far too
-    # small for a whole-story bible in Cyrillic (~2 chars/token). Give the
-    # bible its own key with a creative-sized default; keep the old
-    # validator_agent value as a secondary fallback so existing tuned
-    # configs don't regress.
-    #
-    # BUGFIX (verified-bugs audit #3d, corrected): see the matching comment
-    # in make_story_bible() above — wrapped per-call (not via a shared
-    # helper) so extract_config_reads still sees each literal call.
+    # The bible has its own token budget with a creative-sized default; the validator budget is only a fallback (fable follow-up 3).
     try:
         _legacy_mt = config.getint("validator_agent", "max_tokens", fallback=200)
     except ValueError as exc:
@@ -915,13 +845,7 @@ def _build_llm_call(
     except ValueError as exc:
         logger.warning("config [api_%s] num_ctx is malformed (%s) — using 0", active_profile, exc)
         num_ctx = 0
-    # AUTO-FIX (fable follow-up 3): thinking models (qwen3) wrap output in
-    # <think>…</think>; with a bounded num_predict the reply can truncate
-    # mid-think and the bible comes back empty — or worse, reasoning lines
-    # that happen to match the FACT markers get PERSISTED into
-    # story_bible.md and re-injected into every later chapter prompt.
-    # Mirror the gate1/architect/coder toggle: default off, re-enable via
-    # [story_bible] think = true.
+    # Thinking-model output is off by default for the bible, so reasoning lines are not stored as facts (fable follow-up 3).
     try:
         think = config.getboolean("story_bible", "think", fallback=False)
     except ValueError as exc:
@@ -965,9 +889,7 @@ def _build_llm_call(
                     {"role": "user", "content": user},
                 ],
             }
-        # AUTO-FIX (fable follow-up 3): strip <think> reasoning BEFORE the
-        # fact-marker parser sees the text — otherwise reasoning lines can be
-        # mistaken for facts and persisted into story_bible.md.
+        # Reasoning is stripped before the fact parser runs, so reasoning lines are not stored as facts (fable follow-up 3).
         return _llm_stream.strip_think(
             _llm_stream.request_completion(
                 url=url,

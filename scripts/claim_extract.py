@@ -32,23 +32,32 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="list the sections, no network")
     args = ap.parse_args(argv)
 
-    sections = lf.split_sections(args.report.read_text(encoding="utf-8"))
+    # min_chars=0: extract is free, and the default cut (which pays per claim) dropped a short section's claims silently.
+    sections = lf.split_sections(args.report.read_text(encoding="utf-8-sig"), min_chars=0)
+    # ...but a part that is headings only (the report's `# Title`) has no claim to extract
+    sections = [s for s in sections if any(ln.strip() and not ln.lstrip().startswith("#")
+                                           for ln in s.splitlines())]
     if args.dry_run:
         for sec in sections:
             print("-", sec.splitlines()[0][:100])
         return 0
     cache = lf.Cache(args.cache)
-    # ask for the key only when a section is not cached: a second run sends
-    # nothing and so needs none
+    # Ask for the key only when a section is not cached: a second run sends nothing and needs none.
     todo = [sec for sec in sections if cache.get("extract", sec) is None]
     key = lf.api_key() if todo else ""
     seen: set[str] = set()
     claims: list[dict] = []
-    for sec in sections:
-        for c in lf.extract_claims(sec, key, cache):
-            if lf.normalize(c) not in seen:
-                seen.add(lf.normalize(c))
-                claims.append({"claim": c, "section": sec.splitlines()[0][:80]})
+    try:
+        for sec in sections:
+            for c in lf.extract_claims(sec, key, cache):
+                if lf.normalize(c) not in seen:
+                    seen.add(lf.normalize(c))
+                    claims.append({"claim": c, "section": sec.splitlines()[0][:80]})
+    except lf.LenzError as exc:
+        # one line, as before the LenzError: an HTTP 429 or a bad key was a traceback in extract.log
+        print(f"claim_extract: {exc} — the sections read before it are cached; a re-run does not "
+              "send them again", file=sys.stderr)
+        return 1
     args.out.write_text(json.dumps(claims, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"{len(sections)} sections -> {len(claims)} claims -> {args.out}")
     return 0

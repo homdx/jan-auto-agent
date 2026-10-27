@@ -124,11 +124,7 @@ class TestLongChapterChunkedCapped:
             call_counter[0] += 1
             return "- fact"
 
-        # Craft text that is larger than the chunk budget.
-        # With num_ctx=512, max_tokens=256: input_tokens = 512-256-300-200 = -244 → floored at 200
-        # chunk_budget_chars = 200 * 4 = 800 chars.
-        # Let's force num_ctx larger so budget is well-defined.
-        # num_ctx=2000, max_tokens=500 → input_tokens=2000-500-300-200=1000 → budget=4000 chars
+        # Input larger than the chunk budget, with num_ctx=2000 and max_tokens=500 for a defined budget.
         long_text = ("paragraph of prose. " * 30 + "\n\n") * 6  # ~3600+ chars total
 
         cap = 2
@@ -136,11 +132,7 @@ class TestLongChapterChunkedCapped:
         result = mem.summarize_chapter(long_text)
 
         assert isinstance(result, str)
-        # Total LLM calls must not exceed: (number_of_chunks + 1_merge_call) but
-        # strictly bounded by the cap in terms of *passes*, not raw calls.
-        # The critical assertion: passes ≤ cap means we never loop unboundedly.
-        # A pass = either one direct call or N chunk calls.
-        # We just verify call_counter is finite and the function returned.
+        # Calls stay bounded by the pass cap, so the loop never runs unboundedly.
         assert call_counter[0] > 0
         # And the result must be a non-empty string (best available text)
         assert result.strip()
@@ -159,8 +151,7 @@ class TestLongChapterChunkedCapped:
         mem = _mem(stub_llm, max_compression_passes=1, num_ctx=2000, max_tokens=500)
         result = mem.summarize_chapter(long_text)
 
-        # With cap=1 we can do chunked-pass but NO merge pass (recursion is
-        # blocked by the cap), so result is the concatenation of chunk summaries.
+        # cap=1: chunked pass, no merge pass (recursion blocked), so the result is the chunk concatenation.
         assert "single pass fact" in result
         # The recursion guard logs a warning and returns — verify we didn't infinite-loop.
         assert isinstance(result, str)

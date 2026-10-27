@@ -103,8 +103,7 @@ class TestLearnedStart:
 
     def test_second_candidate_starts_where_the_first_succeeded(self, repo):
         filt = _make_filter()
-        # candidate 0: 512 fails, 4096/0.0, 4096/0.1, 8192/0.0 fail, 8192/0.1 answers
-        # candidate 1: must go out at 8192 and be answered in ONE call
+        # Candidate 0 fails until 8192/0.1; candidate 1 must go out at 8192 and be answered in one call.
         payloads, accepted, _ = _run(
             filt, repo, ["", "", "", "", GOOD, GOOD], n_candidates=2)
         assert [p["max_tokens"] for p in payloads] == [512, 4096, 4096, 8192, 8192, 8192]
@@ -118,8 +117,7 @@ class TestLearnedStart:
 
     def test_ladder_resumes_above_the_learned_budget(self, repo):
         filt = _make_filter()
-        # cand 0 succeeds at 8192 (attempt 3); cand 1 fails at learned 8192,
-        # then the ladder must NOT revisit 4096.
+        # Candidate 0 succeeds at 8192; candidate 1 fails at learned 8192, and the ladder must not revisit 4096.
         payloads, _, _ = _run(
             filt, repo, ["", "", "", GOOD, "", "", "", GOOD], n_candidates=2)
         assert [p["max_tokens"] for p in payloads[4:]] == [8192, 8192, 8192, 16384]

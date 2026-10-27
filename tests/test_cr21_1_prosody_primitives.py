@@ -75,8 +75,7 @@ class TestCountSyllablesRu:
         assert count_syllables_ru("я") == 1
 
     def test_quatrain_line(self):
-        # "Мороз и солнце; день чудесный!"
-        # о,о (Мороз=2) + и (1) + о,е (солнце=2) + е (день=1) + у,е,ы (чудесный=3) → 9
+        # Syllable count of the line is 9 (vowel groups per word, summed).
         line = "Мороз и солнце; день чудесный!"
         result = count_syllables_ru(line)
         assert result == 9
@@ -149,10 +148,7 @@ class TestRhymesRu:
         assert rhymes_ru("дома", "рядом") is False
 
     def test_nebo_reka(self):
-        # небо → "бо" (е at index 1, tail "ебо"... let's check)
-        # небо cleaned = "небо"; last vowel 'о' at idx 3; tail = "о" (len 1); extend → "бо"
-        # река cleaned = "река"; last vowel 'а' at idx 3; tail = "а" (len 1); extend → "ка"
-        # "бо" != "ка", suffix "бо"[-2:]="бо", "ка"[-2:]="ка" → not equal
+        # 'небо' and 'река' end in different vowels (бо vs ка), so they do not rhyme.
         assert rhymes_ru("небо", "река") is False
 
     def test_dom_les(self):
@@ -213,15 +209,13 @@ class TestSplitStanzas:
         # Ends with "!" → not treated as title
         text = "Это не заголовок!\n\nстрока 1\nстрока 2"
         stanzas = split_stanzas(text)
-        # The single-line stanza has punctuation → kept, but len < 2 → dropped
-        # so only one stanza remains
+        # A single-line stanza with punctuation is kept by the splitter but dropped for having fewer than 2 lines.
         assert len(stanzas) == 1
 
     def test_single_line_stanzas_dropped(self):
         text = "одна строка\n\nа\nб"
         stanzas = split_stanzas(text)
-        # "одна строка" is a single-line stanza dropped as title;
-        # "а\nб" survives
+        # A one-line title stanza is dropped; the two-line stanza survives.
         assert len(stanzas) == 1
         assert stanzas[0] == ["а", "б"]
 
@@ -250,14 +244,12 @@ class TestDetectScheme:
     # Build hand-crafted stanzas using words with known rhyme keys
 
     def _aabb_stanza(self):
-        # Lines 1&2 rhyme, lines 3&4 rhyme
-        # "зима" / "прима" (ма), "луна" / "волна" (на)
+        # Lines 1-2 and 3-4 rhyme (AABB): зима/прима and луна/волна.
         return ["Трещит мороза снег зима", "Пришла красавица прима",
                 "Горит вдали ночная луна", "Шумит прибой — морская волна"]
 
     def _abab_stanza(self):
-        # Lines 1&3 rhyme, lines 2&4 rhyme
-        # "зима"/"прима" → 1&3; "луна"/"волна" → 2&4
+        # Lines 1-3 and 2-4 rhyme (ABAB).
         return ["Трещит мороза снег зима", "Горит вдали ночная луна",
                 "Пришла красавица прима", "Шумит прибой — морская волна"]
 
@@ -289,8 +281,7 @@ class TestDetectScheme:
         assert detect_scheme([]) == "NONE"
 
     def test_aabb_takes_priority_over_abab(self):
-        # If all 4 lines rhyme together, AABB is returned (checked first)
-        # "дома"/"зима"/"прима"/"сама" — все на "ма"
+        # If all four lines rhyme, AABB is returned (checked first).
         stanza = ["Я дома", "Трещит зима", "Пришла прима", "Иду сама"]
         result = detect_scheme(stanza)
         # 1&2 rhyme AND 3&4 rhyme → AABB

@@ -14,6 +14,72 @@ class ParsedPrompt:
     raw: str              # Original prompt
 
 
+#: Strategy A's declaration keywords. A keyword is what introduces the symbol, so it can never
+#: be the symbol itself.
+_DECLARATION_KEYWORDS = "def|class|function|func"
+
+#: Strategy C's stopwords: the intent and filler words, plus the declaration keywords. Without the
+#: keywords, a verified head that falls through (`the parse_data class represent`) would hand
+#: `class` over as the target, because `class` does occur in the source (HARDEN-20 C).
+_CANDIDATE_STOPWORDS = (
+    "show|improve|explain|find|view|display|me|the|in|from|optimize|fix|refactor|correct"
+    "|get|read|describe|understand|doc|" + _DECLARATION_KEYWORDS
+)
+
+
+#: Prose that stands where a symbol would be when there is no source to look the name up in (the
+#: first, source-less pass of `main.py`, and a caller with no file): the question words and the
+#: verbs a sentence puts after "the X function" — "what does the handle_request function return".
+#: Applied only without a source; with one, the definition test is the judge and a symbol that is
+#: really called `fail` or `work` is found as such.
+_PROSE_WORDS = frozenset((
+    "what", "how", "why", "when", "where", "which", "who", "does", "do", "did", "is", "are", "was",
+    "were", "tell", "about", "this", "that", "these", "those", "it", "its", "can", "could", "would",
+    "should", "will", "and", "or", "of", "to", "for", "with", "work", "works", "working", "return",
+    "returns", "returning", "fail", "fails", "failing", "represent", "represents", "mean", "means",
+    "raise", "raises", "throw", "throws", "take", "takes", "accept", "accepts", "compute", "computes",
+    "behave", "behaves", "handle", "handles", "break", "breaks", "crash", "crashes", "wrong",
+))
+_PROSE_WORD_RE = re.compile(r"\b(?:" + "|".join(sorted(_PROSE_WORDS, key=len, reverse=True)) + r")\b", re.IGNORECASE)
+
+
+def _declaration_head_is_a_symbol(remainder: str, match: "re.Match[str]", source: str) -> bool:
+    """True when Strategy A's head names a **symbol** rather than a verb (HARDEN-20 C).
+
+    `parse_prompt`'s first strategy is `\\b(def|class|function|func)\\s+(name)\\b`, which takes
+    whatever word follows the keyword and short-circuits the strategies that would find the
+    real symbol, so "what does the handle_request function return" came out with
+    `target_name="return"`. The match is therefore validated the way the later strategy
+    validates a candidate: the name must be a symbol of *source*, or be written in the
+    prompt as a code reference — followed straight away by `(` or `:`.
+
+    A plain word search in the source is not the test here: a prose verb like `return` occurs
+    in every file that returns anything, so the head would still be taken for the symbol. A
+    definition position is what counts — `def name`, `class name`, `function name`,
+    `func name`, or an assignment or annotation to it (`name =`, `name:`).
+
+    With no *source* there is nothing to verify against, so the head is accepted as before:
+    an unverifiable match is not a rejection.
+    """
+    name = re.escape(match.group(2))
+    if not source:
+        # Nothing to verify against, so the name cannot be looked up: a prose word after the keyword
+        # ("function return", "class represent") is a verb, a code reference (`def f(`, `class A:`)
+        # and any other word are taken as before.
+        if re.match(r'[ \t]*[(:]', remainder[match.end():]):
+            return True
+        return match.group(2).lower() not in _PROSE_WORDS
+    if match.group(1) in ("def", "func"):
+        return True                      # a prefix keyword: the word after it is the name, defined yet or not
+    if re.search(r'\b(?:def|class|function|func)\s+' + name + r'\b', source):
+        return True
+    if re.search(r'\b' + name + r'\s*[=:]', source):
+        return True
+    if re.match(r'[ \t]*[(:]', remainder[match.end():]):
+        return True                      # `def handle_request(`, written as a code reference
+    return False
+
+
 def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     """
     Attempts to break down the natural language prompt into structured tokens
@@ -22,17 +88,15 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     """
     cleaned_raw = raw.strip()
     
-    # 1. Extract File Path
-    # Matches common relative/absolute path architectures ending with an extension.
-    #
-    # BUGFIX: a dotted symbol reference like "MyClass.foo" also matches this
-    # pattern (word.word looks identical to word.ext), so a prompt such as
-    # "explain MyClass.foo in app.py" used to grab "MyClass.foo" as the file
-    # path — the first match won, even though the user explicitly marked the
-    # real file with "in ". Collect every candidate match and prefer the ones
-    # that are explicitly introduced by "in "; only fall back to the bare
-    # first-match behavior when no explicit "in <path>" marker exists at all.
-    file_matches = list(re.finditer(r'(?:^|\s)(in\s+)?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)\b', cleaned_raw))
+    # 1. File path. A dotted symbol (MyClass.foo) can look like a file; prefer candidates marked with "in ".
+    # REP-PROMPT-PATH: a path in quotes or backticks ("in `a.py`", "in 'my file.py'") is the
+    # whole quoted span, and "~/proj/a.py" / "C:\\proj\\a.py" are paths too — the backtick broke
+    # the `(?:^|\s)` anchor, "~" and the drive colon were outside the class, and the prompt
+    # fell to a chat answer with the file never read, or to the wrong "file.py".
+    file_matches = list(re.finditer(r'(?:^|\s)(in\s+)?[`\'"]([^`\'"\n]+\.[A-Za-z0-9]+)[`\'"]', cleaned_raw))
+    file_matches += list(re.finditer(
+        r'(?:^|\s)(in\s+)?((?:~|[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)\b', cleaned_raw))
+    file_matches.sort(key=lambda m: m.start())
     if not file_matches:
         return None
 
@@ -49,9 +113,11 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     target_name = ""
     target_type = "unknown"
 
-    # Strategy A: Target explicit language declaration keywords
-    decl_match = re.search(r'\b(def|class|function|func)\s+([A-Za-z_][\w]*)\b', remainder)
-    if decl_match:
+    # Strategy A: Target explicit language declaration keywords. HARDEN-20 C: the head is
+    # validated before it wins — a verb after the keyword (`... function return`) falls through
+    # to the strategies that find the real symbol.
+    decl_match = re.search(r'\b(' + _DECLARATION_KEYWORDS + r')\s+([A-Za-z_][\w]*)\b', remainder)
+    if decl_match and _declaration_head_is_a_symbol(remainder, decl_match, source):
         kw, name = decl_match.group(1), decl_match.group(2)
         target_name = name
         target_type = "class" if kw == "class" else "function"
@@ -61,33 +127,24 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
         from_match = re.search(r'\b(show|improve|explain|find|view|display)\s+([A-Za-z_][\w]*)\s+from\b', cleaned_raw, re.IGNORECASE)
         if from_match:
             target_name = from_match.group(2)
-            # BUGFIX (same class as the already-fixed Strategy A collision,
-            # see test_fix10_prompt_parser_keyword_collision.py): unlike
-            # Strategy A, this branch never stripped the captured
-            # target_name out of `remainder` before the intent keyword
-            # search below. If target_name happens to itself be a
-            # DIFFERENT category's keyword — e.g. "explain optimize from
-            # utils.py" captures target_name="optimize", which is also a
-            # has_improve keyword — it stayed sitting in `remainder` and
-            # silently flipped the detected intent, even though the actual
-            # intent verb ("explain") was the only thing the user typed.
-            # Strip only the target_name token — group(1), the real intent
-            # verb, must stay in `remainder` for the keyword search to see it.
+            # Strip only the target name from the remainder; the intent verb must stay so the keyword search sees it.
             remainder = re.sub(
                 r'\b' + re.escape(target_name) + r'\b', ' ', remainder, count=1
             ).strip()
         else:
-            # Strategy C: Fallback to the remaining single standalone identifier word.
-            # Only accept it if the symbol actually exists somewhere in the source file
-            # (def/class declaration or bare reference) to avoid grabbing prose words like
-            # "bug" from "fix the bug in app.py".
-            clean_rem = re.sub(r'\b(show|improve|explain|find|view|display|me|the|in|from|optimize|fix|refactor|correct|get|read|describe|understand|doc)\b', ' ', remainder, flags=re.IGNORECASE).strip()
-            words = clean_rem.split()
-            valid_identifiers = [w for w in words if re.match(r'^[A-Za-z_][\w]*$', w)]
+            # Strategy C: the single standalone identifier word, accepted only if it exists in the source.
+            clean_rem = re.sub(r'\b(' + _CANDIDATE_STOPWORDS + r')\b', ' ', remainder, flags=re.IGNORECASE).strip()
+            if not source:
+                clean_rem = _PROSE_WORD_RE.sub(' ', clean_rem).strip()   # no source to check a word against
+            words = [w.strip("`'\"") for w in clean_rem.split()]
+            # REP-PROMPT-DOTTED: "Loader.load" is a target too, each part checked in the source;
+            # it used to be dropped, and "show Loader.load in a.py" showed the file's imports.
+            valid_identifiers = [w for w in words if re.match(r'^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$', w)]
             for candidate in valid_identifiers:
                 # Accept only when the symbol is actually defined or referenced in source.
-                if source and not re.search(
-                    r'\b' + re.escape(candidate) + r'\b', source
+                if source and not all(
+                    re.search(r'\b' + re.escape(part) + r'\b', source)
+                    for part in candidate.split(".")
                 ):
                     continue
                 target_name = candidate
@@ -98,20 +155,7 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
 
     normalized_remainder = remainder.lower()
 
-    # Use word-boundary regex so a keyword like 'read' does not spuriously match
-    # inside a file name such as 'README.md' or 'thread.py'.
-    #
-    # Only ever search `remainder` (the raw prompt with the matched file-path
-    # segment and any def/class declaration already stripped out) — never the
-    # original raw string. `remainder` already retains every real verb the
-    # user typed; the *only* extra text a raw-string search would add back in
-    # is the file path / target name itself, and `\b` only guards against
-    # keywords glued to *contiguous* letters (e.g. "thread.py", "README.md").
-    # It does not help when the keyword is its own hyphen/dot-delimited token,
-    # which is a completely ordinary way to name a file or a function — e.g.
-    # "show def helper in small-fix.py" or "improve def show in ui.py" would
-    # otherwise pick up a spurious has_improve/has_show from the filename or
-    # symbol name and misclassify the intent.
+    # Keyword search runs on the remainder only, with word boundaries: the raw prompt would match names in file or symbol names.
     def _has_kw(words: list[str]) -> bool:
         pattern = re.compile(r'\b(?:' + '|'.join(re.escape(w) for w in words) + r')\b')
         return bool(pattern.search(normalized_remainder))

@@ -38,9 +38,7 @@ _LEGACY_CODE_SYSTEM = (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core spec'd tests (from AUTO-CR-19-4)
-# ─────────────────────────────────────────────────────────────────────────────
+# Core spec'd tests (AUTO-CR-19-4)
 
 class TestLegacySystemKeyWarning:
 
@@ -98,9 +96,7 @@ class TestLegacySystemKeyWarning:
         assert _lint_mode_config(None, "code") == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Extends to [coder] system / [architect] system, not just [validator_agent]
-# ─────────────────────────────────────────────────────────────────────────────
+# [coder] and [architect] system prompts, not just [validator_agent]
 
 class TestOtherLegacySystemSections:
 
@@ -146,9 +142,7 @@ class TestOtherLegacySystemSections:
         assert "[coder] system" in warnings[0]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# agents_4k.ini-style small num_ctx left in place for creative mode
-# ─────────────────────────────────────────────────────────────────────────────
+# Small num_ctx is left in place for creative mode (agents_4k.ini style)
 
 class TestSmallNumCtxWarning:
 
@@ -207,10 +201,7 @@ class TestSmallNumCtxWarning:
         assert "num_ctx=4096" in warnings[0]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Real-world fixture: agents_32k.ini (after CR-19-1's recommended addition)
-# must be silent; the un-patched legacy shape must warn.
-# ─────────────────────────────────────────────────────────────────────────────
+# Real-world fixture: agents_32k.ini (after CR-19-1's addition) must be silent; the unpatched legacy shape must warn.
 
 class TestAgentsIniShapes:
 
@@ -241,11 +232,7 @@ class TestAgentsIniShapes:
         assert "validator_agent" in warnings[0]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging side-effect: warnings are actually emitted via the module logger,
-# not just returned (the controller startup call site relies on the log
-# side-effect, not the return value, to surface this to operators).
-# ─────────────────────────────────────────────────────────────────────────────
+# Warnings are logged, not only returned: the controller relies on the log side-effect.
 
 class TestLoggingSideEffect:
 

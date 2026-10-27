@@ -66,11 +66,7 @@ logger = logging.getLogger(__name__)
 
 _FIX_PREFIX = "BUG-FIX-"
 
-# How many times a single bug ticket may enter the (expensive) OuterLoop
-# before it is deferred for an operator.  This bounds the one path that
-# previously had no terminal state at all — see branch 4c in
-# handle_regression.  Each attempt costs a full rounds x rewrites budget of
-# LLM calls, so the default is deliberately small.
+# Attempts a bug ticket may make through the expensive OuterLoop before an operator must step in; each attempt is a full budget.
 MAX_FIX_ATTEMPTS = 2
 
 
@@ -104,9 +100,7 @@ def _root_task_id(task_id: str) -> str:
 _MAX_OUTPUT_CHARS = 800   # keep ticket bodies and fix instructions concise
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Result
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class BugFixResult:
@@ -140,9 +134,7 @@ class BugFixResult:
         return f"[{self.ticket_id}] fix attempt did not pass"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # BugFixLoop
-# ─────────────────────────────────────────────────────────────────────────────
 
 class BugFixLoop:
     """Handles a post-commit regression by opening a ticket and running a fix.
@@ -206,43 +198,12 @@ class BugFixLoop:
             rounds = sorted(tdir.glob("feedback_round_*.md"))
             if not rounds:
                 return
-            # FIX-1 #8 (second half): local clock -> UTC. These archive
-            # directories are read next to run.log lines and ticket
-            # timestamps, both of which _ts() now stamps in UTC; leaving
-            # this one local makes the order of events in a failed run
-            # unreconstructable by eye. Patched in place (not via utils) so
-            # tests_bugfix/test_bug_fix_loop_archive_collision.py can keep
-            # freezing bug_fix_loop.datetime.
+            # Archive stamps are UTC, matching the run log and ticket timestamps (FIX-1 #8).
             stamp   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             archive = tdir / f"previous_attempt_{stamp}"
-            # BUGFIX: two archive calls for the same fix_id within the same
-            # wall-clock second land on an identical `archive` path. With
-            # `exist_ok=True` that used to just reuse the existing
-            # directory — and because feedback rounds are re-numbered from
-            # round 1 on every retry, a second collision within the second
-            # doesn't merely reuse an empty dir: `f.rename(archive /
-            # f.name)` silently OVERWRITES the first attempt's
-            # feedback_round_1.md (etc.) with the second attempt's own,
-            # destroying exactly the inspectable history this function
-            # exists to preserve ("moved aside rather than deleted... so
-            # the accumulated feedback stays inspectable"). The identical
-            # same-second collision was reproduced and fixed this same way
-            # in TicketStore._quarantine and MetricsCollector's corrupt-file
-            # quarantine (and, from there, PromptStore) — apply the same
-            # disambiguating-suffix guard here rather than leaving this one
-            # call site as the odd one out.
+            # Two archives in the same second get a suffix; without it the second would overwrite the first's feedback (bugfix).
             suffix_n = 0
-            # BUGFIX (audit): `while archive.exists(): ...` then a separate
-            # `archive.mkdir(parents=True)` is a check-then-act TOCTOU race
-            # — a concurrent process can create the exact same directory
-            # between this loop's last .exists()=False and the mkdir()
-            # call below, raising FileExistsError. That was caught by the
-            # broad `except OSError` at the bottom of this block, which
-            # just logs a warning and gives up — silently skipping
-            # archiving instead of retrying with the next suffix the way
-            # the loop above already intends to. Retry mkdir() itself on
-            # collision instead of pre-checking existence, closing the
-            # race window entirely.
+            # Retry mkdir on collision instead of checking first, so a concurrent writer cannot make archiving fail silently (bugfix).
             while True:
                 try:
                     archive.mkdir(parents=True)
@@ -257,16 +218,7 @@ class BugFixLoop:
                 "so the retry starts from round 1",
                 len(rounds), fix_id, archive.name,
             )
-            # BUGFIX: also clear the budget ledger (deadline_started_at.txt) so
-            # the retry gets a fresh wall-clock budget. OuterLoop.run_task
-            # opens it on entry and reads back the consumed time on every
-            # resume to compute the remaining budget. Archiving the feedback
-            # rounds resets the *round* counter but not the *time* counter, so
-            # a fix that exhausted most of its max_task_seconds on the first
-            # attempt started the retry with ~0 seconds left and was
-            # immediately re-blocked by the deadline gate — the operator reset
-            # (ticket status -> "open") restored the attempt budget but the
-            # stale ledger silently defeated the retry.
+            # Reset the time budget too: a stale deadline ledger would re-block the retry at once (bugfix).
             deadline_path = tdir / "deadline_started_at.txt"
             if deadline_path.exists():
                 try:
@@ -375,9 +327,7 @@ class BugFixLoop:
         re-registers the fix task as TODO through the normal path, so this
         does not make a retry impossible.
         """
-        # A fix task only exists once an attempt has been started, so on the
-        # terminal gates there is usually nothing to park.  Check first
-        # rather than relying on the except, so the common case stays quiet.
+        # Park only if the fix task exists; checking first keeps the common case quiet.
         existing_task = self._state.get_task(fix_id)
         if existing_task is None:
             return
@@ -417,12 +367,7 @@ class BugFixLoop:
             )
             return False
         except (TicketError, OSError) as exc:
-            # BUGFIX (audit): only TicketNotFound was caught here — a
-            # corrupt-on-disk ticket (TicketSchemaError, quarantined by
-            # TicketStore.update() itself) or a disk-write failure (raw
-            # OSError from the same call) still propagated out, crashing
-            # the run over exactly the kind of bookkeeping write this
-            # method's docstring says must never do that.
+            # A corrupt or unwritable ticket is logged, not allowed to crash the run from bookkeeping (bugfix).
             logger.warning(
                 "BugFixLoop: could not update ticket %s (%s) — "
                 "continuing", ticket_id, exc,
@@ -480,34 +425,12 @@ class BugFixLoop:
             params={"triggering_task": trig_id, "ticket_id": ticket_id},
         )
 
-        # ── 1. Ticket state gate ─────────────────────────────────────────────
-        #
-        # Reaching this method means the acceptance check FAILED just now.
-        # Every path below must therefore end in one of exactly two places:
-        # a bounded amount of new fix work, or a terminal state.  An
-        # unbounded path is a bug — controller._check_regressions re-runs
-        # every DONE task's check after EVERY later commit, so any status
-        # that neither short-circuits nor progresses re-triggers the full
-        # (expensive) OuterLoop on every remaining commit of the run.
-        #
-        #   open                  → proceed (fresh, or an operator reset)
-        #   in-progress           → proceed while attempts remain, else defer
-        #   deferred              → terminal, quiet   (operator resets to retry)
-        #   verification-failed   → terminal, quiet   (already surfaced once)
-        #   fixed                 → NOT terminal-quiet: see below
-        #
+        # 1. Ticket state gate: a ticket that is not open is left alone.
         existing = self._tickets.get(ticket_id)
         status   = (existing or {}).get("status")
         attempts = self._attempts_of(existing)
 
-        # An existing ticket back at "open" can only be an operator reset:
-        # a ticket is moved to "in-progress" immediately after its attempt is
-        # claimed, so the normal flow never leaves one "open" with attempts
-        # already spent.  Reset is the explicit "try this again" signal, so
-        # the budget must be restored with it — carrying the stale counter
-        # over meant the retry got a single attempt (and logged the nonsense
-        # "attempt 3/2"), then deferred again immediately, no matter how many
-        # times the operator reset it.
+        # An operator reset to open restores the attempt budget; otherwise the retry would get one attempt and log an impossible count.
         if status == "open" and attempts:
             logger.info(
                 "BugFixLoop: ticket %s was reset to open — restoring the fix "
@@ -517,14 +440,7 @@ class BugFixLoop:
             # Restoring the counter alone is not enough — see the helper.
             self._clear_stale_fix_rounds(fix_id)
 
-        # "fixed" + a failing check is a contradiction, and silently skipping
-        # it was how a run could finish green over a permanently broken test.
-        # The old code returned fixed=True here, so the controller logged
-        # "already fixed — skipped" and moved on, forever.  One observation is
-        # already proof the recorded fix did not hold; re-running OuterLoop
-        # would just burn a full budget on the same inputs that produced the
-        # bad "pass" in the first place.  So escalate once, loudly, to a
-        # terminal state an operator has to look at.
+        # A fixed ticket that fails its check is a contradiction: escalate once to a state an operator must look at.
         if status == "fixed":
             logger.error(
                 "BugFixLoop: ticket %s is marked fixed but its acceptance "
@@ -565,10 +481,7 @@ class BugFixLoop:
                 skipped=True, verification_failed=True,
             )
 
-        # A "deferred" ticket already exhausted its full OuterLoop
-        # rounds/rewrites budget.  Without this short-circuit every later
-        # commit re-attempted the same expensive cycle on a regression
-        # already known not to resolve.  An operator resets it to "open".
+        # A deferred ticket is not re-attempted on later commits; an operator resets it to open.
         if status == "deferred":
             logger.info(
                 "BugFixLoop: ticket %s already deferred — skipping "
@@ -579,16 +492,7 @@ class BugFixLoop:
                 ticket_id, fix_id, fixed=False, exhausted=True, skipped=True,
             )
 
-        # An "in-progress" ticket means a previous handle_regression call
-        # returned without reaching a terminal state — the 4c "partial
-        # failure" path, where OuterLoop reported neither pass nor
-        # exhaustion.  That path had no short-circuit at all, so it re-ran a
-        # full OuterLoop on every subsequent commit for the rest of the run:
-        # no crash, just an unbounded LLM-budget leak.  The attempt counter
-        # bounds it and then routes it to the same terminal state a genuine
-        # exhaustion gets.  Note "open" is deliberately NOT gated — it is the
-        # explicit operator-reset signal, and gating it would make a manual
-        # retry a no-op.
+        # An in-progress ticket from an unfinished attempt is bounded by the attempt counter, then deferred (bugfix).
         if status == "in-progress" and attempts >= self._max_fix_attempts:
             logger.warning(
                 "BugFixLoop: ticket %s has used its %d fix attempts without "
@@ -604,11 +508,7 @@ class BugFixLoop:
                 "bug_fix_loop", "controller", "attempts_exhausted",
                 params={"ticket_id": ticket_id, "attempts": attempts},
             )
-            # BUGFIX: every other "defer this ticket" branch in this file
-            # calls _discard_fix_residue before _park_fix_task; this one
-            # skipped it, leaving the last (never-committed) fix attempt's
-            # working-tree edits in place to be swept into whatever the
-            # NEXT successful commit happens to be.
+            # Discard the uncommitted fix edits before deferring, as the other defer branches do (bugfix).
             self._discard_fix_residue(fix_id)
             self._park_fix_task(fix_id)
             return BugFixResult(
@@ -620,9 +520,7 @@ class BugFixLoop:
             ticket = make_ticket(
                 id=ticket_id,
                 type="bug",
-                # Canonical root id, not trig_id: when the trigger is the
-                # synthetic fix task the ticket still concerns the ORIGINAL
-                # task, so list_by_task(root) must find it.
+                # Link the ticket to the root task, not the synthetic fix task, so the root can find it.
                 linked_task=root_id,
                 title=f"Regression: {triggering_task.get('title', trig_id)}",
                 body=body,
@@ -634,19 +532,14 @@ class BugFixLoop:
             except TicketAlreadyExists:
                 pass   # race-safe; continue with whatever is on disk
             except TicketError as exc:
-                # AUTO-T37 FIX: OSError from _ensure_dir (permission denied,
-                # read-only fs) is now re-raised as TicketError by create().
-                # Losing the ticket record is acceptable; crashing the run
-                # after a commit already succeeded is not.
+                # A ticket write failure is logged; losing the record is acceptable, crashing after a commit is not (AUTO-T37).
                 logger.warning(
                     "BugFixLoop: ticket %s could not be persisted (%s) "
                     "— continuing without ticket record",
                     ticket_id, exc,
                 )
 
-        # Claim this attempt BEFORE running the (long) fix loop, so the
-        # counter reflects work started rather than work completed — a run
-        # killed mid-OuterLoop must not resume with a free attempt.
+        # Count the attempt before the long fix loop, so a run killed mid-fix cannot resume with a free attempt.
         attempts += 1
         self._safe_update(
             ticket_id, status="in-progress", fix_attempts=attempts,
@@ -664,16 +557,7 @@ class BugFixLoop:
         fix_task = self._build_fix_task(
             fix_id, ticket_id, triggering_task, exec_result
         )
-        # A1 follow-up: fix_id is deterministic (f"{_FIX_PREFIX}{root_id}"), so a
-        # NEW regression on the same root re-upserts the SAME id. Once the first
-        # fix succeeded that task is STATUS_DONE (bug_fix_loop.py:712 /
-        # commit_on_success.py:165), and the A1 downgrade guard would refuse the
-        # done -> todo re-open — the new regression would sit in plan.json with a
-        # fresh instruction and a done status, so the queue would never pick it
-        # up and the regression would go silently unfixed. A new regression IS
-        # the explicit "give this task a fresh start" signal the opt-in exists
-        # for. Plain re-plans (plan_emitter / pipeline) still do not pass it, so
-        # completed work stays protected there.
+        # A new regression on the same root re-opens the done fix task explicitly, so it is not left silently unfixed (A1).
         self._state.upsert_task(fix_task, allow_downgrade=True)
 
         # ── 3. Run the fix through the C-loop ─────────────────────────────────
@@ -683,29 +567,10 @@ class BugFixLoop:
         try:
             outer_result = self._outer.run_task(fix_task, base_dir)
         except BaseException:
-            # The fix task is registered STATUS_TODO and only the outcome
-            # branches below settle it.  If OuterLoop raises — LLM timeout,
-            # API error, MemoryError, KeyboardInterrupt — the exception
-            # propagates out of handle_regression and the task is left TODO,
-            # which resume_info() reports as pending.  The RESUMED run's main
-            # queue then executes the fix task directly, outside this loop:
-            # the fix_attempts bound is bypassed, the ticket is never moved to
-            # "fixed" even if that run succeeds, and a failure routes to
-            # ExhaustionHandler, which opens a SECOND ticket
-            # (TICKET-BUG-FIX-...) for the same underlying bug.
-            #
-            # Park before re-raising so the crashed attempt cannot leak into
-            # the main queue.  The attempt has already been charged, and a
-            # later handle_regression with attempts remaining re-upserts the
-            # task (upsert_task replaces wholesale, restoring TODO), so this
-            # does not block a legitimate retry.
+            # On a crash, discard the residue and park the fix task, so the main queue never runs it outside the attempt bound (bugfix).
             self._discard_fix_residue(fix_id)
             self._park_fix_task(fix_id)
-            # If this crash consumed the last attempt the ticket will never be
-            # retried, so leaving it "in-progress" misreports live work to
-            # anyone reading .agent/tickets/ during an incident.  Settle the
-            # label now; the behaviour is unchanged either way, since the
-            # gate would defer it on the next entry regardless.
+            # Settle the label if this crash used the last attempt, so the ticket does not look live forever.
             if attempts >= self._max_fix_attempts:
                 self._safe_update(ticket_id, status="deferred")
                 self._state.log(
@@ -719,11 +584,7 @@ class BugFixLoop:
             if self._cos is not None:
                 sha = self._cos.commit(fix_task, outer_result)
             else:
-                # No-git mode.  The controller treats a git setup failure as
-                # non-fatal (self.git = None, "Epic A stays usable without
-                # git") and marks tasks DONE by hand in that case; mirror
-                # exactly that here instead of dereferencing None, which
-                # would raise AttributeError from inside a regression fix.
+                # Without git there is no commit sha; the fix is marked done by hand, as the controller does (non-fatal git setup).
                 sha = None
                 try:
                     self._state.set_task_status(fix_id, STATUS_DONE)
@@ -737,45 +598,10 @@ class BugFixLoop:
                     f"commit (no-git mode)"
                 )
 
-            # CommitOnSuccess.commit() returns None on GitError AND when
-            # nothing was staged, and only calls set_task_status(DONE) when a
-            # sha actually came back.  So "passed but not committed" left the
-            # fix task TODO — pending — for the main queue to pick up on the
-            # next run, outside this loop's attempt accounting.  Marking the
-            # ticket "fixed" on top of that claimed a repair that exists only
-            # in the working tree, or nowhere at all.
-            #
-            # This is not an exotic path: a flaky check that regresses and
-            # then passes again without the coder needing to change anything
-            # produces an empty diff, hence no sha.  A failing pre-commit
-            # hook, a detached HEAD or missing git identity produce the same.
-            #
-            # Treat it as an inconclusive attempt — the same bounded
-            # retry-then-defer machinery as branch 4c — rather than a fix.
-            # `sha` alone is the WRONG discriminator here, and treating it as
-            # one was a bug: commit() returns None for TWO different outcomes.
-            #
-            #   * nothing staged — an empty diff.  CommitOnSuccess handles
-            #     this deliberately (commit_on_success.py, the `else` after
-            #     `if sha:`): it logs "nothing staged", marks the task DONE
-            #     with commit="" and returns None.  The acceptance check
-            #     passed and the tree is already correct, so this IS a
-            #     success — it is what a flaky regression that resolves
-            #     itself looks like.
-            #   * GitError — rejected pre-commit hook, detached HEAD, missing
-            #     identity, lock contention.  commit() returns None EARLY,
-            #     without marking anything, so the fix task is still TODO.
-            #     This is a genuine failure.
-            #
-            # The task's own status separates them without changing
-            # commit()'s contract: DONE means the commit path settled it,
-            # by either route.
+            # A commit that returns no sha (error or nothing staged) marks nothing done; the status follows the real outcome.
             settled = (self._state.get_task(fix_id) or {}).get("status") == STATUS_DONE
             if not sha and not settled:
-                # AUTO-FIX: this branch is reached in both modes but always
-                # blamed "the commit (git error)". In no-git mode no git ran
-                # at all — sha is None by construction and the failure is in
-                # the state store. Report what actually failed.
+                # No-git mode has no git commit at all, so report the state-store failure rather than a git error (AUTO-FIX).
                 no_git_mode = self._cos is None
                 reason = (
                     "could not mark the fix task DONE (no-git mode)"
@@ -825,16 +651,7 @@ class BugFixLoop:
                 outer_result.knowledge() if hasattr(outer_result, "knowledge")
                 else "", _MAX_OUTPUT_CHARS
             )
-            # BUGFIX: TicketStore.get() does a fresh disk read here and
-            # returns None if the ticket file is absent — and self._outer
-            # .run_task() above can run for a long time (many LLM calls /
-            # retries), during which the ticket file could be deleted
-            # externally (an operator cleaning up a stuck ticket, a
-            # concurrent process, a filesystem hiccup). The ticket having
-            # existed or been created earlier in this same call doesn't
-            # guarantee it still exists now — a bare `[...]["body"]`
-            # subscript on None would raise TypeError and crash the whole
-            # bug-fix loop instead of just this one deferred update.
+            # The ticket may have vanished during a long run: re-read it defensively, so a missing ticket cannot crash the loop (BUGFIX).
             _existing_ticket = self._tickets.get(ticket_id) or {}
             self._safe_update(
                 ticket_id,
@@ -856,14 +673,7 @@ class BugFixLoop:
                 ticket_id, fix_id, fixed=False, exhausted=True
             )
 
-        # ── 4c. Partial failure — OuterLoop returned no verdict ───────────────
-        # "Shouldn't normally happen" is exactly why this needed a terminal
-        # state: it left the ticket at "in-progress" forever, and since
-        # "in-progress" short-circuited nothing, every subsequent commit
-        # re-ran a full OuterLoop on it for the rest of the run.  The ticket
-        # is left in-progress only while attempts remain (the gate above
-        # bounds that); once spent, it is deferred like any other
-        # unresolvable regression so an operator sees it.
+        # 4c: no verdict from OuterLoop: the ticket stays in progress only while attempts remain, then is deferred like any other.
         logger.warning(
             "BugFixLoop: fix loop for %s returned without pass or exhaustion "
             "(attempt %d/%d)", ticket_id, attempts, self._max_fix_attempts,
@@ -954,9 +764,7 @@ class BugFixLoop:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_bug_fix_loop(
     config,
@@ -995,18 +803,7 @@ def make_bug_fix_loop(
         outer_loop = make_outer_loop(config, base_dir, state_store)
 
     if commit_on_success is None:
-        # A None here is ambiguous: it can mean "not supplied, please build
-        # one", or it can mean "the caller already decided there is no git".
-        # The controller means the SECOND — it sets commit_helper to None
-        # precisely when its own guarded make_git_manager() failed and it
-        # logged "continuing without git".  Rebuilding one here re-ran that
-        # same failing call UNGUARDED, so the GitError the controller had
-        # deliberately swallowed was raised again from make_bug_fix_loop and
-        # aborted the run — defeating the documented no-git mode outright.
-        #
-        # Try to build one for the genuine "not supplied" callers, but treat
-        # failure the way the controller already treats it: log, continue
-        # without a commit helper.
+        # None means "no git" when the controller already decided that; rebuilding a helper here would re-raise its swallowed GitError.
         from tools.auto.git_manager import GitError
         try:
             commit_on_success = make_commit_on_success(
@@ -1030,9 +827,7 @@ def make_bug_fix_loop(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _truncate(text: str, max_chars: int) -> str:
     text = text or ""

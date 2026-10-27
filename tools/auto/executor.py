@@ -60,10 +60,14 @@ from __future__ import annotations
 import logging
 import os
 import re
+from tools.llm_stream import _name_is_not_a_credential
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -73,18 +77,7 @@ from tools.auto.utils import is_pytest_command, is_xdist_flag, pytest_piece_span
 
 logger = logging.getLogger(__name__)
 
-# Environment variables that could give a subprocess network access that we
-# want to suppress.  We clear these rather than block at the OS level.
-#
-# BUGFIX: no_proxy/NO_PROXY are NOT proxy servers — they are bypass lists
-# (e.g. "localhost,.internal") telling an HTTP client which hosts to reach
-# DIRECTLY, without a proxy. Clearing them alongside the actual proxy vars
-# had the opposite of the intended effect: on a host that relies on
-# no_proxy to keep intranet/local traffic off the proxy, removing it made
-# every subprocess spawned by the executor (pytest, linters, scripts) route
-# local-domain requests through a real proxy (or fail/slow down) instead of
-# going direct. Only the actual proxy-server vars are cleared; no_proxy is
-# left untouched.
+# Proxy server variables are cleared for subprocesses; no_proxy is a bypass list and stays.
 _PROXY_SERVER_VARS = (
     "http_proxy", "HTTP_PROXY",
     "https_proxy", "HTTPS_PROXY",
@@ -92,45 +85,32 @@ _PROXY_SERVER_VARS = (
     "all_proxy",  "ALL_PROXY",
 )
 
-# Maximum number of characters captured from stdout / stderr before truncation.
-# Prevents runaway output from filling memory.
+# Output captured from stdout and stderr is capped, so runaway output cannot fill memory.
 _MAX_OUTPUT_CHARS = 64_000
+#: REL-1 #1: a command whose stdout or stderr file grows past this is killed. The text
+#: kept is `_MAX_OUTPUT_CHARS` anyway; this only stops a runaway writer filling the disk.
+_MAX_OUTPUT_FILE_BYTES = 64 * 1024 * 1024
+#: How often `_wait_bounded` looks at the output files while the command runs.
+_OUTPUT_POLL_SEC = 0.25
 
 # Maximum traceback snippet length returned in ExecutionResult.traceback.
 _MAX_TRACEBACK_CHARS = 4_000
 
-# RUN-3: appended to a workspace pytest run when ``[executor] pytest_serial``
-# is on and the project's own pytest config asks for an xdist pool. A task
-# workspace holds one changed file, so xdist has nothing to distribute — yet
-# the workspace inherits the project's ``pytest.ini`` (``addopts = -n auto
-# --dist=loadgroup`` in this repo) and every attempt spawned a worker per CPU,
-# paid the "bringing up nodes..." startup twice, and interleaved the output.
-# ``-n 0`` is xdist's own in-process switch and, given on the command line,
-# overrides the earlier ``-n auto`` from addopts. ``-p no:xdist`` is NOT safe
-# here: it unregisters the plugin that defines ``-n``/``--dist``, so addopts'
-# ``-n auto`` becomes "unrecognized arguments" and every workspace run exits 4
-# before collecting a test (reproduced on pytest 8.3.5 / xdist 3.8.0).
+# RUN-3: serial pytest flag: "-n 0" overrides the project's xdist addopts; disabling the plugin would break the run.
 _PYTEST_SERIAL_FLAG = "-n 0"
 
-# The config files pytest reads for ``addopts``, in pytest's own precedence
-# order; the first one present wins — pytest never merges a second file.
-_PYTEST_CONFIG_FILES = ("pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg")
+# Config files pytest reads for addopts, in its precedence order; the first one present wins.
+_PYTEST_CONFIG_FILES = ("pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini",
+                        "setup.cfg")
 
-# Directories excluded when mirroring base_dir into a task workspace (see
-# _prepare_workspace / AUTO-FIX-1): VCS metadata, the agent's own
-# state/workspace tree — workspace_root defaults to base_dir/.agent/workspace,
-# so excluding ".agent" also prevents shutil.copytree from recursing into its
-# own destination — and common cache/dependency dirs that are large,
-# irrelevant to acceptance checks, and safe to leave out (regenerable).
+# Directories left out when mirroring base_dir into a task workspace (VCS, the agent's own state, caches).
 _MIRROR_IGNORE = shutil.ignore_patterns(
     ".git", ".agent", "__pycache__", ".pytest_cache", ".mypy_cache",
     ".venv", "venv", "node_modules", ".tox", "*.egg-info",
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Result dataclass
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ExecutionResult:
@@ -193,9 +173,7 @@ class ExecutionResult:
         }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Executor
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Executor:
     """Sandboxed runner for autonomous task acceptance checks.
@@ -258,9 +236,7 @@ class Executor:
         self._python_bin  = python_bin or sys.executable
         self._max_retained_workspaces = max(0, int(max_retained_workspaces))
         self._pytest_serial = bool(pytest_serial)
-        # RUN-3: the addopts scan is one file read per repo; cached so the
-        # AUTO-G5 regression loop, which re-runs the executor for every DONE
-        # task after each commit, pays it once.
+        # The addopts scan is cached per repo, since the regression loop re-runs the executor after each commit (RUN-3).
         self._xdist_pool_requested: Optional[bool] = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -291,12 +267,7 @@ class Executor:
             If *task* is missing the ``id`` field (programming error by
             the caller).
         """
-        # AUTO-FIX (low-priority audit): the "" default only covers a
-        # missing 'id' key — a task dict with an explicit `"id": None`
-        # made .get() return None, and None.strip() raised a raw
-        # AttributeError instead of the documented, catchable ValueError
-        # below. The sibling acceptance_check read right after this
-        # already uses `(x or "").strip()` for exactly this reason.
+        # A task id of None is treated as empty, so the documented ValueError is raised instead of an AttributeError (audit).
         task_id = (task.get("id") or "").strip()
         if not task_id:
             raise ValueError("Executor.run(): task dict must have a non-empty 'id' field")
@@ -310,17 +281,10 @@ class Executor:
         # Resolve the command to run.
         command = self._resolve_command(acceptance_check, target_files, workspace)
 
-        # RUN-3: one file per workspace, so xdist here is startup cost and
-        # interleaved output only. Applied after _resolve_command so the
-        # resolved (and safety-checked) command is what gets the flag.
+        # Serial pytest is applied after the command is resolved and checked, so the checked command gets the flag (RUN-3).
         command = self._serialise_pytest(command)
 
-        # AUTO-CR-12: cross-platform no-op acceptance — creative/docs tasks
-        # default acceptance_check to "true" (a Unix builtin), but on Windows
-        # `true`/`false`/`:` aren't commands, so cmd.exe returns rc=1 and every
-        # such task fails. Recognise only these Unix builtins and resolve them
-        # without spawning a shell ("exit 0"/"exit 1" are valid everywhere and
-        # run normally).
+        # Unix no-op builtins run without a shell, so creative and docs tasks with the default check work on Windows too (AUTO-CR-12).
         _norm = (command or "").strip().lower().rstrip(";")
         if _norm in ("true", ":"):
             logger.info("executor run: task=%s no-op acceptance (%r) → pass", task_id, command)
@@ -360,6 +324,72 @@ class Executor:
 
     # ── Workspace setup ───────────────────────────────────────────────────────
 
+    def _mirror_ignore(self, workspace: Optional[Path] = None):
+        """The ``copytree`` ignore callable for the repo mirror.
+
+        On top of :data:`_MIRROR_IGNORE`:
+
+        * AUDIT-10: the workspace root itself. A ``workspace_root`` configured
+          inside ``base_dir`` at a path the static list does not name (say
+          ``<repo>/ws``) was mirrored into the workspace being populated —
+          ``ws/T1/ws/T1/…`` — until the path length or the disk ran out.
+          CC review fixes 49: only a root that lies *inside* ``base_dir`` is
+          skipped. A root above it (``workspace_root`` = the repo's parent)
+          holds every file of the repo, and skipping "everything under the
+          root" mirrored nothing at all. *workspace*, the directory being
+          populated, is always skipped — it is the one place the copy can
+          recurse into, wherever the root is.
+        * AUDIT-21: a symlink whose target resolves outside ``base_dir``, and
+          a directory link back to one of its own ancestors (a cycle).
+          ``symlinks=False`` follows links, so a link to ``/etc`` or ``~``
+          used to copy the outside data into the workspace the acceptance
+          check runs in — the opposite of what the comment beside it promised.
+        """
+        try:
+            base_real = self._base_dir.resolve()
+            ws_real = self._workspace_root.resolve()
+            target = workspace.resolve() if workspace is not None else None
+        except (OSError, RuntimeError):
+            return _MIRROR_IGNORE
+        ws_inside = base_real in ws_real.parents
+
+        def ignore(dirpath, names):
+            skipped = set(_MIRROR_IGNORE(dirpath, names))
+            for name in names:
+                if name in skipped:
+                    continue
+                entry = Path(dirpath) / name
+                try:
+                    real = entry.resolve()
+                except (OSError, RuntimeError):
+                    skipped.add(name)
+                    continue
+                if ws_inside and (real == ws_real or ws_real in real.parents):
+                    skipped.add(name)
+                    continue
+                if target is not None and (real == target or target in real.parents):
+                    skipped.add(name)
+                    continue
+                if entry.is_symlink() and real != base_real and base_real not in real.parents:
+                    logger.warning(
+                        "_prepare_workspace: not mirroring %s — symlink resolves "
+                        "outside %s", entry, base_real,
+                    )
+                    skipped.add(name)
+                    continue
+                if entry.is_symlink() and real.is_dir():
+                    # A link back to the directory it sits in (or one above
+                    # it) is a cycle copytree would follow forever.
+                    try:
+                        here = Path(dirpath).resolve()
+                    except (OSError, RuntimeError):
+                        here = None
+                    if here is not None and (real == here or real in here.parents):
+                        skipped.add(name)
+            return skipped
+
+        return ignore
+
     def _prepare_workspace(self, task_id: str, target_files: list[str]) -> Path:
         """Create the per-task workspace and populate it for acceptance_check.
 
@@ -394,25 +424,13 @@ class Executor:
             shutil.rmtree(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
 
-        # AUTO-FIX-1: mirror the whole repo into the workspace *before*
-        # overlaying target_files. Previously only target_files were copied,
-        # so an acceptance_check referencing a file that exists in base_dir
-        # but wasn't listed in target_files (a pre-existing test file,
-        # conftest.py, a fixture, a sibling module the target imports) would
-        # fail with a spurious "file or directory not found" — a false
-        # negative unrelated to whether the Coder's change was correct, and
-        # one that (via TaskRewriter's failure-pattern handling) could lead
-        # to acceptance_check being silently replaced with a no-op. Best
-        # effort: mirroring failures are logged, not raised, so the run
-        # continues with the pre-existing target-files-only behaviour below
-        # rather than aborting the task outright.
+        # The whole repo is mirrored into the workspace before target files are overlaid, so checks can see helpers (AUTO-FIX-1).
         try:
             shutil.copytree(
                 self._base_dir, workspace,
-                ignore=_MIRROR_IGNORE, dirs_exist_ok=True,
-                # SECURITY: copy symlink *targets*, not the links — a repo
-                # symlink pointing outside base_dir stayed live and
-                # traversable from inside the sandbox workspace.
+                ignore=self._mirror_ignore(workspace), dirs_exist_ok=True,
+                # A link inside base_dir is copied as its target, so the workspace holds no links;
+                # a link whose target leaves base_dir is skipped by _mirror_ignore (AUDIT-21).
                 symlinks=False,
             )
         except (OSError, shutil.Error) as exc:
@@ -440,11 +458,7 @@ class Executor:
         base_resolved = self._base_dir.resolve()
         workspace_resolved = workspace.resolve()
         for rel in target_files:
-            # SECURITY: an absolute `rel` silently discards the left operand
-            # of the "/" join (pathlib), and a "../" one is only resolved by
-            # the OS — either lets a crafted target_files entry read from and
-            # write to arbitrary paths. Require the join to stay inside both
-            # base_dir and workspace.
+            # A target path must stay inside base_dir and the workspace; absolute or ../ paths are refused (SECURITY).
             src = self._base_dir / rel
             dst = workspace / rel
             try:
@@ -464,10 +478,7 @@ class Executor:
                 missing.append(rel)
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
-            # AUTO-FIX: a target_files entry naming a directory made
-            # copy2() raise IsADirectoryError uncaught, aborting the copy of
-            # every remaining file. Skip just the bad one, fail-open like
-            # the "not found" branch above.
+            # A target that is a directory is skipped instead of aborting the copy of the remaining files (AUTO-FIX).
             try:
                 shutil.copy2(src, dst)
             except (IsADirectoryError, OSError) as exc:
@@ -495,15 +506,7 @@ class Executor:
             },
         )
 
-        # AUTO-FIX-2: shutil.copytree's default copy_function (copy2) copies
-        # *metadata* — including mtime — from base_dir onto the workspace
-        # directory itself. Every task's workspace therefore inherits
-        # base_dir's (static) mtime instead of getting a fresh one, so
-        # _prune_old_workspaces' "oldest mtime first" sort is meaningless
-        # (all workspaces compare equal) and evicts an effectively random
-        # sibling rather than the actually-oldest one. Stamp the workspace
-        # with the current time after population so pruning below — and any
-        # future caller — sees a real, monotonically increasing recency.
+        # The workspace is stamped with the current time, so pruning by mtime is meaningful (AUTO-FIX-2).
         try:
             os.utime(workspace, None)
         except OSError as exc:
@@ -535,19 +538,14 @@ class Executor:
             ]
         except (OSError, FileNotFoundError):
             return
-        # Oldest first among the *other* task workspaces.
-        # BUGFIX (audit): p.stat() ran outside the try/except that wraps
-        # iterdir() above — if a sibling is removed by a concurrent
-        # process between the .exists() check and this .stat() call
-        # (TOCTOU), the resulting OSError/FileNotFoundError was uncaught.
+        # Oldest first among the other task workspaces; a sibling removed mid-scan must not raise (BUGFIX).
         def _safe_mtime(p: Path) -> float:
             try:
                 return p.stat().st_mtime
             except OSError:
                 return 0.0
         siblings.sort(key=_safe_mtime)
-        # "keep" always survives, so the other siblings we may retain is
-        # (limit - 1); anything beyond that, starting with the oldest, goes.
+        # The keep sibling is always kept, so the rest are trimmed to limit - 1, oldest first.
         excess = len(siblings) - max(self._max_retained_workspaces - 1, 0)
         for old in siblings[:max(excess, 0)]:
             try:
@@ -560,9 +558,7 @@ class Executor:
 
     # ── Command resolution ────────────────────────────────────────────────────
 
-    # Shell tokens that are never safe in an LLM-generated acceptance_check.
-    # This is a defence-in-depth blocklist, not a complete sandbox — the check
-    # catches obvious mistakes/injections from a hallucinating model.
+    # Shell tokens never safe in an LLM-generated acceptance_check: a defence-in-depth blocklist, not a sandbox.
     _BLOCKED_COMMAND_PATTERNS: tuple[str, ...] = (
         "rm ",  "rm\t",              # file deletion (rm -rf /, rm -rf ~, …)
         "rmdir",                     # directory removal
@@ -609,19 +605,14 @@ class Executor:
         for pattern in Executor._BLOCKED_COMMAND_PATTERNS:
             token = pattern.strip().lower()
             if token.isalpha():
-                # Whole-word match (mirrors coder.py's _check_content_safety):
-                # plain substring containment falsely flagged ordinary commands
-                # — 'rm ' matched 'terrafo[rm ]', 'nc ' matched 'rsy[nc ]',
-                # 'rm ' matched 'confi[rm ]'.  Python \b treats '_' as a word
-                # char, so identifier-style checks stay safe too.
+                # Whole-word matches only, so ordinary commands such as terraform are not flagged (as in coder.py).
                 if (
                     _re.search(r"\b" + _re.escape(token) + r"\b", lower)
                     or _re.search(r"\b" + _re.escape(token) + r"\b", dequoted)
                 ):
                     return False, f"blocked pattern {pattern!r} in acceptance_check"
             elif pattern in lower or pattern in dequoted:
-                # Non-word tokens (shell metachars: '> /', '>/', fork bomb) have
-                # no word boundary to anchor on — keep the substring check.
+                # Shell metacharacters have no word boundary, so they keep the substring check.
                 return False, f"blocked pattern {pattern!r} in acceptance_check"
         return True, ""
 
@@ -653,20 +644,7 @@ class Executor:
         if acceptance_check:
             safe, reason = self._check_command_safety(acceptance_check)
             if not safe:
-                # AUTO-BUG: this used to fall back to bare "pytest" — but
-                # _prepare_workspace mirrors the WHOLE base_dir into the
-                # workspace (AUTO-FIX-1 above), so bare "pytest" collects
-                # and runs every OTHER pre-existing test in the repo too.
-                # In any repo with a healthy existing test suite (this one
-                # included — 2000+ passing tests), that reliably exits 0
-                # regardless of whether the current task's actual goal was
-                # ever met. Reproduced: a task whose real check would have
-                # caught a function still raising NotImplementedError was
-                # marked passed and committed, because an unrelated
-                # existing test happened to pass. A blocked acceptance_check
-                # must fail its task, not risk a spurious pass from
-                # whatever else happens to already be green — "false"
-                # always exits 1, with no dependency on repo contents.
+                # A blocked check fails the task with "false" rather than falling back to pytest, which would run the whole repo's tests (AUTO-BUG).
                 logger.error(
                     "_resolve_command: [SAFETY] %s — acceptance_check "
                     "blocked; failing the check rather than substituting "
@@ -678,15 +656,7 @@ class Executor:
 
         py_files = [f for f in target_files if f.endswith(".py")]
         if len(py_files) == 1:
-            # SECURITY: unlike the acceptance_check branch above, this fallback
-            # builds a command straight from an unvalidated target_files entry.
-            # _prepare_workspace refuses to *copy* an escaping path (see its
-            # resolve()/relative_to() guard), but the command still runs with
-            # cwd=workspace, so an absolute or "../.." entry would execute a
-            # file outside the workspace — the unmodified base_dir original at
-            # best (defeating "run the Coder's version"), an arbitrary host
-            # file at worst. Fail closed, exactly like a blocked
-            # acceptance_check does above.
+            # The fallback does not run an unvalidated target path; the refusal is checked first (SECURITY).
             try:
                 (workspace / py_files[0]).resolve().relative_to(workspace.resolve())
             except ValueError:
@@ -696,15 +666,7 @@ class Executor:
                     py_files[0],
                 )
                 return "false"
-            # AUTO-FIX: this f-string goes straight into
-            # subprocess.run(shell=True); an unquoted space in _python_bin
-            # ("/Users/Jane Doe/.venv/bin/python") or in the file name was
-            # word-split into two bogus arguments.
-            #
-            # Quoting must be per-platform: shell=True runs cmd.exe on
-            # Windows (which this executor supports — see the AUTO-CR-12 fix
-            # above), and cmd.exe ignores shlex.quote()'s single quotes, so
-            # a POSIX-only quote would reintroduce the bug there.
+            # Quoting is per platform: cmd.exe ignores single quotes, so a POSIX-only quote would break Windows (AUTO-FIX).
             def _quote(s: str) -> str:
                 if os.name == "nt":
                     return subprocess.list2cmdline([s])
@@ -741,19 +703,9 @@ class Executor:
         except ValueError:
             return command  # un-parseable shell quoting — leave untouched
 
-        # Walk parts to find the first *argument* token that looks like a plain
-        # filename (not a flag and not already path-qualified).  idx==0 is the
-        # executable itself (bash, python, …) — always skip it.
+        # The first filename-like argument (not a flag, not path-qualified) is the rewrite candidate; the executable is skipped.
         _SHELL_OPS = frozenset({"&&", "||", ";", "|", "&"})
-        # Every shell metacharacter whose presence in the RAW command string
-        # forces the word-boundary substitution rewrite rather than a
-        # rebuild via shlex.join() — shlex.join shell-quotes any token that
-        # is not a lone safe word, so `>`/`<` redirects and `2>&1`/`|&`
-        # forms would turn into literal argv (see the route-comment in the
-        # match branch below). Superset of `_SHELL_OPS`, deliberately: a
-        # `>` glued to a word (`2>&1`) never appears as its own split
-        # element, so the token scan cannot stop on it — the string-level
-        # check is the only place it can be seen.
+        # Any shell metacharacter in the raw command forces the word-boundary rewrite, so redirects survive intact.
         _REWRITE_PRESERVE_OPS = frozenset({"&&", "||", ";", "|", "&", ">", "<"})
         for idx, part in enumerate(parts):
             if idx == 0:
@@ -761,67 +713,22 @@ class Executor:
             if part.startswith("-"):
                 continue  # flag — skip
             if "/" in part or "\\" in part:
-                # BUGFIX: this used to be `return command` — aborting the
-                # ENTIRE scan the moment ANY earlier non-flag token happened
-                # to already be path-qualified, even when that token has
-                # nothing to do with the rewrite and a genuine bare-filename
-                # match exists later in the command. E.g.
-                # "python tests/run_report.py generateAllureReport.sh" would
-                # never rewrite generateAllureReport.sh, because the
-                # already-qualified "tests/run_report.py" token came first —
-                # reproducing the exact "file not found" failure this
-                # function exists to prevent (see its own docstring
-                # example). This token just isn't a rewrite candidate;
-                # treat it the same as the "zero/multiple matches" case
-                # below and keep scanning, rather than as a hard stop like
-                # a genuine shell operator.
+                # An already path-qualified token is not a candidate; keep scanning for a bare filename (BUGFIX).
                 continue  # already path-qualified — not a candidate, keep scanning
             if part in _SHELL_OPS:
                 return command  # compound command — stop scanning; no safe rewrite
-            # `part` is a bare argument token.  Check whether its basename
-            # matches exactly one target file.
+            # A bare argument token is checked by basename against exactly one target file.
             basename = part
             matches = [tf for tf in target_files if Path(tf).name == basename]
             if len(matches) == 1:
                 full_path = matches[0]
-                # BUGFIX: the route decision used to look for only
-                # `&&`/`||`/`;`. Every OTHER shell metacharacter a command
-                # can contain — `|`, `&`, and especially redirections
-                # `>`/`<`, `>>`, `2>&1` — went to the `shlex.join` branch
-                # below, which re-quotes every non-identifier token into
-                # literal arguments. A realistic acceptance check like
-                #   python gen_report.py > /tmp/report.html
-                # was therefore executed as
-                #   python tools/gen_report.py '>' /tmp/report.html
-                # — the redirection silently vanished, the shell passed
-                # `>` and the filename as argv entries, and any subsequent
-                # "does the output file exist" check failed spuriously.
-                # Route to the word-boundary substitution whenever the
-                # ORIGINAL string contains any metacharacter shlex.join
-                # would quote, so every non-target token survives verbatim
-                # (including inside `2>&1`, where `&` is glued to the
-                # digits and could not appear as its own token anyway).
+                # Route to the word-boundary rewrite when the command has any metacharacter, so redirects are not turned into argv (BUGFIX).
                 if any(op in command for op in _REWRITE_PRESERVE_OPS):
-                    # The original command contains shell metacharacters;
-                    # shlex.join would misquote them.  Do a safe
-                    # word-boundary string substitution on the original
-                    # command string instead.
-                    #
-                    # Bugfix: full_path must NOT be passed as re.sub's string
-                    # replacement argument — re.sub interprets backslash
-                    # sequences in a *string* replacement as backreferences
-                    # (\1, \g<n>, ...). This pattern has no capture groups, so
-                    # a target path containing an ordinary backslash (a
-                    # Windows-style path, or any oddly-named file) would raise
-                    # `re.error: invalid group reference` instead of
-                    # substituting cleanly. Same root cause already fixed in
-                    # tools/auto/summary_memory.py — a callable replacement
-                    # sidesteps this entirely, since re.sub never interprets
-                    # backslash escapes in a function's return value.
+                    # re.sub gets a callable replacement, so backslashes in a path are not read as group references (bugfix).
                     import re as _re_local
                     rewritten = _re_local.sub(
                         r"(?<!\S)" + _re_local.escape(basename) + r"(?!\S)",
-                        lambda _m: full_path,
+                        lambda _m, _p=full_path: _p,
                         command,
                         count=1,
                     )
@@ -857,8 +764,7 @@ class Executor:
         command = command.rstrip()
         if not self._pytest_config_requests_pool():
             return command
-        # the flag goes at the end of each pytest run, not of the line: what
-        # follows a `|` or `&&` is another command's argument list
+        # The flag goes at the end of each pytest run, not at the end of the line.
         for start, end in reversed(pytest_piece_spans(command)):
             parts = shlex.split(command[start:end], posix=(os.name != "nt"))
             if any(is_xdist_flag(p) for p in parts[1:]):
@@ -879,11 +785,13 @@ class Executor:
         rather than whatever ``python`` resolves to in the PATH.
         """
         stripped = command.lstrip()
+        # quoted: a path with a space ("/Users/Jane Doe/.venv/bin/python") split into two words
+        python = subprocess.list2cmdline([self._python_bin]) if os.name == "nt" else shlex.quote(self._python_bin)
         for token in ("python3 ", "python "):
             if stripped.startswith(token):
-                return self._python_bin + " " + stripped[len(token):]
+                return python + " " + stripped[len(token):]
         if stripped in ("python", "python3"):
-            return self._python_bin
+            return python
         return command
 
     # ── Subprocess execution ──────────────────────────────────────────────────
@@ -907,32 +815,74 @@ class Executor:
             and mapped to the result fields.
         """
         env = self._build_env()
-        # Use explicit comparison instead of `or None` — 0.0 is falsy in Python,
-        # so `0.0 or None` would silently mean "no timeout" instead of
-        # "immediate timeout," tricking anyone who sets exec_timeout_sec = 0
-        # expecting one behavior into getting the other with no warning. The
-        # explicit form below makes the intent unmistakable.
+        # An explicit timeout check: a zero timeout means an immediate timeout, not "no timeout" (0.0 is falsy).
         timeout = self._timeout_sec if self._timeout_sec > 0 else None
-        # BUGFIX: computed once and reused for every branch below — see
-        # _redact_command's docstring. The real, un-redacted `command` is
-        # still what's actually executed just below; only what gets stored
-        # on ExecutionResult and logged is redacted.
+        # The command is redacted only for storing and logging; the real command is what runs (BUGFIX).
         _logged_command = _redact_command(command)
 
+        # REL-1 #1: the output goes to two temporary files, not to pipes. `communicate`
+        # buffered the whole of it in memory before `_MAX_OUTPUT_CHARS` was applied, so a
+        # runaway `yes` or a print loop in model-written code took the agent down with a
+        # MemoryError (or the OOM killer) long before the timeout. A file over
+        # `_MAX_OUTPUT_FILE_BYTES` kills the group, so the disk is not filled either.
+        out_file = tempfile.TemporaryFile()
+        err_file = tempfile.TemporaryFile()
         try:
-            proc = subprocess.run(
+            # Own session, so a timeout kills the whole group (pytest's xdist workers too), not the shell alone.
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=str(cwd),
                 env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
+                # REL-1 #2: never the agent's own stdin — the command could read what the user
+                # types, and one that waits for input waited out the whole timeout.
+                stdin=subprocess.DEVNULL,
+                stdout=out_file,
+                stderr=err_file,
+                start_new_session=os.name != "nt",
             )
-            stdout = _truncate(proc.stdout, _MAX_OUTPUT_CHARS)
-            stderr = _truncate(proc.stderr, _MAX_OUTPUT_CHARS)
+            over_cap = False
+            try:
+                over_cap = _wait_bounded(proc, timeout, (out_file, err_file))
+            except subprocess.TimeoutExpired:
+                _kill_process_group(proc)
+                try:
+                    proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise subprocess.TimeoutExpired(
+                    command, timeout, output=_read_capped(out_file), stderr=_read_capped(err_file),
+                ) from None
+            except BaseException:
+                # CC-16 (Part D): Ctrl-C. `subprocess.run` used to `except: process.kill(); raise`
+                # for *any* exception, KeyboardInterrupt included, and fix 35 dropped that when it
+                # moved the kill into the timeout branch; `start_new_session=True` also takes the
+                # child out of the terminal's foreground process group, so a terminal Ctrl-C no
+                # longer reaches it either. Nothing then took the interruption's place but the
+                # timeout — the command (typically the acceptance check, a `pytest` with workers,
+                # minutes long) lived on and kept writing into the worktree the next `--auto` run
+                # resets. Kill the whole group, reap it so no zombie is left, and let the
+                # exception go on unchanged: a KeyboardInterrupt stays a KeyboardInterrupt.
+                _kill_process_group(proc)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise
+            # REL-RUNTIME follow-up: with the output in files, nothing waits for the shell's
+            # children any more, so `sleep 99 & echo ok` returned at once — right — and left the
+            # sleep running — wrong: `python app.py & curl …` kept its server on the port and the
+            # next task's check failed with "address in use". The group outlives its leader while
+            # any member runs, so killing it now ends what the command left behind; a group already
+            # empty is a no-op. Before REL-RUNTIME the pipes kept such a command until the timeout,
+            # which killed the group too.
+            _kill_process_group(proc)
+            stdout = _read_capped(out_file)
+            stderr = _read_capped(err_file)
+            if over_cap:
+                stderr += (f"\n... [command killed: its output passed "
+                           f"{_MAX_OUTPUT_FILE_BYTES // (1024 * 1024)} MB]")
+                logger.warning("_execute: OUTPUT CAP task=%s cmd=%r", task_id, _logged_command)
             return ExecutionResult(
                 exit_code = proc.returncode,
                 stdout    = stdout,
@@ -983,6 +933,9 @@ class Executor:
                 command   = _logged_command,
                 task_id   = task_id,
             )
+        finally:
+            out_file.close()
+            err_file.close()
 
     def _build_env(self) -> dict[str, str]:
         """Return a child-process environment with proxy vars cleared."""
@@ -991,10 +944,7 @@ class Executor:
             env.pop(var, None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
-        # Force UTF-8 for all child processes — Windows' default cp1252 codec
-        # can't decode bytes like 0x81. PYTHONUTF8=1 enables UTF-8 mode (PEP
-        # 540, Python >= 3.7); PYTHONIOENCODING is the legacy fallback for
-        # older builds.
+        # Children run in UTF-8 mode: the Windows default codec cannot decode every byte (PEP 540).
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         
@@ -1008,9 +958,7 @@ class Executor:
         return env
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _safe_dir_name(name: str) -> str:
     """Strip path-traversal characters from *name* before use as a directory component.
@@ -1047,6 +995,127 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + notice
 
 
+def _wait_bounded(proc: "subprocess.Popen", timeout: "float | None", files) -> bool:
+    """Wait for *proc* like ``communicate(timeout)``; ``True`` when it was killed for output size.
+
+    The command writes to *files* (REL-1 #1), so ``communicate`` only waits. It is called in
+    short slices so the files can be measured in between; ``TimeoutExpired`` leaves on the
+    caller's own deadline, and any other exception (Ctrl-C) leaves unchanged, as before.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        step = _OUTPUT_POLL_SEC
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            step = min(step, left)
+        try:
+            proc.communicate(timeout=step)
+            return False
+        except subprocess.TimeoutExpired:
+            pass
+        if any(os.fstat(f.fileno()).st_size > _MAX_OUTPUT_FILE_BYTES for f in files):
+            _kill_process_group(proc)
+            proc.wait()
+            return True
+
+
+def _read_capped(f) -> str:
+    """The text of the output file *f*, cut to `_MAX_OUTPUT_CHARS` the way `_truncate` cuts it.
+
+    Decoded as UTF-8 with replacement and universal newlines — what ``text=True`` gave the
+    pipes. Only the head is read (four bytes a character at most), so a huge file is never
+    loaded whole; the omitted count is then in bytes, and says so.
+    """
+    import io
+    size = os.fstat(f.fileno()).st_size
+    f.seek(0)
+    head_bytes = _MAX_OUTPUT_CHARS * 4
+    raw = f.read(head_bytes + 1)
+    text = io.TextIOWrapper(io.BytesIO(raw[:head_bytes]), encoding="utf-8", errors="replace").read()
+    if size <= head_bytes:
+        return _truncate(text, _MAX_OUTPUT_CHARS)
+    return (text[:_MAX_OUTPUT_CHARS]
+            + f"\n... [truncated — about {size - len(text[:_MAX_OUTPUT_CHARS].encode('utf-8'))} bytes omitted]")
+
+
+def _kill_process_group(proc: "subprocess.Popen") -> None:
+    """SIGKILL the command's whole process group — the shell fix 35 started in a session of
+    its own *and every grandchild it spawned* — then the process itself where there is no
+    group (`os.name == "nt"`, which never got `start_new_session`). Killing the shell alone
+    is what let `pytest` and its xdist workers outlive a timeout.
+
+    CC-16 (Part D): the `OSError` guards are the fail-open half — a child that already
+    exited (or a group already gone) makes `killpg`/`kill` raise `ProcessLookupError`, and
+    that must not turn an interruption into a second, unrelated failure. `reap` is left to
+    the caller (`communicate` on the timeout path, so it can still return the partial
+    output; `wait` on the interruption path)."""
+    if os.name != "nt":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _pytest_addopts(root: Path) -> list:
+    """The ``addopts`` tokens of the config file pytest uses: ``pytest.ini`` always, the others only with their
+    pytest section (a ``pyproject.toml`` without one hid a ``tox.ini``'s), continuation lines included."""
+    import configparser
+    sections = {"pytest.ini": "pytest", ".pytest.ini": "pytest", "tox.ini": "pytest", "setup.cfg": "tool:pytest"}
+    for name in _PYTEST_CONFIG_FILES:
+        try:
+            text = (root / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if name in ("pytest.toml", ".pytest.toml"):   # pytest 9: always this file, its own [pytest] table
+            return (_toml_addopts(text, ("pytest",)) or "").split()
+        if name == "pyproject.toml":
+            value = _toml_addopts(text)
+            if value is None:
+                continue
+            return value.split()
+        parser = configparser.ConfigParser(interpolation=None, strict=False)
+        try:
+            parser.read_string(text)
+        except configparser.Error:
+            parser = None
+        if parser is None or not parser.has_section(sections[name]):
+            if name in ("pytest.ini", ".pytest.ini"):
+                return []
+            continue
+        return parser.get(sections[name], "addopts", fallback="").split()
+    return []
+
+
+def _toml_addopts(text: str, keys: tuple = ("tool", "pytest", "ini_options")) -> "str | None":
+    """``[tool.pytest.ini_options] addopts`` of a pyproject.toml (``[pytest]`` of a pytest.toml with
+    *keys*), a list joined; None without the table."""
+    try:
+        import tomllib
+    except ImportError:              # 3.10: the table and its addopts by hand
+        head = re.escape("[" + ".".join(keys) + "]")
+        m = re.search(rf"(?ms)^{head}[ \t]*$(.*?)(?=^\[|\Z)", text)
+        if not m:
+            return None
+        a = re.search(r"(?ms)^addopts[ \t]*=[ \t]*(\[.*?\]|[^\n]*)", m.group(1))
+        return re.sub(r"[\[\],\"']", " ", a.group(1)) if a else ""
+    try:
+        table = tomllib.loads(text)
+        for key in keys:
+            table = table.get(key)
+    except (tomllib.TOMLDecodeError, AttributeError):
+        return None
+    if not isinstance(table, dict):
+        return None
+    value = table.get("addopts", "")
+    return " ".join(map(str, value)) if isinstance(value, list) else str(value)
+
+
 def pytest_config_requests_pool(base_dir: "str | Path") -> bool:
     """True when *base_dir*'s pytest ``addopts`` (or ``PYTEST_ADDOPTS``) name an xdist flag (RUN-3).
 
@@ -1058,44 +1127,293 @@ def pytest_config_requests_pool(base_dir: "str | Path") -> bool:
     files are skipped, never raised on — this runs before every acceptance
     check and must not be the reason one fails.
     """
-    tokens: list[str] = []
-    root = Path(base_dir)
-    for name in _PYTEST_CONFIG_FILES:
-        path = root / name
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("addopts"):
-                continue
-            _, _, value = stripped.partition("=")
-            # pyproject.toml quotes its value (and may use the list form).
-            tokens = value.replace(",", " ").replace("[", " ").replace("]", " ").split()
-            break
-        break
+    tokens = _pytest_addopts(Path(base_dir))
     tokens += os.environ.get("PYTEST_ADDOPTS", "").split()
     return any(is_xdist_flag(t) for t in tokens)
 
 
-# Matches a likely-secret CLI option (--api-key, --token, etc.) followed by
-# a single-token value, so the value can be redacted while the option name
-# — useful for debugging what the command was doing — stays visible.
+# HARDEN-19 C: the value of a secret-bearing flag, one class for `-p`, `-a`, `--password=`,
+# `--token=` and the rest. A quoted word is one value whatever is inside the quotes, so
+# `'my secret'` is the password and not `'my` followed by a bare `secret'`; and a quote
+# need not be closed, since `-p'my secret` at the end of a line is still the password and
+# stopping at the space would have put its second word in the log. `\S*` rather than `\S+`
+# so a bare `-p` with no value matches at all — the judges below refuse an empty value.
+# It is a capturing group: the callers number their groups against it.
+_SECRET_VALUE_RE = r"('[^'\n]*'?|\"[^\"\n]*\"?|\S*)"
+
+
+# Matches a likely-secret CLI option followed by a single-token value; the option name stays visible for debugging.
+#
+# HARDEN-19 C: the value is the shared `_SECRET_VALUE_RE` — a single-quoted word, a
+# double-quoted word, or a run of non-space characters — so `--password='my secret'` is one
+# value, not two. The empty alternative of that class is why the replacement below keeps the
+# match as it stood when nothing followed the option.
 _SECRET_OPT_RE = re.compile(
-    r"(--(?:api[-_]?key|token|secret|password|passwd|pwd|auth|"
+    r"(--(?:api[-_]?key|token|secret|password|passwd|pass|pwd|auth|"
     r"access[-_]?key|client[-_]?secret|private[-_]?key))"
     r"([=:]\s*|\s+)"
-    r"(\S+)"
+    + _SECRET_VALUE_RE
 )
 
-# Authorization header values are commonly two words ("Bearer <token>",
-# "Basic <base64>") — matched separately and greedily up to the next quote
-# or shell-flag boundary, since the single-token pattern above would redact
-# only the scheme word ("Bearer") and leave the actual token exposed.
+# AUDIT3-C14 (#51): any long option whose NAME is a credential, value after a space —
+# `--auth-token V`, `--access-token V`, `--github-token V`, `--db-password V`,
+# `gpg --passphrase V`. The fixed list above names eleven options; the `=` form is
+# already read by name. A switch (`--no-token-check`) and a value that is another
+# flag are left alone.
+_SECRET_LONG_SPACE_RE = re.compile(
+    r"(?<![^\s\"'])(--([A-Za-z][A-Za-z0-9_-]*))([^\S\n]+)(?![-<>|&;])" + _SECRET_VALUE_RE
+)
+_SWITCH_PREFIXES = ("no-", "skip-", "disable-", "enable-", "with-", "without-", "allow-")
+
+# REL-2: an authorization option's value is two words, scheme then credential —
+# `--authorization Bearer T`, `--auth Basic B64`, `--authorization "Bearer T"`. The one-word
+# rules above hid `Basic` (not a secret) and left the credential, and `--authorization` was
+# no credential name at all. Run first, so the scheme and the word after it go together.
+_SECRET_AUTH_SCHEME_OPT_RE = re.compile(
+    r"(?<![^\s\"'])(--(?:proxy-)?auth(?:orization)?)([=:][^\S\n]*|[^\S\n]+)"
+    r"([\"']?)(?i:bearer|basic|token|digest|negotiate)[^\S\n]+[^\s\"']+\3"
+)
+
+
+def _option_names_a_credential(name: str) -> bool:
+    low = name.lower()
+    if low.startswith(_SWITCH_PREFIXES):
+        return False
+    if low.endswith(("-stdin", "-file", "-path", "-env", "-dir", "_file", "_path")):
+        return False    # `--password-stdin`, `--token-file p`: no secret on the line
+    if "passphrase" in low:
+        return True
+    if low in ("authorization", "proxy-authorization"):
+        return True     # REL-2: `--authorization T` carries the token itself
+    return not _name_is_not_a_credential(low.replace("-", "_").upper())
+
+
+# Authorization values are two words (Bearer token); matched up to the next quote or flag so the token is hidden too.
+# Run before `_SECRET_HEADER_RE`: that one takes a single token, which would have left the token behind the `Bearer`.
 _SECRET_AUTH_RE = re.compile(
     r"(Authorization)([=:]\s*|\s+)([^\"'\n]+?)(?=\s+--|[\"'\n]|$)"
 )
+
+# HARDEN-12 D: a credential-named HTTP header anywhere in the command, `x-api-key: v`,
+# `X-API-KEY: v`, `x-token: v`. The name must carry a credential word, so
+# `Accept: application/json` and `Content-Type: application/json` stay. The value is one
+# token — a header's value is a single word, and running it to the end of the line would
+# have swallowed the rest of the command (`x-api-key: v pytest -q` became
+# `x-api-key: [REDACTED]`). `Authorization` keeps its own rule: its value is two words,
+# `Bearer sk-...`, and it is run first so the token behind the word is hidden too.
+# The credential word is a whole part of the name and the separator is not half of a `::`, so a
+# pytest node id (`test_tokenizer.py::TestTokenizer::test_split`) and `TOKENIZERS_PARALLELISM` stay.
+_SECRET_HEADER_RE = re.compile(
+    r"(?i)((?<![A-Za-z0-9_])(?:[A-Za-z0-9]+[-_])*(?:api[-_]?key|apikey|token|secret|password|passwd|key)"
+    r"(?:[-_][A-Za-z0-9]+)*)([=:])(?!:)(\s*)([^\s\"'\n]+)(?=[\s\"'\n]|$)"
+)
+
+# HARDEN-12 D: `NAME=value` handing a key to a command, where NAME names a credential.
+# It may sit only at the start of a command, or right after a `;`, `&&`, `||` or `|` —
+# a `NAME=value` mid-argument is a coincidence (`grep foo=bar file.txt`) and stays.
+#
+# HARDEN-19 B: the name is not restricted to one that carries a credential word as a whole
+# part — `PGPASSWORD`, `GITHUBTOKEN`, `NGROK_AUTHTOKEN` and `DBPASSWORD` name credentials
+# too, and CC review fix 40's rule is what threw them away. The pattern takes any name and
+# asks `_name_is_a_credential`, the same helper the mask uses: `MAX_TOKENS=100`,
+# `TOKENIZER=bert`, `KEYBOARD=us` and `FOO=bar` are not credentials and stay as written.
+_SECRET_ENV_ASSIGN_RE = re.compile(
+    r"(?i)(^|[;|&])(\s*)((?:export\s+|env\s+)?)"
+    r"([A-Za-z_][A-Za-z0-9_.-]*)=(\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;|&]+)"
+)
+
+# HARDEN-19 B: a `NAME=value` that is not at the start of a command and cannot be, where
+# NAME is a delimited path and names a credential — npm's
+# `//registry.npmjs.org/:_authToken=…` and git's `config token.secret=…`. The anchored rule
+# above does not reach a name mid-argument, and the last component is the credential's
+# (`_authToken`), so the name is wide and `_name_is_a_credential` decides. A single
+# component is not matched here: `grep foo=bar file.txt` is the coincidence the anchor
+# exists for. The lookbehind keeps an option's own name out — `--api-key=…` is
+# `_SECRET_OPT_RE`'s, and the `-` or the word before it says so.
+_SECRET_PATH_ASSIGN_RE = re.compile(
+    r"(?i)(?<![\w-])([A-Za-z0-9_][A-Za-z0-9_.:/*-]*[_.:/*-][A-Za-z0-9_-]+)="
+    r"(\s*)"
+    r"(\"[^\"]*\"|'[^']*'|[^\s;|&]+)"
+)
+
+# HARDEN-19 B: npm's other spelling, `npm config set <name> <value>` with a space for the
+# `=`: `npm config set //registry.npmjs.org/:_authToken ghp_…`. The name is the one word
+# before the value, so the name rule decides; `npm config set registry https://…` stays.
+_NPM_CONFIG_SET_RE = re.compile(r"(?i)(\bnpm\s+config\s+set\s+)([^\s=]+)(\s+)(\S+)")
+
+# HARDEN-12 D: `user:pass@` in a URL, only the password. The scheme is any
+# `name://`, the user is kept, and a URL without a password is left byte for byte. The
+# user may be empty: `redis://:password@host` names no user at all (HARDEN-15 C).
+_SECRET_URL_USERINFO_RE = re.compile(
+    r"([A-Za-z][A-Za-z0-9+.-]*://[^\s:/@]*:)([^@\s/]+)(@)"   # a `/` ends the authority: `host:443/@scope` is a port
+)
+
+# HARDEN-12 D: `-u user:pass`. The colon is the tell, so `-u someflag` is a flag value,
+# not a credential, and `grep -u` / `ls -u` are left alone. A colon that opens a URL
+# (`-u redis://:pw@host`) is not one: the URL's password is the URL rule's, and this one
+# would have rewritten `redis://` to `redis:` (HARDEN-15 C).
+_SECRET_USER_OPT_RE = re.compile(
+    r"""(\s(?:-u|--user)(?:\s+|=))([^\s:'"]+):(?!//)([^\s'"]+)"""
+)
+
+# v13 (CMD-1): `-u 'user:pass word'`: the whole argument is one shell-quoted word, so its password may hold
+# spaces. Matched as one unit; the closing quote is the one that opened the word.
+#
+# HARDEN-19 C: the user may hold a space too (`-u "a b:c d"`), and the closing quote need
+# not be there — `-u 'admin:my secret` at the end of a line is still a password, and the
+# pass runs to the end of the line rather than leaving half of it behind.
+_SECRET_USER_QUOTED_RE = re.compile(
+    r"""(\s(?:-u|--user)(?:\s+|=)(['"]))([^'"\n]*?):([^'"\n]*)(\2)?"""
+)
+
+# `-p value` / `-pvalue` is a password only for the commands that take one. `ls -p`,
+# `grep -p pat`, `pytest -p no:cacheprovider` and `docker run -p 8080:80` are unrelated
+# flags and stay as they are (HARDEN-12 D).
+_PASSWORD_OPT_COMMANDS = frozenset({
+    "mysql", "mysqldump", "mariadb", "mariadb-dump", "redis-cli", "sshpass", "htpasswd",
+})
+_PASSWORD_OPT_RE = re.compile(r"""(?<![\w-])(-p)([ \t]*)(""" + _SECRET_VALUE_RE + r""")""")
+# HARDEN-15 C: MySQL reads the password attached to `-p` and nothing else — `-p` on its
+# own is the prompt flag, so the next word is the database (`mysql -p mydb`). The family,
+# not the single name, since mysqldump takes the same flag.
+_MYSQL_FAMILY_COMMANDS = frozenset({"mysql", "mysqldump", "mariadb", "mariadb-dump"})
+# A database name, not a password: letters and `_`, nothing else. A password always
+# carries a digit or an upper-case letter, because a database is named after a word and a
+# password is not (`mysql -p mydb` vs `mysql -p secretpass1234 db`) (HARDEN-15 C).
+_DATABASE_NAME_RE = re.compile(r"[a-z_]+")
+# HARDEN-15 C: redis-cli's own `-a <password>`. `-a` is `--all` in almost every other tool
+# (`ls -a`, `grep -a`, `sort -a`), so only redis-cli's is looked at. Its `--pass` is a
+# long option and is caught by `_SECRET_OPT_RE`.
+_REDIS_CLI_PASSWORD_RE = re.compile(r"""(?<![\w-])(-a)([ \t]*)(""" + _SECRET_VALUE_RE + r""")""")
+# HARDEN-15 C: `aws configure set <name> <value>` writes the named credential into
+# ~/.aws/credentials. The name names it, so the value is the secret.
+_AWS_CONFIGURE_SET_RE = re.compile(r"(?<![\w-])(set)\s+(\S+)\s+(\S+)")
+#: A word that names a credential, for `aws configure set`'s name.
+_SECRET_NAME_RE = re.compile(r"(?i)secret|key|token")
+#: The wrappers the real program sits behind, and the leading `NAME=value` assignments that
+#: are the thing being redacted, never the program.
+_WRAPPER_COMMANDS = frozenset({"sudo", "nohup", "env", "xargs"})
+_ENV_ASSIGN_TOKEN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+#: Splits a command into its sub-commands, so each one's program decides for itself.
+_COMMAND_SPLIT_RE = re.compile(r";|&&|\|\||[|]")
+
+
+def _first_program(segment: str) -> "tuple[str, list]":
+    """The program a command segment runs, and its tokens.
+
+    Leading ``NAME=value`` assignments are skipped (they are the thing being redacted),
+    as are ``sudo``, ``nohup``, ``env``, ``xargs`` and ``timeout`` — the last with its
+    duration argument. The program is taken off its path (``/usr/bin/mysql`` is
+    ``mysql``). Never raises.
+    """
+    tokens = segment.split()
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if _ENV_ASSIGN_TOKEN_RE.match(token):
+            i += 1
+            continue
+        name = token.lower()
+        if name == "timeout":
+            i += 2
+            continue
+        if name in _WRAPPER_COMMANDS:
+            i += 1
+            continue
+        return os.path.basename(token).lower(), tokens
+    return "", tokens
+
+
+def _looks_like_a_password(value: str) -> bool:
+    """Whether a `-p` value is a password rather than a database name or a port.
+
+    A password carries a letter and is longer than a name (`mysql -p db` keeps its
+    database, `mysql -psecretpass1234` loses its password). A quoted word is one
+    value whatever is inside the quotes: `-p'my secret'` is judged on `my secret`.
+
+    HARDEN-19 C: a quote need not be closed — `-p'my secret` at the end of a line is the
+    whole password, and the letters of the opening quote are not letters of a value, so
+    an unterminated word is judged on its length and letters like any bare one.
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+        return (len(value) >= 1 and any(ch.isalpha() for ch in value)) or len(value) >= 4
+    return len(value) >= 4 and any(ch.isalpha() for ch in value)
+
+
+def _looks_like_a_database_name(value: str) -> bool:
+    """Whether a value after a spaced `-p` is a database name, not a password.
+
+    See `_DATABASE_NAME_RE`: `mydb` and `my_database` are databases and `secretpass1234`
+    is a password (HARDEN-15 C).
+    """
+    return bool(_DATABASE_NAME_RE.fullmatch(value))
+
+
+def _password_flag_repl(match: "re.Match", program: str) -> str:
+    """The replacement for one `-p` hit: the password, or the flag as it stood.
+
+    For the MySQL family a *spaced* `-p` is the prompt flag, so its next word is the
+    database and is left alone — unless it is not a name, in which case it is a password
+    after all (`mysql -p secretpass1234 db`) (HARDEN-15 C). The attached form is a
+    password for every command here.
+    """
+    value = match.group(3)
+    if not _looks_like_a_password(value):
+        return match.group(0)
+    if bool(match.group(2)) and program in _MYSQL_FAMILY_COMMANDS and value[:1] not in "'\"" \
+            and _looks_like_a_database_name(value):
+        return match.group(0)
+    return f"{match.group(1)}{match.group(2)}[REDACTED]"
+
+
+def _redact_aws_configure_set(segment: str) -> str:
+    """Redact the value `aws configure set` is told to write, where the name says it is a
+    credential. A name that does not (`set default region us-east-1`) keeps both its
+    words (HARDEN-15 C).
+    """
+    return _AWS_CONFIGURE_SET_RE.sub(
+        lambda m: m.group(0) if not _SECRET_NAME_RE.search(m.group(2))
+        else f"{m.group(1)} {m.group(2)} [REDACTED]", segment)
+
+
+def _redact_redis_cli_passwords(segment: str) -> str:
+    """Redact redis-cli's `-a <password>`; see `_REDIS_CLI_PASSWORD_RE`."""
+    return _REDIS_CLI_PASSWORD_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]"
+        if _looks_like_a_password(m.group(3)) else m.group(0), segment)
+
+
+def _redact_password_flags(command: str) -> str:
+    """Redact the password a command takes in a flag only that program reads as one.
+
+    Done segment by segment, because `-p`, `-a` and `aws configure set` each mean
+    something else in almost every other tool (`ls -p`, `grep -a`, `pytest -p`,
+    `docker run -p`): the program of the segment decides what its own flags hold
+    (HARDEN-15 C).
+    """
+    out = []
+    pos = 0
+    for match in _COMMAND_SPLIT_RE.finditer(command):
+        out.append(_redact_password_flags_in_segment(command[pos:match.start()]))
+        out.append(match.group(0))
+        pos = match.end()
+    out.append(_redact_password_flags_in_segment(command[pos:]))
+    return "".join(out)
+
+
+def _redact_password_flags_in_segment(segment: str) -> str:
+    program, tokens = _first_program(segment)
+    out = segment
+    if program == "aws" and "configure" in tokens and "set" in tokens:
+        out = _redact_aws_configure_set(out)
+    if program == "redis-cli":
+        out = _redact_redis_cli_passwords(out)
+    is_docker_login = program == "docker" and any(t.lower() == "login" for t in tokens)
+    if not (program in _PASSWORD_OPT_COMMANDS or is_docker_login):
+        return out
+    return _PASSWORD_OPT_RE.sub(lambda m: _password_flag_repl(m, program), out)
 
 
 def _redact_command(command: str) -> str:
@@ -1111,17 +1429,71 @@ def _redact_command(command: str) -> str:
     log lines — all of which tend to be archived or shared by an operator
     debugging a run. Only the option/header's value is replaced; the
     option name and the rest of the command are left intact.
+
+    HARDEN-12 D: four more shapes the same command line carries, each of which
+    is redacted with the name or the rest of the command intact — ``NAME=value``
+    at the start of a command where NAME names a credential (the usual way a key
+    is handed to a test command), a credential-named header (``x-api-key:``), the
+    password of ``user:pass@`` in a URL, and the argument of ``-u user:pass`` and
+    ``-p value`` / ``-pvalue`` for the commands that take a password there. A
+    command without a secret is returned byte for byte.
+
+    HARDEN-15 C: the same flags, three corrections — ``redis-cli -a`` and the value
+    ``aws configure set`` writes under a credential-named key are redacted, a `-p`
+    followed by a space for the MySQL family is the database and stays (the attached
+    form is still a password), and ``--pass`` and the password of an empty-user URL
+    (``redis://:pw@host``) are redacted without mangling the URL.
+
+    HARDEN-19 B and C: the name rule is the mask's ``_name_is_a_credential``, so
+    ``PGPASSWORD=…``, ``NGROK_AUTHTOKEN=…``, ``GITHUBTOKEN=…`` and ``DBPASSWORD=…`` are
+    read by their words as well — ``MAX_TOKENS=100``, ``TOKENIZER=bert`` and
+    ``KEYBOARD=us`` still are not — and a name that is a delimited path and sits
+    mid-command is looked at too, npm's ``//registry.npmjs.org/:_authToken=…`` among them.
+    And every flag value takes the shared ``_SECRET_VALUE_RE``, so a quoted password with
+    a space is one value, quotes and all: ``mysql -p'my secret'``,
+    ``redis-cli -a "my secret"``, ``--password='my secret'`` and
+    ``-u 'admin:my secret'`` are redacted whole, and an unterminated quote runs to the
+    end of the line rather than leaving half a password behind.
     """
     try:
-        redacted = _SECRET_OPT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", command)
+        redacted = _SECRET_AUTH_SCHEME_OPT_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]{m.group(3)}", command)
+        redacted = _SECRET_OPT_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]"
+            if m.group(3) and "[REDACTED]" not in m.group(3) else m.group(0), redacted)
+        redacted = _SECRET_LONG_SPACE_RE.sub(
+            lambda m: f"{m.group(1)}{m.group(3)}[REDACTED]"
+            if m.group(4) and "[REDACTED]" not in m.group(4)
+            and _option_names_a_credential(m.group(2)) else m.group(0), redacted)
         redacted = _SECRET_AUTH_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted)
+        redacted = _SECRET_HEADER_RE.sub(
+            lambda m: m.group(0) if _name_is_not_a_credential(m.group(1))
+            else f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]", redacted)
+        redacted = _SECRET_ENV_ASSIGN_RE.sub(
+            lambda m: m.group(0) if _name_is_not_a_credential(m.group(4))
+            else f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}={m.group(5)}[REDACTED]",
+            redacted)
+        redacted = _SECRET_PATH_ASSIGN_RE.sub(
+            lambda m: m.group(0) if _name_is_not_a_credential(m.group(1))
+            else f"{m.group(1)}={m.group(2)}[REDACTED]", redacted)
+        redacted = _NPM_CONFIG_SET_RE.sub(
+            lambda m: m.group(0) if _name_is_not_a_credential(m.group(2))
+            else f"{m.group(1)}{m.group(2)}{m.group(3)}[REDACTED]", redacted)
+        redacted = _SECRET_URL_USERINFO_RE.sub(
+            lambda m: f"{m.group(1)}[REDACTED]{m.group(3)}", redacted)
+        redacted = _SECRET_USER_QUOTED_RE.sub(
+            lambda m: m.group(0) if m.group(3).isdigit() and m.group(4).isdigit()
+            else f"{m.group(1)}{m.group(3)}:[REDACTED]{m.group(5) or ''}", redacted)
+        redacted = _SECRET_USER_OPT_RE.sub(
+            lambda m: m.group(0) if m.group(2).isdigit() and m.group(3).isdigit()   # `-u 1000:1000` is uid:gid
+            else f"{m.group(1)}{m.group(2)}:[REDACTED]", redacted)
+        redacted = _redact_password_flags(redacted)
         return redacted
     except Exception:  # pragma: no cover — never let redaction crash the executor
         return command
 
 
-# Match a Python traceback block: "Traceback (most recent call last):" through
-# the final exception line.
+# Matches a Python traceback, from its first line through the final exception line.
 _TRACEBACK_START = re.compile(r"^Traceback \(most recent call last\):", re.MULTILINE)
 
 
@@ -1147,9 +1519,7 @@ def _extract_traceback(stderr: str) -> str:
     return _truncate(snippet.rstrip(), _MAX_TRACEBACK_CHARS)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience factory — used by AutoController (AUTO-C3)
-# ─────────────────────────────────────────────────────────────────────────────
+# Convenience factory used by AutoController (AUTO-C3)
 
 def make_executor(
     base_dir:       str | Path,

@@ -45,22 +45,19 @@ guarantee this whole epic exists for.
 from __future__ import annotations
 
 import ast
+import threading
 from typing import Dict, List, Optional, Set, Tuple
 
 from tools.collect.ast_facts import _dotted_name
 from tools.collect.model import GuardedAccess
 
-#: Statement types that unconditionally end control flow within the block
-#: they appear in.
+#: Statement types that always end control flow within their own block.
 _TERMINATING_STMT_TYPES = (ast.Return, ast.Raise, ast.Continue, ast.Break)
 
-#: Callable names treated as process-terminating for guard purposes — e.g.
-#: `sys.exit(...)` in `view_trace.find_trace_file`'s real guard, which
-#: never returns any more than a `return` would.
+#: Calls that never return, so a guard ending in one counts as terminating (`sys.exit`, `exit`, `quit`).
 _TERMINATING_CALL_NAMES = frozenset({"sys.exit", "exit", "quit"})
 
-#: Compound-statement body attributes to keep walking, in order, when
-#: descending through a block without changing dataflow scope.
+#: Compound-statement bodies walked in order, without changing the dataflow scope.
 _COMPOUND_BODY_ATTRS = ("body", "orelse", "finalbody")
 
 
@@ -135,15 +132,7 @@ def _falsy_guard_targets(test: ast.expr) -> "Tuple[Set[str], Set[Tuple[str, obje
                 and inner.args
                 and isinstance(inner.args[0], ast.Constant)
             ):
-                # BUGFIX: a truthy default (x.get(k, "non-empty")) means
-                # the guard `not x.get(k, default)` is False when k is
-                # missing (the default is returned), so the guard body
-                # does NOT execute and the code after the if runs with k
-                # absent — x[k] still raises KeyError. Only add the pair
-                # when the default is absent or a falsy constant (None, 0,
-                # False, ""), which makes the guard fire when k is missing.
-                # A non-constant default (x.get(k, func())) can't be
-                # evaluated statically, so we conservatively skip it.
+                # A truthy default makes the guard miss a missing key, so only falsy or absent defaults are paired (BUGFIX).
                 if len(inner.args) < 2:
                     pairs.add((inner.func.value.id, inner.args[0].value))
                 elif isinstance(inner.args[1], ast.Constant) and not inner.args[1].value:
@@ -164,8 +153,7 @@ def _falsy_guard_targets(test: ast.expr) -> "Tuple[Set[str], Set[Tuple[str, obje
                 and right.value == 0
             ):
                 names.add(left.args[0].id)
-            # BUGFIX: `x is None` removed — proves non-None-ness, not
-            # non-emptiness. See the docstring.
+            # "x is None" is not removed, since it proves only non-None, not non-empty (BUGFIX).
             return
 
     visit(test)
@@ -238,25 +226,17 @@ def _is_indexed_access(node: ast.Subscript) -> bool:
     return False
 
 
-#: Statement types whose `body` (and, where present, `orelse`/`handlers`/
-#: `finalbody`) is a nested statement *list* that `_FunctionGuardWalker._walk`
-#: recurses into separately, one statement at a time, with correctly
-#: updated guard state. For these types, `_record_accesses_in_stmt` must
-#: look only at the statement's own "head" expression(s) — the parts
-#: evaluated before any nested block runs — and must not redescend into
-#: that nested block itself, or every access inside it gets recorded twice:
-#: once here (prematurely, before the block's own guard has been applied)
-#: and once more, correctly, by the recursive walk. That premature copy is
-#: not just noise — for an access guarded by a condition inside the very
-#: block being prematurely scanned (e.g. `if not candidates: sys.exit()`
-#: followed by `return candidates[-1]` in the same `if p.is_dir():` body),
-#: it is recorded UNGUARDED, directly contradicting the correct GUARDED
-#: record the recursive walk produces for that exact same site.
-_BLOCK_OWNING_STMT_TYPES = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)
+#: Block-owning statements are walked once: only their head expressions are scanned here, not their bodies.
+#: AUDIT3-4: `match` (3.10+) and `try/except*` (3.11+) own nested blocks too.
+#: Read as plain statements they were scanned whole with the outer guard state,
+#: and a rebind inside a `case` never dropped the guard for what follows.
+_MATCH = getattr(ast, "Match", None)
+_TRY_STAR = getattr(ast, "TryStar", None)
+_BLOCK_OWNING_STMT_TYPES = tuple(t for t in (
+    ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try,
+    _MATCH, _TRY_STAR) if t is not None)
 
-#: Field names holding each block-owning type's own head expression(s) —
-#: i.e. every field *except* the nested statement-list fields the
-#: recursive walk already covers on its own.
+#: Head-only fields for each block-owning statement type: everything except the nested statement lists.
 _HEAD_ONLY_FIELDS: Dict[type, Tuple[str, ...]] = {
     ast.If: ("test",),
     ast.For: ("target", "iter"),
@@ -266,12 +246,25 @@ _HEAD_ONLY_FIELDS: Dict[type, Tuple[str, ...]] = {
     ast.AsyncWith: ("items",),
     ast.Try: (),  # body/handlers/orelse/finalbody are all nested statement lists
 }
+if _MATCH is not None:
+    _HEAD_ONLY_FIELDS[_MATCH] = ("subject",)   # each case's guard is added in _own_scan_sources
+if _TRY_STAR is not None:
+    _HEAD_ONLY_FIELDS[_TRY_STAR] = ()
 
 
-#: Method names that mutate their receiver in place such that a prior
-#: "truthy"/"non-empty" guarantee about it can no longer be trusted
-#: afterward — `.pop()`, `.clear()`, `.popitem()`, `.remove()` can all
-#: turn a previously-guarded non-empty container empty again.
+def _pattern_bound_names(stmt) -> Set[str]:
+    """Names a `match` statement's case patterns bind (AUDIT3-4)."""
+    names: Set[str] = set()
+    for case in getattr(stmt, "cases", None) or []:
+        for node in ast.walk(case.pattern):
+            for attr in ("name", "rest"):
+                value = getattr(node, attr, None)
+                if isinstance(value, str):
+                    names.add(value)
+    return names
+
+
+#: Mutator methods that can empty a container again, so a truthy guard on it is dropped.
 _INVALIDATING_MUTATOR_METHODS = frozenset({"pop", "clear", "popitem", "remove"})
 
 
@@ -327,6 +320,91 @@ def _mutated_name_in_stmt(stmt: ast.stmt) -> set:
     return set()
 
 
+#: PERF (REL-2 follow-up): what `extract_guarded_accesses` knows while it walks one tree.
+#: `_names_stored_in` is asked about every statement of every function — 190 000 on this repo —
+#: and walked each one whole, a third of `scan_repo`. `no_walrus`: the tree has no walrus, so a
+#: simple statement binds a name only in its own targets (a comprehension's variable and a
+#: lambda's are not counted) and a head read binds none — those are all it needs to walk, for
+#: the same names. Unset (a direct call): the full walk.
+_EXTRACT = threading.local()
+
+#: A simple statement (or a `with` item) whose bound names, with no walrus in the tree, are its
+#: targets' alone.
+_TARGET_FIELDS: Dict[type, Tuple[str, ...]] = {
+    ast.Assign: ("targets",), ast.AugAssign: ("target",), ast.AnnAssign: ("target",),
+    ast.Expr: (), ast.Return: (), ast.Raise: (), ast.Assert: (), ast.Delete: (),
+    ast.Pass: (), ast.Break: (), ast.Continue: (), ast.Global: (), ast.Nonlocal: (),
+    ast.withitem: ("optional_vars",),
+}
+
+
+def _names_stored_in(node: ast.AST) -> Set[str]:
+    """Every bare name *node* binds in the enclosing scope (REL-2).
+
+    A `Name` in a store context — an annotated, tuple, starred or augmented target, a
+    `with … as`, a walrus anywhere, a walrus inside a comprehension too — but not a
+    comprehension's own loop variable and nothing inside a lambda, which bind in a scope
+    of their own.
+    """
+    names: Set[str] = set()
+    stack: List[ast.AST] = [node]
+    fields = None
+    if getattr(_EXTRACT, "no_walrus", False):
+        if isinstance(node, ast.expr) and not isinstance(getattr(node, "ctx", None), ast.Store):
+            return names    # a head read (`if` test, `for` iter, `match` subject) binds nothing
+        fields = _TARGET_FIELDS.get(type(node))
+    if fields is not None:
+        stack = []
+        for field in fields:
+            value = getattr(node, field)
+            stack.extend(v for v in (value if isinstance(value, list) else [value]) if v is not None)
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, ast.Lambda):
+            continue
+        if isinstance(cur, ast.comprehension):
+            stack.append(cur.iter)
+            stack.extend(cur.ifs)
+            stack.extend(n.value for n in ast.walk(cur.target) if isinstance(n, ast.NamedExpr))
+            continue
+        if isinstance(cur, ast.Name) and isinstance(cur.ctx, ast.Store):
+            names.add(cur.id)
+        stack.extend(ast.iter_child_nodes(cur))
+    return names
+
+
+def _stmt_bound_names(stmt: ast.stmt) -> Set[str]:
+    """The names *stmt* itself rebinds or empties, not counting its nested statement lists.
+
+    REL-2: only `x = …`, a `for x` target and a few mutators were known, so a guard on
+    `items` outlived `items: list = []`, `items, other = [], 1`, `a, *items = …`,
+    `items[:] = []`, `items *= 0`, `with open(p) as items`, `except E as items`,
+    `(items := [])` in any head, `import os as items`, `def items` and `class items` —
+    and `items[0]` after it was reported GUARDED, which refutes a true crash claim.
+    """
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return {stmt.name}
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return {a.asname or a.name.split(".")[0] for a in stmt.names if a.name != "*"}
+    names: Set[str] = set()
+    for src in _own_scan_sources(stmt):
+        names |= _names_stored_in(src)
+    for handler in getattr(stmt, "handlers", None) or []:
+        if handler.name:
+            names.add(handler.name)
+    targets: List[ast.AST] = []
+    if isinstance(stmt, ast.Assign):
+        targets = list(stmt.targets)
+    elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
+        targets = [stmt.target]
+    for target in targets:
+        # `items[:] = []` empties the list in place; `items[0] = v` does not.
+        if (isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Slice)
+                and isinstance(target.value, ast.Name)):
+            names.add(target.value.id)
+    return names
+
+
 def _own_scan_sources(stmt: ast.stmt) -> List[ast.AST]:
     """AST nodes `_record_accesses_in_stmt` should scan for `stmt` itself.
 
@@ -350,6 +428,9 @@ def _own_scan_sources(stmt: ast.stmt) -> List[ast.AST]:
             sources.extend(value)
         elif value is not None:
             sources.append(value)
+    for case in getattr(stmt, "cases", None) or []:
+        if case.guard is not None:
+            sources.append(case.guard)
     return sources
 
 
@@ -365,6 +446,8 @@ def _nested_stmt_lists(stmt: ast.stmt) -> List[List[ast.stmt]]:
             lists.append(value)
     for handler in getattr(stmt, "handlers", []):
         lists.append(handler.body)
+    for case in getattr(stmt, "cases", None) or []:
+        lists.append(case.body)
     return lists
 
 
@@ -394,40 +477,21 @@ def _rebound_names_in(
     (false positive downstream) is acceptable, a wrongly-kept one is not.
     """
     names: Set[str] = set()
-    # BUGFIX: `_mutated_name_in_stmt` invalidates the guard for the exact
-    # bare name a mutator method is called ON — but a guard on `stack`
-    # survived a mutation reached through a same-scope ALIAS of it:
-    #
-    #     if not stack: return None
-    #     alt = stack
-    #     alt.pop()
-    #     return stack[-1]         # still claimed GUARDED — wrong
-    #
-    # `alt` and `stack` are the same object; `alt.pop()` can empty a
-    # single-element `stack` exactly as `stack.pop()` would, so `stack[-1]`
-    # can genuinely IndexError. `alt` is invalidated (it's the name the
-    # mutator method is called on) but `stack` — the name the ACCESS and
-    # the GUARD are actually about — never sees it, because nothing
-    # connects the two bare names.
-    #
-    # This tracks exactly one hop of bare-Name-to-bare-Name aliasing
-    # (`alt = stack`), matching the same "bare name receiver, not an
-    # attribute/subscript chain" scope `_invalidate_reassigned` and
-    # `_mutated_name_in_stmt` already use — not general alias analysis.
-    # A mutation reached through either name invalidates BOTH, which is
-    # the conservative direction this module's own docstring already
-    # commits to elsewhere in this function: "a missed guard (false
-    # positive downstream) is acceptable, a wrongly-kept one is not."
-    #
-    # BUGFIX: this dict was re-initialized empty on every recursive descent,
-    # so `alt = stack` at the top level was invisible to an `alt.pop()`
-    # inside a nested try/if — the later `stack[-1]` still claimed GUARDED.
-    # Inherit a *copy*, matching _FunctionGuardWalker's copy-on-descent, so
-    # aliases found inside a block don't leak back out to its siblings.
+    # Aliases are copied per descent, so an alias inside a block does not leak out (BUGFIX).
     aliases: Dict[str, str] = dict(_inherited_aliases) if _inherited_aliases else {}
     for s in stmts:
         if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-            continue  # separate dataflow scope — a rebind there is irrelevant here
+            # separate dataflow scope — a rebind there is irrelevant here; the def's own
+            # name is a rebind in this one (REL-2)
+            if not isinstance(s, ast.Lambda):
+                names.add(s.name)
+                aliases.pop(s.name, None)
+            continue
+        for bound in _stmt_bound_names(s):
+            names.add(bound)
+            if not (isinstance(s, ast.Assign) and len(s.targets) == 1
+                    and isinstance(s.targets[0], ast.Name) and s.targets[0].id == bound):
+                aliases.pop(bound, None)
         if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
             names.add(s.targets[0].id)
             target = s.targets[0].id
@@ -435,16 +499,7 @@ def _rebound_names_in(
                 aliases[target] = s.value.id
             else:
                 aliases.pop(target, None)  # rebound to something else — alias broken
-        # BUGFIX (audit): a name reused as a `for` loop variable rebinds it
-        # exactly like a bare `x = <expr>` assignment does — a guard on
-        # `x` from before the loop cannot be trusted for code after it if
-        # the loop reassigns `x` on every iteration. Neither this function
-        # nor `_invalidate_reassigned` (the top-level, non-recursive
-        # sibling, fixed alongside this) recognized this — only
-        # `ast.Assign` invalidated a guard. Same bare-Name-only scope as
-        # an ordinary assignment target (see `_invalidate_reassigned`'s
-        # docstring on why tuple-unpacking targets are deliberately left
-        # alone throughout this module).
+        # A for-loop variable rebinds its name, so it invalidates a guard on that name (BUGFIX).
         elif isinstance(s, (ast.For, ast.AsyncFor)) and isinstance(s.target, ast.Name):
             names.add(s.target.id)
             aliases.pop(s.target.id, None)  # rebound by the loop — alias broken
@@ -455,6 +510,11 @@ def _rebound_names_in(
             for alias_name, source_name in aliases.items():
                 if source_name == mutated:
                     names.add(alias_name)
+        if _MATCH is not None and isinstance(s, _MATCH):
+            bound = _pattern_bound_names(s)
+            names |= bound
+            for name in bound:
+                aliases.pop(name, None)
         for nested in _nested_stmt_lists(s):
             names |= _rebound_names_in(nested, aliases)
     return names
@@ -475,17 +535,7 @@ class _FunctionGuardWalker:
     def __init__(self, module_path: str) -> None:
         self.module_path = module_path
         self.results: List[GuardedAccess] = []
-        # BUGFIX: bare-Name-to-bare-Name alias tracking (`alt = stack`) for
-        # the SEQUENTIAL, same-block mutation-invalidation case in _walk —
-        # see the comment at that discard site for the exact scenario this
-        # closes. One instance per function (extract_guarded_accesses makes
-        # a fresh _FunctionGuardWalker per top-level FunctionDef, so this
-        # never leaks across functions), reset once here in run() rather
-        # than per-nested-block: an alias discovered inside one branch
-        # remaining "known" in a sibling branch can only ever cause an
-        # EXTRA invalidation there, never a wrongly-kept guard — the same
-        # conservative direction _rebound_names_in's own docstring already
-        # commits to for nested-block rebinds.
+        # Alias map is per function, reset once in run(); extra invalidation is the safe direction (BUGFIX).
         self._aliases: Dict[str, str] = {}
 
     def run(self, func: "ast.FunctionDef | ast.AsyncFunctionDef") -> List[GuardedAccess]:
@@ -561,6 +611,15 @@ class _FunctionGuardWalker:
         as a loop variable survived the loop as stale, unlike its
         recursive sibling `_rebound_names_in` (fixed alongside this).
         """
+        # REL-2: every other way the statement binds or empties a name, first.
+        for bound in _stmt_bound_names(stmt):
+            guarded_names.discard(bound)
+            guard_desc.pop(bound, None)
+            for pair in {p for p in guarded_pairs if p[0] == bound}:
+                guarded_pairs.discard(pair)
+            if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == bound):
+                self._aliases.pop(bound, None)
         if isinstance(stmt, (ast.For, ast.AsyncFor)) and isinstance(stmt.target, ast.Name):
             target = stmt.target.id
             guarded_names.discard(target)
@@ -573,9 +632,7 @@ class _FunctionGuardWalker:
         target = stmt.targets[0].id
         guarded_names.discard(target)
         guard_desc.pop(target, None)
-        # `target` no longer denotes whatever dict it used to alias, so any
-        # `(target, key)` pair guarantee is stale too — a later `target[k]`
-        # alias-propagation must not be able to resurrect it.
+        # A rebound target also drops its (target, key) guard pairs, so they cannot come back.
         for pair in {p for p in guarded_pairs if p[0] == target}:
             guarded_pairs.discard(pair)
 
@@ -612,11 +669,7 @@ class _FunctionGuardWalker:
         containing the rebind can never share a control-flow path with
         anything after it.
         """
-        # BUGFIX: passed no alias state, so threading aliases through
-        # _rebound_names_in's own recursion (see its docstring) had no
-        # starting point. This is the live walk's entry point, so it must
-        # seed from self._aliases — the map _walk already maintains — or an
-        # alias bound before this statement stays invisible.
+        # Seed the alias state from self._aliases so an earlier alias stays visible (BUGFIX).
         rebound: Set[str] = set()
         for nested in (nested_lists if nested_lists is not None else _nested_stmt_lists(stmt)):
             rebound |= _rebound_names_in(nested, self._aliases)
@@ -656,29 +709,7 @@ class _FunctionGuardWalker:
             key = value.args[0].value
         if base is not None and (base, key) in guarded_pairs:
             guarded_names.add(target)
-            # BUGFIX: this used to be `if base in guard_desc:
-            # guard_desc.setdefault(target, guard_desc[base])` — silently
-            # doing nothing when `base` itself was never added to
-            # `guard_desc`, which happens whenever the guard that put
-            # `(base, key)` into `guarded_pairs` was a *pairs-only* test
-            # (e.g. `if not entry.get("stack"): return` alone, with no
-            # `not entry`/`or` alongside it) — the `ast.If` branch below
-            # only populates `guard_desc` for entries in `names`, never
-            # for `pairs`. The result: `target` lands in `guarded_names`
-            # (so `is_guarded=True` at the access site) with no
-            # description in `guard_desc`, and `GuardedAccess.__post_init__`
-            # requires exactly the opposite for `status="GUARDED"` —
-            # `model.py`'s own invariant — so this crashed the *entire*
-            # collect run (an unhandled `ValueError`) the moment a
-            # pairs-only guard's alias was ever indexed, rather than
-            # degrading to a missed guard the way every other edge case
-            # in this module does. `known_symbols`/the antihallucination
-            # guarantee only ever discussed this as *wrongly marking*
-            # something guarded — an outright crash is strictly worse.
-            # Falling back to a generic description whenever `base` has
-            # none keeps every path that grants `guarded_names.add(target)`
-            # in lockstep with a path that also satisfies the model's
-            # description requirement.
+            # Fall back to a generic description when the base has none, so no crash (BUGFIX).
             guard_desc.setdefault(target, guard_desc.get(base, f"guard on {base}[{key!r}]"))
 
     def _walk(
@@ -690,22 +721,15 @@ class _FunctionGuardWalker:
     ) -> None:
         for stmt in stmts:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-                continue  # separate dataflow scope — handled on its own pass
+                # separate dataflow scope — handled on its own pass; its name rebinds here (REL-2)
+                self._invalidate_reassigned(stmt, guarded_names, guarded_pairs, guard_desc)
+                continue
 
             self._record_accesses_in_stmt(stmt, guarded_names, guard_desc)
             self._invalidate_reassigned(stmt, guarded_names, guarded_pairs, guard_desc)
             self._propagate_alias(stmt, guarded_names, guarded_pairs, guard_desc)
 
-            # BUGFIX: `alt = stack` then `alt.pop()` never invalidated a
-            # guard on `stack` itself, even though they name the same
-            # object — `stack[-1]` after that kept citing an early
-            # `if not stack: return` as proof it's GUARDED, when a
-            # single-element `stack` genuinely empties via `alt.pop()`.
-            # Track this one bare-Name-to-bare-Name hop so a mutation
-            # reached through either name invalidates both — see __init__
-            # for why this is a per-function instance attribute rather
-            # than a `_walk` parameter, and why leaking across sibling
-            # branches is the acceptable, conservative direction.
+            # A mutation through an alias invalidates the guard on the original name too (BUGFIX).
             if (
                 isinstance(stmt, ast.Assign)
                 and len(stmt.targets) == 1
@@ -731,32 +755,12 @@ class _FunctionGuardWalker:
                         guarded_pairs.discard(pair)
 
             if isinstance(stmt, ast.If):
-                # BUGFIX: `stmt.body` runs on exactly the *opposite* polarity
-                # from what a terminating guard proves — `if not x: ... `
-                # proves `x` truthy only for code that runs *after* this
-                # `if` (or in its `orelse`), never for the guard's own body,
-                # where `test` was True, i.e. `x` is the very thing the test
-                # found falsy. Snapshot the pre-guard state for the body's
-                # walk *before* adding the new guard below, so an access
-                # inside the guard's own body (e.g. `if not x: y = x[0];
-                # return y`) is walked with the guard state as it stood
-                # before this `if`, not after — the body sees no guard on
-                # `x` at all (correctly: the true fact there is that `x` is
-                # falsy, not that it's guarded-truthy), while `orelse` and
-                # every sibling statement after this `if` correctly do.
+                # The body runs with the pre-guard state: inside the guard, the name is falsy (BUGFIX).
                 body_guarded_names = set(guarded_names)
                 body_guarded_pairs = set(guarded_pairs)
                 body_guard_desc = dict(guard_desc)
                 names, pairs = _falsy_guard_targets(stmt.test)
-                # BUGFIX: reaching `orelse` at all already proves `test` was
-                # False (i.e. the named target(s) are truthy) — that's true
-                # unconditionally, independent of whether `stmt.body`
-                # terminates. Termination only matters for whether the
-                # guarantee may persist *past* the whole if/else for
-                # sibling statements that follow it (handled below via
-                # `guarded_names`/`guard_desc`, which the walk after this
-                # `if` reuses) — it must not gate whether `orelse` itself,
-                # walked right here, gets the guard.
+                # Reaching orelse proves the test was False, whether or not the body terminates (BUGFIX).
                 if names or pairs:
                     desc = f"else-branch at {self.module_path}:{stmt.lineno}"
                     orelse_guarded_names = set(guarded_names) | names
@@ -776,12 +780,7 @@ class _FunctionGuardWalker:
                     guarded_pairs |= pairs
                 self._walk(stmt.body, body_guarded_names, body_guarded_pairs, body_guard_desc)
                 self._walk(stmt.orelse, orelse_guarded_names, orelse_guarded_pairs, orelse_guard_desc)
-                # BUGFIX: a rebind inside a branch that terminates can
-                # never fall through to any statement after this `if` —
-                # so it must not invalidate the outer guard state. Only
-                # feed non-terminating branches into the rebind check;
-                # see `_invalidate_rebinds_in_nested_block`'s `nested_lists`
-                # docstring for the concrete idiom this fixes.
+                # A branch that terminates cannot fall through, so its rebinds do not reach the outer state (BUGFIX).
                 if_nested_lists = []
                 if not _block_terminates(stmt.body):
                     if_nested_lists.append(stmt.body)
@@ -797,11 +796,25 @@ class _FunctionGuardWalker:
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
                 self._walk(stmt.body, set(guarded_names), set(guarded_pairs), dict(guard_desc))
                 self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
-            elif isinstance(stmt, ast.Try):
+            elif isinstance(stmt, ast.Try) or (_TRY_STAR is not None and isinstance(stmt, _TRY_STAR)):
                 for attr in _COMPOUND_BODY_ATTRS:
                     self._walk(getattr(stmt, attr, []), set(guarded_names), set(guarded_pairs), dict(guard_desc))
                 for handler in stmt.handlers:
                     self._walk(handler.body, set(guarded_names), set(guarded_pairs), dict(guard_desc))
+                self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
+            elif _MATCH is not None and isinstance(stmt, _MATCH):
+                # AUDIT3-4: a pattern capture rebinds its name inside the case.
+                bound = _pattern_bound_names(stmt)
+                for case in stmt.cases:
+                    case_names = set(guarded_names) - bound
+                    case_pairs = {p for p in guarded_pairs if p[0] not in bound}
+                    case_desc = {k: v for k, v in guard_desc.items() if k not in bound}
+                    self._walk(case.body, case_names, case_pairs, case_desc)
+                for name in bound:
+                    guarded_names.discard(name)
+                    guard_desc.pop(name, None)
+                for pair in {p for p in guarded_pairs if p[0] in bound}:
+                    guarded_pairs.discard(pair)
                 self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
 
 
@@ -815,8 +828,19 @@ def extract_guarded_accesses(tree: ast.Module, module_path: str) -> List[Guarded
     text as a tiebreaker for same-line cases.
     """
     accesses: List[GuardedAccess] = []
+    functions: List[ast.AST] = []
+    walrus = False
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            functions.append(node)
+        elif isinstance(node, ast.NamedExpr):
+            walrus = True
+    outer = getattr(_EXTRACT, "no_walrus", False)
+    _EXTRACT.no_walrus = not walrus
+    try:
+        for node in functions:
             accesses.extend(_FunctionGuardWalker(module_path).run(node))
+    finally:
+        _EXTRACT.no_walrus = outer
     accesses.sort(key=lambda g: (int(g.location.rsplit(":", 1)[-1]), g.access))
     return accesses

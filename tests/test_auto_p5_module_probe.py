@@ -55,9 +55,7 @@ from tools.auto.repo_ingest import RepoCluster
 
 _OPS = ("facts", "module")
 
-# The real shape of tools/backoff.py in a collect artifact — the module whose
-# absence motivated this ticket. Signatures are elided to `name(...)` by
-# collect itself, which is why the listing leans on lineno and docstring.
+# Shape of tools/backoff.py in a collect artifact (signatures elided to name(...)): the module whose absence motivated this ticket.
 _BACKOFF = [
     ("backoff_seconds", 45, "Return wait time (s) for the nth consecutive API error (0-indexed)."),
     ("_now", 60, ""),
@@ -99,9 +97,7 @@ def backoff_bridge(monkeypatch) -> CollectBridge:
     }, monkeypatch)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CollectBridge.module_symbols
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestModuleSymbols:
 
@@ -170,12 +166,7 @@ class TestModuleSymbols:
         rejection reason."""
         out = backoff_bridge.module_symbols("tools/backoff.py")
         lines = out.splitlines()
-        # Exact lines, not substrings. collect stores `signature` as
-        # "name(...)" rather than "(...)", and a naive name+signature concat
-        # renders "backoff_secondsbackoff_seconds(...)" — which a substring
-        # assertion happily accepts, because the doubled text still contains
-        # the expected fragment. Only a whole-line comparison catches it, and
-        # only a live artifact exposed it in the first place.
+        # Whole-line comparison: a substring assert would accept a doubled name such as backoff_secondsbackoff_seconds(...).
         assert lines[1] == (
             "  backoff_seconds(...) :45 — Return wait time (s) for the nth "
             "consecutive API error (0-indexed)."
@@ -197,9 +188,7 @@ class TestModuleSymbols:
         assert f"sym_{limit}(" not in out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Parser gating — no code change needed, per the ticket
-# ─────────────────────────────────────────────────────────────────────────────
+# Parser gating: no code change needed
 
 class TestAllowListGating:
 
@@ -231,9 +220,7 @@ class TestAllowListGating:
         ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # ArchProbe integration
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestArchProbeModuleOp:
 
@@ -275,9 +262,7 @@ class TestArchProbeModuleOp:
         assert p.last_by_op == (ProbeOpTally("module", 0, 1),)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # End to end
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(ops: str = "facts, module") -> configparser.ConfigParser:
     c = configparser.ConfigParser()
@@ -366,9 +351,7 @@ def test_instructions_teach_the_new_op(cluster_and_base, backoff_bridge) -> None
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Reporting
-# ─────────────────────────────────────────────────────────────────────────────
 
 _RUN_START = {"run_id": "r1", "kind": "run_start", "ts": "2026-01-01T00:00:00Z",
               "source": "controller", "target": "auto", "params": {"goal": "g"}}

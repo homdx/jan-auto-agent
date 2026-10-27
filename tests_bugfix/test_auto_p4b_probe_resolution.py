@@ -72,9 +72,7 @@ from tools.auto.collect_bridge import CollectBridge, _qualname_matches
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Defect 1 — the qualname matcher
-# ─────────────────────────────────────────────────────────────────────────────
+# Defect 1: the qualname matcher
 
 _FUNC = "tools/llm_stream.py:strip_think"
 _METH = "tools/auto/inner_loop.py:InnerLoop.run_task"
@@ -160,9 +158,7 @@ class TestBridgeLookups:
         assert [x.name for x in b.contracts_for_symbol("strip_think")] == ["c1"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Defect 2 — an all-miss round is not progress
-# ─────────────────────────────────────────────────────────────────────────────
+# Defect 2: an all-miss round is not progress
 
 class _FakeBridge:
     usable = True
@@ -201,9 +197,7 @@ class TestAllMissRound:
         assert p.chars_used > 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# End-to-end
-# ─────────────────────────────────────────────────────────────────────────────
+# End to end
 
 def _cfg(**over: str) -> configparser.ConfigParser:
     arch = {"temperature": "0.2", "max_tokens": "512", "probe_enabled": "true",
@@ -278,8 +272,7 @@ class TestLoopNoLongerSpins:
             "before AUTO-P4b this same input cost 6 calls (5 rounds + forced)"
         )
         assert arch_probe.FORCED_SUFFIX in _msgs(mock_llm)[1]
-        # It kept probing through the forced call too, so the batch legitimately
-        # yields nothing — but it does so after 2 calls instead of 6.
+        # Probes through the forced call too, so the batch yields nothing, after 2 calls instead of 6.
         assert results == []
 
         # And a model that DOES comply on the forced call still gets its plan.
@@ -350,9 +343,7 @@ class TestLoopNoLongerSpins:
         try:
             with patch(
                 "tools.llm_stream.request_completion",
-                # THREE ops, ONE of which resolves. The asymmetry is the point:
-                # with ops == hits, a report that echoed the request count back
-                # instead of the executor's own tally would look correct.
+                # Three ops, one resolves: ops != hits, so a report that echoes the request count would look wrong.
                 side_effect=["ARCH_PROBE: facts strip_think, facts backoff, facts retry",
                              _good("Grounded")],
             ) as mock_llm:
@@ -378,9 +369,7 @@ class TestLoopNoLongerSpins:
         assert int(res["params"]["misses"]) == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Defect 4 — honest reporting
-# ─────────────────────────────────────────────────────────────────────────────
+# Defect 4: honest reporting
 
 _RUN_START = {"run_id": "r1", "kind": "run_start", "ts": "2026-01-01T00:00:00Z",
               "source": "controller", "target": "auto", "params": {"goal": "g"}}

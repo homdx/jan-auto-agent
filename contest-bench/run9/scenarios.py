@@ -22,8 +22,7 @@ import provider as P
 
 NUDGE = "IMPORTANT: your previous reply was not valid JSON"
 
-# [gate1] for every scenario unless overridden: the field config's `fast` ladder,
-# no learned budget (deterministic max_tokens), no real waiting, one worker.
+# [gate1] for every scenario unless overridden: the field config's `fast` ladder, no learned budget (deterministic max_tokens), no real waiting, one worker.
 GATE1_DEFAULTS = {
     "temperature": "0.0", "max_tokens": "4096", "skip_llm": "false",
     "llm_call_retry_wait_sec": "0", "llm_call_retry_max": "1",

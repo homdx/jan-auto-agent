@@ -47,9 +47,7 @@ from tools.auto.arch_probe import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Parser
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestExtractProbeRequest:
 
@@ -125,9 +123,7 @@ class TestExtractProbeRequest:
         ]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Executor
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _FakeBridge:
     """Stands in for CollectBridge — only `usable` and `pull_symbol` matter."""
@@ -229,9 +225,7 @@ class TestArchProbeExecutor:
         raise mid-batch."""
         probe = ArchProbe(_FakeBridge({}))
         out = probe.execute([ProbeOp("refs", "alpha")])
-        # AUTO-P4b: an op with no executor is a miss like any other, so a
-        # request made only of them comes back empty rather than as a digest
-        # of "(not found)". What matters here is unchanged: no exception.
+        # An op with no executor is a miss: the request returns empty, with no exception.
         assert out == ""
         assert probe.last_misses == 1
         mixed = ArchProbe(_FakeBridge({"a": "module: ok"})).execute(

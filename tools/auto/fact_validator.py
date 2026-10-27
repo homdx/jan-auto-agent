@@ -30,6 +30,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 from tools.config_safe import safe_getboolean, safe_getint
+from tools.auto.verdict_followup import STRICT_VERDICT_RULE
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,8 @@ _GATE3_SYSTEM_FACTS = (
     "Do NOT REVISE for missing detail, style, or rhythm. "
     "If nothing contradicts, reply APPROVED. "
     "If REVISE, name the contradicted fact. "
-    "No JSON, no preamble."
+    "No JSON, no preamble.\n"
+    + STRICT_VERDICT_RULE   # VERDICT-ASK
 )
 
 
@@ -142,7 +144,7 @@ class FactValidator:
             ``approved=False`` only when the LLM explicitly returns ``REVISE``.
         """
         # Import here to avoid a circular import; inner_loop imports us.
-        from tools.auto.inner_loop import _parse_verdict_soft  # noqa: PLC0415
+        from tools.auto.verdict_followup import settle_verdict  # noqa: PLC0415
 
         instruction = (task.get("instruction") or "").strip()
         goal = (task.get("goal") or "").strip()
@@ -159,7 +161,10 @@ class FactValidator:
             logger.warning("FactValidator: LLM call failed — %s", exc)
             return FactVerdict(approved=True, reason="llm error — passed on fail-open", unparseable=False)
 
-        approved, reason, unparseable = _parse_verdict_soft(raw)
+        # VERDICT-ASK: an unclear or self-contradicting reply is put back to the model once.
+        approved, reason, unparseable, raw = settle_verdict(
+            raw, lambda extra: self._llm(_GATE3_SYSTEM_FACTS, user_msg + extra) or "", who="FactValidator",
+        )
 
         if unparseable:
             logger.warning(
@@ -213,8 +218,7 @@ def make_fact_validator(
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-        # GATE3-PROFILE-2: only pass settings= when a profile was actually
-        # resolved — see the identical comment in canon_validator.py.
+        # Pass settings= only when a profile was resolved (as in canon_validator.py).
         llm_call = (
             _make_llm_call(config, task_mode="creative", settings=settings)
             if settings is not None

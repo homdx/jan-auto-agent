@@ -64,9 +64,7 @@ from tools.auto.gate1_filter import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def minimal_config() -> configparser.ConfigParser:
@@ -79,10 +77,7 @@ def minimal_config() -> configparser.ConfigParser:
             "model":      "test-model",
             "api_format": "openai",
         },
-        # RUN-5: this file's acceptance criteria are the fail-closed DROP of
-        # an unanswerable presence check, so it pins the reject policy
-        # explicitly. The default (keep) and its counter are covered in
-        # tests/test_gate1_presence_unknown.py.
+        # RUN-5: this file pins the reject policy (fail closed); the keep default is covered in test_gate1_presence_unknown.py.
         "gate1": {"temperature": "0.0", "max_tokens": "64", "skip_llm": "false",
                   "presence_unknown": "reject"},
         "loop":  {"timeout_seconds": "10"},
@@ -180,9 +175,7 @@ def _rejected_response(reason: str = "Problem not found") -> str:
     return json.dumps({"verdict": "rejected", "reason": reason})
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — bogus candidate (problem absent) is dropped with a logged reason
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: a bogus candidate (problem absent) is dropped with a logged reason
 
 class TestBogusCandidateDropped:
     """AC1: a deliberately bogus candidate is rejected with a reason."""
@@ -256,9 +249,7 @@ class TestBogusCandidateDropped:
         assert any("nonexistent_function" in msg for msg in caplog.messages)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — duplicate candidates are merged
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: duplicate candidates are merged
 
 class TestDuplicateMerging:
     """AC2: identical (file, anchor, title) candidates → only one accepted."""
@@ -419,9 +410,7 @@ class TestDuplicateMerging:
             cited_location=CitedLocation(file="CHANGELOG.md"),
             cluster="support",
         )
-        # Same fp as grounded_second (same cited_location.file, same anchor
-        # — no symbol/line range on either — and same normalised title),
-        # but a different target file set, so a different tfp.
+        # Same file, anchor and title as grounded_second, but a different target set, so a different tfp.
         same_fp_different_target = CandidateTask(
             title="Prepend a new greeting changelog entry",
             instruction="A completely different instruction body...",
@@ -449,9 +438,7 @@ class TestDuplicateMerging:
         assert dup_titles.count("Prepend a new greeting changelog entry") == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Existence checks
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestExistenceChecks:
     def test_missing_file_rejected(
@@ -506,9 +493,7 @@ class TestExistenceChecks:
         mock_llm.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Presence checks (LLM stage)
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPresenceChecks:
     def test_confirmed_verdict_accepted(
@@ -567,10 +552,7 @@ class TestPresenceChecks:
         self, filt: Gate1Filter, repo: Path
     ) -> None:
         c = _make_candidate(symbol="parse_config")
-        # Default retry config is 3 retries * 60s real time.sleep() between
-        # them (see Gate1Filter._check_presence) -- this test only checks
-        # the fail-closed outcome, not retry timing, so skip the wait.
-        # Same idiom as tests_bugfix/test_gate1_llm_call_retry_backoff.py.
+        # Skip the retry wait (default 3 x 60 s): this test checks the fail-closed outcome, not timing.
         filt._llm_call_retry_wait_sec = 0
         with patch(
             "tools.llm_stream.request_completion",
@@ -625,9 +607,7 @@ class TestPresenceChecks:
         assert len(accepted) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Integration — mixed outcomes
-# ─────────────────────────────────────────────────────────────────────────────
+# Integration: mixed outcomes
 
 class TestIntegration:
     def test_mixed_candidates(self, filt: Gate1Filter, repo: Path) -> None:
@@ -673,9 +653,7 @@ class TestIntegration:
         assert rejected == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # filter_candidates() convenience factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestFilterCandidatesFactory:
     def test_factory_reads_config(
@@ -704,9 +682,7 @@ class TestFilterCandidatesFactory:
         assert len(accepted) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Unit tests for internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestFingerprint:
     def test_same_candidate_same_fingerprint(self) -> None:

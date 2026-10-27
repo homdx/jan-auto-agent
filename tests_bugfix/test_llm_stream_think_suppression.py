@@ -46,9 +46,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.llm_stream import build_chat_request, request_completion
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# build_chat_request() — pure payload construction
-# ─────────────────────────────────────────────────────────────────────────────
+# build_chat_request(): pure payload construction
 
 class TestOpenAIFormatThinkSuppression:
 
@@ -137,10 +135,7 @@ class TestOllamaFormatUnaffected:
         assert "reasoning" not in payload
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# End-to-end: the payload actually sent over the wire, and the fix reaching
-# a real caller's default config
-# ─────────────────────────────────────────────────────────────────────────────
+# End to end: the payload on the wire, and the fix reaching a real caller's default config
 
 
 class TestGate1FilterSendsReasoningSuppressionByDefault:
@@ -179,9 +174,7 @@ class TestGate1FilterSendsReasoningSuppressionByDefault:
                 "api_key": "k", "model": "deepseek-v4-flash:free",
                 "api_format": "openai",
             },
-            # [gate1] deliberately left with NO explicit think key — the
-            # fallback=False default is exactly what's active for every
-            # real user unless they override it.
+            # [gate1] has no explicit think key: the fallback=False default is what every real user gets.
             "gate1": {"temperature": "0.0", "max_tokens": "512"},
         })
         filt = Gate1Filter(

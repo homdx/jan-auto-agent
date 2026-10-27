@@ -574,8 +574,7 @@ def test_closing_again_does_not_duplicate_the_reason(repo, capsys):
 
 def test_reopening_twice_is_a_no_op(repo, capsys):
     _run(capsys, "issue", "close", str(NN), "--reason", "why")
-    # `open` is from `queued` only: a closed ticket comes back with `reopen`, so
-    # the `**Closed:**` line is never removed but the verb that wrote it.
+    # `open` is allowed from `queued` only; a closed ticket comes back via `reopen`. The **Closed:** line is never removed.
     _refuse(capsys, "issue", "open", str(NN), want=("open is not allowed from closed",),
             nn=NN, step="transition allowed")
     assert "**Closed:**" in _body(repo)

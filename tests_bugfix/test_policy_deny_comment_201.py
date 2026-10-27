@@ -62,8 +62,7 @@ def test_deny_match_comment_201(command, expected):
 
 
 def test_a_comment_is_not_declared_from_a_malformed_line():
-    # fail open: an unterminated quote, escape, delimiter or substitution never
-    # raises into a run — the reader answers, whatever it answers
+    # Fail open: a malformed quote, escape, delimiter or substitution never raises into a run.
     for command in (
         "echo a # ' <<EOF\ngit push",
         "echo a # $'\ngit push",

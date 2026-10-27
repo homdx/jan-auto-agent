@@ -26,6 +26,15 @@ from collections import defaultdict
 SEV = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 4, "": 5}
 
 
+def is_world_fact(how) -> bool:
+    """A claim-check row of a world claim: its ``how`` is ``world fact``, alone (CC-8) or as the
+    last part after CC-11's ``3 of 5 voters committed; `` — the exact match missed that form, and
+    under ``--accept committed`` a true world fact became a defect ticket. A quote in ``how`` has
+    its ``;`` escaped (``\\;``), so only a bare one separates the parts."""
+    parts = re.split(r"(?<!\\);", str(how or ""))
+    return parts[-1].strip() == "world fact"
+
+
 def slug(s):
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")[:48]
 
@@ -34,7 +43,7 @@ def read(paths, key="finding"):
     out = defaultdict(list)
     for pat in paths or []:
         for p in glob.glob(pat):
-            with open(p, newline="", encoding="utf-8") as fh:
+            with open(p, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
                 rd = csv.DictReader(fh)
                 for r in rd:
                     k = (r.get(key) or "").strip()
@@ -67,19 +76,15 @@ def main():
     ap.add_argument("--out", default="tasks")
     a = ap.parse_args()
 
-    with open(a.truth, newline="", encoding="utf-8") as fh:
+    with open(a.truth, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
         truth_rows = list(csv.DictReader(fh))
-    # The same defect often gets reported at several symbols — the constant, the
-    # constructor that binds it, the attribute it lands on. Those are one bug and
-    # one ticket. A `duplicate_of` column naming the canonical finding folds the
-    # aliases in rather than filing the same work three times.
-    # An alias is folded into the row its `duplicate_of` chain ends in. A chain that ends
-    # in a name that is not a REAL row (missing, mistyped, FALSE) or that loops back on
-    # itself has no canonical row to fold into: its aliases are one bug all the same, so
-    # the first of them is the ticket and the rest fold into it. A defect is never
-    # dropped for naming a bad canonical.
+    # Aliases fold into their canonical row; a world-fact claim (CC-8) is not filed as a code defect.
+    world = [r for r in truth_rows if is_world_fact(r.get("how"))]
+    if world:
+        print(f"skipped {len(world)} world-fact row(s): a true fact is not a defect", file=sys.stderr)
     real_rows = {(r.get("finding") or "").strip(): r for r in truth_rows
-                 if (r.get("truth") or "").strip().upper() == "REAL"}
+                 if (r.get("truth") or "").strip().upper() == "REAL"
+                 and not is_world_fact(r.get("how"))}
     order = {key: i for i, key in enumerate(real_rows)}
 
     def end_of(key):
@@ -137,7 +142,7 @@ def main():
              f"**File:** `{file_}`  ",
              f"**Symbol:** `{symbol or '—'}`  ",
              f"**Status:** confirmed by adjudication ({row.get('checked_by', '?')})  ",
-             (f"**Also reported as:** " + ", ".join(f"`{x}`" for x in alias_note) + "\n"
+             ("**Also reported as:** " + ", ".join(f"`{x}`" for x in alias_note) + "\n"
               if alias_note else "\n"),
              "## The defect\n",
              (longest(both, "consequence") or longest(both, "impact")
@@ -147,8 +152,7 @@ def main():
 
         if longest(both, "repro"):
             T += ["## Reproduction\n", "```", longest(both, "repro"), "```\n"]
-        # Prefer a stage-3 adjudicator's write-up; fall back to the one-line
-        # `how` recorded straight in truth.csv when no truth-*.csv was supplied.
+        # Prefer a stage-3 adjudicator's write-up; fall back to the one-line `how` in truth.csv when no truth-*.csv was supplied.
         how = longest(v, "how") or (row.get("how") or "").strip()
         if how:
             T += ["## How it was verified\n", how + "\n"]

@@ -102,9 +102,7 @@ class PromptOptimizer:
         try:
             tracer.event("prompt_optimizer", "llm", "llm_request",
                          content=meta_prompt, model=self.model, temperature=self.temperature)
-            # AUTO-FIX (fable follow-up 3): strip <think> reasoning before the
-            # candidate is stored — an optimized prompt with a qwen3 thinking
-            # block baked into it would be persisted and reused verbatim.
+            # Strip <think> blocks before storing the candidate, so reasoning is not reused verbatim.
             from tools.llm_stream import strip_think as _strip_think
             candidate = _strip_think(request_completion(
                 url, headers, payload, self.timeout,

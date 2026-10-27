@@ -43,9 +43,7 @@ from tools.auto.repo_ingest import RepoCluster
 from tools.auto.state import StateStore
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared factories
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _git_init(path: Path) -> None:
@@ -99,9 +97,7 @@ def _fake_cfg() -> configparser.ConfigParser:
     return cfg
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Minimal fake controller for unit tests
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 class _FakeController:
@@ -125,9 +121,7 @@ class _FakeController:
         return None, 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-G0 — controller.run() delegates to pipeline.run_pipeline
-# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-G0: controller.run() delegates to pipeline.run_pipeline
 
 
 class TestG0Delegation:
@@ -174,9 +168,7 @@ class TestG0Delegation:
         assert done == 3
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-G1 AC1 — Fresh run: plan.json populated + IMPROVEMENTS.md committed
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: fresh run populates plan.json and commits IMPROVEMENTS.md
 
 
 class TestG1FreshRun:
@@ -278,9 +270,7 @@ class TestG1FreshRun:
         return ctrl
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-G1 AC2 — Resume: plan phase skipped when tasks exist
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: resume skips the plan phase when tasks exist
 
 
 class TestG1Resume:
@@ -336,9 +326,7 @@ class TestG1Resume:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-G1 AC3 — Check-less tasks → manual suggestions only
-# ─────────────────────────────────────────────────────────────────────────────
+# AC3: check-less tasks become manual suggestions only
 
 
 class TestG1ChecklessTasks:
@@ -388,9 +376,7 @@ class TestG1ChecklessTasks:
         assert len(backlog.manual_suggestions) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-G1 — Git-unavailable fallback
-# ─────────────────────────────────────────────────────────────────────────────
+# Git-unavailable fallback
 
 
 class TestG1GitUnavailable:
@@ -438,9 +424,7 @@ class TestG1GitUnavailable:
         assert md_path.exists(), "IMPROVEMENTS.md must be written even without git"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-G1 — run_trace integration (optional; no-op when run_trace is None)
-# ─────────────────────────────────────────────────────────────────────────────
+# run_trace integration (optional; no-op when run_trace is None)
 
 
 class TestG1RunTrace:

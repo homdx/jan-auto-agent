@@ -1,0 +1,3074 @@
+{
+ "target": {
+  "repo": "fx (built by contest-bench/cc/make_fixture.py --build; blackbox_290.py puts its own path here)",
+  "ref": "d36d59e",
+  "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+  "base": null,
+  "warnings": []
+ },
+ "results": [
+  {
+   "model": "kenary/agnes-3-0-flash:free",
+   "run": 0,
+   "votes": {
+    "1": "TRUE",
+    "0": "TRUE",
+    "2": "TRUE",
+    "3": "TRUE",
+    "4": "TRUE",
+    "5": "TRUE",
+    "6": "TRUE",
+    "7": "TRUE",
+    "8": "TRUE",
+    "9": "TRUE",
+    "10": "TRUE",
+    "11": "TRUE",
+    "13": "TRUE",
+    "12": "TRUE",
+    "15": "TRUE",
+    "14": "TRUE",
+    "16": "TRUE",
+    "17": "TRUE",
+    "19": "TRUE",
+    "18": "TRUE",
+    "21": "TRUE",
+    "20": "TRUE",
+    "22": "TRUE",
+    "23": "TRUE",
+    "24": "TRUE",
+    "25": "TRUE",
+    "26": "TRUE",
+    "27": "TRUE",
+    "29": "TRUE",
+    "28": "TRUE",
+    "31": "TRUE",
+    "30": "TRUE",
+    "32": "FALSE",
+    "33": "FALSE",
+    "34": "FALSE",
+    "35": "FALSE",
+    "37": "FALSE",
+    "36": "FALSE",
+    "39": "FALSE",
+    "38": "FALSE",
+    "40": "FALSE",
+    "41": "FALSE",
+    "42": "FALSE",
+    "43": "FALSE",
+    "45": "FALSE",
+    "44": "FALSE",
+    "46": "FALSE",
+    "47": "FALSE",
+    "49": "FALSE",
+    "48": "FALSE",
+    "50": "TRUE",
+    "51": "TRUE",
+    "52": "TRUE",
+    "53": "FALSE",
+    "55": "FALSE",
+    "54": "TRUE",
+    "56": "TRUE",
+    "57": "FALSE",
+    "58": "FALSE",
+    "59": "FALSE",
+    "61": "FALSE",
+    "60": "FALSE",
+    "62": "FALSE",
+    "63": "FALSE",
+    "65": "TRUE",
+    "64": "FALSE",
+    "66": "TRUE",
+    "67": "TRUE",
+    "69": "UNSURE",
+    "68": "FALSE"
+   },
+   "accepted": {
+    "1": {
+     "chunk": "src:config.py:32-36",
+     "quote": "if isinstance(value, bool):\n        return value\n    return bool(value)"
+    },
+    "0": {
+     "chunk": "src:config.py:18-20",
+     "quote": "return parser.getfloat(\"defaults\", \"timeout\", fallback=30.0)"
+    },
+    "2": {
+     "chunk": "src:config.py:39-42",
+     "quote": "return [item for item in raw.split(\",\") if item]"
+    },
+    "3": {
+     "chunk": "src:paths.py:11-15",
+     "quote": "return child.startswith(parent)"
+    },
+    "4": {
+     "chunk": "src:paths.py:23-28",
+     "quote": "i = name.rfind(\".\")\n    if i <= 0:\n        return name, \"\"\n    return name[:i - 1], name[i:]"
+    },
+    "5": {
+     "chunk": "src:paths.py:31-38",
+     "quote": "with open(target, \"w\", encoding=\"utf-8\") as handle:\n        handle.write(text)\n    if not is_inside(target, root):\n        raise ValueError"
+    },
+    "6": {
+     "chunk": "src:store.py:44-46",
+     "quote": "def items(self):\n        \"\"\"A copy of the store's contents.\"\"\"\n        return dict(self._data)"
+    },
+    "7": {
+     "chunk": "src:store.py:15-26",
+     "quote": "except ValueError:\n            self._data = {}\n        except OSError as exc:\n            raise StoreError(str(exc)) from exc"
+    },
+    "8": {
+     "chunk": "src:store.py:33-35",
+     "quote": "return self._data.get(key) or default"
+    },
+    "9": {
+     "chunk": "src:store.py:40-42",
+     "quote": "del self._data[key]"
+    },
+    "10": {
+     "chunk": "src:pipeline.py:13-20",
+     "quote": "    except KeyError:\n        return None"
+    },
+    "11": {
+     "chunk": "src:pipeline.py:23-28",
+     "quote": "    if proc.returncode != 0:\n        return 0"
+    },
+    "13": {
+     "chunk": "src:pipeline.py:48-50",
+     "quote": "return sum(1 for i in range(1, len(steps)) if steps[i] is not None)"
+    },
+    "12": {
+     "chunk": "src:pipeline.py:42-45",
+     "quote": "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+    },
+    "15": {
+     "chunk": "src:gates.py:9-11",
+     "quote": "return [f for f in files if f not in declared]"
+    },
+    "14": {
+     "chunk": "src:gates.py:4-6",
+     "quote": "return proc.returncode in (0, 5)"
+    },
+    "16": {
+     "chunk": "src:gates.py:19-24",
+     "quote": "apply(changes)\n    if not allowed:\n        return False\n    return True"
+    },
+    "17": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "while True:\n        try:\n            return fn()\n        except Exception:\n            attempt += 1\n            sleep(backoff(attempt, delay))"
+    },
+    "19": {
+     "chunk": "src:retry.py:10-13",
+     "quote": "return \"timeout\" in text or \"reset\" in text"
+    },
+    "18": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "except Exception:"
+    },
+    "21": {
+     "chunk": "src:config.py:10-15",
+     "quote": "handle = open(path, encoding=\"utf-8\")\n    parser.read_file(handle)\n    return parser"
+    },
+    "20": {
+     "chunk": "src:config.py:23-29",
+     "quote": "try:\n        return int(raw)\n    except ValueError:\n        return 0"
+    },
+    "22": {
+     "chunk": "src:paths.py:18-20",
+     "quote": "def safe_join(root, name):\n    \"\"\"*name* joined under *root*.\"\"\"\n    return os.path.join(root, name)"
+    },
+    "23": {
+     "chunk": "src:store.py:28-31",
+     "quote": "def save(self):\n        \"\"\"Write the whole store back.\"\"\"\n        with open(self.path, \"w\", encoding=\"utf-8\") as handle:\n            handle.write(json.dumps(self._data, ensure_ascii=False)"
+    },
+    "24": {
+     "chunk": "src:pipeline.py:31-39",
+     "quote": "for step in steps:\n        try:\n            results.append(run_step(step, context))\n        except StepError:\n            break\n    return results"
+    },
+    "25": {
+     "chunk": "src:pipeline.py:53-54",
+     "quote": "def log_step(name, status):\n    print(f\"{name}: {status}\")"
+    },
+    "26": {
+     "chunk": "src:gates.py:14-16",
+     "quote": "return abs(added) + abs(deleted) <= limit"
+    },
+    "27": {
+     "chunk": "src:gates.py:27-31",
+     "quote": "if rerun(failed_ids) == 0:\n        return f\"PASS*{bad}\"\n    return f\"{bad}x\""
+    },
+    "29": {
+     "chunk": "src:retry.py:32-37",
+     "quote": "result = fn()\n    if clock() > deadline:\n        raise TimeoutError(\"deadline passed\")\n    return result"
+    },
+    "28": {
+     "chunk": "src:retry.py:16-18",
+     "quote": "return base * 2 ** attempt"
+    },
+    "31": {
+     "chunk": "src:paths.py:6-8",
+     "quote": "return path.lower().rstrip(\"/\")"
+    },
+    "30": {
+     "chunk": "src:paths.py:6-8",
+     "quote": "return path.lower().rstrip(\"/\")"
+    },
+    "32": {
+     "chunk": "src:store.py:28-31",
+     "quote": "handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")"
+    },
+    "33": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "sleep(backoff(attempt, delay))"
+    },
+    "34": {
+     "chunk": "src:config.py:18-20",
+     "quote": "return parser.getfloat(\"defaults\", \"timeout\", fallback=30.0)"
+    },
+    "35": {
+     "chunk": "src:config.py:45-47",
+     "quote": "return parser.get(\"pipeline\", \"name\", fallback=\"pipeline\")"
+    },
+    "37": {
+     "chunk": "src:paths.py:11-15",
+     "quote": "child = os.path.abspath(child)"
+    },
+    "36": {
+     "chunk": "src:config.py:39-42",
+     "quote": "raw.split(\",\")"
+    },
+    "39": {
+     "chunk": "src:paths.py:41-43",
+     "quote": "return sorted(n for n in os.listdir(norm_path(root)) if n.endswith(\".marker\"))"
+    },
+    "38": {
+     "chunk": "src:paths.py:23-28",
+     "quote": "if i <= 0:\n        return name, \"\""
+    },
+    "40": {
+     "chunk": "src:store.py:15-26",
+     "quote": "except FileNotFoundError:\n            self._data = {}"
+    },
+    "41": {
+     "chunk": "src:store.py:37-38",
+     "quote": "self._data[key] = value"
+    },
+    "42": {
+     "chunk": "src:store.py:48-49",
+     "quote": "def __len__(self):\n        return len(self._data)"
+    },
+    "43": {
+     "chunk": "src:pipeline.py:23-28",
+     "quote": "proc = subprocess.run(argv, cwd=norm_path(cwd), capture_output=True, check=False)"
+    },
+    "45": {
+     "chunk": "src:pipeline.py:42-45",
+     "quote": "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+    },
+    "44": {
+     "chunk": "src:pipeline.py:13-20",
+     "quote": "return step(context)\n    except KeyError:\n        return None\n    except Exception as exc:\n        raise StepError(str(exc)) from exc"
+    },
+    "46": {
+     "chunk": "src:gates.py:4-6",
+     "quote": "return proc.returncode in (0, 5)"
+    },
+    "47": {
+     "chunk": "src:gates.py:34-35",
+     "quote": "return f\"{name}: {'ok' if ok else 'FAIL'}\""
+    },
+    "49": {
+     "chunk": "src:retry.py:32-37",
+     "quote": "def with_deadline(fn, deadline, clock=time.monotonic):"
+    },
+    "48": {
+     "chunk": "src:retry.py:16-18",
+     "quote": "def backoff(attempt, base=0.5):"
+    },
+    "50": {
+     "chunk": "src:pipeline.py:23-28",
+     "quote": "proc = subprocess.run(argv, cwd=norm_path(cwd), capture_output=True, check=False)"
+    },
+    "51": {
+     "chunk": "src:pipeline.py:42-45",
+     "quote": "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+    },
+    "52": {
+     "chunk": "src:store.py:28-31",
+     "quote": "handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")"
+    },
+    "53": {
+     "chunk": "src:config.py:10-15",
+     "quote": "parser = configparser.ConfigParser()"
+    },
+    "55": {
+     "chunk": "src:gates.py:4-6",
+     "quote": "return proc.returncode in (0, 5)"
+    },
+    "54": {
+     "chunk": "src:paths.py:23-28",
+     "quote": "i = name.rfind(\".\")"
+    },
+    "56": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "def retry_call(fn, delay=0.5, sleep=time.sleep):"
+    },
+    "57": {
+     "chunk": "src:store.py:44-46",
+     "quote": "return dict(self._data)"
+    },
+    "58": {
+     "chunk": "note:dangling:scheduler.py",
+     "quote": "`scheduler.py` does not exist at d36d59e; no file of that name is in the repository."
+    },
+    "59": {
+     "chunk": "note:dangling:Store.compact",
+     "quote": "`Store.compact` does not exist at d36d59e; the file `store.py` exists and defines: `StoreError`, `Store`; `Store` has: `__init__`, `load`, `save`, `get`, `put`, `delete`, `items`, `__len__`."
+    },
+    "61": {
+     "chunk": "note:dangling:retry.retry_async",
+     "quote": "`retry.retry_async` does not exist at d36d59e; the file `retry.py` exists and defines: `TransientError`, `is_transient`, `backoff`, `retry_call`, `with_deadline`."
+    },
+    "60": {
+     "chunk": "note:dangling:gates.check_coverage",
+     "quote": "`gates.check_coverage` does not exist at d36d59e; the file `gates.py` exists and defines: `check_exit`, `gate_paths`, `gate_size`, `run_gate`, `gate_flaky`, `summary_line`."
+    },
+    "62": {
+     "chunk": "note:dangling:config.load_profile",
+     "quote": "`config.load_profile` does not exist at d36d59e; the file `config.py` exists and defines: `read_config`, `load_timeout`, `load_workers`, `parse_bool`, `get_list`, `load_name`."
+    },
+    "63": {
+     "chunk": "note:dangling:paths.expand_user",
+     "quote": "`paths.expand_user` does not exist at d36d59e; the file `paths.py` exists and defines: `norm_path`, `is_inside`, `safe_join`, `split_ext`, `write_marker`, `marker_names`."
+    },
+    "65": {
+     "chunk": "ticket:epic-tasks/02-store-get.md",
+     "quote": "**File:** `store.py`"
+    },
+    "64": {
+     "chunk": "ticket:epic-tasks/01-store-errors.md",
+     "quote": "**Status:** open"
+    },
+    "66": {
+     "chunk": "src:epic-tasks/03-retry-bound.md:1-6",
+     "quote": "**Status:** done"
+    },
+    "67": {
+     "chunk": "git:d36d59e:header",
+     "quote": "create mode 100644 retry.py"
+    },
+    "68": {
+     "chunk": "git:d36d59e:header",
+     "quote": "9 files changed, 283 insertions(+)"
+    }
+   },
+   "rejected": [
+    {
+     "claim": 69,
+     "verdict": "TRUE",
+     "chunk": "git:d36d59e:header",
+     "quote": "    fixture: base",
+     "reason": "chunk_not_in_pack"
+    }
+   ]
+  },
+  {
+   "model": "kenary/mimo-v2-6-flash:free",
+   "run": 0,
+   "votes": {
+    "1": "UNSURE",
+    "0": "UNSURE",
+    "2": "TRUE",
+    "3": "TRUE",
+    "4": "TRUE",
+    "5": "TRUE",
+    "6": "TRUE",
+    "7": "UNSURE",
+    "8": "TRUE",
+    "9": "TRUE",
+    "10": "TRUE",
+    "11": "TRUE",
+    "13": "TRUE",
+    "12": "TRUE",
+    "15": "TRUE",
+    "14": "TRUE",
+    "16": "TRUE",
+    "17": "TRUE",
+    "19": "TRUE",
+    "18": "TRUE",
+    "21": "TRUE",
+    "20": "TRUE",
+    "22": "TRUE",
+    "23": "TRUE",
+    "24": "TRUE",
+    "25": "TRUE",
+    "29": "TRUE",
+    "28": "TRUE",
+    "31": "TRUE",
+    "30": "TRUE",
+    "32": "FALSE",
+    "33": "UNSURE",
+    "34": "FALSE",
+    "35": "FALSE",
+    "37": "FALSE",
+    "36": "FALSE",
+    "39": "FALSE",
+    "38": "FALSE",
+    "40": "FALSE",
+    "41": "FALSE",
+    "42": "FALSE",
+    "43": "FALSE",
+    "45": "FALSE",
+    "44": "FALSE",
+    "46": "FALSE",
+    "47": "FALSE",
+    "49": "FALSE",
+    "48": "FALSE",
+    "50": "TRUE",
+    "51": "TRUE",
+    "52": "UNSURE",
+    "53": "UNSURE",
+    "55": "FALSE",
+    "54": "TRUE",
+    "56": "TRUE",
+    "57": "FALSE",
+    "58": "FALSE",
+    "59": "FALSE",
+    "61": "FALSE",
+    "60": "FALSE",
+    "62": "FALSE",
+    "63": "FALSE",
+    "65": "TRUE",
+    "64": "FALSE",
+    "66": "TRUE",
+    "67": "TRUE",
+    "69": "UNSURE",
+    "68": "FALSE"
+   },
+   "accepted": {
+    "2": {
+     "chunk": "src:config.py:39-42",
+     "quote": "def get_list(parser, key):\n    \"\"\"A comma-separated list from ``[pipeline]``.\"\"\"\n    raw = parser.get(\"pipeline\", key, fallback=\"\")\n    return [item for item in raw.split(\",\") if item]"
+    },
+    "3": {
+     "chunk": "src:paths.py:11-15",
+     "quote": "    child = os.path.abspath(child)\n    parent = os.path.abspath(parent)\n    return child.startswith(parent)"
+    },
+    "4": {
+     "chunk": "src:paths.py:23-28",
+     "quote": " 28|     return name[:i - 1], name[i:]"
+    },
+    "5": {
+     "chunk": "src:paths.py:31-38",
+     "quote": " 34|     with open(target, \"w\", encoding=\"utf-8\") as handle:\n 35|         handle.write(text)\n 36|     if not is_inside(target, root):"
+    },
+    "6": {
+     "chunk": "src:store.py:44-46",
+     "quote": "return dict(self._data)"
+    },
+    "8": {
+     "chunk": "src:store.py:33-35",
+     "quote": "return self._data.get(key) or default"
+    },
+    "9": {
+     "chunk": "src:store.py:40-42",
+     "quote": "del self._data[key]"
+    },
+    "10": {
+     "chunk": "src:pipeline.py:13-20",
+     "quote": "    except KeyError:\n        return None"
+    },
+    "11": {
+     "chunk": "src:pipeline.py:23-28",
+     "quote": "    if proc.returncode != 0:\n        return 0"
+    },
+    "13": {
+     "chunk": "src:pipeline.py:48-50",
+     "quote": "return sum(1 for i in range(1, len(steps)) if steps[i] is not None)"
+    },
+    "12": {
+     "chunk": "src:pipeline.py:42-45",
+     "quote": "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)\n    return m.group(1).split() if m else []"
+    },
+    "15": {
+     "chunk": "src:gates.py:9-11",
+     "quote": "return [f for f in files if f not in declared]"
+    },
+    "14": {
+     "chunk": "src:gates.py:4-6",
+     "quote": "return proc.returncode in (0, 5)"
+    },
+    "16": {
+     "chunk": "src:gates.py:19-24",
+     "quote": "    apply(changes)\n    if not allowed:\n        return False\n    return True"
+    },
+    "17": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "    attempt = 0\n    while True:\n        try:\n            return fn()\n        except Exception:\n            attempt += 1\n            sleep(backoff(attempt, delay))"
+    },
+    "19": {
+     "chunk": "src:retry.py:10-13",
+     "quote": "    text = str(exc)\n    return \"timeout\" in text or \"reset\" in text"
+    },
+    "18": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "        except Exception:\n            attempt += 1"
+    },
+    "21": {
+     "chunk": "src:config.py:10-15",
+     "quote": "    parser = configparser.ConfigParser()\n    handle = open(path, encoding=\"utf-8\")\n    parser.read_file(handle)\n    return parser"
+    },
+    "20": {
+     "chunk": "src:config.py:23-29",
+     "quote": "    try:\n        return int(raw)\n    except ValueError:\n        return 0"
+    },
+    "22": {
+     "chunk": "src:paths.py:18-20",
+     "quote": "return os.path.join(root, name)"
+    },
+    "23": {
+     "chunk": "src:store.py:28-31",
+     "quote": "with open(self.path, \"w\", encoding=\"utf-8\") as handle:"
+    },
+    "24": {
+     "chunk": "src:pipeline.py:31-39",
+     "quote": "stopping at the first failure.\""
+    },
+    "25": {
+     "chunk": "src:pipeline.py:53-54",
+     "quote": "print(f\"{name}: {status}\")"
+    },
+    "29": {
+     "chunk": "src:retry.py:32-37",
+     "quote": "    result = fn()\n    if clock() > deadline:\n        raise TimeoutError(\"deadline passed\")\n    return result"
+    },
+    "28": {
+     "chunk": "src:retry.py:16-18",
+     "quote": "def backoff(attempt, base=0.5):\n    \"\"\"Seconds to wait before attempt number *attempt*.\"\"\"\n    return base * 2 ** attempt"
+    },
+    "31": {
+     "chunk": "src:paths.py:6-8",
+     "quote": "    return path.lower().rstrip(\"/\")"
+    },
+    "30": {
+     "chunk": "src:paths.py:6-8",
+     "quote": "    return path.lower().rstrip(\"/\")"
+    },
+    "32": {
+     "chunk": "src:store.py:28-31",
+     "quote": "handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")"
+    },
+    "34": {
+     "chunk": "src:config.py:18-20",
+     "quote": "return parser.getfloat(\"defaults\", \"timeout\", fallback=30.0)"
+    },
+    "35": {
+     "chunk": "src:config.py:45-47",
+     "quote": "return parser.get(\"pipeline\", \"name\", fallback=\"pipeline\")"
+    },
+    "37": {
+     "chunk": "src:paths.py:11-15",
+     "quote": "    child = os.path.abspath(child)\n    parent = os.path.abspath(parent)"
+    },
+    "36": {
+     "chunk": "src:config.py:39-42",
+     "quote": "    return [item for item in raw.split(\",\") if item]"
+    },
+    "39": {
+     "chunk": "src:paths.py:41-43",
+     "quote": "return sorted(n for n in os.listdir(norm_path(root)) if n.endswith(\".marker\"))"
+    },
+    "38": {
+     "chunk": "src:paths.py:23-28",
+     "quote": "i = name.rfind(\".\")\n    if i <= 0:\n        return name, \"\""
+    },
+    "40": {
+     "chunk": "src:store.py:15-26",
+     "quote": "        except FileNotFoundError:\n            self._data = {}"
+    },
+    "41": {
+     "chunk": "src:store.py:37-38",
+     "quote": "    def put(self, key, value):\n        self._data[key] = value"
+    },
+    "42": {
+     "chunk": "src:store.py:48-49",
+     "quote": "     def __len__(self):\n         return len(self._data)"
+    },
+    "43": {
+     "chunk": "src:pipeline.py:23-28",
+     "quote": "proc = subprocess.run(argv, cwd=norm_path(cwd), capture_output=True, check=False)"
+    },
+    "45": {
+     "chunk": "src:pipeline.py:42-45",
+     "quote": "     m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)\n     return m.group(1).split() if m else []"
+    },
+    "44": {
+     "chunk": "src:pipeline.py:13-20",
+     "quote": "    try:\n        return step(context)\n    except KeyError:\n        return None\n    except Exception as exc:\n        raise StepError(str(exc)) from exc"
+    },
+    "46": {
+     "chunk": "src:gates.py:4-6",
+     "quote": "return proc.returncode in (0, 5)"
+    },
+    "47": {
+     "chunk": "src:gates.py:34-35",
+     "quote": "return f\"{name}: {'ok' if ok else 'FAIL'}\""
+    },
+    "49": {
+     "chunk": "src:retry.py:32-37",
+     "quote": "def with_deadline(fn, deadline, clock=time.monotonic):"
+    },
+    "48": {
+     "chunk": "src:retry.py:16-18",
+     "quote": "def backoff(attempt, base=0.5):"
+    },
+    "50": {
+     "chunk": "src:pipeline.py:23-28",
+     "quote": "proc = subprocess.run(argv, cwd=norm_path(cwd), capture_output=True, check=False)"
+    },
+    "51": {
+     "chunk": "src:pipeline.py:42-45",
+     "quote": "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+    },
+    "55": {
+     "chunk": "src:gates.py:4-6",
+     "quote": "return proc.returncode in (0, 5)"
+    },
+    "54": {
+     "chunk": "src:paths.py:23-28",
+     "quote": "i = name.rfind(\".\")"
+    },
+    "56": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "def retry_call(fn, delay=0.5, sleep=time.sleep):"
+    },
+    "57": {
+     "chunk": "src:store.py:44-46",
+     "quote": "return dict(self._data)"
+    },
+    "58": {
+     "chunk": "note:dangling:scheduler.py",
+     "quote": "`scheduler.py` does not exist at d36d59e; no file of that name is in the repository."
+    },
+    "59": {
+     "chunk": "note:dangling:Store.compact",
+     "quote": "`Store.compact` does not exist at d36d59e; the file `store.py` exists and defines: `StoreError`, `Store`; `Store` has: `__init__`,"
+    },
+    "61": {
+     "chunk": "note:dangling:retry.retry_async",
+     "quote": "`retry.retry_async` does not exist at d36d59e; the file `retry.py` exists and defines: `TransientError`, `is_transient`, `backoff`, `retry_call`, `with_deadline`."
+    },
+    "60": {
+     "chunk": "note:dangling:gates.check_coverage",
+     "quote": "`gates.check_coverage` does not exist at d36d59e; the file `gates.py` exists and defines: `check_exit`, `gate_paths`, `gate_size`, `run_gate`, `gate_flaky`, `summary_line`."
+    },
+    "62": {
+     "chunk": "note:dangling:config.load_profile",
+     "quote": "`config.load_profile` does not exist at d36d59e; the file `config.py` exists and defines: `read_config`, `load_timeout`"
+    },
+    "63": {
+     "chunk": "note:dangling:paths.expand_user",
+     "quote": "`paths.expand_user` does not exist at d36d59e; the file `paths.py` exists and defines: `norm_path`, `is_inside`, `safe_joi"
+    },
+    "65": {
+     "chunk": "src:epic-tasks/02-store-get.md:1-6",
+     "quote": "**File:** `store.py`"
+    },
+    "64": {
+     "chunk": "src:epic-tasks/01-store-errors.md:1-6",
+     "quote": "**Status:** open"
+    },
+    "66": {
+     "chunk": "src:epic-tasks/03-retry-bound.md:1-6",
+     "quote": "**Status:** done"
+    },
+    "67": {
+     "chunk": "git:d36d59e:retry.py:1-37",
+     "quote": "diff --git a/retry.py b/retry.py\nnew file mode 100644"
+    },
+    "68": {
+     "chunk": "git:d36d59e:header",
+     "quote": " 9 files changed, 283 insertions(+)"
+    }
+   },
+   "rejected": [
+    {
+     "claim": 1,
+     "verdict": "TRUE",
+     "chunk": "src:config.py:36",
+     "quote": "    return bool(value)",
+     "reason": "chunk_not_in_pack"
+    },
+    {
+     "claim": 0,
+     "verdict": "TRUE",
+     "chunk": "src:config.py:20",
+     "quote": "    return parser.getfloat(\"defaults\", \"timeout\", fallback=30.0)",
+     "reason": "chunk_not_in_pack"
+    },
+    {
+     "claim": 7,
+     "verdict": "TRUE",
+     "chunk": "src:store.py:22-23",
+     "quote": "        except ValueError:\n            self._data = {}",
+     "reason": "chunk_not_in_pack"
+    },
+    {
+     "claim": 52,
+     "verdict": "TRUE",
+     "chunk": "src:store.py:31",
+     "quote": "handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")",
+     "reason": "chunk_not_in_pack"
+    },
+    {
+     "claim": 53,
+     "verdict": "FALSE",
+     "chunk": "src:config.py:12",
+     "quote": "parser = configparser.ConfigParser()",
+     "reason": "chunk_not_in_pack"
+    },
+    {
+     "claim": 69,
+     "verdict": "TRUE",
+     "chunk": "git:d36d59e:header",
+     "quote": "    fixture: base",
+     "reason": "chunk_not_in_pack"
+    }
+   ]
+  },
+  {
+   "model": "kenary/nemotron-3-ultra-550b-a55b:free",
+   "run": 0,
+   "votes": {
+    "1": "TRUE",
+    "0": "TRUE",
+    "2": "TRUE",
+    "3": "TRUE",
+    "4": "TRUE",
+    "5": "TRUE",
+    "6": "TRUE",
+    "7": "TRUE",
+    "8": "TRUE",
+    "9": "TRUE",
+    "10": "TRUE",
+    "11": "TRUE",
+    "13": "TRUE",
+    "12": "TRUE",
+    "15": "TRUE",
+    "14": "TRUE",
+    "16": "TRUE",
+    "17": "TRUE",
+    "19": "TRUE",
+    "18": "TRUE",
+    "21": "TRUE",
+    "20": "TRUE",
+    "22": "TRUE",
+    "23": "TRUE",
+    "24": "TRUE",
+    "25": "TRUE",
+    "26": "TRUE",
+    "27": "TRUE",
+    "29": "TRUE",
+    "28": "TRUE",
+    "31": "TRUE",
+    "30": "TRUE",
+    "32": "FALSE",
+    "33": "UNSURE",
+    "34": "FALSE",
+    "35": "FALSE",
+    "37": "FALSE",
+    "36": "FALSE",
+    "39": "FALSE",
+    "38": "FALSE",
+    "40": "FALSE",
+    "41": "FALSE",
+    "42": "FALSE",
+    "43": "FALSE",
+    "45": "FALSE",
+    "44": "FALSE",
+    "46": "FALSE",
+    "47": "FALSE",
+    "49": "FALSE",
+    "48": "FALSE",
+    "50": "TRUE",
+    "51": "TRUE",
+    "52": "TRUE",
+    "53": "FALSE",
+    "55": "FALSE",
+    "54": "TRUE",
+    "56": "TRUE",
+    "57": "FALSE",
+    "58": "FALSE",
+    "59": "FALSE",
+    "61": "FALSE",
+    "60": "FALSE",
+    "62": "FALSE",
+    "63": "FALSE",
+    "65": "TRUE",
+    "64": "FALSE",
+    "66": "TRUE",
+    "67": "TRUE",
+    "69": "UNSURE",
+    "68": "FALSE"
+   },
+   "accepted": {
+    "1": {
+     "chunk": "src:config.py:32-36",
+     "quote": "    return bool(value)"
+    },
+    "0": {
+     "chunk": "src:config.py:18-20",
+     "quote": "    return parser.getfloat(\"defaults\", \"timeout\", fallback=30.0)"
+    },
+    "2": {
+     "chunk": "src:config.py:39-42",
+     "quote": "    return [item for item in raw.split(\",\") if item]"
+    },
+    "3": {
+     "chunk": "src:paths.py:11-15",
+     "quote": "    return child.startswith(parent)"
+    },
+    "4": {
+     "chunk": "src:paths.py:23-28",
+     "quote": "    i = name.rfind(\".\")\n    if i <= 0:\n        return name, \"\"\n    return name[:i - 1], name[i:]"
+    },
+    "5": {
+     "chunk": "src:paths.py:31-38",
+     "quote": "    target = safe_join(root, name)\n    with open(target, \"w\", encoding=\"utf-8\") as handle:\n        handle.write(text)\n    if not is_inside(target, root):\n        raise ValueError(f\"{name} is outside {root}\")"
+    },
+    "6": {
+     "chunk": "src:store.py:44-46",
+     "quote": "    def items(self):\n        \"\"\"A copy of the store's contents.\"\"\"\n        return dict(self._data)"
+    },
+    "7": {
+     "chunk": "src:store.py:15-26",
+     "quote": "    def load(self):\n        \"\"\"Read the file; a missing file is an empty store.\"\"\"\n        try:\n            with open(self.path, encoding=\"utf-8\") as handle:\n                self._data = json.load(handle)\n        except FileNotFoundError:\n            self._data = {}\n        except ValueError:\n            self._data = {}"
+    },
+    "8": {
+     "chunk": "src:store.py:33-35",
+     "quote": "        return self._data.get(key) or default"
+    },
+    "9": {
+     "chunk": "src:store.py:40-42",
+     "quote": "        del self._data[key]"
+    },
+    "10": {
+     "chunk": "src:pipeline.py:13-20",
+     "quote": "    except KeyError:\n        return None"
+    },
+    "11": {
+     "chunk": "src:pipeline.py:23-28",
+     "quote": "    if proc.returncode != 0:\n        return 0"
+    },
+    "13": {
+     "chunk": "src:pipeline.py:48-50",
+     "quote": "    return sum(1 for i in range(1, len(steps)) if steps[i] is not None)"
+    },
+    "12": {
+     "chunk": "src:pipeline.py:42-45",
+     "quote": "    m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+    },
+    "15": {
+     "chunk": "src:gates.py:9-11",
+     "quote": "def gate_paths(files, declared):\n    \"\"\"The changed files that are not declared.\"\"\"\n    return [f for f in files if f not in declared]"
+    },
+    "14": {
+     "chunk": "src:gates.py:4-6",
+     "quote": "def check_exit(proc):\n    \"\"\"True when the test run passed.\"\"\"\n    return proc.returncode in (0, 5)"
+    },
+    "16": {
+     "chunk": "src:gates.py:19-24",
+     "quote": "    apply(changes)\n    if not allowed:"
+    },
+    "17": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "    while True:\n        try:\n            return fn()\n        except Exception:\n            attempt += 1\n            sleep(backoff(attempt, delay))"
+    },
+    "19": {
+     "chunk": "src:retry.py:10-13",
+     "quote": "def is_transient(exc):\n    \"\"\"True for a timeout or a connection reset.\"\"\"\n    text = str(exc)\n    return \"timeout\" in text or \"reset\" in text"
+    },
+    "18": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "def retry_call(fn, delay=0.5, sleep=time.sleep):\n    \"\"\"Call *fn* until it succeeds.\"\"\"\n    attempt = 0\n    while True:\n        try:\n            return fn()\n        except Exception:\n            attempt += 1\n            sleep(backoff(attempt, delay))"
+    },
+    "21": {
+     "chunk": "src:config.py:10-15",
+     "quote": "    handle = open(path, encoding=\"utf-8\")\n    parser.read_file(handle)\n    return parser"
+    },
+    "20": {
+     "chunk": "src:config.py:23-29",
+     "quote": "    try:\n        return int(raw)\n    except ValueError:\n        return 0"
+    },
+    "22": {
+     "chunk": "src:paths.py:18-20",
+     "quote": "def safe_join(root, name):\n    \"\"\"*name* joined under *root*.\"\"\"\n    return os.path.join(root, name)"
+    },
+    "23": {
+     "chunk": "src:store.py:28-31",
+     "quote": "    def save(self):\n        \"\"\"Write the whole store back.\"\"\"\n        with open(self.path, \"w\", encoding=\"utf-8\") as handle:\n            handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")"
+    },
+    "24": {
+     "chunk": "src:pipeline.py:31-39",
+     "quote": "def run_all(steps, context):\n    \"\"\"Run *steps* in order; the results, stopping at the first failure.\"\"\"\n    results = []\n    for step in steps:\n        try:\n            results.append(run_step(step, context))\n        except StepError:\n            break"
+    },
+    "25": {
+     "chunk": "src:pipeline.py:53-54",
+     "quote": "def log_step(name, status):\n    print(f\"{name}: {status}\")"
+    },
+    "26": {
+     "chunk": "src:gates.py:14-16",
+     "quote": "    return abs(added) + abs(deleted) <= limit"
+    },
+    "27": {
+     "chunk": "src:gates.py:27-31",
+     "quote": "    if rerun(failed_ids) == 0:\n        return f\"PASS*{bad}\""
+    },
+    "29": {
+     "chunk": "src:retry.py:32-37",
+     "quote": "def with_deadline(fn, deadline, clock=time.monotonic):\n    \"\"\"Call *fn*; raise TimeoutError when *deadline* has passed.\"\"\"\n    result = fn()\n    if clock() > deadline:\n        raise TimeoutError(\"deadline passed\")\n    return result"
+    },
+    "28": {
+     "chunk": "src:retry.py:16-18",
+     "quote": "def backoff(attempt, base=0.5):\n    \"\"\"Seconds to wait before attempt number *attempt*.\"\"\"\n    return base * 2 ** attempt"
+    },
+    "31": {
+     "chunk": "src:paths.py:6-8",
+     "quote": "return path.lower().rstrip(\"/\")"
+    },
+    "30": {
+     "chunk": "src:paths.py:6-8",
+     "quote": "return path.lower().rstrip(\"/\")"
+    },
+    "32": {
+     "chunk": "src:store.py:28-31",
+     "quote": "handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")"
+    },
+    "34": {
+     "chunk": "src:config.py:18-20",
+     "quote": "return parser.getfloat(\"defaults\", \"timeout\", fallback=30.0)"
+    },
+    "35": {
+     "chunk": "src:config.py:45-47",
+     "quote": "return parser.get(\"pipeline\", \"name\", fallback=\"pipeline\")"
+    },
+    "37": {
+     "chunk": "src:paths.py:11-15",
+     "quote": "    child = os.path.abspath(child)\n    parent = os.path.abspath(parent)"
+    },
+    "36": {
+     "chunk": "src:config.py:39-42",
+     "quote": "    return [item for item in raw.split(\",\") if item]"
+    },
+    "39": {
+     "chunk": "src:paths.py:41-43",
+     "quote": "def marker_names(root):\n    \"\"\"The marker files under *root*, sorted.\"\"\"\n    return sorted(n for n in os.listdir(norm_path(root)) if n.endswith(\".marker\"))"
+    },
+    "38": {
+     "chunk": "src:paths.py:23-28",
+     "quote": "def split_ext(name):\n    \"\"\"``(stem, ext)`` of a file name; ext keeps its dot.\"\"\"\n    i = name.rfind(\".\")\n    if i <= 0:\n        return name, \"\"\n    return name[:i - 1], name[i:]"
+    },
+    "40": {
+     "chunk": "src:store.py:15-26",
+     "quote": "        \"\"\"Read the file; a missing file is an empty store.\"\"\"\n        try:\n            with open(self.path, encoding=\"utf-8\") as handle:\n                self._data = json.load(handle)\n        except FileNotFoundError:\n            self._data = {}"
+    },
+    "41": {
+     "chunk": "src:store.py:37-38",
+     "quote": "    def put(self, key, value):\n        self._data[key] = value"
+    },
+    "42": {
+     "chunk": "src:store.py:48-49",
+     "quote": "    def __len__(self):\n        return len(self._data)"
+    },
+    "43": {
+     "chunk": "src:pipeline.py:23-28",
+     "quote": "    proc = subprocess.run(argv, cwd=norm_path(cwd), capture_output=True, check=False)\n    if proc.returncode != 0:\n        return 0"
+    },
+    "45": {
+     "chunk": "src:pipeline.py:42-45",
+     "quote": "def parse_header(text):\n    \"\"\"The ``Files:`` field of a step header, as a list of names.\"\"\"\n    m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+    },
+    "44": {
+     "chunk": "src:pipeline.py:13-20",
+     "quote": "def run_step(step, context):\n    \"\"\"Call *step* with *context*; a failing step raises StepError.\"\"\"\n    try:\n        return step(context)\n    except KeyError:\n        return None\n    except Exception as exc:\n        raise StepError(str(exc)) from exc"
+    },
+    "46": {
+     "chunk": "src:gates.py:4-6",
+     "quote": "def check_exit(proc):\n    \"\"\"True when the test run passed.\"\"\"\n    return proc.returncode in (0, 5)"
+    },
+    "47": {
+     "chunk": "src:gates.py:34-35",
+     "quote": "def summary_line(name, ok):\n    return f\"{name}: {'ok' if ok else 'FAIL'}\""
+    },
+    "49": {
+     "chunk": "src:retry.py:32-37",
+     "quote": "def with_deadline(fn, deadline, clock=time.monotonic):"
+    },
+    "48": {
+     "chunk": "src:retry.py:16-18",
+     "quote": "def backoff(attempt, base=0.5):"
+    },
+    "50": {
+     "chunk": "src:pipeline.py:23-28",
+     "quote": "proc = subprocess.run(argv, cwd=norm_path(cwd), capture_output=True, check=False)"
+    },
+    "51": {
+     "chunk": "src:pipeline.py:42-45",
+     "quote": "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+    },
+    "52": {
+     "chunk": "src:store.py:28-31",
+     "quote": "handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")"
+    },
+    "53": {
+     "chunk": "src:config.py:10-15",
+     "quote": "parser = configparser.ConfigParser()"
+    },
+    "55": {
+     "chunk": "src:gates.py:4-6",
+     "quote": "def check_exit(proc):\n    \"\"\"True when the test run passed.\"\"\"\n    return proc.returncode in (0, 5)"
+    },
+    "54": {
+     "chunk": "src:paths.py:23-28",
+     "quote": "def split_ext(name):\n    \"\"\"``(stem, ext)`` of a file name; ext keeps its dot.\"\"\"\n    i = name.rfind(\".\")"
+    },
+    "56": {
+     "chunk": "src:retry.py:21-29",
+     "quote": "def retry_call(fn, delay=0.5, sleep=time.sleep):"
+    },
+    "57": {
+     "chunk": "src:store.py:44-46",
+     "quote": "    def items(self):\n        \"\"\"A copy of the store's contents.\"\"\"\n        return dict(self._data)"
+    },
+    "58": {
+     "chunk": "note:dangling:scheduler.py",
+     "quote": "`scheduler.py` does not exist at d36d59e; no file of that name is in the repository."
+    },
+    "59": {
+     "chunk": "note:dangling:Store.compact",
+     "quote": "`Store.compact` does not exist at d36d59e; the file `store.py` exists and defines: `StoreError`, `Store`; `Store` has: `__init__`, `load`, `save`, `get`, `put`, `delete`, `items`, `__len__`."
+    },
+    "61": {
+     "chunk": "note:dangling:retry.retry_async",
+     "quote": "`retry.retry_async` does not exist at d36d59e; the file `retry.py` exists and defines: `TransientError`, `is_transient`, `backoff`, `retry_call`, `with_deadline`."
+    },
+    "60": {
+     "chunk": "note:dangling:gates.check_coverage",
+     "quote": "`gates.check_coverage` does not exist at d36d59e; the file `gates.py` exists and defines: `check_exit`, `gate_paths`, `gate_size`, `run_gate`, `gate_flaky`, `summary_line`."
+    },
+    "62": {
+     "chunk": "note:dangling:config.load_profile",
+     "quote": "`config.load_profile` does not exist at d36d59e; the file `config.py` exists and defines: `read_config`, `load_timeout`, `load_workers`, `parse_bool`, `get_list`, `load_name`."
+    },
+    "63": {
+     "chunk": "note:dangling:paths.expand_user",
+     "quote": "`paths.expand_user` does not exist at d36d59e; the file `paths.py` exists and defines: `norm_path`, `is_inside`, `safe_join`, `split_ext`, `write_marker`, `marker_names`."
+    },
+    "65": {
+     "chunk": "src:epic-tasks/02-store-get.md:1-6",
+     "quote": "**File:** `store.py`"
+    },
+    "64": {
+     "chunk": "src:epic-tasks/01-store-errors.md:1-6",
+     "quote": "**Status:** open"
+    },
+    "66": {
+     "chunk": "src:epic-tasks/03-retry-bound.md:1-6",
+     "quote": "**Status:** done"
+    },
+    "67": {
+     "chunk": "git:d36d59e:header",
+     "quote": "create mode 100644 retry.py"
+    },
+    "68": {
+     "chunk": "git:d36d59e:header",
+     "quote": " 9 files changed, 283 insertions(+)\n create mode 100644 config.py\n create mode 100644 epic-tasks/01-store-errors.md\n create mode 100644 epic-tasks/02-store-get.md\n create mode 100644 epic-tasks/03-retry-bound.md\n create mode 100644 gates.py\n create mode 100644 paths.py\n create mode 100644 pipeline.py\n create mode 100644 retry.py\n create mode 100644 store.py"
+    }
+   },
+   "rejected": [
+    {
+     "claim": 69,
+     "verdict": "TRUE",
+     "chunk": "git:d36d59e:header",
+     "quote": "    fixture: base",
+     "reason": "chunk_not_in_pack"
+    }
+   ]
+  }
+ ],
+ "claims": [
+  {
+   "id": "f001",
+   "claim": "`config.load_timeout` reads `timeout` from the `[defaults]` section, not from `[pipeline]`.",
+   "truth": true,
+   "verdict": "UNSURE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": false,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "UNSURE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 2,
+    "UNSURE": 1
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:config.py:18-20"
+   ],
+   "quotes": [
+    "return parser.getfloat(\"defaults\", \"timeout\", fallback=30.0)",
+    "    return parser.getfloat(\"defaults\", \"timeout\", fallback=30.0)"
+   ],
+   "rejected": {
+    "chunk_not_in_pack": 1
+   },
+   "downgrades": 1
+  },
+  {
+   "id": "f002",
+   "claim": "`config.parse_bool` returns True for the string \"0\".",
+   "truth": true,
+   "verdict": "UNSURE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": false,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "UNSURE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 2,
+    "UNSURE": 1
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:config.py:32-36"
+   ],
+   "quotes": [
+    "if isinstance(value, bool):\n        return value\n    return bool(value)",
+    "    return bool(value)"
+   ],
+   "rejected": {
+    "chunk_not_in_pack": 1
+   },
+   "downgrades": 1
+  },
+  {
+   "id": "f003",
+   "claim": "`config.get_list` does not strip the whitespace of the items it returns.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:config.py:39-42"
+   ],
+   "quotes": [
+    "return [item for item in raw.split(\",\") if item]",
+    "def get_list(parser, key):\n    \"\"\"A comma-separated list from ``[pipeline]``.\"\"\"\n    raw = parser.get(\"pipeline\", key, fallback=\"\")\n    return [item for item in raw.split(\",\") if item]",
+    "    return [item for item in raw.split(\",\") if item]"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f004",
+   "claim": "`paths.is_inside` compares with a bare `startswith`, so `/a/bc` counts as inside `/a/b`.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:11-15"
+   ],
+   "quotes": [
+    "return child.startswith(parent)",
+    "    child = os.path.abspath(child)\n    parent = os.path.abspath(parent)\n    return child.startswith(parent)",
+    "    return child.startswith(parent)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f005",
+   "claim": "`paths.split_ext` drops the last character of the stem.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:23-28"
+   ],
+   "quotes": [
+    "i = name.rfind(\".\")\n    if i <= 0:\n        return name, \"\"\n    return name[:i - 1], name[i:]",
+    " 28|     return name[:i - 1], name[i:]",
+    "    i = name.rfind(\".\")\n    if i <= 0:\n        return name, \"\"\n    return name[:i - 1], name[i:]"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f006",
+   "claim": "`paths.write_marker` writes the file before it checks that the target is inside the root.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:31-38"
+   ],
+   "quotes": [
+    "with open(target, \"w\", encoding=\"utf-8\") as handle:\n        handle.write(text)\n    if not is_inside(target, root):\n        raise ValueError",
+    " 34|     with open(target, \"w\", encoding=\"utf-8\") as handle:\n 35|         handle.write(text)\n 36|     if not is_inside(target, root):",
+    "    target = safe_join(root, name)\n    with open(target, \"w\", encoding=\"utf-8\") as handle:\n        handle.write(text)\n    if not is_inside(target, root):\n        raise ValueError(f\"{name} is outside {root}\")"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f007",
+   "claim": "`Store.items` in `store.py` returns a shallow copy, so nested values are shared with the store.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:44-46"
+   ],
+   "quotes": [
+    "def items(self):\n        \"\"\"A copy of the store's contents.\"\"\"\n        return dict(self._data)",
+    "return dict(self._data)",
+    "    def items(self):\n        \"\"\"A copy of the store's contents.\"\"\"\n        return dict(self._data)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f008",
+   "claim": "`Store.load` turns a file that is not valid JSON into an empty store instead of raising.",
+   "truth": true,
+   "verdict": "UNSURE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": false,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "UNSURE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 2,
+    "UNSURE": 1
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:15-26"
+   ],
+   "quotes": [
+    "except ValueError:\n            self._data = {}\n        except OSError as exc:\n            raise StoreError(str(exc)) from exc",
+    "    def load(self):\n        \"\"\"Read the file; a missing file is an empty store.\"\"\"\n        try:\n            with open(self.path, encoding=\"utf-8\") as handle:\n                self._data = json.load(handle)\n        except FileNotFoundError:\n            self._data = {}\n        except ValueError:\n            self._data = {}"
+   ],
+   "rejected": {
+    "chunk_not_in_pack": 1
+   },
+   "downgrades": 1
+  },
+  {
+   "id": "f009",
+   "claim": "`Store.get` returns the default when the stored value is falsy, such as 0.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:33-35"
+   ],
+   "quotes": [
+    "return self._data.get(key) or default",
+    "        return self._data.get(key) or default"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f010",
+   "claim": "`Store.delete` raises KeyError for a key that is not in the store.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:40-42"
+   ],
+   "quotes": [
+    "del self._data[key]",
+    "        del self._data[key]"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f011",
+   "claim": "`pipeline.run_step` swallows a KeyError raised by the step and returns None.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:13-20"
+   ],
+   "quotes": [
+    "    except KeyError:\n        return None"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f012",
+   "claim": "`pipeline.run_command` returns 0 when the command fails.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:23-28"
+   ],
+   "quotes": [
+    "    if proc.returncode != 0:\n        return 0"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f013",
+   "claim": "`pipeline.parse_header` reads only the first line of a `Files:` field that wraps onto the next line.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:42-45"
+   ],
+   "quotes": [
+    "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)",
+    "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)\n    return m.group(1).split() if m else []",
+    "    m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f014",
+   "claim": "`pipeline.count_steps` never counts the first step.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:48-50"
+   ],
+   "quotes": [
+    "return sum(1 for i in range(1, len(steps)) if steps[i] is not None)",
+    "    return sum(1 for i in range(1, len(steps)) if steps[i] is not None)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f015",
+   "claim": "`gates.check_exit` treats pytest's exit code 5 as a pass.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:gates.py:4-6"
+   ],
+   "quotes": [
+    "return proc.returncode in (0, 5)",
+    "def check_exit(proc):\n    \"\"\"True when the test run passed.\"\"\"\n    return proc.returncode in (0, 5)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f016",
+   "claim": "`gates.gate_paths` reports a file under a declared directory such as `docs/` as undeclared.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:gates.py:9-11"
+   ],
+   "quotes": [
+    "return [f for f in files if f not in declared]",
+    "def gate_paths(files, declared):\n    \"\"\"The changed files that are not declared.\"\"\"\n    return [f for f in files if f not in declared]"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f017",
+   "claim": "`gates.run_gate` applies the changes before it checks `allowed`.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:gates.py:19-24"
+   ],
+   "quotes": [
+    "apply(changes)\n    if not allowed:\n        return False\n    return True",
+    "    apply(changes)\n    if not allowed:\n        return False\n    return True",
+    "    apply(changes)\n    if not allowed:"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f018",
+   "claim": "`retry.retry_call` retries forever; it has no limit on the number of attempts.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:retry.py:21-29"
+   ],
+   "quotes": [
+    "while True:\n        try:\n            return fn()\n        except Exception:\n            attempt += 1\n            sleep(backoff(attempt, delay))",
+    "    attempt = 0\n    while True:\n        try:\n            return fn()\n        except Exception:\n            attempt += 1\n            sleep(backoff(attempt, delay))",
+    "    while True:\n        try:\n            return fn()\n        except Exception:\n            attempt += 1\n            sleep(backoff(attempt, delay))"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f019",
+   "claim": "`retry.retry_call` retries on any Exception, not only on TransientError.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:retry.py:21-29"
+   ],
+   "quotes": [
+    "except Exception:",
+    "        except Exception:\n            attempt += 1",
+    "def retry_call(fn, delay=0.5, sleep=time.sleep):\n    \"\"\"Call *fn* until it succeeds.\"\"\"\n    attempt = 0\n    while True:\n        try:\n            return fn()\n        except Exception:\n            attempt += 1\n            sleep(backoff(attempt, delay))"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f020",
+   "claim": "`retry.is_transient` matches \"timeout\" case-sensitively, so \"Timeout\" is not transient.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:retry.py:10-13"
+   ],
+   "quotes": [
+    "return \"timeout\" in text or \"reset\" in text",
+    "    text = str(exc)\n    return \"timeout\" in text or \"reset\" in text",
+    "def is_transient(exc):\n    \"\"\"True for a timeout or a connection reset.\"\"\"\n    text = str(exc)\n    return \"timeout\" in text or \"reset\" in text"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f021",
+   "claim": "`config.load_workers` returns 0 when `workers` is not an integer.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:config.py:23-29"
+   ],
+   "quotes": [
+    "try:\n        return int(raw)\n    except ValueError:\n        return 0",
+    "    try:\n        return int(raw)\n    except ValueError:\n        return 0"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f022",
+   "claim": "`config.read_config` opens the file and never closes it.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:config.py:10-15"
+   ],
+   "quotes": [
+    "handle = open(path, encoding=\"utf-8\")\n    parser.read_file(handle)\n    return parser",
+    "    parser = configparser.ConfigParser()\n    handle = open(path, encoding=\"utf-8\")\n    parser.read_file(handle)\n    return parser",
+    "    handle = open(path, encoding=\"utf-8\")\n    parser.read_file(handle)\n    return parser"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f023",
+   "claim": "`paths.safe_join` does not reject an absolute `name`, so its result can leave `root`.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:18-20"
+   ],
+   "quotes": [
+    "def safe_join(root, name):\n    \"\"\"*name* joined under *root*.\"\"\"\n    return os.path.join(root, name)",
+    "return os.path.join(root, name)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f024",
+   "claim": "`Store.save` writes the file in place, not through a temporary file and a rename.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:28-31"
+   ],
+   "quotes": [
+    "def save(self):\n        \"\"\"Write the whole store back.\"\"\"\n        with open(self.path, \"w\", encoding=\"utf-8\") as handle:\n            handle.write(json.dumps(self._data, ensure_ascii=False)",
+    "with open(self.path, \"w\", encoding=\"utf-8\") as handle:",
+    "    def save(self):\n        \"\"\"Write the whole store back.\"\"\"\n        with open(self.path, \"w\", encoding=\"utf-8\") as handle:\n            handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f025",
+   "claim": "`pipeline.run_all` stops at the first failing step and drops the steps after it.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:31-39"
+   ],
+   "quotes": [
+    "for step in steps:\n        try:\n            results.append(run_step(step, context))\n        except StepError:\n            break\n    return results",
+    "stopping at the first failure.\"",
+    "def run_all(steps, context):\n    \"\"\"Run *steps* in order; the results, stopping at the first failure.\"\"\"\n    results = []\n    for step in steps:\n        try:\n            results.append(run_step(step, context))\n        except StepError:\n            break"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f026",
+   "claim": "`pipeline.log_step` prints with `print()` rather than through `logging`.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:53-54"
+   ],
+   "quotes": [
+    "def log_step(name, status):\n    print(f\"{name}: {status}\")",
+    "print(f\"{name}: {status}\")"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f027",
+   "claim": "`gates.gate_size` adds the deleted lines to the added lines before comparing with the limit.",
+   "truth": true,
+   "verdict": "UNSURE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": false,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 2
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:gates.py:14-16"
+   ],
+   "quotes": [
+    "return abs(added) + abs(deleted) <= limit",
+    "    return abs(added) + abs(deleted) <= limit"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f028",
+   "claim": "`gates.gate_flaky` reports `PASS*` when the rerun passes, without checking that `failed_ids` holds as many ids as `bad` tests failed.",
+   "truth": true,
+   "verdict": "UNSURE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": false,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 2
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:gates.py:27-31"
+   ],
+   "quotes": [
+    "if rerun(failed_ids) == 0:\n        return f\"PASS*{bad}\"\n    return f\"{bad}x\"",
+    "    if rerun(failed_ids) == 0:\n        return f\"PASS*{bad}\""
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f029",
+   "claim": "`retry.backoff` has no upper bound on the wait it returns.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:retry.py:16-18"
+   ],
+   "quotes": [
+    "return base * 2 ** attempt",
+    "def backoff(attempt, base=0.5):\n    \"\"\"Seconds to wait before attempt number *attempt*.\"\"\"\n    return base * 2 ** attempt"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f030",
+   "claim": "`retry.with_deadline` checks the deadline only after the call has returned.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:retry.py:32-37"
+   ],
+   "quotes": [
+    "result = fn()\n    if clock() > deadline:\n        raise TimeoutError(\"deadline passed\")\n    return result",
+    "    result = fn()\n    if clock() > deadline:\n        raise TimeoutError(\"deadline passed\")\n    return result",
+    "def with_deadline(fn, deadline, clock=time.monotonic):\n    \"\"\"Call *fn*; raise TimeoutError when *deadline* has passed.\"\"\"\n    result = fn()\n    if clock() > deadline:\n        raise TimeoutError(\"deadline passed\")\n    return result"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f031",
+   "claim": "`paths.norm_path` lower-cases the path it is given.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:6-8"
+   ],
+   "quotes": [
+    "return path.lower().rstrip(\"/\")",
+    "    return path.lower().rstrip(\"/\")"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f032",
+   "claim": "`paths.norm_path` strips every trailing slash, not just one.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:6-8"
+   ],
+   "quotes": [
+    "return path.lower().rstrip(\"/\")",
+    "    return path.lower().rstrip(\"/\")"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f033",
+   "claim": "`Store.save` writes the JSON without a trailing newline.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:28-31"
+   ],
+   "quotes": [
+    "handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f034",
+   "claim": "`retry.retry_call` waits the same `delay` before every retry instead of backing off.",
+   "truth": false,
+   "verdict": "UNSURE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": false,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "UNSURE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "UNSURE"
+   },
+   "all_votes": {
+    "FALSE": 1,
+    "UNSURE": 2
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:retry.py:21-29"
+   ],
+   "quotes": [
+    "sleep(backoff(attempt, delay))"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f035",
+   "claim": "`config.load_timeout` falls back to 60 seconds when the key is unset.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:config.py:18-20"
+   ],
+   "quotes": [
+    "return parser.getfloat(\"defaults\", \"timeout\", fallback=30.0)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f036",
+   "claim": "`config.load_name` returns None when `name` is unset.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:config.py:45-47"
+   ],
+   "quotes": [
+    "return parser.get(\"pipeline\", \"name\", fallback=\"pipeline\")"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f037",
+   "claim": "`config.get_list` splits the value on semicolons.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:config.py:39-42"
+   ],
+   "quotes": [
+    "raw.split(\",\")",
+    "    return [item for item in raw.split(\",\") if item]"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f038",
+   "claim": "`paths.is_inside` resolves symlinks with `os.path.realpath` before comparing.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:11-15"
+   ],
+   "quotes": [
+    "child = os.path.abspath(child)",
+    "    child = os.path.abspath(child)\n    parent = os.path.abspath(parent)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f039",
+   "claim": "`paths.split_ext` treats the whole of `.bashrc` as an extension.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:23-28"
+   ],
+   "quotes": [
+    "if i <= 0:\n        return name, \"\"",
+    "i = name.rfind(\".\")\n    if i <= 0:\n        return name, \"\"",
+    "def split_ext(name):\n    \"\"\"``(stem, ext)`` of a file name; ext keeps its dot.\"\"\"\n    i = name.rfind(\".\")\n    if i <= 0:\n        return name, \"\"\n    return name[:i - 1], name[i:]"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f040",
+   "claim": "`paths.marker_names` returns the marker files in modification-time order.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:41-43"
+   ],
+   "quotes": [
+    "return sorted(n for n in os.listdir(norm_path(root)) if n.endswith(\".marker\"))",
+    "def marker_names(root):\n    \"\"\"The marker files under *root*, sorted.\"\"\"\n    return sorted(n for n in os.listdir(norm_path(root)) if n.endswith(\".marker\"))"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f041",
+   "claim": "`Store.load` raises StoreError when the file does not exist.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:15-26"
+   ],
+   "quotes": [
+    "except FileNotFoundError:\n            self._data = {}",
+    "        except FileNotFoundError:\n            self._data = {}",
+    "        \"\"\"Read the file; a missing file is an empty store.\"\"\"\n        try:\n            with open(self.path, encoding=\"utf-8\") as handle:\n                self._data = json.load(handle)\n        except FileNotFoundError:\n            self._data = {}"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f042",
+   "claim": "`Store.put` refuses to overwrite a key that is already in the store.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:37-38"
+   ],
+   "quotes": [
+    "self._data[key] = value",
+    "    def put(self, key, value):\n        self._data[key] = value"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f043",
+   "claim": "`Store.__len__` counts only the keys whose value is not None.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:48-49"
+   ],
+   "quotes": [
+    "def __len__(self):\n        return len(self._data)",
+    "     def __len__(self):\n         return len(self._data)",
+    "    def __len__(self):\n        return len(self._data)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f044",
+   "claim": "`pipeline.run_command` passes `check=True`, so a failing command raises CalledProcessError.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:23-28"
+   ],
+   "quotes": [
+    "proc = subprocess.run(argv, cwd=norm_path(cwd), capture_output=True, check=False)",
+    "    proc = subprocess.run(argv, cwd=norm_path(cwd), capture_output=True, check=False)\n    if proc.returncode != 0:\n        return 0"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f045",
+   "claim": "`pipeline.run_step` retries a failing step once before raising StepError.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:13-20"
+   ],
+   "quotes": [
+    "return step(context)\n    except KeyError:\n        return None\n    except Exception as exc:\n        raise StepError(str(exc)) from exc",
+    "    try:\n        return step(context)\n    except KeyError:\n        return None\n    except Exception as exc:\n        raise StepError(str(exc)) from exc",
+    "def run_step(step, context):\n    \"\"\"Call *step* with *context*; a failing step raises StepError.\"\"\"\n    try:\n        return step(context)\n    except KeyError:\n        return None\n    except Exception as exc:\n        raise StepError(str(exc)) from exc"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f046",
+   "claim": "`pipeline.parse_header` matches the `Files:` label case-insensitively.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:42-45"
+   ],
+   "quotes": [
+    "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)",
+    "     m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)\n     return m.group(1).split() if m else []",
+    "def parse_header(text):\n    \"\"\"The ``Files:`` field of a step header, as a list of names.\"\"\"\n    m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f047",
+   "claim": "`gates.check_exit` treats exit code 1 as a pass.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:gates.py:4-6"
+   ],
+   "quotes": [
+    "return proc.returncode in (0, 5)",
+    "def check_exit(proc):\n    \"\"\"True when the test run passed.\"\"\"\n    return proc.returncode in (0, 5)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f048",
+   "claim": "`gates.summary_line` prints `PASS` for a gate that passed.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:gates.py:34-35"
+   ],
+   "quotes": [
+    "return f\"{name}: {'ok' if ok else 'FAIL'}\"",
+    "def summary_line(name, ok):\n    return f\"{name}: {'ok' if ok else 'FAIL'}\""
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f049",
+   "claim": "`retry.backoff` starts from a base of 1 second by default.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:retry.py:16-18"
+   ],
+   "quotes": [
+    "def backoff(attempt, base=0.5):"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f050",
+   "claim": "`retry.with_deadline` uses `time.time` as its default clock.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:retry.py:32-37"
+   ],
+   "quotes": [
+    "def with_deadline(fn, deadline, clock=time.monotonic):"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f061",
+   "claim": "`pipeline.run_command` passes `check=False` to `subprocess.run`, which then does not raise on a non-zero exit.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "mixed",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:23-28"
+   ],
+   "quotes": [
+    "proc = subprocess.run(argv, cwd=norm_path(cwd), capture_output=True, check=False)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f062",
+   "claim": "`pipeline.parse_header` uses `re.M` without `re.S`, so `.` in its pattern does not match a newline.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "mixed",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:pipeline.py:42-45"
+   ],
+   "quotes": [
+    "m = re.search(r\"^Files:\\s*(.+)$\", text, re.M)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f063",
+   "claim": "`Store.save` passes `ensure_ascii=False`, so non-ASCII characters are written as themselves.",
+   "truth": true,
+   "verdict": "UNSURE",
+   "needs_code": true,
+   "kind": "mixed",
+   "dangling": false,
+   "unanimous": false,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "UNSURE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 2,
+    "UNSURE": 1
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:28-31"
+   ],
+   "quotes": [
+    "handle.write(json.dumps(self._data, ensure_ascii=False) + \"\\n\")"
+   ],
+   "rejected": {
+    "chunk_not_in_pack": 1
+   },
+   "downgrades": 1
+  },
+  {
+   "id": "f064",
+   "claim": "`config.read_config` uses `configparser.ConfigParser`, whose option names are case-sensitive.",
+   "truth": false,
+   "verdict": "UNSURE",
+   "needs_code": true,
+   "kind": "mixed",
+   "dangling": false,
+   "unanimous": false,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "UNSURE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 2,
+    "UNSURE": 1
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:config.py:10-15"
+   ],
+   "quotes": [
+    "parser = configparser.ConfigParser()"
+   ],
+   "rejected": {
+    "chunk_not_in_pack": 1
+   },
+   "downgrades": 1
+  },
+  {
+   "id": "f065",
+   "claim": "`paths.split_ext` uses `str.rfind`, which returns -1 when the dot is absent.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "mixed",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:paths.py:23-28"
+   ],
+   "quotes": [
+    "i = name.rfind(\".\")",
+    "def split_ext(name):\n    \"\"\"``(stem, ext)`` of a file name; ext keeps its dot.\"\"\"\n    i = name.rfind(\".\")"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f066",
+   "claim": "`gates.check_exit` accepts exit code 5, which is the code pytest uses for an internal error.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "mixed",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:gates.py:4-6"
+   ],
+   "quotes": [
+    "return proc.returncode in (0, 5)",
+    "def check_exit(proc):\n    \"\"\"True when the test run passed.\"\"\"\n    return proc.returncode in (0, 5)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f067",
+   "claim": "`retry.retry_call` uses `time.sleep` as its default sleep, which takes seconds as a float.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "mixed",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:retry.py:21-29"
+   ],
+   "quotes": [
+    "def retry_call(fn, delay=0.5, sleep=time.sleep):"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f068",
+   "claim": "`Store.items` builds its copy with `dict()`, and `dict()` of a dict copies the nested lists too.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "mixed",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:store.py:44-46"
+   ],
+   "quotes": [
+    "return dict(self._data)",
+    "    def items(self):\n        \"\"\"A copy of the store's contents.\"\"\"\n        return dict(self._data)"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f069",
+   "claim": "`scheduler.py` runs the pipeline's steps in parallel threads.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": true,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "note:dangling:scheduler.py"
+   ],
+   "quotes": [
+    "`scheduler.py` does not exist at d36d59e; no file of that name is in the repository."
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f070",
+   "claim": "`Store.compact` in `store.py` removes the keys whose value is None.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": true,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "note:dangling:Store.compact"
+   ],
+   "quotes": [
+    "`Store.compact` does not exist at d36d59e; the file `store.py` exists and defines: `StoreError`, `Store`; `Store` has: `__init__`, `load`, `save`, `get`, `put`, `delete`, `items`, `__len__`.",
+    "`Store.compact` does not exist at d36d59e; the file `store.py` exists and defines: `StoreError`, `Store`; `Store` has: `__init__`,"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f071",
+   "claim": "`gates.check_coverage` fails a change whose coverage is below 80 %.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": true,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "note:dangling:gates.check_coverage"
+   ],
+   "quotes": [
+    "`gates.check_coverage` does not exist at d36d59e; the file `gates.py` exists and defines: `check_exit`, `gate_paths`, `gate_size`, `run_gate`, `gate_flaky`, `summary_line`."
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f072",
+   "claim": "`retry.retry_async` awaits the call between retries.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": true,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "note:dangling:retry.retry_async"
+   ],
+   "quotes": [
+    "`retry.retry_async` does not exist at d36d59e; the file `retry.py` exists and defines: `TransientError`, `is_transient`, `backoff`, `retry_call`, `with_deadline`."
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f073",
+   "claim": "`config.load_profile` reads the `[profile]` section.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": true,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "note:dangling:config.load_profile"
+   ],
+   "quotes": [
+    "`config.load_profile` does not exist at d36d59e; the file `config.py` exists and defines: `read_config`, `load_timeout`, `load_workers`, `parse_bool`, `get_list`, `load_name`.",
+    "`config.load_profile` does not exist at d36d59e; the file `config.py` exists and defines: `read_config`, `load_timeout`"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f074",
+   "claim": "`paths.expand_user` expands a leading `~` in a path.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": true,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "note:dangling:paths.expand_user"
+   ],
+   "quotes": [
+    "`paths.expand_user` does not exist at d36d59e; the file `paths.py` exists and defines: `norm_path`, `is_inside`, `safe_join`, `split_ext`, `write_marker`, `marker_names`.",
+    "`paths.expand_user` does not exist at d36d59e; the file `paths.py` exists and defines: `norm_path`, `is_inside`, `safe_joi"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f075",
+   "claim": "Ticket `epic-tasks/01-store-errors.md` has the status done.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "ticket:epic-tasks/01-store-errors.md",
+    "src:epic-tasks/01-store-errors.md:1-6"
+   ],
+   "quotes": [
+    "**Status:** open"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f076",
+   "claim": "Ticket `epic-tasks/02-store-get.md` declares `store.py` in its **File:** field.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "ticket:epic-tasks/02-store-get.md",
+    "src:epic-tasks/02-store-get.md:1-6"
+   ],
+   "quotes": [
+    "**File:** `store.py`"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f077",
+   "claim": "Ticket `epic-tasks/03-retry-bound.md` is marked done.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "src:epic-tasks/03-retry-bound.md:1-6"
+   ],
+   "quotes": [
+    "**Status:** done"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f078",
+   "claim": "Commit d36d59e adds `retry.py`.",
+   "truth": true,
+   "verdict": "TRUE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "TRUE",
+    "kenary/mimo-v2-6-flash:free": "TRUE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "TRUE"
+   },
+   "all_votes": {
+    "TRUE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "git:d36d59e:header",
+    "git:d36d59e:retry.py:1-37"
+   ],
+   "quotes": [
+    "create mode 100644 retry.py",
+    "diff --git a/retry.py b/retry.py\nnew file mode 100644"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f079",
+   "claim": "Commit d36d59e changes only `config.py`.",
+   "truth": false,
+   "verdict": "FALSE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": true,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "FALSE",
+    "kenary/mimo-v2-6-flash:free": "FALSE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "FALSE"
+   },
+   "all_votes": {
+    "FALSE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [
+    "git:d36d59e:header"
+   ],
+   "quotes": [
+    "9 files changed, 283 insertions(+)",
+    " 9 files changed, 283 insertions(+)",
+    " 9 files changed, 283 insertions(+)\n create mode 100644 config.py\n create mode 100644 epic-tasks/01-store-errors.md\n create mode 100644 epic-tasks/02-store-get.md\n create mode 100644 epic-tasks/03-retry-bound.md\n create mode 100644 gates.py\n create mode 100644 paths.py\n create mode 100644 pipeline.py\n create mode 100644 retry.py\n create mode 100644 store.py"
+   ],
+   "rejected": {},
+   "downgrades": 0
+  },
+  {
+   "id": "f080",
+   "claim": "The subject of commit d36d59e is `fixture: base`.",
+   "truth": true,
+   "verdict": "UNSURE",
+   "needs_code": true,
+   "kind": "code",
+   "dangling": false,
+   "unanimous": false,
+   "by_model": {
+    "kenary/agnes-3-0-flash:free": "UNSURE",
+    "kenary/mimo-v2-6-flash:free": "UNSURE",
+    "kenary/nemotron-3-ultra-550b-a55b:free": "UNSURE"
+   },
+   "all_votes": {
+    "UNSURE": 3
+   },
+   "sha": "d36d59e60eda0da6b04b0e230abeea4ab75b4aaf",
+   "evidence": [],
+   "quotes": [],
+   "rejected": {
+    "chunk_not_in_pack": 3
+   },
+   "downgrades": 3
+  }
+ ]
+}

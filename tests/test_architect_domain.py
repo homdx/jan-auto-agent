@@ -38,9 +38,7 @@ from tools.auto.architect import (
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def cfg() -> configparser.ConfigParser:
@@ -95,9 +93,7 @@ def _item(**overrides) -> dict:
     return base
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1 & 2 — CitedLocation.is_valid() with task_mode
-# ─────────────────────────────────────────────────────────────────────────────
+# 1-2: CitedLocation.is_valid() with task_mode
 
 class TestCitedLocationIsValidMode:
     def test_docs_mode_file_only_is_valid(self):
@@ -137,9 +133,7 @@ class TestCitedLocationIsValidMode:
         assert CitedLocation(file="a.py", line_start=5).is_valid()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3 & 4 & 5 — ClusterReviewer prompt selection
-# ─────────────────────────────────────────────────────────────────────────────
+# 3-5: ClusterReviewer prompt selection
 
 class TestClusterReviewerPromptSelection:
     def test_code_mode_uses_code_prompt(self, cfg):
@@ -184,9 +178,7 @@ class TestClusterReviewerPromptSelection:
         assert r._system == _SYSTEM_PROMPT_CODE
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6 — Docs candidate with file + line_range but no symbol is accepted
-# ─────────────────────────────────────────────────────────────────────────────
+# 6: docs candidate with file and line_range but no symbol is accepted
 
 class TestDocsCandidateAccepted:
     def test_file_and_line_range_no_symbol_accepted_in_docs_mode(self, cfg, tmp_path):
@@ -236,9 +228,7 @@ class TestDocsCandidateAccepted:
         assert results == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7 — Creative mode accepts empty acceptance_check (defaults to 'true')
-# ─────────────────────────────────────────────────────────────────────────────
+# 7: creative mode accepts an empty acceptance_check (defaults to 'true')
 
 class TestCreativeModeAcceptanceCheck:
     def test_empty_acceptance_check_becomes_true_in_creative(self, cfg, tmp_path):
@@ -283,9 +273,7 @@ class TestCreativeModeAcceptanceCheck:
         assert results[0].acceptance_check == "true"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8 — review_clusters factory accepts task_mode kwarg
-# ─────────────────────────────────────────────────────────────────────────────
+# 8: review_clusters accepts a task_mode kwarg
 
 class TestReviewClustersFactory:
     def test_accepts_task_mode_kwarg_docs(self, cfg, tmp_path):
@@ -332,9 +320,7 @@ class TestReviewClustersFactory:
         assert results == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10 & 11 — Backward compat: existing test assertions still hold
-# ─────────────────────────────────────────────────────────────────────────────
+# 10-11: backward compat: existing assertions still hold
 
 class TestBackwardCompat:
     def test_system_prompt_alias_equals_code_prompt(self):

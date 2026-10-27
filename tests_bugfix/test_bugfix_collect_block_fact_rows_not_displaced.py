@@ -192,8 +192,7 @@ def test_config_read_drops_whole_lines_from_the_end_instead_of_vanishing():
     lines = full.split("\n")
     assert len(lines) == 30
 
-    # Monotone in the allowance, and never a fragment: a shorter row is always
-    # a leading slice of the full one.
+    # Monotone in the allowance: a shorter row is always a leading slice of the full one.
     widths, counts = [], []
     for remaining in range(0, len(full) + 1):
         shrunk = _row_config_read(model, TARGET, remaining)
@@ -229,8 +228,7 @@ def test_a_duplicated_config_read_costs_the_cut_nothing():
     )
     assert _row_config_read(doubled, TARGET, None) == _row_config_read(distinct, TARGET, None)
 
-    # Exactly the budget the six distinct lines need, after the rows above them
-    # are at their floors: the doubled module must render the same six.
+    # At the budget the six distinct lines need, the doubled module renders the same six.
     for budget in range(120, 700, 7):
         assert build_collect_context_block(doubled, TARGET, budget=budget) == (
             build_collect_context_block(distinct, TARGET, budget=budget)

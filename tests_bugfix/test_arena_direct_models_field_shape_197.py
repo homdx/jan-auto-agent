@@ -26,8 +26,7 @@ URL = "http://x.invalid/v1"
 KEY = "sk-secret"
 GOOD = {"id": "ok"}
 
-#: The entries the operator met: one field each of the wrong type, `id` intact so
-#: that "skipped" is what is under test.
+#: Entries of the wrong types, with `id` intact so the skip is what is tested.
 WRONG_TYPED = [
     ({"id": "bad", "pricing": "cheap"}, "a pricing that is a string"),
     ({"id": "bad", "pricing": [1, 2]}, "a pricing that is a list"),
@@ -43,8 +42,7 @@ WRONG_TYPED = [
     ({"id": "bad", "pricing": {"input": "cheap"}}, "a price that is a string"),
 ]
 
-#: The ticket's `currency: null`: a null currency is no currency, not a crash —
-#: the entry is kept and priced as unknown.
+#: A null currency is no currency: the entry is kept and priced as unknown.
 NO_CURRENCY = {"id": "no-cur", "pricing": {"currency": None, "input": 0, "output": 0}}
 
 

@@ -62,16 +62,12 @@ class LlmSettings:
     think_effort: Optional[str] = None
 
 
-# Optional fields, in the order they should be resolved/logged. Kept
-# separate from LlmSettings' own field order so adding a future optional
-# key only means appending here and to the dataclass — not touching the
-# per-type parsing branches below.
+# Optional fields, in resolution and log order; a new key goes here and in the dataclass.
 _OPTIONAL_BOOL_FIELDS = ("verify_ssl", "think", "response_format")
 _OPTIONAL_FLOAT_FIELDS = ("temperature",)
 _OPTIONAL_INT_FIELDS = ("max_tokens", "num_ctx")
 _OPTIONAL_STR_FIELDS = ("api_format",)
-# think_effort_enabled/think_effort are handled together, as a pair, since
-# think_effort only means anything when think_effort_enabled is true.
+# think_effort and think_effort_enabled are handled as a pair.
 
 
 def resolve_llm_profile(

@@ -54,16 +54,10 @@ STATUS_BLOCKED     = "blocked"
 
 _VALID_STATUSES = {STATUS_TODO, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED}
 
-# Counters that only ever move forward.  A re-plan or a second regression on
-# the same root task rebuilds these from zero; letting that through would reset
-# the round/attempt budget and drop impl_version to 1, defeating the LOOP-2 /
-# LOOP-3 cross-resume rewrite cap.
+# Counters that only move forward: a re-plan cannot reset the round or attempt budget (LOOP-2, LOOP-3).
 _MONOTONIC_TASK_FIELDS: tuple[str, ...] = ("round", "attempt", "impl_version")
 
-# Free-form fields a fresh plan payload never carries.  A wholesale replace
-# deletes them outright: the commit key severs the git linkage between
-# plan.json and the real commit, and original_instruction is only ever
-# recorded once (first rewrite).
+# Fields a fresh plan payload never carries: they are kept on a replace, since they link the task to its commit (commit, original instruction).
 _PRESERVED_TASK_FIELDS: tuple[str, ...] = ("commit", "original_instruction")
 
 
@@ -84,11 +78,7 @@ def merge_task_update(
     merged = dict(existing)
     merged.update(incoming)
 
-    # Only DONE is protected. A rank ordering over all four statuses would
-    # also freeze blocked -> in_progress / blocked -> todo, which are ordinary
-    # forward moves, not downgrades: BLOCKED is not "more progress" than
-    # IN_PROGRESS. The bug being closed is a re-plan silently reopening
-    # FINISHED work, so guard exactly that.
+    # Only DONE is protected, so a re-plan cannot reopen finished work; other status moves are ordinary.
     existing_status = existing.get("status", STATUS_TODO)
     incoming_status = incoming.get("status", existing_status)
     if (
@@ -98,8 +88,7 @@ def merge_task_update(
     ):
         merged["status"] = existing_status
 
-    # Counters only move forward; a lower value in the incoming dict is the
-    # reset artefact of a re-plan, not real progress.
+    # Counters only move forward, so a lower incoming value is a re-plan reset, not progress.
     for field in _MONOTONIC_TASK_FIELDS:
         old_val, new_val = existing.get(field), incoming.get(field)
         if old_val is None or new_val is None:
@@ -133,9 +122,7 @@ _REQUIRED_TASK_FIELDS: dict[str, type] = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Schema helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_task(
     id: str,            # noqa: A002 — "id" matches the task schema field name;
@@ -184,8 +171,7 @@ def _matches_schema_type(value: Any, expected_type: type) -> bool:
 
 def _validate_task_schema(task: dict) -> None:
     """Raise ValueError if *task* violates the plan.json task schema."""
-    # LOOP-3: backfill impl_version for tasks created before this field existed
-    # (existing plan.json files on disk, hand-rolled dicts in tests, etc.).
+    # impl_version is backfilled for tasks made before it existed (LOOP-3).
     if "impl_version" not in task:
         task["impl_version"] = 1
     for field, expected_type in _REQUIRED_TASK_FIELDS.items():
@@ -284,9 +270,7 @@ def _coerce_delta(value: Any, label: str) -> int:
     return 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # StateStore
-# ─────────────────────────────────────────────────────────────────────────────
 
 class StateStore:
     """Manages all persistent state under *agent_dir* (.agent/).
@@ -413,14 +397,11 @@ class StateStore:
 
     def all_tasks(self) -> list[dict]:
         """Return all tasks in plan order."""
-        # FIX-3 M1: list() alone was a *shallow* copy — a new list holding the
-        # same live dicts, so the plan was still mutable through any element.
+        # list() alone was a shallow copy, so the live task dicts were still mutable (FIX-3 M1).
         return [self._detached(t) for t in self._plan.get("tasks", [])]
 
     def get_goal(self) -> str:
-        # Bugfix: .get("goal", "") only falls back on a MISSING key, so an
-        # explicit `"goal": null` returned None and initialise()'s
-        # `.strip()` on the resume path raised AttributeError.
+        # A goal of null reads as an empty goal, so resume does not crash on it (bugfix).
         return self._plan.get("goal") or ""
 
     def get_progress(self) -> dict:
@@ -491,11 +472,7 @@ class StateStore:
         if status not in _VALID_STATUSES:
             raise ValueError(f"Invalid status '{status}'; must be one of {_VALID_STATUSES}")
 
-        # B1: extra_fields used to be merged with a bare t.update() and no
-        # validation at all, so a typo such as round="2" landed in plan.json
-        # as a string where the schema demands an int, and a later
-        # t["attempt"] + delta raised TypeError somewhere else entirely.
-        # Validate the incoming fields only -- never the merged task.
+        # Extra task fields are type-checked before merging, so a typo like round="2" fails early (B1).
         _validate_extra_task_fields(extra_fields)
 
         tasks = self._plan.get("tasks", [])
@@ -652,21 +629,7 @@ class StateStore:
             the previous ``instruction``, ``impl_version`` and
             ``original_instruction`` state all survive intact.
         """
-        # B2: the task schema requires a non-empty id and title but says
-        # nothing about instruction, and outer_loop hands over
-        # new_task.get("instruction", "") -- the default is literally "".
-        # A truncated or partial rewriter reply therefore overwrote the live
-        # instruction with an empty string, recorded original_instruction and
-        # bumped impl_version. The empty body became the Coder's active task,
-        # and because impl_version had advanced, the real already-failing
-        # instruction dropped out of the "previously tried" history the
-        # rewrite cap depends on.
-        #
-        # The guard runs BEFORE the lookup loop, so no task is touched on
-        # rejection -- not even original_instruction, which must keep holding
-        # the true v1 baseline. isinstance is part of the check: a non-string
-        # (None from a missing JSON key) must raise ValueError here, not
-        # AttributeError from .strip() a line later.
+        # An empty or non-string rewritten instruction is rejected before any task is touched, so the true first instruction is kept (B2).
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError(
                 f"apply_rewrite: refusing a blank or non-string instruction "
@@ -716,13 +679,10 @@ class StateStore:
         if stop_reason is not None:
             self._progress["stop_reason"] = stop_reason
         elif "stop_reason" in extra:
-            # stop_reason was passed as a **extra kwarg — do NOT pop it here;
-            # self._progress.update(extra) below will set it.
+            # stop_reason stays in the extra kwargs; _progress.update sets it below.
             pass
         else:
-            # Neither the named param nor **extra carries a stop_reason → clear
-            # any previously recorded value so stale reasons don't survive a
-            # status transition (e.g. "capped" → "running" on resume).
+            # A stop reason from a previous status does not survive a status change (e.g. capped to running).
             self._progress.pop("stop_reason", None)
         self._progress.update(extra)
         self._refresh_progress(write=False)   # recalculates counts
@@ -887,33 +847,7 @@ class StateStore:
                 loaded = json.loads(
                     self._prog_path.read_text(encoding="utf-8")
                 )
-                # A file that PARSES is not necessarily usable.  Only the
-                # JSONDecodeError case was handled, so valid JSON of the wrong
-                # shape — a list, a string, null — was accepted here and then
-                # crashed on the first write to self._progress, far from the
-                # cause and with nothing naming the file:
-                #
-                #   list   -> TypeError: list indices must be integers
-                #   string -> TypeError: 'str' object does not support item
-                #             assignment
-                #   null   -> TypeError: 'NoneType' object does not support
-                #             item assignment
-                #
-                # No need to fail on it, though: the rebuild path below is
-                # already the right answer, because progress counts are fully
-                # derivable from the plan.  So a wrong-shape file recovers
-                # exactly like a corrupt one instead of poisoning the run.
-                # AUTO-FIX (medium-priority audit, DeepSeek-plan finding):
-                # the isinstance(dict) check above accepts ANY dict, even
-                # one missing the keys this class actually depends on
-                # (done_count/pending_count/status) — e.g. progress.json
-                # truncated to just "{}" by a partial write. That silently
-                # produced a StateStore whose get_progress() callers had to
-                # each separately guess a fallback for a key that should
-                # have been there. Treat a dict missing any required key
-                # the same as a wrong-shape file: rebuild from plan.json,
-                # which is the already-established, no-data-lost recovery
-                # path for exactly this situation.
+                # Progress missing a required key is rebuilt from plan.json, the same as a corrupt file (AUTO-FIX).
                 _required_progress_keys = {"done_count", "pending_count", "status"}
                 if isinstance(loaded, dict):
                     _missing = _required_progress_keys - loaded.keys()
@@ -1013,9 +947,7 @@ class StateStore:
         atomic (see ``_atomic_write``); this recovery path is the safety net
         for any file that is corrupted despite that (e.g. a manual edit).
         """
-        # Bugfix: only JSONDecodeError was caught. Invalid UTF-8 bytes
-        # raise UnicodeDecodeError and an unreadable file raises OSError, so
-        # resume crashed instead of falling through to .bak recovery.
+        # Any unreadable or undecodable plan file falls through to the backup, not a crash on resume (bugfix).
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
@@ -1096,21 +1028,7 @@ class StateStore:
                 )
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         try:
-            # B4: atomicity is not durability. This used to be a bare
-            # Path.write_text() plus os.replace(), which guarantees *path*
-            # always holds one complete version -- but Path.write_text
-            # exposes no file descriptor, so nothing was ever flushed to
-            # disk. A power loss or kernel panic right after the rename could
-            # leave plan.json/progress.json missing entirely, and a resumed
-            # run would start from blank state. Write through an explicit fd
-            # so the contents can be fsynced before the rename, then fsync
-            # the parent directory after it (see utils.fsync_directory for
-            # why the directory step is separate and best-effort).
-            #
-            # The .bak refresh above and the OSError re-wrap below are NOT
-            # delegated to utils.atomic_write_text: that helper has neither,
-            # and .bak is the documented recovery path for a corrupt
-            # plan.json. Only the fsync discipline is shared.
+            # Writes are fsynced before the rename and the directory is synced after it, so a power loss cannot leave the state missing (B4).
             with open(tmp_path, "w", encoding="utf-8") as fh:
                 fh.write(content)
                 fh.flush()
@@ -1155,6 +1073,4 @@ class StateStore:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────

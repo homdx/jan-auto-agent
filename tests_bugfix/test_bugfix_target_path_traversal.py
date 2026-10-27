@@ -103,8 +103,7 @@ class TestResolveTargetPath:
 
     def test_dotdot_traversal_via_nested_dotdot_is_refused(self, tmp_path):
         resolve = _helper()
-        # pkg/../../escape.py — even with a valid-looking prefix the
-        # trailing .. escapes.
+        # A valid-looking prefix does not help: the trailing .. still escapes.
         result = resolve(str(tmp_path), "pkg/../../escape.py")
         assert result is None
 
@@ -178,16 +177,10 @@ class TestRunPipelineRefusesTraversal:
         f = tmp_path / "inside.py"
         f.write_text("# inside\n", encoding="utf-8")
 
-        # Build a real Orchestrator instance — its __init__ builds
-        # agents from config; for this test we only need the
-        # run_pipeline path up to file_reader.read_file, so we
-        # substitute a tiny stub class that exposes run_pipeline
-        # only (avoid loading the full agent stack).
+        # Use a stub with only run_pipeline, so the agent stack is not loaded.
         import main as main_mod
 
-        # Stub file_reader.read_file to raise if called on a path
-        # outside tmp_path. If the security check is in place, the
-        # helper returns None and read_file is never called.
+        # read_file must not be reached for a path outside tmp_path: the security check returns None first.
         from tools import file_reader as real_file_reader
 
         def boom(path):
@@ -198,15 +191,12 @@ class TestRunPipelineRefusesTraversal:
 
         monkeypatch.setattr(real_file_reader, "read_file", boom)
 
-        # Build an Orchestrator-like stub that exposes just
-        # run_pipeline, calling the real run_pipeline code path
-        # enough to exercise the target_path check.
+        # Call the real run_pipeline path up to the target_path check.
         from tools.prompt_parser import parse_prompt
         from tools.prompt_parser import ParsedPrompt
 
         class _StubOrch:
-            # Bind the real run_pipeline as a method so its
-            # `self`-based access works.
+            # Binds the real run_pipeline as a method, so its self access works.
             run_pipeline = main_mod.Orchestrator.run_pipeline
             model = "x"
             base_url = "http://fake"
@@ -222,24 +212,15 @@ class TestRunPipelineRefusesTraversal:
                 self._direct_chat_history = []
 
         orch = _StubOrch()
-        # Attack vector: prompt that parse_prompt parses into a
-        # '..'-prefixed file_path. The simplest one that the
-        # regex-driven parser accepts is "show in <relative path>"
-        # — see test_probe above.
+        # Attack prompt: a relative path that escapes the project (see test_probe above).
         attack = "show in ../outside/secret.py"
-        # run_pipeline prints an error and returns; it must NOT
-        # raise (which would happen if read_file got called via the
-        # boom() patched function above).
+        # run_pipeline reports the error and returns; it must not raise.
         orch.run_pipeline(attack, str(tmp_path))
 
         out = capsys.readouterr().out
-        # The friendly error from run_pipeline or the helper should
-        # appear in stdout; what matters is that no exception
-        # escaped (the patched read_file would have raised).
+        # The rejection is printed, and no exception escapes (the patched read_file would have raised).
         assert "Traceback" not in out
-        # And the friendly rejection message must mention
-        # 'outside the project' (from resolve_target_path) or
-        # 'not a valid file'.
+        # The message names the reason: outside the project, or not a valid file.
         assert ("outside the project" in out
             or "not a valid file" in out), (
             f"expected a refusal message in stdout; got:\n{out}"

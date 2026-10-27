@@ -55,15 +55,128 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterable, List, Optional, Set
+from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from tools.collect.java_parser import parse_java
 from tools.collect.lang import Language
 from tools.collect.model import ModuleRecord
 
-#: Dict[module_path, frozenset[module_path]] — the shape every graph in
-#: this module produces and consumes: adjacency by relative file path.
+#: Graph shape: adjacency from module path to the set of module paths it links to.
 Graph = Dict[str, FrozenSet[str]]
+
+#: Directory names a source layout conventionally puts its packages under; a leading one is stripped
+#: from a module's dotted name exactly as a package root is (HARDEN-4 D3).
+_SOURCE_ROOT_DIRS = frozenset(("src", "lib"))
+
+
+class ModuleIndex(Dict[str, str]):
+    """`{dotted_name: module_path}`, plus what HARDEN-4 D3's layout-relative aliases need to be
+    resolved against the *importer* rather than against whichever module got there first.
+
+    * ``roots_by_path`` — for every module, the leading path components its own dotted name was cut
+      at (`svc_b` for `svc_b/app/views.py`). `()` when the module's root is the repo root.
+    * ``ambiguous_aliases`` — the aliases two or more modules claim (`app.models` in a
+      `svc_a/app/`, `svc_b/app/` layout). Such an alias is never resolved by picking the first
+      claimant. HARDEN-10 D keeps one exception: an alias that is a module's *own* dotted name is
+      not contested — a root-level `app/models.py` is `app.models`, and it is the unambiguous
+      answer for an importer that sits outside every sub-project's root.
+
+    A plain `dict` built by hand still works as an index — every accessor here degrades to
+    "no layout information" — so an older caller that passes one keeps resolving exactly as it did.
+    """
+
+    def __init__(self, mapping, roots_by_path=None, ambiguous_aliases=frozenset()):
+        super().__init__(mapping)
+        self.roots_by_path: Dict[str, Tuple[str, ...]] = dict(roots_by_path or {})
+        self.ambiguous_aliases: FrozenSet[str] = frozenset(ambiguous_aliases)
+
+
+def _package_dirs(paths: Iterable[str]) -> Set[str]:
+    """The directories of `paths` that are Python *packages*, i.e. hold an `__init__.py`.
+
+    Read off the module set itself rather than the filesystem, so `build_module_index` stays a pure
+    function of its input (the loader builds indexes over artifact records that may name files no
+    longer on disk) and costs no extra I/O.
+    """
+    out: Set[str] = set()
+    for p in paths:
+        if p == "__init__.py":
+            out.add("")
+        elif p.endswith("/__init__.py"):
+            out.add(p[: -len("/__init__.py")])
+    return out
+
+
+def _package_roots(packages: Set[str]) -> Set[str]:
+    """Every directory that has a package somewhere below it — the directories a `src/`/`lib/`
+    source root is recognised by (HARDEN-4 D3)."""
+    out: Set[str] = set()
+    for pkg in packages:
+        parts = pkg.split("/") if pkg else []
+        for i in range(len(parts)):
+            out.add("/".join(parts[:i]))
+    return out
+
+
+def _source_root_split(
+    parts: Tuple[str, ...], packages: Set[str], roots: Set[str]
+) -> Tuple[str, ...]:
+    """The leading directory components of *parts* that are not part of the module's dotted name.
+
+    Walks up from the file's own directory and stops at the first directory that is not a package
+    (holds no `__init__.py`) — that directory is the layout's source root, so everything under it is
+    the module's dotted name. `src/pkg/core.py` therefore stops at `src` and yields `pkg.core`
+    instead of `src.pkg.core`, which is what `import pkg.core` spells (HARDEN-4 D3);
+    `tools/collect/model.py` walks past `tools/collect` *and* `tools` (both are packages here) and
+    keeps its full name.
+
+    Only a directory that actually roots a package tree counts, so a plain directory of loose
+    scripts (`scripts/`, `tests/`) keeps the full path it always had; a leading `src`/`lib` counts
+    as a source root even where it holds no `__init__.py` of its own, since that is the only reason
+    it would be named that.
+
+    HARDEN-24 A: the shallowest *package* in the chain decides, not the deepest directory that
+    happens to hold no `__init__.py`. The old walk stopped at the first non-package directory it
+    met from the file's own directory upwards, so `src/c/tests/test_c.py` — a `tests/` folder
+    without an `__init__.py` *inside* the package `src/c` — stopped at `src/c/tests` and read the
+    source root as `src/c/tests`. Its layout-relative name became `test_c`, the import
+    `c.core` was rewritten to `c.tests.c.core`, and the longest-prefix fallback crawled that miss
+    up to `c` — the package's own `__init__.py` instead of `src/c/core.py`. With the shallowest
+    package the source root is `src` and the dotted name is `c.tests.test_c`, as it should be.
+    """
+    dirs = parts[:-1]
+    topmost = None
+    for i in range(1, len(dirs) + 1):
+        if "/".join(dirs[:i]) in packages:
+            topmost = i
+            break
+    if topmost is None:
+        # No package in the chain: the whole chain is the head, and the source-root check below
+        # decides whether it counts at all (a loose `scripts/` does not).
+        head = tuple(dirs)
+    else:
+        # The source root is the parent of the shallowest package in the chain.
+        head = tuple(dirs[:topmost - 1])
+    if not head:
+        return ()
+    if topmost is None and "/".join(head) not in roots and head[0] not in _SOURCE_ROOT_DIRS:
+        return ()
+    if head[0] in _SOURCE_ROOT_DIRS and len(head) > 1:
+        head = head[1:]
+    return head
+
+
+def _module_dotted_parts(path: str) -> Tuple[str, ...]:
+    """The dotted-name components of *path* with the file's own stem last (`__init__.py` dropped)."""
+    p = Path(path)
+    parts = list(p.parts)
+    if not parts:
+        return ()
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    elif parts:
+        parts[-1] = p.stem
+    return tuple(parts)
 
 
 def _module_dotted_name(path: str) -> str:
@@ -93,18 +206,63 @@ def _module_dotted_name(path: str) -> str:
     handles Python's `from x.y import z` coarsening — stripping one
     trailing component at a time until a real module matches.
     """
-    p = Path(path)
-    parts = list(p.parts)
-    if parts and parts[-1] == "__init__.py":
-        parts = parts[:-1]
-    elif parts:
-        parts[-1] = p.stem
-    return ".".join(parts)
+    return ".".join(_module_dotted_parts(path))
 
 
-def build_module_index(modules: Iterable[ModuleRecord]) -> Dict[str, str]:
-    """`{dotted_name: module_path}` for every module in `modules`."""
-    return {_module_dotted_name(m.path): m.path for m in modules}
+def build_module_index(modules: Iterable[ModuleRecord]) -> ModuleIndex:
+    """`{dotted_name: module_path}` for every module in `modules`.
+
+    HARDEN-4 D3: a module's own dotted name is keyed first and never displaced, so everything that
+    resolves today resolves exactly as it did — `src/pkg/core.py` still answers to `src.pkg.core`.
+    The layout-relative name (`pkg.core`) is added as a *second* key for the same path, and only
+    where nothing already owns it, so a `src/`-layout repository's internal imports resolve the same
+    way a flat copy's do instead of every module looking like an entry point with no importers. A
+    repo that has a real top-level package called `src` keeps resolving through the full path key.
+
+    HARDEN-6 D: in a monorepo two sub-projects claim the same alias (`svc_a/app/models.py` and
+    `svc_b/app/models.py` both answer to `app.models`), and the first by sorted path used to win for
+    *every* importer — so `svc_b/app/views.py`'s `import app.models` named `svc_a/app/models.py`,
+    the other service. The index now also records each module's own source root and which aliases are
+    claimed more than once; `resolve_import` resolves an alias against the importer's own root first
+    and leaves a contested one unresolved instead of picking a winner.
+
+    Order is fixed by sorting on path, so two layouts colliding on one name resolve to the same
+    module on every run (COLLECT-3).
+    """
+    modules = sorted(modules, key=lambda m: m.path)
+    packages = _package_dirs(m.path for m in modules)
+    roots = _package_roots(packages)
+
+    index: Dict[str, str] = {}
+    for m in modules:
+        index.setdefault(_module_dotted_name(m.path), m.path)
+    own_names = set(index)
+
+    roots_by_path: Dict[str, Tuple[str, ...]] = {}
+    alias_owners: Dict[str, Set[str]] = {}
+    for m in modules:
+        parts = _module_dotted_parts(m.path)
+        if not parts:
+            continue
+        head = _source_root_split(parts, packages, roots)
+        roots_by_path[m.path] = head
+        if not head:
+            continue  # the layout's root is the repo root: the name above is already the short one
+        alias = ".".join(parts[len(head):])
+        alias_owners.setdefault(alias, set()).add(m.path)
+        index.setdefault(alias, m.path)
+
+    # HARDEN-10 D: an alias that is a module's *own* dotted name is not ambiguous. In a monorepo
+    # with `app/` at the repo root beside `svc_a/app/` and `svc_b/app/`, the root package's own
+    # `app.models` is among the claimants only by accident of the alias, and counting it made the
+    # alias contested for nobody — so `app/views.py` and the root's tests looked like they import
+    # nothing. The sub-projects' aliases stay contested among themselves; the root module is the
+    # unambiguous answer for an importer outside every sub-project's root.
+    ambiguous = {
+        alias for alias, owners in alias_owners.items()
+        if len(owners) > 1 and alias not in own_names
+    }
+    return ModuleIndex(index, roots_by_path=roots_by_path, ambiguous_aliases=ambiguous)
 
 
 def resolve_import(
@@ -166,22 +324,51 @@ def resolve_import(
         candidate = ".".join(full_parts)
         if candidate and candidate in index:
             return index[candidate]
-        # `from . import NAME` where NAME is a symbol in the package
-        # `__init__`, not a submodule: drop one trailing part and try the
-        # package itself (exactly one step, see docstring).
+        # `from . import NAME` where NAME is a symbol, not a submodule: retry once with the package itself.
         if len(full_parts) > 1:
             parent = ".".join(full_parts[:-1])
             if parent in index:
                 return index[parent]
         return None
-    if dotted in index:
-        return index[dotted]
+
+    # HARDEN-6 D: an alias is resolved against the importer's own source root first. `svc_b/app/
+    # views.py` importing `app.models` is `svc_b/app/models.py`, not whichever sub-project's
+    # `app/models.py` came first by sorted path.
+    own_root = _importer_source_root(index, importer_path)
+    if own_root:
+        found = _lookup_index(f"{own_root}.{dotted}", index)
+        if found is not None:
+            return found
+
+    return _lookup_index(dotted, index)
+
+
+def _importer_source_root(index: Dict[str, str], importer_path: Optional[str]) -> str:
+    """The dotted prefix the *importer's* own dotted name was cut at (`svc_b` for
+    `svc_b/app/views.py`), or "" when it has no root of its own or the index carries no layout
+    information. Fail-open by design: an index built by hand resolves as it always did.
+    """
+    if not importer_path:
+        return ""
+    head = getattr(index, "roots_by_path", {}).get(importer_path)
+    return ".".join(head) if head else ""
+
+
+def _lookup_index(dotted: str, index: Dict[str, str]) -> Optional[str]:
+    """Exact match first, then the longest matching package prefix, skipping an alias two or more
+    modules claim (HARDEN-6 D): a contested alias is left unresolved rather than resolved to
+    whichever sub-project happened to sort first.
+
+    An alias that is a module's own dotted name is never in that set (HARDEN-10 D), so a
+    root-level package resolves for an importer outside every sub-project's root.
+    """
+    ambiguous = getattr(index, "ambiguous_aliases", frozenset())
     parts = dotted.split(".")
-    while len(parts) > 1:
-        parts.pop()
+    while parts:
         prefix = ".".join(parts)
-        if prefix in index:
+        if prefix not in ambiguous and prefix in index:
             return index[prefix]
+        parts.pop()
     return None
 
 
@@ -287,12 +474,7 @@ def _unambiguous_symbol_owners(modules: Iterable[ModuleRecord]) -> Dict[str, str
     return {name: next(iter(paths)) for name, paths in owners.items() if len(paths) == 1}
 
 
-#: tree-sitter-java node types that name-call something: an ordinary
-#: method call (`foo()` / `obj.foo()` — only the `name` field is read,
-#: the receiver is ignored, the same "final attribute only" convention
-#: `_called_name` uses for Python's `obj.foo()`) and a constructor call
-#: (`new Circle(...)`), whose "called name" is the type being
-#: instantiated rather than a method identifier.
+#: Java call nodes: method calls (name field only, receiver ignored, as _called_name does for Python) and constructor calls (the type named).
 _JAVA_CALL_NODE_TYPES = frozenset({"method_invocation", "object_creation_expression"})
 
 
@@ -374,38 +556,14 @@ def build_call_edges(root: Path, modules: Iterable[ModuleRecord]) -> Graph:
             continue
 
         if m.language == Language.JAVA:
-            # COLLECT-29: same "re-read, re-parse, walk, look up in
-            # owners, skip anything that doesn't cleanly resolve"
-            # structure as the Python branch below, just against a
-            # tree-sitter tree instead of `ast`. A module that fails to
-            # read, or that tree-sitter can't hand back a usable tree
-            # for (library not installed, a hard parser error), is
-            # silently skipped for call-edge purposes — the same "one
-            # broken/unavailable file can't take down the scan" contract
-            # COLLECT-25 established for `scan_java_module`.
+            # Same structure as the Python branch, on a tree-sitter tree. A module that fails to read or parse is skipped for call edges (COLLECT-25).
             try:
-                source = (root / m.path).read_text(encoding="utf-8")
+                source = (root / m.path).read_text(encoding="utf-8-sig")
             except (OSError, UnicodeDecodeError):
-                # BUGFIX: this used to catch only OSError — a `.java` file
-                # that simply isn't valid UTF-8 raised a bare
-                # UnicodeDecodeError straight out of build_call_edges,
-                # contradicting this branch's own comment ("one broken/
-                # unavailable file can't take down the scan") and the
-                # Python branch below, which already catches both. Same
-                # fix, same reasoning.
+                # Unreadable or non-UTF-8 .java files are skipped, as in the Python branch.
                 continue
             result = parse_java(source, m.path)
-            # BUGFIX: check has_error too — tree-sitter recovers a tree with
-            # ERROR/MISSING nodes for a syntactically broken .java file,
-            # returning error=None, tree=<recovered>, has_error=True.
-            # scan_java_module (scanner.py:100) treats has_error=True as a
-            # parse error and sets ModuleRecord.parse_error, which the
-            # m.parse_error check above (line 352) skips. But this re-parse
-            # is independent of scan_repo — a file that was valid during
-            # scan but corrupted before build_call_edges (or any non-deterministic
-            # tree-sitter recovery) would walk the broken tree and extract
-            # garbage call names. Checking has_error here mirrors the Python
-            # branch's SyntaxError guard and scan_java_module's contract.
+            # Reject recovered trees with error nodes: a file corrupted after the scan must not yield garbage call names.
             if result.error is not None or result.tree is None or result.has_error:
                 continue
             for name in _java_call_names(result.tree):
@@ -415,7 +573,7 @@ def build_call_edges(root: Path, modules: Iterable[ModuleRecord]) -> Graph:
             continue
 
         try:
-            source = (root / m.path).read_text(encoding="utf-8")
+            source = (root / m.path).read_text(encoding="utf-8-sig")
             tree = ast.parse(source, filename=m.path)
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue

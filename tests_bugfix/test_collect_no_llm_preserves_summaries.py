@@ -52,8 +52,7 @@ def _llm(purpose_prefix: str = "purpose of"):
 
     def _call(system: str, user: str) -> str:
         calls.append(user)
-        # The module path is quoted in the prompt; keep the purpose per-module
-        # so a carried-forward summary can be told from a re-derived one.
+        # Quoted module path keeps each purpose per module, so carried-forward summaries are identifiable.
         for name in ("pkg/a.py", "pkg/b.py", "pkg/c.py"):
             if name in user:
                 return json.dumps({"purpose": f"{purpose_prefix} {name}", "notes": ""})
@@ -186,8 +185,7 @@ def test_next_llm_refresh_re_summarizes_stale_modules_even_when_unchanged(summar
     action_collect(summarized, llm_call=None)
     assert _summaries(summarized / ".collect")["pkg/a.py"]["provenance"] == "llm-stale"
 
-    # Nothing changed since the --no-llm refresh, but a.py's summary is
-    # stale: a Pass B run owes it a real one — and only it (b.py is fresh).
+    # a.py's summary is stale and gets a real Pass B run; b.py is fresh and is not re-run.
     llm = _llm("fresh")
     result = action_refresh(summarized, llm_call=llm)
 

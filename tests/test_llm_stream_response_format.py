@@ -91,9 +91,7 @@ def _serve_script(script):
 _OK_BODY = {"choices": [{"message": {"content": '{"ok": true}'}}]}
 _OK_BODY_OLLAMA = {"message": {"content": '{"ok": true}'}}
 
-# A strict-schema provider's rejection of response_format, shaped like the
-# real Gemini "Unknown name" 400 the reasoning-field fallback already
-# handles.
+# Strict-schema rejection of response_format, shaped like Gemini's 400 "Unknown name".
 _REJECT_RESPONSE_FORMAT_400 = json.dumps({
     "error": {
         "code": 400,
@@ -305,8 +303,7 @@ class TestResponseFormat400Fallback:
         finally:
             server.shutdown()
 
-        # Simulate the caller's next build_chat_request() call — same
-        # base_url, flag still True — after the endpoint has been marked.
+        # Next build_chat_request() for the same base_url, after the endpoint is marked.
         _, _, next_payload = build_chat_request(
             base_url=f"http://127.0.0.1:{port}", api_key="k", model="m",
             api_format="openai", temperature=0.0, max_tokens=100,

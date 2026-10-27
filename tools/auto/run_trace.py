@@ -124,6 +124,22 @@ class RunTrace:
         )
         self._state.log(f"[AUTO-F2] task blocked {task_id}: {reason}")
 
+    def log_task_failed(self, task_id: str, reason: str = "commit_failed") -> None:
+        """Record a task that PASSED but could not be committed (B2).
+
+        Distinct from ``log_task_blocked``: the work is done and its acceptance
+        check passed — the *commit* is what failed, so the task stays pending
+        for a resume and its edits are kept as a patch.
+        """
+        tracer.event(
+            source="outer_loop",
+            target=_SOURCE,
+            kind="decision",
+            params={"task_id": task_id, "reason": reason},
+            content="FAILED_COMMIT",
+        )
+        self._state.log(f"[AUTO-F2] task commit failed {task_id}: {reason}")
+
     def log_run_finished(self, stop_reason: Optional[str] = None) -> None:
         """Record a clean (or capped) end of the run."""
         kind    = "run_capped" if stop_reason else "run_finished"
@@ -229,9 +245,7 @@ class RunTrace:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Gate 1 corpus AUTO-T2 grades `setup_run_trace` live: tests/test_gate1_corpus_precision.py
 def setup_run_trace(
@@ -261,10 +275,7 @@ def setup_run_trace(
     agent_dir  = Path(state.agent_dir)
     trace_path = agent_dir / f"trace_{run_id}.jsonl"
 
-    # ── 3–4. Configure the tracer singleton ───────────────────────────────
-    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
-    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
-    # the literal config.getX(...) call shape.
+    # Each config read is wrapped, so extract_config_reads still sees config.getX(...).
     try:
         enabled = config.getboolean("trace", "enabled", fallback=True)
     except ValueError as exc:

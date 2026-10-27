@@ -58,8 +58,7 @@ class TestOverCapKeepsAllAndWarns:
     def test_all_facts_kept_with_warning(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # Distinct, non-substring facts whose combined length lands between
-        # max_chars and the hard ceiling (2x max_chars).
+        # Distinct facts whose total lands between max_chars and 2x max_chars.
         facts = [f"Distinct durable fact number {i} about the world" for i in range(4)]
 
         def extract_llm(system: str, user: str) -> str:
@@ -88,8 +87,7 @@ class TestHardCeilingDropsOldestWithLog:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         max_chars = 20
-        # Each fact is long/distinct enough that dedup can't help, and the
-        # total comfortably exceeds the hard ceiling (2x max_chars = 40).
+        # Facts are distinct and long enough that dedup cannot help; the total exceeds the 2x ceiling.
         facts = [f"Unique durable fact {i} that is fairly long indeed" for i in range(6)]
 
         def extract_llm(system: str, user: str) -> str:
@@ -121,9 +119,7 @@ class TestNoLlmCallInCompaction:
 
         def exploding_llm(system: str, user: str) -> str:
             calls["count"] += 1
-            # First call is the extraction call (must succeed so we have
-            # facts to compact); any call beyond that would be the old
-            # compaction LLM call, which AUTO-CR-24-3 must never make.
+            # First call is the extraction; a later call would be the old compaction LLM call, which must not happen.
             if calls["count"] == 1:
                 return _bullets_text(
                     [f"Durable fact {i} about the established world" for i in range(5)]

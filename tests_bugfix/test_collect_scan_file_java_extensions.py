@@ -42,10 +42,7 @@ def test_scan_file_honors_custom_java_extension_when_config_passed():
 
 
 def test_scan_file_without_config_falls_back_to_default_java_only():
-    # No config at all: only the built-in `.java` extension is Java-eligible,
-    # so `.jav` still falls through to the Python path — same "last resort
-    # default" contract the function has always documented for an
-    # unrecognized extension.
+    # Without config only the built-in .java extension is Java; .jav falls back to the Python path.
     record = scan_file(VALID_JAVA_SRC, "Weird.jav")
     assert record.language == Language.PYTHON
     assert record.parse_error is not None

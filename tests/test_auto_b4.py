@@ -71,9 +71,7 @@ from tools.auto.backlog_prioritiser import (
 from tools.auto.state import _validate_task_schema
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Candidate builder helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cand(
     *,
@@ -137,9 +135,7 @@ def _rt(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — every auto task has a runnable acceptance_check
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: every auto task has a runnable acceptance_check
 
 class TestAutoTasksHaveRunnableChecks:
     def test_real_check_stays_in_auto(self) -> None:
@@ -200,9 +196,7 @@ class TestAutoTasksHaveRunnableChecks:
         assert result.manual_suggestions[0].title == "Manual task"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — check-less tasks land in IMPROVEMENTS.md under "Manual suggestions"
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: check-less tasks go to IMPROVEMENTS.md under Manual suggestions
 
 class TestImprovementsMd:
     def test_manual_section_heading_present(self) -> None:
@@ -274,9 +268,7 @@ class TestImprovementsMd:
         assert "will not" in md.lower() or "not" in md.lower()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dependency inference — same-file linear order
-# ─────────────────────────────────────────────────────────────────────────────
+# Dependency inference: same-file linear order
 
 class TestSameFileLinearDependency:
     def test_earlier_lines_become_dependency(self) -> None:
@@ -336,9 +328,7 @@ class TestSameFileLinearDependency:
         assert task_a.task_id in task_b.dependencies
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dependency inference — cross-file symbol reference
-# ─────────────────────────────────────────────────────────────────────────────
+# Dependency inference: cross-file symbol reference
 
 class TestCrossFileSymbolDependency:
     def test_instruction_mentioning_symbol_adds_dep(self) -> None:
@@ -375,9 +365,7 @@ class TestCrossFileSymbolDependency:
         )
         backlog = build_backlog([a, b])
         task_b = next(t for t in backlog.auto_tasks if t.title == "Use helper")
-        # same-file dep may be added, but not a *cross-file* dep
-        # (both tasks on the same file so cross-file rule must not fire)
-        # We just check no *double* dependency is created
+        # A same-file dep may be added but no cross-file one; check there is no duplicate dependency.
         assert task_b.dependencies.count(backlog.auto_tasks[0].task_id) <= 1
 
     def test_no_dep_without_symbol_in_instruction(self) -> None:
@@ -391,17 +379,7 @@ class TestCrossFileSymbolDependency:
         task_b = next(t for t in backlog.auto_tasks if t.title == "Task B")
         assert not task_b.dependencies
 
-    # Bugfix regression: the chapter-order rule (rule 3) and the
-    # symbol-ref rule (rule 2) can disagree about direction when a symbol
-    # cited in a later chapter happens to be named in an earlier chapter's
-    # instruction text (e.g. foreshadowing). Rule 3 says chapter_1 depends
-    # on nothing and chapter_2 depends on chapter_1; rule 2, read in
-    # isolation, says chapter_1's task depends on chapter_2's task (the
-    # citer of the symbol). Adding both edges produces a 2-node cycle that
-    # _topological_sort() can only resolve by discarding order guarantees
-    # for both tasks entirely. The chapter-order edge (the more reliable,
-    # deterministic rule) must win and the conflicting symbol-ref edge must
-    # be dropped rather than silently creating a cycle.
+    # Regression: a symbol-ref edge must not reverse chapter order (it would form a cycle); the chapter edge wins.
     def test_symbol_ref_does_not_reverse_chapter_order(self) -> None:
         a = _cand(
             title="fix ch2 Bob", file="chapter_2.md", symbol="Bob",
@@ -422,19 +400,14 @@ class TestCrossFileSymbolDependency:
         # No cycle: exactly one direction of dependency exists between them.
         assert not (task_a.task_id in task_b.dependencies
                     and task_b.task_id in task_a.dependencies)
-        # Chapter order wins: chapter_2's task depends on chapter_1's task
-        # (correct causal direction), and chapter_1's task has no reverse
-        # dependency back on chapter_2's task (which the symbol-ref rule,
-        # read in isolation, would have incorrectly added).
+        # Chapter order wins: chapter_2 depends on chapter_1, and chapter_1 gets no reverse edge.
         assert task_a.dependencies == [task_b.task_id]
         assert task_a.task_id not in task_b.dependencies
         # The correct chapter order is preserved in the final ordering.
         assert backlog.auto_tasks.index(task_b) < backlog.auto_tasks.index(task_a)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Topological sort
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestTopologicalSort:
     def test_chain_ordered_correctly(self) -> None:
@@ -483,9 +456,7 @@ class TestTopologicalSort:
         assert len(ordered) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Task IDs
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestTaskIDs:
     def test_default_prefix(self) -> None:
@@ -514,9 +485,7 @@ class TestTaskIDs:
         assert result.auto_tasks[0].task_id == "AUTO-T1"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # State task conversion
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestStateTaskConversion:
     def test_schema_valid(self) -> None:
@@ -563,8 +532,7 @@ class TestStateTaskConversion:
         t = backlog.to_state_tasks(status="in_progress")[0]
         assert t["status"] == "in_progress"
 
-    # Bugfix regression: new_file used to be silently dropped when a
-    # candidate was converted into a persisted task dict.
+    # Regression: new_file used to be dropped when a candidate became a persisted task dict.
     def test_new_file_flag_preserved(self) -> None:
         c = _cand(file="tools/brand_new.py", symbol=None, line_start=None,
                    line_end=None, acceptance_check="pytest", new_file=True)
@@ -579,9 +547,7 @@ class TestStateTaskConversion:
         assert t["cited_locations"][0]["new_file"] is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # _is_runnable_check unit tests
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestIsRunnableCheck:
     @pytest.mark.parametrize("check,expected", [
@@ -618,9 +584,7 @@ class TestIsRunnableCheck:
         assert _is_runnable_check(check) is expected
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # PrioritisedBacklog.summary()
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestBacklogSummary:
     def test_summary_counts(self) -> None:
@@ -636,9 +600,7 @@ class TestBacklogSummary:
         assert "0" in backlog.summary()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # ReadyTask property pass-throughs
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestReadyTaskProperties:
     def test_passthrough_properties(self) -> None:
@@ -655,9 +617,7 @@ class TestReadyTaskProperties:
         assert rt.cited_location is c.cited_location
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Integration
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestIntegration:
     def test_end_to_end_ordering_and_split(self) -> None:

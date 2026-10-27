@@ -52,9 +52,7 @@ from tools.auto.ticket_store import make_ticket_store
 from tools.auto.bug_fix_loop import BugFixResult
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fake helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class FakeExecResult:
@@ -199,9 +197,7 @@ def _run_with_fakes(
     return stop_reason, tasks_done, fake_outer, fake_executor, fake_bfl
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — Seeded regression → bug ticket opened + fix commit + ticket closed
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: a seeded regression opens a bug ticket, a fix commit, and closes the ticket
 
 class TestG5RegressionFixed:
     def test_bfl_called_when_prior_done_task_regresses(self, tmp_path):
@@ -211,8 +207,7 @@ class TestG5RegressionFixed:
         new_task  = _make_task("T-NEW")
         ctrl      = _make_controller(tmp_path, [done_task, new_task])
 
-        # T-DONE is already done — it should not be re-executed by outer_loop.
-        # T-NEW passes. executor detects T-DONE regressed.
+        # T-DONE must not be re-executed; executor flags it as regressed when T-NEW passes.
         _, _, _, fake_exec, fake_bfl = _run_with_fakes(
             ctrl,
             outer_side_effects=[_passed_outer("T-NEW")],
@@ -276,9 +271,7 @@ class TestG5RegressionFixed:
         assert "BUG-T-SUM" in log_text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — Permanently-failing fix → "deferred" ticket, no crash
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: a permanently failing fix gives a deferred ticket, with no crash
 
 class TestG5RegressionExhausted:
     def test_exhausted_fix_does_not_raise(self, tmp_path):
@@ -322,9 +315,7 @@ class TestG5RegressionExhausted:
         assert "BUG-T-EXLOG" in log_text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC3 — just-committed task excluded from regression scan
-# ─────────────────────────────────────────────────────────────────────────────
+# AC3: a just-committed task is excluded from the regression scan
 
 class TestG5ExcludeJustCommitted:
     def test_just_committed_task_not_checked(self, tmp_path):
@@ -337,8 +328,7 @@ class TestG5ExcludeJustCommitted:
             outer_side_effects=[_passed_outer("T-ONLY")],
         )
 
-        # No previously-DONE tasks (besides the one we just committed),
-        # so executor should never be called for a regression check.
+        # No earlier DONE task is left to check, so the executor is never called.
         fake_exec.run.assert_not_called()
 
     def test_only_prior_done_tasks_checked(self, tmp_path):
@@ -364,9 +354,7 @@ class TestG5ExcludeJustCommitted:
         assert "T-NEW4" not in checked_ids
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC4 — Tasks without acceptance_check are silently skipped
-# ─────────────────────────────────────────────────────────────────────────────
+# AC4: tasks without acceptance_check are skipped silently
 
 class TestG5SkipNoCheck:
     def test_task_without_check_not_executed(self, tmp_path):
@@ -398,9 +386,7 @@ class TestG5SkipNoCheck:
         fake_bfl.handle_regression.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC6 — Run continues when regression is detected mid-run
-# ─────────────────────────────────────────────────────────────────────────────
+# AC6: the run continues when a regression is detected mid-run
 
 class TestG5RunContinues:
     def test_pending_tasks_run_after_regression_fixed(self, tmp_path):
@@ -410,8 +396,7 @@ class TestG5RunContinues:
         task2  = _make_task("T-B")
         ctrl   = _make_controller(tmp_path, [done, task1, task2])
 
-        # After T-A commits:  check T-PRE (1 call, fails → bfl triggered)
-        # After T-B commits:  check T-PRE + T-A (2 calls, both pass)
+        # Each commit adds one more regression check: one call first, then two.
         _, tasks_done, fake_outer, fake_exec, _ = _run_with_fakes(
             ctrl,
             outer_side_effects=[_passed_outer("T-A"), _passed_outer("T-B")],
@@ -432,8 +417,7 @@ class TestG5RunContinues:
         task2 = _make_task("T-P2")
         ctrl  = _make_controller(tmp_path, [done, task1, task2])
 
-        # After T-P1 commit: check T-GREEN (1 call)
-        # After T-P2 commit: check T-GREEN + T-P1 (2 calls)
+        # Same pattern as above: one check after the first commit, two after the second.
         _, _, _, _, fake_bfl = _run_with_fakes(
             ctrl,
             outer_side_effects=[_passed_outer("T-P1"), _passed_outer("T-P2")],
@@ -453,8 +437,7 @@ class TestG5RunContinues:
         task_b = _make_task("T-RB")
         ctrl   = _make_controller(tmp_path, [done, task_a, task_b])
 
-        # After T-RA commit: check T-R0 → fails (1 call)
-        # After T-RB commit: check T-R0 + T-RA → both fail (2 calls)
+        # Same pattern again, with both checks failing.
         stop_reason, tasks_done, *_ = _run_with_fakes(
             ctrl,
             outer_side_effects=[_passed_outer("T-RA"), _passed_outer("T-RB")],
@@ -469,9 +452,7 @@ class TestG5RunContinues:
         assert tasks_done == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Unit: _check_regressions in isolation
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestCheckRegressionsUnit:
     """Unit tests for controller._check_regressions directly."""

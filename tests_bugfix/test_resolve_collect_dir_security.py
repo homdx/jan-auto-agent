@@ -58,11 +58,7 @@ def test_allows_absolute_path_that_still_resolves_inside_root(tmp_path: Path):
 
 
 def test_allows_traversal_that_normalizes_back_inside_root(tmp_path: Path):
-    # `sub/../.collect` contains `..` but os.path.normpath collapses it
-    # back to `.collect`, still under root. The containment check runs
-    # against the *normalized* destination, not a blanket ban on the `..`
-    # substring, so this has to be allowed — otherwise the fix would be
-    # over-broad and reject legitimate configs alongside malicious ones.
+    # sub/../.collect normalises back under the root, so it is allowed: the check runs on the normalised path.
     result = resolve_collect_dir(tmp_path, _config("sub/../.collect"))
     assert Path(os.path.normpath(str(result))) == tmp_path / ".collect"
 
@@ -76,8 +72,7 @@ def test_rejects_relative_traversal_above_root(tmp_path: Path):
 
 
 def test_rejects_single_level_traversal(tmp_path: Path):
-    # One level up is still "outside the project root" — the check is
-    # exact containment, not a depth threshold.
+    # One level up is outside the root: the check is exact containment, not a depth limit.
     with pytest.raises(CollectCliError, match="outside the project root"):
         resolve_collect_dir(tmp_path, _config(".."))
 
@@ -94,8 +89,7 @@ def test_rejects_absolute_path_to_unrelated_system_dir(tmp_path: Path):
 
 
 def test_error_message_names_the_offending_setting(tmp_path: Path):
-    # Not just "raises something" — a human has to go fix a config typo
-    # from this message, so it has to actually point at what's wrong.
+    # The message must name the offending setting, so a human can fix the config.
     outside = tmp_path.parent / "escaped"
     with pytest.raises(CollectCliError) as exc_info:
         resolve_collect_dir(tmp_path, _config(str(outside)))

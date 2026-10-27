@@ -137,9 +137,7 @@ def _named_paths(line: str) -> int:
     return len([part for part in line.split(", ") if part.endswith(".py")])
 
 
-# A graph used by most of the row tests below. `pkg/hub.py` is imported by 7
-# shipped modules and 3 test modules, imports 7 shipped modules, and is
-# covered by 7 test files — so every cap in this file has a remainder to cut.
+# Graph shared by the row tests: pkg/hub.py has a remainder under every cap.
 CALLERS_HEAVY = tuple(f"pkg/c{i}.py" for i in range(1, 8))
 TEST_CALLERS = (
     "tests/test_one.py",
@@ -601,8 +599,7 @@ def test_a_row_that_raises_is_dropped_but_the_pack_survives(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _empty_seeds(monkeypatch):
-    # Seed contracts and the gate map are not under test here; neutralising
-    # them keeps the collected graph and test map deterministic.
+    # Neutralise seed contracts and the gate map so the graph and test map stay deterministic.
     monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules, root=None: [])
     monkeypatch.setattr(cli_mod.gates_mod, "build_gates_map", lambda modules, root: [])
 
@@ -662,8 +659,7 @@ def test_a_collected_repo_renders_the_neighbourhood_rows_through_the_loader(neig
         "tests: 1 file: tests/test_core.py",
         "public_symbols: pkg/core.py:core_fn",
     ]
-    # `core.py` imports only `os`, which the producer drops as stdlib, so the
-    # row is absent rather than claiming an empty import list.
+    # core.py imports only stdlib (dropped), so the row is absent rather than empty.
     assert _CALLS_INTO_PREFIX not in block
     assert _row_calls_into(model, "pkg/core.py", None) == ""
 

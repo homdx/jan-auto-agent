@@ -66,9 +66,7 @@ def test_llm_notes_claiming_unsafe_do_not_flip_a_guarded_verdict(mini_repo):
     assert answer.safe is True
     assert answer.reason == "guarded"
 
-    # Now attach LLM prose that directly contradicts the static fact, by
-    # patching a false "unsafe" claim straight into the artifact's module
-    # summary -- exactly the shape Pass B would produce.
+    # Attach LLM prose that contradicts a static fact, as Pass B would produce.
     collect_dir = cli_mod.resolve_collect_dir(mini_repo, None)
     artifact_path = collect_dir / cli_mod.ARTIFACT_FILENAME
     payload = json.loads(artifact_path.read_text(encoding="utf-8"))
@@ -81,9 +79,7 @@ def test_llm_notes_claiming_unsafe_do_not_flip_a_guarded_verdict(mini_repo):
             }
     artifact_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    # Freshness (file hashes) is untouched -- only the artifact's own
-    # summary field changed -- so this still loads as fresh, and the
-    # verdict must be identical: static facts, not LLM notes, decide.
+    # Fresh hashes with changed LLM notes: static facts, not LLM notes, decide the verdict.
     model_with_llm_notes = loader_mod.load(mini_repo)
     answer2 = model_with_llm_notes.is_safe(location)
     assert answer2.safe is True

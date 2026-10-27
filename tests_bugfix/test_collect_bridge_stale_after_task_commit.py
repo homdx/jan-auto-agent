@@ -805,8 +805,7 @@ def test_controller_reports_how_many_blocks_it_withheld(mini_repo, monkeypatch):
     ctrl.limits = RunLimits(max_tasks_per_run=2)
     logs: list[str] = []
     ctrl.state.log = logs.append
-    # Two tasks on the same file: T1 commits an edit, T2 reads the block
-    # for it (and so meets the dirty path), then the task cap stops the run.
+    # T1 commits an edit; T2 reads the block for it and meets the dirty path; the task cap then stops the run.
     ctrl.state.resume_info.return_value = {"pending": [
         _task("T1", "pkg/a.py"),
         _task("T2", "pkg/a.py"),
@@ -846,8 +845,7 @@ def test_controller_reports_nothing_when_nothing_was_withheld(mini_repo, monkeyp
     fake_outer.run_task.return_value = SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
     _run_loop(ctrl, fake_outer)
 
-    # The path T1 wrote is still dirty, so the run says so — but it never
-    # withheld a block, and the summary must not claim it did.
+    # The dirty path is reported but no block is withheld, and the summary must not claim one.
     assert not any("withheld" in line for line in logs), logs
     assert any("still unrefreshed" in line and "pkg/a.py" in line for line in logs), logs
 
@@ -873,8 +871,7 @@ def test_controller_auto_refresh_gives_task3_the_post_task1_facts(mini_repo, mon
     seen: dict[str, str] = {}
 
     def _read_then_edit(task, base_dir):
-        # The real pipeline builds the coder prompt (and therefore reads the
-        # collect block) BEFORE the task writes anything — mirror that order.
+        # The real pipeline builds the coder prompt (and reads the collect block) before the task writes.
         seen[task["id"]] = ctrl._get_collect_bridge("code").context_for(
             task["target_files"][0])
         new_symbol = f"helper_from_{task['id']}"
@@ -891,13 +888,11 @@ def test_controller_auto_refresh_gives_task3_the_post_task1_facts(mini_repo, mon
     assert "helper_from_T1" in seen["T3"], (
         "task 3 must see task 1's post-edit facts; it saw: %r" % seen["T3"])
     assert "helper_from_T3" not in seen["T3"]
-    # Task 1 was served the pre-edit facts, as it must be — its own edit had
-    # not happened yet.
+    # Task 1 gets the pre-edit facts, as it must: its own edit has not happened yet.
     assert "helper_from_T1" not in seen["T1"]
     # Task 3's own commit must have been visible to task 5's read.
     assert "helper_from_T3" in seen["T5"]
-    # A task that never touches pkg/a.py keeps reading real blocks the whole
-    # time, and the build-once contract survives the repairs.
+    # A task that never touches pkg/a.py keeps reading real blocks, and build-once survives the repairs.
     assert "COLLECT MODEL" in seen["T2"]
     assert "COLLECT MODEL" in seen["T4"]
     assert len(counts) == 1, f"load() called {len(counts)} times for 5 tasks"

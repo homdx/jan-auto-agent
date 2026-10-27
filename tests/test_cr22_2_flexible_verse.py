@@ -19,9 +19,7 @@ from tools.auto.prosody import (
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-# Two quatrains, NONE rhyme scheme (no AABB/ABAB/ABCB anywhere), but
-# positionally syllable-regular (8-8-8-8 in both stanzas) — i.e. "blank
-# verse": regular rhythm, no rhyme.
+# Two quatrains with no rhyme scheme but regular rhythm: blank verse.
 _BLANK_VERSE_TWO_STANZAS = """\
 Тихо падает первый снег
 Город молчит под фонарём
@@ -34,8 +32,7 @@ _BLANK_VERSE_TWO_STANZAS = """\
 Листья летят, кружась, кружась
 """
 
-# Same first stanza alone (single stanza, NONE scheme) — used to confirm the
-# rhythm rule cannot fire with nothing to compare against.
+# One stanza with no rhyme: the rhythm rule cannot fire with nothing to compare.
 _SINGLE_STANZA_NO_RHYME = """\
 Тихо падает первый снег
 Город молчит под фонарём
@@ -43,8 +40,7 @@ _SINGLE_STANZA_NO_RHYME = """\
 Ветер качает старый дом
 """
 
-# Clean AABB quatrain — rhymes (used for the rhyme-required regression check
-# in the negative direction: take an unrhymed quatrain instead).
+# Unrhymed single quatrain for the negative rhyme check.
 _UNRHYMED_SINGLE_QUATRAIN = _SINGLE_STANZA_NO_RHYME
 
 

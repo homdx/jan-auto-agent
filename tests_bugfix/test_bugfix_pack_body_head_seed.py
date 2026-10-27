@@ -75,9 +75,7 @@ def test_a_row_line_coincidentally_matching_the_module_head_line_is_kept():
     block = ca.build_collect_context_block(model, TARGET)
     lines = block.split("\n")
 
-    # One "module: pkg/hub.py" from the head, and a SECOND one contributed
-    # by the fake row's own line — before the fix only the head's copy
-    # survived.
+    # The head's module line and the fake row's own module line both survive.
     assert lines.count(f"module: {TARGET}") == 2
     assert "config_read [coder] num_ctx (fallback=8192)" in lines
 

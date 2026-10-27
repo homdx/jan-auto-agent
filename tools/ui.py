@@ -1,6 +1,53 @@
+"""Terminal output helpers: a spinner and streamed-token writers.
+
+Everything here is *cosmetic* output. None of it may ever raise into the
+caller: the LLM reply it accompanies has already been paid for and, once the
+process's stdout is closed (a pipe to ``head``, a cron job with no terminal,
+``| tail -1``), ``sys.stdout.write`` raises ``BrokenPipeError`` on every
+subsequent call. A raised write inside a call's ``try`` therefore turns a
+received answer into a failed call — see :func:`safe_stdout_write`.
+"""
+
 import sys
 import time
 import threading
+
+__all__ = ["Spinner", "stream_tracker", "safe_stdout_write", "safe_print"]
+
+
+def safe_stdout_write(t: str) -> None:
+    """Write *t* to stdout, swallowing a closed/broken stdout.
+
+    When stdout is piped to a command that closes early (``| head``) or the
+    process is run without a terminal, ``sys.stdout.write`` raises
+    ``BrokenPipeError`` — and stays broken, so the second write raises too.
+    Streaming output is cosmetic: the token has already been received and is
+    appended to the caller's own buffer, so the only correct behaviour is to
+    drop the write and carry on.
+
+    Shared by every streaming call site (validator, improvement, architect,
+    coder) so a closed stdout can never be classified as an LLM failure.
+    """
+    try:
+        sys.stdout.write(t)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        # A stdout that is not UTF-8 (a Windows console redirected to a file, a latin-1 locale) gets the
+        # characters it can hold; the 🧠 of a banner is not a failed call.
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        try:
+            sys.stdout.write(t.encode(encoding, "replace").decode(encoding, "replace"))
+            sys.stdout.flush()
+        except (OSError, ValueError, LookupError):
+            pass
+    except (OSError, ValueError):   # BrokenPipeError is an OSError, a closed file a ValueError
+        pass
+
+
+def safe_print(line: str = "") -> None:
+    """``print(line)`` that cannot raise on a closed stdout — the same
+    contract as :func:`safe_stdout_write` for a whole line."""
+    safe_stdout_write(line + "\n")
 
 
 class Spinner:
@@ -30,11 +77,12 @@ class Spinner:
         try:
             sys.stdout.write(f"\r{self.frames[self.idx % len(self.frames)]} {self.message}...")
             sys.stdout.flush()
+        except UnicodeEncodeError:
+            # AUDIT3-18: a stdout that cannot hold the Braille frames gets ASCII ones.
+            self.frames = ["|", "/", "-", "\\"]
+            safe_stdout_write(f"\r{self.frames[self.idx % len(self.frames)]} {self.message}...")
         except (BrokenPipeError, OSError):
-            # AUTO-UI-GUARD-1: stdout piped somewhere that closed early
-            # (`| head`, a disconnected terminal, ...) — every future call
-            # would fail identically, so stop the background thread
-            # instead of spinning forever on a dead pipe.
+            # Stdout closed early (e.g. | head): stop the thread instead of spinning on a dead pipe.
             self.running = False
             return
         self.idx += 1
@@ -60,7 +108,7 @@ class Spinner:
         try:
             sys.stdout.write("\r" + " " * (len(self.message) + 6) + "\r")
             sys.stdout.flush()
-        except (BrokenPipeError, OSError):
+        except (BrokenPipeError, OSError, UnicodeEncodeError):
             pass
 
     # ── context-manager support ──────────────────────────────────────────
@@ -96,11 +144,11 @@ def stream_tracker():
         try:
             sys.stdout.write(t)
             sys.stdout.flush()
+        except UnicodeEncodeError:
+            # AUDIT3-18: a non-UTF-8 stdout must not kill a paid streaming call.
+            safe_stdout_write(t)
         except (BrokenPipeError, OSError):
-            # AUTO-UI-GUARD-1: stdout piped somewhere that closed early —
-            # cosmetic streaming output only; the underlying LLM call and
-            # its accumulated result are unaffected, so swallow and keep
-            # tracking token stats rather than crashing mid-stream.
+            # Stdout closed early: streaming output is cosmetic, so keep tracking tokens and do not crash.
             pass
 
     def stats() -> str:

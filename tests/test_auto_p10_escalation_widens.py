@@ -137,9 +137,7 @@ class TestEscalationAlwaysWidens:
         assert p.raise_budget(1.5) == int(16624 * 1.5)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # End to end
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg() -> configparser.ConfigParser:
     c = configparser.ConfigParser()
@@ -185,10 +183,7 @@ def test_seeded_escalation_is_strictly_wider(cluster_and_base, tmp_path) -> None
                         api_key="t", model="m", api_format="openai",
                         verify_ssl=False)
     r._probe_built = True
-    # Blocks of ~1 215 chars against a seeded cap of 3 600: three fit, the
-    # fourth is dropped, and the next pass of the loop escalates. Sized so the
-    # budget actually binds — an end-to-end test that never escalates would
-    # pass no matter what raise_budget did.
+    # Blocks sized so the budget binds and the loop escalates.
     p = ArchProbe(_Bridge(1200), max_chars=2000, max_total_chars=2000)
     p.configure_learning(warmup=1, headroom=4.0, ceiling=0)
     p._round_costs = [900]          # seeded cap = 3 600, above the 2 000 floor

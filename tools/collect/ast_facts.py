@@ -29,25 +29,13 @@ from typing import Any, List, Optional
 
 from tools.collect.model import ConfigRead, ExceptSite, FunctionRecord
 
-#: AST node types that count as a "public symbol" for COLLECT-4 — top-level
-#: functions/classes. Nested defs (methods, closures) are intentionally out
-#: of scope for this task; they're not part of a module's public surface.
+#: AST node types that count as public symbols: top-level functions and classes only (COLLECT-4).
 _SYMBOL_NODE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 
-#: `ConfigParser` reader methods COLLECT-5 recognizes. The idiom this
-#: codebase uses everywhere (`agents.ini` access) is
-#: ``config.get*(section, key, fallback=...)`` — the presence of a
-#: `fallback=` keyword is what distinguishes a config read from an
-#: unrelated `.get(...)` call (e.g. `dict.get`), so that keyword is
-#: required, not just the method name.
+#: Config reader method names; a read is recognised only with a fallback= keyword, so dict.get is not counted (COLLECT-5).
 _CONFIG_READ_METHODS = frozenset({"get", "getint", "getboolean", "getfloat"})
 
-#: Attribute-call method names COLLECT-6 treats as "this except body logs
-#: the error" — i.e. not silent, even though it doesn't re-raise. Matches
-#: both the stdlib `logging` API and the common `logger.*`/`self.logger.*`
-#: call-site idiom this codebase uses (the method name is what's checked,
-#: not the receiver, since a dedicated logger instance's import alias
-#: varies module to module).
+#: Logging method names: a handler that calls one is not a silent fail-open (COLLECT-6).
 _LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "exception", "critical", "log"})
 
 
@@ -77,14 +65,11 @@ def extract_symbols(tree: ast.Module, module_path: str) -> List[FunctionRecord]:
                     is_private=node.name.startswith("_"),
                 )
             )
-    # Stable order independent of AST traversal quirks: by source position,
-    # then qualname as a tiebreaker (COLLECT-3 determinism).
+    # Sorted by source position, then by qualname, so the order is stable (COLLECT-3).
     return sorted(symbols, key=lambda s: (s.lineno, s.qualname))
 
 
-#: V10: a rendered parameter list longer than this is cut on a parameter
-#: boundary and closed with `, …)` — a 40-symbol `module` block has to stay
-#: readable, and a 300-char signature is not what "readable" means.
+#: A long parameter list is cut on a parameter boundary, so a module block stays readable (V10).
 _SIGNATURE_MAX_CHARS = 160
 
 
@@ -118,11 +103,16 @@ def _signature(node: ast.AST) -> str:
     except Exception:  # AttributeError on < 3.9; anything else → placeholder
         return f"{name}(...)"
     if drop_self:
-        # `ast.unparse` gives "self, a, b" / "self" / "self, *args"; the
-        # first parameter of `__init__` is not part of the calling
-        # convention the reader is after.
+        # The first parameter of __init__ is not part of the calling convention, so it is dropped from the rendered list.
         head, sep, rest = rendered.partition(", ")
         rendered = rest if sep else ""
+        # AUDIT3-C16: `def __init__(self, /, x)` left a bare positional-only
+        # marker in front — `C(/, x)` is not Python. With `self` gone the
+        # marker has nothing before it, so it goes too.
+        if rendered == "/":
+            rendered = ""
+        elif rendered.startswith("/, "):
+            rendered = rendered[3:]
     full = f"{name}({rendered})"
     if len(full) <= _SIGNATURE_MAX_CHARS:
         return full
@@ -137,11 +127,13 @@ def _signature(node: ast.AST) -> str:
 
 def _split_params(rendered: str) -> List[str]:
     """Split an `ast.unparse(arguments)` string on top-level commas — the
-    commas inside a default value (`x=(1, 2)`, `y={'a': 1}`, `z='a, b'`)
-    or an annotation (`Dict[str, int]`) do not separate parameters."""
+    commas inside a default value (`x=(1, 2)`, `y={'a': 1}`, `z='a, b'`),
+    an annotation (`Dict[str, int]`) or a lambda's parameters (`f=lambda x, y:
+    x`) do not separate parameters."""
     parts: List[str] = []
     depth = 0
     quote: Optional[str] = None
+    lambdas: List[int] = []         # the depth of each lambda whose ":" is still ahead
     start = 0
     i = 0
     while i < len(rendered):
@@ -157,7 +149,14 @@ def _split_params(rendered: str) -> List[str]:
             depth += 1
         elif ch in ")]}":
             depth -= 1
-        elif ch == "," and depth == 0:
+        elif ch == "l" and rendered.startswith("lambda", i) and (i == 0 or not (rendered[i - 1].isalnum()
+                or rendered[i - 1] == "_")) and not (rendered[i + 6:i + 7].isalnum() or rendered[i + 6:i + 7] == "_"):
+            lambdas.append(depth)
+            i += 6
+            continue
+        elif ch == ":" and lambdas and lambdas[-1] == depth:
+            lambdas.pop()
+        elif ch == "," and depth == 0 and not lambdas:
             parts.append(rendered[start:i].strip())
             start = i + 1
         i += 1
@@ -234,20 +233,7 @@ def extract_all_defined_names(tree: ast.Module) -> "frozenset[str]":
                 _walk(child, in_function_body=True)
             elif isinstance(child, ast.ClassDef):
                 names.add(child.name)
-                # A class body always executes at class-definition time as
-                # its own scope — same as module scope — regardless of
-                # *where* the `class` statement itself sits. BUGFIX: this
-                # used to pass through the enclosing `in_function_body`
-                # unchanged, so a class defined *inside* a function (e.g.
-                # `def f(): class Local: ATTR = 1`) incorrectly inherited
-                # that function's "local, non-citable" scope for its own
-                # body, excluding `Local`'s own attributes (`ATTR`) the
-                # same as if they were the enclosing function's local
-                # variables. A class's own attributes are real, citable
-                # names (`module.py:ATTR`-style) no matter how the class
-                # itself is nested, so its body always resets to `False`
-                # here — only a further-nested `def` inside that class
-                # (a method) reintroduces function-local scope beneath it.
+                # A class body is its own scope, so its attributes are citable names even when the class sits inside a function (BUGFIX).
                 _walk(child, in_function_body=False)
             elif isinstance(child, ast.Assign) and not in_function_body:
                 for target in child.targets:
@@ -314,9 +300,7 @@ def extract_imports(tree: ast.Module) -> List[str]:
             if node.module:
                 names.add(prefix + node.module)
             elif node.level:
-                # `from . import util` / `from .. import helpers` — the
-                # only surviving spelling of the dependency is the alias
-                # list itself.
+                # Names imported with a relative "from . import x" are kept as the alias list (the only spelling left).
                 for alias in node.names:
                     names.add(prefix + alias.name)
     return sorted(names)
@@ -440,23 +424,10 @@ def _simple_literal_assignments(tree: ast.Module) -> dict:
     return {k: v for k, v in seen.items() if k not in ambiguous}
 
 
-#: The name of this codebase's shared mode-aware config-read helper
-#: (`tools.auto.utils._cfg_mode`). Calling it at all *is* the
-#: `{key}_{task_mode}` mode-override convention — it unconditionally tries
-#: `{key}_{task_mode}` before falling back to the bare `key` — so a call
-#: shaped like this is recognized by name, the same way `_CONFIG_READ_
-#: METHODS` recognizes `ConfigParser` methods by name.
+#: The shared mode-aware config helper is recognised by name; calling it is the {key}_{task_mode} convention (COLLECT-5).
 _CFG_MODE_HELPER_NAME = "_cfg_mode"
 
-#: This codebase's shared fail-open config readers (`tools.config_safe`,
-#: FIX-2 M3). Their argument order deliberately mirrors `_cfg_mode`'s —
-#: `safe_get*(config, section, key, fallback=...)` — so the same positional
-#: layout applies: section is args[1], key is args[2]. Recognized by name for
-#: the same reason `_cfg_mode` is: the real `config.get*` call lives inside
-#: the helper's body, one module away from every caller, so an extractor that
-#: only saw literal `config.get*()` shapes would record ZERO reads for every
-#: site that routes through them — silently emptying the config map of 31
-#: call sites the moment they were converted.
+#: The shared fail-open config readers are recognised by name, with the same argument layout as the mode helper (FIX-2 M3).
 _SAFE_CONFIG_HELPERS = frozenset({"safe_getint", "safe_getfloat", "safe_getboolean"})
 
 
@@ -513,9 +484,7 @@ def extract_config_reads(tree: ast.Module, module_path: str) -> List[ConfigRead]
                     fallback_node = kw.value
                     break
             if fallback_node is None and len(node.args) < 3:
-                # No `fallback=` keyword and no positional fallback: this is
-                # not the ConfigParser idiom this codebase uses — likely an
-                # unrelated `.get(...)` call. Skip it.
+                # A call without a fallback is not the ConfigParser idiom this codebase uses, so it is not recorded as a read.
                 continue
             if fallback_node is None and len(node.args) >= 3:
                 fallback_node = node.args[2]
@@ -552,11 +521,7 @@ def extract_config_reads(tree: ast.Module, module_path: str) -> List[ConfigRead]
             )
 
         elif isinstance(func, ast.Name) and func.id in _SAFE_CONFIG_HELPERS:
-            # safe_getint(config, section, key, fallback=...) — the leading
-            # `config` positional shifts section/key one slot later than the
-            # direct-call shape above, exactly like _cfg_mode. Unlike
-            # _cfg_mode, these never imply the mode-override convention: they
-            # read the key they are given, verbatim.
+            # safe_getint and friends shift section and key one slot, like _cfg_mode, but read the key verbatim (no mode convention).
             if len(node.args) < 3:
                 continue  # can't determine section/key positionally; skip
 
@@ -597,9 +562,7 @@ def extract_config_reads(tree: ast.Module, module_path: str) -> List[ConfigRead]
             )
 
         elif isinstance(func, ast.Name) and func.id == _CFG_MODE_HELPER_NAME:
-            # _cfg_mode(config, section, key, task_mode, fallback=...) —
-            # note the leading `config` positional shifts section/key one
-            # slot later than the direct-call shape above.
+            # _cfg_mode shifts section and key one slot later than the direct-call shape.
             if len(node.args) < 3:
                 continue  # can't determine section/key positionally; skip
 
@@ -729,16 +692,7 @@ def _walk_own_scope(node: ast.AST):
         for deco in node.decorator_list:
             yield from _walk_own_scope(deco)
         yield from _walk_own_scope(node.args)
-        # BUGFIX: `node.returns` (the `-> ...` return-type annotation) is
-        # evaluated eagerly at def-statement time, in the enclosing scope
-        # — exactly like `decorator_list` and the argument defaults above,
-        # and for the same reason (it must exist before the function
-        # object is even callable). It was left out of this branch, so a
-        # call hidden there (e.g. `def handler() -> logger.error(...):`)
-        # was silently missed by `_classify_except_body`, misclassifying
-        # a handler that does log at the except site as `"pass"`/
-        # `is_fail_open=True`. `ast.Lambda` has no return annotation, so
-        # no matching gap exists in that branch below.
+        # A return annotation runs at definition time, in the enclosing scope, so a call in it counts as logging (BUGFIX).
         if node.returns is not None:
             yield from _walk_own_scope(node.returns)
         return
@@ -813,9 +767,7 @@ def extract_except_sites(tree: ast.Module, module_path: str) -> List[ExceptSite]
     the AC references (`coder.py:718`, `coder.py:866`) use.
     """
     handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
-    # Stable order (COLLECT-3 determinism): by source line, numerically —
-    # not by the formatted `location` string, which would sort "...:10"
-    # before "...:9".
+    # Handlers are sorted by line number, not by the formatted location string, so 9 comes before 10 (COLLECT-3).
     handlers.sort(key=lambda h: h.lineno)
 
     sites: List[ExceptSite] = []

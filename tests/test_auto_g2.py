@@ -53,9 +53,7 @@ from tools.auto.outer_loop import OuterLoopResult
 from tools.auto.exhaustion_handler import ExhaustionOutcome
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers / factories
-# ─────────────────────────────────────────────────────────────────────────────
+# Helpers and factories
 
 def _make_task(task_id: str, *, deps: list[str] | None = None) -> dict:
     return {
@@ -136,9 +134,7 @@ def _make_controller(tmp_path: Path, tasks: list[dict], *, runtime_cap: float = 
     return ctrl
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AUTO-G2 AC1: skeleton is gone, outer_loop is called, task ends DONE
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestG2TaskPassesAndCommits:
     def test_passed_task_marked_done_with_commit(self, tmp_path):
@@ -229,9 +225,7 @@ class TestG2TaskPassesAndCommits:
         assert fake_commit_helper.commit.call_count == 3
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-G4: Exhaustion → knowledge + ticket, run continues
-# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-G4: exhaustion writes knowledge and a ticket, and the run continues
 
 class TestG4Exhaustion:
     def test_exhausted_task_calls_exhaustion_handler(self, tmp_path):
@@ -317,9 +311,7 @@ class TestG4Exhaustion:
         assert fake_outer.run_task.call_count == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-G2 AC2: caps preserved
-# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-G2 AC2: caps are preserved
 
 class TestG2CapsPreserved:
     def test_task_cap_fires_before_second_task(self, tmp_path):
@@ -379,9 +371,7 @@ class TestG2CapsPreserved:
         assert tasks_done == 5
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # AUTO-G2 AC3: dependency guard
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestG2DependencyGuard:
     def test_blocked_by_incomplete_dep_skipped(self, tmp_path):
@@ -404,11 +394,7 @@ class TestG2DependencyGuard:
              patch("tools.auto.exhaustion_handler.make_exhaustion_handler"):
             stop_reason, tasks_done = ctrl._run_task_loop()
 
-        # T-DEP ran (no deps), T-BLOCKED was skipped (dep not done at loop time)
-        # Note: loop order is pending order; T-DEP runs first → DONE,
-        # but T-BLOCKED sees T-DEP as DONE only if commit_helper updated it.
-        # commit_helper is mocked; state.set_task_status DONE is NOT called by mock.
-        # So T-BLOCKED's dep T-DEP remains not-DONE at the dependency check.
+        # commit_helper is mocked, so T-DEP never reaches DONE and T-BLOCKED stays blocked.
         blocked = ctrl.state.get_task("T-BLOCKED")
         assert blocked["status"] == STATUS_BLOCKED
 
@@ -436,9 +422,7 @@ class TestG2DependencyGuard:
         assert tasks_done == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Observability: run_trace, progress_display, metrics
-# ─────────────────────────────────────────────────────────────────────────────
+# Observability: run_trace, progress_display and metrics
 
 class TestG2Observability:
     def test_run_trace_called_on_pass(self, tmp_path):
@@ -560,9 +544,7 @@ class TestG2Observability:
         assert "0.87" in log
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# G2: CommitOnSuccess re-uses controller.git (not a second GitManager)
-# ─────────────────────────────────────────────────────────────────────────────
+# G2: CommitOnSuccess reuses controller.git (not a second GitManager)
 
 class TestG2GitManagerReuse:
     def test_commit_on_success_uses_controller_git(self, tmp_path):
@@ -601,9 +583,7 @@ class TestG2GitManagerReuse:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # G2: empty task list
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestG2EdgeCases:
     def test_no_pending_tasks_returns_immediately(self, tmp_path):
@@ -644,9 +624,7 @@ class TestG2EdgeCases:
         ctrl.run_trace.log_task_done.assert_called_once_with("T-GITERR", None)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-CR-14: controller wires SummaryMemory into CommitOnSuccess for creative
-# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-CR-14: the controller wires SummaryMemory into CommitOnSuccess for creative mode
 
 class TestCR14SynopsisWiring:
     def test_creative_wires_summary_memory(self, tmp_path):

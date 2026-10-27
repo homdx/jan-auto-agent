@@ -21,9 +21,7 @@ def run(roots, flags=()):
 
 T, B = "tests", "tests_bugfix"
 
-#: Every non-empty line of the corpus, in file order, with the runs a reader
-#: of that command finds in it. `.smoke_tests` + `.regression_tests` = `tests`;
-#: `-n`, `--timeout`, `tail` do not count; `-q`, `--tb`, `--durations` do.
+#: Corpus lines and the test runs found in them; `-n`, `--timeout` and `tail` are not counted.
 EXPECTED = [
     ("timeout 1200000 python3 -m pytest .smoke_tests/ -q 2>&1 | tail -20", [run([T], ["-q"])]),
     ("timeout 1200000 python3 -m pytest .regression_tests/ -q 2>&1 | tail -20", [run([T], ["-q"])]),

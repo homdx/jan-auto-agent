@@ -39,8 +39,7 @@ def _module(purpose: str = "", notes: str = "") -> ModuleRecord:
 
 
 def test_kept_count_matches_all_claims_surviving_when_nothing_dropped():
-    # Three newline-separated, unpunctuated claims — none of them cite
-    # anything checkable, so all three survive verification untouched.
+    # Three unpunctuated claims that cite nothing checkable: all survive untouched.
     purpose = "Handles retries\nLogs failures\nReturns cached result"
     module = _module(purpose=purpose)
 
@@ -51,15 +50,12 @@ def test_kept_count_matches_all_claims_surviving_when_nothing_dropped():
 
     assert report["dropped_count"] == 0
     assert report["kept_count"] == 3
-    # the reconstructed text itself was always correct — only the count
-    # in the report was wrong, so this must keep passing unchanged.
+    # The reconstructed text was always correct; only the report count was wrong.
     assert verified[0].summary.purpose == "Handles retries Logs failures Returns cached result"
 
 
 def test_kept_count_matches_partial_survival_with_newline_claims():
-    # Same newline-separated shape, but one of the three claims cites a
-    # location whose line is out of range for the file, so it must be
-    # dropped (dropped:no-citation) while the other two survive.
+    # Same shape, but one claim cites an out-of-range line and is dropped (dropped:no-citation).
     purpose = "Handles retries\nBreaks at m.py:9999\nReturns cached result"
     module = _module(purpose=purpose)
 

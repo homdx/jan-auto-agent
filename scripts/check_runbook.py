@@ -82,11 +82,7 @@ class Finding:
     label: str
     #: Factual observation — what was actually seen. Always shown.
     detail: str = ""
-    #: Why it matters and what to do. Shown ONLY when the finding fails.
-    #: Separate from `detail` because a message written to explain a failure
-    #: reads as a flat contradiction beside PASS. Real output from the first
-    #: live run: "[PASS] seed entry preserved — the coder rewrote the file
-    #: wholesale instead of prepending".
+    #: Why it matters and what to do; shown only when the finding fails.
     hint: str = ""
     #: A finding that is informational rather than pass/fail.
     warn: bool = False
@@ -114,9 +110,7 @@ class Report:
         return not self.failed
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Sandbox resolution
-# ─────────────────────────────────────────────────────────────────────────────
 
 def sandbox_for(task: int, repo_root: Path = REPO_ROOT) -> Path:
     """Per-task sandbox if it exists, else the shared one."""
@@ -126,9 +120,7 @@ def sandbox_for(task: int, repo_root: Path = REPO_ROOT) -> Path:
     return repo_root / "examples" / "hello-world"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _read(path: Path) -> str:
     try:
@@ -165,12 +157,7 @@ def _run_ran(sandbox: Path) -> bool:
     return (sandbox / ".agent").is_dir()
 
 
-#: Directories that are not part of the sandbox's real working tree: the
-#: per-task workspace mirrors under .agent/workspace/<task_id>/ each copy
-#: the WHOLE repo (see AUTO-T*/AUTO-G* mirroring in executor.py), so an
-#: unfiltered recursive search finds every test file once per mirror on
-#: top of the real one — or, on a run where the real file never landed,
-#: finds only a stale copy inside a mirror and reports a false PASS.
+#: Directories outside the sandbox's real working tree (per-task mirrors, caches), skipped by recursive searches.
 _NON_WORKTREE_DIRS = {".agent", ".git", "__pycache__", ".venv", "venv", "node_modules"}
 
 
@@ -220,9 +207,7 @@ def _add_run_context(report: Report, sandbox: Path) -> bool:
         return False
     report.add(True, "flow was run", str(sandbox))
 
-    # run_flows.sh writes the console log next to the sandbox. Naming it here
-    # saves hunting for it: every "the flow did nothing" diagnosis needs it,
-    # and none of the on-disk checks can explain WHY nothing happened.
+    # run_flows.sh writes its console log next to the sandbox; named here for diagnosing a no-op flow.
     log = sandbox.parent / "console-log.txt"
     if log.is_file():
         report.add(True, "console log", str(log), warn=True)
@@ -251,9 +236,7 @@ def _add_run_context(report: Report, sandbox: Path) -> bool:
                     warn=(stop == "task_cap" and done > 0),
                 )
             else:
-                # A run that completed ZERO tasks is not a completed run. This
-                # passed in the first live run and made a 436-second no-op look
-                # like a success with a couple of cosmetic complaints.
+                # A run that completed zero tasks is not a completed run: a no-op must not read as success.
                 report.add(
                     done > 0, "run completed", f"{done} task(s) done",
                     hint="the run finished without doing any work at all",
@@ -263,9 +246,7 @@ def _add_run_context(report: Report, sandbox: Path) -> bool:
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Task 1 — code hardening
-# ─────────────────────────────────────────────────────────────────────────────
+# Task 1: code hardening
 
 def check_task1(sandbox: Path) -> Report:
     report = Report(1, TASK_SKILL[1], sandbox)
@@ -312,10 +293,7 @@ def check_task1(sandbox: Path) -> Report:
 
     if test_files:
         rel = [str(p) for p in test_files]
-        # Bugfix: unguarded — a hung test raised TimeoutExpired and
-        # crashed the whole checker instead of reporting the failure, unlike
-        # _prints_hello_world's guard above. The static "uses pytest
-        # conventions" check below still runs after a timeout.
+        # A hung test is reported as a failure, not a crash; the static convention check still runs after it.
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "pytest", "-q", *rel],
@@ -345,13 +323,9 @@ def check_task1(sandbox: Path) -> Report:
     return report
 
 
-#: Matches Gate 1's own rejection line, e.g.:
-#:   Gate1[existence] REJECTED 'Create README.md ...' — new_file='README.md'
-#:   but this path already exists — not a new file; drop new_file or cite
-#:   the real content
+#: Matches Gate 1's rejection line for a new_file that already exists.
 _GATE1_REJECT_RE = re.compile(r"Gate1\[[a-z_]+\] REJECTED '([^']*)' — (.+)")
-#: Matches the architect fully giving up on a cluster after exhausting its
-#: empty/non-JSON retry budget (see [architect] empty_response_retry_max).
+#: Matches the architect giving up on a cluster after its empty-reply retries.
 _ARCHITECT_GIVEUP_RE = re.compile(
     r"review_one_cluster \[([^\]]+)\]: still unsalvageable after \d+ .*?"
     r"giving up on this batch with 0 candidates"
@@ -392,9 +366,7 @@ def _diagnose_no_candidates(sandbox: Path) -> str:
     return "; ".join(unique)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Task 2 — documentation
-# ─────────────────────────────────────────────────────────────────────────────
+# Task 2: documentation
 
 def check_task2(sandbox: Path) -> Report:
     report = Report(2, TASK_SKILL[2], sandbox)
@@ -429,8 +401,7 @@ def check_task2(sandbox: Path) -> Report:
         hint="the docs skill forbids modifying .py files",
     )
 
-    # Reuse the shipped existence gate rather than reimplementing it, so this
-    # check and the in-run gate can never disagree about what counts.
+    # Reuses the in-run existence gate, so the two checks cannot disagree.
     try:
         sys.path.insert(0, str(REPO_ROOT))
         from tools.auto.existence_validator import ExistenceValidator
@@ -445,9 +416,7 @@ def check_task2(sandbox: Path) -> Report:
     return report
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Task 3 — narrative changelog
-# ─────────────────────────────────────────────────────────────────────────────
+# Task 3: narrative changelog
 
 _ENTRY_RE = re.compile(r"^###\s+(.+)$", re.MULTILINE)
 
@@ -487,16 +456,7 @@ def check_task3(sandbox: Path) -> Report:
              "its approval means less than it appears to",
     )
 
-    # CHECK-1 bug (found via a live run): the check above only looks for the
-    # HEADING string. A run where the architect never saw the real
-    # CHANGELOG.md (its cluster review came back empty) reconstructed the
-    # seed entry from a guess and the coder overwrote its prose wholesale —
-    # same heading, different words — and "seed entry preserved" read as a
-    # bare PASS right next to "a new entry was added" correctly failing.
-    # This compares the actual committed seed entry (not just its heading)
-    # against what is on disk now. Skips (warn) rather than fails when there
-    # is no baseline to diff against, e.g. a repo without the usual
-    # examples/hello-world/CHANGELOG.md history.
+    # Compare the committed seed entry's text, not just its heading; warn when there is no baseline.
     baseline_changelog = _baseline("CHANGELOG.md")
     seed_entry = _entry_text(baseline_changelog, "The first greeting")
     if seed_entry:
@@ -539,26 +499,13 @@ def check_task3(sandbox: Path) -> Report:
     return report
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Task 4 — narrative changelog, canon/continuity on a second provider
-# ─────────────────────────────────────────────────────────────────────────────
-# GATE3-PROFILE-5: proves the GATE3-PROFILE-2 per-validator profile keys work
-# on a real run, not only in unit tests. hello-creative-split is the same
-# skill body as hello-creative (same base, same artefact contract), with
-# [validator_agent] canon_llm_profile / continuity_llm_profile pointed at
-# [task4_provider_b] via its [skill.overlay] — see skills/hello-creative-split
-# .skill.ini. So this reuses check_task3 wholesale for the artefact criteria,
-# then adds one more finding this task alone can make: did canon/continuity
-# actually go to a DIFFERENT provider than the coder and Gate 2 did.
+# Task 4: narrative changelog, with canon and continuity on a second provider (GATE3-PROFILE-5).
 
-#: Matches GATE3-PROFILE-2's per-gate startup line, e.g.:
-#:   validator_agent.canon_llm_profile: provider = https://b.example/v1 (m) — via ...
+#: Matches the per-gate startup line that GATE3-PROFILE-2 prints.
 _GATE_PROVIDER_RE = re.compile(
     r"validator_agent\.(canon|continuity)_llm_profile: provider = (\S+) \("
 )
-#: Matches the shared-provider step every enabled gate resolves through
-#: first (GATE3-PROFILE-2's `validator_llm_profile` link in the chain),
-#: which is what the coder and Gate 2 also use — the baseline "provider A".
+#: The shared-provider step every enabled gate resolves through: the baseline provider A.
 _SHARED_PROVIDER_RE = re.compile(
     r"validator_agent\.validator_llm_profile: provider = (\S+) \("
 )
@@ -639,36 +586,9 @@ def check_task4(sandbox: Path) -> Report:
 CHECKS = {1: check_task1, 2: check_task2, 3: check_task3, 4: check_task4}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Weighted scoring — a percentage on top of the pass/fail findings above
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# check_task1/2 report binary findings: a run either satisfies "test suite
-# passes" or it doesn't. That's the right tool for "should CI go green", but
-# it throws away information a human reviewing a run actually wants — a run
-# that hardened main.py but forgot one docstring is not the same outcome as
-# a run that left main.py untouched, and PASS/FAIL alone can't tell them
-# apart. WEIGHTS turns the SAME findings check_task1/2 already computed into
-# a 0-100 score instead of a second, independent judgement — this can never
-# disagree with the PASS/FAIL verdict about WHAT happened, only about how
-# much a given gap should cost.
-#
-# GATES are findings whose failure caps the score outright, no matter how
-# many other points were earned: points for "wrote docstrings" mean nothing
-# if the docs run edited main.py instead of README.md, or if the code run's
-# one required behaviour (prints "Hello world") broke. A capped run can
-# still land above 0% — a gate failure means "this run violated a hard
-# constraint", not "this run did nothing".
-#
-# Only tasks 1 and 2 are weighted below. Task 3/4 (creative) are deliberately
-# left out — RUNBOOK.md is explicit that judging prose quality is out of
-# scope for this deterministic checker; a creative rubric needs a different
-# kind of criterion (canon/continuity) that belongs to the Gate-3 validators
-# at runtime, not to a percentage computed after the fact.
+# Weighted score: a 0-100 view of the same findings as tasks 1-2; gates cap the score; creative tasks are not scored.
 
 @dataclass(frozen=True)
 class ScoreBand:
@@ -693,8 +613,7 @@ def band_for(pct: float) -> ScoreBand:
     return BANDS[-1]  # pragma: no cover — 0 is always in range
 
 
-#: label -> points earned when that finding is present and OK. Each task's
-#: points sum to 100 so the raw total doubles as the percentage.
+#: Points per finding; each task's points sum to 100, so the total is the percentage.
 WEIGHTS: dict[int, dict[str, int]] = {
     1: {  # hello-code
         "main.py present": 5,
@@ -716,8 +635,7 @@ WEIGHTS: dict[int, dict[str, int]] = {
     },
 }
 
-#: label -> cap. If that finding fails, the score cannot exceed cap even
-#: though other points were earned.
+#: Cap per finding: a failed finding limits the score to its cap.
 GATES: dict[int, dict[str, int]] = {
     1: {
         "main.py parses": 10,                    # broken syntax — nothing else here is trustworthy

@@ -389,8 +389,7 @@ class TestIdempotency:
         bfl.handle_regression(task, exec_result, base_dir=tmp_path)
         assert tickets.get("BUG-AUTO-T1")["status"] == "deferred"
 
-        # Second call (simulating the NEXT commit's regression re-check) must
-        # skip without calling outer_loop again.
+        # Second call (next commit's regression re-check) skips without calling outer_loop.
         outer = _make_outer(FakeOuterResult(passed=True))
         cos   = _make_cos()
         bfl2  = BugFixLoop(outer, cos, tickets, bfl._state)

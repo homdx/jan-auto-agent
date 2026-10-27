@@ -29,9 +29,7 @@ from tools.auto.controller import (
 from tools.auto.state import StateStore, make_task, STATUS_DONE
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(**auto_kw) -> configparser.ConfigParser:
     c = configparser.ConfigParser()
@@ -73,9 +71,7 @@ def mock_inner_loop_pipeline(monkeypatch):
     monkeypatch.setattr("tools.auto.outer_loop.make_inner_loop", lambda config, base_dir, **kwargs: FakeInnerLoop(config, base_dir))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # RunLimits.from_config
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestRunLimitsConfig:
     def test_defaults_no_caps(self):
@@ -111,9 +107,7 @@ class TestRunLimitsConfig:
         assert lim.exec_timeout_sec == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# cap predicates (with fake clock)
-# ─────────────────────────────────────────────────────────────────────────────
+# cap predicates (fake clock)
 
 class TestCapPredicates:
     def test_runtime_not_exceeded_before_cap(self, tmp_path):
@@ -170,9 +164,7 @@ class TestCapPredicates:
         assert c.check_caps(tasks_done=100) is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# graceful stop + resume through run()
-# ─────────────────────────────────────────────────────────────────────────────
+# graceful stop and resume through run()
 
 class TestGracefulStop:
     def test_task_cap_stops_run_gracefully(self, tmp_path):
@@ -195,9 +187,7 @@ class TestGracefulStop:
 
     def test_runtime_cap_stops_run(self, tmp_path):
         _seed_tasks(tmp_path, "g", n=5)
-        # auto-advancing clock: each call jumps +100s, so the first cap check
-        # inside the loop is already past a 10s cap (the skeleton loop itself
-        # consumes no real time).
+        # Auto-advancing clock: each call adds 100 s, so the first cap check is past a 10 s cap.
         class _AutoClock:
             def __init__(self): self.t = 1000.0
             def __call__(self):

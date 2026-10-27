@@ -1,0 +1,1 @@
+../tests/test_claimcheck_lenz_hint.py

@@ -188,9 +188,7 @@ def test_revision_bounded_by_cap(tmp_path):
     task = {"id": "t1", "target_files": ["chapter_03.md"]}
     result = loop.run_task(task, tmp_path)
 
-    # With cap=1: attempt 1 → canon reject (1 revision used); attempt 2 →
-    # cap reached → accept-with-warning. The canon check fires once (it is
-    # skipped once the cap is consumed), and the loop ends approved.
+    # cap=1: one canon rejection, then accept with warning; the canon check runs once.
     assert canon.check_calls == 1
     assert result.passed is True
     assert result.attempts_used == 2

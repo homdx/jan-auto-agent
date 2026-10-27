@@ -99,9 +99,7 @@ _CAND_TYPE_HINTS = CandidateTask(
     cluster="support",
 )
 
-# The candidate that matters most: this is the "create a separate test
-# file" proposal the deterministic checker wanted, and it was rejected
-# right alongside the other two.
+# The candidate the checker wanted: a separate test file, rejected with the other two.
 _CAND_TEST_FILE = CandidateTask(
     title="Add a pytest test for main.py output",
     instruction=(
@@ -117,9 +115,7 @@ _CAND_TEST_FILE = CandidateTask(
     cluster="support",
 )
 
-# Control: the one "entry_orchestration"-cluster candidate from the same
-# run, where citation and instruction already agree (both main.py). Must
-# never get a note — asserted below alongside the three broken ones.
+# Control: citation and instruction agree (both main.py), so this candidate must never get a note.
 _CAND_CORRECTLY_CITED = CandidateTask(
     title="Add a pytest test asserting the printed output",
     instruction=(
@@ -207,8 +203,7 @@ class TestGroundingNotesIntegration:
     ) -> None:
         ok, reason, block = filt._check_existence(candidate, HELLO_WORLD_DIR, cluster_files=None)
         assert ok, f"existence check failed: {reason}"
-        # Sanity: Stage A's extracted block is CHANGELOG.md's content, the
-        # exact condition that makes Stage B reject these without the fix.
+        # Stage A's block is CHANGELOG.md's content, the condition that makes Stage B reject without the fix.
         assert "Changelog" in block
 
         module_docstring = filt._module_docstring_for(candidate, HELLO_WORLD_DIR)

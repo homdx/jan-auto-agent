@@ -63,13 +63,7 @@ class AgentTracer:
         self.enabled: bool = False
         self.console_echo: bool = False   # print inter-agent calls live to stdout
         self.console_preview_chars: int = 600  # how many prompt/response chars to show
-        # LLM_DEBUG=2 forces the FULL, untruncated prompt header to stdout for
-        # every llm_request, even when console_echo is off / max_field_chars
-        # would otherwise truncate it. LLM_DEBUG=1 (or unset) leaves the
-        # normal head/tail preview behavior untouched.
-        # AUTO-FIX: the tracer is a module-level singleton, so this runs at
-        # import time — a non-numeric LLM_DEBUG ("true", a typo) raised
-        # ValueError and broke the import for every module that imports it.
+        # LLM_DEBUG=2 prints the full prompt header; a non-numeric value must not break import (AUTO-FIX).
         try:
             self.llm_debug: int = int(os.environ.get("LLM_DEBUG", "0") or 0)
         except (TypeError, ValueError):
@@ -85,9 +79,7 @@ class AgentTracer:
         self._lock = threading.Lock()
         self._fh: Optional[Any] = None   # persistent file handle opened at configure()
 
-    # ------------------------------------------------------------------ #
-    # Configuration                                                       #
-    # ------------------------------------------------------------------ #
+    # Configuration
 
     def configure(
         self,
@@ -114,23 +106,14 @@ class AgentTracer:
             try:
                 self._fh = open(self.path, "a", encoding="utf-8")  # noqa: SIM115
             except OSError as exc:
-                # AUTO-FIX (medium-priority audit, DeepSeek-plan finding):
-                # this used to fail completely silently — self._fh = None
-                # with no log line — so a bad trace path (permissions,
-                # missing parent dir, disk full) disabled tracing for the
-                # entire run with zero indication anything went wrong.
-                # Every subsequent tracer.event() call already no-ops
-                # cleanly on self._fh is None, so this is purely a
-                # visibility fix, not a behavior change.
+                # A failed log open is reported once, and the tracer keeps running without the file (AUTO-FIX).
                 self._fh = None
                 logger.warning(
                     "AgentTracer: could not open trace file %s (%s) — "
                     "tracing disabled for this run", self.path, exc,
                 )
 
-    # ------------------------------------------------------------------ #
-    # Run grouping                                                         #
-    # ------------------------------------------------------------------ #
+    # Run grouping
 
     def start_run(self, user_input: str) -> str:
         """Open a new run group. All subsequent events share this run_id."""
@@ -143,9 +126,7 @@ class AgentTracer:
         )
         return self._run_id
 
-    # ------------------------------------------------------------------ #
-    # Event emission                                                       #
-    # ------------------------------------------------------------------ #
+    # Event emission
 
     def event(
         self,
@@ -172,9 +153,7 @@ class AgentTracer:
         if not self.enabled or self.path is None:
             return
 
-        # Only the shared counter/state needs the lock. Building the record
-        # is pure computation on locals, so it's safe outside the lock too —
-        # keep it in the locked block just for a consistent `seq` snapshot.
+        # Only the sequence counter needs the lock; the record is built outside it.
         with self._lock:
             self._seq += 1
             seq = self._seq
@@ -198,25 +177,9 @@ class AgentTracer:
         if content is not None:
             record["content"] = self._truncate(content)
 
-        # NEVER perform blocking I/O (logging, print, file writes/flush)
-        # while holding self._lock. Under concurrent callers (and especially
-        # under pytest-xdist, where stdout is a captured pipe), a stalled
-        # write can block a thread that is holding the lock, and every other
-        # thread calling event() then piles up behind it — a real deadlock,
-        # not just a slowdown. So all I/O below happens lock-free; each
-        # thread does its own write independently. The `_fh.write`/`flush`
-        # pair below is on a shared, unbuffered-append file handle opened in
-        # "a" mode, so individual writes on POSIX are atomic for our
-        # line-sized records without needing a lock to serialize them.
+        # Never do blocking I/O while holding the lock: a stalled write would make every other event() call queue behind it.
         if self.console_echo or (self.llm_debug >= 2 and kind == "llm_request"):
-            # AUTO-FIX (medium-priority audit, DeepSeek-plan finding):
-            # _console_line writes directly to sys.stdout (several
-            # sys.stdout.write/.flush calls inside it, not routed through
-            # `logging`) with no guard anywhere. If stdout is piped and the
-            # reader closes early (e.g. `| head`), that raises
-            # BrokenPipeError — unlike the trace-file write below, which
-            # already treats a write failure as non-fatal, this purely
-            # diagnostic console echo was able to crash the whole run.
+            # A closed stdout (| head) must not crash the run: the console echo is diagnostic, so its errors are swallowed.
             try:
                 self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
             except OSError:
@@ -227,12 +190,7 @@ class AgentTracer:
                 self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                 self._fh.flush()
         except (OSError, TypeError):
-            # Tracing must never break the pipeline — swallow write errors
-            # (OSError) AND serialization errors (TypeError, e.g. an
-            # unserializable object that slipped past _sanitize/_truncate
-            # into params/content — more likely to actually happen under
-            # LLM_DEBUG=2, which is exactly when unusual objects are most
-            # likely to reach here).
+            # Tracing must never break the pipeline: write and serialisation errors are swallowed.
             pass
 
     def _console_line(
@@ -253,8 +211,7 @@ class AgentTracer:
         rst = _C["reset"]
         dim = _C["dim"]
 
-        # ── header line — routed through standard logging so the timestamp,
-        # level and module name match the rest of the pipeline output.
+        # The header line goes through logging, so its timestamp and level match the pipeline.
         meta_parts: list[str] = []
         if model:
             meta_parts.append(f"model={model}")
@@ -327,9 +284,7 @@ class AgentTracer:
 
         sys.stdout.flush()
 
-    # ------------------------------------------------------------------ #
-    # Helpers                                                              #
-    # ------------------------------------------------------------------ #
+    # Helpers
 
     def _truncate(self, value: Any) -> Any:
         """Stringify (if needed) and cap long fields."""

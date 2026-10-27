@@ -44,9 +44,7 @@ NESTED_INI = "[pytest]\naddopts = -n auto\n"
 NESTED_TESTS = "".join(f"def test_{name}(): pass\n" for name in "abcdef")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the nested run
-# ─────────────────────────────────────────────────────────────────────────────
+# Nested run
 
 @pytest.fixture
 def nested(tmp_path):
@@ -91,9 +89,7 @@ def _combine(proc) -> str:
     return proc.stdout + proc.stderr
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the count moves, so the file is read at every start
-# ─────────────────────────────────────────────────────────────────────────────
+# The count changes, so the file is read at every start
 
 def test_the_file_is_read_at_every_pytest_start(nested):
     """Two pytests, two counts: the round rewrote the file between them, and
@@ -114,9 +110,7 @@ def test_the_file_is_read_at_every_pytest_start(nested):
     assert _workers(second) == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# nothing to say: xdist answers for itself
-# ─────────────────────────────────────────────────────────────────────────────
+# Nothing to say: xdist answers for itself
 
 @pytest.mark.parametrize("text", ["", "abc", "0", "-1"])
 def test_an_unusable_file_gives_xdist_its_own_fallback(nested, text):
@@ -156,9 +150,7 @@ def _xdist_auto() -> int:
             os.environ["PYTEST_XDIST_AUTO_NUM_WORKERS"] = saved
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# no xdist at all
-# ─────────────────────────────────────────────────────────────────────────────
+# No xdist at all
 
 def test_the_plugin_needs_no_xdist_to_load(nested):
     """``-p no:xdist`` must not fail with an unknown hook: the plugin declares
@@ -174,9 +166,7 @@ def test_the_plugin_needs_no_xdist_to_load(nested):
     assert "unknown hook" not in _combine(proc).lower()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the four variables together, as the round sets them
-# ─────────────────────────────────────────────────────────────────────────────
+# The four variables together, as the round sets them
 
 def test_all_four_variables_are_honoured_at_once(nested):
     """The round's own combination: the file says 2, the fallback says 8, the
@@ -191,8 +181,7 @@ def test_all_four_variables_are_honoured_at_once(nested):
     workers.write_text("2\n", encoding="utf-8")
     env = _env(workers_file=str(workers), fallback="8")
     assert env["PYTHONPATH"] == str(PLUGIN_DIR)
-    # one directory, and it is the plugin's own: the runner's repo root is not
-    # there, so an agent's pytest imports the clone's code, not the runner's
+    # PYTHONPATH holds only the plugin's own directory, not the runner's repo root.
     assert env["PYTHONPATH"].split(os.pathsep) == [str(PLUGIN_DIR)]
 
     proc = _run(nested, env, [], target="test_thing.py")

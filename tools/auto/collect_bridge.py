@@ -38,6 +38,14 @@ Three responsibilities, all opt-in via `[collect] use_in_auto` /
    stale by construction, and the operator who turned V9 on has already
    said the pack is worth keeping fresh. Fail-open: a refresh that raises
    leaves the stale model, `usable` False, one WARNING, one stdout line.
+   HARDEN-6 E adds a second, narrower exception: a model stale **only**
+   because a module has no summary is usable. CC-15 made that manifest
+   stale, and the effect was that one failed Pass B switched the pack off
+   for the whole `--auto` session — for every module, although every file
+   was unchanged and every other fact in the artifact was right. The pack
+   now stays on for the modules that have their facts, and a module
+   without a summary is served without one; stale for any other cause is
+   still not usable at all.
 
 4. **V9: freshness within a run.** Item 3 only covers the artifact's
    status at load time. It says nothing about the middle of a run:
@@ -98,8 +106,7 @@ from tools.auto.context_assembler import build_collect_context_block_stats
 
 logger = logging.getLogger(__name__)
 
-# AUTO-CR-23-2-style default budget for the collect block injected into a
-# single task's prompt. Overridable via [collect] max_context_chars_auto.
+# Default budget for the collect block in one task's prompt; [collect] max_context_chars_auto overrides it.
 _DEFAULT_MAX_CONTEXT_CHARS = 1200
 
 _SHRINK_SYSTEM_PROMPT = (
@@ -148,8 +155,7 @@ def _qualname_matches(qualname: str, name: str) -> bool:
         return False
     if qualname == name:
         return True
-    # Split off the module-path prefix; collect always uses ':' for it, and a
-    # symbol name can never contain one.
+    # Splits off the module path; a symbol name never contains a colon.
     symbol = qualname.split(":", 1)[1] if ":" in qualname else qualname
     if symbol == name:
         return True
@@ -264,6 +270,20 @@ def _stale_provenance(base_dir, config) -> "tuple[str, str]":
     return artifact_sha, head_sha
 
 
+def _summary_only_stale(model) -> bool:
+    """True when the only thing stale about *model* is that a module has no summary (HARDEN-6 E).
+
+    The same test `CollectBridge._summary_only_stale` makes, for a model the bridge is about to be
+    built over. Fail-open: a model with no `stale_causes` of its own has unknown causes, which reads
+    as "not usable", exactly as it did before.
+    """
+    causes = getattr(model, "stale_causes", ()) or ()
+    try:
+        return bool(causes) and all(str(c) == "unsummarized" for c in causes)
+    except Exception:  # noqa: BLE001 — a malformed field is not a usable model
+        return False
+
+
 def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
     """RUN-6: the incremental refresh `staleness = refresh` would have run
     inside `load()`, run here instead because `[collect]
@@ -302,15 +322,19 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
     root = Path(base_dir)
     artifact_sha, head_sha = _stale_provenance(root, config)
     modules = hashes = None
+    skipped: tuple = ()
     changed = None
     reason: Optional[str] = None
     previous_version: Optional[str] = None
     current_version: Optional[str] = None
     try:
         from tools.collect import manifest as manifest_mod
-        from tools.collect.scanner import scan_repo
+        from tools.collect.scanner import scan_repo_ex
 
-        modules = scan_repo(root, config=config)
+        # CC review fixes 45: the walk's skipped files go to the refresh with the modules, so a
+        # refresh between tasks keeps them on the manifest instead of writing an empty list.
+        modules, skipped = scan_repo_ex(root, config=config)
+        skipped = tuple(skipped)
         hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
         previous = manifest_mod.read_manifest(
             cli_mod.resolve_collect_dir(root, config) / cli_mod.MANIFEST_FILENAME)
@@ -318,8 +342,7 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
         previous_version = previous.collector_version
         current_version = manifest_mod.COLLECTOR_VERSION
         if previous_version != current_version:
-            # `action_refresh` falls back to a full build here and asks Pass
-            # B for every module, not the diff — the bill is the tree.
+            # action_refresh falls back to a full build here, so every module is re-summarised.
             changed = len(modules)
             reason = "version"
         else:
@@ -348,7 +371,7 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
     try:
         cli_mod.action_refresh(
             root, config=config, config_path=config_path, llm_call=llm_call,
-            modules=modules, hashes=hashes,
+            modules=modules, hashes=hashes, skipped_files=skipped,
         )
         reloaded = load_fn(base_dir, config=config, config_path=config_path)
         ok = getattr(reloaded, "status", "absent") == "fresh"
@@ -404,48 +427,26 @@ class CollectBridge:
         self._task_mode = task_mode
         self._max_context_chars = max(200, int(max_context_chars))
         self._pack_enabled = bool(pack_enabled)
-        # V6: per-run memo keyed by (target_file, budget, pack_enabled). The same
-        # file is a target in many tasks of one --auto run; caching the assembled
-        # (and possibly LLM-shrunk) block means a second context_for("x.py") costs
-        # zero further LLM calls. Bounded by distinct target files — the bridge is
-        # built once per run. Entries are dropped by invalidate() when that path
-        # is committed dirty — or when the entry quotes a dirtied neighbour in its
-        # `neighbours:` row — so the memo never serves stale facts.
+        # Per-run memo keyed by (file, budget, pack flag): a file targeted by many tasks costs one assembly; dirty paths invalidate it (V6).
         self._memo: dict = {}
-        # `summarizer_call` is a `tools.collect.summarizer.LlmCall`:
-        # Callable[[system: str, user: str], str]. None = shrink disabled,
-        # falls back to hard truncation.
+        # Summarizer for shrinking the block; None falls back to hard truncation.
         self._summarizer_call = summarizer_call
-        # AUTO-METRIC: how many times the LLM shrink path actually fired
-        # this run — surfaced for tests and for run-summary logging.
+        # Counts how often the LLM shrink path fired this run, for tests and the run summary (AUTO-METRIC).
         self.shrink_calls = 0
-        # V9: module paths written by a task of this run since `load()`.
-        # `load()` saw the tree before any of them; `status` cannot have
-        # changed to say so, so this set is what carries it.
+        # Module paths written by this run since load(); status cannot show them, so they are tracked here (V9).
         self._dirty_paths: set = set()
-        # Paths whose in-run repair already failed once — not retried again
-        # until the next commit dirties the path, at which point
-        # `invalidate()` drops them from here so the repair is re-attempted.
+        # Paths whose in-run repair already failed; retried only after a commit dirties them again.
         self._repair_failed: set = set()
         # V9: `[collect] auto_refresh_between_tasks` (default false).
         self._auto_refresh = bool(auto_refresh)
         self._base_dir = base_dir
         self._config = config
         self._config_path = config_path
-        # Injectable replacement for `action_module` — one module, one LLM
-        # call. Tests pass a stub; production uses `_action_module_record`.
+        # Injectable replacement for action_module; tests pass a stub.
         self._module_refresh_fn = module_refresh_fn
-        # M4 `collect_miss` counters: reason -> count. M4's run_trace events
-        # do not exist in this tree yet, so the bridge keeps the tally
-        # itself and hands it out for a run summary.
+        # Per-run collect_miss tally, kept here because the run-level events are not emitted yet (M4).
         self.collect_misses: dict = {}
-        # M4: per-run tally of what the pack actually did to prompts, read by
-        # `collect_counters()` and emitted once as `collect_summary`. Keys:
-        # blocks (context_for calls that returned a block), chars (their
-        # length), memo_hits (blocks served from the V6 memo) and
-        # shrink_by_path (rows | llm | truncate). Misses are deliberately not
-        # here: `collect_misses` is the pre-existing tally `summary()` and the
-        # run.log line already read, so one counter serves both.
+        # Per-run counters for the summary: blocks, chars, memo hits and shrink kinds; misses are in collect_misses (M4).
         self.collect_stats: dict = {
             "blocks": 0,
             "chars": 0,
@@ -475,9 +476,34 @@ class CollectBridge:
 
     @property
     def usable(self) -> bool:
-        """`True` only when the model is FRESH. A stale artifact is treated
-        exactly like no artifact at all — see module docstring, item 3."""
-        return bool(self._model is not None and self.status == "fresh")
+        """`True` when the pack can be served from this model.
+
+        A fresh model always is. A stale one is too when its *only* cause is a module without a
+        summary (HARDEN-6 E): every static fact in the artifact is still true — the module whose
+        Pass B failed has no summary, not wrong facts — so the pack stays on for every module that
+        has one, and a module without a summary is simply served without one. Stale for any other
+        cause (a tracked file moved, another collector version, another `skip_dirs`) is not usable,
+        exactly as before: those put facts the model never knew about into the prompt.
+        """
+        if self._model is None:
+            return False
+        if self.status == "fresh":
+            return True
+        return self.status == "stale" and self._summary_only_stale()
+
+    def _summary_only_stale(self) -> bool:
+        """True when the only thing stale about this model is that some module has no summary.
+
+        Fail-open by construction: a model with no `stale_causes` of its own (built by hand, or
+        written by an older loader) has no causes at all, which is *not* "no cause" — it is
+        "unknown", so the conservative answer is False and the pack stays off, as it always did.
+        """
+        causes = getattr(self._model, "stale_causes", ()) or ()
+        try:
+            causes = tuple(str(c) for c in causes)
+        except Exception:  # noqa: BLE001 — a malformed field is not a usable model
+            return False
+        return bool(causes) and all(c == "unsummarized" for c in causes)
 
     # ── V9: invalidate on write ─────────────────────────────────────────
 
@@ -620,12 +646,10 @@ class CollectBridge:
         while ref.startswith("./"):
             ref = ref[2:]
         if ref == ".." or ref.startswith("../"):
-            # Above the tree root: git never reports such a path and the
-            # model holds nothing there, so there is nothing to blind.
+            # Above the tree root there is nothing to blind, since git never reports such a path.
             return None
         if ref.startswith("/"):
-            # An absolute path only means something relative to the tree the
-            # model was built from; outside it there is nothing to blind.
+            # An absolute path is meaningful only inside the tree, so nothing is blinded outside it.
             base = getattr(self, "_base_dir", None)
             try:
                 ref = Path(ref).resolve().relative_to(Path(base).resolve()).as_posix() \
@@ -655,9 +679,7 @@ class CollectBridge:
         if failed is None:
             failed = self._repair_failed = set()
         if norm in failed:
-            # Already tried once this run and could not repair it. Every
-            # caller would otherwise re-run action_module — and re-pay its
-            # LLM call — on each lookup of a path that is going to stay dirty.
+            # Already tried this run and could not repair it: do not re-pay the LLM call on each lookup (V9).
             return True
         if self._refresh_module_in_place(norm):
             self._dirty_paths = set(dirty_paths - {norm})
@@ -716,27 +738,11 @@ class CollectBridge:
         if not new_dirty:
             return
         self._dirty_paths = set(self._dirty_set() | new_dirty)
-        # V6: drop memo entries for the now-dirty paths. The cached block
-        # described the tree as it was before this commit; a later context_for
-        # must rebuild (and re-check dirt) rather than serve a stale clean
-        # result. Keys are normalized in context_for(), so they match here.
-        # BUGFIX: the key alone is not enough. The `neighbours:` row renders
-        # another module's LLM purpose, so a block for `pkg/a.py` goes stale
-        # when `pkg/caller_a.py` is edited — and that block is keyed by
-        # `pkg/a.py`, which this commit did not touch. `stats["neighbours_paths"]`
-        # names exactly the paths whose prose each entry quotes, so those
-        # entries are dropped too. Dropped, not patched: the block is an
-        # immutable string and rebuilding is what re-checks dirt per path.
-        # `getattr` — some callers build a bridge via __new__() and never run
-        # __init__, so _memo may be absent; treat that as "nothing cached"
-        # rather than raising, matching the fail-open stance of _dirty_set().
+        # Dirty paths drop their memo entries, and entries quoting a dirty neighbour's prose too (V6, BUGFIX).
         memo = getattr(self, "_memo", None)
         if memo:
             self._memo = _drop_stale_memo(memo, new_dirty)
-        # A new commit means new facts, so a repair that already failed for
-        # these paths is worth one more attempt: an outage that started at
-        # task N must not keep blinding a path that task N+2 edited again.
-        # The attempt stays once per *edit* — never once per lookup.
+        # A new commit may fix a failed repair, so the failure record is cleared once per edit (V9).
         failed = getattr(self, "_repair_failed", None)
         if failed is not None and new_dirty & failed:
             failed -= new_dirty
@@ -782,16 +788,14 @@ class CollectBridge:
             return None
         status = getattr(self._model, "status", "absent")
         if status != "fresh":
-            # `usable` is False for such a model anyway, so repairing it
-            # would spend an LLM call that no block would ever be served.
+            # An unusable model is not repaired, since no block would be served from it.
             return None
         try:
             known = {m.path for m in (getattr(self._model, "modules", ()) or ())}
         except Exception:  # noqa: BLE001
             return None
         if path not in known:
-            # Not in the model: no prior record to update, so a refresh would
-            # only invent one. Leave it dirty.
+            # A module not in the model has no record to update, so it stays dirty.
             return None
 
         record = None
@@ -838,9 +842,7 @@ class CollectBridge:
             from tools.collect import cli as cli_mod
             from tools.collect.model import ModuleRecord
 
-            # The same Pass B summarizer `_shrink` uses — `make_collect_bridge`
-            # already built it under `[collect] llm_summaries`, so a repair
-            # is one LLM call with the flag on and structural-only without.
+            # The repair uses the same summarizer as _shrink: one LLM call with the flag on, structural-only without.
             cli_mod.action_module(
                 self._base_dir, path,
                 config=self._config, config_path=self._config_path,
@@ -891,29 +893,18 @@ class CollectBridge:
         """
         if self._miss_if_unusable(target_file, task_id=task_id):
             return ""
-        # V9: the model predates this path's edit, so its facts describe a
-        # tree that no longer exists. Runs before the budget check and
-        # before `_shrink`, so a dirty path neither spends the shrink LLM
-        # call nor returns a shrunk block of pre-edit facts.
+        # A dirty path returns nothing: its model describes a tree that no longer exists (V9).
         if self._is_dirty(target_file):
             self._miss("dirty", target_file, task_id=task_id)
             return ""
-        # V6: normalise the key so invalidate() — which stores normalized
-        # paths — can drop the right entries. Non-.py targets (None from
-        # _normalize_path) fall back to the raw string.
+        # Memo keys are normalised so invalidate() can match them; non-.py paths keep the raw string (V6).
         norm = self._normalize_path(target_file) or target_file
         key = (norm, self._max_context_chars, self._pack_enabled)
-        # `setdefault` on `__dict__` rather than `self._memo`: a bridge built
-        # via `__new__()` (the probe tests) never ran `__init__`, and a missing
-        # memo is "nothing cached", not a crash — same stance as `invalidate`.
+        # A bridge built without __init__ has no memo, which means nothing is cached, not a crash.
         memo = self.__dict__.setdefault("_memo", {})
         cached = memo.get(key)
         if cached is not None:
-            # V6 memoises the block so a second request in the run costs zero
-            # LLM calls; M4 still counts it, because "blocks per coder request"
-            # is the number M4 exists to measure and a build-only event would
-            # undercount it. Stats travel with the entry so the memo hit
-            # reports the same rows the build reported.
+            # A memo hit still counts as a block for M4, with its stats, so the per-request numbers stay honest (V6).
             block, stats = _memo_block(cached)
             self._note_block(target_file, block, stats,
                              memo_hit=True, task_id=task_id)
@@ -928,20 +919,12 @@ class CollectBridge:
             logger.warning("CollectBridge.context_for(%s): failed: %s", target_file, exc)
             return ""
         if not raw:
-            # The model is fresh and usable, but has no record for this path —
-            # a file outside the artifact. Distinct from `absent` / `stale`:
-            # nothing is broken, there is simply nothing to say.
+            # A path outside the artifact is a distinct miss: nothing is broken, the model has no record for it.
             self._miss("unknown_module", target_file, task_id=task_id)
             return ""
         if len(raw) <= self._max_context_chars:
             result = raw
-            # V6: the budget was applied inside the assembler, so the block
-            # fits without `_shrink`. That is a shrink of its own and the one
-            # that happens on every over-budget file today — invisible before
-            # M4, because the assembler returns a bare `str`. Emitted only
-            # when the cut actually removed characters: rows with no data also
-            # leave `rows_cut > 0`, and a shrink from N chars to N chars would
-            # be a report that says nothing.
+            # The budget cut is a shrink of its own, counted only when characters were actually removed (M4).
             chars_uncapped = int(stats.get("chars_uncapped") or 0)
             if chars_uncapped > len(raw):
                 self._note_shrink(
@@ -949,8 +932,7 @@ class CollectBridge:
                     task_id=task_id,
                 )
         else:
-            # Observe `_shrink` from the outside: compare lengths and read the
-            # existing `shrink_calls` counter. `_shrink` is not modified.
+            # Observes _shrink from outside by comparing lengths and reading shrink_calls; _shrink is unchanged.
             calls_before = getattr(self, "shrink_calls", 0) or 0
             result = self._shrink(raw)
             path = "llm" if (getattr(self, "shrink_calls", 0) or 0) > calls_before else "truncate"
@@ -1072,9 +1054,7 @@ class CollectBridge:
                 shrunk = self._summarizer_call(_SHRINK_SYSTEM_PROMPT, user)
                 shrunk = (shrunk or "").strip()
                 if shrunk and len(shrunk) <= self._max_context_chars * 1.15:
-                    # small overshoot tolerance for the model rounding words;
-                    # a bigger overshoot means the shrink didn't work — fall
-                    # through to hard truncation instead of trusting it.
+                    # Accept a shrink only when it fits within a small tolerance; otherwise fall back to hard truncation.
                     return shrunk
                 if shrunk:
                     logger.warning(
@@ -1084,11 +1064,7 @@ class CollectBridge:
                     )
             except Exception as exc:  # noqa: BLE001 — fail open to truncation
                 logger.warning("CollectBridge: shrink call failed: %s — hard-truncating", exc)
-        # The notice itself takes budget too — appending it after a cut at
-        # exactly _max_context_chars made the returned string overshoot by
-        # the notice's own length. Reserve room for it first; the notice's
-        # length depends on `excess`, which depends on the cut, so converge
-        # in a few steps (the digit count of `excess` rarely needs more).
+        # The truncation notice takes budget too: reserve room for it, converging on the cut length.
         cut = self._max_context_chars
         notice = ""
         for _ in range(4):
@@ -1131,17 +1107,10 @@ class CollectBridge:
                     if not any(
                         _qualname_matches(s.qualname, name) for s in module.public_symbols
                     ):
-                        # The pre-edit record does not know the name — but
-                        # the edit may have ADDED it. Repairing now would
-                        # pay an LLM call for every dirty path on every
-                        # pull; a clean record elsewhere may still answer,
-                        # so the repair waits until nothing else did.
+                        # The edit may have added the name, but repairing every dirty path on every pull is too costly; wait until nothing else answers.
                         deferred.append(path)
                         continue
-                    # V9: this record predates the edit, so it cannot be
-                    # trusted as is. `_is_dirty` repairs it when
-                    # auto_refresh is on; otherwise a clean duplicate
-                    # elsewhere still wins, so the loop keeps going.
+                    # A record predating an edit is not trusted: it is repaired when auto_refresh is on, else a clean duplicate wins.
                     if self._is_dirty(path):
                         dirty_hit = True
                         continue
@@ -1238,11 +1207,7 @@ class CollectBridge:
             )
         return ""
 
-    # Symbols listed before the inventory is cut short. A module with 65
-    # entries (the largest in this tree) would otherwise be truncated
-    # mid-line by ArchProbe._cap, leaving the Architect with a partial list
-    # it cannot tell is partial. Cutting on a symbol boundary and saying so
-    # is the difference between "here is some of the file" and a silent lie.
+    # Cap the symbol list on a symbol boundary and say so, so the Architect knows the list is partial (_MODULE_SYMBOL_LIMIT).
     _MODULE_SYMBOL_LIMIT = 40
 
     def _format_module_block(self, module) -> str:
@@ -1261,18 +1226,13 @@ class CollectBridge:
         lines = [f"module: {module.path}"]
         syms = list(module.public_symbols)
         if not syms:
-            # Distinct from a miss: the module resolved, it is simply empty.
-            # Callers and telemetry must not conflate the two.
+            # A miss differs from an empty module, which resolved and simply has no symbols.
             lines.append("(no public top-level symbols)")
             return "\n".join(lines)
         for sym in syms[: self._MODULE_SYMBOL_LIMIT]:
             qn = getattr(sym, "qualname", "") or ""
             bare = qn.split(":", 1)[-1] if ":" in qn else qn
-            # collect stores `signature` as "name(a, b)" / "name(...)", NOT "(...)" — a
-            # naive f"{bare}{signature}" renders "backoff_secondsbackoff_seconds(...)".
-            # Found on a live artifact, not in a fixture: the test double had
-            # the same shape and the doubled text still contained the expected
-            # substring, so only real data exposed it.
+            # Signatures already include the name, so do not prepend it again (found on live data).
             sig = (getattr(sym, "signature", "") or "").strip()
             if sig.startswith(bare):
                 part = f"  {sig}"
@@ -1388,8 +1348,7 @@ def make_collect_bridge(
     `tests_bugfix/test_collect_bridge_entry_refresh_loads_twice.py`.
     """
     key = "use_in_doc" if task_mode == "docs" else "use_in_auto"
-    # Bugfix (config-crash audit): unguarded. Wrapped per-call, not via a
-    # helper, so extract_config_reads still sees the literal call.
+    # Bugfix (config-crash audit): unguarded, so each read is wrapped per call.
     try:
         use_collect = config.getboolean("collect", key, fallback=False)
     except ValueError as exc:
@@ -1411,13 +1370,7 @@ def make_collect_bridge(
         logger.warning("make_collect_bridge: load() failed: %s", exc)
         return None
 
-    # V9: `[collect] auto_refresh_between_tasks` (default false). When true,
-    # a path a task edits is repaired via the existing incremental
-    # `action_module` (one module, one LLM call) instead of being blinded
-    # for the rest of the run. RUN-6: the same flag also repairs an artifact
-    # that is already stale on entry (below) — read here, before the stale
-    # check, for that reason. A malformed value degrades to the default,
-    # like every other `[collect]` read in this function.
+    # V9 auto_refresh_between_tasks (default false) repairs edited paths; RUN-6 also repairs a stale artifact on entry. A malformed value degrades to the default.
     try:
         auto_refresh = config.getboolean("collect", "auto_refresh_between_tasks", fallback=False)
     except ValueError as exc:
@@ -1428,10 +1381,7 @@ def make_collect_bridge(
         auto_refresh = False
 
     summarizer_call = None
-    # BUGFIX (audit): unguarded — the two reads above already catch
-    # ValueError; this one didn't, contradicting this function's own
-    # "opt-in, never fatal / fail-open" contract (a malformed value raised
-    # straight out instead of degrading to the documented default).
+    # Opt-in and fail-open: a malformed value falls back to the default instead of raising (BUGFIX).
     try:
         _llm_summaries = config.getboolean("collect", "llm_summaries", fallback=True)
     except ValueError as exc:
@@ -1448,26 +1398,25 @@ def make_collect_bridge(
             summarizer_call = None
 
     if getattr(model, "status", "absent") == "stale":
-        # staleness=warn (default): loader already decided not to refresh.
-        # The summarizer is built above, before this branch: the entry refresh
-        # is the V9 repair over every path that moved, so it takes the same
-        # Pass B call (`llm_summaries = true`) — or none, structural-only.
+        # Stale on entry: with auto_refresh, the artifact is repaired over the paths that moved, using the same summarizer.
         refreshed = _refresh_on_entry(
             base_dir, config, config_path, load_collect_model, llm_call=summarizer_call,
         ) if auto_refresh else None
         if refreshed is not None:
-            # RUN-6: the operator already pays for per-path repairs (V9); a
-            # whole-artifact repair on entry is the same operation over the
-            # set of paths that moved. The bridge below is built over a
-            # fresh model, so the pack is on for the whole session.
+            # A repaired artifact is used for the whole session (RUN-6).
             model = refreshed
+        elif _summary_only_stale(model):
+            # HARDEN-6 E: one module without a summary is not a reason to switch the pack off for
+            # every module. The pack stays on and serves every module that has its facts; the
+            # listed one is served without a summary.
+            logger.warning(
+                "make_collect_bridge: collect artifact is stale (%s) — the pack stays ON for "
+                "the modules that have their facts; the module(s) without a summary are served "
+                "without one (rebuilt at the next --collect)",
+                getattr(model, "reason", ""),
+            )
         else:
-            # Per product decision this is a plain fallback to standard
-            # --auto for the affected files — say so once in the log and
-            # once on stdout (a run.log WARNING is not where an operator
-            # looks during a run), then let `.usable` gate every call to
-            # False. With auto_refresh on, `_refresh_on_entry` has already
-            # printed and traced why the refresh did not stick.
+            # Without auto_refresh the affected files fall back to plain --auto, said once on the log and on stdout.
             logger.warning(
                 "make_collect_bridge: collect artifact is stale (%s) — "
                 "falling back to standard --auto context for this run "
@@ -1493,11 +1442,7 @@ def make_collect_bridge(
         )
         max_chars = _DEFAULT_MAX_CONTEXT_CHARS
 
-    # V6: `[collect] pack_enabled` (default true). When false, the fact pack
-    # collapses to the V2 baseline (contract, config_read, public_symbols only),
-    # so the block is byte-identical to a pre-V3 tree's output. A malformed
-    # value warns once and falls back to the default, like every other
-    # `[collect]` read in this function.
+    # V6 pack_enabled (default true): false collapses the block to the V2 baseline; a malformed value warns and falls back.
     try:
         pack_enabled = config.getboolean("collect", "pack_enabled", fallback=True)
     except ValueError as exc:

@@ -114,9 +114,7 @@ class TestReopenDoneFixTask:
         res1: BugFixResult = loop.handle_regression(trig, _ExecResult(), tmp_path)
         assert state.get_task(f"BUG-FIX-{root}")["status"] == "done"
 
-        # 2. NEW regression on the same root id -> BugFixLoop re-upserts the
-        #    same deterministic fix_id.  What matters is the status the loop's
-        #    own upsert leaves the task in *before* any new work runs.
+        # Regression on the same root id: the loop re-upserts the same fix_id; check the status it leaves before new work.
         loop.handle_regression(trig, _ExecResult(), tmp_path)
         assert outer.status_at_entry == "todo", (
             "BugFixLoop must reopen the DONE fix task to TODO for a new "

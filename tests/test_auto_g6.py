@@ -51,9 +51,7 @@ from tools.auto.progress_display import ProgressDisplay
 from tools.auto.state import StateStore
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared test fixtures / helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Shared fixtures and helpers
 
 def _make_state(tmp_path: Path, tasks=None) -> StateStore:
     store = StateStore(tmp_path / ".agent")
@@ -146,9 +144,7 @@ def _make_controller(tmp_path, tasks=None, *, task_cap=0):
     return ctrl
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC7 — on_cluster_done callback in architect.review_clusters
-# ─────────────────────────────────────────────────────────────────────────────
+# AC7: on_cluster_done callback in architect.review_clusters
 
 class TestArchitectCallback:
     """Unit tests for the on_cluster_done hook added to ClusterReviewer."""
@@ -261,9 +257,7 @@ class TestArchitectCallback:
         assert len(ticks) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — tick_arch called per cluster during PLAN phase
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: tick_arch called per cluster during PLAN
 
 class TestPlanPhaseArchTicks:
     def _make_clusters(self, n):
@@ -332,9 +326,7 @@ class TestPlanPhaseArchTicks:
         assert "coding [0/4]" in banner
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC3/AC4 — tick_code and set_task during EXECUTE phase
-# ─────────────────────────────────────────────────────────────────────────────
+# AC3/AC4: tick_code and set_task during EXECUTE
 
 class TestExecutePhaseProgress:
     def _run_execute(self, tmp_path, tasks, outer_results):
@@ -396,9 +388,7 @@ class TestExecutePhaseProgress:
         assert display.code_total == 3
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC5 — progress.json mirrors console counters
-# ─────────────────────────────────────────────────────────────────────────────
+# AC5: progress.json mirrors the console counters
 
 class TestProgressJson:
     def test_progress_json_written_on_tick_arch(self, tmp_path):
@@ -457,9 +447,7 @@ class TestProgressJson:
         assert pj.get("code_total") == display.code_total
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC6 — Resume: PLAN skipped, EXECUTE refresh shows correct counts
-# ─────────────────────────────────────────────────────────────────────────────
+# AC6: resume skips PLAN; EXECUTE refresh shows correct counts
 
 class TestResumeProgress:
     def test_execute_refresh_on_resume_shows_done_count(self, tmp_path):
@@ -511,9 +499,7 @@ class TestResumeProgress:
         mock_ingest.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC8 — progress_display=None is safe throughout
-# ─────────────────────────────────────────────────────────────────────────────
+# AC8: progress_display=None is safe throughout
 
 class TestNoneDisplaySafe:
     def test_plan_phase_with_none_display(self, tmp_path):

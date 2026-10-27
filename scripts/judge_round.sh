@@ -1,27 +1,12 @@
 #!/bin/bash
-# judge_round.sh — judge a round's candidate patches locally, one after another.
-#
-#   scripts/judge_round.sh 88                        every contest-out/88/*.patch
-#   scripts/judge_round.sh 88 fl5-88-ideal.patch 56/ ...plus extra patches / folders of patches
-#   QUICK=1 scripts/judge_round.sh 88                apply + scope checks only, no pytest
-#   JOBS=8 scripts/judge_round.sh 88                 pytest -n 8 instead of 4
-#
-# scripts/judge_epic_round.py scores agents' worktrees as they stand; this one
-# takes the handed-in .patch files and checks that they land on today's kc.
-#
-# Each patch is applied with `git am` on a fresh detached worktree of the local
-# `kc` HEAD (what the patch must land on), then:
-#   commits above base · files touched · CollectBridge._shrink byte-identical ·
-#   pytest tests -n 4 · pytest tests_bugfix -n 4 (sequential, never in parallel) ·
-#   sync_test_tiers.py --check
-# The main checkout is never touched, nothing is committed or pushed, and the
-# worktrees are removed at the end. Results: $OUT/summary.txt, logs per patch.
+# Judges a round's candidate patches on a detached worktree. usage: judge_round.sh NN [patch ...]
 set -u
 # The main checkout (where contest-out/ lives), even when run from a worktree.
 REPO=$(dirname "$(git -C "$(dirname "$(realpath "$0")")" rev-parse --path-format=absolute --git-common-dir)")
 BASE=${BASE:-kc}
 JOBS=${JOBS:-4}   # pytest -n; JOBS=8 when the box is free
 round=${1:?usage: judge_round.sh ROUND [extra.patch|dir/ ...]}; shift
+case $round in */*|*..*|"") echo "judge_round.sh: ROUND is a round name, not a path: $round" >&2; exit 2;; esac
 OUT=${OUT:-/tmp/judge-$round}
 mkdir -p "$OUT/wt"
 
@@ -51,7 +36,10 @@ for p in "${patches[@]}"; do
   [ -f "$p" ] || continue
   name=$(basename "$p" .patch); wt="$OUT/wt/$name"; log="$OUT/$name.log"
   git -C "$REPO" worktree remove --force "$wt" 2>/dev/null
-  git -C "$REPO" worktree add -q --detach "$wt" "$base_sha"
+  if ! git -C "$REPO" worktree add -q --detach "$wt" "$base_sha" >"$log" 2>&1; then
+    echo "$name | NO WORKTREE at $wt (see $log)" | tee -a "$OUT/summary.txt"; continue
+  fi
+  trap 'git -C "$REPO" worktree remove --force "$wt" 2>/dev/null; exit 130' INT TERM
   if ! git -C "$wt" am -q --whitespace=nowarn "$p" >"$log" 2>&1; then
     git -C "$wt" am --abort 2>/dev/null
     echo "$name | DOES NOT APPLY on ${base_sha:0:7} (see $log)" | tee -a "$OUT/summary.txt"

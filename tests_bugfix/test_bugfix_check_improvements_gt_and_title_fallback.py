@@ -58,9 +58,7 @@ def test_weak_overlap_returns_highest_ratio_not_first():
     task = {"target_files": {"a.py", "b.py", "c.py", "d.py"}, "title": "t"}
     # Shares 1/4 files with task -> ratio 0.25, seen first.
     weak_fp = {"target_files": {"a.py", "x.py", "y.py", "z.py"}, "title": "weak"}
-    # Shares 3/4 files with task -> ratio 0.75, seen second, above
-    # weak_fp's ratio but still below the 0.9 overlap_ratio threshold
-    # used here (so still "weak_overlap", not "file_overlap").
+    # Overlap 0.75 is below the 0.9 threshold used here: weak_overlap, not file_overlap.
     stronger_fp = {"target_files": {"a.py", "b.py", "c.py", "q.py"}, "title": "stronger"}
 
     matched, kind = find_false_positive(task, [weak_fp, stronger_fp], overlap_ratio=0.9)

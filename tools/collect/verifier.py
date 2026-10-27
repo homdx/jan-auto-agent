@@ -58,10 +58,7 @@ REASON_NO_CITATION = "dropped:no-citation"
 REASON_CONTRADICTS_GUARD = "dropped:contradicts-guard"
 REASON_CONTRADICTS_FAIL_OPEN = "dropped:contradicts-fail-open"
 REASON_SIBLING_CITATION_FAILED = "dropped:sibling-citation-failed"
-# COLLECT-17 follow-up (self-play round 2): the mirror image of
-# REASON_CONTRADICTS_GUARD. A claim that an access is *safe* ("is fully
-# guarded", "cannot raise") is checked against a real UNGUARDED status the
-# same way a claim that an access *crashes* is checked against GUARDED.
+# A claim that an access is safe is checked against a real UNGUARDED status (COLLECT-17).
 REASON_CONTRADICTS_CRASH = "dropped:contradicts-crash-risk"
 
 
@@ -128,36 +125,16 @@ class DroppedClaim:
 # ── claim extraction from Pass B prose ─────────────────────────────────────────
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
-_LOCATION_RE = re.compile(r"([\w./\\-]+\.py):(\d+)")
-# A `path.py:identifier` citation — the same "file:thing" shape as
-# `_LOCATION_RE`, but naming a symbol instead of a line number (identifier
-# starts with a letter/underscore, so it can never collide with the
-# all-digit line-number form above). This is what lets `extract_claims`
-# recognize an *invented* symbol name as an attempted citation at all — see
-# the `known_names` guard where this is used below, which is what keeps
-# this pattern from also flagging a *real* name Pass A's narrower
-# `public_symbols` index just doesn't happen to track (a module-level
-# constant, a class method).
-_SYMBOL_CITATION_RE = re.compile(r"([\w./\\-]+\.py):([A-Za-z_]\w*)\b")
-# Matches only the *start* of a candidate access citation — `name[` — so we
-# can then hand-walk the brackets with `_iter_access_citations` below
-# rather than trying to express "balanced, possibly-nested brackets" as a
-# single regex. (BUGFIX, see `_iter_access_citations`'s docstring for why
-# this replaced a plain single-pattern `_ACCESS_RE`.)
-_ACCESS_START_RE = re.compile(r"[A-Za-z_][\w.]*(?=\[)")
-# Base names that are typing/builtin generic containers, not variables —
-# BUGFIX (found via self-play): a sentence like "parse_config returns
-# dict[str, int] and raises ValueError on bad input" was previously read
-# by `_ACCESS_RE` as citing an access `dict[str, int]`; combined with
-# "raises...Error" tripping `_CRASH_WORDS_RE`, that turned an ordinary,
-# entirely correct type-annotation sentence into an `access_crash` claim
-# whose cited "access" can never appear in `known_accesses` (COLLECT-7's
-# catalog only ever holds real indexed-access sites, never type
-# expressions) — so `citation_check` dropped the whole sentence as a
-# fabrication, even though nothing in it was fabricated. Any candidate
-# citation whose base name is one of these is never treated as an access
-# citation at all, the same "nothing to check, so it survives" treatment
-# any other non-citation prose gets.
+# HARDEN-1 A5: the longest "sentence" `extract_claims` will parse at all. A claim
+# over about 2 000 characters is not a claim, and Pass B's prose has no length
+# cap of its own, so this is the second line of defence behind `_pair_brackets`.
+_MAX_CLAIM_SENTENCE_CHARS = 2000
+_LOCATION_RE = re.compile(r"(?<![\w./\\-])([\w./\\-]+\.py):(\d+)")   # (?<!…): starts where its run starts
+# Matches a symbol citation (path.py:Name), so an invented name is caught too.
+_SYMBOL_CITATION_RE = re.compile(r"(?<![\w./\\-])([\w./\\-]+\.py):([A-Za-z_]\w*)\b")
+# Matches only the start of an access citation (name[); the brackets are walked by hand.
+_ACCESS_START_RE = re.compile(r"(?<![\w.])[A-Za-z_][\w.]*(?=\[)")
+# Typing generics such as dict[str, int] are not variables, so they are not treated as accesses (BUGFIX).
 _TYPING_BASE_NAMES = frozenset({
     "dict", "list", "set", "tuple", "frozenset", "type",
     "Dict", "List", "Set", "Tuple", "FrozenSet", "Type",
@@ -170,33 +147,7 @@ _CRASH_WORDS_RE = re.compile(
     re.IGNORECASE,
 )
 _SILENT_WORDS_RE = re.compile(r"\b(silent(?:ly)?|swallow(?:s|ed|ing)?)\b", re.IGNORECASE)
-# COLLECT-17 follow-up (self-play round 2, found via
-# stub-test/run_hallucination_selfplay_v2.py's NEGATION-FLIP pattern): the
-# mirror image of _CRASH_WORDS_RE. Before this, a sentence citing an access
-# and asserting it is SAFE ("is fully guarded", "cannot raise", "will not
-# crash") fell through to kind="generic" — it has an access citation, but
-# _CRASH_WORDS_RE doesn't match affirmative-safety language, so
-# citation_check never checked the access against known_accesses and
-# contradiction_check's access_crash branch never ran at all. A false safety
-# claim about a genuinely UNGUARDED (crashing) access therefore survived
-# into the artifact completely unchecked — arguably worse than a false
-# crash claim, since it actively tells a reader a real risk is handled.
-# BUGFIX (verified-bugs audit #6): a safety sentence phrased with a
-# NEGATED crash word ("stack[-1] will not crash", "it won't throw", "there is
-# no risk of crash") was previously read as actual crash language:
-# _CRASH_WORDS_RE matches the literal word "crash"/"throw"/"fail" even when
-# it follows "will not"/"cannot"/"won't", so the crash branch above fired
-# first and the sentence was classified access_crash. That collapsed a true
-# "X is safe" claim into a crash claim — a true safety sentence about a
-# GUARDED access was then dropped as "contradicts-guard", and a false "X will
-# not crash" affirmation about an UNGUARDED access survived entirely
-# unchecked (as an access_crash, which has no UNGUARDED contradiction check).
-# The negation forms below (all three persons/tenses of "not", plus "never")
-# are exactly what _CRASH_WORDS_RE otherwise cannot see past. Note the same
-# problem never existed for "cannot raise"/"will not raise": the crash
-# pattern for "raise" requires a following `\bError` suffix, so plain
-# "cannot raise" never matched it — "crash"/"throw"/"fail" have no such
-# suffix and are the ones that needed this.
+# Negated crash words ("will not crash") are safety claims, not crash claims (COLLECT-17, BUGFIX).
 _SAFE_WORDS_RE = re.compile(
     r"\bsafe(?:ly)?\b|\bguarded\b|"
     r"(?:\bcannot\b|\bcan'?t\b|\bwill\s+not\b|\bwon'?t\b|\bwould\s+not\b|\bwouldn'?t\b|"
@@ -209,19 +160,48 @@ _SAFE_WORDS_RE = re.compile(
 )
 
 
-# BUGFIX: `dataflow.py` catalogs a string-key subscript's `access` field
-# via Python `repr()` on the key literal — which always renders with
-# single quotes (`entry['stack']`) — while Pass B prose naturally quotes
-# the same access the way it appears in the actual source, which is
-# whatever quote style that source file used (`entry["stack"]`). Compared
-# literally, those two strings never match, so *every* claim about a
-# double-quoted string-key access — crash or safety, doesn't matter — was
-# dropped by `citation_check` as "does not correspond to any indexed
-# access site", even though the exact same site is sitting right there in
-# `known_accesses` under the single-quoted spelling. `_normalize_access`
-# collapses both quote characters to one canonical form before any
-# access-citation comparison, on both sides, so quote style stops being
-# load-bearing for whether a real, correctly-cited claim survives.
+# Quote style is normalised on both sides before comparing accesses, so "x" and 'x' match (BUGFIX).
+def _site_key(location) -> "tuple[str, int] | None":
+    """``(path, first line)`` of a ``path:line`` / ``path:a-b`` location, or None."""
+    if not isinstance(location, str):
+        return None
+    m = re.match(r"^(.*?):(\d+)(?:[-–]\d+)?$", location.strip())
+    if not m:
+        return None
+    return m.group(1).replace("\\", "/"), int(m.group(2))
+
+
+def _claim_site_key(claim) -> "tuple[str, int] | None":
+    """The ``(path, line)`` an access claim is about, or None.
+
+    CC review fixes 50: `extract_claims` gives a claim ONE citation — its
+    location, its symbol or its access — so an access claim never carries the
+    line its sentence names, and the AUDIT3-3 narrowing never ran outside its
+    own tests. The line is read from the sentence then: the one ``path:line``
+    it cites in the claim's own module (two different ones name no single line).
+    """
+    key = _site_key(claim.location)
+    if key is not None:
+        return key
+    module = (claim.module or "").replace("\\", "/")
+    found = {(path.replace("\\", "/"), int(line))
+             for path, line in _LOCATION_RE.findall(claim.text or "")}
+    found = {k for k in found if k[0] == module}
+    return found.pop() if len(found) == 1 else None
+
+
+def _same_access_sites(module, cited: str, key) -> list:
+    """The module's recorded accesses with the cited text, narrowed to the
+    claim's own line *key* when one of them is on it (AUDIT3-3). A line with
+    no such access is the model's slip, not a site: every site is judged then,
+    as before AUDIT3-3 (CC review fixes 50)."""
+    sites = [ga for ga in module.guarded_accesses
+             if _normalize_access(ga.access) == cited]
+    if key is None:
+        return sites
+    return [ga for ga in sites if _site_key(ga.location) == key] or sites
+
+
 def _normalize_access(access: str) -> str:
     """Canonicalize an access-citation string for comparison purposes:
     fold both `'` and `"` to a single quote character. Only used for
@@ -230,6 +210,36 @@ def _normalize_access(access: str) -> str:
     "wins" is arbitrary as long as it's applied identically everywhere.
     """
     return access.replace('"', "'")
+
+
+def _pair_brackets(sentence: str) -> dict:
+    """Every ``[`` in *sentence* paired with the ``]`` that closes it, as a
+    ``{open_index: close_index}`` dict — one left-to-right pass with a stack.
+
+    HARDEN-1 A5: `_iter_access_citations` used to find every ``name[`` start
+    and then walk *forward from that start* to the bracket that brought its
+    depth back to zero. When the brackets never balance — ``"a[" * n``, a
+    looping or long Pass B answer — every start walked to the end of the
+    sentence, so the walk was O(n) per start and O(n²) overall: 38 s for
+    24 000 characters of unmatched brackets, at 100 % CPU, with no error and
+    no timeout, holding ``--collect`` for minutes.
+
+    Pairing once here makes the whole sentence O(n): each ``]`` closes the
+    most recent still-open ``[``, which is exactly the bracket the per-start
+    walk used to find, so the two agree on every string (checked against the
+    old function on 20 000 random bracket strings). An unmatched ``[`` (no
+    ``]`` left for it) and an unmatched ``]`` (nothing open to close) simply
+    have no entry, which is the old code's "unbalanced — not a real
+    subscript citation" outcome.
+    """
+    pairs: Dict[int, int] = {}
+    stack: List[int] = []
+    for i, ch in enumerate(sentence):
+        if ch == "[":
+            stack.append(i)
+        elif ch == "]" and stack:
+            pairs[stack.pop()] = i
+    return pairs
 
 
 def _iter_access_citations(sentence: str) -> List[str]:
@@ -249,35 +259,22 @@ def _iter_access_citations(sentence: str) -> List[str]:
        so a true, correctly-cited claim about the *outer* access was
        dropped by `citation_check` as an uncatalogued fabrication — even
        though it was neither uncatalogued nor fabricated, just mismatched
-       on a truncated string. Walking the brackets with an explicit depth
-       counter instead of a regex character class captures the whole
-       balanced span regardless of nesting depth.
+       on a truncated string. Pairing the brackets with an explicit stack
+       (see `_pair_brackets`) captures the whole balanced span regardless
+       of nesting depth, in one linear pass instead of one walk per start.
     2. The old pattern had no way to tell a real access apart from a type
        annotation using the same subscript syntax (`dict[str, int]`) —
        see `_TYPING_BASE_NAMES`'s docstring above.
     """
+    pairs = _pair_brackets(sentence)
     citations: List[str] = []
     for m in _ACCESS_START_RE.finditer(sentence):
         base = m.group(0)
         if base.rsplit(".", 1)[-1] in _TYPING_BASE_NAMES:
             continue
-        start = m.end()  # index of the opening '['
-        depth = 0
-        end = None
-        i = start
-        while i < len(sentence):
-            ch = sentence[i]
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
-            i += 1
-        if end is None:
-            continue  # unbalanced — not a real subscript citation
-        citations.append(sentence[m.start():end + 1])
+        end = pairs.get(m.end())   # the `]` that closes this start's `[`, if it has one
+        if end is not None:
+            citations.append(sentence[m.start():end + 1])
     return citations
 
 
@@ -419,74 +416,22 @@ def extract_claims(
         sentence = raw_sentence.strip()
         if not sentence:
             continue
+        # HARDEN-1 A5 / HARDEN-6 F: a 2 000+ character run-on sentence is kept cut to the cap with a mark. Its
+        # citations are still read from the whole of it (every check below is linear), so a fabricated one
+        # inside it is dropped like any other.
+        shown = sentence
+        if len(sentence) > _MAX_CLAIM_SENTENCE_CHARS:
+            shown = (sentence[:_MAX_CLAIM_SENTENCE_CHARS].rstrip()
+                     + f"… [truncated by Pass C: {len(sentence)} characters]")
 
-        # BUGFIX (found via self-play hallucination review): every field
-        # below used to be captured with a single `.search()` — the first
-        # match in the sentence, full stop. A sentence citing *two* things
-        # of the same kind ("make_summarizer_call and
-        # tools/collect/summarizer.py:_totally_invented_helper_fn both
-        # live in this module") only ever produced ONE `Claim`, carrying
-        # only the first citation found (`make_summarizer_call`, real) —
-        # the second, fabricated one was never extracted into anything
-        # `citation_check` could see at all, so it survived verbatim
-        # alongside the real citation that vouched for the sentence as a
-        # whole. Same failure mode for two `path.py:line` citations in one
-        # sentence (a real, in-range one plus a fabricated, out-of-range
-        # one). Fixed by finding *every* location/symbol/access citation
-        # in the sentence (not just the first of each) and emitting one
-        # `Claim` per citation — all sharing this sentence's `.text`/
-        # `.kind`, so `verify_claims` can (and does, below) enforce that
-        # the whole sentence only survives into the artifact if *every*
-        # citation it makes does.
+        # Every location, symbol and access citation in a sentence is extracted, not only the first (BUGFIX).
         locations = [f"{m.group(1)}:{m.group(2)}" for m in _LOCATION_RE.finditer(sentence)]
         accesses = _iter_access_citations(sentence)
 
-        # BUGFIX (bare short-name over-matching, found via self-play
-        # hallucination review against this repo's own collect run):
-        # `known_symbols` is the whole repo's flat table — in the low
-        # thousands per `_symbol_patterns`' own docstring — so a bare
-        # `\bshort\b` match with no `path.py:` prefix at all routinely hit
-        # short names that are *also* everyday English words ("task",
-        # "main", "check", "run", "repo"), coincidentally defined
-        # *somewhere* in a few-hundred-file repo's test suite. A sentence
-        # merely discussing "task metrics" or "the repo" got treated as an
-        # attempted citation of some unrelated test fixture's `task`/`repo`
-        # symbol and dropped as an unverifiable cross-module reference —
-        # even though the sentence made no code reference at all; "Entry
-        # point is main() via argparse" fared no better, flagged once per
-        # *other* file that also happens to define its own `main`.
-        #
-        # The distinguishing signal isn't call syntax (real citations this
-        # mechanism is *for* — "make_summarizer_call and summarize_repo
-        # both live in this module" — are bare, parenthesis-free prose
-        # too) — it's that a plain, single, undecorated lowercase word is
-        # both (a) indistinguishable from ordinary English and (b) exactly
-        # the shape of a generic, likely-non-unique local name (a stray
-        # test fixture, a parameter), so a bare match on one is low-signal
-        # either way. A real function/class name worth treating as a
-        # citation candidate is virtually always multi-word — snake_case
-        # (`make_summarizer_call`) or CamelCase (`AutoController`) — which
-        # ordinary prose doesn't spontaneously produce. Restricting bare
-        # (unprefixed) matching to that shape, while leaving the explicit
-        # `path.py:identifier` branch below completely untouched, keeps the
-        # mechanism's actual intended catch (a real multi-word helper name
-        # dropped into prose without its module prefix) while dropping the
-        # false-positive-prone single-word case entirely — it isn't lost,
-        # it just falls through as ordinary unverifiable prose, the same
-        # "nothing to check, so it survives" treatment any other
-        # unfalsifiable sentence already gets. An outright *invented*
-        # short name never matched `known_symbols` to begin with and is
-        # unaffected either way.
+        # A bare short name is matched only with a call or a path, so plain English words do not match (BUGFIX).
         symbols: List[str] = []
         for sym, pattern in _symbol_patterns(known_symbols):
-            # AUDIT NOTE: matches `_symbol_patterns`' own `sym.split(":")[-1]`
-            # exactly (rather than `split(":", 1)[1]`, which would silently
-            # disagree with it if a qualname ever contained a second colon)
-            # — currently equivalent in practice, since `ast_facts.py`/
-            # `java_facts.py` both build every qualname as exactly one
-            # colon (`f"{module_path}:{name}"`), but there's no reason for
-            # this loop to compute `short` any way other than the one the
-            # regex it's about to reuse was itself keyed by.
+            # Short name is split the same way as in _symbol_patterns, so the two always agree.
             short = sym.split(":")[-1]
             if "_" not in short and short == short.lower():
                 continue  # bare single lowercase word — too generic to trust
@@ -503,22 +448,12 @@ def extract_claims(
                 continue  # real-but-unindexed name in this module — not a citation to check
             symbols.append(exact_qualname)
 
-        # BUGFIX (see _SAFE_WORDS_RE): a safety sentence like "stack[-1] will
-        # not crash" contains the literal crash word "crash", so probing the
-        # raw sentence first would classify it access_crash. Probe the crash
-        # keywords on a copy with every safe phrasing removed — only
-        # genuinely affirmative crash language then trips the crash branch.
-        # A sentence that contains BOTH a real crash assertion and safety
-        # language still keeps the existing crash-wins behavior, because the
-        # residual crash assertion survives the strip.
+        # Crash words are probed on a copy with safe phrasings removed (BUGFIX).
         _crash_probe = _SAFE_WORDS_RE.sub("", sentence)
         if accesses and _CRASH_WORDS_RE.search(_crash_probe):
             kind = "access_crash"
         elif accesses and _SAFE_WORDS_RE.search(sentence):
-            # access_safe: the mirror image of access_crash (see
-            # _SAFE_WORDS_RE). Checked below the crash branch so a sentence
-            # that (unusually) contains both crash and safety language
-            # keeps the existing access_crash behavior unchanged.
+            # Safety claims are checked after crash claims, so a mixed sentence keeps crash behaviour.
             kind = "access_safe"
         elif _SILENT_WORDS_RE.search(sentence):
             kind = "silent_except"
@@ -536,7 +471,7 @@ def extract_claims(
         for fields in citation_fields:
             claims.append(
                 Claim(
-                    text=sentence,
+                    text=shown,
                     module=module_path,
                     kind=kind,
                     symbol=fields.get("symbol"),
@@ -628,11 +563,7 @@ def citation_check(
             return (
                 f"cited symbol {claim.symbol!r} belongs to module "
                 f"{symbol_module!r}, not {claim.module!r}"
-                # V16: the suffix describes a set actually widened past the
-                # module itself. A source module's set is `{claim.module}`
-                # alone (what `None` folds into above), so its detail string
-                # stays byte-identical to the pre-V11 wording — `.collect/`
-                # diffs and the M-tickets' reason counters read it.
+                # The set-of-modules suffix is added only when it is wider than the module (V16).
                 + (" or any module it imports" if len(citable) > 1 else "")
             )
 
@@ -709,25 +640,27 @@ def contradiction_check(
     """
     if claim.kind == "access_crash" and claim.access:
         cited = _normalize_access(claim.access)
-        for ga in module.guarded_accesses:
-            if _normalize_access(ga.access) == cited and ga.status == "GUARDED":
-                guard_desc = ga.guard or "guarded"
-                return (
-                    REASON_CONTRADICTS_GUARD,
-                    f"{claim.access} at {ga.location} is GUARDED ({guard_desc})",
-                )
+        # AUDIT3-3: a claim that names its line is judged by that line only —
+        # the same text GUARDED elsewhere in the module says nothing about it.
+        # A claim with no usable location keeps the COLLECT-17 rule: any
+        # GUARDED occurrence contradicts it.
+        key = _claim_site_key(claim)
+        same = _same_access_sites(module, cited, key)
+        on_line = key is not None and any(_site_key(ga.location) == key for ga in same)
+        guarded = [ga for ga in same if ga.status == "GUARDED"]
+        if guarded and (not on_line or len(guarded) == len(same)):
+            ga = guarded[0]
+            guard_desc = ga.guard or "guarded"
+            return (
+                REASON_CONTRADICTS_GUARD,
+                f"{claim.access} at {ga.location} is GUARDED ({guard_desc})",
+            )
 
     if claim.kind == "access_safe" and claim.access:
-        # Mirror image of the access_crash check above: a claim that an
-        # access is safe/guarded, checked against a real UNGUARDED status.
-        # Found via stub-test/run_hallucination_selfplay_v2.py's
-        # NEGATION-FLIP pattern — before this branch existed, this claim
-        # kind was never even constructed (see _SAFE_WORDS_RE), so a false
-        # "X is safely guarded" claim about a genuinely crashing access
-        # reached the artifact unchecked in every module tested.
+        # A safe-access claim is checked against UNGUARDED, the mirror of the crash check (COLLECT-17).
         cited = _normalize_access(claim.access)
-        for ga in module.guarded_accesses:
-            if _normalize_access(ga.access) == cited and ga.status == "UNGUARDED":
+        for ga in _same_access_sites(module, cited, _claim_site_key(claim)):
+            if ga.status == "UNGUARDED":
                 return (
                     REASON_CONTRADICTS_CRASH,
                     f"{claim.access} at {ga.location} is UNGUARDED "
@@ -812,10 +745,7 @@ def verify_claims(
 
         provisionally_kept.append(claim)
 
-    # First failure per sentence, so the swept-in siblings below can name the
-    # actual reason a sentence failed instead of always blaming citation —
-    # `contradiction_check` drops land here exactly as often as `citation_check`
-    # ones do, and BUGFIX above already established the two are not the same.
+    # The first failure per sentence is kept, so siblings name the real reason (BUGFIX).
     failed_sentence_source: Dict[str, DroppedClaim] = {}
     for d in dropped:
         failed_sentence_source.setdefault(d.claim.text, d)
@@ -859,12 +789,7 @@ def _verify_text(
         fail_open_locs=fail_open_locs,
         citable_modules=citable_modules,
     )
-    # BUGFIX (companion to `verify_claims`'s "sink or swim together" fix
-    # above): a sentence with *multiple* citations that all individually
-    # survived now has multiple `Claim`s in `kept` sharing the exact same
-    # `.text` — naively joining every kept claim's text would duplicate
-    # that sentence once per surviving citation. `dict.fromkeys` dedupes
-    # while preserving first-seen order (plain `set` would not).
+    # Duplicate sentence text is removed while keeping order, so a multi-citation sentence is not repeated (BUGFIX).
     filtered_text = " ".join(dict.fromkeys(c.text for c in kept))
     return filtered_text, dropped
 
@@ -915,9 +840,7 @@ def verify_module(
         known_names=known_names, citable_modules=citable_modules,
     )
 
-    # V8: a carried-forward `llm-stale` summary stays stale through Pass C —
-    # verification drops fabricated citations, it does not make old prose
-    # current.
+    # A carried-forward stale summary stays stale after verification (V8).
     verified_summary = LLMSummary(
         purpose=verified_purpose, notes=verified_notes, provenance=module.summary.provenance,
     )
@@ -970,16 +893,7 @@ def verify_repo(
         for m in modules
     }
 
-    # Broader "every name this module defines anywhere" index (COLLECT-17
-    # fabricated-symbol-citation fix), one per module, built directly from
-    # `sources` here rather than stored on `ModuleRecord` — it is a Pass-C
-    # -only heuristic guard against false-positive drops, never a
-    # structural fact COLLECT-1's provenance contract would need to track.
-    # A module whose source fails to re-parse (shouldn't happen — Pass A
-    # already parsed it — but `sources` is caller-supplied, so fail open to
-    # an empty set exactly like `line_counts`/`fail_open_registry` already
-    # do elsewhere in this function, rather than let one bad source string
-    # abort the whole verification run).
+    # Per-module set of every name the module defines, used only as a Pass C guard (COLLECT-17).
     known_names_by_module: Dict[str, FrozenSet[str]] = {}
     for m in modules:
         try:
@@ -997,43 +911,7 @@ def verify_repo(
     kept_count = 0
 
     for m in modules:
-        # BUGFIX: kept_count used to be recomputed by re-running
-        # extract_claims on the *rejoined* (already-filtered) purpose/notes
-        # text — but sentence-splitting doesn't round-trip through that
-        # rejoin. `_verify_text` reassembles surviving claims by joining
-        # their `.text` with a single space, so newline-separated,
-        # unpunctuated claims (a real Pass B idiom for bullet-style notes,
-        # e.g. "Handles retries\nLogs failures") collapse back into one
-        # sentence on re-split, since the split regex's `\n+` alternative
-        # no longer has a newline to match and the joined text has no
-        # terminal punctuation to trigger the other alternative either.
-        # Three surviving claims could silently get reported as one kept
-        # claim — undermining the "kept/dropped count for transparency"
-        # guarantee this report exists for (COLLECT-17 AC). Fixed by
-        # counting kept-by-subtraction against the *original* claim count
-        # instead: every claim `verify_claims` sees is either kept or
-        # recorded in `dropped`, nothing vanishes silently, so
-        # `total - len(dropped)` is exact by construction and needs no
-        # round-trip through reconstructed text at all.
-        # BUGFIX: `known_names` (the real-but-unindexed-name exemption
-        # guard) must be identical here to what `verify_module` uses
-        # internally below, or this count and `len(dropped)` stop being
-        # counts of the *same* claim set. Before multi-citation sentences
-        # existed (one `Claim` per sentence, always), a mismatched
-        # `known_names` could only change *which* field a sentence's lone
-        # `Claim` carried, never how many `Claim`s a sentence produced —
-        # so this call getting the default (empty) `known_names` instead
-        # of the module's real one was silently harmless. Now that one
-        # sentence can produce several `Claim`s (one per citation), a
-        # sentence combining an exempt (real-but-unindexed) citation with
-        # a genuine one produces a *different claim count* depending on
-        # whether the exemption fires — so an inconsistent `known_names`
-        # here would desync this count from what `verify_module` actually
-        # processes, breaking the `total - len(dropped) == len(kept)`
-        # invariant this whole block exists to guarantee.
-        # V11: the same holds for `citable_modules` — it changes how many
-        # `Claim`s a bare homonym mention produces (`extract_claims`), so
-        # this count and `verify_module` must see the same set.
+        # Kept claims are total minus dropped, so the known_names and citable_modules inputs must match (BUGFIX, V11).
         total_claims = 0
         m_citable = citable_by_module.get(m.path)
         if m.summary is not None:
@@ -1081,7 +959,5 @@ def write_verification_report(report: Dict[str, Any], path: Path) -> None:
     """Write `report` as canonical (sorted-key, indented) JSON."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    from tools.auto.utils import atomic_write_text
+    atomic_write_text(path, json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False) + "\n")

@@ -1,9 +1,5 @@
 #!/bin/bash
-# ingest_kc19.sh <name> <patch-or-diff>: worktree at c27bc32 + the entry + the ticket's mechanical checks.
-# A `.patch` (git format-patch) goes in with `git am`; a `.diff` (a STALLED worktree's `git diff`) with
-# `git apply` + one commit, so every entry is "one commit over the base" for the checks below.
-# Worktrees go to ../cb-kc19/<name> (outside the repo tree); logs to ../cb-kc19/logs.
-# The pytest lines run one at a time — never two entries at once (the roots collide on ports).
+# ingest_kc19.sh <name> <patch-or-diff>: worktree at c27bc32, then the entry and the checks.
 B=$(dirname "$(readlink -f "$0")"); R=$(git -C "$B" rev-parse --show-toplevel); BASE=c27bc32
 n=$1; p=$(readlink -f "$2"); W=$R/../cb-kc19/$n; L=$R/../cb-kc19/logs; mkdir -p "$L"
 rm -rf "$W"; git -C "$R" worktree prune

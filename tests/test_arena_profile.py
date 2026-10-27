@@ -203,8 +203,7 @@ def test_arena_never_reads_the_agents_ini(repo):
 
 
 def test_the_repo_is_this_checkout_and_not_the_working_directory(tmp_path):
-    # The launcher runs from wherever the operator is; a contest.ini in the cwd
-    # is nobody's profile file.
+    # The launcher runs from wherever the operator is; a contest.ini in the cwd is nobody's profile file.
     assert cli.REPO_ROOT == REPO_ROOT
     (tmp_path / "contest.ini").write_text("[arena.profile.from_cwd]\nlegs = 1\n")
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}

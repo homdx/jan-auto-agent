@@ -54,9 +54,7 @@ from tools.auto.outer_loop import OuterLoopResult  # noqa: E402
 from tools.auto.state import StateStore, make_task  # noqa: E402
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared fixtures / helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# Shared fixtures and helpers
 
 
 @dataclass
@@ -120,9 +118,7 @@ def _done_task(tid: str, acceptance_check: str = "true") -> dict:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Layer 1 — end-to-end through _run_task_loop (call-site guard)
-# ─────────────────────────────────────────────────────────────────────────────
+# Layer 1: end to end through _run_task_loop (call-site guard)
 
 
 def _run_full_loop(ctrl: AutoController, exc: BaseException):
@@ -186,9 +182,7 @@ class TestFullLoopToleratesRegressionCheckFailure:
         assert "index.lock is held" in log
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Layer 2 — calling _check_regressions directly (per-item inner guard)
-# ─────────────────────────────────────────────────────────────────────────────
+# Layer 2: _check_regressions directly (per-item inner guard)
 
 
 class TestCheckRegressionsInnerGuard:

@@ -298,8 +298,7 @@ class TestFailOpen:
         assert "validator error" in r.last_feedback
 
     def test_prior_critique_is_detected_on_the_method_actually_called(self, tmp_path, no_sleep):
-        # approve() takes prior_critique, approve_verdict() does not: the
-        # loop calls approve_verdict(), so it must not pass the kwarg there.
+        # The loop calls approve_verdict(), which takes no prior_critique kwarg.
         class V:
             def __init__(self):
                 self.kwargs = []
@@ -495,9 +494,7 @@ class TestMetricsAndTuner:
         assert out.promoted is False and "No baseline runs" in out.reason
 
     def test_projection_ignores_unavailable_rows_too(self, tmp_path):
-        # _projected_score reads load_recent(5) itself: four outages padding
-        # one real rejection must project exactly what the rejection alone
-        # projects — not a window of four "0-iteration" rows.
+        # Four outages must not pad the projection window: it equals one real rejection's projection.
         mc = MetricsCollector(tmp_path / "m.json")
         mc.record(_rec("rejected", 3))
         pe = PromptEvaluator(None, mc, None, max_iter=3)

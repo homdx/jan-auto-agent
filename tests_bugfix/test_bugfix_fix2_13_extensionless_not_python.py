@@ -34,8 +34,7 @@ from tools.auto.architect import CandidateTask, CitedLocation  # noqa: E402
 from tools.auto.gate1_filter import Gate1Filter  # noqa: E402
 from tools.auto.gate1_grounding import target_file_context  # noqa: E402
 
-# A brace-delimited definition in an extensionless file — the shape the
-# language-neutral extractor handles and the Python one cannot.
+# Brace-delimited definition in an extensionless file, which the language-neutral extractor handles.
 JENKINSFILE = """\
 // SENTINEL_TOP_OF_FILE
 pipeline {
@@ -46,8 +45,7 @@ pipeline {
 }
 """
 
-# Valid Python whose first statement is a string literal. Read as Python this
-# looks like a module docstring; it is a plain text file.
+# Valid Python text, but a plain text file: it must not be read as a module docstring.
 TEXTFILE = '''\
 """not actually a docstring — this file is not Python"""
 '''
@@ -174,11 +172,7 @@ class TestTargetFileContext:
             base_dir=tmp_path,
         )
         assert note is not None
-        # Asserting "stage" alone would pass either way: with the .py default
-        # extract_block returns nothing and target_file_context falls back to
-        # a head-of-file slice that happens to contain the word. Pin the
-        # extracted block itself instead — the fallback carries the file's
-        # first line, the real block does not.
+        # Pin the extracted block itself: the head-of-file fallback would contain the word too.
         assert "UNIQUE_MARKER" in note
         assert "SENTINEL_TOP_OF_FILE" not in note
 

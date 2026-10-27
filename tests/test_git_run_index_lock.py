@@ -54,9 +54,7 @@ BRANCH = "contest/fl2/agent-a"
 
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the harness
-# ─────────────────────────────────────────────────────────────────────────────
+# Harness
 
 
 def _git(cwd, *args) -> str:
@@ -164,9 +162,7 @@ class _Verdict:
     commit = None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# the ladder itself
-# ─────────────────────────────────────────────────────────────────────────────
+# Retry ladder
 
 
 def test_the_ladder_is_the_one_the_ticket_names():
@@ -243,9 +239,7 @@ def test_retries_1_is_one_attempt_and_no_waiting(repo, monkeypatch, lock_text, b
     assert backoffs == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# every caller waits the transient out
-# ─────────────────────────────────────────────────────────────────────────────
+# Every caller waits out the transient lock
 
 
 @pytest.mark.parametrize("caller", ["workspace", "gates", "manifest"])
@@ -302,9 +296,7 @@ def test_a_stale_lock_still_raises_with_the_original_git_text(repo, backoffs):
     assert len(backoffs) == git_run.LOCK_RETRIES - 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# a failed read is not an empty tree
-# ─────────────────────────────────────────────────────────────────────────────
+# A failed read is not an empty tree
 
 
 def test_a_clean_tree_is_still_an_empty_string(repo):

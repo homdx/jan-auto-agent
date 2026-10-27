@@ -13,6 +13,7 @@ from tools.llm_stream import (
     request_completion as _request_completion,
     ollama_chat_url as _ollama_chat_url,
     strip_think as _strip_think,
+    strip_json_fence as _strip_json_fence,
 )
 
 _FILTER_SNIPPET_CHARS = 800
@@ -46,12 +47,7 @@ def extract_block(filepath: str, target_name: str) -> Optional[str]:
             source = fh.read()
         result = _extract_block_from_source(source, target_name, ext)
         if not result:
-            # BUGFIX: this branch used to be indistinguishable from a read
-            # failure below (both returned bare None). It also fires for a
-            # file with no extension — ext="" degrades extract_block to a
-            # brace-based scan instead of an AST parse, which is a real,
-            # silent quality drop, not just "not found". Logged at debug so
-            # the cause is visible without changing the return contract.
+            # A file without an extension is logged at debug, since it falls back to a brace scan (BUGFIX).
             logger.debug(
                 "search_agent.extract_block: %r not found in %s (ext=%r%s)",
                 target_name, filepath, ext,
@@ -73,6 +69,36 @@ _DEFAULT_SKIP_DIRS = [
 ]
 
 
+def _normalise_already_searched(
+    already_searched: Optional[List[Any]],
+) -> tuple[Set[str], Set[tuple]]:
+    """Split an ``already_searched`` list into a file-level blacklist and a
+    ``(file, ref)`` blacklist.
+
+    Two shapes are accepted, because both appear in the wild:
+
+    * a plain ``str`` entry — the legacy shape (and what a resume
+      checkpoint written by an older run still holds). It skips that file
+      for *every* reference, exactly as it always did.
+    * a two-element ``(file, ref)`` entry — what :meth:`SearchAgent.run`
+      now reports. It skips that file only for that one reference, so the
+      next iteration can still find a *different* name defined there.
+
+    Anything else is ignored rather than raising: a malformed entry costs a
+    redundant file read, never a failed search.
+    """
+    files: Set[str] = set()
+    pairs: Set[tuple] = set()
+    if not isinstance(already_searched, (list, tuple, set, frozenset)):
+        return files, pairs
+    for entry in already_searched:
+        if isinstance(entry, str):
+            files.add(entry)
+        elif isinstance(entry, (tuple, list)) and len(entry) == 2:
+            pairs.add((str(entry[0]), str(entry[1])))
+    return files, pairs
+
+
 class SearchAgent:
     def __init__(
         self,
@@ -88,13 +114,10 @@ class SearchAgent:
         ssl_context=None,
     ):
         self.max_file_kb = max_file_kb
-        # None  → use the project-wide defaults
-        # []    → skip nothing (caller explicitly wants no exclusions)
-        # [...]  → use exactly what the caller passed
+        # None uses the defaults, [] skips nothing, and a list is used as given.
         self.skip_dirs: List[str] = list(_DEFAULT_SKIP_DIRS) if skip_dirs is None else skip_dirs
         self.max_depth = max_depth
-        # LLM noise-filter config. When model/base_url are absent the filter is
-        # disabled and every reference is approved (backward-compatible no-LLM mode).
+        # With no model or base_url the noise filter is off and every reference is approved.
         self.model = model
         self.base_url = base_url.rstrip("/") if base_url else None
         self.api_key = api_key
@@ -175,17 +198,12 @@ class SearchAgent:
                 url, headers, payload, self.timeout,
                 api_format=self.api_format, ssl_context=self.ssl_context,
             )
-            cleaned = _strip_think(raw or "").strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("```", 2)[1]
-                if cleaned.lstrip().lower().startswith("json"):
-                    cleaned = cleaned.lstrip()[4:]
+            # any fence label (```text, ```jsonc): a label left on the body failed json.loads and approved all
+            cleaned = _strip_json_fence(_strip_think(raw or "").strip())
             approved = json.loads(cleaned)
             if not isinstance(approved, list):
                 raise ValueError(f"expected a JSON list, got {type(approved).__name__}")
-            # An empty list ("[]") is valid JSON, so it skipped the
-            # except-block's fail-open path — treat it the same way, per
-            # this method's own documented fail-open contract.
+            # An empty JSON list is valid, so it takes the same fail-open path (per the method contract).
             if not approved:
                 logger.warning(
                     "_evaluate_with_llm: LLM returned an empty list — "
@@ -193,8 +211,7 @@ class SearchAgent:
                     "ref(s) [fail-open]", len(all_names),
                 )
                 return all_names
-            # Keep only names that were actually in the input (guard against
-            # the model inventing names), preserving the original order.
+            # Only names that were in the input are kept, so the model cannot invent one; order is kept.
             approved_set = {str(a) for a in approved}
             result = [n for n in all_names if n in approved_set]
             tracer.event("llm", "search_agent", "llm_response",
@@ -213,7 +230,7 @@ class SearchAgent:
         self,
         references: List[str],
         base_dir: str,
-        already_searched: Optional[List[str]] = None,
+        already_searched: Optional[List[Any]] = None,
         file_ext_hint: str = "",
         visited_names: Optional[Set[str]] = None,
         current_depth: int = 0
@@ -226,9 +243,28 @@ class SearchAgent:
         used as a hard filter — all extensions in ``_SEARCHABLE_EXTS`` are
         searched so non-Python projects receive context too.  Pass a non-empty
         value to *prefer* files with that extension (they are scanned first).
+
+        B3: ``already_searched`` used to be a list of *files*, and a file the
+        run had merely looked in was skipped wholesale on the next iteration.
+        The next iteration's ``suggested_searches`` are new names, so a name
+        asked for afterwards could only ever be found in a file that had never
+        been opened — a definition sitting in a file scanned for the first name
+        was unreachable, and a reference found earlier regressed to missing.
+        Entries are therefore ``(file, ref)`` pairs, and a file is skipped only
+        for the references already looked up in it.  Plain-string entries (the
+        legacy shape, still what a resume checkpoint from an older run holds)
+        keep the old whole-file meaning — see
+        :func:`_normalise_already_searched`.  ``result["searched_files"]``
+        reports the same ``(file, ref)`` pairs back, so the caller can feed it
+        straight into the next iteration.
         """
-        already_searched_set = set(already_searched or [])
-        visited_names = visited_names or set()
+        already_searched_files, already_searched_pairs = _normalise_already_searched(
+            already_searched
+        )
+        # AUDIT-22: `or` replaced a caller's EMPTY set with a new one, so the
+        # names this call visits never reached the set the caller passed in.
+        if visited_names is None:
+            visited_names = set()
         
         result: Dict[str, Any] = {
             "found": {},
@@ -251,9 +287,7 @@ class SearchAgent:
                 result["not_found"] = references
                 return result
 
-            # Gather candidate files across all supported source languages.
-            # If file_ext_hint is set, preferred-extension files come first so
-            # the most likely match is found quickly; others follow.
+            # Source files are gathered for all languages; the hinted extension is tried first.
             raw_candidates = list_source_files(base_dir, skip_dirs=self.skip_dirs)
             if file_ext_hint:
                 preferred = [f for f in raw_candidates if Path(f).suffix == file_ext_hint]
@@ -265,7 +299,7 @@ class SearchAgent:
                 p = Path(file_path)
                 str_path = str(p)
 
-                if str_path in already_searched_set:
+                if str_path in already_searched_files:
                     continue
 
                 # Guard: File size limit
@@ -275,12 +309,11 @@ class SearchAgent:
             # 2. Scan for References
             refs_to_search = [r for r in references if r not in visited_names]
             found_raw: Dict[str, Dict[str, str]] = {}
-            searched_this_run: Set[str] = set()
+            # What this run actually looked at, as (file, ref) pairs (B3): the
+            # next iteration may skip a pair, never a whole file.
+            searched_this_run: Set[tuple] = set()
 
-            # Intra-run source cache: each candidate file is read from disk at
-            # most once per run() call, regardless of how many references are
-            # searched. Key = absolute file path, value = file text (empty
-            # string marks a file that failed to read — skipped on all refs).
+            # Each candidate file is read at most once per run (empty text marks a failed read).
             _source_cache: Dict[str, str] = {}
 
             for ref in refs_to_search:
@@ -288,7 +321,11 @@ class SearchAgent:
                 ref_found = False
 
                 for candidate_file in valid_candidates:
-                    searched_this_run.add(candidate_file)
+                    # B3: only the (file, ref) pair is blacklisted, so a later
+                    # name can still be found in a file scanned for an earlier one.
+                    if (candidate_file, ref) in already_searched_pairs:
+                        continue
+                    searched_this_run.add((candidate_file, ref))
 
                     # Populate cache on first encounter of this file.
                     if candidate_file not in _source_cache:
@@ -319,7 +356,6 @@ class SearchAgent:
                     result["not_found"].append(ref)
 
             result["searched_files"] = list(searched_this_run)
-
             # 3. LLM Noise Filtering (Single Batch Call)
             if found_raw:
                 approved_refs = self._evaluate_with_llm(found_raw)
@@ -366,10 +402,7 @@ def make_search_agent(config, base_dir="."):
     active  = config.get("api", "active", fallback="local")
     section = f"api_{active}"
 
-    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
-    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
-    # the literal config.getX(...) call shape — see RunLimits.from_config's
-    # comment for the full reasoning.
+    # Wrapped per call, so extract_config_reads still sees the literal config.getX calls (AUTO-FIX).
     try:
         verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
     except ValueError as exc:

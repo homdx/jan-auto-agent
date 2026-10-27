@@ -377,7 +377,11 @@ def test_the_brief_reaches_the_prompt_verbatim_with_the_maps(collected):
 
 
 def test_the_maps_are_cut_to_the_configured_budget(collected):
-    big = "x" * 10_000
+    # A character the prompt's own text does not carry: the format spec and the acceptance
+    # block are full of letters, so a letter would over-count the cut as its own.
+    sentinel = next(c for c in "789"
+                    if c not in draft_mod.ticket_format_spec() + BRIEF + ACCEPTANCE)
+    big = sentinel * 10_000
     (collected / draft_mod.COLLECT_DIR / "TEST_MAP.md").write_text(big)
     prompts = []
 
@@ -389,7 +393,7 @@ def test_the_maps_are_cut_to_the_configured_budget(collected):
                            llm_call=fake)
     prompt = prompts[0]
     assert big not in prompt
-    assert prompt.count("x") == 200
+    assert prompt.count(sentinel) == 200
     assert "cut to 200 characters" in prompt
 
 
@@ -1139,8 +1143,7 @@ def test_brief_sources_reads_the_existing_files_the_brief_names(tmp_path):
 def test_the_prompt_carries_the_source_and_asks_for_cases(collected):
     """Round 129: the drafter saw only maps and restated the brief; now it gets the code."""
     prompts = []
-    # rglob order is the filesystem's: on another disk the first .py can be
-    # an empty __init__.py, which has no first line to look for.
+    # rglob order varies by disk; skip empty __init__.py files when picking the first module.
     target = next(p for p in sorted(collected.rglob("*.py"))
                   if ".collect" not in p.parts and p.read_text().strip())
     rel = target.relative_to(collected).as_posix()

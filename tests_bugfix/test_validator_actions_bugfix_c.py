@@ -154,11 +154,7 @@ class TestJsonOkRateExcludesBothFailureModes:
             {"status": "needs_fix"},  # ordinary content-based rejection — still "ok JSON"
         ]
         rate = self._json_ok_rate(results)
-        # 1 _api_error result is excluded from the denominator entirely
-        # (network jitter, not a prompt-quality signal) — 2 approved + 1
-        # ordinary needs_fix count as "ok JSON" out of the 4 judged results
-        # (5 total minus the 1 _api_error); the 1 _unparseable result is
-        # judged and counts against the candidate.
+        # Errors are excluded from the denominator; 2 approved and 1 needs_fix count as ok JSON out of 4.
         assert rate == 3 / 4
 
 

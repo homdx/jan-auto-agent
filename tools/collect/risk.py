@@ -45,12 +45,7 @@ LOC_WEIGHT = 1
 BLAST_RADIUS_WEIGHT = 5
 UNGUARDED_WEIGHT = 10
 UNDOCUMENTED_FAIL_OPEN_WEIGHT = 8
-#: Coverage is binary-gated, not scaled by a count: a module with *any*
-#: covering test is not on the zero-list, so this bonus never applies to
-#: it. This is the "coverage (zero -> max risk)" requirement — it is
-#: deliberately the single largest term in the table, since no other
-#: signal here should be able to outrank "nothing tests this at all"
-#: unless the module is also huge/UNGUARDED/undocumented-fail-open-heavy.
+#: Coverage is binary: any covering test removes the zero-list bonus, the largest term, so nothing outranks an untested module.
 ZERO_COVERAGE_BONUS = 50
 
 
@@ -90,14 +85,9 @@ def _loc(root: Optional[Path], module: ModuleRecord) -> int:
     if root is None or module.parse_error:
         return 0
     try:
-        source = (Path(root) / module.path).read_text(encoding="utf-8")
+        source = (Path(root) / module.path).read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError):
-        # BUGFIX: same class of bug as scanner.scan_repo/graph.build_call_edges
-        # — a file that isn't valid UTF-8 (e.g. it changed on disk between
-        # the scan and this risk-index pass) raised a bare
-        # UnicodeDecodeError here, contradicting this function's own
-        # docstring ("degrades to 'no size signal' rather than raising and
-        # taking down the whole index").
+        # Invalid UTF-8 (e.g. changed since the scan) degrades to no size signal, as the docstring says.
         return 0
     return len(source.splitlines())
 

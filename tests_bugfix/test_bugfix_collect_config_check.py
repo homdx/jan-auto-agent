@@ -115,8 +115,7 @@ class TestCollectDefaultMissingConfigIsTolerated:
     def test_no_config_flag_and_no_agents_ini_on_disk_still_runs(
         self, tmp_path: Path, capsys
     ) -> None:
-        # No --config passed at all -> args.config defaults to "agents.ini",
-        # which does not exist anywhere under tmp_path (our cwd for the run).
+        # No --config: args.config defaults to agents.ini, which does not exist under tmp_path.
         argv = ["main.py", "--collect", "--base", str(tmp_path)]
         code, mock_run = _run_collect(argv, tmp_path)
 

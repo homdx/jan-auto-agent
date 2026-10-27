@@ -82,8 +82,7 @@ class TestNoKnownFactsUnchanged:
         assert captured["user"] == "CHAPTER:\nChapter text."
 
     def test_do_update_passes_empty_bible_on_first_run(self, tmp_path: Path) -> None:
-        # No bible file exists yet → load() returns "" → extract() prompt
-        # is unchanged (regression for the very first chapter).
+        # No bible file yet: the extract prompt is unchanged (first chapter).
         captured: dict = {}
 
         def stub_llm(system: str, user: str) -> str:
@@ -126,17 +125,13 @@ class TestDedupStillBackstops:
         first_content = bible.load()
         assert first_content.count("Капитан — Рейес") == 1
 
-        # Second chapter: stub (mis)behaves and repeats the same fact
-        # verbatim despite the known-facts block being present in the prompt.
+        # The stub repeats a known fact verbatim on the second chapter.
         bible.update("Chapter two.")
         second_content = bible.load()
         assert second_content.count("Капитан — Рейес") == 1
 
     def test_repeated_paraphrase_not_caught_by_string_dedup(self, tmp_path: Path) -> None:
-        # Documents the honest limit: dedup is string-based, not semantic.
-        # A paraphrase of an existing fact is NOT removed by the merge step —
-        # only the prompt (tested above) discourages the model from emitting
-        # it in the first place.
+        # Documents the limit: string dedup misses paraphrases; only the prompt discourages them.
         calls = {"n": 0}
 
         def stub_llm(system: str, user: str) -> str:

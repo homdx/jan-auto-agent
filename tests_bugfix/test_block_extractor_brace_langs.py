@@ -62,15 +62,7 @@ def test_java_method_with_generic_return_type():
     assert _found("names")
 
 
-# BUGFIX: the return-type generics group used to be a single, non-nesting
-# `<[^>{}]*>` — `[^>]*` stops at the FIRST `>`, so a NESTED generic return
-# type like `Map<String, List<Integer>>` (extremely common in real Java —
-# any Map/Optional/List of a parameterized type) only consumed up through
-# the INNER closing `>`, left the outer `>` unconsumed right before the
-# required whitespace, and the whole pattern failed to match. Every other
-# candidate pattern requires the method name to be the first token on the
-# line, which it isn't when a return type precedes it — so the method was
-# unfindable by ANY pattern, not just this one.
+# Regression: nested generic return types (Map<String, List<Integer>>) were not matched.
 JAVA_NESTED_GENERICS = """\
 public class DataService {
 
@@ -126,9 +118,7 @@ def test_rust_fn():
 
 
 def test_no_false_positive_on_call_site():
-    # A bare call `foo(...)` on its own indented line could be matched by the
-    # loose `^\s*name(` pattern; that's acceptable (it still yields a block),
-    # but a method *definition* must be preferred when both exist.
+    # A bare call matches the loose pattern too, but a method definition must be preferred.
     src = "class X {\n    void caller() {\n        helper(1);\n    }\n    int helper(int n) {\n        return n;\n    }\n}\n"
     blk = extract_block(src, "helper", ".java")
     assert "int helper(int n)" in blk

@@ -37,14 +37,11 @@ MAX_BATCH = 20          # /assess takes at most 20 claims per call
 DEFAULT_MAX = 12        # our own cap: one credit per claim
 VERIFY_CREDITS = 10     # what one /verify costs, for the console estimate
 
-# A sentence is *internal* when it names something that only exists in this
-# repo: a path, a ticket id, a backticked identifier with _ or a dot-suffix.
+# A sentence is internal when it names something that exists only in this repo (path, ticket id, identifier).
 _TICKET = re.compile(r"\b(?:KC|FL|AR|AUTO|SLOW|GATE1)-[\w-]*\d")
 _BACKTICK = re.compile(r"`([^`]+)`")
 _PATHLIKE = re.compile(r"(?:\w+/)+\w|\b\w+/(?![\w/])|\.(?:py|md|ini|json|csv|sh)\b")
-# Ordinary words that carry a slash ("read/write", "TCP/IP") and plain
-# fractions ("24/7") are not paths; they are cut out before _PATHLIKE looks,
-# or a public claim holding one is never sent and is voted CODE-CHECK.
+# Slash words ("read/write", "TCP/IP", "24/7") are not paths; cut them out before _PATHLIKE matches.
 _SLASH_WORDS = re.compile(
     r"(?<![\w/.])(?:and/or|either/or|read/write|r/w|input/output|i/o|tcp/ip|"
     r"client/server|yes/no|true/false|on/off|pass/fail|success/failure|"
@@ -67,8 +64,7 @@ _HINTS = re.compile(
 def _repo_symbols(root: Path) -> set[str]:
     """Names defined in the repo's own code: def/class names and file stems."""
     names: set[str] = set()
-    # -z: NUL-separated and unquoted, so "my module.py" stays one file and a
-    # non-ASCII name is not C-quoted; surrogateescape keeps any bytes readable.
+    # NUL-separated and unquoted, so names with spaces or non-ASCII stay readable.
     try:
         raw = subprocess.run(["git", "ls-files", "-z", "*.py"], cwd=root,
                              capture_output=True, check=True).stdout
@@ -92,8 +88,7 @@ def split_sentences(text: str) -> list[str]:
         line = line.strip()
         if not line or line.startswith(("|", "#", "```")):
             continue
-        # one real list marker ("- ", "* ", "+ ", "1. ", "12) ", "1.2. ") and
-        # only that: "404 is ...", "3.5 seconds ...", "-1 is ..." keep their words
+        # Only one real list marker is removed, so numbers at the start of a sentence keep their words.
         line = re.sub(r"^(?:[-*+]|\d+(?:\.\d+)*[.)])\s+", "", line, count=1)
         line = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", r"\1", line)   # bold, not "2 ** 10"
         label = _LABEL.match(line)
@@ -101,10 +96,28 @@ def split_sentences(text: str) -> list[str]:
             if label.group(1).lower() in _NOT_CLAIMS:
                 continue
             line = line[label.end():]
-        for part in re.split(r"(?<=[.!?])\s+(?=[A-Z`])", line):
+        for part in _sentences(line):
             part = part.strip()
             if len(part) > 30:
                 out.append(part)
+    return out
+
+
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z`])")
+#: Abbreviations such as e.g., i.e., vs and approx do not end a sentence; "no", "etc" and "fig" are left out of the list.
+_ABBREV_END = re.compile(r"(?:^|[\s(])(?:e\.g|i\.e|vs|cf|approx|resp|incl|esp)\.$", re.I)
+
+
+def _sentences(line: str) -> list[str]:
+    """*line* cut at sentence ends: a full stop, ``!`` or ``?`` before a capital or a backtick, not
+    after a common abbreviation."""
+    out, start = [], 0
+    for m in _SENTENCE_END.finditer(line):
+        if _ABBREV_END.search(line[start:m.start()]):
+            continue
+        out.append(line[start:m.start()])
+        start = m.end()
+    out.append(line[start:])
     return out
 
 
@@ -121,8 +134,7 @@ def is_internal(sentence: str, symbols: set[str]) -> bool:
     for tok in _BACKTICK.findall(sentence):
         if tok in symbols or _CODEISH.search(tok):
             return True
-    # a repo name written bare; only snake_case ones, a plain word ("render")
-    # is too often an English word as well
+    # A bare word is a repo name only when it is snake_case, since plain words are often English.
     return any(tok in symbols for tok in _SNAKE.findall(sentence))
 
 
@@ -155,8 +167,7 @@ class Cache:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
-        # valid JSON that is not an object ([] or null) is an empty cache too;
-        # the next put rewrites the file as an object
+        # Valid JSON that is not an object is an empty cache; the next put rewrites it as an object.
         self.data: dict = data if isinstance(data, dict) else {}
 
     @staticmethod
@@ -184,6 +195,11 @@ def api_key() -> str:
     return getpass.getpass("Lenz API key (not saved): ").strip()
 
 
+class LenzError(Exception):
+    """One Lenz call that did not answer: HTTP, network or a reply that is no JSON. A batch fetched
+    before it is cached, so a re-run does not pay for it again."""
+
+
 def call(method: str, path: str, key: str, body: dict | None = None,
          timeout: int = 120) -> dict:
     req = urllib.request.Request(
@@ -195,13 +211,43 @@ def call(method: str, path: str, key: str, body: dict | None = None,
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
-        sys.exit(f"Lenz {method} {path}: HTTP {exc.code} {exc.read()[:300]!r}")
+        # raised, not sys.exit: /verify's poll loop loses its paid task id to an exit
+        raise LenzError(f"Lenz {method} {path}: HTTP {exc.code} {exc.read()[:300]!r}") from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
+        # a dropped connection, a DNS failure, a timeout: a traceback before
+        raise LenzError(f"Lenz {method} {path}: {type(exc).__name__}: {getattr(exc, 'reason', exc)}") from None
+    except ValueError as exc:
+        raise LenzError(f"Lenz {method} {path}: the reply is not JSON ({exc})") from None
 
 
-def split_sections(text: str) -> list[str]:
+def _heading_parts(text: str) -> list[str]:
+    """*text* cut before every ``##``/``###`` line outside a ``` / ~~~ fence: a ``## `` inside a
+    quoted shell session or a markdown sample is not a heading (it split a section in two)."""
+    parts, cur, fence = [], [], ""
+    for line in text.splitlines(keepends=True):
+        mark = re.match(r"\s*(`{3,}|~{3,})(.*)", line)
+        if mark and not fence:
+            fence = mark.group(1)
+        elif mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence) and not mark.group(2).strip():
+            # A fence closes only with as many of its own characters, as CommonMark requires.
+            fence = ""
+        elif not fence and re.match(r"#{2,3} ", line) and cur:
+            parts.append("".join(cur))
+            cur = []
+        cur.append(line)
+    parts.append("".join(cur))
+    return parts
+
+
+def split_sections(text: str, min_chars: int = 120) -> list[str]:
     """Report -> sections at ##/### headings; a section keeps its own heading,
-    so /extract gets the context ("Bug 1: ...") the bare sentences lacked."""
-    parts = [p.strip() for p in re.split(r"(?m)^(?=#{2,3} )", text) if len(p.strip()) > 120]
+    so /extract gets the context ("Bug 1: ...") the bare sentences lacked.
+
+    A section of *min_chars* or fewer is left out: this script pays for /check on what it
+    sends, and CC-9's lenz_hint counts on that cut (`SECTION_MIN`). claim_extract.py passes 0:
+    a short `## Lock` section with a real claim, or a whole 79-character report, gave no claims
+    and no word of it."""
+    parts = [p.strip() for p in _heading_parts(text) if len(p.strip()) > min_chars]
     if len(parts) >= 2:
         return parts
     # no headings (a plain-text review): pack paragraphs into ~1800-char chunks
@@ -213,7 +259,7 @@ def split_sections(text: str) -> list[str]:
             cur = ""
         cur += para + "\n\n"
     chunks.append(cur.strip())
-    return [c for c in chunks if len(c) > 120]
+    return [c for c in chunks if len(c) > min_chars]
 
 
 def extract_claims(section: str, key: str, cache: Cache) -> list[str]:
@@ -286,7 +332,11 @@ def verify(claim: str, key: str, cache: Cache, wait: int = 240) -> dict:
     deadline = time.time() + wait
     while task_id and time.time() < deadline:
         time.sleep(10)
-        st = call("GET", f"/verify/status/{task_id}", key)
+        try:
+            st = call("GET", f"/verify/status/{task_id}", key)
+        except LenzError as exc:
+            # the /verify was paid for: its task id is reported, not lost with the process
+            return {"status": "error", "task_id": task_id, "error": str(exc), "cached": False}
         if st.get("status") in ("completed", "complete", "done", "ready", "failed"):
             if st.get("status") != "failed":
                 cache.put("verify", claim, st)
@@ -330,8 +380,7 @@ def main(argv: list[str] | None = None) -> int:
             print("  -", sec.splitlines()[0][:100])
         return 0
 
-    # The key is asked for only when something must go out: a fully cached
-    # run (every section, every claim) and an empty send need none.
+    # The key is asked for only when something must be sent.
     keys: list[str] = []
 
     def need_key() -> str:
@@ -340,9 +389,15 @@ def main(argv: list[str] | None = None) -> int:
         return keys[0]
 
     extracted: list[str] = []
-    for sec in sections:
-        key = need_key() if cache.get("extract", sec) is None else ""
-        extracted += extract_claims(sec, key, cache)
+    try:
+        for sec in sections:
+            key = need_key() if cache.get("extract", sec) is None else ""
+            extracted += extract_claims(sec, key, cache)
+    except LenzError as exc:
+        # the free /extract fails as /assess does: one line, not a traceback
+        print(f"lenz_claim_filter: {exc} — the sections read before it are cached; a re-run does not "
+              "send them again", file=sys.stderr)
+        return 1
     claims = pick_extracted(extracted, args.max, _repo_symbols(args.repo_root))
     fresh = sum(1 for c in claims if not cache.get("assess", c))
     print(f"{len(sections)} sections -> {len(extracted)} claims (free) -> "
@@ -352,14 +407,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:                      # the next stage never reads a stale file
             args.json.write_text("[]\n", encoding="utf-8")
         return 0
-    rows = assess(claims, need_key() if fresh else "", cache)
+    try:
+        rows = assess(claims, need_key() if fresh else "", cache)
+    except LenzError as exc:
+        print(f"lenz_claim_filter: {exc} — the rows fetched before it are cached; a re-run does not "
+              "send them again", file=sys.stderr)
+        return 1
     report = {"source": str(args.report), "sentences": len(extracted),
               "internal": len(extracted) - len(claims), "rows": rows, "verify": None}
     worst = most_doubtful(rows) if args.verify else None
     if worst is not None:
         claim = rows[worst].get("claim") or claims[worst]
         key = "" if cache.get("verify", claim) else need_key()
-        report["verify"] = {"claim_text": claim, "result": verify(claim, key, cache)}
+        try:
+            result = verify(claim, key, cache)
+        except LenzError as exc:
+            result = {"status": "error", "error": str(exc), "cached": False}
+        report["verify"] = {"claim_text": claim, "result": result}
     print(render(report))
     if args.json:
         args.json.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")

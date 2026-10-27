@@ -63,16 +63,12 @@ def test_prune_evicts_oldest_workspace_first(tmp_path):
     task_ids = [f"AUTO-T{i}" for i in range(5)]
     for task_id in task_ids:
         _run_task(executor, task_id)
-        # Force distinct stamps; the bug this guards against manifested even
-        # with a real time gap between runs, since the broken mtime came from
-        # copytree metadata, not from timing.
+        # Distinct stamps: the bug came from copytree metadata, not from timing.
         _past_the_stamp_of(workspace_root / task_id, tmp_path)
 
     remaining = sorted(p.name for p in workspace_root.iterdir())
 
-    # Only the 3 most-recently-created task workspaces should survive, in
-    # strict creation order — not an arbitrary subset caused by a broken
-    # (all-equal) mtime sort.
+    # Keep the three newest task workspaces, in creation order.
     assert remaining == ["AUTO-T2", "AUTO-T3", "AUTO-T4"]
 
 
@@ -92,6 +88,5 @@ def test_workspace_mtime_is_not_clobbered_by_copytree(tmp_path):
     _run_task(executor, "AUTO-T1")
     ws1_mtime = (workspace_root / "AUTO-T1").stat().st_mtime
 
-    # Before the fix these were identical, both inherited from base_dir's
-    # own mtime via shutil.copytree's default metadata-preserving copy.
+    # Both inherited base_dir's mtime from copytree's metadata-preserving copy before the fix.
     assert ws1_mtime > ws0_mtime

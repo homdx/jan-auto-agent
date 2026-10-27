@@ -97,6 +97,19 @@ Keys and tests are AR-60.
 - A name not in the profile: refusal naming the profile's models.
 - Dropping every model: refusal `arena: profile 'default' would be empty — 1 model
   must stay`, file unchanged.
+- A name matches a profile entry with or without its provider (`p1/a:free` is `a:free`)
+  and whatever its `@variant`.
+
+### `arena model replace OLD NEW -p PROFILE [-y]`
+
+- One NEW model (a list is a refusal: that is `use`). NEW is checked like `use`'s names
+  and refused if it is a judge model.
+- Every entry of the profile that is OLD (with or without its provider, any `@variant`)
+  becomes NEW at its own place; the order and the other entries' repeats stay, and NEW
+  already in the profile is one more agent, as in `use`.
+- OLD not in the profile: refusal naming the profile's models, file unchanged.
+- OLD replaced by itself: `(unchanged)`, nothing asked, nothing written.
+- Prints `models =` before → after and asks; `-y` applies without asking.
 
 ---
 

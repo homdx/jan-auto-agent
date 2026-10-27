@@ -43,9 +43,7 @@ def _cfg(**validator_agent_kv) -> configparser.ConfigParser:
     return cfg
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core resolver tests (spec'd in AUTO-CR-19-1)
-# ─────────────────────────────────────────────────────────────────────────────
+# Core resolver tests (AUTO-CR-19-1)
 
 class TestResolveValidatorSystem:
 
@@ -60,9 +58,7 @@ class TestResolveValidatorSystem:
         assert "APPROVED" in resolved
         assert "REVISE" in resolved
         assert "function" not in resolved.lower()
-        # Not the legacy JSON-contract code prompt (the creative builtin's
-        # own "Do NOT return JSON" guard is fine — that's a negative
-        # instruction, not a JSON-output contract like the code prompt's).
+        # The creative builtin's "Do NOT return JSON" is a negative instruction, not a JSON contract.
         assert '"approved"' not in resolved
         assert "JSON object" not in resolved
 
@@ -120,16 +116,12 @@ class TestResolveValidatorSystem:
         assert resolved == _LEGACY_CODE_SYSTEM
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LLMGate2Validator construction — confirms the wiring inside __init__
-# uses the fixed resolver, not a re-implementation that could drift.
-# ─────────────────────────────────────────────────────────────────────────────
+# LLMGate2Validator construction: __init__ uses the fixed resolver.
 
 class TestLLMGate2ValidatorWiring:
 
     def _make_validator(self, task_mode: str, cfg: configparser.ConfigParser) -> LLMGate2Validator:
-        # Other sections referenced by __init__ (search_agent / coder probe)
-        # are optional; LLMGate2Validator tolerates a minimal config.
+        # Optional sections (search_agent, coder probe) may be missing; the validator tolerates a minimal config.
         return LLMGate2Validator(
             base_url="http://localhost:11434",
             model="llama3.1:8b",

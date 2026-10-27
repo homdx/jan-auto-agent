@@ -54,9 +54,7 @@ from tools.auto.repo_ingest import RepoCluster
 from tools.auto.state import StateStore, _validate_task_schema
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cand(
     *,
@@ -107,9 +105,7 @@ def _make_emitter(tmp_path: Path, git=None, state=None) -> PlanEmitter:
     return PlanEmitter(base_dir=tmp_path, state=state, git=git)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — IMPROVEMENTS.md written and committed
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: IMPROVEMENTS.md is written and committed
 
 class TestImprovementsMdWritten:
     def test_file_created_in_base_dir(self, tmp_path: Path) -> None:
@@ -141,9 +137,7 @@ class TestImprovementsMdWritten:
         assert (tmp_path / IMPROVEMENTS_FILENAME).exists()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — git.commit() called with correct message
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: git.commit() is called with the correct message
 
 class TestCommitMessage:
     def test_commit_called_once(self, tmp_path: Path) -> None:
@@ -190,9 +184,7 @@ class TestCommitMessage:
         assert result is None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — tasks upserted into plan.json via StateStore
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: tasks are upserted into plan.json via StateStore
 
 class TestTasksUpserted:
     def test_upsert_called_per_auto_task(self, tmp_path: Path) -> None:
@@ -236,9 +228,7 @@ class TestTasksUpserted:
         state.upsert_task.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # StateLogging
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestStateLogging:
     def test_state_log_called(self, tmp_path: Path) -> None:
@@ -258,9 +248,7 @@ class TestStateLogging:
         assert "1" in log_messages
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # _cluster_hash unit tests
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestClusterHash:
     def test_deterministic(self) -> None:
@@ -293,9 +281,7 @@ class TestClusterHash:
         assert isinstance(h, str) and len(h) == 64  # SHA-256 hex
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# changed_clusters — re-run cheapness (AC1)
-# ─────────────────────────────────────────────────────────────────────────────
+# changed_clusters: re-run cheapness (AC1)
 
 class TestChangedClusters:
     def test_all_returned_on_first_run(self, tmp_path: Path) -> None:
@@ -367,9 +353,7 @@ class TestChangedClusters:
         assert emitter.changed_clusters([]) == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# emit() without clusters arg — hash not updated
-# ─────────────────────────────────────────────────────────────────────────────
+# emit() without a clusters argument leaves the hash unchanged
 
 class TestEmitWithoutClusters:
     def test_no_hash_file_created_when_clusters_not_passed(self, tmp_path: Path) -> None:
@@ -386,9 +370,7 @@ class TestEmitWithoutClusters:
         assert stale == clusters
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Integration — real StateStore + GitManager + tmp repo
-# ─────────────────────────────────────────────────────────────────────────────
+# Integration: real StateStore, GitManager and a temp repo
 
 class TestIntegration:
     """End-to-end: real StateStore, real GitManager, real filesystem."""
@@ -513,9 +495,7 @@ class TestIntegration:
         assert stale[0].name == "io"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Bug 14 — atomic IMPROVEMENTS.md write and guarded upsert loop
-# ─────────────────────────────────────────────────────────────────────────────
+# Bug 14: atomic IMPROVEMENTS.md write and a guarded upsert loop
 
 class TestAtomicWrite:
     """emit() must use atomic_write_text, not a plain write_text, for IMPROVEMENTS.md."""

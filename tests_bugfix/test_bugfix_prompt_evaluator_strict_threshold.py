@@ -44,9 +44,7 @@ def _evaluator_with_scores(current_score: float, candidate_score: float) -> Prom
 
 
 def test_exact_boundary_delta_is_not_promoted():
-    # delta == 0.05 exactly (0.05 - 0.0 is exact in binary float, unlike
-    # most other "nice" decimal pairs): docstring requires STRICTLY
-    # greater than 0.05.
+    # Exactly 0.05 is not promoted: the threshold is strictly greater than 0.05.
     ev = _evaluator_with_scores(current_score=0.0, candidate_score=0.05)
     result = ev.evaluate("validator_agent", CANDIDATE)
     assert result.promoted is False

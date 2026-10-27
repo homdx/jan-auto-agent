@@ -104,9 +104,7 @@ def test_candidate_resting_only_on_llm_prose_is_not_suppressed(mini_repo):
     say-so -- must not be auto-suppressed, because `is_safe()` never
     looks at LLM notes in the first place."""
     model = _load(mini_repo)
-    # pkg/a.py:2 is inside `guarded()` but isn't the indexed-access line
-    # itself, so no static source vouches for it -- mirrors a candidate
-    # that only an LLM's prose (never consulted here) would speak to.
+    # pkg/a.py:2 is inside guarded() but not the indexed-access line: no static source vouches for it.
     candidate = bf.BughuntCandidate(location="pkg/a.py:2", claim="LLM notes claim this line is fine")
 
     verdicts = bf.suppress([candidate], model)

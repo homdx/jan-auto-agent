@@ -25,9 +25,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from analyze_logs import analyze, render_run_summary
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _evt(kind: str, params: dict | None = None, run_id: str = "run1", **kw) -> dict:
     return {
@@ -64,9 +62,7 @@ def _capture_summary(run: dict) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 1. plan_ready populates plan_total
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPlanReadyEvent:
     def test_plan_ready_sets_plan_total(self) -> None:
@@ -91,9 +87,7 @@ class TestPlanReadyEvent:
         assert runs["run1"]["plan_total"] == 5
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. render_run_summary displays plan= and uses plan_total
-# ─────────────────────────────────────────────────────────────────────────────
+# 2. render_run_summary shows plan= and uses plan_total
 
 class TestRenderRunSummary:
     def _make_run(self, plan_total: int = 0, n_tasks: int = 0) -> dict:
@@ -164,9 +158,7 @@ class TestRenderRunSummary:
         assert "seen=3" in text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. Multiple runs — each gets its own plan_total
-# ─────────────────────────────────────────────────────────────────────────────
+# 3. Multiple runs, each with its own plan_total
 
 class TestMultipleRuns:
     def test_each_run_has_independent_plan_total(self) -> None:
@@ -181,9 +173,7 @@ class TestMultipleRuns:
         assert runs["runB"]["plan_total"] == 12
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 4. pipeline.py emits plan_ready after _run_plan_phase
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPipelineEmitsPlanReady:
     def _make_controller(self, tmp_path: Path, n_tasks: int = 3) -> MagicMock:

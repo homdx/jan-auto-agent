@@ -259,9 +259,7 @@ def test_contract_row_deduplicates_identical_lines_before_budget_cut():
     ]
     model = _model([module], contracts)
 
-    # The full form has two identical lines for c1, but the deduplicated form
-    # has one. The block's across-row dedup would remove the duplicate anyway,
-    # so the row must measure its cost without it.
+    # The deduplicated form has one line; the row must measure its cost without the block's dedup.
     full = _row_contract(model, TARGET, None)
     lines = full.split("\n")
     assert len(lines) == 2, f"expected 2 unique lines, got {len(lines)}: {lines}"

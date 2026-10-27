@@ -106,8 +106,7 @@ def _grid(payloads):
 class TestStrictIsTheOldLadder:
 
     def test_default_mode_reproduces_the_field_log(self, repo):
-        # log-test.txt candidate #7: 32768/0.0 → 32768/0.0, 32768/0.1,
-        # 65536/0.0, 65536/0.1, 131072/0.0 (HTTP 400 in the field), 131072/0.1
+        # log-test.txt candidate #7: the default ladder reproduces the field log's call sequence.
         filt = _make_filter()
         assert filt._unparseable_retry_mode == "strict"
         payloads, _, rejected = _run(filt, repo, [""] * 7)
@@ -115,9 +114,7 @@ class TestStrictIsTheOldLadder:
             (32768, 0.0), (32768, 0.0), (32768, 0.1), (65536, 0.0),
             (65536, 0.1), (131072, 0.0), (131072, 0.1),
         ]
-        # RUN-5: the ladder never got a verdict, so the candidate is kept as
-        # unknown rather than rejected. This test is about the grid, but the
-        # outcome must not be misread as a model rejection.
+        # RUN-5: no verdict, so the candidate is kept as unknown, not rejected.
         assert rejected == []
         assert filt.presence_unknown == 1
 
@@ -139,8 +136,7 @@ class TestStrictIsTheOldLadder:
 class TestFastMode:
 
     def test_never_repeats_the_initial_call_and_empty_pins_the_tier(self, repo):
-        # candidate #7 in fast mode: initial 32768/0.0 empty → only the
-        # other temperature at the SAME tier, then fail-closed: 2 calls, not 6.
+        # Candidate #7 in fast mode: an empty initial reply retries only the other temperature at the same tier.
         filt = _make_filter(unparseable_retry_mode="fast")
         payloads, _, rejected = _run(filt, repo, [""] * 7)
         assert _grid(payloads) == [(32768, 0.0), (32768, 0.1)]
@@ -180,9 +176,7 @@ class TestFastMode:
             (32768, 0.0), (32768, 0.1), (65536, 0.0), (65536, 0.1)]
 
     def test_small_configured_budget_still_climbs_in_fast_mode(self, repo):
-        # 512 configured, empty reply: a 512 budget really can be the
-        # problem (a <think> block truncated before any answer strips to
-        # ""), so the empty-pin is only honoured at/above the ladder floor.
+        # A 512 budget can truncate the think block to an empty reply, so the empty-pin applies only at the floor.
         filt = _make_filter(max_tokens="512", num_ctx="",
                             unparseable_retry_mode="fast")
         payloads, accepted, _ = _run(filt, repo, ["", GOOD])

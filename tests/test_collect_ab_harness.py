@@ -268,10 +268,7 @@ def test_counters_read_every_trace_of_the_tree(tmp_path):
 
 
 def test_m4_collect_block_events_win_over_the_header_grep():
-    # Two coder requests, one collect_block event (M4 counts per request
-    # served, so a run whose second request got no block says 1, not 2). The
-    # pack rows still come from the prompt text: `rows_kept` counts the V2
-    # rows too, so it is not the A=0 / B>0 number.
+    # M4 counts collect_block events per request; rows_kept also counts V2 rows, so it is not the A=0/B>0 number.
     events = [
         _ev("llm_request", "coder", "llm", _BLOCK_ON + _PROMPT_TAIL),
         _ev("llm_request", "coder", "llm", _BLOCK_ON + _PROMPT_TAIL),
@@ -332,8 +329,7 @@ def test_verdict_fails_when_arm_a_shows_pack_rows():
 
 
 def test_verdict_fails_loudly_when_an_arm_has_no_m4_events():
-    # M5 acceptance: both arms run post-M4 code, so a coder-reaching arm with
-    # no collect_* event is a stale trace, not a measurement.
+    # A coder-reaching arm with no collect_* event is a stale trace, not a measurement.
     d = ab.diff_arms(_arm(collect_pack_rows=0, m4_events=False), _arm(collect_pack_rows=30), budget=1200)
     assert d["verdict"] == "fail"
     assert any("arm A has coder calls but no M4 collect_* event" in r for r in d["reasons"])
@@ -360,12 +356,7 @@ def test_gate1_rows_must_be_equal_between_arms():
 
 # ── the stub ──────────────────────────────────────────────────────────────────
 
-# FL-1 (round 84): a hang guard against a stub server in this very process,
-# not a claim about how fast it answers. 10 s looked generous for a loopback
-# POST that normally returns in milliseconds, and the operator's 32-worker
-# stress run went through it anyway — a `TimeoutError: timed out` from deep
-# inside `http.client`, which says nothing about what broke. pytest-timeout
-# is the right thing to call a hang a hang, and it prints a stack dump.
+# FL-1 (round 84): hang guard for the stub server; pytest-timeout reports a hang better than TimeoutExpired.
 _STUB_TIMEOUT_S = 120
 
 

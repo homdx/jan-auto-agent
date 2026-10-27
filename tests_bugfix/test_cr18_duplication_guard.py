@@ -109,25 +109,7 @@ def test_creative_task_cap_truncates():
     assert len(cands) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-CR-18-2 — within-file duplication (a single file, multiple entries)
-# ─────────────────────────────────────────────────────────────────────────────
-# Field failure: a "narrative changelog" task looped 8 attempts across 7
-# rounds. Each attempt APPENDED a new "### Greeting <verb> Hello world"
-# entry to CHANGELOG.md — a synonym-swapped rewrite of the entry before it
-# — rather than writing one entry, because nothing ever rejected the
-# growing file: the guard above only compares DIFFERENT file names, and a
-# single target file (CHANGELOG.md) is always compared against itself and
-# skipped (`oname == pname`). The file kept growing until the bloated,
-# heavily-repetitive prompt made the Gate-2 validator itself degenerate.
-#
-# A second, independent bug compounded it: even a direct, deliberate
-# comparison of the two near-duplicate entries scored ratio=0.085 with
-# difflib's default autojunk=True — nowhere near the 0.92 threshold —
-# because autojunk discards frequently-recurring substrings (ordinary
-# prose's spaces and common short words) from matching once a string
-# passes ~200 characters, exactly the length any real chapter or entry
-# reaches. autojunk=False on the same two entries: 0.938.
+# Regression: a changelog grew as near-duplicate entries, and difflib autojunk hid their similarity (use autojunk=False).
 
 _ENTRY_A = (
     "We taught the program its first and only line of speech by writing one "
@@ -143,11 +125,7 @@ _ENTRY_A = (
     "A reader can now run the program and see its greeting without opening "
     "the file that produces it."
 )
-# A synonym-swapped rewrite of _ENTRY_A — same structure, ~15% of words
-# changed. This is the realistic near-duplicate shape a model produces
-# when it rewrites rather than repeats verbatim; a verbatim-copy fixture
-# (ratio 1.0 regardless of autojunk) would not have caught the autojunk
-# bug at all.
+# Synonym-swapped rewrite of _ENTRY_A: the near-duplicate shape a model produces.
 _ENTRY_B = (
     "We gave the program its opening words by writing one line in main.py "
     "that prints Hello world to standard output and then ends. We wanted "
@@ -250,9 +228,7 @@ def test_split_creative_entries_needs_at_least_two_headings():
     assert _split_creative_entries("") == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-CR-18-2 — the autojunk regression itself, isolated from entry-splitting
-# ─────────────────────────────────────────────────────────────────────────────
+# Regression: the autojunk case, isolated from entry splitting
 
 def test_autojunk_true_would_have_missed_this_real_paraphrase():
     """Documents the bug directly: this is the exact pair of entries a live

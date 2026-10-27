@@ -64,9 +64,7 @@ if scen_path:
     for section, key, default in getattr(mod, "CONFIG_KEYS", []):
         m = re.search(r"^\[" + re.escape(section) + r"\](.*?)(?=^\[|\Z)", ini, re.S | re.M)
         body = m.group(1) if m else ""
-        # the key is a whole identifier (`max_retries` does not document `retries`) and its
-        # value is the default, not a longer number that begins with it (`0.5` is not a
-        # default of `0`). A commented example (`#key = 3`) or prose still documents it.
+        # Match a whole identifier (`max_retries` does not document `retries`) with the default value itself (`0.5` is not a default of `0`); a commented example or prose still documents it.
         name = r"(?<![A-Za-z0-9_])" + re.escape(key) + r"(?![A-Za-z0-9_])"
         assign = name + r"[ \t]*=[ \t]*"
         documented = bool(re.search(name, body))

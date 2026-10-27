@@ -95,8 +95,7 @@ class TestTsWithOffsetClock:
     def test_local_time_is_not_leaked(self, monkeypatch):
         """The classic symptom: a local clock bleeding into a UTC label."""
         monkeypatch.setattr(utils, "datetime", _fake_datetime(timedelta(hours=5)))
-        # Under the old bug, a UTC+5 local clock at the fixed instant would
-        # read 17:30, not 12:30.
+        # Under the old bug, a UTC+5 clock at the fixed instant would read 17:30, not 12:30.
         assert _ts() != "2026-09-07T17:30:00Z"
 
 
@@ -154,8 +153,7 @@ class TestRunLogStampsAreUtc:
         store.log("task AUTO-T1 completed")
 
         lines = (agent_dir / "run.log").read_text(encoding="utf-8").splitlines()
-        # initialise() already logged a line before the clock was swapped;
-        # only the line written after the swap is pinned here.
+        # The line written after the clock swap is the one pinned here.
         assert lines[-1].startswith("[2026-09-07T12:30:00Z] task AUTO-T1 completed")
 
 
@@ -189,9 +187,7 @@ class TestQuarantineStampIsUtc:
         monkeypatch.setattr(ticket_store, "datetime", _fake_datetime(timedelta(0)))
 
         for _i in (1, 2):
-            # Same id twice: the quarantine rename frees the .json path, so
-            # the second create/corrupt cycle lands on the identical stamped
-            # destination -- which is exactly what the suffix guards.
+            # Same id twice: quarantine frees the .json path, so the second cycle lands on the same stamped path; the suffix guards that.
             store.create(make_ticket(
                 id="TICKET-AUTO-T1", type="bug", linked_task="",
                 title="t", body="b",

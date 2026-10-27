@@ -35,9 +35,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from analyze_logs import analyze, render_stage_breakdown, render_timeline
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _e(kind: str, src: str = "", tgt: str = "", content: str = "",
        params: dict | None = None, run_id: str = "run1",
@@ -74,9 +72,7 @@ def _capture(fn, *args, **kwargs) -> str:
     return _strip_ansi(buf.getvalue())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1–4: analyze() stage parsing
-# ─────────────────────────────────────────────────────────────────────────────
+# 1-4: analyze() stage parsing
 
 class TestStageAccumulation:
     def test_rejected_stage_is_counted(self):
@@ -171,8 +167,7 @@ class TestFallbackAndAutocreate:
     def test_falls_back_to_current_task_when_task_param_missing(self):
         """Events where params["task"] is absent use run["_current_task"]."""
         task_start = _task_start("AUTO-T5", "my task")
-        # Craft a stage event with no "task" key in params — simulates an older
-        # emitter that only set "stage" and "attempt".
+        # A stage event with no "task" param, as an older emitter sends (only stage and attempt).
         stage_evt = _e("decision", src="gate2", tgt="inner_loop",
                        content="REJECTED",
                        params={"attempt": 1, "stage": "gate2"})
@@ -181,9 +176,7 @@ class TestFallbackAndAutocreate:
         assert runs["run1"]["tasks"]["AUTO-T5"]["stages"]["gate2"]["REJECTED"] == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7–8: render_stage_breakdown()
-# ─────────────────────────────────────────────────────────────────────────────
+# 7-8: render_stage_breakdown()
 
 class TestRenderStageBreakdown:
     def test_empty_stages_prints_nothing(self):
@@ -239,9 +232,7 @@ class TestRenderStageBreakdown:
             assert label in text, f"Missing label: {label}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # 9: timeline renders inner_loop decisions
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestTimelineStageEvents:
     def _run_with_events(self, evts: list[dict]) -> dict:
@@ -273,9 +264,7 @@ class TestTimelineStageEvents:
         assert "ACCEPTED_AT_CAP" in text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10: backward compat — old validator result events still work
-# ─────────────────────────────────────────────────────────────────────────────
+# 10: backward compat: old validator result events still work
 
 class TestBackwardCompat:
     def test_validator_result_still_increments_approved(self):
@@ -305,18 +294,7 @@ class TestBackwardCompat:
         assert t["rejected"] == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GATES-SYNC: theme / existence gates, and future-gate protection
-#
-# analyze_logs.py's _STAGE_ORDER / _STAGE_LABELS used to be a hand-copied
-# snapshot of tools/auto/gate_registry.py's GATES tuple and silently fell
-# behind it — "theme" and "existence" were added to the registry but never
-# made it into analyze_logs.py, so those gates rendered with a raw stage
-# name instead of a label. These tests cover the two missed gates directly,
-# and — more importantly — assert against the *live* registry so a gate
-# added after this was written fails loudly here instead of drifting apart
-# silently again.
-# ─────────────────────────────────────────────────────────────────────────────
+# GATES-SYNC: theme and existence gates; tests assert against the live registry so new gates fail loudly.
 
 class TestGateRegistrySync:
     def test_theme_stage_is_counted(self):

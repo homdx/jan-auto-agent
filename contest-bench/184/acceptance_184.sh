@@ -1,17 +1,5 @@
 #!/usr/bin/env bash
-# Round 184 acceptance: test_run_tests_detail_ends_the_suite_at_the_harvest_budget
-# must not depend on how fast the nested pytest starts, and must still catch
-# what it pins.  Usage:  acceptance_184.sh OUT_DIR NAME=WORKTREE ...
-#
-# Cases (one result line per case and tree in OUT_DIR/results.tsv):
-#   quiet        the test alone, no load, 3 runs                    -> must pass
-#   load         16 busy loops, the test at nice 19, 20 runs         -> must pass
-#   m-nokill     _end_process_group is a no-op (ticket's test 2)     -> must fail
-#   m-noname     the tail no longer says "the budget hit in:", quiet -> must fail
-#   m-noname-ld  the same mutation under the load, 5 runs            -> fails = the
-#                name is still checked when the box is starved
-#   m-nobudget   run_tests_detail ignores budget_sec                 -> must fail
-#   file         tests/test_contest_harvest.py -n 4                  -> must pass
+# Round 184 acceptance (ticket 184): quiet, load, and the m-* checks, then file.
 set -uo pipefail
 OUT=$1; shift
 mkdir -p "$OUT"

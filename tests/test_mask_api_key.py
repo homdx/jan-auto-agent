@@ -31,9 +31,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.llm_stream import build_chat_request, mask_api_key, request_completion
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# mask_api_key() — pure string transform
-# ─────────────────────────────────────────────────────────────────────────────
+# mask_api_key(): pure string transform
 
 class TestMaskApiKeyPure:
 
@@ -130,9 +128,7 @@ class TestMaskApiKeyPure:
         assert "nospace" not in out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# build_chat_request() — masking applied to system/user content
-# ─────────────────────────────────────────────────────────────────────────────
+# build_chat_request(): masking applied to system and user content
 
 class TestBuildChatRequestMasksSecrets:
 
@@ -174,9 +170,7 @@ class TestBuildChatRequestMasksSecrets:
         assert payload["messages"][1]["content"] == "just a normal question"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# request_completion() end-to-end — inspect what actually hit the wire
-# ─────────────────────────────────────────────────────────────────────────────
+# request_completion(): what actually reaches the wire
 
 class _CapturingHandler(http.server.BaseHTTPRequestHandler):
     received_body: dict = {}

@@ -67,12 +67,7 @@ from typing import Callable
 
 from tools.auto.utils import atomic_write_text, chars_per_token
 
-# Bugfix: "LlmSettings" is used in annotations here but was only imported
-# inside _default_llm_settings's body. Under `from __future__ import
-# annotations` that stayed dormant until typing.get_type_hints() resolved
-# the string against module globals and raised NameError. A module-level
-# import is safe (llm_profile.py imports nothing from this package) and a
-# TYPE_CHECKING-gated one would not fix it — that block never executes.
+# Module-level import of LlmSettings, so type hints resolve under postponed evaluation (bugfix).
 from tools.auto.llm_profile import LlmSettings
 from tools.config_safe import safe_getboolean, safe_getfloat, safe_getint
 
@@ -82,15 +77,16 @@ logger = logging.getLogger(__name__)
 
 _INSTRUCTION_OVERHEAD_TOKENS = 300
 
-# Reserved headroom inside the summarisation budget for the system prompt and
-# the "summarise these chunk-summaries" wrapper prompt in pass 2.
+# Headroom in the summary budget for the system prompt and the pass-2 wrapper.
 _SUMMARISE_OVERHEAD_TOKENS = 200
 
 # Synopsis section marker format — must match ContextAssembler._SECTION_RE.
 _SECTION_BEGIN = "<!-- BEGIN {name} -->"
 _SECTION_END   = "<!-- END {name} -->"
 _SECTION_RE = re.compile(
-    r"<!--\s*BEGIN\s+(?P<name>\S+)\s*-->(?P<body>.*?)<!--\s*END\s+(?P=name)\s*-->",
+    # REL-6 #53: a name may hold spaces ("My Novel/chapter_01.md") — `\S+` wrote such a
+    # section and never read it back, so there was no STORY SO FAR.
+    r"<!--[^\S\n]*BEGIN[^\S\n]+(?P<name>[^\r\n]+?)[^\S\n]*-->(?P<body>.*?)<!--[^\S\n]*END[^\S\n]+(?P=name)[^\S\n]*-->",
     re.DOTALL,
 )
 
@@ -127,7 +123,9 @@ def _chunk_paragraphs(text: str, max_chars: int) -> list[str]:
     *max_chars*.  A single paragraph that exceeds *max_chars* is kept as its
     own chunk (we never split mid-paragraph).
     """
-    paragraphs = re.split(r"\n{2,}", text.strip())
+    # REP-CHUNK-BLANK: a blank line holding spaces is a paragraph break too; "\n   \n" kept
+    # a whole chapter in one paragraph and sent it to the model in one oversized call.
+    paragraphs = re.split(r"\n[^\S\n]*\n\s*", text.strip())
     chunks: list[str] = []
     current: list[str] = []
     current_len = 0
@@ -158,19 +156,124 @@ _META_PAREN_MARKERS = (
 )
 
 
+# HARDEN-27: every marker above is a prefix *family* on purpose ("grammat"
+# covers grammatical and grammatically, "ориги" covers оригинал and оригинальный),
+# and the old test was a plain substring search —
+# ``any(k in inner for k in _META_PAREN_MARKERS)``. A family root therefore
+# fired on any ordinary word that merely begins with the same letters:
+# "should" in *shoulder*, "correct" in *correctional*, "bullet" in *bulletin*,
+# "remove" in *removal*, "original" in *originality*, "пункт" in *пунктуация*.
+# The bullet that owned that fact was then deleted from synopsis.md — the
+# story's only long-term memory — with nothing logged.
+#
+# A marker now matches a whole word of the parenthetical, not a piece of one:
+# at the start of a word, and only through the word forms the commentary
+# actually uses — should / shouldn't, correct / corrected / correctly /
+# correction / incorrect, remove / removed, relevant / irrelevant. The dict
+# below is that rule, keyed by the single-word families; the two-word markers
+# ("does not", "not explicitly") match as phrases on word boundaries.
+#
+# CC review fixes 48: every form below holds its family's marker, so a word is
+# commentary only where the substring test also called it so — the rule moved
+# the boundary and must not reach further. HARDEN-27 had listed forms the old
+# test never matched, and the story fact went from synopsis.md again:
+# "(он добавил соль в суп)", "(деревня удалена от города)", "(ему следовало
+# бежать)", "(removing his helmet)", "(he went to grammar school)", "(as his
+# tone implied)". The one exception is "удалён" / "удалены", which the
+# HARDEN-27 follow-up pins as commentary, and "удален", the same word with е.
+_META_MARKER_WORD_FORMS: dict[str, tuple[str, ...]] = {
+    "bullet":    ("bullet", "bullets"),
+    "remove":    ("remove", "removes", "removed"),
+    # "corrections" is not here (AUDIT-23): "(her brother, a corrections
+    # officer)", "(the department of corrections)" are story facts. As
+    # commentary it is "(corrections: …)", matched as a phrase below. The
+    # singular stays (CC review fixes 50): "(correction needed)", "(needs
+    # correction)", "(minor correction)" are the model's notes to itself, and
+    # with the word gone they went into synopsis.md.
+    "correct":   ("correct", "corrects", "corrected", "correcting", "correctly",
+                  "correction", "incorrect", "incorrectly"),
+    "original":  ("original", "originals", "originally", "unoriginal"),
+    "accurate":  ("accurate", "accurately", "inaccurate", "inaccurately"),
+    "partially": ("partially",),
+    "should":    ("should", "shouldn't"),
+    "relevant":  ("relevant", "irrelevant"),
+    "mention":   ("mention", "mentions", "mentioned", "mentioning"),
+    "grammat":   ("grammatical", "grammatically"),
+    "implies":   ("implies",),
+    "doesn't":   ("doesn't",),
+    "пункт":      ("пункт", "пункта", "пункту", "пункте", "пункты", "пунктам",
+                  "пунктами", "пунктах", "пунктов", "пунктом"),
+    "удалить":    ("удалить", "удалён", "удален", "удалены"),
+    "ориги":      ("оригинал", "оригинала", "оригиналу", "оригинале", "оригиналом",
+                  "оригиналы", "оригинальных", "оригинальный", "оригинальная",
+                  "оригинальное", "оригинальные"),
+    "ошибоч":     ("ошибочный", "ошибочная", "ошибочное", "ошибочные", "ошибочно",
+                  "ошибочность", "ошибочности"),
+    "следует":    ("следует",),
+    "граммат":    ("грамматика", "грамматики", "грамматику", "грамматический",
+                  "грамматическая", "грамматическое", "грамматические",
+                  "грамматично", "грамматичность"),
+    "подразум":   ("подразумевается", "подразумеваются", "подразумевает",
+                  "подразумевать"),
+    "уточня":     ("уточнять", "уточняю", "уточняет", "уточняется", "уточняются"),
+    "добавляет":  ("добавляет",),
+}
+
+# Every word form the commentary uses, flat, so the test below is one set lookup.
+_META_MARKER_WORDS = frozenset(w for forms in _META_MARKER_WORD_FORMS.values()
+                               for w in forms)
+
+# The two-word markers, as phrases. Bounded on both sides so "does not" cannot
+# fire inside a longer word.
+_META_PAREN_PHRASES: tuple[str, ...] = (
+    r"(?<!\w)does\s+not(?!\w)",
+    r"(?<!\w)not\s+explicitly(?!\w)",
+    # "(correction: …)" / "(corrections — …)": the noun as the commentary's label.
+    r"^\s*corrections?\s*(?::|-|—|–)",
+)
+_META_PAREN_PHRASE_RE = re.compile("|".join(_META_PAREN_PHRASES))
+
+# One word of the parenthetical, letter for letter (a-z and Cyrillic), carrying
+# the single apostrophe the commentary actually writes: shouldn't, doesn't.
+_META_PAREN_WORD_RE = re.compile(r"[a-z\u0430-\u044f\u0451]+(?:'[a-z\u0430-\u044f\u0451]+)*")
+
+
+def _is_meta_commentary(inner: str) -> bool:
+    """True when a parenthetical reads as the model's commentary on its own
+    bullet rather than a story fact (HARDEN-27). Never raises."""
+    if not inner:
+        return False
+    lowered = inner.lower().replace("\u2019", "'")   # “shouldn’t” → “shouldn't”
+    if _META_PAREN_PHRASE_RE.search(lowered):
+        return True
+    for word in _META_PAREN_WORD_RE.findall(lowered):
+        # "this bullet's numbers are wrong": the possessive is the marker word's own form.
+        if word in _META_MARKER_WORDS or (word.endswith("'s") and word[:-2] in _META_MARKER_WORDS):
+            return True
+    return False
+
+
 def _strip_meta_parentheticals(fact: str) -> str:
     """Remove trailing/embedded ``(...)`` segments that are self-evaluation
     commentary rather than story facts (e.g. '(this bullet should be removed
     because...)'). Keeps parentheticals that look like genuine content.
+
+    HARDEN-27: a marker matches a whole word, never a piece of one, so
+    "(his left shoulder, ...)" and "(a correctional facility upstate)" are
+    story facts and stay put. Only the commentary parenthetical of a bullet is
+    removed; the others are left byte-for-byte. Runs in one pass over the text,
+    so a 100 000-character parenthetical costs linear time. Fail-open: any
+    surprise returns the bullet unchanged rather than raising into the run.
     """
     import re as _re
 
-    def _repl(m: "_re.Match") -> str:
-        inner = m.group(1).lower()
-        return "" if any(k in inner for k in _META_PAREN_MARKERS) else m.group(0)
+    try:
+        def _repl(m: "_re.Match[str]") -> str:
+            return "" if _is_meta_commentary(m.group(1)) else m.group(0)
 
-    cleaned = _re.sub(r"\s*\(([^()]*)\)", _repl, fact)
-    return cleaned.strip()
+        return _re.sub(r"\s*\(([^()]*)\)", _repl, fact).strip()
+    except Exception:
+        return fact
 
 
 def _is_ok_sentinel(reply: str) -> bool:
@@ -290,12 +393,7 @@ class SummaryFidelityVerifier:
         lang_instr = language_instruction(detect_language(chapter_text))
         system = _SYSTEM_FIDELITY + (("\n" + lang_instr) if lang_instr else "")
         if lang_instr:
-            # Same class of bug as the continuity validator: "output
-            # {language} only, do not translate" also swallows the literal
-            # "OK" sentinel on rounds where no correction is needed, so the
-            # early-exit branch below can never fire for non-English books —
-            # every round looks like it "needed a fix" and the loop always
-            # bleeds out via max_fidelity_rounds instead of a genuine pass.
+            # The language instruction swallows the literal OK sentinel, so the early exit never fires; the check is kept in the language-neutral form (same bug class as the continuity validator).
             system += (
                 "\nEXCEPTION TO THE LANGUAGE RULE ABOVE: if no correction is "
                 "needed, reply with exactly the English word OK — do not "
@@ -415,13 +513,7 @@ class SummaryMemory:
         self._verifier = SummaryFidelityVerifier(
             llm_call, max_fidelity_rounds=max_fidelity_rounds,
         )
-        # Budget for *input* to a single summarisation LLM call.
-        # Reserve output budget + overhead; leave _SUMMARISE_OVERHEAD_TOKENS
-        # of headroom for the system prompt and wrapper text.
-        # Stored as a token count, not a fixed char count: the char budget
-        # depends on the text being chunked (Cyrillic tokenizes ~2x denser
-        # than Latin — see chars_per_token()), so it's computed per-call in
-        # _chunk_budget_chars() rather than fixed at construction time.
+        # Budget for the input of one summary call: output and overhead are reserved first.
         self._input_tokens = max(
             0,
             (int(num_ctx) if num_ctx else 4096)
@@ -464,12 +556,7 @@ class SummaryMemory:
         """
         _base = Path(base_dir) if base_dir is not None else self._base_dir
         chapter_path = _base / chapter_file
-        # BUGFIX (audit): no validation — an absolute chapter_file discards
-        # _base entirely (pathlib's `/` operator returns the right side
-        # unchanged when it's absolute), and a relative one containing
-        # ".." can escape _base the same way the other base_dir-relative
-        # reads in this codebase's Gate 1 stage did before their own fix
-        # (see gate1_filter.py / context_broker.py / gate1_grounding.py).
+        # A chapter path outside the base directory is refused before it is read (BUGFIX).
         try:
             chapter_path.resolve().relative_to(_base.resolve())
         except ValueError:
@@ -479,7 +566,9 @@ class SummaryMemory:
             )
             return
         try:
-            chapter_text = chapter_path.read_text(encoding="utf-8", errors="replace")
+            # AUDIT3-9: in the chapter's own codec, so a cp1251 chapter is not
+            # summarized from a run of U+FFFD.
+            chapter_text, _enc, _eol = _read_in_own_codec(chapter_path, lossy_ok=True)
         except OSError as exc:
             logger.error(
                 "SummaryMemory.update: cannot read %s: %s — skipping synopsis update.",
@@ -495,33 +584,14 @@ class SummaryMemory:
 
         summary = self.summarize_chapter(chapter_text)
         verified = self._verifier.verify_and_fix(chapter_text, summary)
-        # AUTO-CR-16: final cleanup — strip any residual meta-commentary
-        # parentheticals / non-bullet noise. Keep the verified text if cleaning
-        # would empty it (fail-safe).
+        # Residual meta-commentary is stripped, and the verified text is kept if the cleanup would empty it (AUTO-CR-16).
         cleaned = _clean_bullet_list(verified)
         body = cleaned or verified
 
-        # AUTO-BUG-6 fix: previously `cleaned or verified` would happily
-        # persist whatever `verified` was even when it was obviously not a
-        # summary at all (observed in practice: the literal grader verdict
-        # "APPROVED" ended up written into synopsis.md as a chapter's
-        # "durable fact summary"). Refuse to write anything that looks like
-        # a bare verdict word or is implausibly short for a summary, and
-        # leave the previous section (if any) untouched instead.
+        # A bare verdict word or an implausibly short summary is never written as a chapter summary (AUTO-BUG-6).
         _stripped = body.strip()
         _is_bare_verdict = _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}
-        # BUGFIX (audit, generalizes the fix above): the previous version of
-        # this guard only rejected UNCLEAN content when it was a single
-        # line — but _clean_bullet_list() itself already fails open
-        # ("") for ANY reply that doesn't look like a fact list, single-
-        # line or not (e.g. >20 lines, or a line >220 chars — its own
-        # "looks like narrative prose" checks; see its docstring). When
-        # the summarizer/verifier failed and `verified` was raw or
-        # truncated multi-line chapter text, `cleaned` was correctly ""
-        # but this guard let it through anyway because it had more than
-        # one line, polluting synopsis.md with un-summarized chapter
-        # text. `cleaned` being "" is _clean_bullet_list's own considered
-        # verdict that the content isn't usable, regardless of line count.
+        # A reply the cleaner rejects is not written, even when it has several lines (BUGFIX).
         _unclean = not cleaned
         if not _stripped or _is_bare_verdict or _unclean:
             logger.warning(
@@ -612,52 +682,55 @@ class SummaryMemory:
             f"{_SECTION_END.format(name=chapter_file)}"
         )
 
-        # Read existing synopsis.
+        # Read existing synopsis — in its own codec and with its own line ends
+        # (AUDIT3-9): a cp1251 synopsis read with errors="replace" and written
+        # back as UTF-8 lost every earlier chapter's text to U+FFFD, and a CRLF
+        # file came back LF.
+        encodings: "tuple[str, ...]" = ("utf-8",)
+        eol = "\n"
         try:
-            existing = self._synopsis_path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            existing, encodings, eol = _read_in_own_codec(self._synopsis_path)
+        except FileNotFoundError:
             existing = ""
+        except (OSError, UnicodeError) as exc:
+            logger.error(
+                "SummaryMemory: %s cannot be read without loss (%s) — left "
+                "untouched; the section for %s is not written",
+                self._synopsis_path, exc, chapter_file,
+            )
+            return
 
         # Replace existing section if present, otherwise append.
         pattern = re.compile(
             rf"<!--\s*BEGIN\s+{re.escape(chapter_file)}\s*-->.*?<!--\s*END\s+{re.escape(chapter_file)}\s*-->",
             re.DOTALL,
         )
-        #
-        # Bugfix: this used to be `pattern.sub(section_text, existing)` —
-        # passing section_text (which embeds the LLM-generated chapter
-        # summary) as re.sub's REPLACEMENT argument. re.sub interprets
-        # backslash sequences in a *string* replacement as backreferences
-        # (\1, \g<name>, ...); this pattern has no capture groups, so any
-        # summary containing an ordinary backslash — a footnote marker, a
-        # Windows path, dialogue about a regex or LaTeX expression, even
-        # just "...found it at 221\1 Baker Street." — raised
-        # `re.error: invalid group reference`. Only the *replace an existing
-        # section* path was affected (a fresh section is plain string
-        # concatenation, below); commit_on_success.py catches the exception
-        # so it doesn't crash the run, but because it fires before the file
-        # write, that chapter's section was silently left at its FIRST-DRAFT
-        # summary forever — exactly the staleness this file exists to
-        # prevent — with only one logger.error to show for it.
-        #
-        # A callable replacement sidesteps this entirely: re.sub never
-        # interprets backslash escapes in a function's return value, no
-        # matter what it contains.
+        # Section text is inserted as a plain string, so backslashes in a summary are not read as group references (bugfix).
         if pattern.search(existing):
             new_content = pattern.sub(lambda _m: section_text, existing)
         else:
             separator = "\n\n" if existing.strip() else ""
             new_content = existing.rstrip() + separator + section_text + "\n"
 
+        if eol != "\n":
+            new_content = new_content.replace("\n", eol)
+        encoding = _first_codec_holding(encodings, new_content)
+        if encoding is None:
+            # REL-2: an arrow, a minus sign or an emoji in a summary is common, and no legacy
+            # codec of the list holds it; the section was dropped and the chapter left a hole
+            # in the continuity memory for good. The text is already decoded, so the whole
+            # file is written as UTF-8 instead, with its own line ends.
+            logger.warning(
+                "SummaryMemory: the section for %s holds characters %s's own codec "
+                "(%s) cannot store — the synopsis is rewritten as UTF-8", chapter_file,
+                self._synopsis_path, encodings[0],
+            )
+            encoding = "utf-8"
         try:
             self._synopsis_path.parent.mkdir(parents=True, exist_ok=True)
-            # Bugfix: was plain write_text() — same class as the story_bible.md
-            # fix.  synopsis.md is rewritten wholesale each update (pattern.sub
-            # produces a full new string, not an append), so a kill mid-write
-            # truncates it silently.  The next chapter's coder then receives an
-            # incomplete continuity context with no error anywhere.
-            # atomic_write_text (temp-file + os.replace) is the one-line fix.
-            atomic_write_text(self._synopsis_path, new_content)
+            # The synopsis is written atomically, so a kill mid-write cannot leave an incomplete continuity context (bugfix).
+            atomic_write_text(self._synopsis_path, new_content,
+                              **_codec_write_kwargs(encoding, eol))
             logger.info(
                 "SummaryMemory: wrote synopsis section for %s → %s",
                 chapter_file, self._synopsis_path,
@@ -666,6 +739,88 @@ class SummaryMemory:
             logger.error(
                 "SummaryMemory: cannot write %s: %s", self._synopsis_path, exc,
             )
+
+
+def _read_in_own_codec(path: Path, *, lossy_ok: bool = False):
+    """``(text with LF line ends, candidate codecs, the file's line end)``.
+
+    AUDIT3-9: the codec is the one ``/edit`` and the Coder choose from the
+    file's bytes (``tools.actions._edit_write_encodings``): UTF-8 when the
+    bytes are UTF-8 (a BOM stays a ``\\ufeff`` character, as before), else
+    the legacy codec that describes them. Strict: a byte none of them reads
+    raises ``UnicodeError`` — unless *lossy_ok*, for text that is only read,
+    never written back.
+    """
+    raw = Path(path).read_bytes()
+    # REL-2: a UTF-16 file (PowerShell's `>` writes one) was probed as cp1251, which decodes
+    # almost any byte, and the new section went in as single bytes between the UTF-16 ones.
+    # Its BOM names it; the BOM stays a `\ufeff` character and is written back the same way.
+    for bom, codec in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+        if raw.startswith(bom) and not raw.startswith(b"\xff\xfe\x00\x00"):
+            text = raw.decode(codec, errors="replace" if lossy_ok else "strict")
+            eol = "\r\n" if "\r\n" in text else "\n"
+            return text.replace("\r\n", "\n"), (codec,), eol
+    try:
+        from tools.actions import _edit_write_encodings
+        encodings = tuple(_edit_write_encodings(str(path))) or ("utf-8",)
+    except Exception:  # noqa: BLE001 — no probe: UTF-8, as before
+        encodings = ("utf-8",)
+    if encodings[0] != "utf-8" and _mostly_utf8(raw):
+        # CC review fixes 50: UTF-8 with a broken byte or two is UTF-8. Read as
+        # the legacy codec the probe falls back to, its Cyrillic was mojibake no
+        # legacy codec of the list could take a new section in — and the
+        # synopsis was never updated again. Lossy for those bytes only, as
+        # every read was before AUDIT3-9.
+        logger.warning("%s is UTF-8 with %d undecodable byte(s) — read as UTF-8, "
+                       "they become U+FFFD", path, raw.decode("utf-8", "replace").count("\ufffd"))
+        text = raw.decode("utf-8", errors="replace")
+        eol = "\r\n" if "\r\n" in text else "\n"
+        return text.replace("\r\n", "\n"), ("utf-8",), eol
+    try:
+        text = raw.decode(encodings[0])
+    except UnicodeError:
+        if not lossy_ok:
+            raise
+        text = raw.decode("utf-8", errors="replace")
+    eol = "\r\n" if "\r\n" in text else "\n"
+    return text.replace("\r\n", "\n"), encodings, eol
+
+
+def _mostly_utf8(raw: bytes) -> bool:
+    """True when *raw* is UTF-8 text with a few undecodable bytes (CC review fixes 50).
+
+    Valid multi-byte characters must be at least twice the broken bytes: a
+    cp1251 or cp1252 file decoded as UTF-8 breaks on nearly every non-ASCII
+    letter and makes a valid sequence only by accident (a capital letter before
+    "ё" or "»"), so it stays with its own codec.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    broken = text.count("\ufffd") - raw.count("\ufffd".encode("utf-8"))
+    valid = sum(1 for ch in text if ord(ch) > 127 and ch != "\ufffd")
+    return broken > 0 and valid >= 2 * broken
+
+
+def _codec_write_kwargs(encoding: str, eol: str) -> dict:
+    """``atomic_write_text`` keywords for a file in *encoding* with *eol* ends.
+
+    A plain UTF-8, LF file is written exactly as before (no keywords — the
+    platform's newline translation and all); only a legacy codec or a CRLF
+    file gets ``newline=""`` and its codec, so its bytes come back as they were.
+    """
+    if encoding == "utf-8" and eol == "\n":
+        return {}
+    return {"newline": "", "encoding": encoding}
+
+
+def _first_codec_holding(encodings, text: str):
+    """The first of *encodings* that can store *text*, or None."""
+    for encoding in encodings:
+        try:
+            text.encode(encoding)
+            return encoding
+        except (UnicodeError, LookupError):
+            continue
+    return None
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────
@@ -711,33 +866,10 @@ def _default_llm_settings(
     max_tokens = int(max_tokens_str)
 
     temperature = safe_getfloat(config, "inner_loop", "temperature", fallback=0.2)
-    # AUTO-FIX (fable follow-up 3): thinking models (qwen3) prepend a
-    # <think> block; if it truncates against num_predict the synopsis update
-    # comes back empty, and if it doesn't, the reasoning text is WRITTEN
-    # INTO synopsis.md — a long-lived artifact re-injected into every later
-    # prompt, so one polluted call poisons the whole run. Same toggle as
-    # gate1/architect/coder: default off, [summary_memory] think = true
-    # re-enables it.
+    # Thinking output is off by default for the synopsis, so reasoning text is not written into it (fable follow-up 3).
     think = safe_getboolean(config, "summary_memory", "think", fallback=False)
 
-    # AUTO-FIX (GATE3-PROFILE audit): think_effort was absent here, so every
-    # LlmSettings this function produced carried the dataclass default (None)
-    # rather than what [api] says, and a named profile appeared to "override"
-    # a value the default had never read. Reasoning depth is a cost/quality
-    # knob that does not change the shape of the reply, so the global [api]
-    # switch is safe to honour.
-    #
-    # response_format is deliberately NOT read from [api] here. That switch
-    # forces the server to emit a JSON object, which is right for Gate 1, the
-    # Coder and the Architect — and wrong for every caller of this function.
-    # The Gate-3 validators (canon/fact/continuity/theme) and SummaryMemory
-    # all parse FREE TEXT: an "APPROVED" / "REVISE: ..." verdict, or a prose
-    # synopsis. Honouring `[api] response_format = true` here would hand them
-    # a JSON object instead and break every one of them at once — and
-    # agents_128k.ini already ships with that key set to true, so this would
-    # have gone straight into a live profile. A caller that genuinely wants
-    # JSON mode can still set response_format in its own *_llm_profile, which
-    # is an explicit, per-caller opt-in rather than a global one.
+    # Reasoning depth is honoured from [api]; response_format is not, since the summary and verdict callers parse free text (GATE3-PROFILE).
     think_effort_enabled = safe_getboolean(
         config, "api", "think_effort_enabled", fallback=False)
     think_effort = (
@@ -800,59 +932,23 @@ def _make_llm_call(
     think_effort    = settings.think_effort
 
     timeout = safe_getint(config, "loop", "timeout_seconds", fallback=300)
-    # RUN-10: the [loop] HTTP retry budget, read the same way as the timeout
-    # above — one reader for every auto-mode caller, request_completion()'s
-    # built-in defaults when the keys are absent.
+    # The [loop] retry budget is read the same way as the timeout, with the request defaults when keys are absent (RUN-10).
     retry_kwargs = _llm_stream.retry_kwargs_from_config(config)
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
     def _call(system: str, user: str) -> str:
-        # AUTO-FIX (GATE3-PROFILE audit): this used to hand-roll its own
-        # payload, alone among the callers — Coder, Gate1Filter, Architect
-        # and TaskRewriter all go through build_chat_request. Two settings
-        # were silently dropped as a result:
-        #
-        #   * response_format / think_effort — resolve_llm_profile read them
-        #     faithfully from a <gate>_llm_profile and logged the profile as
-        #     applied, and then nothing used them. The same key worked in
-        #     [gate1] presence_llm_profile, so an operator could verify it
-        #     there and get silence here.
-        #   * think = false on api_format = openai — the hand-built openai
-        #     branch had no think handling at all, so suppression only ever
-        #     worked for ollama. build_chat_request sends the reasoning /
-        #     thinking fields both branches need.
-        #
-        # Verified byte-for-byte identical to the old payload for
-        # (ollama, think on/off) and (openai, think on); the openai +
-        # think=false case is the bug fix and is the only intended change.
-        # The one further payload difference: think=True now sends an
-        # explicit think:true (ollama) / thinking:enabled (openai) where the
-        # old code omitted the field. That restates the server default rather
-        # than changing it, and it is what makes think_effort reachable at
-        # all — the builder applies effort only when thinking is enabled.
-        #
-        # Going through the shared builder also picks up the per-(url, model)
-        # unsupported-field memoization: a provider that rejects `reasoning`
-        # or `response_format` once is not asked again.
+        # The call goes through build_chat_request like every other caller, so the same settings apply (GATE3-PROFILE audit).
         url, headers, payload = _llm_stream.build_chat_request(
             base_url=base_url, api_key=api_key, model=model,
             api_format=api_format, temperature=temperature,
             max_tokens=max_tokens, system=system, user_msg=user,
             num_ctx=num_ctx,
-            # think is passed as a real bool, never None. `None` would omit
-            # the field entirely, which preserved the old ollama payload
-            # byte-for-byte when think=True — but build_chat_request only
-            # applies think_effort when thinking is explicitly ENABLED, so
-            # `None` left think_effort dead on arrival. Keeping a
-            # configurable key working beats preserving one payload key that
-            # only ever restated the server default; every other caller
-            # (Gate1Filter, Coder, Architect) already passes a bool here.
+            # think is passed as a real bool, so think_effort is not dead when thinking is on; every other caller passes a bool too.
             think=think,
             response_format=response_format, think_effort=think_effort,
         )
-        # AUTO-FIX (fable follow-up 3): strip <think> BEFORE the synopsis
-        # parser — reasoning text must never be persisted into synopsis.md.
+        # <think> is stripped before the synopsis parser, so reasoning is never saved (AUTO-FIX).
         return _llm_stream.strip_think(
             _llm_stream.request_completion(
                 url=url,

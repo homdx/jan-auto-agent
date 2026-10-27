@@ -17,6 +17,10 @@ left is about the design, not about whether the suite passes.
         --worktree agnes=/tmp/wt-a --worktree glm=/tmp/wt-g --cross \
         --ideal 4c1f0e2 --jobs 4
 
+    # and the claims phase: the ticket's own claims, judged at the base and at each entry
+    python3 scripts/judge_epic_round.py --round 296 --base competition \
+        --runs contest-out/296/wt --cross --claims --claims-profiles opus sonnet haiku
+
 Hard gates (a `FAIL` here settles the round regardless of anything else):
 
   shrink       `CollectBridge._shrink` must be byte-identical to `--base`
@@ -33,13 +37,24 @@ against every other entry's code, the base, and a candidate ideal. An entry's
 tests find what the bench misses — round 151's cache that outlived the drop,
 its linked worktree left with Kilo's own `.gitignore`.
 
-Exit codes: 0 scored · 1 usage / nothing to score · 2 nothing was crossed.
+The claims phase (`--claims`, CC-14) is the third: the ticket's own claims,
+each judged at the base and at every entry that passed the hard gates, by the
+same voters and rule `claim_diff.py` uses (`claim_diff.judge_both` is the call,
+not a copy). The base side is voted once per round — every entry starts from the
+same tree — and reused for the others, refused when the claims, the base sha, the
+voters, the runs or the rule differ. Like the cross phase's `behaviour` class it
+is a lead: a mismatch sets no exit code and fails no round, so read the evidence
+and reproduce it by hand before a ticket is filed.
+
+Exit codes: 0 scored · 1 usage / nothing to score · 2 nothing was crossed or
+the claims phase refused before a request.
 
 KC-5: the scoring itself lives in `tools/contest/gates.py` (`judge_worktree`)
 so the contest runner can import it; this file is the operator CLI over it and
 keeps its CLI and its stdout/CSV bytes.
 """
 import argparse
+import configparser
 import csv
 import importlib.util
 import json
@@ -51,7 +66,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from pathlib import Path
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if str(REPO_ROOT) not in sys.path:
@@ -62,40 +80,34 @@ from tools.contest.gates import (  # noqa: E402
     ticket_for_round,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# The cross phase (158)
-#
-# P's changed test files are copied into a scratch copy of I's tree and run
-# there, then the copy and its basetemp are deleted again. No entry's
-# worktree is ever written to — `git archive` reads — and nothing is left on
-# disk: round 151 ran the box out of inodes before the copies were cleaned up.
-# ─────────────────────────────────────────────────────────────────────────────
+#: The scripts dir, so the claims phase reuses `claim_diff`'s and `claim_vote`'s own code
+#: rather than a second copy of the voting, the tally and the rule.
+SCRIPTS_DIR = os.path.join(REPO_ROOT, "scripts")
+if SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, SCRIPTS_DIR)
 
-#: The three kinds of failure a cell can hold, in the order the operator
-#: reads them — the first two are not bugs in the code under test.
+import claim_diff as cd  # noqa: E402  (CC-7/CC-14: prepare_sides, judge_both, requests_of, the reuse)
+import claim_vote as cv  # noqa: E402  (CC-6: ask_v2, tally, the ini and the pacer)
+from tools.claimcheck import compare as cc_compare  # noqa: E402  (CC-7: the deltas, the expect)
+from tools.claimcheck import target as cc_target  # noqa: E402  (the base and the entry's head)
+
+# The cross phase: P's test files run in a scratch copy of I's tree, deleted afterwards; no worktree is written.
+
+#: The three kinds of failure a cell can hold, in the order the operator reads them.
 API = "api"               # a name or signature P has and I does not have
 BASE = "base"             # the test fails on the base too: no one asked for it
 BEHAVIOUR = "behaviour"   # a candidate bug in I, to be reproduced by hand
 
-#: A cell is P's test, run on I's code: `tests/_xcross_<P>_<file>`. Named that
-#: way so pytest still collects it when it is passed on the command line, and
-#: so it can never be mistaken for a test of I's own tree.
+#: A cross cell is P's test on I's code, named _xcross_<P>_<file> so pytest still collects it.
 _CROSS_NAME = "_xcross_"
 
-#: The test roots an entry may put its tests in. `tests/` is the ordinary one;
-#: a round that fixes a historical bug ships its tests in `tests_bugfix/`
-#: instead, and a judge that looked in one root only scored round 198's six
-#: entries as zero cells (bug 16). A path in neither root is not a test.
+#: Test roots an entry may use: tests/ and tests_bugfix/ (a judge that looked in one only scored zero cells, bug 16).
 TEST_ROOTS = ("tests/", "tests_bugfix/")
 
-#: The first root, the one every matrix before 202 knew. Kept as the fallback
-#: for a path that names neither root, and as the name callers still use.
+#: The first test root, kept as the fallback for paths that name neither root.
 TEST_ROOT = TEST_ROOTS[0]
 
-#: What a matrix with no cells says, in place of "no cell failed": the two
-#: sentences read the same at the end of the output and the second judged
-#: nothing. On stdout, in cross.md and in SUMMARY.md, once at the top and
-#: once at the bottom, and behind the exit code below.
+#: Text for a matrix with no cells, printed in place of "no cell failed" and behind the exit code.
 NOTHING_CROSSED = (
     f"cross: no entry changed a test under {' or '.join(TEST_ROOTS)} — nothing was crossed"
 )
@@ -109,14 +121,10 @@ CROSS_WORKERS = 4
 #: Seconds of wall clock one cell may spend before it is ended by group.
 CROSS_CELL_TIMEOUT = 300.0
 
-#: pytest's short-summary line: the node id, then ` - message`. xdist's
-#: `@group` suffix and the message are both dropped — the node id is enough.
+#: Node id from pytest's short-summary line; the xdist group and the message are dropped.
 _SUMMARY_FAIL = re.compile(r"^(?:FAILED|ERROR) (\S+?)(?:@[^\s\[]+)?(?: - .*)?$")
 
-#: pytest's section header between a run's sections: `_____ name _____` — and a
-#: name too long for the line gets one `_` on each side, `_ ERROR at setup of
-#: test_a_very_long_name _`, which still has to be a header (an indented source
-#: line never starts with `_`; the spaces around the name are the format's own).
+#: pytest's section header, including the single-underscore form for long names.
 _SECTION = re.compile(r"^_+ (.+?) _+\s*$")
 
 #: The first `E ` line of a traceback is the failure; the rest is context.
@@ -125,26 +133,21 @@ _E_LINE = re.compile(r"^E\s")
 #: …unless it is a frame (`E     File "x.py", line 3`): the failure comes last.
 _E_FRAME = re.compile(r'^E\s+File "')
 
-#: ImportError / ModuleNotFoundError / AttributeError / TypeError, the ticket's own
-#: four: P's code has a name or a signature that I's does not. That is a different
-#: implementation, not a bug in I. Every TypeError counts, not only the ones that
-#: name a keyword or an argument count: `'int' object is not iterable` is what a
-#: call with another implementation's argument shape raises, and calling it a
-#: `behaviour` lead sent the operator after a bug that was only a different API.
+#: Import and signature errors (ImportError, AttributeError, TypeError) mean a different implementation, not a bug in I.
 _API_ERR = re.compile(
     r"\b(?:ImportError|ModuleNotFoundError|AttributeError|TypeError)\b"
-    # a test that runs another entry's CLI with its own flags: `assert rc == 0` fails
-    # on argparse's banner, `AssertionError: usage: judge_epic_round.py [-h] --round ...`
+    # A test that runs another entry's CLI fails on argparse's usage banner, so the pattern is kept.
     r"|\busage: \S+ \[-h\]",
     re.I)
 
-#: pytest's stats line, the last line that carries a count and a duration:
-#: `1 failed, 1 passed in 0.02s`.
+#: Pytest's stats line, the last line with a count and a duration.
 _STATS = re.compile(r"(\d+) (passed|failed|errors?|skipped)")
 
-#: pytest's stats line ends in `====================`, so the duration is only
-#: searched for, never anchored: `1 failed in 0.55s ====`.
-_HAS_DURATION = re.compile(r"\d+(?:\.\d+)?\s*[smh]")
+#: The stats line ends in ====; the duration is searched for, never anchored.
+#: (?<!\d) starts the digit run at its first digit, so one line of thousands of digits
+#: cannot make every start position backtrack through the whole run (14.1 s at 20 000
+#: digits — HARDEN-1 A6); matches on ordinary text are unchanged.
+_HAS_DURATION = re.compile(r"(?<!\d)\d+(?:\.\d+)?\s*[smh]")
 
 
 def _slug(name):
@@ -183,8 +186,9 @@ def _git(cwd, *args):
     a cell that says so — not an exception into the run.
     """
     try:
-        p = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
-                           text=True, timeout=300)
+        # core.quotepath=false: a non-ASCII test path came back C-quoted and was no test of a root
+        p = subprocess.run(["git", "-c", "core.quotepath=false", *args], cwd=cwd, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=300)
     except (OSError, subprocess.SubprocessError):
         return 1, ""
     return p.returncode, p.stdout.strip()
@@ -270,17 +274,10 @@ def _copy_tests(entry, files, dest, label):
             continue  # the diff named a file the worktree does not carry
         root, rest = next(((r, rel[len(r):]) for r in TEST_ROOTS if rel.startswith(r)),
                           (TEST_ROOT, rel))
-        # the path below the root stays in the module name: `tests/a/test_x.py` and
-        # `tests/b/test_x.py` are two files, and one name for both is an
-        # `import file mismatch` — a false 0/1 on the entry's own code
+        # Keep the path below the root in the module name, so tests/a/test_x.py and tests/b/test_x.py stay distinct.
         stem = rest
         tag = _root_tag(root)
-        # a module name: pytest imports the file by its basename, and a `.` or
-        # a `/` in it is a package path — `_xcross_agnes-2.5-flash_test_x` is
-        # `ModuleNotFoundError: No module named '_xcross_agnes-2'`, which would
-        # read as `api` for every cell of an entry named like a model or a
-        # judge folder (`apertus-v1-5-8b.GAVE_UP`). The root goes in too, when
-        # the root is not the one the file sits in.
+        # Module names must be valid identifiers (no "." or "/"); the root is included when it is not the file's own.
         name = (f"{_CROSS_NAME}{_modname(label)}"
                 + (f"_{tag}_" if tag else "_")
                 + f"{_modname(os.path.splitext(stem)[0])}.py")
@@ -360,10 +357,7 @@ def _run_pytest(code_root, files, basetemp, timeout, workers=CROSS_WORKERS):
     if importlib.util.find_spec("pytest_timeout") is not None:
         cmd += ["--timeout", str(max(1, int(timeout)))]
     cmd += list(files)
-    # The cell's temp files live inside the cell: a test that makes a dir with
-    # `tempfile` and leaves it, or sweeps `<tmp>/xcross-*` like round 158's
-    # agnes-2-5-flash does at the end of one of its tests, touches nothing of
-    # the judge's and nothing outlives the scratch copy.
+    # The cell's temp files live inside the cell, so nothing outlives the scratch copy.
     cell_tmp = os.path.join(code_root, ".cell_tmp")
     os.makedirs(cell_tmp, exist_ok=True)
     return _run(cmd, code_root, timeout, env={**os.environ, "TMPDIR": cell_tmp})
@@ -410,15 +404,12 @@ def _sections(out):
         lines = [l.strip() for l in b if _E_LINE.match(l)]
         if not lines:
             continue
-        # the first `E ` line is the failure — except when the code under test did
-        # not even import: a SyntaxError opens with `E   File "…", line N` and a
-        # source line, and the error itself is the last `E ` line
+        # On an import failure the error is the last E line; otherwise it is the first.
         keep.append((n, lines[-1] if _E_FRAME.match(lines[0]) else lines[0]))
     return keep
 
 
-#: What pytest prints before the name in the header of a section that is not a
-#: plain test failure: `ERROR at setup of test_x`, `ERROR collecting tests/x.py`.
+#: Section header kinds that pytest prints before a test name, other than a plain failure.
 _SECTION_KIND = re.compile(r"^ERROR (?:at (?:setup|teardown) of|collecting)\s+")
 
 
@@ -490,8 +481,7 @@ def _cross_cell(p_name, p_path, files, i_name, i_ref, i_repo, cell_timeout, work
     which. Those read as `n/a` and are not classified, because there was no
     run to classify.
     """
-    # not `xcross-…`: that is the name a test of another entry may sweep (a cell
-    # of `--jobs 3` lost its scratch dir to such a test, `rc 127`, `no tests ran`)
+    # The scratch dir name avoids xcross-, which a test of another entry may sweep (rc 127).
     scratch = tempfile.mkdtemp(prefix=f"judgecell-{_slug(p_name)}-{_slug(i_name)}-")
     basetemp = os.path.join(scratch, ".pytest_basetemp")
     try:
@@ -506,10 +496,7 @@ def _cross_cell(p_name, p_path, files, i_name, i_ref, i_repo, cell_timeout, work
         passed, total = _counts(out)
         fails = _pair(_fails(out), out)
         if passed is None and not fails and rc not in (124, 127):
-            # no verdict at all (`no tests ran`, rc 5): under load an xdist worker
-            # can die before it collects. Once more, in a clean basetemp, before
-            # the cell is called `n/a` — a ninety-cell matrix with one hole in it
-            # is a matrix to run again by hand
+            # No verdict (e.g. a worker died before collecting): retry once in a clean basetemp before calling the cell n/a.
             shutil.rmtree(basetemp, ignore_errors=True)
             rc, out, err = _run_pytest(scratch, copied, basetemp, cell_timeout, workers)
             passed, total = _counts(out)
@@ -673,8 +660,7 @@ def _render_markdown(providers, impls, by, base, ideal, ticket=None, round_no=No
                  if ideal else "- ideal: —")
     lines.append("")
     if not rows:
-        # A matrix with no rows is not a quiet one: nothing was run, so the
-        # table, the leads and "no cell failed" would all say "all is well".
+        # A matrix with no rows is not a quiet one; nothing ran, so it says so.
         lines.append(NOTHING_CROSSED)
         lines.append("")
         return "\n".join(lines)
@@ -798,14 +784,9 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
             providers.append((name, str(path), files))
 
     impls = [(name, "HEAD", str(path)) for name, path in trees]
-    # `setup_worktrees.py` makes a `base` and an `ideal` worktree of its own: a
-    # tree with that name IS the column, and the ref is not archived a second
-    # time under the same name (two `base` columns shared one cell dict)
+    # A worktree with the same name is the column itself; the ref is not archived again under that name.
     named = {name for name, _ in trees}
-    # 191: a ref is looked for in the entries' checkouts first, then in the one
-    # the judge runs from — a round of separate clones has its ideal only here —
-    # and a ref found nowhere is said, not dropped: a matrix without its ideal
-    # column looked complete (round 146's first run, "9 × 13", no word).
+    # Refs are looked up in the entries' checkouts, then the judge's own repo; a ref found nowhere is reported, not dropped.
     homes = list(repos)
     if os.path.isdir(REPO_ROOT) and not any(
             os.path.realpath(str(r)) == os.path.realpath(REPO_ROOT) for r in homes):
@@ -827,8 +808,7 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
     if not providers:
         return _cross_empty(impls, skipped, base, ideal, out_dir, round_no, ticket, log)
 
-    # one line per finished cell: a real round is some ninety cells and minutes
-    # long, and a judge that says nothing until the end looks hung
+    # One line per finished cell, so a long run does not look hung.
     total = len(providers) * len(impls)
     cells = []
 
@@ -879,8 +859,7 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
             "tests": [p[0] for p in providers],
             "impls": [i[0] for i in impls],
             "leads": leads,
-            # the count the lists add up to: a reader of cross.json must never
-            # have to work one out, and never be handed a number that is not it
+            # The counts in cross.json are the lengths of the lists, so they always agree.
             "leads_count": len(leads["behaviour"]) + len(leads["discriminating"]),
             "nothing_crossed": False,
             "cells": [{"tests": pn, "code": in_, "passed": c["passed"], "total": c["total"],
@@ -905,6 +884,576 @@ def _cross_tests(trees, base, ideal=None, jobs=1, cell_timeout=CROSS_CELL_TIMEOU
     return data
 
 
+# ── the claims phase (CC-14) ─────────────────────────────────────────────────
+
+#: `--claims` with no FILE: the claims come from the round's own ticket.
+CLAIMS_FROM_TICKET = object()
+
+#: The four words a `## Claims` bullet names: `claim_diff`'s expects.
+CLAIM_WORDS = ("new", "fixed", "still", "gone")
+
+#: The changes the claims table counts, in the order the operator reads them.
+CLAIM_COUNTS = ("FIXED", "STILL", "NEW", "GONE", "UNCLEAR", "n/a")
+
+#: Seconds one voter call may spend — the claims phase does not outwait `claim_diff`.
+CLAIMS_TIMEOUT = 240
+
+#: Voter calls in flight at once, both sides together.
+CLAIMS_PARALLEL = 4
+
+#: The seed and the prompt mode of the claims phase, fixed for the whole round: the same
+#: two settings `ask` below hands to `ask_v2`. CC-16 (Part B) put them in the identity of a
+#: recorded base side — they decide what the voters were shown, so a record judged under
+#: another seed or prompt mode is another run's evidence — which means the phase has to
+#: state them rather than leave them implicit.
+CLAIMS_SEED = 1
+CLAIMS_FIXED_PROMPT = False
+
+#: One line instead of an empty table: every entry failed a hard gate.
+CLAIMS_NOTHING = "claims: no entry passed the hard gates — nothing was judged"
+
+#: What the table is worth: a column next to the cross phase, never a hard gate.
+CLAIMS_LEAD = ("claims: a lead, not a gate — a mismatch is a model's reading, so read the evidence "
+               "and reproduce it by hand before a ticket")
+
+#: `## Claims` — the optional section that carries the round's claims, after `## Acceptance`.
+#: A heading that adds a parenthetical is still the section, so the match stops at the word.
+#: Any of the six levels — `## Claims` through `###### Claims` — with an optional trailing colon
+#: and an optional suffix (`## Claims (3)`); case-insensitive. HARDEN-14 D: levels 3 and 4 and
+#: the colon did not open the section, so a ticket that wrote them scored nothing and said
+#: nothing. HARDEN-20 E: the ceiling was level 4, so a `#### Claims` ticket was judged by this
+#: reader yet never announced by the one the summary used — now the same six levels both sides.
+_CLAIMS_HEADING = re.compile(
+    r"^(#{2,6})[ \t]+Claims[ \t]*(?::[ \t]*(?:\S.*)?)?(?:[ \t]+\S.*)?[ \t]*$", re.I
+)
+
+#: Any markdown heading with its level, so a `### Claims` section ends at a `###` sibling and not
+#: only at a `## `.
+_HEADING_LEVEL = re.compile(r"^(#{1,6})[ \t]")
+
+#: `- [new] text` and `1. [new] text` — the bracketed word is the claim's `expect`, the rest is the
+#: claim itself. The token is taken as written, so a mangled one like `- [ne]w` reports `[ne]w`,
+#: not `ne`. A numbered item is a claim bullet too (HARDEN-8 C): it was neither here nor a
+#: `_LIST_ITEM`, so a numbered claims list gave no claims and no refusal.
+_CLAIM_BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(\S+)\s+(.*)$")
+
+#: A list item at all (HARDEN-8 C): a dash, star or plus bullet *or* a numbered one, `1.` / `1)`.
+#: A claim bullet that names no word is a refusal, not a silent skip — the numbered form used to
+#: fall in neither branch, so `## Claims` holding `1. [new] a` gave no claims and no refusal.
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+
+#: A code fence's opening or closing line: ``` or ~~~ with up to three leading spaces.
+_FENCE_MARKER = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+class _FenceTracker:
+    """A fenced block's open/closed state, so a heading or a claim written inside a code block
+    is not read as one (HARDEN-8 C). The closer must be the same character and at least as long
+    as the opener, so a ``` inside a ```` block is body, not a closer."""
+
+    def __init__(self) -> None:
+        self._fence = ""
+
+    def feed(self, line: str) -> bool:
+        """One line: True when it is inside a fenced block afterwards."""
+        marker = _FENCE_MARKER.match(line)
+        if not self._fence:
+            if marker:
+                self._fence = marker.group(1)
+            return False
+        if marker and marker.group(1)[0] == self._fence[0] and len(marker.group(1)) >= len(self._fence) \
+                and not line.strip()[len(marker.group(1)):]:
+            self._fence = ""
+        return True
+
+
+def _claims_section(text, fenced=False):
+    """`(the heading's line number, [(line number, line)])` of a ticket's `## Claims` section —
+    `None` when it has none.
+
+    The section is optional and may be the ticket's last, so the body runs to the next heading of
+    its own level or a shallower one, or to the end of the file. Line numbers start at 1, the way
+    an editor numbers them: a refusal names the line, not a position in a list.
+
+    HARDEN-8 C: a fenced block is not read here at all. A `## Claims` written inside a code
+    block — a ticket that documents the section, or a prompt that quotes one — was a section,
+    and its lines were then parsed as claims. HARDEN-14 D: the heading's level is returned, so a
+    `### Claims` section does not keep reading past a `###` sibling. HARDEN-20 E: the lines come
+    from `splitlines()`, not `split("\\n")` — on a CRLF ticket the heading read `## Claims\r`,
+    which the pattern did not match, so the round judged nothing at all and said nothing.
+    """
+    lines = (text or "").splitlines()
+    start = None
+    level = 2
+    fences = _FenceTracker()
+    for i, line in enumerate(lines):
+        if fences.feed(line):
+            continue
+        m = _CLAIMS_HEADING.match(line)
+        if m:
+            start = i + 1
+            level = len(m.group(1))
+            break
+    if start is None:
+        return None
+    body = []
+    fences = _FenceTracker()
+    for i in range(start, len(lines)):
+        if fences.feed(lines[i]):
+            if fenced:
+                body.append((i + 1, lines[i]))
+            continue
+        hm = _HEADING_LEVEL.match(lines[i])
+        if hm and len(hm.group(1)) <= level:
+            break
+        body.append((i + 1, lines[i]))
+    return start, body
+
+
+def ticket_claims(text, name=""):
+    """The claims of a ticket's `## Claims` section as `[{"claim", "expect"}]`, `[]` when it has none.
+
+    The word in brackets is the claim's `expect`, one of the four: `new` states the behaviour the
+    ticket adds, `fixed` states the defect (true at the base, false after the fix), `still` what
+    must not change and `gone` what must not be there. Any other word is a refusal naming the line
+    — a typo would otherwise leave claims that can never be met, and an `expect` that never matches
+    is the gate that looks like it checked. A list item whose first word carries no brackets is
+    refused too: the section is a claims list, not prose — a dash, star or plus bullet and a
+    numbered one alike (HARDEN-8 C: `1. [new] a` used to fall in neither branch, so a numbered
+    claims list gave no claims and no refusal). An indented line after a bullet is its
+    continuation, so a long claim may wrap without becoming a second claim.
+    """
+    where = name or "ticket"
+    found = _claims_section(text)
+    if found is None:
+        return []
+    heading_lineno, body = found
+    claims = []
+    for lineno, line in body:
+        bullet = _CLAIM_BULLET.match(line)
+        if bullet:
+            token, claim = bullet.group(1), bullet.group(2).strip()
+            if not token.startswith("["):
+                raise ValueError(f"{where}:{lineno}: a claim names its word in brackets — "
+                                 f"{', '.join('[' + w + ']' for w in CLAIM_WORDS)}")
+            word = token.strip("[]").strip().lower()
+            if word not in CLAIM_WORDS:
+                raise ValueError(f"{where}:{lineno}: '{token}' is not one of "
+                                 f"{', '.join(CLAIM_WORDS)} — the word in brackets is the claim's expect")
+            claims.append({"claim": claim, "expect": word})
+        elif _LIST_ITEM.match(line) and line.strip():
+            raise ValueError(f"{where}:{lineno}: a claim names its word in brackets — "
+                             f"{', '.join('[' + w + ']' for w in CLAIM_WORDS)}")
+        elif line.strip() and claims and line[:1] in (" ", "\t"):   # only an indented line continues it
+            claims[-1]["claim"] = (claims[-1]["claim"] + " " + line.strip()).strip()
+    if not claims:
+        # A list written inside a code block is not read; said here rather than left as "no claims".
+        for lineno, line in _claims_section(text, fenced=True)[1]:
+            bullet = _CLAIM_BULLET.match(line)
+            if bullet and bullet.group(1).startswith("["):
+                raise ValueError(f"{where}:{lineno}: the claims are inside a code block — "
+                                 f"write them as a plain list under ## Claims")
+        # HARDEN-14 D: a ticket that opened the section and gave it no claim is a refusal naming
+        # the heading, not `[]` — `[]` read as "the ticket said nothing", so the judge scored
+        # nothing and said nothing.
+        raise ValueError(f"{where}:{heading_lineno}: the Claims section has no claim — write a "
+                         f"list of `[word]` items under it")
+    return claims
+
+
+def _ini_fail_open(repo_root):
+    """`[claim_vote]` of *repo_root*, or a parser with the section and nothing else.
+
+    A missing, unreadable or malformed ini is no claims data — `claim_diff`'s own defaults —
+    never an exception into a run that has already scored a round."""
+    try:
+        return cv.read_ini(Path(repo_root))
+    except Exception:   # noqa: BLE001 — a broken config degrades to no collect data, never a crash
+        parser = configparser.ConfigParser()
+        parser.add_section(cv.SECTION)
+        return parser
+
+
+def _claims_config(repo_root, parser, accept=None, batch=None, code_batch=None, runs=1):
+    """`(accept, batch, code_batch, budget, why-refused)`.
+
+    `[claim_vote] accept` is the rule both sides are tallied under (CC-11) and the ini's
+    `batch` / `code_batch` are the ones `claim_diff` builds its packs with. A key that is absent
+    or malformed is the default; a count under 1 or a rule that is not one of the two is a refusal
+    naming it, so a round never starts on a misread config."""
+    if parser is None:
+        parser = _ini_fail_open(repo_root)
+    rule, why = cv.accept_rule(accept, parser)
+    if why:
+        return None, None, None, None, why
+
+    def get(key, fallback):
+        try:
+            return int(str(parser.get(cv.SECTION, key, fallback=str(fallback))).strip())
+        except (TypeError, ValueError):
+            return fallback
+    batch = cv.given_or(batch, get("batch", 10))
+    code_batch = cv.given_or(code_batch, get("code_batch", 2))
+    for label, value in (("batch", batch), ("code_batch", code_batch), ("runs", runs)):
+        if value is not None and value < 1:
+            return None, None, None, None, f"{label} {value}: must be 1 or more"
+    return rule, batch, code_batch, cd.PackBudget.from_config(parser), ""
+
+
+def _claims_skip(row):
+    """The hard gate that keeps *row* out of the claims phase, `""` when it passed.
+
+    The three hard gates of the scorecard: `_shrink` byte-identical, exactly one commit, nothing
+    pushed. An entry that failed one is not worth the requests, and it is listed as skipped so the
+    table still accounts for every agent. `no test shipped` is a column of the scorecard, not a
+    hard gate, so it does not skip an entry here.
+    """
+    commits = row.get("commits")
+    if not isinstance(commits, int):
+        return row.get("notes") or "not a git worktree"
+    if row.get("shrink") == "CHANGED":
+        return "shrink is not byte-identical to the base"
+    if commits != 1:
+        return f"{commits} commits, expected 1"
+    if row.get("pushed") == "yes":
+        return "reached a remote"
+    return ""
+
+
+def _claims_costs(sides_list, voters, runs, batch, code_batch):
+    """`(base requests once, head requests per entry, total)` — `claim_diff`'s own `requests_of`.
+
+    Every entry starts from the same base, so its base side is the same question asked again: the
+    first entry pays for it and the rest pay for their head only. Adding up per claim would bill
+    the base once per entry, which is most of the requests of a round of eight.
+
+    CC-16 (Part E): which claims are code claims is a per-entry answer, and a claim that is a
+    code claim for at least one entry is voted at the base once, whoever needs it — so the bill
+    is the union of the entries' non-world claims, not the first entry's alone (which billed
+    nothing for a claim only a later entry anchors)."""
+    seen = set()
+    union_items = []
+    for sides in sides_list:
+        for i, item in enumerate(sides["items_b"]):
+            if sides["world"][i] or i in seen:
+                continue
+            seen.add(i)
+            union_items.append(item)
+    base = cd.requests_of(union_items, len(voters), runs, batch, code_batch)
+    heads = [cd.requests_of(s["items_h"], len(voters), runs, batch, code_batch) for s in sides_list]
+    return base, heads, base + sum(heads)
+
+
+def _render_claims_table(entries, skipped, mismatches):
+    """The console table: one row per entry, then the claims that did not meet their `expect`.
+
+    `expect` is `met/total` over the claims that carry one — a claim without an `expect` is never
+    a mismatch, so it is not in either number. Skipped entries are listed under the table, with
+    the gate that kept them out, so the table accounts for every agent it was given."""
+    head = ["agent"] + list(CLAIM_COUNTS) + ["expect"]
+    body = [[e["agent"]] + [str(e["counts"].get(c, 0)) for c in CLAIM_COUNTS]
+            + [f"{e['met']}/{e['total']} met"] for e in entries]
+    width = [max(len(head[i]), *(len(r[i]) for r in body)) if body else len(head[i])
+             for i in range(len(head))]
+    lines = ["  ".join(h.ljust(width[i]) for i, h in enumerate(head))]
+    for row in body:
+        lines.append("  ".join(str(c).ljust(width[i]) for i, c in enumerate(row)))
+    for name, reason in skipped.items():
+        lines.append(f"  skipped: {name} — {reason}")
+    if mismatches:
+        lines.append("")
+        lines.append("Mismatches — expect is the ticket, got is the model's reading:")
+        for name, line in mismatches:
+            lines.append(f"  {name}: {line}")
+    else:
+        lines.append("")
+        lines.append("Every claim with an expect met it.")
+    return lines
+
+
+def _render_claims_markdown(entries, skipped, mismatches, *, round_no=None, ticket=None,
+                            base_ref=None, n_claims=0, voters=(), runs=1, requests=0):
+    """The same table as `claims.md`: the round's facts, the counts, the skipped entries,
+    the mismatches with both sides' verdicts and the evidence ids."""
+    head = ["agent"] + list(CLAIM_COUNTS) + ["expect"]
+    lines = ["# Claims — the ticket's claims at the base and at every entry", ""]
+    if round_no is not None:
+        lines.append(f"- round: {round_no}")
+    if ticket:
+        lines.append(f"- ticket: {ticket}")
+    if base_ref:
+        lines.append(f"- base: `{base_ref}`")
+    lines += [f"- claims: {n_claims}", f"- voters: {', '.join(voters) or '—'}",
+              f"- runs: {runs}",
+              f"- requests: {requests} (the base side once, then one head side per entry)"]
+    if entries:
+        lines += ["", "| " + " | ".join(head) + " |",
+                  "|" + "|".join([" --- "] * len(head)) + "|"]
+        for e in entries:
+            row = [e["agent"]] + [str(e["counts"].get(c, 0)) for c in CLAIM_COUNTS] \
+                  + [f"{e['met']}/{e['total']} met"]
+            lines.append("| " + " | ".join(row) + " |")
+    lines += ["", "A mismatch is a lead, not a gate: read the evidence and reproduce it by hand "
+                "before a ticket is filed."]
+    if skipped:
+        lines.append("")
+        lines.append("## Not judged")
+        lines.append("")
+        for name, reason in skipped.items():
+            lines.append(f"- {name}: {reason}")
+    lines.append("")
+    lines.append("## Mismatches")
+    lines.append("")
+    if mismatches:
+        for name, line in mismatches:
+            lines.append(f"- **{name}** `{line}`")
+    else:
+        lines.append("None — every claim with an expect met it.")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _write_claims_artifacts(out_dir, base, head, got, entry, *, budget, collect, parser,
+                            voters, log):
+    """`<out_dir>/claims/<entry>/` — `delta.json`, `votes_base.json` and `votes_head.json`, in
+    the shape `claim_diff --out` writes (so `score_cc.py` and `claimcheck_truth` read them as they
+    read a diff run). `votes_base.json` is the base side judged once for the round, written
+    unchanged into every entry's folder. Returns the delta table, or `""` when the artifacts
+    could not be written — a directory that fails only loses the files, never the phase."""
+    try:
+        dest = os.path.join(out_dir, "claims", _slug(entry))
+        return cd.write_outputs(Path(dest), base, head, got, budget=budget, collect=collect,
+                                models=cv.voter_models(voters, parser), seed=CLAIMS_SEED,
+                                fixed_prompt=CLAIMS_FIXED_PROMPT)
+    except (OSError, ValueError) as e:   # noqa: BLE001 — a model that does not resolve is no model row
+        log(f"claims: could not write {dest} — {type(e).__name__}: {e} (the table above stands)")
+        return ""
+
+
+def _claims_input(tasks_dir, name, source):
+    """`(claims, where, refusal)` — the round's ticket's `## Claims` when no FILE was given, else
+    the FILE, which may be anything `claim_diff.py` reads. An unknown word in the section and an
+    unreadable FILE are a refusal naming it; a ticket without the section is no phase, not a refusal."""
+    if source is CLAIMS_FROM_TICKET:
+        text = ""
+        try:
+            text = Path(tasks_dir, name).read_text(encoding="utf-8")
+        except OSError:
+            pass   # ticket_for_round read it already: an unreadable ticket is no claims, not a crash
+        try:
+            return ticket_claims(text, name), f"{name} ## Claims", ""
+        except ValueError as e:
+            return [], f"{name} ## Claims", str(e)
+    try:
+        return cd.load_claims(Path(source)), str(source), ""
+    except (OSError, ValueError) as e:   # json.JSONDecodeError is a ValueError
+        return [], str(source), f"{getattr(e, 'strerror', None) or e}"
+
+
+def _claims_refused(data, reason):
+    """A phase that refused before a request: the data the caller needs to report and exit 2."""
+    data["status"] = "refused"
+    data["refusal"] = reason
+    return data
+
+
+def claims_phase(rows, base_ref, claims, *, voters, runs=1, repo_root=REPO_ROOT, parser=None,
+                 accept=None, batch=None, code_batch=None, timeout=CLAIMS_TIMEOUT,
+                 collect=True, out_dir=None, round_no=None, ticket=None, log=_say, vote=None):
+    """Judge the ticket's claims at the base and at every entry that passed the hard gates.
+
+    *rows* are the scorecard rows of `judge_worktree`, in order: an entry whose `shrink`,
+    `commits` or `pushed` gate failed is listed as skipped and costs no request. For each entry
+    left, `claim_diff.judge_both` with the target the entry's worktree, base `base_ref` and head
+    its `HEAD`, the voters of `[claim_vote] llm_profiles`, one acceptance rule for both sides and
+    packs with the collect facts — the vote seam of `judge_both`, so a test fills it with scripted
+    voters and no request leaves the machine.
+
+    The base side is judged once: the first entry's record is passed to every later entry as
+    `base_side`, and `judge_both` reuses it only when the claims, the base sha, the voters, the
+    runs and the rule are all this run's — a difference is a refusal naming the field, never a
+    stale base judged as this round's. One line with the cost is printed before the first request.
+
+    Returns `{"status": "ok" | "refused" | "nothing", "refusal", "requests", "entries",
+    "skipped", "mismatches", "markdown"}`. A mismatch never sets the exit code; a refusal does
+    (the caller exits 2). Never raises: a target that will not open, an unreadable ini, a broken
+    artifact are a refusal or an `n/a`, never an exception into a run that has scored a round.
+    """
+    data = {"status": "nothing", "refusal": "", "requests": 0, "entries": [], "skipped": {},
+            "mismatches": [], "markdown": ""}
+    try:
+        return _claims_phase(rows, base_ref, claims, voters=voters, runs=runs, repo_root=repo_root,
+                             parser=parser, accept=accept, batch=batch, code_batch=code_batch,
+                             timeout=timeout, collect=collect, out_dir=out_dir, round_no=round_no,
+                             ticket=ticket, log=log, vote=vote)
+    except Exception as e:   # noqa: BLE001 — the claims phase never takes the run down with it
+        return _claims_refused(data, f"{type(e).__name__}: {e}")
+
+
+def _claims_phase(rows, base_ref, claims, *, voters, runs=1, repo_root=REPO_ROOT, parser=None,
+                  accept=None, batch=None, code_batch=None, timeout=CLAIMS_TIMEOUT, collect=True,
+                  out_dir=None, round_no=None, ticket=None, log=_say, vote=None):
+    data = {"status": "ok", "refusal": "", "requests": 0, "entries": [], "skipped": {},
+            "mismatches": [], "markdown": ""}
+    if not claims:
+        return _claims_refused(data, "no claims to judge: an empty file, or a section with no claims")
+    voters = [str(v) for v in (voters or []) if str(v).strip()]
+    if not voters:
+        return _claims_refused(data, f"no voters: pass --claims-profiles or set "
+                                     f"[{cv.SECTION}] llm_profiles")
+    # main passes no parser: the voters' sections are read from the ini here, once, and the same parser is the
+    # one every vote asks (a None reached claim_vote.voter_settings and every vote died with an AttributeError)
+    parser = parser if parser is not None else _ini_fail_open(repo_root)
+    # A voter whose section is missing is a refusal before the first request, not a vote that errors for
+    # every claim: a ``provider/model`` ref is Kilo's, read from its files, so only a section name is checked.
+    absent = [v for v in voters if "/" not in v and not parser.has_section(v)]
+    if absent:
+        return _claims_refused(data, "no ini section for the voter(s) "
+                                     + ", ".join(f"[{v}]" for v in absent)
+                                     + " (contest.local.ini); add it or pick another --claims-profiles")
+    accept, batch, code_batch, budget, why = _claims_config(
+        repo_root, parser, accept, batch, code_batch, runs)
+    if why:
+        return _claims_refused(data, why)
+
+    # The three hard gates decide who is judged; a skipped entry is still accounted for in the table.
+    skipped, trees = data["skipped"], []
+    for row in rows:
+        name = row.get("agent") or "entry"
+        reason = _claims_skip(row)
+        if reason:
+            skipped[name] = reason
+        else:
+            trees.append((name, row.get("path")))
+    if not trees:
+        data["status"] = "nothing"
+        log(CLAIMS_NOTHING)
+        return data
+
+    # The base is looked up in the entries' checkouts, then the judge's own repo — a ref found
+    # nowhere is a refusal naming it, not a target that fails halfway through a run.
+    homes = [p for _, p in trees if os.path.isdir(os.path.join(str(p), ".git"))
+             or os.path.exists(os.path.join(str(p), ".git"))]
+    if os.path.isdir(REPO_ROOT) and not any(
+            os.path.realpath(h) == os.path.realpath(REPO_ROOT) for h in homes):
+        homes.append(REPO_ROOT)
+    home = _resolve(homes, base_ref)
+    if not home:
+        return _claims_refused(data, f"--base {base_ref} resolves in no checkout (the entries' "
+                                     f"or {REPO_ROOT}) — no base side to judge")
+
+    scratch = tempfile.mkdtemp(prefix="judgeclaims-")
+    try:
+        with ExitStack() as stack:
+            try:
+                base = stack.enter_context(cc_target.Target.open(home, base_ref, scratch=scratch))
+                heads = {}
+                for name, path in trees:
+                    heads[name] = stack.enter_context(
+                        cc_target.Target.open(path, "HEAD", scratch=scratch))
+            except cc_target.TargetError as e:
+                return _claims_refused(data, f"refused: {e}")
+            data["base_sha"] = base.sha
+
+            prepared = []
+            for name, _path in trees:
+                try:
+                    sides = cd.prepare_sides(claims, base, heads[name], budget, collect=collect)
+                except Exception as e:   # noqa: BLE001 — a broken artifact is no claims data
+                    return _claims_refused(data, f"{name}: the packs did not build — "
+                                                 f"{type(e).__name__}: {e}")
+                for i, c in enumerate(claims):
+                    if c.get("expect") and sides["world"][i]:
+                        return _claims_refused(data, f"{name}: expect on a world claim "
+                                                     f"({c.get('id') or i + 1}): it is judged once, "
+                                                     f"at head, so its expect can never be met")
+                prepared.append((name, heads[name], sides))
+
+            base_req, head_reqs, total_req = _claims_costs(
+                [p[2] for p in prepared], voters, runs, batch, code_batch)
+            data["requests"] = total_req
+
+            # The bill, printed before the first request: a round of eight is not started blind.
+            log(f"\nClaims — {len(claims)} claims, {len(voters)} voters, {runs} run(s), "
+                f"{len(prepared)} entries: {total_req} requests (the base side once, then one head "
+                f"side per entry)" + (f"\nskipped: " + ", ".join(f"{n} ({why})"
+                                                                  for n, why in skipped.items())
+                                      if skipped else ""))
+
+            def ask(ref, items, run):
+                return cv.ask_v2(ref, items, run, CLAIMS_SEED, parser, timeout, batch, code_batch,
+                                 CLAIMS_FIXED_PROMPT)
+
+            with ThreadPoolExecutor(max(1, CLAIMS_PARALLEL)) as pool:
+                voter = vote if vote is not None else cd.make_vote(voters, runs, pool, ask)
+                # CC-16 (Part B): the run's own settings, the same ones `ask` hands the
+                # voters, so the base side's record can be shown to be this round's.
+                # (`collect` and `budget` are `judge_both`'s own parameters, so they are
+                # named rather than folded into the dict it is splatted from.)
+                run_settings = dict(seed=CLAIMS_SEED,
+                                    fixed_prompt=CLAIMS_FIXED_PROMPT,
+                                    models=cv.voter_models(voters, parser))
+                record = None
+                entries = data["entries"]
+                for (name, head, sides), head_req in zip(prepared, head_reqs):
+                    try:
+                        got = cd.judge_both(claims, base, head, voter, budget, collect=collect,
+                                            accept=accept, base_side=record, voters=voters,
+                                            runs=runs, sides=sides, **run_settings)
+                    except ValueError as e:
+                        return _claims_refused(data, f"{name}: {e}")
+                    if record is None:
+                        record = cd.base_side_record(claims, base, voters, runs, got,
+                                                     collect=collect, budget=budget,
+                                                     **run_settings)
+                    else:
+                        # CC-16 (Part E): the record keeps every claim already judged at the
+                        # base — `judge_both` hands them back under `voted`, keyed by
+                        # `index` — so the next entry pays only for what it adds.
+                        record = cd.base_side_record(
+                            claims, base, voters, runs, {**got, "base": {
+                                **got["base"], "results": got["base"]["voted"]}},
+                            collect=collect, budget=budget, **run_settings)
+                    counts = Counter(d.change for d in got["deltas"])
+                    deltas = [d for d in got["deltas"] if d.expect]
+                    lines = [cc_compare.mismatch_line(d) for d in cc_compare.mismatches(got["deltas"])]
+                    met = sum(1 for d in deltas if cc_compare.EXPECTS[d.expect] == d.change)
+                    entries.append({"agent": name, "path": head.repo, "head": head.sha,
+                                    "counts": dict(counts), "met": met, "total": len(deltas),
+                                    "mismatches": lines})
+                    data["mismatches"].extend((name, line) for line in lines)
+                    row = entries[-1]
+                    log(f"  [{len(entries)}/{len(prepared)}] {name}: "
+                        + "  ".join(f"{c}={counts.get(c, 0)}" for c in CLAIM_COUNTS)
+                        + f" | expect {row['met']}/{row['total']} met ({head_req} requests)"
+                        + (f"\n{CLAIMS_LEAD}" if lines else ""))
+                    if out_dir:
+                        _write_claims_artifacts(out_dir, base, head, got, name, budget=budget,
+                                                collect=collect, parser=parser, voters=voters, log=log)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    log("\n".join(_render_claims_table(data["entries"], skipped, data["mismatches"])))
+    data["markdown"] = _render_claims_markdown(
+        data["entries"], skipped, data["mismatches"], round_no=round_no, ticket=ticket,
+        base_ref=base.sha, n_claims=len(claims), voters=voters, runs=runs,
+        requests=data["requests"])
+    if out_dir:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            md_path = os.path.join(out_dir, "claims.md")
+            with open(md_path, "w", encoding="utf-8") as fh:
+                fh.write(data["markdown"] + "\n")
+            with open(os.path.join(out_dir, "claims.json"), "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=1, ensure_ascii=False)
+                fh.write("\n")
+            log(f"\nclaims -> {md_path}, {os.path.join(out_dir, 'claims.json')}")
+        except OSError as e:
+            log(f"claims: could not write {out_dir} — {e} (the table above stands)")
+    return data
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--round", type=int, required=True, help="round number, matches NN- prefix")
@@ -924,11 +1473,25 @@ def main():
                     help="wall clock one cross cell may spend")
     ap.add_argument("--cross-out", default=None, metavar="DIR",
                     help="write cross.json / cross.md there (default contest-out/NN)")
+    ap.add_argument("--claims", nargs="?", const=CLAIMS_FROM_TICKET, default=None, metavar="FILE",
+                    help="judge the ticket's claims at the base and at every entry that passed "
+                         "the hard gates; FILE is anything claim_diff.py reads, and with no FILE "
+                         "the claims come from the round's ticket ## Claims")
+    ap.add_argument("--claims-profiles", nargs="+", default=None, metavar="PROFILE",
+                    help="the voters of the claims phase ([claim_vote] llm_profiles when unset)")
+    ap.add_argument("--claims-runs", type=int, default=1, metavar="N",
+                    help="voter runs per side of the claims phase (the default 1)")
     a = ap.parse_args()
 
     name, title, declared = ticket_for_round(a.tasks, a.round)
     if not name:
         print(f"no ticket numbered {a.round} in {a.tasks}/", file=sys.stderr)
+        return 1
+    if not title:
+        # An empty ticket file has no title: the round cannot be named, and its
+        # declared paths are empty, so it is refused here, naming the file.
+        print(f"{a.tasks}/{name} is empty — the round needs a ticket with a title",
+              file=sys.stderr)
         return 1
 
     trees = []
@@ -968,16 +1531,46 @@ def main():
 
     crossed = True
     if a.cross:
-        # zero-padded like `contest-out/<NN>` of the runner (`_round_out_dir`),
-        # so cross.json / cross.md land next to SUMMARY.md also for round 7
+        # Zero-padded like contest-out/<NN>, so cross.json sits next to SUMMARY.md.
         out_dir = a.cross_out or os.path.join("contest-out", f"{a.round:02d}")
         data = cross_tests(trees, a.base, ideal=a.ideal, jobs=a.jobs,
                            cell_timeout=a.cell_timeout, out_dir=out_dir,
                            round_no=a.round, ticket=name)
         crossed = not data.get("nothing_crossed", False)
 
+    claims_status = "off"
+    if a.claims is not None:
+        claims, where, refuse = _claims_input(a.tasks, name, a.claims)
+        if refuse:
+            print(f"claims: {where}: {refuse}", file=sys.stderr)
+            return 2
+        if not claims:
+            if a.claims is CLAIMS_FROM_TICKET:
+                # Optional section: a ticket without it is judged as today, so the exit code is untouched.
+                print("\nclaims: the ticket has no ## Claims section, and no FILE was given — "
+                      "nothing was judged")
+                claims_status = "none"
+            else:
+                print(f"claims: {where}: no claims to judge", file=sys.stderr)
+                return 2
+        else:
+            # The base side of the claims is voted once, so the same --cross-out that holds cross.md
+            # holds claims.md: one folder to read when the round ends.
+            out_dir = a.cross_out or (os.path.join("contest-out", f"{a.round:02d}") if a.cross else None)
+            data = claims_phase(rows, a.base, claims, voters=a.claims_profiles,
+                                runs=a.claims_runs, repo_root=Path.cwd(), out_dir=out_dir,
+                                round_no=a.round, ticket=name)
+            if data.get("status") == "refused":
+                print(f"claims: {data['refusal']}", file=sys.stderr)
+                return 2
+            claims_status = data["status"]
+
+    first = ("  1. Does it do what the ticket's Acceptance list says, item by item?"
+             if claims_status != "ok" else
+             "  1. The claims phase scored the ticket's claims: read its mismatches, and the diff\n"
+             "     of any code it did not judge")
     print("\nWhat this script cannot score — read the diffs for these:")
-    print("  1. Does it do what the ticket's Acceptance list says, item by item?")
+    print(first)
     print("  2. Is it the simplest thing that does it, or is there a new abstraction")
     print("     the ticket did not ask for?")
     print("  3. Does the test fail without the change? (delete the change, re-run it)")
@@ -990,7 +1583,8 @@ def main():
             for r in rows:
                 wr.writerow({k: r.get(k, "") for k in wr.fieldnames})
         print(f"\nscorecard -> {a.csv}")
-    return EXIT_NO_CROSS if not crossed else 0
+    # A mismatch never sets the code; only a refused or unjudged claims phase does, like --cross.
+    return EXIT_NO_CROSS if (not crossed or claims_status == "nothing") else 0
 
 
 if __name__ == "__main__":

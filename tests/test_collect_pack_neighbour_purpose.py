@@ -76,16 +76,13 @@ CALLED = ("tools/x.py",)
 TESTS = ("tests/test_hub.py",)
 ALL_PATHS = (TARGET,) + CALLERS + CALLED + TESTS
 
-# Deliberately long and terminator-free inside the first 110 chars, so the char
-# ceiling is what cuts it. The boundary after "before" sits well before the
-# limit, so the cut must land there rather than inside a word.
+# No terminator in the first 110 chars: the char ceiling cuts at the boundary after "before", not inside a word.
 LONG_PURPOSE = (
     "Loads standard SKILL.md files and applies them as in-memory config overlays "
     "to the parsed agents.ini before the agent pipeline starts so downstream "
     "modules run unmodified"
 )
-# Two sentences, the first comfortably inside the limit: the sentence cut must
-# win over the char ceiling.
+# Two sentences, the first inside the limit: the sentence cut wins over the char ceiling.
 TWO_SENTENCES = (
     "Runs the per-round inner loop of the autonomous pipeline. It then hands "
     "each attempt to the coder, the executor and the validator in turn, and "
@@ -209,10 +206,7 @@ def _neighbour_lines(block: str) -> list:
     return [line for line in block.split("\n") if line.startswith(_NEIGHBOURS_PREFIX)]
 
 
-# Every row this file can make render, by the prefix it renders with. Used to
-# read a block back into a label list — `config_read`'s own text carries no
-# colon, so splitting a line on ":" would return the whole line instead of its
-# label.
+# Every row prefix this file can render; used to read a block back into labels (config_read has no colon).
 _ROW_PREFIXES = (
     _CALLERS_PREFIX,
     _CALLS_INTO_PREFIX,
@@ -350,8 +344,7 @@ def test_the_row_caps_at_three_even_when_more_neighbours_have_purposes():
     )
     lines = _neighbour_lines(build_collect_context_block(model, TARGET))
     assert len(lines) == _NEIGHBOURS_MAX_ENTRIES
-    # the cap keeps the two heaviest callers, then takes the callee it meets
-    # next in the candidate order, cutting everything after the third slot
+    # The cap keeps the two heaviest callers, then the callee next in candidate order.
     assert _paths_in(lines) == [CALLERS[0], CALLERS[1], extras[0]]
     assert extras[1] not in "\n".join(lines)
     assert CALLED[0] not in "\n".join(lines)
@@ -799,8 +792,7 @@ def test_rendering_is_deterministic_across_two_independently_built_models():
 
 @pytest.fixture(autouse=True)
 def _empty_seeds(monkeypatch):
-    # Seed contracts and the gate map are not under test here; neutralising
-    # them keeps the collected graph and test map deterministic.
+    # Seed contracts and the gate map are not under test here; neutralise them for a deterministic graph.
     monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules, root=None: [])
     monkeypatch.setattr(cli_mod.gates_mod, "build_gates_map", lambda modules, root: [])
 
@@ -951,9 +943,7 @@ def test_the_live_artifact_renders_coder_neighbours_with_real_llm_prose():
     cannot supply."""
     model = loader_mod.load(REPO_ROOT)
     target = "tools/auto/coder.py"
-    # A collect run with Pass B off (no LLM configured, or --no-llm) writes a
-    # valid artifact with no summaries at all; this test is about the prose,
-    # so such an artifact is the same "not on this checkout" as no artifact.
+    # A run with Pass B off writes an artifact with no summaries, which counts as no artifact for this test.
     candidates = tuple(model.callers_of(target)) + tuple(model.calls_into(target))
     if not any(getattr(getattr(model.module(p), "summary", None), "purpose", "")
                for p in candidates):

@@ -1,43 +1,5 @@
 #!/usr/bin/env bash
-# scripts/run_flows.sh — CHECK-1: run the skill flows and validate them.
-#
-# Each flow gets its OWN sandbox:
-#
-#     examples/task1/hello-world/     hello-code            (base = code)
-#     examples/task2/hello-world/     hello-docs            (base = docs)
-#     examples/task3/hello-world/     hello-creative        (base = creative)
-#     examples/task4/hello-world/     hello-creative-split  (base = creative,
-#                                                             canon/continuity
-#                                                             on a 2nd provider)
-#
-# That isolation is the point. The flows commit into their base directory, so
-# running several against the shared examples/hello-world/ means a later task
-# inspects an earlier task's output — the results stop being independent and
-# a passing check might only be passing because an earlier task already
-# created the file it wanted.
-#
-# Every sandbox is rebuilt from the committed baseline before its flow runs,
-# so a re-run never starts from the previous run's output.
-#
-# Task 4 (GATE3-PROFILE-5) is deliberately NOT part of the default set: it
-# needs a [task4_provider_b] section — a second real, reachable LLM
-# endpoint — added to $CONFIG by the operator first (see RUNBOOK.md "Flow
-# 4"), which the other three flows don't require. Run it explicitly once
-# that's in place: `scripts/run_flows.sh 4`.
-#
-# Validation is scripts/check_runbook.py: deterministic, no LLM, no network.
-# Task 4's provider-split evidence is a WARN rather than a FAIL when only one
-# provider is actually configured/reachable — see check_task4's docstring.
-#
-# Usage:
-#     scripts/run_flows.sh                 # tasks 1-3, then validate
-#     scripts/run_flows.sh 2               # only task 2
-#     scripts/run_flows.sh 4               # task 4 (needs [task4_provider_b])
-#     scripts/run_flows.sh --check-only    # validate without running
-#     scripts/run_flows.sh --config agents_32k.ini
-#     scripts/run_flows.sh --keep          # do not rebuild sandboxes
-#
-# Exit code is 0 only when every requested flow ran AND validated.
+# Runs the skill flows, each in its OWN sandbox, then validates them with check_runbook.py (usage: [N] [--check-only] [--keep] [--config FILE]).
 
 set -uo pipefail
 
@@ -53,8 +15,10 @@ TASKS=()
 
 GOAL_1="Harden main.py: docstrings, type hints, a pytest test"
 GOAL_2="Write user documentation for this project"
-GOAL_3="Write a narrative changelog entry for the greeting"
-GOAL_4="Write a narrative changelog entry for the greeting"
+# RUN-11: not "for the greeting" — the seed entry "### The first greeting" already tells that story, so
+# every honest new entry retold it, Gate 2 called the two a duplicate and the coder dropped the seed.
+GOAL_3="Write a narrative changelog entry for the runbook"
+GOAL_4="Write a narrative changelog entry for the runbook"
 
 SKILL_1="hello-code"
 SKILL_2="hello-docs"
@@ -88,8 +52,7 @@ if [ ! -f "$CONFIG" ]; then
     exit 2
 fi
 
-# The skills declare min_num_ctx = 16384. Catching that here costs a second;
-# catching it inside a run costs the whole run.
+# Skills declare min_num_ctx = 16384; checking here costs a second, checking inside a run costs the whole run.
 if ! "$PYTHON" - "$CONFIG" <<'PY'
 import configparser, sys
 cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
@@ -183,8 +146,7 @@ done
 say "Summary"
 for t in "${TASKS[@]}"; do
     ran="ok"; checked="ok"
-    # In --check-only nothing ran, and reporting "ok" there would read as a
-    # successful run that never happened.
+    # --check-only runs nothing; reporting "ok" there would read as a successful run that never happened.
     [ "$CHECK_ONLY" -eq 1 ] && ran="skipped"
     [[ " ${RUN_FAILED[*]-} " == *" $t "* ]] && ran="FAILED"
     [[ " ${CHECK_FAILED[*]-} " == *" $t "* ]] && checked="FAILED"

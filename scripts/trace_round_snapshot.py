@@ -76,14 +76,12 @@ def base_sha(base, started_at=None):
     except (TypeError, ValueError):
         return head, head, False
 
-    # The entry in effect at t0 is the newest one at or before it. Its sha is
-    # where HEAD moved *to*, which is exactly the tree the run ingested.
+    # The entry in effect at t0 is the newest one at or before it; its sha is the tree the run ingested.
     at_start = next((e for e in entries if e[0] <= t0), None)
     if at_start is None:
         return head, head, False
 
-    # Anything logged between the run's start and now that moved HEAD is a
-    # mid-run switch: the trace and the current history describe different trees.
+    # A HEAD move during the run makes the trace and the history describe different trees.
     switched = any(e[0] > t0 and not e[2].endswith("emit plan")
                    and "commit: auto(" not in e[2] for e in entries)
     return head, at_start[1], switched
@@ -112,23 +110,11 @@ def read_run(base, run_id=None):
                    "unknown": 0},
         "gate1_split": None,
         "gate1_location_ext": collections.Counter(),
-        # RUN-7: Gate-2's own stage-decision events, keyed by the status each
-        # carries in `content` (APPROVED / REJECTED / ERROR / UNAVAILABLE —
-        # see tools.auto.inner_loop._trace_stage's "gate2" calls). Read the
-        # same way as the coder-budget decision events just below, so a
-        # validator-provider outage is its own counted column instead of
-        # being invisible (dropped) or folded into "rejected".
+        # RUN-7: Gate 2 decisions by status (APPROVED, REJECTED, ERROR, UNAVAILABLE), so a provider outage is its own column.
         "gate2": collections.Counter(),
-        # RUN-8: the coder's own stage-decision events, keyed by the status
-        # each carries in `content` (OK / REJECTED / ERROR / TRANSPORT /
-        # OK_WITH_SKIPS — see tools.auto.inner_loop._trace_stage's "coder"
-        # calls). TRANSPORT is a call that died before the model could
-        # answer: not a rejection, not a budget tier, its own column.
+        # RUN-8: coder decisions by status; TRANSPORT (died before an answer) is its own column, not a rejection.
         "coder": collections.Counter(),
-        # RUN-4: the coder's truncation ladder — how many rejected coder
-        # attempts had just raised the output budget for the next one, and
-        # at which tier the attempts went out. The ladder is only visible in
-        # the coder decision event, which carries max_tokens + budget_raised.
+        # RUN-4: coder truncation ladder: escalations and the tier each attempt went out at.
         "coder_budget_escalations": 0,
         "coder_budgets": collections.Counter(),
         "probe": {"ops": 0, "hits": 0, "misses": 0, "memo_hits": 0},
@@ -137,9 +123,7 @@ def read_run(base, run_id=None):
         "collect": {
             "blocks": 0, "chars": 0, "memo_hits": 0,
             "shrink": collections.Counter(), "miss": collections.Counter(),
-            # RUN-6: refresh-on-entry — runs, how many succeeded, modules
-            # re-summarised, seconds spent. Zero runs = the pack was fresh
-            # (or off) on every session start.
+            # RUN-6: refresh-on-entry: runs, successes, modules re-summarised, seconds.
             "refresh": {"runs": 0, "ok": 0, "modules": 0, "seconds": 0.0},
         },
         "collect_source": "grep",
@@ -208,10 +192,7 @@ def read_run(base, run_id=None):
                         out["probe_by_op"][f"{name}_miss"] += int(m2)
                     except ValueError:
                         pass
-            # ── M4: collect counters ───────────────────────────────────────
-            # collect_summary is one event per run and restates the totals,
-            # so it is skipped here — the per-block events are the source, and
-            # counting both would double every number in a resumed run.
+            # collect_summary restates the totals; the per-block events are the source, so it is skipped.
             elif kind == "collect_block":
                 p = r.get("params") or {}
                 out["collect"]["blocks"] += 1
@@ -241,11 +222,7 @@ def read_run(base, run_id=None):
                 rf["modules"] = int(rf["modules"])
             elif kind == "gate1_split":
                 out["gate1_split"] = dict(r.get("params") or {})
-            # ── RUN-4: the coder's truncation ladder ───────────────────────
-            # Only the coder's REJECTED decision carries the budget; a coder
-            # attempt that went out at 12000 instead of 3000 is visible here
-            # and nowhere else, so this is what tells you the ladder was
-            # needed (and how often the cap got in the way).
+            # RUN-4: coder truncation ladder from the REJECTED decision, which carries the budget.
             elif kind == "decision" \
                     and str((r.get("params") or {}).get("stage")) == "coder":
                 p = r.get("params") or {}
@@ -257,15 +234,12 @@ def read_run(base, run_id=None):
                 # agent_trace stringifies params: "False" is truthy.
                 if str(p.get("budget_raised", "")).strip().lower() in ("true", "1", "yes"):
                     out["coder_budget_escalations"] += 1
-            # ── RUN-7: Gate-2 validator outcomes, including "unavailable" ──
-            # (a provider outage, counted separately from a real rejection —
-            # see tools.auto.inner_loop.LLMGate2Validator.approve_verdict).
+            # RUN-7: Gate 2 outcomes; an outage counts separately from a real rejection.
             elif kind == "decision" \
                     and str((r.get("params") or {}).get("stage")) == "gate2":
                 out["gate2"][str(r.get("content") or "?")] += 1
 
-    # M4 events, or the pre-M4 grep. Comparability between the two is the
-    # whole point of keeping the grep at all.
+    # The grep is kept only so the two counts can be compared.
     if out["collect"]["blocks"]:
         out["collect_source"] = "events"
         out["collect_block_occurrences"] = out["collect"]["blocks"]
@@ -278,22 +252,14 @@ def read_run(base, run_id=None):
         t1 = datetime.datetime.fromisoformat(out["gate1_last_ts"])
         out["gate1"]["seconds_per_candidate"] = round(
             (t1 - t0).total_seconds() / (out["gate1"]["requests"] - 1), 1)
-    # RUN-5: `presence_unknown` gets its own column instead of being folded
-    # into `unparsed`. `unparsed` counts per-response what the snapshot could
-    # not read as a verdict; `unknown` counts per-candidate what the presence
-    # stage ended without a verdict from the model at all, and it only exists
-    # once the M4 gate1_split event carries it. agent_trace stringifies
-    # params, so decode before trusting it.
+    # RUN-5: presence_unknown has its own column; agent_trace stringifies params, so decode before using them.
     if out["gate1_split"] is not None:
         try:
             out["gate1"]["unknown"] = int(
                 out["gate1_split"].get("presence_unknown", 0) or 0)
         except (TypeError, ValueError):
             out["gate1"]["unknown"] = 0
-        # RUN-9: why the empty replies were empty — `presence_empty_transport`
-        # (a degraded provider, retried unchanged) and
-        # `presence_empty_exhausted` (the budget went into thinking, pinned).
-        # Same source as `unknown`; zero when the split predates RUN-9.
+        # RUN-9: why empty replies were empty (transport or exhausted budget); zero on older traces.
         for _key, _col in (("presence_empty_transport", "empty_transport"),
                            ("presence_empty_exhausted", "empty_exhausted")):
             try:
@@ -330,24 +296,10 @@ def main():
     if not snap["runs"]:
         return 1
 
-    # The suffix says which counter fed the column, because "12 blocks" from
-    # a grep and from a collect_block event are not the same measurement.
+    # The suffix says which counter fed the column, since the two counts measure different things.
     _block = lambda r: f"{r['collect_block_occurrences']} ({r['collect_source']})"
 
-    # RUN-7: the Gate-2 decisions get their own columns, separate from "rej"
-    # (gate1's confirmed/rejected) and never folded into it — a Gate-2
-    # provider outage is not a rejection. g2 rej = a real model verdict,
-    # g2 err = the validator raised, g2 unavail = the validator was never
-    # reached (one event per outage, retries folded into its `calls=`). The
-    # three side by side are the measurement: what share of "no" was ever
-    # said by a model. See tools.auto.inner_loop._trace_stage's "gate2"
-    # events and the module docstring above.
-    #
-    # RUN-8: `cod transport` sits next to `cod esc` (the coder's truncation
-    # ladder) for the same reason — the two look identical in a trace line
-    # ("the coder came back without files") and only the status tells them
-    # apart: a cut-off reply climbed the budget, a dead socket got the
-    # attempt back.
+    # RUN-7/RUN-8: Gate 2 and coder outcomes get their own columns, never folded into rejections.
     hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'unk':>4} {'empty t/x':>9} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8} {'cod transport':>13} {'g2 rej':>6} {'g2 err':>6} {'g2 unavail':>10}"
     print(hdr)
     print("-" * len(hdr))
@@ -357,9 +309,7 @@ def main():
         g2 = r.get("gate2", {})
         g2_rej, g2_err, g2_unavail = (g2.get("REJECTED", 0), g2.get("ERROR", 0),
                                       g2.get("UNAVAILABLE", 0))
-        # RUN-8: coder calls that died on the wire before the model could
-        # answer — next to `cod esc` (the budget ladder) so a hung socket is
-        # not mistaken for a cut-off reply.
+        # RUN-8: coder calls that died on the wire, next to the budget ladder so a hung socket is not read as cut-off.
         cod_transport = r.get("coder", {}).get("TRANSPORT", 0)
         tot["arch"] += r["llm_by_source"].get("architect", 0)
         tot["g1"] += g["requests"]

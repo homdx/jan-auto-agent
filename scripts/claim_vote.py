@@ -22,6 +22,21 @@ cannot hand back one answer N times (``--fixed-prompt`` is the control).
     python3 scripts/claim_vote.py claims.json --profiles vote_sn68 vote_agnes vote_nemo --runs 3
 
 ``claims.json`` is a JSON list of strings, or of {"claim": ..., "truth": true|false|null}.
+
+CC-6: with ``--target REPO`` (and ``--ref``, ``--base``, ``--fetch``) the claims are
+judged against that repository at a pinned commit (``tools.claimcheck.target.Target``):
+each claim's anchors are resolved and classified (CC-1), a ``code`` or ``mixed`` claim is
+sent with its evidence pack (CC-5) in batches of ``[claim_vote] code_batch``, and a
+TRUE/FALSE stands only when it names a chunk of that pack and quotes it verbatim
+(``tools.claimcheck.judge.verify_quotes``); one that does not is UNSURE and counted in
+``rejected``. Without ``--target`` nothing of this runs: the script is ``CLAIM-1``'s.
+
+    python3 scripts/claim_vote.py claims.json --target . --ref origin/main --profiles a b c
+
+CC-11: ``--accept all|committed`` (``[claim_vote] accept``, default ``all``) is the acceptance
+rule of `tally`: ``all`` needs every voter of the run to commit; ``committed`` needs three
+committed voters that agree, and a voter that abstained on a claim does not block it (the rows
+name it in ``abstained``). Five voters or more: ``--accept committed``. ``votes.json`` records it.
 """
 from __future__ import annotations
 
@@ -46,13 +61,27 @@ from tools.llm_stream import (  # noqa: E402
     build_chat_request, request_completion, retry_kwargs_from_config, strip_think)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lenz_claim_filter as lf  # noqa: E402  (is_internal: the repo-claim test)
+from tools.claimcheck import anchors as cc_anchors  # noqa: E402  (CC-1: the repo-claim test with a repository)
+from tools.claimcheck import judge as cc_judge  # noqa: E402  (CC-6: prompt v2, the quote check)
+from tools.claimcheck.pack import PackBudget, build_pack  # noqa: E402  (CC-5: the evidence pack)
+from tools.claimcheck.target import Target, TargetError, parse_report_ref  # noqa: E402  (CC-2)
 
 KILO_CONFIG = Path.home() / ".config" / "kilo" / "kilo.jsonc"
 KILO_AUTH = Path.home() / ".local" / "share" / "kilo" / "auth.json"
 VERDICTS = ("TRUE", "FALSE", "UNSURE")
 
-# Same job, three wordings: the first sentence swaps its words around, so the
-# prompts differ from the very first token and no prefix cache can match.
+_PROGRESS_LOCK = threading.Lock()
+
+
+def progress(line: str) -> None:
+    """One ``[progress]`` line on stderr, whole. ``print`` writes the text and the newline
+    apart, so the pool's threads ran two lines into one (PROGRESS-LINE) and a log reader
+    counted one request less."""
+    with _PROGRESS_LOCK:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+# Each opener is worded differently, so no prompt shares a prefix that a cache could match.
 _OPENERS = (
     "Judge each of the following claims as TRUE, FALSE or UNSURE.",
     "Each of the following claims must be judged by you: TRUE, FALSE or UNSURE.",
@@ -76,12 +105,27 @@ class Pacer:
         self._width = width
         self._lock = threading.Lock()
 
-    def wait(self, provider: str) -> threading.Semaphore:
+    def wait(self, provider: str, deadline: "float | None" = None) -> threading.Semaphore:
+        """A slot of *provider*'s, held until the caller releases it. *deadline* (monotonic):
+        a caller that no longer waits for the answer (Gate 1's vote gave up) does not queue for
+        a slot past it — `TimeoutError` instead."""
         with self._lock:
             sem = self._slots.setdefault(provider, threading.Semaphore(self._width))
-        sem.acquire()
+        if deadline is None:
+            sem.acquire()
+        elif not sem.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            raise TimeoutError(f"no free slot for {provider} before the deadline")
         with self._lock:
-            start = max(time.time(), self._next.get(provider, 0.0))
+            now = time.time()
+            start = max(now, self._next.get(provider, 0.0))
+            # AUDIT-14: the deadline also bounds the pacing sleep. A slot whose
+            # scheduled start lies past it is given back and the start time is
+            # not reserved, so the caller that stopped waiting neither starts
+            # late nor pushes every later caller's start back by an interval.
+            if deadline is not None and time.monotonic() + (start - now) > deadline:
+                sem.release()
+                raise TimeoutError(
+                    f"{provider}'s next start is past the deadline")
             self._next[provider] = start + self.interval
         time.sleep(max(0.0, start - time.time()))
         return sem
@@ -91,6 +135,8 @@ PACER = Pacer()
 
 
 SECTION = "claim_vote"
+# A urllib request needs an explicit User-Agent, since some providers refuse the default one.
+USER_AGENT = "jan-auto-agent"
 
 
 def read_ini(root: Path) -> configparser.ConfigParser:
@@ -98,7 +144,7 @@ def read_ini(root: Path) -> configparser.ConfigParser:
     parser = roster._new_parser()
     for name in ("contest.ini", roster.LOCAL_FILENAME):
         if (root / name).is_file():
-            parser.read(root / name, encoding="utf-8")
+            parser.read(root / name, encoding="utf-8-sig")   # a BOM (Notepad), as roster reads it
     if not parser.has_section(SECTION):
         parser.add_section(SECTION)
     return parser
@@ -123,8 +169,7 @@ def strip_jsonc_comments(text: str) -> str:
     while i < n:
         ch = text[i]
         if ch == '"':
-            # a string literal, copied whole: a backslash escapes the next
-            # character (``\"`` does not end it), and nothing in it is a comment
+            # A string literal is copied whole, since a backslash escapes the next character.
             j = i + 1
             while j < n and text[j] != '"':
                 j += 2 if text[j] == "\\" else 1
@@ -161,13 +206,20 @@ def _kilo_settings(ref: str) -> LlmSettings:
     try:
         base = config["provider"][provider]["options"]["baseURL"]
     except (KeyError, TypeError, IndexError):
-        # `[]`, `{"provider": {}}` or a provider without options: one line too, a
-        # TypeError was the traceback `--add-profiles` still printed
+        # A malformed provider entry is a one-line refusal, not a traceback (--add-profiles).
         raise ValueError(f"{KILO_CONFIG}: no provider {provider!r} with "
                          "options.baseURL") from None
     if not isinstance(base, str):
         raise ValueError(f"{KILO_CONFIG}: provider {provider!r} options.baseURL is not a string")
-    key = json.loads(KILO_AUTH.read_text(encoding="utf-8"))[provider]["key"]
+    # A plain-string entry is refused in one line too, without naming the key (--add-profiles).
+    try:
+        auth = json.loads(KILO_AUTH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        raise ValueError(f"{KILO_AUTH}: not valid JSON (line {err.lineno}, column {err.colno})") from None
+    entry = auth.get(provider) if isinstance(auth, dict) else None
+    key = entry.get("key") if isinstance(entry, dict) else None
+    if not isinstance(key, str) or not key:
+        raise ValueError(f"{KILO_AUTH}: no key for provider {provider!r}")
     return LlmSettings(base_url=base.rstrip("/"), api_key=key, model=model,
                        temperature=0.3, max_tokens=4000)
 
@@ -184,6 +236,22 @@ def voter_settings(ref: str, parser: configparser.ConfigParser) -> LlmSettings:
                              max_tokens=4000))[0]
 
 
+def voter_models(voters, parser: configparser.ConfigParser) -> dict:
+    """``{ref: model}`` of the voters that resolve: votes.json records it (``models``), so the truth
+    step reads each voter's family off its model wherever it runs. It read ``contest.ini`` of the
+    current directory: the same votes.json gave no row from the project and a REAL row of three
+    agnes sections ("three families") from anywhere else. A ref that does not resolve is left out."""
+    out = {}
+    for ref in dict.fromkeys(voters):
+        try:
+            model = voter_settings(ref, parser).model
+        except Exception:   # noqa: BLE001 — a dead voter is reported by the vote itself
+            continue
+        if model:
+            out[ref] = model
+    return out
+
+
 def add_profiles(refs: list[str], root: Path) -> list[str]:
     """Append ``[claim_vote_llm.<slug>]`` sections for Kilo ``provider/model`` refs
     to ``contest.local.ini``; returns the section names.  Existing ones are kept.
@@ -191,9 +259,14 @@ def add_profiles(refs: list[str], root: Path) -> list[str]:
     never world-readable."""
     path = root / roster.LOCAL_FILENAME
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-    names, add = [], ""
+    names, add, owner = [], "", {}
     for ref in refs:
         name = "claim_vote_llm." + re.sub(r"[^a-z0-9]+", "_", ref.lower()).strip("_")
+        # The duplicate check reads the ini as it is after this call, so the section is not written twice.
+        if owner.setdefault(name, ref) != ref:
+            raise ValueError(f"{owner[name]!r} and {ref!r} both map to [{name}]; pass one of them")
+        if name in names:
+            continue
         names.append(name)
         if f"[{name}]" in existing:
             continue
@@ -230,14 +303,8 @@ def build_prompt(claims: list[str], run: int, seed: int,
 def parse_votes(text: str, order: list[int]) -> dict[int, str]:
     """Model reply -> {original claim index: verdict}; garbage gives {}."""
     text = text or ""
-    decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch != "[":
-            continue
-        try:
-            rows, _end = decoder.raw_decode(text, i)
-        except json.JSONDecodeError:
-            continue
+    # The judge's bounded tries cover the head and tail of the reply, so no answer is lost (CLAIM-1).
+    for rows in cc_judge.json_values(text, "[", strict=True):
         if not isinstance(rows, list):
             continue
         votes: dict[int, str] = {}
@@ -278,6 +345,7 @@ def ask(ref: str, claims: list[str], run: int, seed: int, parser: configparser.C
             api_format=st.api_format, temperature=st.temperature,
             max_tokens=st.max_tokens, system="You are a careful technical fact checker.",
             user_msg=prompt, num_ctx=st.num_ctx, think=st.think)
+        headers.setdefault("User-Agent", USER_AGENT)
         sem = PACER.wait(host)
         try:
             text = strip_think(request_completion(url, headers, payload, timeout,
@@ -299,7 +367,70 @@ def ask(ref: str, claims: list[str], run: int, seed: int, parser: configparser.C
     return out
 
 
+def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.ConfigParser,
+           timeout: float, batch: int = 10, code_batch: int = 2, fixed: bool = False,
+           deadline: "float | None" = None, budget: "float | None" = None, pacer=None) -> dict:
+    """CC-6's `ask`: one model, one run over ``(claim, pack_or_None)`` items, prompt v2,
+    every committed vote on a claim with a pack checked against its quote.
+
+    The HTTP call, the pacer and the retry budget are `ask`'s; the batching, the prompt,
+    the parser and the check are ``tools.claimcheck.judge.ask_with_packs``. The row adds
+    ``accepted`` (the evidence of each vote that stood), ``rejected`` (each downgrade,
+    with its reason), ``requests`` (made with a pacer slot) and ``replies`` (answered) to `ask`'s. *deadline* (``time.monotonic()``, Gate 1's vote): no slot is
+    waited for and no retry is made past it (`request_completion`'s ``deadline``). *budget*:
+    seconds one request has once it holds its pacer slot (the queue is not its time). *pacer*: what
+    the request waits on for its slot instead of `PACER` (Gate 1 keeps its votes' requests in order)."""
+    try:
+        st = voter_settings(ref, parser)
+        retry = retry_kwargs_from_config(parser, SECTION)
+        host = st.base_url.split("//")[-1].split("/")[0]
+    except (ValueError, OSError, KeyError) as exc:
+        return {"model": ref, "run": run, "votes": {}, "accepted": {}, "rejected": [],
+                "error": str(exc)[:120]}
+
+    def complete(prompt: str) -> str:
+        url, headers, payload = build_chat_request(
+            base_url=st.base_url, api_key=st.api_key, model=st.model,
+            api_format=st.api_format, temperature=st.temperature,
+            max_tokens=st.max_tokens, system=cc_judge.SYSTEM,
+            user_msg=prompt, num_ctx=st.num_ctx, think=st.think)
+        headers.setdefault("User-Agent", USER_AGENT)
+        sem = (pacer or PACER).wait(host, deadline)
+        started = time.monotonic()
+        end = deadline
+        if budget is not None:
+            end = started + budget if end is None else min(end, started + budget)
+        # passed only when set: a stub of request_completion with the old signature still fits
+        until = {"deadline": end} if end is not None else {}
+        try:
+            text = strip_think(request_completion(url, headers, payload, timeout,
+                                                  api_format=st.api_format, **retry, **until))
+            replies[0] += 1
+            return text
+        finally:
+            sem.release()
+            calls[0] += 1
+            # One progress line per request, so a live run shows which voter is alive.
+            progress(f"[progress] {ref} run{run} request {calls[0]} "
+                     f"{time.monotonic() - started:.0f}s")
+
+    calls, replies = [0], [0]
+    got = cc_judge.ask_with_packs(items, run, seed, complete, batch=batch,
+                                  code_batch=code_batch, fixed=fixed)
+    # Requests and replies are counted apart, so a voter that never replies is visible.
+    out = {"model": ref, "run": run, "votes": got["votes"], "accepted": got["accepted"],
+           "rejected": got["rejected"], "requests": calls[0], "replies": replies[0]}
+    if got["errors"]:
+        out["error"] = got["errors"][0]
+    if got["raw_head"]:
+        out["raw_head"] = got["raw_head"]
+    return out
+
+
 MIN_COMMITTED = 3   # models that must commit (TRUE/FALSE) before a verdict stands
+#: CC-11 accept rules: "all" (every voter committed, one verdict) or "committed" (the quorum committed and agrees).
+ACCEPT_RULES = ("all", "committed")
+DEFAULT_ACCEPT = "all"
 
 
 def _strict_plurality(counts: Counter) -> str:
@@ -312,19 +443,69 @@ def _strict_plurality(counts: Counter) -> str:
     return counts.most_common(1)[0][0]
 
 
+def claim_kind(claim: str, symbols: "set[str] | None" = None, view=None) -> tuple:
+    """(kind, dangling) of one claim: ``code``, ``world`` or ``mixed``.
+
+    With a ``RepoView`` the claim's anchors are looked up in the repository
+    (CC-1, ``tools/claimcheck/anchors.py``); without one the regex rule
+    ``lenz_claim_filter.is_internal`` decides, as before, and nothing dangles."""
+    if view is not None:
+        resolved = cc_anchors.resolve_claim(claim, view)
+        return cc_anchors.classify(claim, resolved), cc_anchors.is_dangling(resolved)
+    return ("code" if lf.is_internal(claim, symbols or set()) else "world"), False
+
+
+def _evidence_of(results: list[dict], i: int, verdict: "str | None" = None) -> tuple:
+    """(chunk ids, quotes, {reason: n}) of claim *i* over every result: what the votes
+    that stood cited, first seen first, and what the quote check rejected. With a TRUE/FALSE
+    *verdict* only the votes for it count: a FALSE run's quote led the `how` of a REAL row."""
+    chunks: list = []
+    quotes: list = []
+    rejected: Counter = Counter()
+    for r in results:
+        got = r.get("accepted", {}).get(i)
+        if got and verdict in ("TRUE", "FALSE") and got.get("verdict", verdict) != verdict:
+            got = None     # a vote for the other side (an entry without a verdict is an old file's)
+        if got:
+            if got.get("chunk") and got["chunk"] not in chunks:
+                chunks.append(got["chunk"])
+            if got.get("quote") and got["quote"] not in quotes:
+                quotes.append(got["quote"])
+        rejected.update(row["reason"] for row in r.get("rejected", ()) if row.get("claim") == i)
+    return chunks, quotes, dict(rejected)
+
+
 def tally(claims: list[dict], results: list[dict],
-          symbols: "set[str] | None" = None, quorum: int = MIN_COMMITTED) -> list[dict]:
+          symbols: "set[str] | None" = None, quorum: int = MIN_COMMITTED,
+          view=None, meta: "list[dict] | None" = None, accept: str = DEFAULT_ACCEPT) -> list[dict]:
     """Per claim: every vote, each model's own majority, and the cross-model one.
 
     UNSURE is an abstention, not a vote: the verdict is decided among TRUE and
     FALSE, ``SPLIT`` on a tie, ``UNSURE`` when nobody committed.  A claim about
     this repo's own code (``needs_code``) is never accepted from votes: the
-    models cannot see the code, so a TRUE there is a plausible guess.
+    models cannot see the code, so a TRUE there is a plausible guess.  With a
+    ``view`` (a ``RepoView``) the test is the anchor classifier, and each row
+    also says ``kind`` (code|world|mixed) and ``dangling``.
+
+    CC-6: *meta* (one ``{kind, dangling, sha}`` per claim, from ``--target``) means the
+    votes were cast on the evidence and already passed ``verify_quotes``: a code claim's
+    verdict then stands like a world claim's (no ``CODE-CHECK``), under the same rule, and
+    each row gains ``id`` (when the claim has one), ``sha``, ``evidence``, ``quotes``,
+    ``rejected`` ({reason: n}) and ``downgrades`` (their total).
+
+    CC-11: *accept* is the acceptance rule (`ACCEPT_RULES`). Under ``committed`` each row also
+    says ``abstained``: the voters of the run that did not commit on this claim. Under ``all``
+    the rows are what they were (no ``abstained``: an accepted row has none by the rule).
     """
+    if accept not in ACCEPT_RULES:
+        raise ValueError(f"accept = {accept!r}: one of {', '.join(ACCEPT_RULES)}")
     out = []
     # a result read back from a saved JSON has string keys; a live one has ints
-    results = [{**r, "votes": {int(k): v for k, v in r["votes"].items()}} for r in results]
-    voters = {r["model"] for r in results}
+    results = [{**r, "votes": {int(k): v for k, v in r["votes"].items()},
+                **({"accepted": {int(k): v for k, v in r["accepted"].items()}}
+                   if "accepted" in r else {})} for r in results]
+    # A model with no vote in any run is not a voter, so it cannot block unanimity (round 280).
+    voters = {r["model"] for r in results if r["votes"]} or {r["model"] for r in results}
     for i, c in enumerate(claims):
         per_model: dict[str, list[str]] = {}
         for r in results:
@@ -340,19 +521,108 @@ def tally(claims: list[dict], results: list[dict],
             verdict = "SPLIT"
         else:
             verdict = decided[0][0]
-        # the acceptance rule of the runbook: every voter committed, all to one verdict.
-        # ``voters`` is every model that produced any result; a voter with no vote
-        # on this claim (silent, lost batch, unreadable reply) makes unanimous False.
+        # Accept rule: unanimous with a quorum; a dissent blocks, but an abstainer does not (CC-11 committed rule).
         unanimous = (len(decided) == 1 and committed >= quorum
-                     and committed == len(voters))
-        needs_code = lf.is_internal(c["claim"], symbols or set())
-        if needs_code and verdict in ("TRUE", "FALSE", "SPLIT"):
+                     and (accept == "committed" or committed == len(voters)))
+        if meta is not None:
+            kind, dangling = meta[i]["kind"], meta[i]["dangling"]
+        else:
+            kind, dangling = claim_kind(c["claim"], symbols, view)
+        needs_code = kind != "world"
+        blind = needs_code and meta is None     # a code claim the voters could not see
+        if blind and verdict in ("TRUE", "FALSE", "SPLIT"):
             verdict = "CODE-CHECK"
-        out.append({"claim": c["claim"], "truth": c.get("truth"), "verdict": verdict,
-                    "needs_code": needs_code, "unanimous": unanimous and not needs_code,
-                    "by_model": model_major,
-                    "all_votes": dict(total)})
+        row = {"claim": c["claim"], "truth": c.get("truth"), "verdict": verdict,
+               "needs_code": needs_code, "kind": kind, "dangling": dangling,
+               "unanimous": unanimous and not blind,
+               "by_model": model_major,
+               "all_votes": dict(total)}
+        if accept == "committed":
+            # who was asked and did not commit here: a row accepted over abstainers says so
+            row["abstained"] = sorted(m for m in voters if model_major.get(m, "UNSURE") == "UNSURE")
+        if meta is not None:
+            chunks, quotes, rejected = _evidence_of(results, i, verdict)
+            if c.get("id") is not None:
+                row = {"id": c["id"], **row}
+            row.update(sha=meta[i].get("sha", ""), evidence=chunks, quotes=quotes,
+                       rejected=rejected, downgrades=sum(rejected.values()))
+        out.append(row)
     return out
+
+
+def report_sha(path: "Path | None") -> "str | None":
+    """The first sha a report names about itself (``origin/kc @ afa53f1``), or None."""
+    if path is None:
+        return None
+    for hint in parse_report_ref(path.read_text(encoding="utf-8", errors="replace")):
+        if hint.sha:
+            return hint.sha
+    return None
+
+
+def prepare_target(claims: list[dict], target: Target, budget: PackBudget,
+                   base: "str | None" = None, collect: bool = True,
+                   config: "configparser.ConfigParser | None" = None) -> tuple:
+    """(items, meta) for the claims at *target*: each claim's anchors resolved and
+    classified there (CC-1); a ``code`` or ``mixed`` claim gets its pack (CC-5, with
+    ``base``..the target's sha when *base* is given, and the collect facts of the target when
+    *collect*), a ``world`` claim ``None``.
+
+    *config* is the run's ini, handed to `Target.collect`: one that names a walk depth walks to
+    it, one that does not walks to `COLLECT_MAX_DEPTH_DEFAULT` (HARDEN-21 D)."""
+    view = target.view()
+    items, meta = [], []
+    model = [None, False]    # built once, on the first claim that needs a pack
+    for c in claims:
+        text = c["claim"]
+        resolved = cc_anchors.resolve_claim(text, view)
+        kind = cc_anchors.classify(text, resolved)
+        pack = None
+        if kind != "world":
+            if collect and not model[1]:
+                # CC-3: collect facts reach the voter's pack; a repository collect cannot model is an absent model.
+                model[:] = [target.collect(config), True]
+            pack = build_pack(text, resolved, view, model=model[0], base=base,
+                              head=target.sha if base else None, budget=budget)
+        items.append((text, pack))
+        meta.append({"kind": kind, "dangling": cc_anchors.is_dangling(resolved),
+                     "sha": target.sha})
+    return items, meta
+
+
+#: claim_vote.py options that only mean something with --target
+TARGET_ONLY = ("ref", "base", "fetch", "pack_chars", "code_batch", "report", "expect_sha", "scratch",
+               "no_collect")
+
+
+def given_or(value, fallback):
+    """*value* when the option was given, else *fallback*: `args.x or default` turned an explicit
+    `--interval 0` (no pacing) into the ini's 4 s."""
+    return fallback if value is None else value
+
+
+def check_counts(args) -> str:
+    """Why a count option is out of range, or ``""``: a batch, a per-host limit or a pack size
+    is at least 1, an interval at least 0 (both shared with claim_diff.py)."""
+    for name in ("batch", "code_batch", "per_provider", "pack_chars", "parallel", "runs"):
+        value = getattr(args, name, None)
+        if value is not None and value < 1:
+            return f"--{name.replace('_', '-')} {value}: must be 1 or more"
+    interval = getattr(args, "interval", None)
+    if interval is not None and interval < 0:
+        return f"--interval {interval}: must be 0 or more"
+    return ""
+
+
+def accept_rule(given: "str | None", parser: configparser.ConfigParser) -> tuple:
+    """(rule, why it is refused or ``""``): ``--accept`` beats ``[claim_vote] accept``, which
+    defaults to `DEFAULT_ACCEPT` (shared with claim_diff.py)."""
+    rule = given if given is not None else parser.get(SECTION, "accept", fallback=DEFAULT_ACCEPT)
+    rule = rule.strip().lower()
+    if rule not in ACCEPT_RULES:
+        where = "--accept" if given is not None else f"[{SECTION}] accept ="
+        return rule, f"{where} {rule}: must be {' or '.join(ACCEPT_RULES)}"
+    return rule, ""
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -370,14 +640,28 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch", type=int, help="claims per request ([claim_vote] batch)")
     ap.add_argument("--per-provider", type=int, help="calls in flight per host ([claim_vote] per_provider)")
     ap.add_argument("--interval", type=float, help="seconds between call starts per host ([claim_vote] interval_sec)")
+    ap.add_argument("--accept", metavar="all|committed",
+                    help="the acceptance rule ([claim_vote] accept, default all): all = every voter committed; "
+                         "committed = at least 3 committed and they agree, an abstainer does not block (CC-11)")
     ap.add_argument("--out", type=Path)
     ap.add_argument("--repo-root", type=Path, default=Path.cwd(), help="where contest.ini / contest.local.ini live")
     ap.add_argument("--symbols-root", type=Path, help="the repo whose code the claims are about (default: --repo-root)")
+    # CC-6: judge the claims on the evidence of a repository at a pinned commit
+    ap.add_argument("--target", metavar="REPO", help="a repository (path or URL): code claims are judged on its evidence")
+    ap.add_argument("--ref", help="the commit of --target to judge at (default HEAD)")
+    ap.add_argument("--base", metavar="REF", help="also give each pack the git evidence of BASE..the --ref commit")
+    ap.add_argument("--fetch", action="store_true", help="git fetch --target before resolving --ref")
+    ap.add_argument("--pack-chars", type=int, help="rendered characters of one claim's pack ([claim_vote] pack_chars)")
+    ap.add_argument("--code-batch", type=int, help="code and mixed claims per request ([claim_vote] code_batch)")
+    ap.add_argument("--report", type=Path, help="the report the claims come from: the sha it names is checked against --ref")
+    ap.add_argument("--expect-sha", help="the sha the report says it is about (instead of --report)")
+    ap.add_argument("--scratch", type=Path, help="where --target's worktree goes (default: <repo-root>/claim-check-out/scratch)")
+    ap.add_argument("--no-collect", action="store_true",
+                    help="packs without the target's collect facts (a collect of a large tree takes seconds to minutes)")
     args = ap.parse_args(argv)
 
     if args.add_profiles:
-        # Bug 210/48: Kilo's files unreadable, unparsable or without the
-        # provider is one refusal line on stderr and exit 2, not a traceback.
+        # Unreadable or unparsable Kilo files are a one-line refusal with exit 2 (bug 210/48).
         try:
             names = add_profiles(args.add_profiles, args.repo_root)
         except (ValueError, OSError, KeyError) as exc:
@@ -387,32 +671,66 @@ def main(argv: list[str] | None = None) -> int:
         for name in names:
             print(f"[{name}] in {roster.LOCAL_FILENAME}")
         return 0
+    # Options that only mean something with --target are refused without it.
+    if not args.target:
+        given = [f"--{k.replace('_', '-')}" for k in TARGET_ONLY if getattr(args, k) not in (None, False)]
+        if given:
+            ap.error(f"{', '.join(given)} need --target")
+    bad = check_counts(args)
+    if bad:
+        ap.error(bad)
     parser = read_ini(args.repo_root)
     get = lambda key, cast, fallback: cast(parser.get(SECTION, key, fallback=str(fallback)))  # noqa: E731
-    batch = args.batch or get("batch", int, 10)
-    PACER.__init__(args.per_provider or get("per_provider", int, 2),
-                   args.interval or get("interval_sec", float, 4.0))
+    batch = given_or(args.batch, get("batch", int, 10))
+    per_provider = given_or(args.per_provider, get("per_provider", int, 2))
+    interval = given_or(args.interval, get("interval_sec", float, 4.0))
+    # Counts are checked as given: zero is refused where it would break range() or the pacer (CLAIM-1).
+    for key, value, least in (("batch", batch, 1), ("per_provider", per_provider, 1),
+                              ("interval_sec", interval, 0)):
+        if value < least:
+            ap.error(f"[{SECTION}] {key} = {value:g}: must be {least} or more")
+    # one line and exit 2, before any request: a typo here was a run under a rule nobody chose
+    args.accept, why = accept_rule(args.accept, parser)
+    if why:
+        print(f"claim_vote: {why}", file=sys.stderr)
+        return 2
+    PACER.__init__(per_provider, interval)
     voters = (args.profiles or []) + (args.models or []) or [
         n.strip() for n in parser.get(SECTION, "llm_profiles", fallback="").split(",") if n.strip()]
     if not args.claims or not voters:
         ap.error("need claims.json and voters: --profiles, --models, or [claim_vote] llm_profiles")
     if len(voters) < MIN_COMMITTED:
-        # Bug 210/46: below the quorum no claim can ever be accepted — `tally`
-        # needs MIN_COMMITTED committed models — and the table was all UNSURE
-        # with no word why. One line says so before the run; the run goes on
-        # (its votes are still worth reading) and the exit code is unchanged.
+        # Below the quorum no claim can be accepted; say so before the run, which goes on.
         print(f"claim_vote: {len(voters)} voters, quorum is {MIN_COMMITTED}: "
               "no claim can be accepted", file=sys.stderr)
 
     raw = json.loads(args.claims.read_text(encoding="utf-8"))
+    # The object form of the claims file is read as a list of claims, not as a dict.
+    if isinstance(raw, dict) and isinstance(raw.get("claims"), list):
+        raw = raw["claims"]
+    if not isinstance(raw, list) or not all(
+            isinstance(c, str) or (isinstance(c, dict) and isinstance(c.get("claim"), str)) for c in raw):
+        ap.error(f"{args.claims}: not a claims file (a list of claims, or {{\"claims\": [...]}}, "
+                 "each a string or an object with a \"claim\")")
     claims = [c if isinstance(c, dict) else {"claim": c, "truth": None} for c in raw]
+    # An empty claim list is refused, and a blank claim is never sent to a voter.
+    if not claims:
+        ap.error(f"{args.claims}: no claims in it")
+    blank = [i for i, c in enumerate(claims, 1) if not c["claim"].strip()]
+    if blank:
+        ap.error(f"{args.claims}: claim {blank[0]} is empty" + (f" (and {len(blank) - 1} more)" if len(blank) > 1 else ""))
     texts = [c["claim"] for c in claims]
+    if args.target:
+        return main_target(args, parser, claims, voters, batch)
     jobs = [(m, r) for m in voters for r in range(args.runs)]
     with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
         results = list(pool.map(lambda j: ask(j[0], texts, j[1], args.seed, parser,
                                               args.timeout, batch, args.fixed_prompt), jobs))
-    table = tally(claims, results, lf._repo_symbols(args.symbols_root or args.repo_root))
-    report = {"results": results, "claims": table}
+    # With --symbols-root, anchors are resolved in that repo; otherwise the regex rule decides (CC-1).
+    view = cc_anchors.PathRepoView(args.symbols_root) if args.symbols_root else None
+    table = tally(claims, results, lf._repo_symbols(args.symbols_root or args.repo_root), view=view,
+                  accept=args.accept)
+    report = {"accept": args.accept, "models": voter_models(voters, parser), "results": results, "claims": table}
     if args.out:
         args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     for r in results:
@@ -420,10 +738,87 @@ def main(argv: list[str] | None = None) -> int:
               + (f" ERROR {r['error']}" if r.get("error") else ""))
     dead = sorted({r["model"] for r in results if not r["votes"]})
     print("verdicts:", dict(Counter(t["verdict"] for t in table)),
-          "| unanimous (*, accept):", sum(t["unanimous"] for t in table),
+          "| unanimous (*, accept):", sum(t["unanimous"] for t in table), f"(rule {args.accept})",
           "| models with no votes at all:", dead or "none")
     for t in table:
         print(f"[{t['verdict']:10}]{'*' if t['unanimous'] else ' '}truth={t['truth']} {t['all_votes']} {t['claim'][:90]}")
+    if claims and results and all(r.get("error") and not r["votes"] for r in results):
+        # Every voter failed (wrong key, no network, dead endpoint): reported, and the exit code says so.
+        print(f"claim_vote: no voter returned a vote ({len(results)} runs, every one an ERROR)",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def main_target(args, parser: configparser.ConfigParser, claims: list[dict],
+                voters: list[str], batch: int) -> int:
+    """CC-6: the vote on the evidence of ``--target`` at ``--ref``."""
+    get = lambda key, cast, fallback: cast(parser.get(SECTION, key, fallback=str(fallback)))  # noqa: E731
+    code_batch = given_or(args.code_batch, get("code_batch", int, 2))
+    budget = PackBudget.from_config(parser)
+    if args.pack_chars:
+        budget = PackBudget(chars=args.pack_chars, chunks=budget.chunks, per_chunk=budget.per_chunk)
+    try:
+        expect = args.expect_sha or report_sha(args.report)
+    except OSError as exc:
+        print(f"claim_vote: --report {args.report}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
+    scratch = args.scratch or args.repo_root / "claim-check-out" / "scratch"
+    try:
+        target = Target.open(args.target, args.ref or "HEAD", scratch=scratch, fetch=args.fetch,
+                             expect_sha=expect)
+    except TargetError as exc:
+        print(f"claim_vote: --target refused: {exc}", file=sys.stderr)
+        return 2
+    with target:
+        for warning in target.warnings:
+            print(f"claim_vote: warning: {warning}", file=sys.stderr)
+        # --base is resolved once, so the recorded sha is the one that voted (CC-1).
+        base_sha = None
+        if args.base:
+            try:
+                base_sha = target.view().git("rev-parse", "--verify", f"{args.base}^{{commit}}").strip()
+            except TargetError as exc:
+                print(f"claim_vote: --base {args.base}: does not resolve ({exc})", file=sys.stderr)
+                return 2
+        items, meta = prepare_target(claims, target, budget, base_sha, collect=not args.no_collect,
+                                     config=parser)
+        jobs = [(m, r) for m in voters for r in range(args.runs)]
+        with concurrent.futures.ThreadPoolExecutor(args.parallel) as pool:
+            results = list(pool.map(lambda j: ask_v2(j[0], items, j[1], args.seed, parser,
+                                                     args.timeout, batch, code_batch,
+                                                     args.fixed_prompt), jobs))
+        table = tally(claims, results, meta=meta, accept=args.accept)
+        warnings = list(target.warnings)
+        report = {"target": {"repo": target.repo, "ref": target.ref, "sha": target.sha,
+                             "base": args.base, "base_sha": base_sha, "warnings": warnings,
+                             "collect": not args.no_collect,
+                             # the budget the packs were cut to (--pack-chars may differ from the ini)
+                             "budget": {"chars": budget.chars, "chunks": budget.chunks,
+                                        "per_chunk": budget.per_chunk}},
+                  "accept": args.accept, "models": voter_models(voters, parser),
+                  "results": results, "claims": table}
+    if args.out:
+        args.out.write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    for r in results:
+        print(f"{r['model']:48} run{r['run']} votes={len(r['votes'])}/{len(claims)}"
+              f" rejected={len(r.get('rejected', ()))}"
+              + (f" ERROR {r['error']}" if r.get("error") else ""))
+    dead = sorted({r["model"] for r in results if not r["votes"]})
+    print("verdicts:", dict(Counter(t["verdict"] for t in table)),
+          "| unanimous (*, accept):", sum(t["unanimous"] for t in table), f"(rule {args.accept})",
+          "| models with no votes at all:", dead or "none",
+          "| rejected quotes:", sum(len(r.get("rejected", ())) for r in results),
+          "| warnings:", "; ".join(warnings) or "none",
+          f"| at {report['target']['sha'][:7]}")
+    for t in table:
+        print(f"[{t['verdict']:10}]{'*' if t['unanimous'] else ' '}{t['kind']:5} truth={t['truth']} "
+              f"{t['all_votes']} {t['claim'][:90]}")
+    if claims and results and all(r.get("error") and not r["votes"] for r in results):
+        # Every voter failed (wrong key, no network, dead endpoint): reported, and the exit code says so.
+        print(f"claim_vote: no voter returned a vote ({len(results)} runs, every one an ERROR)",
+              file=sys.stderr)
+        return 1
     return 0
 
 

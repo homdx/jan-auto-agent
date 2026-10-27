@@ -36,24 +36,26 @@ from typing import List, Optional, Set
 
 from tools.collect.model import FunctionRecord
 
-#: tree-sitter-java node types that introduce a new named type — the
-#: Java analogue of Python's `ast.ClassDef`, just four-way instead of
-#: one-way (class vs. interface vs. enum vs. record all matter to the
-#: JIRA AC, unlike Python where `class` is the only keyword).
+#: tree-sitter-java node types that declare a type (class, interface, enum, record, @interface).
 _TYPE_DECL_TYPES = frozenset(
-    {"class_declaration", "interface_declaration", "enum_declaration", "record_declaration"}
+    {"class_declaration", "interface_declaration", "enum_declaration",
+     "record_declaration", "annotation_type_declaration"}
 )
 
-#: A method or constructor — Java's `ast.FunctionDef` analogue. Both are
-#: recorded as symbols; only the signature rendering differs (a
-#: constructor has no return type to show).
+#: Method or constructor declaration nodes; the signature rendering differs (no return type on constructors).
 _METHOD_DECL_TYPES = frozenset({"method_declaration", "constructor_declaration"})
 
-#: The three explicit Java access-level keywords `_access_modifier` looks
-#: for among a declaration's `modifiers` children. Anything else in that
-#: node (`static`, `final`, `abstract`, `sealed`, `non-sealed`,
-#: `synchronized`, an `@Annotation`, ...) isn't an access level and is
-#: ignored for this purpose.
+#: A record's compact constructor (`public Point { … }`) — a separate tree-sitter node type from
+#: `constructor_declaration`, no `parameters` field, only a `name` and a `body`.
+_COMPACT_CONSTRUCTOR = "compact_constructor_declaration"
+
+#: The wrapper node tree-sitter-java puts the body of an `enum_body` behind:
+#: `enum Color { RED, GREEN; <enum_body_declarations> { Color() {} int rgb() {} } }`.
+#: Everything inside it (constructors, methods, nested types) is real enum content, not a
+#: sibling of `enum_constant`, and must be recursed into the same way as the enclosing body.
+_ENUM_BODY_DECLARATIONS = "enum_body_declarations"
+
+#: The access keywords _access_modifier looks for; other modifiers are not access levels.
 _ACCESS_KEYWORDS = frozenset({"public", "private", "protected"})
 
 _KEYWORD_FOR_DECL_TYPE = {
@@ -61,21 +63,13 @@ _KEYWORD_FOR_DECL_TYPE = {
     "interface_declaration": "interface",
     "enum_declaration": "enum",
     "record_declaration": "record",
+    # `@interface MyAnno { ... }` — the keyword in the source has an at-sign.
+    "annotation_type_declaration": "@interface",
 }
 
 
 def _text(node) -> str:
-    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): callers pass
-    # `node.child_by_field_name("name")` results straight through, and
-    # tree-sitter returns None when a grammar node is missing the
-    # requested field — a malformed parse, or simply a future grammar
-    # version adding/renaming fields. `None.text` raised an unguarded
-    # AttributeError deep inside symbol extraction, which (per
-    # scan_java_module's own contract) should degrade to a recorded
-    # parse_error, never crash the caller. Returning "" here lets every
-    # existing call site's `_text(...)` degrade gracefully — a symbol with
-    # an unrecognised name is simply an unnamed one, same handling this
-    # module already gives to other "not present in this grammar" cases.
+    # A missing grammar field yields "" instead of an AttributeError, so the symbol is unnamed and extraction continues.
     if node is None:
         return ""
     return node.text.decode("utf-8", errors="replace")
@@ -124,8 +118,16 @@ def _javadoc_first_line(node) -> str:
     comment, which is never treated as documentation here (mirroring how
     a Python module only takes its docstring from an actual
     `ast.get_docstring`, never from a `#` comment above it).
+
+    HARDEN-21 B: a `// …` line comment sitting BETWEEN the Javadoc and
+    the declaration is transparent. Both the javadoc and the declaration
+    are direct children of the same body node, so any run of intervening
+    line comments does not sever the association.
     """
     prev = node.prev_sibling
+    # Line comments (never block comments, which may be documentation of their own) are transparent.
+    while prev is not None and prev.type == "line_comment":
+        prev = prev.prev_sibling
     if prev is None or prev.type != "block_comment":
         return ""
     text = _text(prev)
@@ -182,6 +184,38 @@ def _type_signature(node) -> str:
     return " ".join(parts)
 
 
+def _compact_constructor_signature(node) -> str:
+    """`"Point(int x, int y)"` for a record's compact constructor (`public Point { … }`):
+    tree-sitter-java gives it no `parameters` field, only a `name`, but its parameters ARE the
+    record's components, so they are read off the enclosing record's header. Rendering it as a
+    method would print `Point: void`; a bare name would hide that it takes the components.
+    """
+    name = _text(node.child_by_field_name("name")) or "<compact-constructor>"
+    body = node.parent
+    record = body.parent if body is not None else None
+    params = record.child_by_field_name("parameters") if record is not None and record.type == "record_declaration" else None
+    return name + _text(params) if params is not None else name
+
+
+def _annotation_element_signature(node) -> str:
+    """`"String value(): default \"hello\""` for an `@interface` element —
+    `annotation_type_element_declaration` has a `name` and a `type` but no
+    `parameters` field, so the method renderer would print `value: String`
+    with no parameters and no default. Recording the default keeps the
+    signature useful as a lookup key.
+    """
+    name = _text(node.child_by_field_name("name"))
+    type_node = node.child_by_field_name("type")
+    type_text = _text(type_node) if type_node is not None else "?"
+    # The default value is the `value` field of the node, not a `default` field —
+    # the `default` keyword itself is just a plain child token.
+    value_node = node.child_by_field_name("value")
+    if value_node is None:
+        return f"{name}(): {type_text}"
+    value_text = _text(value_node)
+    return f"{name}(): {type_text}, default {value_text}"
+
+
 def _method_signature(node) -> str:
     """`"sum(): int"` / `"helper(): void"` / `"Point(int x, int y)"`
     (constructor, no return type) — Java's return type is worth showing
@@ -203,10 +237,7 @@ def _method_name(node) -> str:
     name_node = node.child_by_field_name("name")
     if name_node is not None:
         return _text(name_node)
-    # A constructor_declaration's "name" field is present in every
-    # tree-sitter-java grammar version this project has tested against,
-    # but degrade to the enclosing class's own name rather than crash if
-    # a future grammar update ever changes that.
+    # A constructor without a name field is reported as <init> rather than crashing.
     return "<init>"
 
 
@@ -217,6 +248,7 @@ def _walk_type_body(
     symbols: List[FunctionRecord],
     *,
     member_default_access: str = "package-private",
+    in_enum: bool = False,
 ) -> None:
     for child in body_node.children:
         if child.type in _TYPE_DECL_TYPES:
@@ -225,13 +257,90 @@ def _walk_type_body(
                 default_access=member_default_access,
             )
         elif child.type in _METHOD_DECL_TYPES:
+            # REL-1 #4: an enum's constructor is implicitly private (JLS §8.9.2) — it was
+            # reported package-private.
+            default = ("private" if in_enum and child.type == "constructor_declaration"
+                       else member_default_access)
             _record_method_decl(
+                child, module_path, containing_qualname, symbols, default_access=default
+            )
+        elif child.type == _COMPACT_CONSTRUCTOR:
+            _record_compact_constructor(
                 child, module_path, containing_qualname, symbols, default_access=member_default_access
             )
-        # Anything else at this level (field_declaration, a plain block,
-        # comments, enum_constant, ...) isn't a symbol COLLECT-26 tracks —
-        # left alone, not recursed into (a field initializer's anonymous
-        # class body, like a Python closure's body, is out of scope).
+        elif child.type == "annotation_type_element_declaration":
+            _record_annotation_element(
+                child, module_path, containing_qualname, symbols, default_access=member_default_access
+            )
+        elif child.type == _ENUM_BODY_DECLARATIONS:
+            # The wrapper that holds an enum's constructors/methods/nested types: recurse as if it
+            # were the body itself (HARDEN-21 B). Without this, `enum Color { RED; int rgb(){} }`
+            # loses every member after the constants.
+            _walk_type_body(
+                child, module_path, containing_qualname, symbols,
+                member_default_access=member_default_access, in_enum=in_enum,
+            )
+        # Other members (fields, blocks, comments) are not tracked and are not recursed into.
+
+
+def _record_compact_constructor(
+    node,
+    module_path: str,
+    containing_qualname: str,
+    symbols: List[FunctionRecord],
+    *,
+    default_access: str = "package-private",
+) -> None:
+    """Record a record's compact constructor (`public Point { … }`) as its own symbol.
+
+    `compact_constructor_declaration` is not a `constructor_declaration`, so it fell through
+    `_walk_type_body` silently. Its signature is just the record name — there is no parameters
+    field to render.
+    """
+    name = _method_name(node)
+    qualname = f"{containing_qualname}.{name}"
+    access = _access_modifier(node, default=default_access)
+    symbols.append(
+        FunctionRecord(
+            qualname=f"{module_path}:{qualname}",
+            module=module_path,
+            lineno=node.start_point[0] + 1,
+            signature=_compact_constructor_signature(node),
+            docstring_first_line=_javadoc_first_line(node),
+            is_private=(access != "public"),
+            access_modifier=access,
+        )
+    )
+
+
+def _record_annotation_element(
+    node,
+    module_path: str,
+    containing_qualname: str,
+    symbols: List[FunctionRecord],
+    *,
+    default_access: str = "public",
+) -> None:
+    """Record an `@interface`'s element (`String value() default "";`).
+
+    Interfaces are implicitly public by JLS §9.4, so the default access here is `"public"`;
+    members of an `@interface` are the same shape. The signature renderer is `_annotation_element_
+    signature`, not `_method_signature`, because this node has no `parameters` field.
+    """
+    name = _method_name(node)
+    qualname = f"{containing_qualname}.{name}"
+    access = _access_modifier(node, default=default_access)
+    symbols.append(
+        FunctionRecord(
+            qualname=f"{module_path}:{qualname}",
+            module=module_path,
+            lineno=node.start_point[0] + 1,
+            signature=_annotation_element_signature(node),
+            docstring_first_line=_javadoc_first_line(node),
+            is_private=(access != "public"),
+            access_modifier=access,
+        )
+    )
 
 
 def _record_type_decl(
@@ -283,12 +392,14 @@ def _record_type_decl(
     )
     body = node.child_by_field_name("body")
     if body is not None:
-        # JLS §9.4: an interface member with no explicit access keyword
-        # is implicitly public, unlike a class member (implicitly
-        # package-private) — the one place this recursion needs to know
-        # what kind of type it's inside, not just walk uniformly.
-        member_default = "public" if node.type == "interface_declaration" else "package-private"
-        _walk_type_body(body, module_path, qualname, symbols, member_default_access=member_default)
+        # JLS 9.4 (interfaces) and 9.6.1 (@interface): members are implicitly public.
+        # Everything else (class, enum, record) is package-private without an explicit modifier.
+        member_default = (
+            "public" if node.type in ("interface_declaration", "annotation_type_declaration")
+            else "package-private"
+        )
+        _walk_type_body(body, module_path, qualname, symbols, member_default_access=member_default,
+                        in_enum=node.type == "enum_declaration")
 
 
 def _record_method_decl(

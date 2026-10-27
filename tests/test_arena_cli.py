@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import json
 import os
 import stat
@@ -37,8 +39,7 @@ def test_unknown_object_is_one_stderr_line_exit_two(capsys):
     "argv", [[], ["issue"], ["-o", "xml", "issue", "list"], ["--bogus", "run", "list"]]
 )
 def test_missing_or_malformed_arguments_are_one_line_usage_errors(argv, capsys):
-    # A missing object or verb, a bad --output, an unknown global flag: each
-    # is a usage error, never a help page with exit 0.
+    # Missing object or verb, bad --output, unknown global flag: all are usage errors (one-line message, exit 2), never a help page with exit 0.
     assert cli.main(argv) == 2
     err = capsys.readouterr().err
     assert len(err.splitlines()) == 1 and err.startswith("arena: ")
@@ -66,8 +67,9 @@ def test_ar8_verbs_parse_their_own_arguments(monkeypatch):
 
     entry = cli.Object("entry", dict(cli.OBJECTS["entry"].verbs))
     issue = cli.Object("issue", dict(cli.OBJECTS["issue"].verbs))
-    entry.verbs["merge"].handler = capture
-    issue.verbs["land"].handler = capture
+    # Fresh Verb objects: dict copies share them with cli.OBJECTS, so `.handler = capture` outlived monkeypatch and later `issue land` calls returned 0 and committed nothing.
+    entry.verbs["merge"] = dataclasses.replace(entry.verbs["merge"], handler=capture)
+    issue.verbs["land"] = dataclasses.replace(issue.verbs["land"], handler=capture)
     monkeypatch.setitem(cli.OBJECTS, "entry", entry)
     monkeypatch.setitem(cli.OBJECTS, "issue", issue)
 
@@ -104,8 +106,7 @@ def test_passthrough_after_double_dash_is_kept_verbatim(monkeypatch):
 
 
 def test_fake_verb_handler_gets_the_global_flags_and_their_defaults(monkeypatch):
-    # From sensenova-6-7-var1's entry: the globals reach the verb handler, and
-    # only the first standalone `--` splits — a later one is passed verbatim.
+    # From sensenova-6-7-var1's entry: globals reach the verb handler, and only the first standalone `--` splits; a later one is passed verbatim.
     seen = []
 
     def add_arguments(p):

@@ -1,0 +1,1 @@
+../tests/test_contest_policy_deny_wrapper_ask.py

@@ -1,21 +1,5 @@
 #!/usr/bin/env bash
-# 2legs/prepare_task.sh — make any git repo ready for a multi-leg round.
-#
-# On a new branch `contest-legs` of the target repo it commits:
-#   scripts/next_task.py, scripts/append_task.py   (the agents' prompt runs them)
-#   epic-tasks/<NN>-<kind>.md                       (an open ticket from your brief)
-# and nothing else. Your own branch is not touched; go back with
-# `git -C <repo> checkout -`.
-#
-# The ticket declares no files (`**File:** —`), so harvest never reports
-# off-ticket files; it still requires a test file, one commit and green tests.
-#
-# usage:
-#   2legs/prepare_task.sh [--free] REPO_PATH "brief" [NN]
-#   brief  plain text, or @file to read it from a file
-#   --free the brief IS the task (coverage, docs, refactor ...); without it
-#          the brief is wrapped in the bug-hunt template (find, test, fix)
-#   NN     the ticket and round number inside that repo, default 1
+# Prepares a repo for a multi-leg round on contest-legs, committing only the task files.
 set -euo pipefail
 KIND=hunt
 if [ "${1:-}" = "--free" ]; then KIND=free; shift; fi

@@ -48,9 +48,7 @@ from tools.auto.state import (
 from tools.auto.ticket_store import make_ticket_store
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers / factories
-# ─────────────────────────────────────────────────────────────────────────────
+# Helpers and factories
 
 def _make_task(
     task_id: str,
@@ -144,9 +142,7 @@ def _ticket_store(ctrl: AutoController):
     return make_ticket_store(ctrl.agent_dir)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — Knowledge note written to disk
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: knowledge note is written to disk
 
 class TestG4KnowledgeNote:
     def test_knowledge_file_created(self, tmp_path):
@@ -234,9 +230,7 @@ class TestG4KnowledgeNote:
         assert "TypeError: unsupported operand type" in content
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — Investigation ticket written with correct schema
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: investigation ticket has the correct schema
 
 class TestG4Ticket:
     def _run_exhausted(self, tmp_path: Path, task_id: str, title: str = ""):
@@ -313,9 +307,7 @@ class TestG4Ticket:
         assert ticket is not None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC3 — Exhausted task is set to STATUS_BLOCKED
-# ─────────────────────────────────────────────────────────────────────────────
+# AC3: exhausted task is set to STATUS_BLOCKED
 
 class TestG4TaskBlocked:
     def test_exhausted_task_status_is_blocked(self, tmp_path):
@@ -352,9 +344,7 @@ class TestG4TaskBlocked:
         assert ctrl.state.get_task("T-FAIL")["status"] == STATUS_BLOCKED
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC4 — Run continues; dependent tasks are blocked, independents run
-# ─────────────────────────────────────────────────────────────────────────────
+# AC4: the run continues; dependent tasks are blocked, independent ones run
 
 class TestG4RunContinues:
     def test_independent_task_runs_after_exhaustion(self, tmp_path):
@@ -466,9 +456,7 @@ class TestG4RunContinues:
         assert tasks_done == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC5 — run.log records the event
-# ─────────────────────────────────────────────────────────────────────────────
+# AC5: run.log records the event
 
 class TestG4Logging:
     def test_log_contains_ticket_id(self, tmp_path):
@@ -517,9 +505,7 @@ class TestG4Logging:
         ctrl.run_trace.log_task_done.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC6 — Idempotence on resume (no duplicate ticket)
-# ─────────────────────────────────────────────────────────────────────────────
+# AC6: idempotent on resume (no duplicate ticket)
 
 class TestG4Idempotence:
     def test_second_run_does_not_duplicate_ticket(self, tmp_path):
@@ -538,9 +524,7 @@ class TestG4Idempotence:
         ts = _ticket_store(ctrl)
         assert ts.exists("TICKET-T-IDEM")
 
-        # Simulate re-run: reset task status to todo, re-queue it
-        # (In practice the controller skips BLOCKED tasks on resume,
-        #  but test the handler's own idempotency directly)
+        # Re-queue the task and call the handler directly, to test its own idempotency.
         from tools.auto.exhaustion_handler import ExhaustionHandler
         handler = ExhaustionHandler(ctrl.state)
         result  = _exhausted_result("T-IDEM")

@@ -47,16 +47,13 @@ from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
-#: Extensions a bare token must carry to be treated as a file reference.
-#: Deliberately narrow — the cost of a false positive here is a rejected
-#: attempt and a confused author, so anything ambiguous is left alone.
+#: Extensions a bare token must have to count as a file reference; narrow on purpose, to avoid false rejections.
 DEFAULT_EXTENSIONS = (
     "py", "md", "txt", "rst", "json", "yaml", "yml", "ini", "cfg",
     "toml", "sh", "bash", "csv", "sql", "lock",
 )
 
-#: Names that routinely appear in prose as examples or conventions rather
-#: than as claims about this repository.
+#: Names that usually appear in prose as examples or conventions, not claims about the repo.
 DEFAULT_IGNORE = (
     "setup.py", "requirements.txt", "pyproject.toml", "setup.cfg",
     "Pipfile.lock", "poetry.lock", "package.json", "tox.ini",
@@ -73,22 +70,13 @@ _TEST_RUNNER_RE = re.compile(
 #: How a test file is recognised when deciding whether a suite exists.
 _TEST_FILE_RE = re.compile(r"(^test_.*\.py$)|(.*_test\.py$)|(^conftest\.py$)")
 
-#: Inline code spans and fenced blocks — the only places a file reference is
-#: read from. Prose mentioning "the main script" is not a claim about a path.
+#: Only inline code spans are read for file references; prose mentions are not claims.
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_-]*\n(.*?)```", re.DOTALL)
 
 _URLISH_RE = re.compile(r"https?://|www\.")
 
-# Prose punctuation that can legitimately wrap a path token: quotes and
-# trailing sentence punctuation are never part of a filename and are always
-# safe to strip. Brackets/parens are different — they are also valid
-# *filename* characters (see the glob.escape() call in check(), added for
-# exactly this reason, for "handler[old].py") — so they are only stripped
-# when they form a genuine wrapping pair or an unambiguous stray delimiter.
-# "." is deliberately NOT in this set: it is the leading character of a
-# dotfile reference (".hidden_test.py"), which the AUTO-FIX in _normalise()
-# below exists specifically to preserve.
+# Quotes and trailing punctuation are always stripped from a token; brackets are stripped only as a wrapping pair, since they can be part of a filename.
 _QUOTE_AND_PUNCT = "\"',;:"
 _OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
 _CLOSE_TO_OPEN = {close: open_ for open_, close in _OPEN_TO_CLOSE.items()}
@@ -201,6 +189,11 @@ def _is_hidden(path: Path, base: Path) -> bool:
     return any(part.startswith(".") for part in _parts_inside_base(path, base))
 
 
+def _re_windows_drive(token: str) -> bool:
+    """Whether *token* opens with a drive letter ("C:/x.ini", "D:x.ini")."""
+    return len(token) > 2 and token[0].isalpha() and token[1] == ":" and token[2] in "/\\"
+
+
 class ExistenceValidator:
     """Check that every file a document references is really there."""
 
@@ -225,6 +218,14 @@ class ExistenceValidator:
             return False
         if token.startswith("-"):          # a CLI flag, not a path
             return False
+        # REP-EXISTENCE: a wildcard ("tests/test_*.py", "*.md"), a home or environment path
+        # ("~/.app/x.json", "$HOME/x.ini", "%APPDATA%\\x.ini") and a Windows path
+        # ("C:\\Users\\me\\x.ini") name no file of the repository; they were reported missing
+        # and the Coder was told to delete valid test commands and install steps.
+        if any(c in token for c in "*?") or token[0] in "~$%" or "\\" in token:
+            return False
+        if _re_windows_drive(token):
+            return False
         suffix = token.rsplit(".", 1)
         if len(suffix) != 2:
             return False
@@ -232,19 +233,27 @@ class ExistenceValidator:
 
     def _normalise(self, token: str) -> str:
         token = _strip_wrapping_delimiters(token.strip())
-        # AUTO-FIX: lstrip("./") strips a *charset*, not the "./" prefix —
-        # ".hidden_test.py" became "hidden_test.py". Strip only real leading
-        # "./" and "../" path segments.
+        # Strip only real leading "./" and "../" segments (lstrip would also eat the leading "." of ".hidden").
         while token.startswith("./") or token.startswith("../"):
             token = token.split("/", 1)[1] if "/" in token else token
         return token.lstrip("/")
 
-    def references(self, text: str) -> list[str]:
-        """Distinct file references in *text*, in order of appearance."""
+    def references(self, text: str, base_dir=None) -> list[str]:
+        """Distinct file references in *text*, in order of appearance.
+
+        With *base_dir*, an absolute path whose first directory is not in the repository
+        ("/etc/myapp/config.yaml") is a system path, not a reference; "/docs/usage.md" with a
+        ``docs/`` in the repository stays a repo-root-relative one (REP-EXISTENCE).
+        """
         seen: list[str] = []
         for raw in _candidate_tokens(text):
             if not self._looks_like_path(raw):
                 continue
+            bare = _strip_wrapping_delimiters(raw.strip())
+            if base_dir is not None and bare.startswith("/") and "/" in bare[1:]:
+                first = bare.lstrip("/").split("/", 1)[0]
+                if not (Path(base_dir) / first).exists():
+                    continue
             token = self._normalise(raw)
             if token.lower() in self._ignore:
                 continue
@@ -267,11 +276,7 @@ class ExistenceValidator:
         """Verify *text*'s file references against *base_dir*. Never raises."""
         try:
             base = Path(base_dir)
-            # An unusable base_dir must fail OPEN, and it does not do so on its
-            # own: rglob() on a missing directory returns an empty iterator
-            # rather than raising, so every reference would look missing and the
-            # gate would reject every document it ever saw. The except clause
-            # below never fires for this case, so it is caught explicitly.
+            # A missing base_dir must fail closed: rglob on it returns nothing, so check the directory explicitly.
             if not base.is_dir():
                 logger.warning(
                     "ExistenceValidator: base_dir %s is not a directory — approving.",
@@ -279,16 +284,12 @@ class ExistenceValidator:
                 )
                 return ExistenceVerdict(approved=True, reason="base_dir unavailable")
             missing: list[str] = []
-            for ref in self.references(text):
+            for ref in self.references(text, base):
                 if ref == rel_path or (base / ref).exists():
                     continue
-                # A bare name may sit anywhere in the tree ("test_main.py"
-                # referenced from a nested doc), so fall back to a name match
-                # before calling it missing.
+                # A bare name may sit anywhere in the tree; match by name before calling it missing.
                 name = Path(ref).name
-                # AUTO-FIX: rglob() takes a glob pattern, so a reference
-                # like "handler[old].py" searched for a pattern, not that
-                # name. Escape it for a literal match.
+                # Escape glob characters so "handler[old].py" matches literally.
                 if any(
                     p.name == name and not _is_hidden(p, base)
                     for p in base.rglob(glob.escape(name))

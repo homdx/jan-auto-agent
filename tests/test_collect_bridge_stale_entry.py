@@ -134,8 +134,7 @@ def test_stale_auto_refresh_true_calls_refresh_and_reloads(mini_repo, monkeypatc
     assert bridge is not None
     assert len(calls) == 1
     assert Path(calls[0][0][0]) == mini_repo
-    # The operator's config and its path reach action_refresh unchanged —
-    # Pass B (off here) and the collect dir are resolved from them.
+    # Config and path reach action_refresh unchanged; Pass B and the collect dir resolve from them.
     assert calls[0][1]["config"].get("collect", "use_in_auto") == "true"
     assert calls[0][1]["config_path"] == str(config_path)
     assert bridge.usable is True
@@ -332,12 +331,7 @@ def test_no_event_without_the_flag(mini_repo, monkeypatch):
     assert [e for e in events if e.get("kind") == "collect_refresh"] == []
 
 
-# ── RUN-11: the line and the event say what Pass B is about to do ───────────
-#
-# The count was the hash diff, which understates the bill three orders of
-# magnitude on a collector_version bump: the live run read "refreshing 1
-# module(s)" while Pass B was about to work over 543 modules, and
-# collect_refresh.modules recorded the same 1.
+# RUN-11: the line and event report Pass B's real work (modules), not the hash diff.
 
 
 def test_entry_refresh_reports_a_version_bump_as_a_full_rebuild(mini_repo, monkeypatch, capsys):
@@ -393,14 +387,15 @@ def test_entry_refresh_no_count_when_the_pre_flight_fails(mini_repo, monkeypatch
     """Fail-open: the version check must not turn a failed pre-flight into
     anything other than what it always was — "?" on the line, no reason in
     the event, and the refresh still runs. Only the bridge's own lazy
-    `scan_repo` import is patched: `cli_mod.scan_repo` is bound at import,
-    so `action_refresh` rescans for itself and the refresh completes."""
+    `scan_repo_ex` import is patched (its pre-flight walk since CC review
+    fixes 45): `cli_mod.scan_repo_ex` is bound at import, so
+    `action_refresh` rescans for itself and the refresh completes."""
     cli_mod.action_collect(mini_repo)
     config_path = _write_ini(mini_repo, auto_refresh_between_tasks="true")
     _make_stale(mini_repo)
     events = _capture_events(monkeypatch)
     monkeypatch.setattr(
-        "tools.collect.scanner.scan_repo",
+        "tools.collect.scanner.scan_repo_ex",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("walk failed")),
     )
 

@@ -56,17 +56,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-#: Agents whose system prompt a skill may target. These are exactly the
-#: sections that already honour a ``system_{mode}`` override, so injection is
-#: a config write rather than a code change.
+#: Agents whose system prompt a skill may target; they already honour a system_{mode} override.
 INJECTABLE_AGENTS = ("architect", "coder", "validator_agent", "gate1_filter")
 
 #: Mechanical modes an adapter may sit on top of.
 BASE_MODES = ("code", "docs", "creative")
 
-#: Minimum profile ``num_ctx`` a skill run is allowed to start with, unless
-#: the adapter lowers it explicitly. Below this, even a small skill body
-#: leaves too little room for the task text plus the file contents.
+#: Minimum num_ctx a skill run starts with, unless the adapter lowers it.
 DEFAULT_MIN_NUM_CTX = 16384
 
 #: Share of ``num_ctx`` the skill body may occupy.
@@ -89,9 +85,7 @@ class SkillBudgetError(SkillError):
     """The skill body does not fit the active profile's context window."""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Token estimation
-# ─────────────────────────────────────────────────────────────────────────────
 
 def estimate_tokens(text: str) -> int:
     """Estimate the token cost of *text*, erring on the high side.
@@ -116,9 +110,7 @@ def estimate_tokens(text: str) -> int:
     return int(len(text) / chars_per_token) + 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # SKILL.md parsing
-# ─────────────────────────────────────────────────────────────────────────────
 
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
@@ -193,9 +185,7 @@ def parse_skill_md(path: Path) -> SkillDoc:
     return SkillDoc(name=name, description=description, body=body.strip(), path=path)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Adapter + overlay
-# ─────────────────────────────────────────────────────────────────────────────
+# Adapter and overlay
 
 @dataclass
 class SkillOverlay:
@@ -251,8 +241,7 @@ def builtin_prompt(agent: str, base: str) -> str:
     return ""
 
 
-#: Header separating the agent's own contract from the skill's guidance, so a
-#: model reading the composed prompt can tell which part is non-negotiable.
+#: Header that separates the agent's own contract from the skill's guidance, so the non-negotiable part is clear.
 SKILL_SECTION_HEADER = (
     "\n\n"
     "====================================================================\n"
@@ -420,9 +409,7 @@ def load_skill(
 
     # ── budget ───────────────────────────────────────────────────────────────
     num_ctx = _active_num_ctx(config)
-    # Bugfix (config-crash audit): both reads were unguarded. Wrapped
-    # per-call, not via a helper, so extract_config_reads still sees the
-    # literal calls.
+    # Both config reads are guarded per call, so a bad value raises a clean error (BUGFIX).
     try:
         min_num_ctx = adapter.getint("skill", "min_num_ctx", fallback=DEFAULT_MIN_NUM_CTX)
     except ValueError as exc:
@@ -439,11 +426,7 @@ def load_skill(
             exc, DEFAULT_BUDGET_FRACTION,
         )
         fraction = DEFAULT_BUDGET_FRACTION
-    # BUGFIX (audit): a syntactically-valid-but-nonsensical
-    # budget_fraction <= 0 passed getfloat() fine (no ValueError), but
-    # later int(need / fraction) in _overflow_error() divides by it
-    # directly — a 0 value crashed with ZeroDivisionError instead of the
-    # SkillBudgetError this whole function exists to raise cleanly.
+    # A budget fraction of zero or less is rejected, not a ZeroDivisionError (BUGFIX).
     if fraction <= 0:
         logger.warning(
             "config [skill] budget_fraction must be > 0 (got %r) — using default %r",
@@ -546,7 +529,11 @@ def apply_overlay(config: configparser.ConfigParser, overlay: SkillOverlay) -> N
     for section, key, value in overlay.entries:
         if not config.has_section(section):
             config.add_section(section)
-        config.set(section, key, value)
+        try:
+            config.set(section, key, value)
+        except ValueError:
+            # an interpolating parser (main.py's) refuses a bare % ("100% done"); %% reads back as %
+            config.set(section, key, value.replace("%", "%%"))
 
 
 def apply_skill(

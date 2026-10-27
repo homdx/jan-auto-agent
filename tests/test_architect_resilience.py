@@ -46,9 +46,7 @@ from tools.auto.architect import (
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture()
 def cfg() -> configparser.ConfigParser:
@@ -121,9 +119,7 @@ def _make_candidate(title: str = "Fix something") -> CandidateTask:
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RETRY — AC-R1 through AC-R6
-# ─────────────────────────────────────────────────────────────────────────────
+# Retry: AC-R1 to AC-R6
 
 class TestRetryOnTransientErrors:
 
@@ -233,9 +229,7 @@ class TestRetryOnTransientErrors:
         mock_sleep.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BATCH CLUSTER-NAME NORMALISATION (AUTO-T1 regression)
-# ─────────────────────────────────────────────────────────────────────────────
+# Batch cluster-name normalisation (AUTO-T1 regression)
 
 class TestBatchClusterNameNormalisation:
     """A cluster large enough to need more than one review batch must still
@@ -286,9 +280,7 @@ class TestBatchClusterNameNormalisation:
             verify_ssl=False,
         )
 
-        # Batch 1/2 is only shown tools/a.py, but the LLM cites tools/b.py —
-        # a real file belonging to the SAME cluster, just not to the batch
-        # actually under review. Batch 2/2 (tools/b.py) reports nothing.
+        # Batch 1 sees tools/a.py, but the LLM cites tools/b.py from the same cluster; batch 2 reports nothing.
         cross_batch_payload = json.dumps([{
             "title": "Cross-batch citation",
             "instruction": "Do the fix.",
@@ -312,9 +304,7 @@ class TestBatchClusterNameNormalisation:
         assert results[0].cluster == "agents"
         assert "(batch" not in results[0].cluster
 
-    # Guards against a regression in the other direction: a cluster small
-    # enough to fit in a single batch never had a suffix to strip, so the
-    # fix must be a true no-op for the common (non-batched) case.
+    # A single-batch cluster has no suffix to strip: the fix must be a no-op for the common case.
     def test_single_batch_cluster_name_unaffected(
         self, reviewer: ClusterReviewer, cluster_and_base
     ) -> None:
@@ -326,9 +316,7 @@ class TestBatchClusterNameNormalisation:
         assert results[0].cluster == "agents"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHECKPOINT — AC-C1 through AC-C9
-# ─────────────────────────────────────────────────────────────────────────────
+# Checkpoint: AC-C1 to AC-C9
 
 class TestCandidateSerialisation:
 
@@ -461,6 +449,17 @@ class TestCheckpointWriteAndRead:
 
         mock_llm.assert_called_once()
         assert results[0].title == "After corrupt ckpt"
+
+    def test_a_checkpoint_that_is_not_an_object_falls_back(
+        self, reviewer: ClusterReviewer, cluster_and_base, tmp_path: Path
+    ) -> None:
+        cluster, base_dir = cluster_and_base
+        ckpt = tmp_path / "arch_ckpt.json"
+        ckpt.write_text("[1, 2]", encoding="utf-8")       # valid JSON, not an object: a TypeError on write
+        with patch("tools.llm_stream.request_completion", return_value=_good_payload("After a list ckpt")):
+            results = reviewer.review_clusters([cluster], base_dir, goal="improve code", checkpoint_path=ckpt)
+        assert results[0].title == "After a list ckpt"
+        assert isinstance(json.loads(ckpt.read_text(encoding="utf-8")), dict)
 
     # AC-C6: different goals do NOT share cache entries
     def test_different_goals_dont_share_cache(

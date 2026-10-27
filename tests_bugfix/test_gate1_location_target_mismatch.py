@@ -57,11 +57,7 @@ def filt(minimal_config: configparser.ConfigParser) -> Gate1Filter:
     )
 
 
-# AUTO-T1, real production candidate: Location=agents_4k.ini (a config file,
-# no Python code at all), Target=tools/collect/cli.py. Confirmed rejected in
-# the real run with reason: "The code shown is agents_4k.ini, a
-# configuration file, not tools/collect/cli.py, so the claimed error-handling
-# problem in that Python module is not present in the shown code."
+# AUTO-T1: candidate whose Location is a config file, not the Python target; rejected in the real run.
 _AUTO_T1 = CandidateTask(
     title="Harden error handling in the collect CLI",
     instruction=(
@@ -82,10 +78,7 @@ _AUTO_T1 = CandidateTask(
     cluster="entry_orchestration",
 )
 
-# AUTO-T2, real production candidate: Location=tests/test_collect_cli.py (a
-# test file), Target=tools/collect/cli.py. Same shape, different mismatch —
-# cited evidence is a test asserting the desired behavior, not the
-# implementation itself.
+# AUTO-T2: candidate whose Location is a test file; the cited evidence is a test, not the implementation.
 _AUTO_T2 = CandidateTask(
     title="Harden error handling in tools/collect/cli.py",
     instruction=(
@@ -118,8 +111,7 @@ class TestTargetFileContextUnit:
         assert note is not None
         assert "tools/collect/cli.py" in note
         assert "agents_4k.ini" in note
-        # The real target file's actual content must be in there, not a
-        # placeholder — spot check a name that only exists in cli.py.
+        # The real target's content must be in the note, not a placeholder.
         assert "CollectCliError" in note or "def " in note
 
     def test_matching_citation_returns_none(self) -> None:

@@ -57,9 +57,7 @@ def _reset_reasoning_cache():
     llm_stream_mod._REASONING_UNSUPPORTED_KEYS.clear()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _base_dict(**gate1_overrides) -> dict:
     gate1 = {"temperature": "0.0", "max_tokens": "64", "skip_llm": "false"}
@@ -109,9 +107,7 @@ def _candidate(*, symbol: str = "parse_config", new_file: bool = False,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# No profile configured — exact pre-existing behaviour (backward compat)
-# ─────────────────────────────────────────────────────────────────────────────
+# No profile configured: exact pre-existing behaviour (backward compatibility)
 
 class TestNoProfileConfigured:
 
@@ -124,8 +120,7 @@ class TestNoProfileConfigured:
         assert filt._presence_ssl_context is filt._ssl_context
 
     def test_presence_settings_mirror_gate1_own_values_not_hardcoded_defaults(self):
-        # Deliberately non-default values so a match can't be a coincidence
-        # with hardcoded fallback constants (think default False, etc.).
+        # Non-default values, so a match cannot be a coincidence with the hardcoded fallbacks.
         filt = _make_filter(_base_dict(
             think="true", temperature="0.37", max_tokens="777",
         ))
@@ -142,9 +137,7 @@ class TestNoProfileConfigured:
         assert filt._presence_base_url == filt._base_url
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Profile configured — full override
-# ─────────────────────────────────────────────────────────────────────────────
+# Profile configured: full override
 
 class TestProfileFullOverride:
 
@@ -198,8 +191,7 @@ class TestProfileFullOverride:
         assert filt._presence_ssl_context is not None
 
     def test_verify_ssl_defaults_to_constructor_value_when_unset_on_profile(self):
-        # Constructor was called with verify_ssl=False in _make_filter();
-        # the profile doesn't set its own verify_ssl here.
+        # _make_filter passes verify_ssl=False, and the profile does not override it here.
         filt = _make_filter(self._cfg())
         assert filt._presence_ssl_context is not None
 
@@ -244,15 +236,7 @@ class TestProfilePartialOverrideFallsBackToGate1():
         assert filt._presence_api_format == "openai"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# response_format / think_effort: same independent-override contract as
-# think/temperature/max_tokens/num_ctx above, extended to the two GLOBAL
-# ([api]) switches added after this profile mechanism was first built.
-# This is the direct scenario the feature was requested for: "[api]
-# response_format = true / think_effort_enabled = true everywhere, but the
-# presence profile's model doesn't support one or the other while the main
-# model does" — each setting must be resolvable independently per profile.
-# ─────────────────────────────────────────────────────────────────────────────
+# response_format and think_effort are overridable per profile, independently of the other keys (the global [api] switches).
 
 class TestProfileResponseFormatAndThinkEffortOverride:
 
@@ -296,8 +280,7 @@ class TestProfileResponseFormatAndThinkEffortOverride:
         filt = _make_filter(d)  # think_effort_enabled absent -> None
         assert filt._presence_think_effort is None
 
-    # ── Profile sets its own response_format — wins over global, either
-    #    direction ──
+    # A profile response_format wins over the global value, either way.
 
     def test_profile_response_format_false_wins_over_global_true(self):
         """The scenario the feature exists for: global JSON-mode is on for
@@ -316,8 +299,7 @@ class TestProfileResponseFormatAndThinkEffortOverride:
         assert filt._response_format is False
         assert filt._presence_response_format is True
 
-    # ── Profile sets its own think_effort — wins over global, either
-    #    direction ──
+    # A profile think_effort wins over the global value, either way.
 
     def test_profile_think_effort_wins_over_global_disabled(self):
         filt = _make_filter(self._cfg(
@@ -345,8 +327,7 @@ class TestProfileResponseFormatAndThinkEffortOverride:
         ))
         assert filt._presence_think_effort is None
 
-    # ── Profile omits the key entirely — falls back to THIS instance's
-    #    resolved global value, not a hardcoded default ──
+    # A profile that omits the key falls back to this instance's resolved global value.
 
     def test_profile_without_response_format_key_falls_back_to_global(self):
         filt = _make_filter(self._cfg(
@@ -363,8 +344,7 @@ class TestProfileResponseFormatAndThinkEffortOverride:
         ))
         assert filt._presence_think_effort == "low"
 
-    # ── End-to-end: build_chat_request actually receives the profile's
-    #    values, not the global ones ──
+    # End to end: build_chat_request receives the profile's values, not the global ones.
 
     def test_end_to_end_build_chat_request_receives_profile_values(self, repo):
         filt = _make_filter(self._cfg(
@@ -395,9 +375,7 @@ class TestProfileResponseFormatAndThinkEffortOverride:
         assert captured["think_effort"] == "low"        # profile's, not global's "high"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Misconfiguration fails loudly, never silently reuses the shared provider
-# ─────────────────────────────────────────────────────────────────────────────
+# Misconfiguration fails loudly; it never silently reuses the shared provider
 
 class TestProfileMisconfigurationRaises:
 
@@ -437,9 +415,7 @@ class TestProfileMisconfigurationRaises:
         assert "api_key" in msg
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# End-to-end: the presence check actually talks to the profile's provider
-# ─────────────────────────────────────────────────────────────────────────────
+# End to end: the presence check talks to the profile's provider
 
 class TestProfileUsedEndToEnd:
 
@@ -494,10 +470,7 @@ class TestProfileUsedEndToEnd:
         assert len(accepted) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GATE1-PROVIDER-1 integration: reasoning-field cache stays per (url, model)
-# even when the presence check is routed through a distinct profile.
-# ─────────────────────────────────────────────────────────────────────────────
+# GATE1-PROVIDER-1: the reasoning-field cache stays per (url, model) even with a distinct profile
 
 class TestPresenceProfileReasoningCacheIndependence:
 
@@ -549,11 +522,7 @@ class TestPresenceProfileReasoningCacheIndependence:
             "http://main.example/v1/chat/completions", "main-model") is True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AUTO-PRESENCE-LOG-1: which provider presence-check calls will actually
-# hit must be visible at startup, in one line, without reverse-engineering
-# it from request URLs buried in a much larger run log.
-# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-PRESENCE-LOG-1: the provider the presence calls will hit is logged once at startup
 
 class TestPresenceProviderStartupLog:
 

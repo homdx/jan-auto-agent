@@ -53,9 +53,7 @@ from tools.auto.executor import Executor, _safe_dir_name
 from tools.auto.state import STATUS_DONE
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers (mirrored from test_auto_g9 for isolation)
-# ─────────────────────────────────────────────────────────────────────────────
 
 _HELLO_PY_INITIAL = """\
 def greet():
@@ -180,9 +178,7 @@ def _git_log(repo: Path) -> list[str]:
     return [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-DRYRUN — plan only, zero task commits
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-DRYRUN: plan only, zero task commits
 
 class TestDryRun:
     """``--auto --dry-run`` emits the plan but makes no task commits."""
@@ -280,9 +276,7 @@ class TestDryRun:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-BLOCKLIST — dangerous commands in acceptance_check are rejected
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-BLOCKLIST: dangerous commands in acceptance_check are rejected
 
 class TestExecutorBlocklist:
     """Blocked shell tokens are refused by the executor; run does not crash."""
@@ -304,8 +298,7 @@ class TestExecutorBlocklist:
     def test_blocked_command_does_not_pass(self, executor, tmp_path, dangerous_cmd):
         """AC-BLOCKLIST: a task whose acceptance_check contains a blocked token
         yields passed=False and must not execute the dangerous command."""
-        # Create a minimal task that would otherwise pass (Python -c "pass")
-        # but with a dangerous acceptance_check.
+        # A minimal task that would pass, but with a dangerous acceptance check.
         task = {
             "id": "TEST-BLOCK-1",
             "title": "Dangerous task",
@@ -315,16 +308,7 @@ class TestExecutorBlocklist:
 
         # The executor must not raise; it falls back and returns passed=False.
         result = executor.run(task)
-        # AUTO-BUG (fixed): a blocked command used to fall back to bare
-        # `pytest`, which collects and runs every OTHER pre-existing test
-        # in the mirrored workspace (see _prepare_workspace's AUTO-FIX-1) —
-        # in a repo with its own healthy test suite that reliably exits 0
-        # regardless of the current task, letting an unverified task pass.
-        # It now falls back to `false`, which always exits 1 independent of
-        # repo contents, so passed=False is guaranteed here, not incidental
-        # to tmp_path happening to have no tests. What matters either way:
-        # the dangerous command itself was never attempted (no side-effects,
-        # no crash).
+        # A blocked command falls back to false (always exits 1), not pytest, so the task cannot pass by accident.
         assert not result.passed, (
             f"A task with a blocked command ({dangerous_cmd!r}) must not pass"
         )
@@ -360,9 +344,7 @@ class TestExecutorBlocklist:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-PATHTRAVERSAL — task id sanitisation prevents workspace escapes
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-PATHTRAVERSAL: task id sanitisation prevents workspace escapes
 
 class TestPathTraversalGuard:
     """Path-traversal characters in task IDs are stripped before workspace use."""
@@ -398,8 +380,7 @@ class TestPathTraversalGuard:
             "acceptance_check": f"{sys.executable} -c \"pass\"",
         }
         result = executor.run(task)
-        # The run may pass or fail (depending on pytest availability),
-        # but must NOT have created anything outside workspace_root.
+        # The run may pass or fail, but must not create anything outside workspace_root.
         evil_escape = tmp_path.parent / "evil"
         assert not evil_escape.exists(), (
             f"Path traversal escaped workspace root to {evil_escape}"
@@ -428,9 +409,7 @@ class TestPathTraversalGuard:
             )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-CAP — wall-clock runtime cap bounds the run through the real loop
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-CAP: the wall-clock runtime cap bounds the run through the real loop
 
 class TestRuntimeCap:
     """Runtime cap fires mid-loop; progress.json records capped/runtime_cap."""
@@ -446,14 +425,12 @@ class TestRuntimeCap:
         # Set a tiny runtime cap: 0.001 minutes = 0.06 seconds.
         ini = _write_ini(tmp, max_runtime_min=0.001)
 
-        # Fake time function: starts at 0, jumps to 1000 on the second call
-        # so the cap fires after the plan phase but before the first task executes.
+        # The fake clock starts at 0 and jumps to 1000 on the second call, so the cap fires after planning.
         call_count = [0]
 
         def _fake_time():
             call_count[0] += 1
-            # First call: run start baseline → 0.
-            # All subsequent calls: far past the cap.
+            # The first clock call is the baseline; every later call is past the cap.
             return 0.0 if call_count[0] == 1 else 1000.0
 
         with patch("tools.llm_stream.request_completion",
@@ -523,9 +500,7 @@ class TestRuntimeCap:
         assert len(done) >= 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-DRYRUN — CLI flag wiring (unit test; no subprocess needed)
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-DRYRUN: CLI flag wiring (unit test, no subprocess)
 
 class TestDryRunCLIWiring:
     """Verify that the --dry-run flag is parsed and forwarded correctly."""

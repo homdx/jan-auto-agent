@@ -97,10 +97,7 @@ def test_java_real_unguarded_bug_is_not_suppressed():
 
 
 def test_java_fail_open_catch_site_is_suppressed():
-    # The Java analogue of a Python `except: pass` — an empty
-    # `catch (Exception e) {}` (COLLECT-27's own future job to extract;
-    # this test just confirms the registry consuming it doesn't care
-    # which language produced the FailOpenEntry).
+    # Java analogue of `except: pass`: an empty catch is suppressed.
     module = ModuleRecord(path="com/example/Loader.java", language="java")
     fail_open = FailOpenEntry(
         location="com/example/Loader.java:45",
@@ -119,10 +116,7 @@ def test_java_fail_open_catch_site_is_suppressed():
 
 
 def test_java_candidate_backed_only_by_llm_summary_is_not_suppressed():
-    # The same non-negotiable guarantee as the Python test suite's
-    # equivalent: is_safe() never reads ModuleRecord.summary, for any
-    # language — an LLM's prose about a Java module never auto-suppresses
-    # anything.
+    # is_safe() never reads ModuleRecord.summary, in any language.
     from tools.collect.model import LLMSummary
 
     module = ModuleRecord(path="com/example/Widget.java", language="java")
@@ -141,9 +135,7 @@ def test_java_candidate_backed_only_by_llm_summary_is_not_suppressed():
 
 
 def test_java_and_python_candidates_suppressed_side_by_side_in_one_call():
-    # A mixed batch — exactly what a real bughunt run over a mixed
-    # Python+Java repo would submit — must not have one language's
-    # candidates interfere with the other's verdicts.
+    # Mixed Python and Java candidates in one call must not affect each other's verdicts.
     java_module = ModuleRecord(
         path="com/example/Point.java",
         language="java",
@@ -201,9 +193,7 @@ def test_java_contract_covered_location_is_suppressed():
         location="com/example/Cache.java:50",
         claim="a race condition in Cache",
     )
-    # No guarded_accesses/fail_open data at all — only a class-wide
-    # contract with no method reference in its description, so it
-    # matches at the class-wide grain (see registries.AlreadySafeIndex).
+    # Class-wide contract with no method reference: matches at class grain.
     verdicts = bf.suppress([candidate], model)
     assert verdicts[0].suppressed is True
     assert verdicts[0].reason == "contract"

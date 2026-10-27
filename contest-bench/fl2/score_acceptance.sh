@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Run the FL-2 acceptance suite on every bench worktree, one at a time.
-# The suite is copied into <worktree>/tests/ so it imports that tree's tools/.
-# usage: contest-bench/fl2/score_acceptance.sh ../cb-fl2 [entry ...]
+# Runs the FL-2 acceptance suite on each bench worktree, one at a time.
 set -u
 B=$(realpath "$1"); shift
 SUITE=$(realpath "$(dirname "$0")/acceptance_fl2.py")

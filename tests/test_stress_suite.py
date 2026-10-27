@@ -195,8 +195,7 @@ def test_neither_shape_combines_the_roots_and_no_two_passes_overlap(capsys, tmp_
     assert out.count("suites/pass=4") == 1
 
     per_pass = [bench.runs[i : i + 4] for i in range(0, 12, 4)]
-    # The stress pass is genuinely concurrent: all four are spawned before any
-    # of them has finished, so the load inside the pass is real.
+    # Stress pass: all four runs are spawned before any finishes, so the load is real.
     for group in per_pass:
         assert max(r.spawned for r in group) <= min(r.finished for r in group)
     # ...while passes never overlap, which would invalidate both of them.

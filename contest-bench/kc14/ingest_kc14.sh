@@ -1,7 +1,5 @@
 #!/bin/bash
-# ingest_kc14.sh <name> <patch>: worktree at 0f4eb02 + git am + the ticket's mechanical checks.
-# Worktrees go to ../cb-kc14/<name> (outside the repo tree); logs to ../cb-kc14/logs.
-# The pytest lines run one at a time — never two entries at once (the roots collide on ports).
+# ingest_kc14.sh <name> <patch>: worktree at 0f4eb02, git am, then the checks.
 B=$(dirname "$(readlink -f "$0")"); R=$(git -C "$B" rev-parse --show-toplevel); BASE=0f4eb02
 n=$1; p=$(readlink -f "$2"); W=$R/../cb-kc14/$n; L=$R/../cb-kc14/logs; mkdir -p "$L"
 rm -rf "$W"; git -C "$R" worktree prune

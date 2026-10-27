@@ -32,12 +32,10 @@ __all__ = [
 
 _LOG = logging.getLogger(__name__)
 
-#: The order ``highest`` tries, strongest first. From KC-49's ``VARIANT_RANK``
-#: minus ``none`` (not a reasoning escalation) plus ``None`` (no variant).
+#: Order tried, strongest first: KC-49's VARIANT_RANK, minus none, plus None (no variant).
 VARIANT_LADDER = ("max", "xhigh", "high", "medium", "low", "minimal", "none", None)
 
-#: Default TTL: re-probe after this many days even when no ``--reprobe`` is
-#: given and the Kilo version has not changed.
+#: Default TTL: re-probe after this many days, even with no --reprobe and no Kilo version change.
 _DEFAULT_TTL_DAYS = 7
 
 #: Name of the cache file, placed next to ``contest.ini``.
@@ -137,8 +135,7 @@ def probe_model(
 
     key = f"{provider_id}/{model_id}"
 
-    # No reasoning capability → nothing to probe; the plain request is the
-    # model's only rung, and it is not asked here.
+    # No reasoning capability: the plain request is the only rung and is not probed.
     if not listed:
         return ProbeResult(variant=None, usable=True)
 
@@ -150,7 +147,11 @@ def probe_model(
     if not reprobe and cache is not None:
         entry = cache.get(key)
         if isinstance(entry, dict):
-            age_days = (now - float(entry.get("probed_at", 0))) / 86400.0
+            # AUDIT3-C17: a non-numeric probed_at is an expired entry, not a raise.
+            try:
+                age_days = (now - float(entry.get("probed_at", 0))) / 86400.0
+            except (TypeError, ValueError):
+                age_days = float("inf")
             cached_version = entry.get("kilo_version", "")
             version_match = (not kilo_version) or (cached_version == kilo_version)
             if (0 <= age_days < ttl_days and version_match

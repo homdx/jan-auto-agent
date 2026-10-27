@@ -50,9 +50,7 @@ from tools.auto.controller import _lint_probe_config
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Fixtures
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _cfg(**architect_overrides: str) -> configparser.ConfigParser:
     c = configparser.ConfigParser()
@@ -97,8 +95,7 @@ def _reviewer(cfg, bridge=None) -> ClusterReviewer:
         api_format="openai",
         verify_ssl=False,
     )
-    # Pre-seed the lazily-built probe so no collect artifact is needed. None
-    # models "collect off/absent", which _get_probe returns for real.
+    # Pre-seeds the lazy probe, so no collect artifact is needed; None means collect is off.
     r._probe_built = True
     r._probe = (
         arch_probe.ArchProbe(
@@ -153,9 +150,7 @@ def _msgs(mock_llm) -> list[str]:
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-P1-1 / AC-P1-6 — the feature stays invisible when it should
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-P1-1 / AC-P1-6: the feature stays invisible when it should
 
 class TestOffAndUnavailable:
 
@@ -203,9 +198,7 @@ class TestOffAndUnavailable:
         assert [x.title for x in results] == ["Forced task"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-P1-2 / AC-P1-3 — the happy path
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-P1-2 / AC-P1-3: the happy path
 
 class TestProbeRoundTrip:
 
@@ -231,9 +224,7 @@ class TestProbeRoundTrip:
         assert [x.title for x in results] == ["Grounded task"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-P1-4 / AC-P1-5 / AC-P1-7 / AC-P1-8 — the budgets
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-P1-4, 5, 7, 8: the budgets
 
 class TestBudgets:
 
@@ -309,10 +300,7 @@ class TestBudgets:
                 probe_max_rounds="5",
                 probe_max_chars="500",
                 probe_max_total_chars="500",
-                # AUTO-P8 added a budget-escalation ladder that now sits
-                # between exhaustion and the forced call. This test is about
-                # the CAP ending the loop, not about the ladder, so the ladder
-                # is switched off here; AUTO-P8's own tests cover it.
+                # Budget escalation is off here: this test is about the cap ending the loop (AUTO-P8 has its own tests).
                 probe_budget_escalations="0",
             ),
             bridge=bridge,
@@ -348,9 +336,7 @@ class TestBudgets:
         assert [x.title for x in results] == ["Kept task"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-P1-10 / AC-P1-11 — the decision gate can actually be measured
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-P1-10 / AC-P1-11: the decision gate can be measured
 
 class TestObservability:
 
@@ -383,10 +369,7 @@ class TestObservability:
 
         req = next(e for e in events if e.get("kind") == "probe_request")
         res = next(e for e in events if e.get("kind") == "probe_result")
-        # analyze_logs.py reads exactly these keys — assert the contract.
-        # agent_trace stringifies every params value (_truncate_params), which
-        # is why analyze_logs coerces with int(...) rather than trusting the
-        # type it emitted. Assert against the on-disk form, not the intent.
+        # analyze_logs.py reads these keys; assert on the on-disk form, since agent_trace stringifies params.
         assert req["params"]["cluster"] == "agents"
         assert int(req["params"]["ops"]) == 1
         assert int(res["params"]["round"]) == 1
@@ -409,9 +392,7 @@ class TestObservability:
             {"run_id": "r1", "kind": "probe_request", "ts": "2026-01-01T00:00:03Z",
              "source": "architect", "target": "probe", "content": "facts zzz",
              "params": {"cluster": "io", "ops": 1}},
-            # AUTO-P4a: the reason the second request went unanswered is now
-            # recorded explicitly instead of being inferred from the
-            # requests-minus-results gap. See the assertion note below.
+            # The second request's reason is recorded explicitly (AUTO-P4a), not inferred from the gap.
             {"run_id": "r1", "kind": "probe_declined", "ts": "2026-01-01T00:00:04Z",
              "source": "architect", "target": "probe", "content": "facts zzz",
              "params": {"cluster": "io", "reason": "unresolved", "ops": 1,
@@ -428,12 +409,7 @@ class TestObservability:
         out = capsys.readouterr().out
         assert "Architect probes" in out
         assert "2 request(s)" in out
-        # AUTO-P4a superseded the bare "N unresolved" label this originally
-        # asserted. The intent is unchanged and is now served better: the gap
-        # is still visible, but attributed to a cause. The old label was
-        # actively misleading — it claimed every unanswered request was a
-        # collect miss, when on the first real probing run all of them were
-        # the round cap and none were collect misses.
+        # AUTO-P4a replaced the bare "N unresolved" label: the gap is attributed to a cause now.
         assert "1 declined" in out
         assert "collect had no answer" in out
 
@@ -502,8 +478,7 @@ class TestObservability:
              "source": "architect", "target": "probe", "content": "module x.py",
              "params": {"cluster": "a", "reason": "repeat", "ops": 1,
                         "round": 1}},
-            # Cluster "b": a genuine miss, then a repeat of it — NOT
-            # out-of-batch, must not be mislabelled as such.
+            # Cluster b is a genuine miss and its repeat, and neither is out of batch.
             {"run_id": "r1", "kind": "probe_request", "ts": "2026-01-01T00:00:02.5Z",
              "source": "architect", "target": "probe", "content": "facts zzz",
              "params": {"cluster": "b", "ops": 1}},
@@ -522,9 +497,7 @@ class TestObservability:
         assert "2 re-asked an answered probe (1 already had it, out of batch)" in out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-P1-12 — AUTO-P3 startup lint
-# ─────────────────────────────────────────────────────────────────────────────
+# AC-P1-12: AUTO-P3 startup lint
 
 class TestProbeConfigLint:
 

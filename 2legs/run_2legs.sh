@@ -1,24 +1,5 @@
 #!/usr/bin/env bash
-# 2legs/run_2legs.sh — KC-77: run both legs of the two-leg runbook, then check.
-#
-#   leg 1  round 1, ticket 01 (__repr__) on a freshly built $TARGET
-#   land   the first READY agent whose patch applies and keeps tests green
-#   leg 2  round 2, ticket 02 (__eq__) on top of leg 1's winner
-#   land   the same way
-#   check  2legs/check_2legs.py — deterministic, no LLM, no network
-#
-# The pick is mechanical on purpose: this is the runbook's test, not the
-# judging. HOW-WE-RUN-2LEGS.md is the hand version where you read patches.
-#
-# Models are never stored in git: export MODELS=a,b,c before running.
-#
-# usage:
-#   source 2legs/env.sh && export MODELS=provider/model-a,provider/model-b
-#   2legs/run_2legs.sh                 # rebuild target, both legs, check
-#   2legs/run_2legs.sh --keep          # keep $TARGET as it is (resume by hand)
-#   2legs/run_2legs.sh --check-only    # validate the previous run only
-#
-# Exit code is 0 only when both legs ran AND every check passed.
+# Runs both legs of the two-leg runbook, then checks (KC-77).
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$HERE/env.sh"

@@ -39,9 +39,7 @@ _SYM_RUN  = "⚙"
 _SYM_WAIT = "○"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Rendering helpers (pure functions — kept backward-compatible)
-# ─────────────────────────────────────────────────────────────────────────────
+# Rendering helpers (pure functions)
 
 def render_banner(
     arch_done:  int,
@@ -122,9 +120,7 @@ def _task_detail_line(task_num: int, task_id: str, title: str) -> str:
     return f"{_SYM_RUN}  {label}{id_part}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # ProgressDisplay
-# ─────────────────────────────────────────────────────────────────────────────
 
 class ProgressDisplay:
     """Tracks run-level and per-task progress; emits the canonical format.
@@ -288,9 +284,7 @@ class ProgressDisplay:
         self._state.update_progress(current_status, **extra)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 # Gate 1 corpus AUTO-T1 grades `make_progress_display` live: tests/test_gate1_corpus_precision.py
 def make_progress_display(
@@ -320,14 +314,7 @@ def make_progress_display(
     codebase, so it's unaffected and stays a plain read.
     """
     from tools.auto.utils import _cfg_mode
-    # BUGFIX (report §4, item 8): `fallback=` on a config read only covers a
-    # *missing* key, not a malformed *value* — a non-numeric
-    # max_attempts_per_task (or its _creative override) or max_rounds_per_task
-    # raised a raw ValueError straight out of this function. It's called
-    # unconditionally during AutoController's startup sequence, so a bad
-    # value in either key killed the whole --auto run before it even started.
-    # Mirrors the existing try/except-around-int() pattern used by
-    # tools/auto/repo_ingest.py::_read_int / _read_int_mode.
+    # A malformed numeric config value falls back to the default instead of stopping --auto startup.
     max_attempts_str = _cfg_mode(
         config, "auto", "max_attempts_per_task", task_mode,
         fallback=_MAX_ATTEMPTS_DEFAULT,

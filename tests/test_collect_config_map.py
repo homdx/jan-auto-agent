@@ -76,8 +76,7 @@ def test_config_map_entries_are_config_map_entry_instances_sorted():
 
 
 def test_multiple_readers_of_same_key_are_merged_not_duplicated():
-    # Two modules reading the same (section, key) collapse into one entry
-    # whose readers list both of them, rather than two separate rows.
+    # Two readers of the same key merge into one entry.
     from tools.collect.scanner import scan_module
 
     m1 = scan_module(
@@ -158,8 +157,7 @@ def test_key_present_everywhere_is_not_flagged():
         },
     )
     by_key = {(g.section, g.key) for g in gaps}
-    # [coder] temperature is a plain, unremarkable key present in every
-    # profile — it must never show up as a gap.
+    # [coder] temperature is present in every profile: never a gap.
     assert ("coder", "temperature") not in by_key
 
 
@@ -174,8 +172,7 @@ def test_unreadable_sibling_is_excluded_not_flagged_wholesale(tmp_path):
         primary,
         {"sibling_ok": sibling_ok, "ghost": missing_path},
     )
-    # `x` is present in the one sibling that could actually be read, and
-    # the unreadable "ghost" sibling contributes no false gap.
+    # The unreadable sibling contributes no false gap.
     assert gaps == []
 
 

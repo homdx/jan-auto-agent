@@ -62,10 +62,7 @@ _FEEDBACK_GLOB = "feedback_round_*.md"
 _FEEDBACK_RE = re.compile(r"feedback_round_(\d+)\.md$")
 _MAX_FEEDBACK_CHARS = 800        # keep each round file compact
 
-# RUN-2: this task's budget ledger. The name is kept so the two callers that
-# unlink it (bug_fix_loop.py, controller.py) and the tests that assert on it
-# need no change; only the content changed, from a bare start timestamp to
-# {"consumed_s": …, "session_started_at": …}.
+# The task budget ledger: the file name is kept, but its content holds consumed time and the session start (RUN-2).
 _BUDGET_FILE = "deadline_started_at.txt"
 
 
@@ -75,11 +72,7 @@ class _TaskBudget:
     max_seconds: float                  # max_task_seconds (0 disables the guard)
     consumed_s: float = 0.0             # seconds worked, summed over sessions
     session_started_at: float | None = None   # wall clock; set while active
-    # RUN-8: seconds this session spent inside coder calls that died on the
-    # wire. They are in this session's elapsed time (session_started_at is
-    # wall clock), so _end_task_budget takes them back out before the ledger
-    # is persisted — otherwise the task left todo after an 80-minute hang
-    # resumes with its whole max_task_seconds already consumed.
+    # Seconds a session spent in coder calls that died on the wire; they are taken back out of the ledger (RUN-8).
     credit_s: float = 0.0
 
 
@@ -187,9 +180,7 @@ def _coerce_impl_version(value: object) -> int:
 _IMPL_HEADER_RE = re.compile(r"impl v(\d+)")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Result
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class OuterLoopResult:
@@ -201,13 +192,9 @@ class OuterLoopResult:
     feedback_files:      list[str] = field(default_factory=list)
     inner_results:       list = field(default_factory=list)   # list[InnerLoopResult]
     impl_versions_used:  list = field(default_factory=list)   # list[int] — LOOP-3
-    # RUN-7: True when this round ended because the Gate-2 validator was
-    # unavailable (not a real rejection) — the task was left `todo`, not
-    # blocked, and no feedback file / knowledge / ticket was written for it.
+    # True when the round ended because the validator never answered, so it is not a rejection (RUN-7).
     unavailable:         bool = False
-    # RUN-8: which stage left the round unavailable — "coder" (the coder call
-    # died before the model could answer) or "gate2" (RUN-7). "" on a legacy
-    # result; the summary and the controller key their wording off it.
+    # Which stage left the round unavailable ("coder" or "gate2"), so the summary names the real outage (RUN-8).
     unavailable_stage:   str = ""
 
     def summary(self) -> str:
@@ -230,9 +217,7 @@ class OuterLoopResult:
         return "\n\n".join(parts)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # OuterLoop
-# ─────────────────────────────────────────────────────────────────────────────
 
 class OuterLoop:
     """Drives up to ``max_rounds`` fresh-context rounds for one task (AUTO-C4)."""
@@ -258,11 +243,7 @@ class OuterLoop:
         round if feedback files already exist.  Never raises."""
         task_id = task.get("id", "?")
 
-        # RUN-2: open this task's budget ledger before the first round, and
-        # close it from the finally so every exit path — pass, block,
-        # exhaustion, exception, KeyboardInterrupt — folds this session's
-        # elapsed time into the persisted total in ONE place instead of once
-        # per `return OuterLoopResult(...)` scattered through the loop below.
+        # The task budget ledger opens before the first round and closes in finally, so every exit path records the time once (RUN-2).
         _budget = self._begin_task_budget(task_id)
         try:
             return self._run_rounds(task, base_dir, task_id, _budget)
@@ -273,32 +254,12 @@ class OuterLoop:
         self, task: dict, base_dir: str | Path, task_id: str, budget: _TaskBudget
     ) -> OuterLoopResult:
         """The round loop, given an already-open budget ledger."""
-        # AUTO-CR-33: one wall-clock budget for the whole task (all rounds) —
-        # previously each round re-entered InnerLoop.run_task and reset its own
-        # start time, so the effective cap was max_rounds × max_task_seconds
-        # (10 × 30 min ≈ 5h observed). Compute the deadline once here and both
-        # gate the round loop and hand it to the inner loop.
-        #
-        # BUGFIX (audit): the deadline was originally purely in-process
-        # (time.monotonic() + budget), so it reset to a fresh full budget on
-        # every process restart — the exact multi-round runaway this mechanism
-        # exists to prevent, just re-emerging across restarts instead of across
-        # rounds. monotonic() has no fixed epoch and can't be persisted
-        # meaningfully, so it was persisted as a wall-clock start timestamp.
-        #
-        # RUN-2: a start timestamp is calendar time, not run time. Stop the run
-        # in the evening, resume in the morning, and every task that had already
-        # started was over budget before a single LLM call. What survives a
-        # restart must be "seconds this task was alive and working this task",
-        # which is what the ledger holds — so the remaining budget below is the
-        # leftover of the persisted total, and it still accumulates across
-        # restarts (the AUTO-CR-33 runaway stays closed).
+        # One wall-clock budget covers all rounds of a task and survives restarts, so resuming does not reset it (AUTO-CR-33, RUN-2).
         _task_deadline = None
         if budget.max_seconds > 0:
             _remaining = max(budget.max_seconds - budget.consumed_s, 0.0)
             _task_deadline = time.monotonic() + _remaining
-        # AUTO-CR-33: only hand the deadline to inner loops that accept it, so
-        # fakes/older InnerLoop signatures are not broken.
+        # The deadline is passed only to inner loops that accept it, so older fakes still work (AUTO-CR-33).
         try:
             import inspect as _inspect
             _inner_accepts_deadline = (
@@ -308,17 +269,7 @@ class OuterLoop:
         except (ValueError, TypeError):
             _inner_accepts_deadline = False
 
-        # LOOP-4: the TRUE v1 baseline instruction — used so _build_impl_history
-        # can correctly label version 1 even after a later rewrite overwrites
-        # task["instruction"]. Bugfix: this used to just read task["instruction"]
-        # unconditionally, which was safe only within a single continuous run
-        # (before any rewrite happened yet). Now that a rewrite's text is
-        # persisted back into task["instruction"] (see StateStore.apply_rewrite,
-        # LOOP-3 below), a *resumed* session loads a task whose "instruction"
-        # already holds the latest rewrite, not v1's — so prefer the explicitly
-        # preserved "original_instruction" when one exists, falling back to
-        # "instruction" for a task that has never been rewritten (where
-        # "instruction" still IS v1).
+        # The first instruction is kept separately, so a resumed task still labels version 1 correctly (LOOP-4).
         original_instruction: str = task.get("original_instruction") or task.get("instruction", "")
 
         # ── Resume: existing feedback files mean prior rounds already ran ──
@@ -327,18 +278,7 @@ class OuterLoop:
         feedback_files = [str(p) for p in self._feedback_paths(task_id)]
         inner_results: list = []
 
-        # LOOP-2: rewrite tracking. Bugfix: this used to always start at 0, so
-        # max_rewrites was only ever enforced within a single process's
-        # lifetime — restarting the process (a crash, or just stopping and
-        # re-running the CLI) reset the count and allowed unlimited further
-        # rewrites across enough restarts. impl_version is persisted and
-        # already tracks exactly this (starts at 1, +1 per rewrite — see
-        # apply_rewrite), so seed the local counter from it to make the cap a
-        # true per-task, cross-resume limit.
-        # LOOP-3: impl_version tracking — starts at 1, bumped on each rewrite
-        # FIX-2 #2: the bare int(impl_version or 1) raised ValueError/TypeError
-        # on a corrupt plan.json value before round 1 and escaped run_task,
-        # dropping every pending task. See _coerce_impl_version().
+        # The rewrite counter is seeded from the persisted impl_version, so max_rewrites holds across restarts (LOOP-2, FIX-2 #2).
         impl_version = _coerce_impl_version(task.get("impl_version", 1))
         rewrites_done = max(0, impl_version - 1)
         impl_versions_used: list[int] = []
@@ -356,8 +296,7 @@ class OuterLoop:
                              "impl_version": impl_version})
 
         for rnd in range(start_round, self.max_rounds + 1):
-            # AUTO-CR-33: enforce the task-wide wall-clock budget BEFORE starting
-            # another round (this is what previously ran away for ~5 h).
+            # The task-wide budget is checked before each round, since a run once ran away for 5 hours (AUTO-CR-33).
             if _task_deadline is not None and time.monotonic() >= _task_deadline:
                 logger.warning(
                     "OuterLoop: task %s wall-clock budget (%ds = %.1f min) "
@@ -365,25 +304,18 @@ class OuterLoop:
                     task_id, int(budget.max_seconds), budget.max_seconds / 60.0, rnd,
                 )
                 self.state.set_task_status(task_id, STATUS_BLOCKED)
-                # BUGFIX (audit): impl_versions_used was omitted here,
-                # unlike every other OuterLoopResult return path in this
-                # method — on round 2+ (impl_versions_used already holds
-                # entries from earlier rounds by this point), this reported
-                # an empty list despite impls having actually been used.
+                # Every result path reports the implementations used, including this one (BUGFIX).
                 return OuterLoopResult(task_id, False, rnd - 1, True,
                                        feedback_files, inner_results,
                                        impl_versions_used)
 
             # Fresh context: seed ONLY with the compact prior-round summaries.
             prior = self._read_round_feedback(task_id)
-            # RUN-7: the round counter as persisted before this round bumps
-            # it — an unavailable exit puts it back exactly here. Read from
-            # the store, not *task*: the caller's dict is a detached copy.
+            # The round counter is read from the store, since the caller's task dict is a detached copy (RUN-7).
             _round_at_entry = (self.state.get_task(task_id) or {}).get("round", rnd - 1)
             self.state.set_task_status(task_id, STATUS_IN_PROGRESS, round=rnd)
 
-            # LOOP-4: build prior implementation history so the coder knows
-            # which strategies already failed and must not be repeated.
+            # Prior implementation history tells the coder which strategies already failed (LOOP-4).
             prior_impls = self._build_impl_history(
                 task_id, impl_version, original_instruction
             )
@@ -397,14 +329,7 @@ class OuterLoop:
             try:
                 res = self.inner_loop.run_task(task, base_dir, **_rt_kwargs)
             except Exception as exc:
-                # AUTO-OUTER-GUARD-1: previously unguarded — any exception
-                # inner_loop.run_task doesn't already handle itself
-                # propagated straight out of THIS run_task (the per-task
-                # body of the whole --auto loop), crashing the entire
-                # multi-task run instead of just failing this one task.
-                # Fail this task closed (BLOCKED, same status the
-                # runtime-cap-exhausted branch above already uses) and
-                # let the caller move on to the next task in the plan.
+                # An exception that escapes the inner loop fails this task closed, not the whole run (AUTO-OUTER-GUARD-1).
                 logger.exception(
                     "%s: inner_loop.run_task raised in round %d — %s",
                     task_id, rnd, exc,
@@ -421,42 +346,24 @@ class OuterLoop:
                                        feedback_files, inner_results,
                                        impl_versions_used)
             inner_results.append(res)
-            # RUN-8: a coder call that died before the model could answer
-            # spent wall-clock that is not this task's budget — the inner loop
-            # credited it against its own _eff_deadline, and this shared one is
-            # the same monotonic budget, so add the same seconds here. Fail-
-            # open: an older inner result without the field credits 0.
+            # Seconds a dead coder call used are credited back to the shared deadline (RUN-8).
             try:
                 _credit = float(getattr(res, "deadline_credit_s", 0.0) or 0.0)
             except (TypeError, ValueError):
                 _credit = 0.0
             if _task_deadline is not None and _credit > 0:
                 _task_deadline += _credit
-            # …and out of the persisted ledger too (RUN-2): the session's
-            # elapsed time is wall clock and still contains the dead-socket
-            # wait, so _end_task_budget must not fold it into consumed_s.
+            # The same seconds are taken out of the persisted ledger, since the session clock still counted them (RUN-2).
             if _credit > 0:
                 budget.credit_s += _credit
-            # round is set authoritatively above via set_task_status(round=rnd);
-            # here we only accumulate the attempt count.
+            # The round is set by set_task_status; here only the attempt count is added.
             self.state.increment_task_counters(
                 task_id, attempt_delta=getattr(res, "attempts_used", 0),
             )
 
-            # RUN-7: the Gate-2 validator never answered (a transport/parse
-            # error on every re-run, not a real {"approved": false}) — this
-            # round never happened as far as the task is concerned. Undo the
-            # STATUS_IN_PROGRESS/round=rnd set above, write no
-            # feedback_round_N.md (the resume logic counts those files, so
-            # one here would burn the round AND hand the next coder a verdict
-            # nobody made), burn no impl version, and never reach the rewrite
-            # check below. The task goes back to `todo` so the next session
-            # offers it again once the provider is back. Identity check, not
-            # truthiness: an unconfigured MagicMock inner result answers any
-            # attribute with a truthy MagicMock.
+            # An unavailable validator means the round never happened: the status and round counter are undone, and no feedback is written (RUN-7).
             if getattr(res, "unavailable", False) is True:
-                # RUN-8: which half never answered — the wording is different
-                # for the two outages, but the exit is the same either way.
+                # The two outages read differently, but both end the same way (RUN-8).
                 _u_stage = str(getattr(res, "unavailable_stage", "") or "")
                 _u_label = ("coder transport failure" if _u_stage == "coder"
                             else "validator unavailable")
@@ -492,19 +399,7 @@ class OuterLoop:
                                        feedback_files, inner_results,
                                        impl_versions_used)
 
-            # Failed round → write ONE compact feedback file, then fresh round.
-            #
-            # AUTO-FIX (high-priority audit): this write went through
-            # StateStore.write_task_file with no error handling at all — a
-            # disk/permission failure here used to propagate straight out
-            # of run_task, contradicting this method's own documented
-            # "Never raises" contract and crashing the whole multi-hour
-            # --auto session on what should be a recoverable, single-round
-            # hiccup. Now the failure is logged and the round proceeds
-            # without a persisted feedback file for this round (later
-            # _build_impl_history calls degrade gracefully on a missing
-            # feedback_round_*.md — see its own file-read guard) rather
-            # than aborting the whole task.
+            # A failed round writes one compact feedback file; a failed write is logged, not allowed to abort the task (AUTO-FIX).
             try:
                 fpath = self._write_round_feedback(task_id, rnd, res, impl_version)
                 feedback_files.append(str(fpath))
@@ -523,13 +418,7 @@ class OuterLoop:
                 except OSError:
                     pass  # run.log itself is unwritable too — already logged above
 
-            # LOOP-2: check whether a rewrite is due (rnd >= 3, (rnd-1) %
-            # rewrite_every_n_rounds == 0, rewrites_done < max_rewrites, and a
-            # rewriter wired up). Pull-model gate: only rewrite when the inner
-            # loop's context was satisfied — if the last attempt was still
-            # REQUESTING context, the failure is "missing information," not
-            # "bad framing," so skip the rewrite and let the prefetched
-            # context flow instead.
+            # A rewrite is due on a schedule, and only when the coder had its context satisfied (LOOP-2).
             if (
                 self.task_rewriter is not None
                 and self.max_rewrites > 0
@@ -552,10 +441,7 @@ class OuterLoop:
                 try:
                     new_task = self.task_rewriter.rewrite(task, failure_history)
                 except Exception as exc:
-                    # BUGFIX (audit): task_rewriter.rewrite() was called with no
-                    # guard here — an exception it doesn't already swallow
-                    # internally (e.g. a bad template) propagated straight out
-                    # of run_task, violating its own "Never raises" contract.
+                    # A failing rewriter is logged, not allowed to escape run_task (BUGFIX).
                     logger.warning(
                         "outer_loop: task_rewriter.rewrite failed for %s — "
                         "continuing with the original task unchanged: %s",
@@ -563,16 +449,7 @@ class OuterLoop:
                     )
                     new_task = task
                 if new_task is not task:
-                    # A genuine rewrite was produced — record it on disk and
-                    # persist it in state (LOOP-3). Bugfix: this used to call
-                    # bare increment_impl_version(), which only persisted the
-                    # version *number* — the rewritten instruction itself lived
-                    # only in the local `task` variable below and was lost the
-                    # moment the process restarted. apply_rewrite() persists
-                    # the rewritten instruction/acceptance_check/title in the
-                    # SAME call that bumps impl_version, so a resumed session
-                    # picks up the latest rewrite instead of silently reverting
-                    # to the original (already-failing) instruction.
+                    # A real rewrite is recorded on disk and in state, so a resumed task keeps the new instruction (LOOP-3, BUGFIX).
                     try:
                         impl_version = self.state.apply_rewrite(
                             task_id,
@@ -581,17 +458,7 @@ class OuterLoop:
                             title=new_task.get("title"),
                         )
                     except Exception as exc:
-                        # BUGFIX (audit): this used to fall through to write
-                        # the rewrite_round_N.md artifact and apply new_task
-                        # in-memory anyway — but state never durably recorded
-                        # this rewrite, so a resume restarts from the
-                        # pre-rewrite task while this round's artifact file
-                        # (and impl_version bump) still exist on disk,
-                        # letting the rewrite gate fire again and produce a
-                        # duplicate. Treat a failed apply_rewrite the same as
-                        # "no rewrite happened" — skip persisting the
-                        # artifact and keep the original task for this round
-                        # — instead of applying half of it.
+                        # A failed rewrite apply is treated as no rewrite, so the artifact and version bump are not left behind (BUGFIX).
                         logger.warning(
                             "outer_loop: apply_rewrite failed for %s — discarding "
                             "this round's rewrite, continuing with the original "
@@ -611,11 +478,7 @@ class OuterLoop:
                                 rewrite_body,
                             )
                         except OSError as exc:
-                            # BUGFIX (audit): unguarded — a disk/permission
-                            # failure here must not crash the whole --auto run
-                            # over a bookkeeping write; the rewrite still applies
-                            # in-memory (and via apply_rewrite above, if that
-                            # succeeded) even if this human-readable copy fails.
+                            # The human-readable copy of a rewrite is best-effort; the rewrite itself still applies (BUGFIX).
                             logger.warning(
                                 "outer_loop: could not write rewrite_round_%d.md "
                                 "for %s — continuing without it: %s",
@@ -740,8 +603,7 @@ class OuterLoop:
         if budget.max_seconds <= 0 or budget.session_started_at is None:
             return
         elapsed = max(time.time() - budget.session_started_at, 0.0)
-        # RUN-8: the wall-clock spent inside coder calls that died on the wire
-        # is not this task's — take it back out before the total is persisted.
+        # Time spent in coder calls that died on the wire is taken back out of the task total (RUN-8).
         elapsed = max(elapsed - max(budget.credit_s, 0.0), 0.0)
         try:
             self.state.write_task_file(
@@ -766,10 +628,7 @@ class OuterLoop:
         return int(m.group(1)) if m else 0
 
     def _existing_rounds(self, task_id: str) -> int:
-        # Delegates to the shared helper (tools.auto.utils) also used by
-        # AutoController's BLOCKED-reset check, so the two can never disagree
-        # about how many rounds a task has actually used (see the
-        # round-exhaustion bugfix in controller.py's run()).
+        # Uses the shared round counter, so the controller and this loop agree on how many rounds a task has used.
         return highest_completed_round(self.state.task_dir(task_id))
 
     def _read_round_feedback(self, task_id: str) -> list[str]:
@@ -871,9 +730,7 @@ def _truncate(text: str, max_chars: int) -> str:
     return text if len(text) <= max_chars else text[:max_chars] + f"… [+{len(text) - max_chars} chars]"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_outer_loop(
     config: configparser.ConfigParser,
@@ -896,9 +753,7 @@ def make_outer_loop(
     fact/prosody gates see the run goal even when the architect didn't echo
     it into a task's own ``instruction``.
     """
-    # Bugfix (config-crash audit): all three were unguarded. Wrapped
-    # per-call, not via a helper, so extract_config_reads still sees the
-    # literal calls.
+    # Config reads are guarded per call, so a malformed value falls back to the default (config-crash audit).
     try:
         max_rounds = config.getint("auto", "max_rounds_per_task",
                                    fallback=_DEFAULT_MAX_ROUNDS)
@@ -925,10 +780,7 @@ def make_outer_loop(
         )
         max_rewrites = 5
 
-    # selfrun E2E finding: the rewrite condition requires rnd >= 3, so with
-    # max_rounds_per_task <= 2 a configured rewriter can NEVER fire — and
-    # until now that mismatch was silent (a run just exhausted its rounds and
-    # blocked, with max_rewrites looking enabled). Say it once, loudly.
+    # A rewriter cannot fire with fewer than three rounds; that mismatch is reported once, not silent (selfrun E2E).
     if max_rewrites > 0 and max_rounds < 3 and task_mode != "creative":
         logger.warning(
             "make_outer_loop: max_rewrites=%d is configured but "
@@ -943,10 +795,7 @@ def make_outer_loop(
                                       run_goal=run_goal,   # AUTO-DM-1 / AUTO-CR-22-1
                                       collect_bridge=collect_bridge)  # COLLECT-24
 
-    # LOOP-2: build a TaskRewriter only if rewrite keys + max_rewrites > 0 are
-    # configured. AUTO-CR-27: skip it in creative mode — its code-test-framed
-    # prompt is meaningless there and previously wasted a call while nudging
-    # the model toward emitting code mid-story.
+    # A task rewriter is built only when configured, and never in creative mode (LOOP-2, AUTO-CR-27).
     task_rewriter = None
     if max_rewrites > 0 and task_mode != "creative":
         try:

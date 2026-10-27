@@ -62,9 +62,7 @@ from tools.auto.state import make_task
 
 logger = logging.getLogger(__name__)
 
-# ── Placeholder detector ──────────────────────────────────────────────────────
-# Acceptance checks that match this pattern are treated as non-runnable and
-# the candidate is moved to the manual suggestions list.
+# Placeholder acceptance checks: treated as non-runnable and moved to the manual suggestions.
 _PLACEHOLDER_RE = re.compile(
     r"^\s*(?:n/?a|none|tbd|todo|manual\s+review|manual\s+check|"
     r"code\s+review|peer\s+review|human\s+review|review\s+manually|"
@@ -75,15 +73,11 @@ _PLACEHOLDER_RE = re.compile(
 # Default prefix for generated task IDs.
 _DEFAULT_ID_PREFIX = "AUTO-T"
 
-# Matches "chapter_07", "chapter-3", "chapter 1", "Chapter_07.md" etc.
-# Mirrors the pattern used in context_broker, canon_validator, context_assembler
-# so "chapter index" means the same numeric value everywhere.
+# Chapter index pattern, the same as in context_broker and canon_validator.
 _CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Data model
-# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ReadyTask:
@@ -175,21 +169,7 @@ class PrioritisedBacklog:
                 "symbol":     loc.symbol,
                 "line_start": loc.line_start,
                 "line_end":   loc.line_end,
-                # Bugfix: this dict literal predates CitedLocation.new_file
-                # and was never updated when that field was added, so every
-                # task built here silently forgot whether its citation was a
-                # not-yet-created file. Nothing in today's control flow
-                # re-reads cited_locations[0]["new_file"] after planning (Gate
-                # 1's existence check runs on the CandidateTask itself, before
-                # this conversion), so the loss is currently inert, but the
-                # persisted task dict is the on-disk source of truth for the
-                # task (plan.json) and silently dropping a real field from it
-                # is a correctness bug regardless of whether anything reads it
-                # today — the checkpoint serialiser in architect.py
-                # (_serialise_candidates) already preserves this same field
-                # for the same CitedLocation, which is the asymmetry that
-                # gives this away as an oversight rather than a deliberate
-                # omission.
+                # new_file is kept in the task dict, so a not-yet-created file is still known after planning (bugfix).
                 "new_file":   loc.new_file,
             }
             result.append(make_task(
@@ -216,9 +196,7 @@ class PrioritisedBacklog:
 Backlog = PrioritisedBacklog
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # BacklogPrioritiser
-# ─────────────────────────────────────────────────────────────────────────────
 
 class BacklogPrioritiser:
     """Splits Gate-1-accepted candidates and orders the autonomous subset.
@@ -353,12 +331,7 @@ class BacklogPrioritiser:
             if dep_task.task_id in dependent_task.dependencies:
                 return  # already registered
             if _depends_on(dep_task, dependent_task.task_id, id_to_task):
-                # dep_task already (transitively) depends on dependent_task —
-                # adding the reverse edge would create a 2+-node cycle.
-                # A more reliable earlier rule already established the
-                # opposite direction; drop this weaker/later edge instead
-                # of letting the topological sort discover the cycle and
-                # discard both.
+                # The reverse edge would close a cycle; the earlier ordering rule wins, so this weaker edge is dropped.
                 logger.debug(
                     "dep [%s]: skipped %s → %s — would create a cycle "
                     "(conflicts with an already-established edge)",
@@ -403,16 +376,7 @@ class BacklogPrioritiser:
         if loc_a.file != loc_b.file:
             return False
 
-        # FIX-2 H11b: an ordering claim needs A's range to be *known*, not
-        # guessed. a_end used to fall back to line_start when line_end was
-        # null, collapsing A to a single line so that every later task in the
-        # file looked cleanly downstream of it — an edge asserted from data
-        # the citation never carried, and dependencies are hard blockers in
-        # the controller. line_start is required for the same reason the
-        # docstring already states ("numeric line anchors"): a citation with
-        # an end but no start does not describe a range either. B only needs
-        # its start — where B's edit *ends* has no bearing on whether A
-        # finishes before it begins, and demanding it would drop real edges.
+        # A range end falls back to nothing, not to line_start: an ordering edge needs a known range, not a guess (FIX-2 H11b).
         a_start = loc_a.line_start
         a_end   = loc_a.line_end
         b_start = loc_b.line_start
@@ -434,8 +398,26 @@ class BacklogPrioritiser:
             return False
 
         # Require a whole-word match so "parse" doesn't match "parse_config".
-        pattern = re.compile(rf"\b{re.escape(symbol_a)}\b")
-        return bool(pattern.search(task_b.instruction))
+        name = re.escape(symbol_a)
+        if _looks_like_code(symbol_a):
+            return bool(re.search(rf"\b{name}\b", task_b.instruction))
+        # A name that is also an English word counts only where it is written as code (`run`, `Store`), not in prose.
+        # A backticked file name (`main.py`, `run.log`) is not a symbol: the span counts only where the name is not followed by .ext.
+        ext = _FILE_EXT_RE
+        return bool(re.search(
+            rf"`[^`\n]*\b{name}(?!\.{ext})\b[^`\n]*`|\b{name}\(|\.{name}\b|\b{name}\.(?!{ext})\w",
+            task_b.instruction,
+        ))
+
+
+# The file extensions that make `name.ext` a file name rather than a symbol, inside and outside a backticked span.
+_FILE_EXT_RE = r"(?:log|txt|md|rst|py|json|csv|ini|cfg|toml|ya?ml|sh|out|err|tmp|lock)\b"
+
+
+def _looks_like_code(name: str) -> bool:
+    """A name no prose word is: an underscore, a dot, a digit, or a capital past its first letter
+    (`load_rows`, `Store.compact`, `parse2`, `LoadRows`)."""
+    return any(ch in "_." or ch.isdigit() for ch in name) or any(ch.isupper() for ch in name[1:])
 
 
 def _depends_on(
@@ -465,9 +447,7 @@ def _depends_on(
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Chapter-filename dependency inference (AUTO-CR-19-3)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _chapter_number(task: ReadyTask) -> int | None:
     """Return the highest chapter number found in *task*'s target_files, or None.
@@ -522,11 +502,7 @@ def _chapter_dependencies(tasks: list[ReadyTask]) -> dict[str, list[str]]:
     # Sort by chapter number (ascending, numeric).
     chapter_tasks.sort(key=lambda x: x[0])
 
-    # For each chapter-N task, depend on the nearest chapter-M task, M < N.
-    # BUGFIX: chapter_tasks[idx - 1] is just the previous sorted entry,
-    # which for two tasks on the same chapter is a same-chapter task, not
-    # one with a strictly smaller M — so same-chapter tasks were chained
-    # and could not run in parallel. Group equal chapter numbers first.
+    # Depend on the nearest lower-numbered chapter; tasks on the same chapter are grouped so they can run in parallel (bugfix).
     groups: list[tuple[int, list[ReadyTask]]] = []
     for n, task in chapter_tasks:
         if groups and groups[-1][0] == n:
@@ -636,9 +612,7 @@ def _topological_sort(tasks: list[ReadyTask]) -> list[ReadyTask]:
     return ordered
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # IMPROVEMENTS.md generator
-# ─────────────────────────────────────────────────────────────────────────────
 
 _MD_HEADER = """\
 # IMPROVEMENTS.md
@@ -731,9 +705,7 @@ def to_improvements_md(backlog: PrioritisedBacklog) -> str:
     return "".join(parts)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Convenience factory
-# ─────────────────────────────────────────────────────────────────────────────
 
 def build_backlog(
     candidates: list[CandidateTask],
@@ -755,9 +727,7 @@ def build_backlog(
     return BacklogPrioritiser(task_id_prefix=task_id_prefix).build(candidates)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _is_runnable_check(check: str) -> bool:
     """Return True if *check* looks like a runnable shell command.

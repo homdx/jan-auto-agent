@@ -7,9 +7,7 @@ PLANNED_DIR="$HOME/Downloads/crypie/planned"
 GROUND_DIR="$HOME/Downloads/crypie"
 REPORT_FILE="$AGENT_DIR/report.txt"
 
-# ---------------------------------------------------------
-# MODEL LISTS
-# ---------------------------------------------------------
+# Model lists
 
 # Option 1: Models to replace under "kilo ai model"
 MODELS_KILO=(
@@ -37,10 +35,7 @@ MODELS_GOOGLE=(
     "gemini-3.1-flash-lite"
 )
 
-# ---------------------------------------------------------
-# TEST SCENARIOS Definitions
-# Format: "Archive_Name|Extracted_Folder_Name|Ground_Truth_File|Scenario_Name"
-# ---------------------------------------------------------
+# Scenario definitions: Archive|Extracted_Folder|Ground_Truth_File|Scenario_Name
 SCENARIOS=(
     "google6-gemini-3-1.tar.gz|test1|GROUND-TRUTH-GOOGLE.md|GOOGLE"
     "mistral-large-task-created.tar.gz|test2|GROUND-TRUTH-mistral-large.md|MISTRAL"
@@ -48,12 +43,7 @@ SCENARIOS=(
     "test-deepseek-pro-bynara.tar.gz|test1|GROUND-TRUTH-BYNARA_deepseek_pro.md|DEEPSEEK"
 )
 
-# ---------------------------------------------------------
-# SANITY CHECK: agents_128k.ini location
-# If the config isn't where AGENT_DIR expects it, but we were
-# launched from a folder that DOES have it, just warn and use
-# the launch folder as AGENT_DIR instead of failing.
-# ---------------------------------------------------------
+# Warn and use the launch folder if agents_128k.ini is missing from AGENT_DIR.
 STARTUP_DIR="$(pwd)"
 
 if [ ! -f "$AGENT_DIR/agents_128k.ini" ]; then
@@ -75,9 +65,7 @@ echo "Starting Automated Model Testing Batch..."
 echo "Results will be appended to: $REPORT_FILE"
 echo ""
 
-# ---------------------------------------------------------
-# MAIN TESTING FUNCTION
-# ---------------------------------------------------------
+# Main test function
 run_test_suite() {
     local MODEL="$1"
     local TARGET_LINE="$2"
@@ -115,8 +103,7 @@ run_test_suite() {
         # 5. Run the main agent process (Main process output colors are kept on screen, but not piped)
         time LLM_DEBUG=1 proxychains4 python3 main.py --validate-plan --base ../test1 --config agents_128k.ini
 
-        # 6. Evaluate output, strip ANSI colors using sed, and write to temporary file
-        #    The sed command 's/\x1b\[[0-9;]*[a-zA-Z]//g' hunts down and deletes terminal color codes.
+        # 6. Strip ANSI colour codes with sed, and write the result to a temp file.
         python3 check_improvements.py ../test1 --repo . --ground-truth "$GROUND_DIR/$GROUND_FILE" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' > report.tmp
 
         # 7. Append final results to the primary report.txt
@@ -129,9 +116,7 @@ run_test_suite() {
     done
 }
 
-# ---------------------------------------------------------
-# EXECUTION
-# ---------------------------------------------------------
+# Execution
 
 # Group 1 Execution (Target: "kilo ai model")
 for MODEL in "${MODELS_KILO[@]}"; do

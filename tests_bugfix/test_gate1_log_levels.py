@@ -46,9 +46,7 @@ from tools.auto.architect import CandidateTask, CitedLocation
 from tools.auto.gate1_filter import Gate1Filter, _is_technical_failure
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# _is_technical_failure — pure classifier
-# ─────────────────────────────────────────────────────────────────────────────
+# _is_technical_failure: pure classifier
 
 class TestIsTechnicalFailure:
 
@@ -85,9 +83,7 @@ class TestIsTechnicalFailure:
         assert _is_technical_failure("") is False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# filter() — log levels, end to end
-# ─────────────────────────────────────────────────────────────────────────────
+# filter(): log levels, end to end
 
 @pytest.fixture()
 def minimal_config() -> configparser.ConfigParser:
@@ -225,12 +221,7 @@ class TestPresenceRejectionLevelDependsOnCause:
         """A real call failure must NOT be downgraded to INFO — this is
         the actual anomaly WARNING exists for."""
         c = _candidate(symbol="stable_func")
-        # Default retry config is 3 retries * 60s real time.sleep() between
-        # them (see Gate1Filter._check_presence) -- this test only checks
-        # the WARNING-level logging outcome, not retry timing, so skip the
-        # wait. Was split into tests_slow/test_gate1_log_levels_slow.py
-        # while this ~180s cost was unavoidable; merged back now that it
-        # isn't (2026-09-03, same fix as tests/test_auto_b3.py).
+        # Skip the retry wait (default 3 x 60 s) here: this test checks the WARNING log, not timing.
         filt._llm_call_retry_wait_sec = 0
         with caplog.at_level(logging.WARNING, logger="tools.auto.gate1_filter"):
             with patch(
@@ -238,12 +229,7 @@ class TestPresenceRejectionLevelDependsOnCause:
                 side_effect=RuntimeError("HTTP 500 from server"),
             ):
                 accepted, rejected = filt.filter([c], repo)
-        # RUN-5: no verdict is not a rejection, so the default policy keeps
-        # the candidate — but it must still be a WARNING, and it must not be
-        # logged as REJECTED, or a grep for REJECTED would count a failure
-        # as if the model had rejected the claim.
-        # The kept candidate is the same object, with the "presence unknown"
-        # note appended to its instruction (the reason travels with the task).
+        # RUN-5: no verdict is not a rejection: the candidate is kept, logged as WARNING, and never as REJECTED.
         assert accepted == [c]
         assert "Gate 1 note: presence unknown" in c.instruction
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -251,9 +237,7 @@ class TestPresenceRejectionLevelDependsOnCause:
         assert not any("Gate1[presence] REJECTED" in r.message for r in caplog.records)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# filter() — per-candidate progress output
-# ─────────────────────────────────────────────────────────────────────────────
+# filter(): per-candidate progress output
 
 class TestProgressOutput:
 

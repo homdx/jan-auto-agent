@@ -10,9 +10,7 @@ import sys
 import types
 import pytest
 
-# ---------------------------------------------------------------------------
-# Minimal stub so inner_loop.py can be imported without the full project tree
-# ---------------------------------------------------------------------------
+# Minimal stub so inner_loop.py imports without the full project tree
 
 def _make_stub(name: str) -> types.ModuleType:
     m = types.ModuleType(name)
@@ -79,9 +77,7 @@ if _parse_verdict_soft is None:
     _parse_verdict_soft = _ns["_parse_verdict_soft"]
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def approved(text: str) -> tuple[bool, str, bool]:
     return _parse_verdict_soft(text)
@@ -108,9 +104,7 @@ def _assert_unparseable(text: str) -> None:
     assert unparseable is True,  f"{text!r} → expected unparseable=True"
 
 
-# ===========================================================================
 # 1. English APPROVED
-# ===========================================================================
 
 class TestEnglishApproved:
     def test_approved_exact(self):           _assert_approved("APPROVED")
@@ -123,9 +117,7 @@ class TestEnglishApproved:
     def test_approved_leading_whitespace(self): _assert_approved("  APPROVED  ")
 
 
-# ===========================================================================
-# 2. English REVISE / REJECT / NO
-# ===========================================================================
+# 2. English REVISE, REJECT and NO
 
 class TestEnglishRevise:
     def test_revise_with_reason(self):
@@ -150,9 +142,7 @@ class TestEnglishRevise:
         _assert_revise("NO")
 
 
-# ===========================================================================
 # 3. Russian APPROVED
-# ===========================================================================
 
 class TestRussianApproved:
     def test_net_protivorechiy(self):        _assert_approved("Нет противоречий.")
@@ -170,9 +160,7 @@ class TestRussianApproved:
     def test_sootvetstvuet(self):            _assert_approved("Соответствует тексту")
 
 
-# ===========================================================================
 # 4. Russian REVISE
-# ===========================================================================
 
 class TestRussianRevise:
     def test_protivorechie_with_colon(self):
@@ -191,9 +179,7 @@ class TestRussianRevise:
     def test_ne_sootvetstvuet(self):         _assert_revise("Не соответствует плану")
 
 
-# ===========================================================================
-# 5. Negation traps — the critical ordering tests
-# ===========================================================================
+# 5. Negation traps: the critical ordering tests
 
 class TestNegationTraps:
     """These are the exact pitfalls the spec calls out."""
@@ -222,19 +208,7 @@ class TestNegationTraps:
             "'не противоречит' must be APPROVED"
 
 
-# ===========================================================================
-# 5b. One-word negation traps — Russian
-# ===========================================================================
-#
-# The «соглас» pattern already had four lookbehinds: (?<!не)(?<!нет)(?<!не )
-# (?<!нет ).  But «одобр», «принят», «соответствует», and «всё верно» only
-# had (?<!не ) (with-space) — a one-word negation like «неодобренный» (no
-# space) had only 2 chars before the keyword, so the 3-char (?<!не ) could
-# not match and the keyword was classified APPROVED, letting a rejected
-# chapter through Gate 2.  The fix adds (?<!не) (no-space) to each.
-#
-# «не всё верно» (spaced) had NO negation lookbehind at all on «всё верно»,
-# so the spaced negation matched the APPROVED pattern too.
+# 5b. One-word Russian negation traps: each keyword needs the no-space and spaced negation lookbehinds (bug fix).
 
 class TestOneWordNegationTraps:
     """One-word (no-space) and spaced negations of APPROVED keywords must
@@ -310,9 +284,7 @@ class TestOneWordNegationTraps:
         assert ok is True and unparseable is False
 
 
-# ===========================================================================
-# 6. Case / whitespace robustness
-# ===========================================================================
+# 6. Case and whitespace robustness
 
 class TestCaseAndWhitespace:
     def test_mixed_case_protiv(self):        _assert_revise("  пРотИв  ")
@@ -323,9 +295,7 @@ class TestCaseAndWhitespace:
     def test_leading_empty_lines(self):      _assert_approved("\n\nAPPROVED")
 
 
-# ===========================================================================
-# 7. Unparseable (fail-open)
-# ===========================================================================
+# 7. Unparseable replies fail open
 
 class TestUnparseable:
     def test_json_blob(self):
@@ -345,9 +315,7 @@ class TestUnparseable:
         _assert_unparseable("Текст написан хорошо и атмосфера передана верно в целом")
 
 
-# ===========================================================================
-# 8. Regression — existing English-only behaviour unchanged
-# ===========================================================================
+# 8. Regression: English-only behaviour is unchanged
 
 class TestRegression:
     """Replicate the original CR-2 test expectations exactly."""
@@ -373,9 +341,7 @@ class TestRegression:
         assert unparseable is True
 
 
-# ===========================================================================
 # 9. Reason extraction
-# ===========================================================================
 
 class TestReasonExtraction:
     def test_ru_colon_reason_captured(self):

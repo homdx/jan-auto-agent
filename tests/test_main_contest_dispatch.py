@@ -30,9 +30,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# harness
-# ─────────────────────────────────────────────────────────────────────────────
+# Harness
 
 class _FakeOrch:
     """Minimal stand-in for `Orchestrator`: the REPL needs only its key strings
@@ -79,8 +77,7 @@ def _run_repl(lines, base_dir, contest_main=None, *, real_contest=False):
 
     orch = _FakeOrch()
 
-    # a config path that does not exist: `_validate_typed_config_values` bails
-    # out immediately instead of scanning the real agents.ini
+    # A config path that does not exist: _validate_typed_config_values bails out at once.
     argv = ["main.py", "--base", str(base_dir),
             "--config", str(base_dir / "absent.ini")]
 
@@ -107,9 +104,7 @@ def _repl(base_dir, line, *, real_contest=False, contest_main=None):
     return _run_repl([line, "/exit"], base_dir, contest_main, real_contest=real_contest)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # /contest in the REPL
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestReplContestDispatch:
 
@@ -118,8 +113,7 @@ class TestReplContestDispatch:
         orch = _repl(tmp_path, "/contest run --ticket 63 --no-tests", contest_main=contest)
         out = capsys.readouterr().out
         assert contest.calls == [["run", "--ticket", "63", "--no-tests"]]
-        # must not fall through to run_pipeline — a missed dispatch would parse
-        # the whole line as a prompt and try to chat or edit a file
+        # Must not fall through to run_pipeline, which would treat the line as a prompt.
         assert orch.pipeline_calls == []
         assert "Unknown command" not in out
 
@@ -192,9 +186,7 @@ class TestReplContestSystemExit:
         assert "exit code 1" in out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # --contest one-shot flag
-# ─────────────────────────────────────────────────────────────────────────────
 
 class TestContestOneShot:
 
@@ -299,9 +291,7 @@ class TestContestOneShot:
         assert exc_info.value.code == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# slash-command guard
-# ─────────────────────────────────────────────────────────────────────────────
+# Slash-command guard
 
 class TestContestGuardAndHelp:
 

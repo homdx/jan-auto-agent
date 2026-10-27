@@ -7,17 +7,14 @@ from typing import Any, Dict, List, TYPE_CHECKING
 if TYPE_CHECKING:
     from tools.prompt_parser import ParsedPrompt
 
-# BUGFIX: was `str(x).lstrip("-* ")` at both call sites below. str.lstrip(chars)
-# removes ANY of the given characters from the left, repeatedly — it has no
-# concept of "a bullet marker" versus "the text's own leading punctuation".
-# An LLM-reported issue/change that legitimately starts with a minus sign
-# (e.g. "-1 is returned instead of raising an IndexError") had that sign
-# silently eaten, becoming "1 is returned instead of raising an IndexError"
-# and flipping the reported meaning in the console output the user reads.
-# Same bug class already found and fixed in canon_validator.py's claim
-# extraction; reuse the same "marker + required trailing whitespace" shape
-# so a real "- " or "* " bullet prefix is stripped but a bare leading "-"
-# or "*" attached to actual content is left alone.
+# HARDEN-7 C: the shared reader of a reply field's type. `render` is the last
+# step of a run — after every LLM call has been paid for — and the improvement
+# agent's `explanation` / `improved_code` used to be read with
+# `(improvement.get("explanation") or "").strip()`, which raised AttributeError
+# on a model that answered with a list instead of a string.
+from tools.llm_stream import reply_text
+
+# Strip only bullet markers ("- ", "* "), not a leading minus or star that is part of the text (e.g. "-1 is returned").
 _BULLET_MARKER_RE = re.compile(r"^\s*[-*]\s+")
 
 
@@ -65,7 +62,7 @@ class OutputFormatter:
         elif parsed.target_type == "class":
             target_prefix = "class "
             
-        target_display = f"{target_prefix}{parsed.target_name}".strip()
+        target_display = f"{target_prefix}{parsed.target_name}".strip() if parsed.target_name else ""
         if not target_display:
             target_display = "File Imports Only"
 
@@ -103,11 +100,7 @@ class OutputFormatter:
             for ref_name, ref_data in found_refs.items():
                 if isinstance(ref_data, dict):
                     source_file = ref_data.get("file", "unknown_source")
-                    # BUGFIX (audit): .get("code", "") only applies the ""
-                    # default when the key is ABSENT, not when it's present
-                    # with an explicit None value — (None).strip() crashed.
-                    # Other fields in this codebase use the `or ""` idiom
-                    # for exactly this reason; this one didn't.
+                    # `or ""` covers an explicit None, which .get("code", "") does not.
                     ref_code = (ref_data.get("code") or "").strip()
                     if ref_code:
                         print(f"# REFERENCED FROM {source_file}")
@@ -117,24 +110,19 @@ class OutputFormatter:
         # 5. Evaluate Intent Matrices Filtering Threshold Rules
         intent = parsed.intent
 
-        # Section: EXPLANATION (Skipped for intent='show'/'show_imports')
-        # Bugfix: "show_imports" is a distinct intent (prompt_parser.py)
-        # that should behave like "show", but this gate only matched the
-        # literal "show" and printed a spurious EXPLANATION under the list.
+        # Skip EXPLANATION for intent show and show_imports.
         if intent not in ("show", "show_imports"):
-            explanation_text = (improvement.get("explanation") or "").strip()
+            explanation_text = reply_text(improvement.get("explanation"))
             if explanation_text:
                 print("# EXPLANATION")
                 print(explanation_text)
                 print()
 
-        # Sections: ISSUES, IMPROVED CODE, CHANGES
-        # (Skipped for intent='show'/'show_imports'/'explain' — same bug as
-        # the EXPLANATION gate above: show_imports was missing here too.)
+        # Skip ISSUES, IMPROVED CODE and CHANGES for show, show_imports and explain.
         if intent not in ("show", "show_imports", "explain"):
             # Sub-Section: ISSUES
             print("# ISSUES")
-            issues = improvement.get("issues", [])
+            issues = _as_items(improvement.get("issues", []))
             if issues:
                 for issue in issues:
                     clean_issue = _BULLET_MARKER_RE.sub("", str(issue), count=1).strip()
@@ -145,7 +133,7 @@ class OutputFormatter:
             print()
 
             # Sub-Section: IMPROVED CODE
-            improved_code_text = (improvement.get("improved_code") or "").strip()
+            improved_code_text = reply_text(improvement.get("improved_code"))
             if improved_code_text:
                 print("# IMPROVED CODE")
                 print(improved_code_text)
@@ -153,7 +141,7 @@ class OutputFormatter:
 
             # Sub-Section: CHANGES
             print("# CHANGES")
-            changes = improvement.get("changes", [])
+            changes = _as_items(improvement.get("changes", []))
             if changes:
                 for change in changes:
                     clean_change = _BULLET_MARKER_RE.sub("", str(change), count=1).strip()
@@ -164,3 +152,17 @@ class OutputFormatter:
             print()
 
         print(divider)
+
+
+def _as_items(value) -> list:
+    """A reply's issues/changes as a list of items (AUDIT3-C7).
+
+    A model that answers ``"issues": "the function lacks error handling"`` sent
+    one string, which was iterated character by character — one bullet per
+    letter. A string is one item; a dict or a number is one item too.
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]

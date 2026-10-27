@@ -80,8 +80,7 @@ def _reviewer(cfg: configparser.ConfigParser) -> ClusterReviewer:
         ("probe_budget_max_chars", "_probe_budget_max_chars", 0),
         ("probe_budget_escalations", "_probe_budget_escalations", 2),
         ("probe_memo_max_entries", "_probe_memo_max_entries", 200),
-        # Already guarded before this fix — pinned here so the whole probe
-        # block is covered by one contract.
+        # Already guarded before this fix; pinned so the whole probe block has one contract.
         ("probe_budget_ladder_scale", "_probe_budget_ladder_scale", 1.0),
     ],
 )

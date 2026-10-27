@@ -58,8 +58,7 @@ model = test/a
 #: The same ini with the gate's profile gone: no reviewer without `--no-review`.
 INI_NO_GATE = INI.replace("gate_llm_profile = review_model\n", "").replace(REVIEW_SECTION, "")
 
-#: One `### ID` per case: the target, a longer number, a lettered one, a fenced
-#: fake and the next part the section must not run into.
+#: One `### ID` per case: the target, a longer number, a lettered one, a fenced fake, and the next part the section must not run into.
 EPIC = """# The arena epic
 
 Intro.
@@ -317,8 +316,7 @@ def test_file_and_item_cut_one_section(repo, monkeypatch, capsys, tmp_path):
     material = "## Material: epic.md — section AR-7"
     assert task in prompt and material in prompt
     assert prompt.index(task) < prompt.index("skip AR-5, do AR-7") < prompt.index(material)
-    # the cut section: the heading and its body, and no other heading's text. The
-    # epic itself is also handed to the model by path, so cut at the next `## `.
+    # Cut the section at its heading and body only; the epic is also handed to the model by path, so cut at the next `## `.
     section = prompt.split(material, 1)[1].split("\n## ", 1)[0]
     assert "seven" in section
     for gone in ("five", "seventy", "seven b", "Next part", "### AR-7 fake"):
@@ -720,8 +718,7 @@ def direct_repo(repo, monkeypatch):
         lambda provider, url, key, now: [dict(r) for r in DIRECT_RECORDS])
 
     def kilo_list(repo, providers):
-        # Kilo knows only `kiloprov`; a named provider it does not know is an error,
-        # which is what keeps the "not in kilo.jsonc" hint quiet for the roles.
+        # Kilo knows only `kiloprov`; an unknown named provider is an error, which keeps the "not in kilo.jsonc" hint quiet for the roles.
         if providers:
             raise models.KiloError(f"kilo models {providers[0]}: unknown provider")
         return {"kiloprov": {"model-k": {"cost": {"input": 0, "output": 0}}}}

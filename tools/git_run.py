@@ -43,16 +43,12 @@ __all__ = [
     "run_git",
 ]
 
-#: The one signature that is a transient — git's own "another git has the index"
-#: message, on stderr with exit 128. A stale lock left by a crashed git matches it
-#: too, which is exactly why the ladder below is bounded and short: it ends by
-#: raising that error rather than waiting forever.
+#: Git's "another git has the index" message (stderr, exit 128). A stale lock matches it too, so the ladder is bounded and then raises.
 LOCK_CONTENTION_RE = re.compile(
     r"Unable to create '.*\.lock': File exists", re.IGNORECASE,
 )
 
-#: 8 attempts 0.25 s apart. A held lock that a neighbour releases in half a second
-#: is inside the ladder; a stale one costs about two seconds and then raises.
+#: 8 attempts, 0.25 s apart: a lock released within about 2 s is waited out; a stale one raises.
 LOCK_RETRIES = 8
 LOCK_BACKOFF_S = 0.25
 
@@ -61,8 +57,15 @@ def _backoff(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _attempted(text: str) -> bool:
-    """Whether *text* is git's held-index message."""
+def _attempted(text) -> bool:
+    """Whether *text* is git's held-index message.
+
+    Accepts ``bytes`` as well as ``str``: a caller that asked for the raw
+    ``stdout``/``stderr`` (``text=False``) still gets the one retry the message
+    describes, instead of a bytes/str mismatch silently disabling the ladder.
+    """
+    if isinstance(text, (bytes, bytearray)):
+        text = bytes(text).decode("utf-8", errors="replace")
     return bool(LOCK_CONTENTION_RE.search(text))
 
 
@@ -76,6 +79,7 @@ def run_git(
     retries: int = LOCK_RETRIES,
     backoff_s: float = LOCK_BACKOFF_S,
     sleep: Optional[Callable[[float], None]] = None,
+    text: bool = True,
 ) -> subprocess.CompletedProcess:
     """Run *cmd* — the full git argv — and return its `CompletedProcess`.
 
@@ -92,6 +96,14 @@ def run_git(
     "no baseline"). *timeout* is ``None`` unless the caller had one before — the
     ladder adds no deadline to a call that never had one. *retries=1* is a single
     attempt with no waiting at all.
+
+    *text=False* hands back the raw ``bytes`` of stdout and stderr, for a caller
+    that must reproduce git's output byte for byte — HARDEN-7 D: the patch that
+    keeps a failed task's work, where a CRLF line end and a non-UTF-8 byte are
+    both destroyed by decoding it as text. ``encoding`` and ``errors`` must be
+    left unset on that call: ``subprocess`` refuses them together with
+    ``text=False``. The held-index retry still applies, and reads ``stderr`` as
+    bytes for the same message.
 
     *sleep* is the wait between two attempts, the module's ``_backoff`` unless
     given: a named seam so a test can release the lock *in* the backoff and count the attempts
@@ -110,9 +122,9 @@ def run_git(
             list(cmd),
             cwd=str(cwd) if cwd is not None else None,
             capture_output=True,
-            text=True,
-            encoding=encoding,
-            errors=errors,
+            text=text,
+            encoding=encoding if text else None,
+            errors=errors if text else None,
             timeout=timeout,
         )
         if (

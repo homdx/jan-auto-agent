@@ -32,10 +32,7 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def _init_repo(root: Path) -> None:
-    # .collect/ is a build artifact directory (same category as .agent/)
-    # and is git-ignored in the real project — mirrored here so these
-    # fixtures match real-world dirty-tree behavior rather than treating
-    # collect's own untracked output as an uncommitted source change.
+    # .collect/ is git-ignored in the real project; mirror that here.
     (root / ".gitignore").write_text(".collect/\n")
     _git(root, "init", "-q")
     _git(root, "config", "user.email", "test@example.com")

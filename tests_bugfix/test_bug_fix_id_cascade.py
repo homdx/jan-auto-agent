@@ -499,10 +499,7 @@ class TestTerminalGatesAlsoParkFixTask:
                 .handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
         except Boom:
             pass
-        # An in-process exception now parks the task on its way out, so force
-        # it back to model the harder case the gate must still cover: SIGKILL
-        # / power loss, where no Python runs and the task is left TODO on disk
-        # with no opportunity to clean up.
+        # Simulate SIGKILL or power loss: the task is left TODO with no cleanup.
         state.set_task_status("BUG-FIX-AUTO-T168", "todo")
 
         outer = MagicMock()

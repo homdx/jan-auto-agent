@@ -38,16 +38,11 @@ HELLO_WORLD = REPO_ROOT / "examples" / "hello-world"
 RUNBOOK = HELLO_WORLD / "RUNBOOK.md"
 SKILLS_DIR = REPO_ROOT / "skills"
 
-#: How many `python3 main.py --auto ... --skill ...` invocations the runbook
-#: is expected to document — one per mechanical base, plus Flow 4's
-#: same-base provider-split variant (GATE3-PROFILE-5). Pinned so that losing
-#: a flow to a bad edit is a failure rather than a smaller, still-green run.
+#: Number of documented --auto invocations: one per mechanical base, plus Flow 4's provider-split variant. Pinned so a dropped flow fails.
 EXPECTED_FLOWS = 4
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Parsing
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _runbook_text() -> str:
     return RUNBOOK.read_text(encoding="utf-8")
@@ -91,9 +86,7 @@ def _flow_ids() -> list[str]:
 FLOWS = _flow_commands()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# The parser itself must not silently find nothing
-# ─────────────────────────────────────────────────────────────────────────────
+# The parser must not silently find nothing
 
 def test_runbook_exists():
     assert RUNBOOK.is_file(), f"{RUNBOOK} is missing"
@@ -116,9 +109,7 @@ def test_every_flow_names_a_skill():
         assert _opt(argv, "--skill"), f"no --skill in: {' '.join(argv)}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Each documented command is runnable in principle
-# ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("argv", FLOWS, ids=_flow_ids())
 def test_flow_skill_exists(argv):
@@ -174,9 +165,7 @@ def test_flow_flags_are_recognised_by_argparse(argv):
             assert flag in help_text, f"{flag} is not a real main.py flag"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # The runbook's claims match the adapters
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _gate_table() -> dict[str, list[str]]:
     """Parse the 'Expected gate sets' markdown table."""
@@ -255,9 +244,7 @@ def test_every_shipped_skill_has_a_documented_flow():
     assert set(list_skills(SKILLS_DIR)) == documented
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # The baseline the flows measure against
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_baseline_main_prints_hello_world():
     result = subprocess.run(
@@ -307,9 +294,7 @@ def test_no_leftover_agent_state():
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Documented facts that are easy to get wrong
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_runbook_documents_the_reset_step():
     """Every observed re-run problem traced back to a dirty sandbox."""

@@ -42,14 +42,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from tools.collect.model import ModuleRecord, Provenance
 
-# ♻️ Reused, not redefined: the one place this project enumerates its
-# known `task_mode` values (COLLECT-14 must never drift from
-# `tools.auto.utils.normalize_task_mode`'s notion of "known").
+# Reuses tools.auto.utils' known task modes, so COLLECT-14 cannot drift.
 from tools.auto.utils import _KNOWN_TASK_MODES
 
-#: `{key}_{task_mode}` templates render with this literal placeholder
-#: (see `ast_facts._fstring_key_and_override`); COLLECT-14 expands it
-#: back out per known task_mode to get the concrete `.ini` key.
+#: `{key}_{task_mode}` templates use this placeholder; COLLECT-14 expands it per known mode.
 _MODE_PLACEHOLDER = "{task_mode}"
 
 
@@ -127,12 +123,7 @@ def build_config_map(
                 {"readers": set(), "fallbacks": set(), "has_mode_override": False},
             )
             bucket["readers"].add(c.reader_module)
-            # Fallback values must be hashable to dedupe via a set; mutable
-            # fallbacks (list/dict literals) can't occur here since
-            # `ast_facts._literal_or_none` only ever returns
-            # `ast.literal_eval`-able scalars/None for a `fallback=` kwarg
-            # shaped like this codebase's config reads use, but guard
-            # anyway rather than assume.
+            # Fallbacks are hashable scalars; guard anyway so a mutable fallback cannot break the set.
             try:
                 bucket["fallbacks"].add(c.fallback)
             except TypeError:

@@ -56,9 +56,7 @@ from tools.auto.auto_metrics import AutoMetricsStream
 from tools.auto.auto_tuner import AutoTuner, TuneOutcome
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_config() -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
@@ -194,9 +192,7 @@ def _run_tasks(ctrl, outer_results, *, exhaustion_ticket="TKT-1"):
         return ctrl._run_task_loop()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 — record_gate2 called after every task
-# ─────────────────────────────────────────────────────────────────────────────
+# AC1: record_gate2 is called after every task
 
 class TestRecordGate2Called:
     def test_record_gate2_called_for_passed_task(self, tmp_path):
@@ -267,9 +263,7 @@ class TestRecordGate2Called:
         assert ctrl.metrics_stream.record_gate2.call_count == 2
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC8 — attempts and feedback extracted correctly from inner_results
-# ─────────────────────────────────────────────────────────────────────────────
+# AC8: attempts and feedback are extracted correctly from inner_results
 
 class TestAttemptsAndFeedback:
     def test_attempts_summed_from_inner_results(self, tmp_path):
@@ -336,9 +330,7 @@ class TestAttemptsAndFeedback:
         assert kwargs["prompt_store"] is ps
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC2 — maybe_tune called once per task, after record_gate2
-# ─────────────────────────────────────────────────────────────────────────────
+# AC2: maybe_tune is called once per task, after record_gate2
 
 class TestMaybeTuneCalled:
     def test_maybe_tune_called_once_per_task(self, tmp_path):
@@ -386,9 +378,7 @@ class TestMaybeTuneCalled:
         ctrl.metrics_stream.record_gate2.assert_not_called()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC3 — promoted outcome logged to run.log
-# ─────────────────────────────────────────────────────────────────────────────
+# AC3: the promoted outcome is logged to run.log
 
 class TestPromotionLogging:
     def _read_log(self, ctrl) -> str:
@@ -433,9 +423,7 @@ class TestPromotionLogging:
         assert "0.90" in log
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC4 — non-promoted outcome does NOT write to run.log
-# ─────────────────────────────────────────────────────────────────────────────
+# AC4: a non-promoted outcome does not write to run.log
 
 class TestNonPromotionSilent:
     def _read_log(self, ctrl) -> str:
@@ -474,9 +462,7 @@ class TestNonPromotionSilent:
         assert "promoted" not in log
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC5 — auto metrics isolated from interactive metrics.json
-# ─────────────────────────────────────────────────────────────────────────────
+# AC5: auto metrics are isolated from the interactive metrics.json
 
 class TestMetricsIsolation:
     def test_auto_metrics_stream_writes_to_agent_dir(self, tmp_path):
@@ -526,19 +512,15 @@ class TestMetricsIsolation:
 
     def test_auto_metrics_stream_refuses_interactive_path(self, tmp_path):
         """AC9: AutoMetricsStream raises if given the interactive default path."""
-        # Only runnable when CWD has no existing metrics.json collision
-        # (the guard compares resolved paths)
+        # Runs only when CWD has no metrics.json that would collide (the guard compares resolved paths).
         cwd_metrics = Path("metrics.json").resolve()
         fake_agent_dir = cwd_metrics.parent   # would resolve to project root
-        # This should raise ValueError because the metrics path would collide
-        # with the interactive default
+        # Must raise, since the metrics path would collide with the interactive default.
         with pytest.raises(ValueError, match="collide"):
             AutoMetricsStream(fake_agent_dir)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC6 — hot-reload fired on promotion
-# ─────────────────────────────────────────────────────────────────────────────
+# AC6: hot-reload fires on promotion
 
 class TestHotReload:
     def test_prompt_store_push_called_on_promotion(self, tmp_path):
@@ -629,9 +611,7 @@ class TestHotReload:
         assert len(reload_called) == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC7 — metrics_stream=None / auto_tuner=None handled safely
-# ─────────────────────────────────────────────────────────────────────────────
+# AC7: metrics_stream=None and auto_tuner=None are handled safely
 
 class TestNoneSafe:
     def test_metrics_stream_none_does_not_crash(self, tmp_path):
@@ -680,9 +660,7 @@ class TestNoneSafe:
         assert tasks_done == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# End-to-end: real AutoMetricsStream + mock AutoTuner
-# ─────────────────────────────────────────────────────────────────────────────
+# End to end: real AutoMetricsStream with a mock AutoTuner
 
 class TestEndToEndMetricsWiring:
     def test_real_stream_records_correct_count(self, tmp_path):

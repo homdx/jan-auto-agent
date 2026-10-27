@@ -26,21 +26,20 @@ class GitRefError(Exception):
 
 
 def git(repo: Path, *args: str, env: Optional[dict] = None,
-        stdin: Optional[str] = None, strip: bool = True) -> str:
+        stdin: Optional[str] = None, strip: bool = True,
+        timeout: Optional[float] = None) -> str:
     """Run `git <args>` in *repo*; its stdout (stripped unless *strip* is
-    False — a file's text keeps its bytes), or `GitRefError`."""
+    False — a file's text keeps its bytes), or `GitRefError` (also when it
+    runs longer than *timeout* seconds; the process is killed)."""
     try:
         proc = subprocess.run(
             ["git", *args], cwd=str(repo), capture_output=True, env=env,
-            # Bug 174: not the locale's strict codec — a latin-1 commit subject
-            # or ticket blob was a UnicodeDecodeError traceback. surrogateescape
-            # keeps every byte, so a blob read here and fed back as *stdin*
-            # (`hash-object`) is the same blob; `printable` is for the screen.
-            # Bug 185: bytes in, bytes out — text mode's universal newlines
-            # turned a CRLF ticket's `\r\n` into `\n`, so the blob read back
-            # was never the blob on the branch.
+            # Bytes in and out (surrogateescape), so CRLF blobs and non-UTF-8 subjects round-trip (bugs 174, 185).
             input=None if stdin is None else stdin.encode("utf-8", "surrogateescape"),
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as err:
+        raise GitRefError(printable(f"git {' '.join(args)}: timed out after {err.timeout:g} s")) from err
     except OSError as err:  # no git binary at all
         raise GitRefError(printable(f"git {' '.join(args)}: {err}")) from err
     out = proc.stdout.decode("utf-8", "surrogateescape")
@@ -90,8 +89,7 @@ def status_paths(repo: Path, pathspec: Optional[str] = None,
         if not record:
             continue
         if renamed:
-            # `-z` puts the OLD name second in an `R ` / `C ` pair — `old -> new`
-            # over a tab becomes `new\0old`, so the name worth keeping was first.
+            # -z lists the new name first in an R/C pair, so the first name is kept.
             renamed = False
             continue
         if len(record) < 3 or record[2] != " ":

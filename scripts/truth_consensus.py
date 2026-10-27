@@ -10,7 +10,9 @@ than resolved by majority.
     python3 scripts/truth_consensus.py validate1/truth-*.csv \\
         --truth validate1/truth.csv --report validate1/adjudication.md
 
-Exit code 4 when anything is left disputed — useful in a script.
+Exit code 4 when anything is left disputed — useful in a script. Exit code 2 when a row's truth is
+no verdict (REAL, FALSE, FIXED; UNDECIDED or a blank cell decides nothing), or when --truth would
+lose rows of an existing file that this run does not settle (--replace writes it anyway).
 """
 import argparse
 import csv
@@ -21,24 +23,43 @@ from collections import Counter, defaultdict
 
 SEV = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "NONE": 4, "": 5}
 NEEDED = {"finding", "truth"}
+#: what settles a finding; UNDECIDED (and a blank cell) is a row that decides nothing
+VERDICTS = ("REAL", "FALSE", "FIXED")
+TRUTH_COLUMNS = ["finding", "truth", "checked_by", "how"]
 
 
 def load(paths):
-    rows, skipped = [], []
+    """Every verdict row, its adjudicator in ``_adj``, its file and line in ``_at``. A blank truth is
+    UNDECIDED: it settled as the verdict "" (two blank rows "agreed"); see `no_verdicts`."""
+    rows, skipped, nameless = [], [], []
     for p in paths:
         name = os.path.basename(p).rsplit(".", 1)[0].lower()
         name = name[6:] if name.startswith("truth-") else name
-        with open(p, newline="", encoding="utf-8") as fh:
+        with open(p, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM: "\ufefffinding"
             rd = csv.DictReader(fh)
             if not NEEDED.issubset(set(rd.fieldnames or [])):
                 skipped.append(os.path.basename(p)); continue
             for r in rd:
+                if not (r.get("finding") or "").strip():
+                    # a verdict without a finding settled as the finding "" (truth.csv got ",REAL,a+b,x")
+                    if (r.get("truth") or "").strip():
+                        nameless.append(f"{p}:{rd.line_num}")
+                    continue
                 r["_adj"] = name
-                r["truth"] = (r.get("truth") or "").strip().upper()
+                r["_at"] = f"{p}:{rd.line_num}"
+                r["truth"] = (r.get("truth") or "").strip().upper() or "UNDECIDED"
                 rows.append(r)
     if skipped:
         print(f"skipped (not verdict CSVs): {', '.join(skipped)}", file=sys.stderr)
+    if nameless:
+        print(f"skipped (a verdict with no finding): {', '.join(nameless)}", file=sys.stderr)
     return rows
+
+
+def no_verdicts(rows) -> list:
+    """``file:line: 'WORD'`` of each row whose truth is no verdict: MAYBE settled as one, and so did a second
+    header line of a file (``TRUTH``, append_verdict's doubled header)."""
+    return [f"{r['_at']}: {r['truth']!r}" for r in rows if r["truth"] not in VERDICTS and r["truth"] != "UNDECIDED"]
 
 
 def longest(rs, field):
@@ -59,6 +80,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csvs", nargs="+")
     ap.add_argument("--truth", metavar="FILE.csv", help="write the settled ground truth")
+    ap.add_argument("--replace", action="store_true",
+                    help="write --truth even when that drops rows of it this run does not settle (it is "
+                         "written from the adjudicators' files alone; without this the run refuses)")
     ap.add_argument("--report", metavar="FILE.md")
     ap.add_argument("--arbiter", metavar="NAME",
                     help="whose verdict settles a split (e.g. the human who read the "
@@ -69,8 +93,23 @@ def main():
     if a.arbiter:
         a.arbiter = a.arbiter.strip().lower()
 
-    paths = [p for pat in a.csvs for p in sorted(glob.glob(pat))] or a.csvs
+    paths, unmatched = [], []
+    for pat in a.csvs:
+        # A file with that name is that file; glob patterns apply only when no file matches.
+        hits = [pat] if os.path.isfile(pat) else sorted(glob.glob(pat))
+        paths += hits
+        if not hits:
+            unmatched.append(pat)
+    if unmatched:
+        # the pattern itself was opened: a FileNotFoundError traceback
+        print(f"no file matches: {', '.join(unmatched)}", file=sys.stderr)
+        return 2
     rows = load(paths)
+    bad = no_verdicts(rows)
+    if bad:
+        print("not a verdict (REAL, FALSE, FIXED, or UNDECIDED for none):\n  " + "\n  ".join(bad[:20])
+              + (f"\n  … and {len(bad) - 20} more" if len(bad) > 20 else ""), file=sys.stderr)
+        return 2
     if not rows:
         print("no verdict rows", file=sys.stderr)
         return 1
@@ -80,27 +119,37 @@ def main():
     for r in rows:
         g[(r.get("finding") or "").strip()].append(r)
 
-    settled, disputed, arbitrated = {}, {}, {}
+    settled, disputed, arbitrated, torn = {}, {}, {}, {}
     for k, rs in g.items():
-        votes = {r["_adj"]: r["truth"] for r in rs}
+        # Two verdicts from one adjudicator (REAL and FALSE on one place) are UNDECIDED and reported; row order must not decide.
+        said: dict = defaultdict(set)
+        for r in rs:
+            if r["truth"] != "UNDECIDED":
+                said[r["_adj"]].add(r["truth"])
+        votes = {r["_adj"]: "UNDECIDED" for r in rs}
+        for adj, vs in said.items():
+            if len(vs) == 1:
+                votes[adj] = next(iter(vs))
+            else:
+                torn.setdefault(k, {})[adj] = sorted(vs)
         distinct = {v for v in votes.values() if v != "UNDECIDED"}
         if len(distinct) == 1:
-            settled[k] = (distinct.pop(), rs)
+            verdict = distinct.pop()
+            # Only the adjudicators who said it are listed; an UNDECIDED one is not shown as agreeing.
+            settled[k] = (verdict, [r for r in rs if r["truth"] == verdict and votes[r["_adj"]] == verdict])
         elif distinct:
-            # An arbiter breaks the tie rather than the count doing it. Two
-            # models agreeing is not evidence when both applied the same wrong
-            # rule — which is exactly how a split usually arises.
+            # An arbiter breaks ties: two models agreeing is not evidence when both applied the same wrong rule.
             if a.arbiter and a.arbiter in votes and votes[a.arbiter] != "UNDECIDED":
-                settled[k] = (votes[a.arbiter], rs)
+                settled[k] = (votes[a.arbiter], [r for r in rs if r["truth"] == votes[a.arbiter]
+                                                 and votes[r["_adj"]] == votes[a.arbiter]])
                 arbitrated[k] = (votes[a.arbiter], votes)
             else:
                 disputed[k] = (votes, rs)
         else:
-            # every vote is UNDECIDED: nobody decided it, so it is left open for a human —
-            # neither settled nor dropped from the report
+            # Every vote UNDECIDED: left open for a human, neither settled nor dropped from the report.
             disputed[k] = (votes, rs)
 
-    L = [f"# Adjudication\n",
+    L = ["# Adjudication\n",
          f"{len(adjudicators)} adjudicators · {len(g)} findings · "
          f"{len(settled)} settled · {len(disputed)} disputed\n",
          f"Adjudicators: {', '.join(adjudicators)}\n"]
@@ -137,6 +186,16 @@ def main():
         for k, (chosen, votes) in arbitrated.items():
             others = ", ".join(f"{n}={v}" for n, v in sorted(votes.items()) if n != a.arbiter)
             L.append(f"| `{k}` | **{chosen}** | {others} |")
+        L.append("")
+
+    if torn:
+        L.append(f"\n## Contradicting themselves ({len(torn)})\n")
+        L.append("An adjudicator's file says more than one verdict for these: that adjudicator counts as "
+                 "UNDECIDED on them. Settle the file by hand (claimcheck_truth writes both rows when two "
+                 "claims about one place disagree).\n")
+        L.append("| finding | adjudicator: verdicts |\n|---|---|")
+        for k, who in sorted(torn.items()):
+            L.append(f"| `{k}` | " + "; ".join(f"{n}: {'/'.join(v)}" for n, v in sorted(who.items())) + " |")
         L.append("")
 
     L.append(f"\n## Disputed ({len(disputed)}) — a human decides\n")
@@ -181,19 +240,34 @@ def main():
              "together. It only flags an adjudicator that is reliably out of step, "
              "which is worth reading before trusting it.\n")
 
+    # The truth file is rebuilt from the adjudicators' files only; rows no adjudicator settles this run, and columns this run does not write, are kept.
+    old_rows, old_cols = {}, []
+    if a.truth and os.path.isfile(a.truth):
+        with open(a.truth, newline="", encoding="utf-8-sig") as fh:
+            rd = csv.DictReader(fh)
+            old_cols = [c for c in (rd.fieldnames or []) if c and c not in TRUTH_COLUMNS]
+            old_rows = {(r.get("finding") or "").strip(): r for r in rd if (r.get("finding") or "").strip()}
+        lost = sorted(f for f in old_rows if f not in settled)
+        if lost and not a.replace:
+            print(f"{a.truth}: {len(lost)} of its rows are not settled by this run (first: {lost[0]}); writing it "
+                  "would delete them. Put them in an adjudicator's file, or pass --replace.", file=sys.stderr)
+            return 2
+
     text = "\n".join(L)
     if a.report:
-        open(a.report, "w", encoding="utf-8").write(text)
+        with open(a.report, "w", encoding="utf-8") as fh:
+            fh.write(text)
         print(f"report -> {a.report}")
     else:
         print(text)
 
     if a.truth:
         with open(a.truth, "w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=["finding", "truth", "checked_by", "how"])
+            w = csv.DictWriter(fh, fieldnames=TRUTH_COLUMNS + old_cols)
             w.writeheader()
             for k, (t, rs) in sorted(settled.items()):
-                w.writerow({"finding": k, "truth": t,
+                w.writerow({**{c: old_rows.get(k, {}).get(c) or "" for c in old_cols},
+                            "finding": k, "truth": t,
                             "checked_by": "+".join(sorted(r["_adj"] for r in rs)),
                             "how": longest(rs, "how")})
         print(f"ground truth -> {a.truth}  ({len(settled)} settled)")

@@ -80,8 +80,7 @@ def test_identical_lines_across_different_rows_are_not_deduplicated():
 
     block = build_collect_context_block(model, "pkg/a.py")
     assert "config_read [api] active (fallback=True)" in block
-    # Contract might not be present if the renderer returns empty (no calls/calls_into)
-    # This is expected behavior - the row exists but has no data
+    # Empty renderer output: the row exists but has no data.
 
 
 def test_multiple_identical_config_reads_are_all_deduplicated():

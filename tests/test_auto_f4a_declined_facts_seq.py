@@ -64,10 +64,7 @@ from tools.auto.architect import ClusterReviewer
 from tools.auto.repo_ingest import RepoCluster
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Integration harness — mirrors tests/test_auto_p6_decline_tallies.py exactly,
-# since this fix sits right next to the code AUTO-P6 already patched once.
-# ─────────────────────────────────────────────────────────────────────────────
+# Integration harness, mirrors tests/test_auto_p6_decline_tallies.py
 
 class _FakeBridge:
     usable = True
@@ -168,8 +165,7 @@ class TestDeclineFactsSeq:
         cluster, base_dir = cluster_and_base
         bridge = _FakeBridge({
             "tools/x.py": "module: tools/x.py\n  helper(...)  :1 — a thing",
-            # "helper" deliberately absent — module knows the name, the
-            # bridge's own pull_symbol does not.
+            # "helper" is absent: the module knows the name, the bridge does not.
         })
         r = _reviewer(_cfg(probe_max_rounds="2"), bridge)
         ev = _run(
@@ -260,10 +256,7 @@ class TestDeclineFactsSeq:
         assert d[0]["params"]["informed_facts"] == "0/0"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC-F4a-4/5/6: analyze_logs rendering, against synthetic events (same style
-# as tests/test_auto_f4_informed_facts.py's TestAnalyzeLogsRendering).
-# ─────────────────────────────────────────────────────────────────────────────
+# analyze_logs rendering on synthetic events (see test_auto_f4_informed_facts.py)
 
 def _evt(kind: str, params: dict | None = None, run_id: str = "run1", **kw) -> dict:
     return {
@@ -378,7 +371,6 @@ class TestAnalyzeLogsIncludesDeclines:
         ]
         runs = analyze_logs.analyze(events)
         text = _capture_summary(runs["run1"])
-        # c1: informed 1/1. c2 (declined): blind 0/2. Grand total:
-        # informed 1/1, blind 0/2 — not double-counted, not dropped.
+        # c1 informed 1/1, c2 blind 0/2; the grand total must not double-count.
         assert "informed" in text and "100% (1/1)" in text
         assert "blind" in text and "0% (0/2)" in text

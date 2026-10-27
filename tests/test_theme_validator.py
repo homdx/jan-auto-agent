@@ -400,7 +400,5 @@ def test_ascii_guard_survives_malformed_python(tmp_path):
     written, err = c._write_files(
         [{"path": "main.py", "content": truncated}], tmp_path, "T",
         allowed_paths=frozenset({"main.py"}))
-    # Must not raise. The ascii gate can't tokenize broken code, so it can't
-    # find identifiers to flag — the file proceeds to the remaining guards
-    # (which is where a genuinely broken file gets caught, on its own terms).
+    # Must not raise: broken code is left to the later guards, which catch it.
     assert isinstance(err, str)

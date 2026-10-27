@@ -142,10 +142,7 @@ def main() -> None:
     os.utime(log, (past, past))
     if no_log:
         log.unlink()        # a server the round did not start: no log anywhere
-    # the server's pid: idle (`sleep`), or a process that burns CPU with no
-    # request going anywhere — flat out (cpu_full), or about half the time
-    # (cpu_half). The CPU is only what the line reports; silence is still
-    # events + log, so both of these are silent servers.
+    # A server the round did not start: idle (sleep), or CPU burn with no request, flat out (cpu_full) or half the time (cpu_half). The line reports CPU only; both are silent servers.
     burn = {"cpu_full": "while True: pass",
             "cpu_half": ("import time\n"
                          "while True:\n"
@@ -157,9 +154,7 @@ def main() -> None:
     turn = {"events": ["busy", "idle"]} if harvest else {"events": [], "idle": False}
     fake = FakeKiloServer({"turns": [turn]}).start()
     if harvest:
-        # the agents' work is committed and claimed before the round, so the
-        # idle turn goes straight to HARVESTING; the roots then take their time
-        # while Kilo, rightly, has nothing to say
+        # The agents' work is committed and claimed before the round, so the idle turn goes straight to HARVESTING; the roots take their time while Kilo has nothing to say.
         for ws in wss:
             d = ws.path
             (d / "pkg" / "thing.py").write_text("def thing():\n    return 42\n")

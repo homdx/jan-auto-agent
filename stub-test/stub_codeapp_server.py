@@ -189,8 +189,7 @@ def build_reply(system: str, user: str) -> str:
         _log("gate2_code", system, user, reply)
         return reply
 
-    # Gate-1 presence (false-positive check): the skeleton raises
-    # NotImplementedError, so every claimed improvement is genuinely present.
+    # Gate-1 presence (false-positive check): the skeleton raises NotImplementedError, so every claimed improvement is present.
     if "false-positive check" in system:
         reply = json.dumps({"verdict": "confirmed", "reason": "hello() "
                             "raises NotImplementedError; the claimed work is real."})

@@ -30,10 +30,7 @@ SECTION_PREFIX = "arena.profile."
 #: The profile name used when `[arena] profile =` is not set.
 DEFAULT_PROFILE = "default"
 
-#: Every accepted profile key → its `tools.contest run` flag. `None`: the key is
-#: arena-owned data (AR-3/AR-8 read it), not a flag. `extra` is special: its
-#: value is `shlex.split` and appended verbatim after the mapped flags. The
-#: dict order is the flag order `profile_flags` produces.
+#: Profile key -> its `tools.contest run` flag (None: arena-owned data). extra is shlex-split and appended after the mapped flags; dict order is the flag order.
 KNOWN_KEYS: dict[str, Optional[str]] = {
     "models": "--models",
     "legs": "--legs",
@@ -45,22 +42,17 @@ KNOWN_KEYS: dict[str, Optional[str]] = {
     "extra": None,
     "branch": None,
     "trailer": None,
-    # AR-63: the ticket's writer and reviewer, kept per profile like `models` —
-    # read by `arena issue create`, never handed to the runner.
+    # writer and reviewer are per-profile arena data, read by issue create and never sent to the runner.
     "writer": None,
     "reviewer": None,
     # AR-63: one model may both write and review; a deliberate choice, visible here.
     "same_model_review": None,
 }
 
-#: Flags `arena` sets per round; a profile may never carry them, nor may the
-#: passthrough (`rounds._OWNED_FLAGS` is this same tuple). `--out` and `--target`
-#: move the round's folder and repository away from where `run list`, `run view`
-#: and `run rerun` look.
+#: Flags arena sets per round; a profile may not carry them, nor the passthrough.
 OWNED_FLAGS = ("--ticket", "--base", "--target", "--out")
 
-#: AR-62: the runner flags that take a value. Given twice (profile key, `extra`,
-#: passthrough after `--`), only the last one reaches the runner.
+#: Runner flags that take a value: given twice, only the last reaches the runner.
 VALUE_FLAGS = ("--max-parallel", "--variant", "--legs", "--backend", "--provider", "--models")
 #: Switches (no value) the runner takes at most once.
 SWITCH_FLAGS = ("--fresh",)
@@ -122,10 +114,9 @@ def load_profiles(repo: Path) -> tuple[dict[str, dict[str, str]], str]:
         path = repo / name
         if path.is_file():
             try:
-                parser.read(path, encoding="utf-8")
+                parser.read(path, encoding="utf-8-sig")
             except configparser.Error as err:
-                # A broken header or a key outside any section: one refusal
-                # line naming the file, never a traceback.
+                # A broken header or an unknown key is one refusal line naming the file, never a traceback.
                 raise ProfileError(f"{name}: {_one_line(err)}") from err
 
     profiles: dict[str, dict[str, str]] = {}
@@ -141,8 +132,7 @@ def load_profiles(repo: Path) -> tuple[dict[str, dict[str, str]], str]:
                 fresh_on(values["fresh"])
             except ProfileError as err:
                 raise ProfileError(f"[{section}] {err}") from err
-        # AR-63: `same_model_review` is a yes/no key too — refuse a bad value
-        # here, naming the section, as for `fresh`.
+        # same_model_review is a yes/no key too: a bad value is refused, naming the section.
         if "same_model_review" in values:
             try:
                 fresh_on(values["same_model_review"], "same_model_review")
@@ -182,8 +172,7 @@ def profile_flags(
     except ValueError as err:  # an unbalanced quote
         raise ProfileError(f"extra: {err}") from err
     for word in extra:
-        # `--base X`, `--base=X` and an abbreviation argparse accepts (`--bas`)
-        # all count, for every flag arena owns
+        # Owned flags count in every spelling: --base X, --base=X, and an argparse-style abbreviation.
         flag = owned_flag(word, OWNED_FLAGS)
         if flag in ("--base", "--ticket"):
             raise ProfileError("--base/--ticket are set by arena, not by a profile")
@@ -237,5 +226,10 @@ def dedupe_flags(words: list[str]) -> list[str]:
 
 
 def _one_line(err: Exception) -> str:
-    """configparser's messages span lines (file, line, text); keep the first."""
-    return str(err).splitlines()[0]
+    """configparser's messages span lines (file, line, text); keep the first.
+
+    An exception with no message at all has no lines, and its type name is the
+    one thing left to print instead of an `IndexError` out of the guard.
+    """
+    lines = str(err).splitlines()
+    return lines[0] if lines else type(err).__name__

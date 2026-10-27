@@ -56,16 +56,13 @@ __all__ = [
 
 _LOG = logging.getLogger(__name__)
 
-#: The spelling that asks intake to find the top working variant — also the
-#: round's default (``[contest] variant``).
+#: The spelling for intake to pick the top working variant; also the round's default ([contest] variant).
 HIGHEST = "highest"
 
 #: The spelling that sends no variant at all: the provider's own default.
 DEFAULT = "default"
 
-#: Every variant name Kilo 7.6.2 was seen to list, strongest first. A listed
-#: name outside this tuple has no known place on the ladder, so ``highest``
-#: never tries it — it can still be named explicitly.
+#: Variant names Kilo 7.6.2 lists, strongest first. Names outside this tuple are never tried by `highest`, but can be named explicitly.
 VARIANT_RANK = ("max", "xhigh", "high", "medium", "low", "minimal", "none")
 
 #: What the probe asks for, and how long one rung may take.
@@ -101,9 +98,7 @@ class VariantPick:
         return f"{head} (failed: {rungs})"
 
 
-#: The words a provider's refusal uses when the credentials are the problem —
-#: `bynara` says "A valid API key is required.", `kilo` "You need to sign in to
-#: use this model." Matched lower-cased, as substrings.
+#: Refusal words for credential problems (matched lower-case as substrings).
 LOGIN_MARKERS = ("api key", "api_key", "apikey", "sign in", "log in", "login",
                  "unauthorized", "unauthenticated", "authentication", "401")
 
@@ -129,10 +124,7 @@ class ProbeReason(str):
     quota: bool = False
 
 
-#: KC-70: refusals that answer the same way when asked again. KC-45 §2: a
-#: provider that rejects a session's first request rejects it when resent; a
-#: Kilo call that answered 4xx (other than 408 and 429) refused the request
-#: itself — an unknown variant, a malformed body.
+#: Refusals that repeat on resend: KC-70; a 4xx other than 408/429 is a refusal of the request itself (KC-45 §2).
 _FINAL_RE = re.compile(
     r"provider rejected the request|blocked by a gateway or proxy"
     r"|-> (?!408\b|429\b)4\d\d\b", re.IGNORECASE)
@@ -293,8 +285,7 @@ def hello_probe(server, provider_id: str, model_id: str, *,
     from .backend import _wait_for_stream
     from .kilo_client import EventTap, KiloClient, KiloHttpError
 
-    # KC-61: armed only when given, so a caller that predates them gets today's
-    # wait_idle call, argument for argument.
+    # KC-61: extra args are passed only when given, so an older caller gets the same wait_idle call.
     probe_kwargs = {}
     if max_retry_wait is not None:
         probe_kwargs["max_retry_wait"] = max_retry_wait

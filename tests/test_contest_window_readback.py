@@ -45,16 +45,14 @@ from tools.contest.context_memory import (  # noqa: E402
 )
 from tools.contest.kilo_client import KiloClient  # noqa: E402
 
-#: Kilo's declared window for the model, and the size the memory remembers below
-#: it — round 145's glm-4.5-flash, the same pair round 148's watch was built on.
+#: Declared window for the model, and the remembered size below it (round 145's glm-4.5-flash).
 DECLARED = tow.DECLARED
 REFUSED_AT = tow.REFUSED_AT
 
 #: The model the one-agent roster below runs.
 MODEL = "agent-a:free"
 
-#: The ``limit`` the spawn's ``KILO_CONFIG_CONTENT`` carries for the model: the
-#: overlay's own window, which the server keeps whatever a patch says.
+#: The `limit` carried by KILO_CONFIG_CONTENT: the overlay's window, which the server keeps whatever a patch says.
 ENV_LIMIT = kilo_limit(DECLARED, None, DEFAULT_COMPACT_AT_PERCENT)
 
 #: The smaller window the memory remembers, and what the patch asks for.

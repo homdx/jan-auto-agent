@@ -106,9 +106,7 @@ class TestContextAssembler:
         assert "STORY SO FAR (synopsis)" in context
         assert ch1_synopsis in context
 
-        # Must NOT include chapter 1 raw text in the verbatim block
-        # (synopsis section may reference chapter 1 content in summarised form,
-        # but the full prose "Chapter one prose." block should not appear)
+        # Chapter 1's raw prose must not appear in the verbatim block; synopsis summaries may.
         assert "PREVIOUS CHAPTER (verbatim)" in context
         # Only chapter_02 should be in the verbatim block header
         assert "chapter_01.md" not in context.split("PREVIOUS CHAPTER")[1]
@@ -131,8 +129,7 @@ class TestContextAssembler:
         # Verbatim block must contain chapter 4 text
         assert "Unique marker ch4." in context
 
-        # Full raw prose of chapters 1-3 must NOT appear verbatim in the
-        # PREVIOUS CHAPTER section (synopsis may include summaries)
+        # Full raw prose of chapters 1-3 must not appear in the PREVIOUS CHAPTER section; summaries may.
         prev_section = context.split("PREVIOUS CHAPTER (verbatim)")[1] if "PREVIOUS CHAPTER (verbatim)" in context else ""
         for i in range(1, 4):
             assert f"Unique marker ch{i}." not in prev_section
@@ -152,11 +149,7 @@ class TestContextAssembler:
         for i in range(1, 6):
             _make_chapter(tmp_path, f"chapter_0{i}.md", f"Ch{i} prose. ")
 
-        # Use a tiny budget: 1000 tokens total, 500 reserved for output → 500
-        # remaining minus 300 overhead = 200 tokens = 800 chars. A single
-        # chapter section body is ~200 chars; the prev-chapter block for ch5
-        # is small. Fitting all 4 synopsis sections (ch1-ch4) would exceed
-        # the remaining budget.
+        # Tiny budget: only the newest chapter fits, not all four synopsis sections.
         assembler = ContextAssembler(
             num_ctx=1000, max_tokens=500, base_dir=tmp_path,
         )
@@ -171,8 +164,7 @@ class TestContextAssembler:
 
         # The drop marker must appear if any sections were omitted
         if _DROP_MARKER in context:
-            # Newer chapters must appear after the marker; older may be absent
-            # ch5 (newest prior) should be present if anything is
+            # Newer chapters appear after the drop marker; older ones may be absent.
             assert "chapter_05.md" in context or "chapter_04.md" in context
         # No exception = pass (fail-open contract)
 
@@ -223,8 +215,7 @@ class TestContextAssembler:
             all_chapter_files=["chapter_01.md", "chapter_02.md"],
         )
 
-        # Must not raise; result is either the synopsis fallback or '' if even
-        # synopsis doesn't fit the tiny budget.
+        # Must not raise: the result is the synopsis fallback or '' when even that does not fit.
         assert isinstance(context, str)
 
         # If *something* was returned it must NOT contain the huge chapter text

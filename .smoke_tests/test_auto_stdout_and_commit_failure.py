@@ -1,0 +1,1 @@
+../tests/test_auto_stdout_and_commit_failure.py

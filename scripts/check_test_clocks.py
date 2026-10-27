@@ -84,15 +84,13 @@ HANG = "HANG"
 MARKER_CLAIM = "claim"
 MARKER_GUARD = "guard"
 
-#: Bounds at or under this are the claim itself: 0.1 / 0.3 / 0.5 / 1.0 s, where
-#: firing *is* the assertion and weakening it destroys the test.
+#: Bounds at or under 1.0 s are the claim itself (0.1/0.3/0.5/1.0 s): firing is the assertion, and weakening it destroys the test.
 CLAIM_SHORT_S = 1.0
 
 #: Scaffolding lives at or above here. ``barrier.wait(60)`` clears it.
 GUARD_FLOOR_S = 60.0
 
-#: A bound within this multiple of the window it must outlast has no margin:
-#: the 0.5 s window bounded at 20 s has forty times, at 5 s it has five.
+#: A bound within this multiple of its window has no margin: the 0.5 s window bounded at 20 s has forty times the margin, at 5 s only five.
 C1_NEAR_S = 8.0
 
 #: A zero window is not a starved-box tolerance, so C5 needs a real one.

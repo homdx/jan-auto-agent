@@ -110,8 +110,7 @@ def test_to_dict_round_trips_all_fields(gates_entries):
 
 
 def test_gate1_is_fail_closed(gates_entries):
-    # Gate 1's own docstring: "Fail-closed: an unparseable response ...
-    # is treated as a *rejection*".
+    # Gate 1 is fail-closed: an unparseable response counts as a rejection.
     entries = _by_name(gates_entries)
     assert entries["gate1"].fail_mode == "closed"
 
@@ -145,8 +144,7 @@ def test_language_gate_is_fail_open_and_spends_no_llm_call(gates_entries):
 
 
 def test_verdict_gate_spends_no_extra_llm_call(gates_entries):
-    # The verdict gate IS the base Gate-2 call every attempt already
-    # makes — it is not layered on top of anything.
+    # The verdict gate is the base Gate-2 call; it adds no extra LLM call.
     entries = _by_name(gates_entries)
     assert entries["verdict"].extra_llm_call is False
 
@@ -222,18 +220,13 @@ def test_foreign_repo_skips_seed_instead_of_raising(tmp_path):
 
 
 def test_method_qualified_parser_resolves_via_bare_name(gates_entries):
-    # "CanonValidator._ground_claim" must resolve by searching for a
-    # method named `_ground_claim`, not by literally finding that
-    # dotted string in source.
+    # A method name resolves by bare name, not by the dotted string in source.
     entries = _by_name(gates_entries)
     assert entries["canon"].parser == "CanonValidator._ground_claim"
 
 
 def test_reused_parser_across_modules_resolves_repo_wide(gates_entries):
-    # `_parse_verdict_soft` is defined once in inner_loop.py but cited as
-    # the parser for continuity/theme/fact, whose own modules only
-    # *import* it — the citation check must search the whole repo, not
-    # just each gate's own module.
+    # A parser defined once but reused by other gates is found repo-wide.
     entries = _by_name(gates_entries)
     for name in ("continuity", "theme", "fact"):
         assert entries[name].parser == "_parse_verdict_soft"
