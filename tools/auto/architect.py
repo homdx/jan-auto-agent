@@ -49,6 +49,7 @@ from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
 from tools.config_safe import safe_getboolean
+from tools.auto.verdict_followup import STRICT_VERDICT_RULE
 from tools.ui import safe_print as _safe_print, safe_stdout_write as _safe_stdout_write
 
 logger = logging.getLogger(__name__)
@@ -111,7 +112,8 @@ _ARCH_PLAN_SYSTEM = (
     "ONE line. First token APPROVED or REVISE. Reply REVISE only when a task "
     "contradicts a fact in the goal, or a required fact in the goal is "
     "covered by no task. Name the problem. Do not REVISE for wording or "
-    "ordering. No JSON, no preamble."
+    "ordering. No JSON, no preamble.\n"
+    + STRICT_VERDICT_RULE   # VERDICT-ASK
 )
 
 _SYSTEM_PROMPTS: dict[str, str] = {
@@ -600,7 +602,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         Never raises — any LLM error or unparseable reply returns ``(True, "")``.
         """
         # Import locally to avoid a circular import (inner_loop imports architect).
-        from tools.auto.inner_loop import _parse_verdict_soft  # noqa: PLC0415
+        from tools.auto.verdict_followup import settle_verdict  # noqa: PLC0415
 
         # Format candidates compactly: "title: instruction" per task.
         task_lines: list[str] = []
@@ -623,7 +625,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             logger.warning("validate_plan: LLM call failed — %s; passing plan.", exc)
             return True, ""
 
-        approved, reason, unparseable = _parse_verdict_soft(raw)
+        # VERDICT-ASK: an unclear or self-contradicting reply is put back to the model once.
+        approved, reason, unparseable, raw = settle_verdict(
+            raw, lambda extra: self._llm_call(_ARCH_PLAN_SYSTEM, user_msg + extra) or "",
+            who="validate_plan",
+        )
         if unparseable:
             logger.warning(
                 "validate_plan: unparseable reply %r — passing plan (fail-open).",

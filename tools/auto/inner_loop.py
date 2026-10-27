@@ -63,6 +63,7 @@ from tools.llm_stream import reply_is_yes, reply_text
 from dataclasses import dataclass, field
 from pathlib import Path
 from tools.config_safe import safe_getboolean, safe_getint
+from tools.auto.verdict_followup import STRICT_VERDICT_RULE   # VERDICT-ASK
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +191,8 @@ _GATE2_SYSTEM_CREATIVE = (
     "2. The scene description repeats another chapter word for word — cut it to "
     "a single phrase or remove it.\n"
     "3. The character is called \"he\" although the facts say she is a woman — "
-    "bring every pronoun and verb form into agreement."
+    "bring every pronoun and verb form into agreement.\n"
+    + STRICT_VERDICT_RULE   # VERDICT-ASK
 )
 
 # Backward-compatibility alias
@@ -689,24 +691,13 @@ class LLMGate2Validator:
 
             # ── Creative mode: line-oriented soft verdict (AUTO-CR-2) ─────────
             if self.task_mode == "creative":
-                approved, reason, unparseable = _parse_verdict_soft(raw)
-                # If the verdict is buried in prose, the validator is asked once more with a hard nudge (AUTO-CR-31).
-                if unparseable:
-                    logger.info(
-                        "LLMGate2Validator [creative]: verdict unparseable — "
-                        "re-asking once. raw=%r", raw[:120]
-                    )
-                    _nudge = (
-                        "\n\nIMPORTANT: your previous reply did not begin with a "
-                        "verdict. Reply AGAIN and make the VERY FIRST token exactly "
-                        "APPROVED or REVISE (in English, uppercase). If REVISE, "
-                        "follow it with ':' and the numbered list of problems."
-                    )
-                    raw2 = _call_validator(user_msg + _nudge)
-                    if raw2 and raw2.strip():
-                        a2, r2, u2 = _parse_verdict_soft(raw2)
-                        if not u2:        # second answer was clear — use it
-                            raw, approved, reason, unparseable = raw2, a2, r2, u2
+                # If the verdict is buried in prose, the validator is asked once more with a hard nudge (AUTO-CR-31);
+                # an approval that goes on to name a problem is asked about the same way, its own reply quoted (VERDICT-ASK).
+                from tools.auto.verdict_followup import settle_verdict  # noqa: PLC0415
+                approved, reason, unparseable, raw = settle_verdict(
+                    raw, lambda extra: _call_validator(user_msg + extra),
+                    who="LLMGate2Validator [creative]",
+                )
                 if unparseable:
                     logger.warning(
                         "LLMGate2Validator [creative]: verdict still unparseable "

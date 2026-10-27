@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from tools.config_safe import safe_getboolean, safe_getint
+from tools.auto.verdict_followup import STRICT_VERDICT_RULE
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,8 @@ _CONTINUITY_SYSTEM = (
     "female (она / Ей / -ла endings) and the NEW chapter uses male forms (он / "
     "стоял / спросил), or vice-versa, that is a contradiction — REVISE with the "
     "concrete fix, e.g. 'change the captain from он/стоял to она/стояла'. "
-    "No JSON, no preamble."
+    "No JSON, no preamble.\n"
+    + STRICT_VERDICT_RULE   # VERDICT-ASK
 )
 
 
@@ -159,7 +161,7 @@ class ContinuityValidator:
             ``REVISE``.
         """
         # Import here to avoid a circular import; inner_loop imports us.
-        from tools.auto.inner_loop import _parse_verdict_soft  # noqa: PLC0415
+        from tools.auto.verdict_followup import settle_verdict  # noqa: PLC0415
 
         from tools.auto.utils import detect_language, language_instruction  # noqa: PLC0415
 
@@ -185,7 +187,10 @@ class ContinuityValidator:
                 approved=True, reason="llm error — passed on fail-open", unparseable=False,
             )
 
-        approved, reason, unparseable = _parse_verdict_soft(raw)
+        # VERDICT-ASK: an unclear or self-contradicting reply is put back to the model once.
+        approved, reason, unparseable, raw = settle_verdict(
+            raw, lambda extra: self._llm(system, user_msg + extra) or "", who="ContinuityValidator",
+        )
 
         if unparseable:
             logger.warning(

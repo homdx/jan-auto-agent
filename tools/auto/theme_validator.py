@@ -33,6 +33,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from tools.auto.verdict_followup import STRICT_VERDICT_RULE
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,7 +44,8 @@ _THEME_SYSTEM = (
     "Judge ONLY against the guidelines — do not critique style, plot, or "
     "consistency. Reply ONE line. APPROVED if the chapter respects the "
     "guidelines. Otherwise reply exactly 'REVISE: <one concrete instruction "
-    "describing what violates the guidelines and how to fix it>'."
+    "describing what violates the guidelines and how to fix it>'.\n"
+    + STRICT_VERDICT_RULE   # VERDICT-ASK
 )
 
 
@@ -95,7 +98,7 @@ class ThemeValidator:
             return ThemeVerdict(approved=True, reason="no guidelines configured")
 
         # Imported here to avoid circular import; inner_loop imports us.
-        from tools.auto.inner_loop import _parse_verdict_soft  # noqa: PLC0415
+        from tools.auto.verdict_followup import settle_verdict  # noqa: PLC0415
         from tools.auto.utils import detect_language, language_instruction  # noqa: PLC0415
 
         lang_instr = language_instruction(detect_language(new_text))
@@ -117,7 +120,10 @@ class ThemeValidator:
             logger.warning("ThemeValidator: LLM call failed — %s", exc)
             return ThemeVerdict(approved=True, reason="llm error — passed on fail-open")
 
-        approved, reason, unparseable = _parse_verdict_soft(raw)
+        # VERDICT-ASK: an unclear or self-contradicting reply is put back to the model once.
+        approved, reason, unparseable, raw = settle_verdict(
+            raw, lambda extra: self._llm(system, user_msg + extra) or "", who="ThemeValidator",
+        )
         if unparseable:
             logger.warning(
                 "ThemeValidator: unparseable reply %r — passed on fail-open.", raw[:120]
