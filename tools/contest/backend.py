@@ -1530,27 +1530,34 @@ def _agent_tools() -> list:
     ]
 
 
-@contextlib.contextmanager
-def _sigint_held():
-    """Hold a SIGINT that arrives inside the block; yields a list, non-empty if one did.
+#: the signals that stop the agent: Ctrl-C, and the runner's abort (`proc.terminate()`)
+_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
-    The caller re-raises it (``signal.raise_signal``) once it can clean up, so the
+
+@contextlib.contextmanager
+def _stop_signals_held():
+    """Hold a stop signal that arrives inside the block; yields the list of those that did.
+
+    The caller re-raises them (``signal.raise_signal``) once it can clean up, so the
     handler that was in place still runs, just later. Off the main thread, where
-    no handler can be set, or with SIGINT ignored, nothing is held.
+    no handler can be set, nothing is held; neither is a signal whose handler is not
+    Python's (ignored, or the default that ends the process anyway).
     """
     held: list = []
     if threading.current_thread() is not threading.main_thread():
         yield held
         return
-    previous = signal.getsignal(signal.SIGINT)
-    if previous in (signal.SIG_IGN, None):
-        yield held
-        return
-    signal.signal(signal.SIGINT, lambda signum, frame: held.append(signum))
+    previous = {}
+    for signum in _STOP_SIGNALS:
+        handler = signal.getsignal(signum)
+        if callable(handler):
+            previous[signum] = handler
+            signal.signal(signum, lambda num, frame: held.append(num))
     try:
         yield held
     finally:
-        signal.signal(signal.SIGINT, previous)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
@@ -1575,14 +1582,15 @@ def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
         try:
             # CTRL-C-START: bash may already run while Popen has not returned (or
             # `try:` is not reached yet); a Ctrl-C there escaped the kill below and
-            # left the command running. It is held until `proc` is known.
-            with _sigint_held() as held:
+            # left the command running. It is held until `proc` is known — and so
+            # is the runner's SIGTERM (AGENT-TERM).
+            with _stop_signals_held() as held:
                 proc = subprocess.Popen(["bash", "-c", command], cwd=cwd,
                                         stdout=out_f, stderr=err_f,
                                         stdin=subprocess.DEVNULL,
                                         start_new_session=posix)
-            if held:
-                signal.raise_signal(signal.SIGINT)
+            for signum in dict.fromkeys(held):
+                signal.raise_signal(signum)
             proc.wait(timeout=timeout)
         except BaseException:
             # CC review fixes 49: not only a timeout — a Ctrl-C (KeyboardInterrupt)
@@ -1633,6 +1641,10 @@ def _reasoning_effort(variant) -> "str | None":
     return effort
 
 
+class _AgentStopped(Exception):
+    """The runner aborted, or went away, while a turn waited on it (AGENT-ABORT)."""
+
+
 class _Agent:
     """The loop: read a prompt, call the model, run its tool calls, say ``idle``."""
 
@@ -1671,6 +1683,11 @@ class _Agent:
         call, with the path in ``patterns`` — the same three sources
         ``policy._extract_paths`` reads, so the mechanical layer decides a
         write inside the worktree on its own and never costs a gate call.
+
+        AGENT-ABORT: an ``abort`` line, or the end of stdin, raises
+        ``_AgentStopped`` and ends the turn. Both used to be a refusal of this one
+        call, after which the turn went on asking the model (and the runner) for
+        up to ``max_steps`` more paid steps of an entrant already stopped.
         """
         pid = f"{call_id}-{name}"
         if name == "bash":
@@ -1689,13 +1706,13 @@ class _Agent:
         while True:
             line = self._ask()
             if line is None:
-                return "reject", "the runner went away"
+                raise _AgentStopped("the runner went away")
             if line.get("type") == "permission.reply":
                 reply = line.get("reply") if line.get("reply") in ("once", "reject") else "reject"
                 message = str(line.get("message") or "")
                 break
             if line.get("type") == "abort":
-                return "reject", "aborted"
+                raise _AgentStopped("aborted")
         return reply, message
 
     # ── the model ───────────────────────────────────────────────────────────
@@ -1750,7 +1767,7 @@ class _Agent:
     # ── the tools ───────────────────────────────────────────────────────────
 
     def _tool_result(self, name: str, call_id: str, args: dict) -> tuple:
-        """One tool call: ``(status, output text)``. Never raises."""
+        """One tool call: ``(status, output text)``. Raises only ``_AgentStopped``."""
         if name == "bash":
             command = str(args.get("command") or "")
             if not command:
@@ -1839,7 +1856,10 @@ class _Agent:
                 except (json.JSONDecodeError, ValueError):
                     args = {}
                 call_id = str(call.get("id") or f"{step}.{index}")
-                status, output = self._tool_result(name, call_id, args)
+                try:
+                    status, output = self._tool_result(name, call_id, args)
+                except _AgentStopped:
+                    return False
                 self._say({"type": "tool", "tool": name,
                            "state": {"status": status, "input": args,
                                      "output": str(output)}})
@@ -1861,6 +1881,10 @@ def _loads(line) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def _exit_on_sigterm(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def agent_loop(argv=None) -> int:
     """``python3 -m tools.contest.backend --agent-loop …`` — the subprocess."""
     parser = argparse.ArgumentParser(prog="tools.contest.backend --agent-loop")
@@ -1872,6 +1896,11 @@ def agent_loop(argv=None) -> int:
     parser.add_argument("--request-timeout", type=float, default=300.0)
     parser.add_argument("--variant", default=None)
     args = parser.parse_args(argv)
+    # AGENT-TERM: the runner's abort is `proc.terminate()`. With the default SIGTERM the
+    # process ended on the spot and a command it was running — in its own session, so
+    # not signalled with it — lived on (a dev server, a test run). Raised as SystemExit,
+    # it goes through `_run_bash_group`'s cleanup, which kills the command's group.
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
     _Agent(args.base_url, os.environ.get("CONTEST_AGENT_API_KEY", ""), args.model,
            args.directory, max_steps=args.max_steps,
            request_timeout=args.request_timeout, variant=args.variant).run()
