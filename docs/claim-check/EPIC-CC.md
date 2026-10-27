@@ -1,12 +1,17 @@
 # EPIC CC — claim check with evidence: models judge claims about our code with the code in front of them
 
-**Status:** in progress — CC-0 … CC-11 (250 … 293) and CC-13 … CC-15 (295 … 297) landed (CC-10, 292, behind `[gate1] claim_vote = off`; its live set not run); CC-12 (294) is open; the
-review of the branch (five reports) landed as ten "CC review fixes N/10" commits, not tickets
+**Status:** ready to merge — CC-0 … CC-11 (250 … 293) and CC-13 … CC-16 (295 … 297, 302) landed;
+CC-10 (292) is behind `[gate1] claim_vote = off`, and its live layer 2 (seven runs,
+`GATE1-VOTE-LAYER2.md`) kept it off: a unanimous FALSE was right 14 of 14, a unanimous TRUE
+wrong 75 to 88 %. CC-12 (294, callers in the pack, meant to fix that TRUE) is open and does
+not block the merge: with the flag off nothing reads it. The review of the branch landed as
+the "CC review fixes 1 … 50" commits, the HARDEN tickets (298 … 301, 303 … 325, §9) and a
+dozen named fixes (REL, REP, VERDICT-ASK, POLICY-*, AGENT-ABORT, EXTRACT-GAPS, …)
 **Base:** `main` after the open `arena` tickets and their bugs have landed
 **Branch:** `cc-epic-docs` (the sketch said `cc`)
 **Tickets:** CC-0 … CC-8, numbered **250 … 290 in steps of five**, then CC-9 = 291 and
-CC-10 = 292, CC-11 = 293, CC-12 = 294, CC-13 = 295, CC-14 = 296 and CC-15 = 297 (§9). The four numbers after each ticket are reserved for the fixes that real
-rounds will turn up; 293 … 299 are left for the epic's own close-out. Each ticket is
+CC-10 = 292, CC-11 = 293, CC-12 = 294, CC-13 = 295, CC-14 = 296, CC-15 = 297 and CC-16 = 302 (§9). The four numbers after each ticket are reserved for the fixes that real
+rounds will turn up; 298 … 325 but 302 went to the HARDEN tickets (§9). Each ticket is
 written in full under `docs/claim-check/tickets/` and is copied into `epic-tasks/` (with `arena issue create
 --number NNN`) when its turn comes — not before: `run` refuses untracked files in
 `epic-tasks/`.
@@ -232,6 +237,7 @@ prefix normalisation, is not a substring of that chunk (reason `quote_not_in_pac
 | 295 | CC-13 | The collect model for the judges: `[gate1] vote_collect = auto` puts a fresh `.collect` into the voters' pack, `[collect] skip_dirs`, one line saying whether collect was there, layer 2 with and without it | M | CC-5, CC-10 | contest | 10 |
 | 296 | CC-14 | The round's claims at the judge: `## Claims` in a contest ticket, `judge_epic_round.py --claims` runs CC-7 on every entry with the base judged once, a lead and never a gate | M | CC-7, CC-11 | contest | 10 |
 | 297 | CC-15 | A module Pass B left without a summary is not up to date: the manifest lists it, `--check` says so, the next `--collect` summarizes it (today it never is again) | S | RUN-11, CC-13 | contest | 10 |
+| 302 | CC-16 | The five follow-ups of CC-13 … CC-15: a refresh without Pass B keeps the unsummarized list, `claim_diff` reuses the base side claim by claim (and refuses a record that does not say what it was judged with), `/edit` writes in the file's own codec, a Ctrl-C in `executor` kills the command's group | M | CC-13, CC-14, CC-15 | contest | 11 |
 
 Why ten contest tickets (CC-1 … CC-10) and not five: an earlier sketch folded CC-3/CC-4 pack assembly
 and the voter changes into one ticket. A round gives one agent one session; an L ticket
@@ -315,7 +321,16 @@ enough, stop after CC-6.
   276; the fourth is 279). The fifth bug at one ticket opens a new block (300 and up).
 * 293 is CC-11 (the acceptance rule found by running the runbook on free models); 294 … 299: close-out tickets of the epic (docs sync, the ideal-merge, the final bench run).
 * The review of the branch (five reports, ten Haiku-written tickets 300–345 that were never
-  committed) landed directly as the ten "CC review fixes N/10" commits.
+  committed) landed directly as the ten "CC review fixes N/10" commits; the later reports as
+  "CC review fixes 11 … 50".
+* 294 stayed CC-12's; the rest of the close-out block went elsewhere: **298 … 301 and
+  303 … 325 are the HARDEN tickets** (`epic-tasks/298-harden-1-…` … `325-harden-27-…`, the
+  hardening found by the review: parsers, the secret mask, the verdict reader, the
+  extractor), and **302 is CC-16**. The docs sync is this file; the final bench run of §6.2 is
+  the numbers below, taken ticket by ticket rather than in one closing run:
+  evidence-bound voting (round 280) settled 56 to 63 of the fixture's 80 claims and 10 to 16 of
+  the 30 real ones with 0 wrong (the baseline settled 0 of 50 code claims), and
+  `--accept committed` with five or seven voters settles 146 of 150 with 0 wrong (CC-11).
 * `arena issue create --number NNN` fixes the number. Without it `next_number` returns
   max + 1, which after 290 exists is 291+: unrelated tickets created in the meantime should
   pass `--number` 300 or higher, or accept that they take a reserved number.
@@ -389,3 +404,8 @@ Result of the re-check, on `main` at `d7ff804` (arena merged), 2026-10-09:
 | 291 | `docs/claim-check/tickets/291-cc-9-lenz-comparison-hint.md` |
 | 292 | `docs/claim-check/tickets/292-cc-10-claim-check-in-gate1.md` |
 | 293 | `docs/claim-check/tickets/293-cc-11-accept-on-committed-voters.md` |
+| 294 | `docs/claim-check/tickets/294-cc-12-callers-in-the-pack.md` (open) |
+| 295 | `docs/claim-check/tickets/295-cc-13-collect-for-the-judges.md` |
+| 296 | `docs/claim-check/tickets/296-cc-14-the-rounds-claims-at-the-judge.md` |
+| 297 | `docs/claim-check/tickets/297-cc-15-a-module-pass-b-left-without-a-summary-is-up-to-date-and-never-summarized-again.md` |
+| 302 | `epic-tasks/302-cc-16-a-refresh-that-does-not-run-pass-b-keeps-the-list-of-unsummarized-modules.md` |
