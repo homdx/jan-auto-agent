@@ -929,7 +929,7 @@ def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: boo
 
 
 def _find_earliest_genuine_definition(
-    source: str, target_name: str, lang: str = "", typed_lang: bool = False
+    source: str, target_name: str, lang: str = "", typed_lang: bool = False, ext: str = ""
 ) -> Optional[tuple]:
     """
     Search every brace-language candidate pattern for `target_name` and
@@ -1001,7 +1001,12 @@ def _find_earliest_genuine_definition(
     # has no `const` and no `function` in front of it, and it is how handlers, reducers, route
     # tables and action maps are written. It is last of the four passes, so it can only turn a
     # "not found" into a found block.
-    return _find_earliest_property_arrow_definition(source, target_name, lang, typed_lang=typed_lang)
+    prop = _find_earliest_property_arrow_definition(source, target_name, lang, typed_lang=typed_lang)
+    if prop is not None:
+        return prop
+
+    # EXTRACT-GAPS: the fifth pass, last for the same reason.
+    return _find_earliest_assigned_definition(source, target_name, lang, ext)
 
 
 def _property_arrow_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
@@ -1633,9 +1638,259 @@ def _find_earliest_declaration(source: str, target_name: str, lang: str = "") ->
     return (best_match_start, None, best_end)
 
 
+# EXTRACT-GAPS: the fifth pass — a definition written as an assignment or as an
+# expression-bodied member, which none of the four passes above reached and so answered
+# "not found" (what Gate 1 reads as a hallucination):
+#   module.exports.f = () => {…}       exports.h = (x) => x * 2
+#   const mk = (a): { x: number } => {…}   (a TS return type with braces)
+#   const Button = React.memo((props) => {…});   const Input = forwardRef<A, B>(…);
+#   public double Area() => w * h;     public string Name => _name;   (C#)
+#   double area() => w * h;            String get full => '$a $b';    (Dart)
+#   def area(w: Int, h: Int): Int = w * h                             (Scala)
+# Every head is anchored at a line start, and what follows it is read by bounded scans, never a
+# wider regular expression.
+
+#: the callees whose call *is* the definition of the name it is assigned to (React and friends);
+#: any other call counts only when a function is written among its arguments
+_WRAPPER_CALLEES = frozenset(("memo", "forwardRef", "observer", "lazy", "useCallback", "useMemo",
+                              "connect", "withRouter", "withStyles", "defineComponent"))
+#: words that can stand before a name without making the line a declaration of it
+_NOT_A_DECLARATION_WORDS = frozenset(("return", "yield", "await", "var", "new", "case", "else",
+                                      "throw", "in", "is", "as", "await", "typeof", "delete"))
+_JS_IDENT = re.compile(r"[A-Za-z_$][\w$]*")
+_JS_DOTTED_IDENT = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*")
+_ASSIGNED_SCAN_BOUND = 4000
+
+
+def _skip_space(source: str, i: int, newlines: bool = True) -> int:
+    chars = " \t\r\n" if newlines else " \t"
+    n = len(source)
+    while i < n and source[i] in chars:
+        i += 1
+    return i
+
+
+def _angle_end(source: str, i: int) -> Optional[int]:
+    """The index just past the `>` that closes the `<` at *i* (type parameters), or None."""
+    depth = 0
+    for k in range(i, min(len(source), i + 400)):
+        ch = source[k]
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+            if depth == 0:
+                return k + 1
+        elif ch in ";{}\n":
+            return None
+    return None
+
+
+def _paren_end(source: str, i: int, lang: str) -> Optional[int]:
+    """The index just past the `)` that closes the `(` at *i*, or None when it never closes."""
+    end = _brace_scan_end(source, i, "(", ")", lang)
+    if end > len(source) or end - i > _ASSIGNED_SCAN_BOUND or source[end - 1] != ")":
+        return None
+    return end
+
+
+def _arrow_after(source: str, j: int) -> Optional[int]:
+    """Past the `=>` that follows a parameter list ending at *j*, across an optional return type
+    — `{ x: number; y: string }`, `Promise<{ ok: boolean }>`, `'a' | 'b'` — or None."""
+    n = len(source)
+    k = _skip_space(source, j)
+    if source.startswith("=>", k):
+        return k + 2
+    if k >= n or source[k] != ":":
+        return None
+    k += 1
+    depth = 0
+    bound = min(n, k + _ASSIGNED_SCAN_BOUND)
+    while k < bound:
+        if depth == 0 and source.startswith("=>", k):
+            return k + 2
+        ch = source[k]
+        if ch in "'\"`":
+            close = source.find(ch, k + 1)
+            if close < 0 or "\n" in source[k:close]:
+                return None
+            k = close + 1
+            continue
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and ch in ";,=":
+            return None
+        elif depth == 0 and ch == "\n":
+            back = source[:k].rstrip(" \t\r")
+            if not back or back[-1] not in "(,:=<>|&":
+                return None
+        k += 1
+    return None
+
+
+def _arrow_value_end(source: str, i: int, lang: str) -> Optional[int]:
+    """The end of an arrow function that starts at *i* (`async <T>(a): R => body`), or None."""
+    n = len(source)
+    m = re.compile(r"async\b").match(source, i)
+    if m and not source.startswith("=>", _skip_space(source, m.end())):
+        i = _skip_space(source, m.end())
+    if source.startswith("<", i):
+        close = _angle_end(source, i)
+        if close is None:
+            return None
+        i = _skip_space(source, close)
+    if source.startswith("(", i):
+        j = _paren_end(source, i, lang)
+    else:
+        m = _JS_IDENT.match(source, i)
+        j = m.end() if m else None
+    if j is None:
+        return None
+    arrow = _arrow_after(source, j)
+    if arrow is None:
+        return None
+    k = _skip_space(source, arrow)
+    if k < n and source[k] == "{":
+        return _brace_scan_end(source, k, lang=lang)
+    return _find_definition_end_bodyless(source, k, False, lang)
+
+
+def _wrapper_value_end(source: str, i: int, lang: str) -> Optional[int]:
+    """The end of `React.memo(…)`, `forwardRef<A, B>(…)`, `connect(a)(B)` — a call that wraps a
+    component or a callback — starting at *i*, with its `;`; None for any other value."""
+    m = _JS_DOTTED_IDENT.match(source, i)
+    if not m:
+        return None
+    callee = m.group(0).rsplit(".", 1)[-1]
+    j = _skip_space(source, m.end(), newlines=False)
+    if source.startswith("<", j):
+        close = _angle_end(source, j)
+        if close is None:
+            return None
+        j = close
+    if not source.startswith("(", j):
+        return None
+    end = _paren_end(source, j, lang)
+    if end is None:
+        return None
+    if callee not in _WRAPPER_CALLEES and not re.search(r"=>|\bfunction\b", source[j:end]):
+        return None
+    for _ in range(3):                                 # connect(mapState)(Component)
+        if not source.startswith("(", end):
+            break
+        nxt = _paren_end(source, end, lang)
+        if nxt is None:
+            break
+        end = nxt
+    k = _skip_space(source, end, newlines=False)
+    return k + 1 if source.startswith(";", k) else end
+
+
+def _assigned_candidate_patterns(target_name: str) -> list:
+    """`(pattern, wrappers allowed)` for the JS/TS heads `const f =`, `exports.f =`,
+    `module.exports.f =` and a class field `f =`; the field takes only an arrow, since a plain
+    `f = g(x)` inside a function is an assignment, not a definition."""
+    name = re.escape(target_name)
+    ann = r"(?:[ \t]*:[^=\n]{1,200}?)?"
+    eq = r"[ \t]*=(?![=>])[ \t]*"
+    return [
+        (re.compile(rf"(?m)^[ \t]*(?:export[ \t]+(?:default[ \t]+)?)?(?:const|let|var)[ \t]+{name}"
+                    rf"[ \t]*!?{ann}{eq}"), True),
+        (re.compile(rf"(?m)^[ \t]*(?:module\.)?exports\.{name}{eq}"), True),
+        (re.compile(rf"(?m)^[ \t]*(?:(?:public|private|protected|static|readonly|override|declare)[ \t]+)*"
+                    rf"{name}[ \t]*[?!]?{ann}{eq}"), False),
+    ]
+
+
+def _expression_bodied_end(source: str, target_name: str, ext: str) -> Optional[tuple]:
+    """C# and Dart: `… Area(…) => expr;`, `… Name => expr;`, `… get full => expr;`."""
+    name = re.escape(target_name)
+    head = re.compile(rf"(?m)^[ \t]*(?P<prefix>[^\n();={{}}]{{0,200}}?[\w>\]?])[ \t]+{name}\b"
+                      rf"[ \t]*(?:<[^<>\n]{{0,200}}>)?[ \t]*")
+    for m in head.finditer(source):
+        words = m.group("prefix").split()
+        if not words or words[-1] in _NOT_A_DECLARATION_WORDS or words[-1].endswith("."):
+            continue
+        j = m.end()
+        if source.startswith("(", j):
+            j = _paren_end(source, j, "")
+            if j is None:
+                continue
+        k = _skip_space(source, j)
+        if source.startswith("async", k) and ext == ".dart":
+            k = _skip_space(source, k + len("async"))
+        if not source.startswith("=>", k):
+            continue
+        end = _find_definition_end_bodyless(source, _skip_space(source, k + 2), False, "")
+        if end is not None:
+            return (_effective_match_start(source, m.start()), None, end)
+    return None
+
+
+def _scala_def_end(source: str, target_name: str) -> Optional[tuple]:
+    """Scala: `def area(w: Int, h: Int): Int = w * h`, `def tw(x: Int) =` / `  x * 2`."""
+    name = re.escape(target_name)
+    head = re.compile(rf"(?m)^[ \t]*(?:(?:override|private|protected|final|implicit|inline|lazy|"
+                      rf"abstract|sealed)(?:\[[^\]\n]*\])?[ \t]+)*def[ \t]+{name}\b[ \t]*"
+                      rf"(?:\[[^\]\n]{{0,200}}\])?")
+    n = len(source)
+    for m in head.finditer(source):
+        j = _skip_space(source, m.end(), newlines=False)
+        while source.startswith("(", j):
+            j = _paren_end(source, j, "")
+            if j is None:
+                break
+            j = _skip_space(source, j, newlines=False)
+        if j is None:
+            continue
+        k = j
+        bound = min(n, j + 400)
+        while k < bound and source[k] not in "=\n{;":
+            k += 1
+        if k >= bound or source[k] != "=" or source.startswith("=>", k):
+            continue
+        after = _skip_space(source, k + 1, newlines=False)
+        if source.startswith("{", after):
+            end = _brace_scan_end(source, after)
+        else:
+            end = _find_definition_end_bodyless(source, k + 1, False, "")
+        if end is not None:
+            return (_effective_match_start(source, m.start()), None, end)
+    return None
+
+
+def _find_earliest_assigned_definition(source: str, target_name: str, lang: str = "",
+                                       ext: str = "") -> Optional[tuple]:
+    """EXTRACT-GAPS: the fifth pass, `(match_start, None, end)` or None (see the note above)."""
+    if not target_name or not re.fullmatch(r"[\w$]+", target_name):
+        return None
+    if ext in (".cs", ".dart"):
+        return _expression_bodied_end(source, target_name, ext)
+    if ext in (".scala", ".sc"):
+        return _scala_def_end(source, target_name)
+    if lang != "js":
+        return None
+    best = None
+    for pat, wrappers in _assigned_candidate_patterns(target_name):
+        for m in pat.finditer(source):
+            start = _effective_match_start(source, m.start())
+            if best is not None and start >= best[0]:
+                continue
+            end = _arrow_value_end(source, m.end(), lang)
+            if end is None and wrappers:
+                end = _wrapper_value_end(source, m.end(), lang)
+            if end is not None:
+                best = (start, None, end)
+    return best
+
+
 def _extract_brace_block(source: str, target_name: str, lang: str = "",
-                         typed_lang: bool = False) -> str:
-    found = _find_earliest_genuine_definition(source, target_name, lang, typed_lang=typed_lang)
+                         typed_lang: bool = False, ext: str = "") -> str:
+    found = _find_earliest_genuine_definition(source, target_name, lang, typed_lang=typed_lang, ext=ext)
     if found is None:
         return ""
 
@@ -1768,7 +2023,7 @@ def _extract_block_named(source: str, target_name: str, ext: str) -> str:
         return _extract_python_block(source, target_name)
     # Default to brace-based strategy for JS/TS/Go/Java/C/C++/Rust/etc.
     return _extract_brace_block(source, target_name, _LANG_OF_EXT.get(ext, ""),
-                                typed_lang=ext in _TYPESCRIPT_EXTS)
+                                typed_lang=ext in _TYPESCRIPT_EXTS, ext=ext)
 
 
 def extract_block(source: str, target_name: str, file_ext: str) -> str:
@@ -2126,7 +2381,7 @@ def _find_block_start_line_fallback(source: str, target_name: str, file_ext: str
 
     # The earliest real definition is used, not the first pattern that matches, so a call site cannot pre-empt it (AUTO-BUG).
     found = _find_earliest_genuine_definition(
-        source, target_name, _LANG_OF_EXT.get(ext, ""), typed_lang=ext in _TYPESCRIPT_EXTS
+        source, target_name, _LANG_OF_EXT.get(ext, ""), typed_lang=ext in _TYPESCRIPT_EXTS, ext=ext
     )
     if found is None:
         return None
