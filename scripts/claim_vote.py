@@ -70,6 +70,17 @@ KILO_CONFIG = Path.home() / ".config" / "kilo" / "kilo.jsonc"
 KILO_AUTH = Path.home() / ".local" / "share" / "kilo" / "auth.json"
 VERDICTS = ("TRUE", "FALSE", "UNSURE")
 
+_PROGRESS_LOCK = threading.Lock()
+
+
+def progress(line: str) -> None:
+    """One ``[progress]`` line on stderr, whole. ``print`` writes the text and the newline
+    apart, so the pool's threads ran two lines into one (PROGRESS-LINE) and a log reader
+    counted one request less."""
+    with _PROGRESS_LOCK:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
 # Each opener is worded differently, so no prompt shares a prefix that a cache could match.
 _OPENERS = (
     "Judge each of the following claims as TRUE, FALSE or UNSURE.",
@@ -400,8 +411,8 @@ def ask_v2(ref: str, items: list, run: int, seed: int, parser: configparser.Conf
             sem.release()
             calls[0] += 1
             # One progress line per request, so a live run shows which voter is alive.
-            print(f"[progress] {ref} run{run} request {calls[0]} "
-                  f"{time.monotonic() - started:.0f}s", file=sys.stderr, flush=True)
+            progress(f"[progress] {ref} run{run} request {calls[0]} "
+                     f"{time.monotonic() - started:.0f}s")
 
     calls, replies = [0], [0]
     got = cc_judge.ask_with_packs(items, run, seed, complete, batch=batch,

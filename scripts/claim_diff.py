@@ -531,11 +531,10 @@ def make_vote(voters: list, runs: int, pool: concurrent.futures.Executor, ask: C
             with lock:
                 done[0] += 1
                 n = done[0]
-            print(f"[progress] {side} {job[0]} run{job[1]} done: votes={len(row.get('votes', {}))}"
-                  f"/{len(items)} rejected={len(row.get('rejected', ()))} job {n}/{len(jobs)} "
-                  f"{time.monotonic() - started:.0f}s"
-                  + (f" ERROR {row['error']}" if row.get("error") else ""),
-                  file=sys.stderr, flush=True)
+            cv.progress(f"[progress] {side} {job[0]} run{job[1]} done: votes={len(row.get('votes', {}))}"
+                        f"/{len(items)} rejected={len(row.get('rejected', ()))} job {n}/{len(jobs)} "
+                        f"{time.monotonic() - started:.0f}s"
+                        + (f" ERROR {row['error']}" if row.get("error") else ""))
             return row
         return list(pool.map(one, jobs))
     return vote
@@ -713,16 +712,15 @@ def main(argv: "list[str] | None" = None) -> int:
                 # (CC-16, Part E) rather than billing the whole side twice.
                 planned[side] = requests_of(items, len(voters), args.runs, batch, code_batch)
                 if not items:
-                    print(f"[plan] {side}: re-used from --base-votes, 0 requests "
-                          f"(every claim of this side is in the record)", file=sys.stderr, flush=True)
+                    cv.progress(f"[plan] {side}: re-used from --base-votes, 0 requests "
+                                f"(every claim of this side is in the record)")
                     return []
-                print(f"[plan] {side}: {len(items)} claim(s) not in --base-votes, "
-                      f"{planned[side]} requests ({len(voters)} voters x {args.runs} runs)",
-                      file=sys.stderr, flush=True)
+                cv.progress(f"[plan] {side}: {len(items)} claim(s) not in --base-votes, "
+                            f"{planned[side]} requests ({len(voters)} voters x {args.runs} runs)")
                 return vote(items, side)
             planned[side] = requests_of(items, len(voters), args.runs, batch, code_batch)
-            print(f"[plan] {side}: {len(items)} claims, {planned[side]} requests "
-                  f"({len(voters)} voters x {args.runs} runs)", file=sys.stderr, flush=True)
+            cv.progress(f"[plan] {side}: {len(items)} claims, {planned[side]} requests "
+                        f"({len(voters)} voters x {args.runs} runs)")
             return vote(items, side)
 
         with concurrent.futures.ThreadPoolExecutor(max(1, args.parallel)) as pool:
