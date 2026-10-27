@@ -520,7 +520,7 @@ def _kilo_config(path: Path, worktree: "Path | None") -> bool:
 _CMD_TOKEN = re.compile(r'"[^"]*"|\'[^\']*\'|[^\s<>|&;()"\']+')
 
 
-def _command_paths(command) -> list:
+def _command_paths(command, depth: int = 0) -> list:
     """The path-shaped tokens of a ``bash`` command, quotes stripped (KC-13).
 
     Kilo names the *first* outside directory it detects in ``patterns``; a
@@ -544,17 +544,83 @@ def _command_paths(command) -> list:
     raw command text, not this list, so it is unaffected; and an
     ``external_directory`` pattern of ``/`` is never scanned here.
     """
-    if not isinstance(command, str) or "\x00" in command:
+    if not isinstance(command, str) or "\x00" in command or depth > _MAX_NESTING:
         return []
     paths = []
+    previous = ""
     for token in _CMD_TOKEN.findall(command):
-        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        quoted = len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'"
+        if quoted:
             token = token[1:-1]
-        if not token or token == "/":
+        if quoted and _SCRIPT_OPTION_RE.match(previous):
+            # POLICY-CLIMB-2: `sh -c '…'`, `python -c "…"`: the script is a command line of its own.
+            paths.extend(_command_paths(token, depth + 1))
+            previous = token
             continue
-        if _pathlike(token):
-            paths.append(token)
+        previous = token
+        for candidate in _token_values(token):
+            if candidate and candidate != "/" and _pathlike(candidate):
+                paths.append(candidate)
     return paths
+
+
+#: The option before an inline script: `-c` (also `-lc`, `-ec`) and `-e` (perl, node, ruby).
+_SCRIPT_OPTION_RE = re.compile(r"^-[A-Za-z]*[ce]$")
+#: A short option glued to its value: `-O../f`, `-o/tmp/x`.
+_GLUED_SHORT_OPTION_RE = re.compile(r"^-[A-Za-z](?=[./~$])")
+
+
+def _token_values(token: str) -> list:
+    """*token* and the values the program behind it is handed (POLICY-CLIMB-2).
+
+    ``of=../wt-b/f``, ``--output=../wt-b/f``, ``F=../wt-b/f`` and ``-O../wt-b/f``
+    resolved whole name a directory called ``of=..`` (``--output=..``, ``-O..``)
+    inside the worktree, so the write into a sibling worktree was approved as
+    "inside worktree/tmp_roots". ``dd``, ``tar``, ``git``, ``cp``, ``curl``,
+    ``wget`` and ``sort`` read the part after the ``=`` or the option letter, and
+    the shell keeps an assignment's value for a later ``$F``: that part is
+    judged too.
+    """
+    values = [token]
+    if "=" in token and not token.startswith("="):
+        values.append(token.split("=", 1)[1])
+    if _GLUED_SHORT_OPTION_RE.match(token):
+        values.append(token[2:])
+    return values
+
+
+#: A word the shell rewrites before it runs — a backtick or `$(…)` substitution, a
+#: `{a,b}` or `{a..b}` brace list — and that holds a slash, so it may be a path.
+_EXPANDED_WORD_RE = re.compile(r"\S*(?:`|\$\(|\{[^{}\s]*(?:,|\.\.)[^{}\s]*\})\S*")
+#: A shell assignment, `F=…` or `export F=…`.
+_ASSIGNMENT_RE = re.compile(r"(?:^|[\s;&|(])([A-Za-z_][A-Za-z0-9_]*)=")
+#: A redirect into a variable: `> $F`, `>> "${OUT}"`.
+_REDIRECT_TO_VAR_RE = re.compile(r">\s*\"?(\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)(?![A-Za-z0-9_/])")
+
+
+def _unreadable_target(command) -> bool:
+    """True when *command* names a place only the shell can work out (POLICY-CLIMB-2).
+
+    ``echo x > {..,.}/wt-b/f`` and ``echo x > `pwd`/../wt-b/f`` were dropped by the
+    path scan (a brace list and a backtick are not path characters) and approved as
+    "no path outside worktree/tmp_roots"; ``echo x > $F`` was, since only a
+    ``$VAR/`` is refused. The mechanical layer cannot read such a word, so — the rule
+    of ``_unresolved_var`` — it hands the command to the gate. Single-quoted text is
+    literal and is not read; an expansion with no slash (``echo {1..5}``, a commit
+    message's `` `name` ``) is not a path.
+    """
+    if not isinstance(command, str) or not command:
+        return False
+    text = re.sub(r"'[^']*'", "''", command)
+    if any("/" in m.group(0) for m in _EXPANDED_WORD_RE.finditer(text)):
+        return True
+    # A variable the command assigns itself (`F=../x; … > $F`) is judged by its value in `_token_values`.
+    assigned = {m.group(1) for m in _ASSIGNMENT_RE.finditer(text)}
+    for m in _REDIRECT_TO_VAR_RE.finditer(text):
+        var = m.group(1)
+        if var not in _KNOWN_SHELL_VARS and var.strip("${}") not in assigned:
+            return True
+    return False
 
 
 #: Shell variables the policy expands: $HOME and $PWD only; any other $VAR is refused.
@@ -1940,6 +2006,9 @@ class Policy:
                 )
             if _unresolved_var(command):
                 # A $FOO/x path is not a place the mechanical layer can see, so the gate decides (KC-13).
+                return None
+            if _unreadable_target(command):
+                # A brace list, a substitution or a `> $F` names a place only the shell knows (POLICY-CLIMB-2).
                 return None
 
         if _inside_worktree_or_tmp(pairs, worktree, self._tmp_roots(ctx)):
