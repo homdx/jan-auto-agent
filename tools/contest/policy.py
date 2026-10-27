@@ -338,6 +338,8 @@ REFUSE, without exception:
     git checkout, git fetch);
   * a network fetch piped into a shell (curl ... | sh, wget ... | sh);
   * git push, git push --force, git reset --hard, git clean -f, git rebase;
+  * anything the deny_commands line names, also when a wrapper, a variable
+    or a substitution runs it (taskset 1 git push, su -c '...', $x push);
   * rm, chmod, chown, kill, reboot, shutdown or any other destructive command
     whose target is outside the worktree;
   * anything you cannot read and understand in full, or whose effect on this
@@ -1709,6 +1711,116 @@ def _deny_globs(pattern: str) -> tuple:
     return (pattern, pattern + " *")
 
 
+#: A word of a piece as the suspicion check reads it: cut at blanks, `=`, `!` and grouping marks.
+_FLAT_WORD_RE = re.compile(r"[^\s=!(){};`|&<>]+")
+
+#: Characters that make a command word something only the shell can read: `$x`, `git${IFS}push`, `$(…)`.
+_EXPANSION_CHARS = ("$", "`")
+
+
+def _pattern_words(pattern: str) -> list:
+    """The literal words a ``deny_commands`` pattern starts with, up to its first glob.
+
+    ``git push*`` → ``git push``, ``sudo *`` → ``sudo``, ``rm -rf /*`` → ``rm -rf /``,
+    ``curl * | sh`` → ``curl``: the words a command must hold, in order, to be
+    that pattern behind something the deny matcher does not read.
+    """
+    words: list = []
+    for word in pattern.split("|", 1)[0].split():
+        if any(c in word for c in "*?["):
+            head = word.split("*", 1)[0]
+            if head and not any(c in head for c in "?["):
+                words.append(head)
+            break
+        words.append(word)
+    return words
+
+
+def _word_is(token: str, word: str) -> bool:
+    """*token* is *word* as a pattern's ``word*`` reads it: whole, or followed by a non-word character."""
+    if token == word:
+        return True
+    tail = token[len(word):len(word) + 1] if token.startswith(word) else ""
+    return bool(tail) and not (tail.isalnum() or tail in "_-")
+
+
+def _in_order(tokens: list, words: list) -> bool:
+    """Every one of *words* appears in *tokens*, in that order (other tokens between them)."""
+    k = 0
+    for token in tokens:
+        if k < len(words) and _word_is(token, words[k]):
+            k += 1
+    return k == len(words)
+
+
+def _deny_suspicion(command: str, deny_commands, _depth: int = 0) -> "str | None":
+    """Why *command* may run a ``deny_commands`` pattern the matcher missed, or ``None``.
+
+    POLICY-DENY-ASK: ``_deny_match`` reads the wrappers it knows (``sudo``,
+    ``timeout``, ``bash -c`` …), and a miss there was an approval — the command
+    names no path, so ``_mechanical`` answered "no path outside worktree" and the
+    gate never saw ``taskset 1 git push``, ``strace git push``, ``su -c 'git
+    push'``, ``find . -exec git push \\;``, ``busybox sh -c 'git push'``,
+    ``git${IFS}push``, ``x=git; $x push`` or ``git $(echo push)``. A list of
+    wrappers is never complete, so each shell piece is read three ways instead,
+    and a hit sends the command to the gate (it is not a rejection — ``echo "git
+    push"`` is legal — but it is not the mechanical layer's call):
+
+    * a pattern's words (``git`` … ``push``) stand in the piece in order, quotes
+      dropped, starting anywhere but at the piece's own command word — something
+      runs them that the matcher did not recognise;
+    * the command word holds ``$`` or a backtick: what runs is decided by the shell;
+    * the command word is a pattern's first word and a later word of the pattern
+      is a ``$``/backtick word there (``git $(echo push)``).
+
+    The answer is the line the gate reads as ``suspicion:``. With no
+    ``deny_commands`` there is nothing to miss and nothing is asked.
+    """
+    patterns = [p for p in _as_list(deny_commands) if isinstance(p, str) and p.strip()]
+    if not command or not patterns:
+        return None
+    word_lists = [(p, _pattern_words(p)) for p in patterns]
+    for piece in _shell_pieces(command):
+        try:
+            tokens = shlex.split(_ansi_c_expand(piece))
+        except ValueError:
+            tokens = piece.split()
+        tokens = [t.lstrip("({!") if k == 0 else t for k, t in enumerate(tokens)]
+        tokens = [t for t in tokens if t]
+        start = _deny_command_start(tokens)
+        if start is None:
+            continue
+        word = tokens[start]
+        if any(c in word for c in _EXPANSION_CHARS):
+            return f"the command word {word!r} is only known once the shell expands it"
+        name = _command_word(word)
+        # quotes and backslashes dropped: `su -c 'git push'` and `g''it` read as words, and
+        # a word is cut at `=`/`!` too — `git -c alias.p="!git push" p` runs a push
+        flat = [_command_word(t) for t in _FLAT_WORD_RE.findall(re.sub(r"[\"'\\]", "", piece))]
+        for pattern, words in word_lists:
+            if not words:
+                continue
+            if name == words[0]:
+                rest = tokens[start + 1:]
+                if name == "git":  # past the global options, as _deny_normalised reads them
+                    k = 0
+                    while k < len(rest) and rest[k].startswith("-"):
+                        k += 2 if rest[k] in _GIT_VALUE_OPTIONS else 1
+                    rest = rest[k:]
+                if any(c in t for t in rest[:len(words) - 1] for c in _EXPANSION_CHARS):
+                    return f"{word} with a shell expansion where {pattern!r} would name its subcommand"
+            hits = [i for i, t in enumerate(flat)
+                    if t == words[0] and _in_order(flat[i + 1:], words[1:])]
+            if hits[1 if name == words[0] else 0:]:
+                return f"{pattern!r} appears behind {name!r}, a wrapper the deny matcher does not read"
+    if _depth < _MAX_NESTING:
+        for inner in _substitutions(command):
+            found = _deny_suspicion(inner, deny_commands, _depth + 1)
+            if found:
+                return found
+    return None
+
+
 # The gate's reply
 
 #: Head of a gate object cut off by max_tokens; the verdict is whole, only the reason ran out (round 46).
@@ -1826,8 +1938,14 @@ def _tool_lines(recent_tools) -> list:
     return lines
 
 
-def _gate_user_message(props: dict, ctx: PolicyContext, tmp_roots: tuple = ()) -> str:
-    """The one user message the gate reads: every labelled line, nothing else."""
+def _gate_user_message(props: dict, ctx: PolicyContext, tmp_roots: tuple = (),
+                       deny_commands: tuple = ()) -> str:
+    """The one user message the gate reads: every labelled line, nothing else.
+
+    POLICY-DENY-ASK: the operator's ``deny_commands`` are named, so a command sent up
+    because it may run one of them is judged against the list, not only the prompt's
+    own examples; ``suspicion:`` says why the mechanical layer did not decide.
+    """
     meta = _metadata(props)
     worktree = _resolve(ctx.worktree)
     roots = [root for root in _as_list(tmp_roots) if isinstance(root, str) and root]
@@ -1843,6 +1961,13 @@ def _gate_user_message(props: dict, ctx: PolicyContext, tmp_roots: tuple = ()) -
         f"ticket: {_as_str(ctx.ticket_title) or '-'}",
         f"ticket files: {', '.join(files) or '-'}",
     ]
+    denied = [p for p in _as_list(deny_commands) if isinstance(p, str) and p]
+    if denied:
+        lines.append(f"deny_commands: {', '.join(denied)}")
+        if _as_str(props.get("permission")) == "bash":
+            suspicion = _deny_suspicion(_as_str(meta.get("command")), denied)
+            if suspicion:
+                lines.append(f"suspicion: {suspicion}")
     tools = _tool_lines(ctx.recent_tools)
     lines.append("recent tools:" + (" none" if not tools else ""))
     lines.extend(f"  {line}" for line in tools)
@@ -2010,6 +2135,9 @@ class Policy:
             if _unreadable_target(command):
                 # A brace list, a substitution or a `> $F` names a place only the shell knows (POLICY-CLIMB-2).
                 return None
+            if _deny_suspicion(command, self._deny_commands()):
+                # A deny pattern behind a wrapper the matcher does not read, or a command word the shell builds (POLICY-DENY-ASK).
+                return None
 
         if _inside_worktree_or_tmp(pairs, worktree, self._tmp_roots(ctx)):
             return Decision("once", "mechanical", "inside worktree/tmp_roots")
@@ -2112,7 +2240,9 @@ class Policy:
                 f"gate budget exhausted ({int(budget)})",
             )
 
-        request = self._gate_request(_gate_user_message(props, ctx, self._tmp_roots(ctx)))
+        request = self._gate_request(_gate_user_message(
+            props, ctx, self._tmp_roots(ctx), self._deny_commands(),
+        ))
         if request is None:
             return Decision(
                 "reject", "gate-failed",
