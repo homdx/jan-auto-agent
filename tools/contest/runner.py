@@ -220,7 +220,7 @@ from tools.contest import context_memory
 from tools.contest.backend import (ContestBackend, ContestBackendError, KiloLimitKept,
                                   KiloLimitRefused, KiloTapReconnectError,
                                   drop_stale_kilo_file)
-from tools.contest.gates import DEADLINE_COMMIT_EMAIL, declared_files, git
+from tools.contest.gates import BRIDGE, DEADLINE_COMMIT_EMAIL, declared_files, git
 from tools.contest.harvest import harvest, rework_message
 from tools.contest.kilo_client import (
     AGENT_TEST_TIMEOUT_MS,
@@ -1906,6 +1906,26 @@ python3 scripts/append_task.py --progress runs/{name}/PROGRESS.csv \\
 Stop after **one** ticket. Do not call `next_task.py` again — the next round
 is handed out separately, from a different tree.
 
+{rules}Run git commands one after another, never as parallel tool calls: two of them
+at once collide on your worktree's index.lock.
+
+Running the test suite on this machine can take up to 20 minutes under load:
+give that `bash` call a `timeout` of at least {test_timeout_ms} ms.
+
+When you are done, report: the commit sha, each Acceptance checkbox and
+whether you met it, and anything in the ticket you found to be wrong about the
+live code — each ticket names the commit it was written against in its
+`**Status:**` line{status_example}; the code is the
+authority, not the ticket.
+
+Your starting tree is commit {base_sha}; your one commit goes on top of it.
+{scratch_note}Any command that reaches outside your worktree is decided by a reviewer, and a
+rejection is final for that command — do not retry it.
+"""
+
+
+#: The ground rules of a jan-auto-agent round: its own `CollectBridge._shrink`, collect and ini files.
+_HOUSE_RULES = """\
 The ground rules are printed inside the ticket. Three of them settle the round
 on their own, so read them before you start:
 
@@ -1925,22 +1945,37 @@ Two more that are checked by reading your diff:
 Never point any command at a live provider config. If a step needs one, copy
 `agents_128k.ini` to a scratch path and stub every `base_url` first.
 
-Run git commands one after another, never as parallel tool calls: two of them
-at once collide on your worktree's index.lock.
-
-Running the test suite on this machine can take up to 20 minutes under load:
-give that `bash` call a `timeout` of at least {test_timeout_ms} ms.
-
-When you are done, report: the commit sha, each Acceptance checkbox and
-whether you met it, and anything in the ticket you found to be wrong about the
-live code — each ticket names the commit it was written against in its
-`**Status:**` line (the original 24 used `68b78a0`); the code is the
-authority, not the ticket.
-
-Your starting tree is commit {base_sha}; your one commit goes on top of it.
-{scratch_note}Any command that reaches outside your worktree is decided by a reviewer, and a
-rejection is final for that command — do not retry it.
 """
+
+#: The same paragraph for an external --target repo, which has none of jan-auto-agent's files (GYRO-01).
+_TARGET_RULES = """\
+The ground rules are printed inside the ticket. These settle the round on
+their own, so read them before you start:
+
+- **One local commit.** Never `git push`.
+- **A test ships with the change**, and it must fail without the change.
+- **Stay on the ticket.** Touching files the ticket does not name counts
+  against you unless you say why in the commit message.
+
+"""
+
+
+def _house_repo(ticket_path, base_sha: str) -> bool:
+    """True when the round's repo carries `BRIDGE` at *base_sha*, i.e. it is jan-auto-agent itself.
+
+    Read off the ticket's own checkout. Fail-open to True: anything unreadable
+    keeps the prompt as it always was.
+    """
+    def present(obj: str) -> bool:
+        return subprocess.run(["git", "cat-file", "-e", obj], cwd=cwd, capture_output=True,
+                              text=True, timeout=30).returncode == 0
+
+    try:
+        cwd = Path(ticket_path).resolve().parent
+        # A base git cannot read (no repo, an unknown sha) is not proof of an external repo.
+        return not present(f"{base_sha}^{{commit}}") or present(f"{base_sha}:{BRIDGE}")
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+        return True
 
 
 #: Sentence added when the round gives an agent a scratch dir; empty means no sentence (KC-59).
@@ -2014,7 +2049,8 @@ def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: st
     """The runbook's prompt for *agent_name*, plus the base sha and the permission rule.
 
     The ticket is not repeated: the session reads it from its own worktree via
-    `next_task.py`, so *ticket_path* is accepted for the caller's clarity only.
+    `next_task.py`; *ticket_path* only tells jan-auto-agent's own rounds from an
+    external --target, whose prompt carries no `CollectBridge`/ini rules (GYRO-01).
     When *tmp_dir* is non-empty (KC-59), the sentence that names the agent's own
     scratch dir is appended first; when *dirty* is non-empty (a `--resume` into a
     worktree that still holds uncommitted work, KC-22), the `continue_message`
@@ -2027,8 +2063,10 @@ def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: st
     paragraph: `leg_message`'s account of the relay so far and the instruction to
     continue. Every existing caller passes none of them and gets the unchanged text.
     """
-    del ticket_path
+    house = _house_repo(ticket_path, base_sha)
     text = _PROMPT.format(name=agent_name, base_sha=base_sha,
+                          rules=_HOUSE_RULES if house else _TARGET_RULES,
+                          status_example=" (the original 24 used `68b78a0`)" if house else "",
                           test_timeout_ms=AGENT_TEST_TIMEOUT_MS,
                           scratch_note=_scratch_note(agent_name, tmp_roots, tmp_dir))
     if tmp_dir:

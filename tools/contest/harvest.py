@@ -651,10 +651,9 @@ def rework_message(h: Harvest, attempt: int, max_rework: int) -> str:
     if noted:
         lines += ["", "Also noted:"]
         lines += [f"- {r.text}" for r in noted]
-    lines += [
-        "",
-        "Ground rules that settle a round:",
-        "- `CollectBridge._shrink` stays byte-identical to the base.",
-        "- Ship a test that fails without the change.",
-    ]
+    lines += ["", "Ground rules that settle a round:"]
+    # An external --target base has no bridge (`shrink` is "?"), so there is no _shrink to keep (GYRO-01).
+    if (h.facts or {}).get("shrink") != "?":
+        lines.append("- `CollectBridge._shrink` stays byte-identical to the base.")
+    lines.append("- Ship a test that fails without the change.")
     return "\n".join(lines)
