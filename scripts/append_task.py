@@ -24,7 +24,27 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tools import file_lock  # noqa: E402
+try:
+    from tools.file_lock import locked  # noqa: E402
+except ImportError:
+    # GYRO-01: an external --target repo gets this script alone, without tools/file_lock.py
+    # (llama.cpp even has a tools/ of its own); the same parent-directory flock, inline.
+    import contextlib
+
+    @contextlib.contextmanager
+    def locked(path):
+        parent = os.path.dirname(os.path.realpath(path))
+        os.makedirs(parent, exist_ok=True)
+        fd = None
+        if os.name != "nt":
+            import fcntl
+            fd = os.open(parent, os.O_RDONLY)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fd is not None:
+                os.close(fd)
 
 COLUMNS = ["ticket", "finding", "outcome", "commit", "note"]
 OUTCOMES = {"FIXED", "ALREADY-OK", "SKIPPED"}
@@ -94,7 +114,7 @@ def main():
         os.makedirs(d, exist_ok=True)
     # AUDIT3-C4: the duplicate check and the append are one locked step, as in
     # append_verdict.py — two agents recording one ticket both passed the check.
-    with file_lock.locked(a.progress):
+    with locked(a.progress):
         existed = os.path.exists(a.progress) and os.path.getsize(a.progress) > 0
         why = _not_utf8(a.progress) if existed else ""
         if why:
