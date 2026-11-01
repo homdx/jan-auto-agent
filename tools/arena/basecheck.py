@@ -24,6 +24,7 @@ exit code is the steps'.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -32,7 +33,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Optional, Sequence
+from typing import Callable, Iterator, Mapping, Optional, Sequence
 
 from tools.arena import gitref, output
 
@@ -122,6 +123,70 @@ def resolve_sha(repo: Path, ref: str) -> str:
 def worktree_path(repo: Path, sha: str) -> Path:
     """The throwaway checkout of *sha*: `.arena/base-check/<sha[:12]>`."""
     return Path(repo) / ".arena" / WORKTREE_DIR / sha[:SHORT]
+
+
+def lock_path(repo: Path, sha: str) -> Path:
+    """The process-safe lock of one commit: `.arena/base-check/<sha[:12]>.lock`.
+
+    HARDEN-29 E: two overlapping checks of the same commit serialise on this
+    file, so neither removes the other's live checkout. The file itself is
+    never removed — a process waiting on it holds an open descriptor, and
+    removing the path under it would let a third run start a second lock.
+    """
+    return Path(repo) / ".arena" / WORKTREE_DIR / f"{sha[:SHORT]}.lock"
+
+
+@contextlib.contextmanager
+def _check_lock(repo: Path, sha: str) -> Iterator[None]:
+    """Hold the per-commit lock across a check's whole lifecycle.
+
+    A crashed run's descriptor closes with its process, so the next check
+    acquires the lock and cleans the leftover; a live run is never disturbed.
+    Fail-open: without ``fcntl`` or if the lock file cannot be created, the
+    run proceeds as today (a platform without advisory locks).
+    """
+    with _flock(lock_path(repo, sha)):
+        yield
+
+
+@contextlib.contextmanager
+def _cache_lock(repo: Path) -> Iterator[None]:
+    """Hold `.arena/base-check.json.lock` across one read-modify-write of the cache.
+
+    HARDEN-29 E: the per-commit lock does not cover the cache, which every
+    commit shares — two checks of two commits finishing together each read the
+    old cache and the second write dropped the first one's pass.
+    """
+    with _flock(cache_path(repo).with_name(CACHE_FILE + ".lock")):
+        yield
+
+
+@contextlib.contextmanager
+def _flock(path: Path) -> Iterator[None]:
+    """An exclusive advisory lock on *path* for the block; fail-open."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        yield
+        return
+    locked = False
+    try:
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+        except (ImportError, OSError):
+            locked = False
+        yield
+    finally:
+        if locked:
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+        os.close(fd)
 
 
 def _registered(repo: Path) -> set[str]:
@@ -371,36 +436,41 @@ def run_base_check(
         dry_run(sha, tree, steps)
         return EXIT_OK
 
-    if not getattr(args, "force", False):
-        hit = _hit(read_cache(repo), sha, [step.name for step in steps])
-        if hit is not None:
-            _print(hit, sha, fmt)
-            return EXIT_OK
+    # HARDEN-29 E: one check of a commit at a time, across the cache read,
+    # the worktree lifecycle and the cache write, so two overlapping checks
+    # never remove each other's live checkout.
+    with _check_lock(repo, sha):
+        if not getattr(args, "force", False):
+            hit = _hit(read_cache(repo), sha, [step.name for step in steps])
+            if hit is not None:
+                _print(hit, sha, fmt)
+                return EXIT_OK
 
-    try:
-        prepare_tree(repo, tree, sha)
-    except BaseCheckError as err:
-        return output.refuse(str(err))
+        try:
+            prepare_tree(repo, tree, sha)
+        except BaseCheckError as err:
+            return output.refuse(str(err))
 
-    try:
-        rows = run_steps(tree, steps)
-    finally:
-        if getattr(args, "keep", False):
-            if tree.exists():
-                print(str(tree))
-        else:
-            remove_tree(repo, tree)
+        try:
+            rows = run_steps(tree, steps)
+        finally:
+            if getattr(args, "keep", False):
+                if tree.exists():
+                    print(str(tree))
+            else:
+                remove_tree(repo, tree)
 
-    for row in rows:
-        row["sha"], row["cached"] = sha, False
-    _print(rows, sha, fmt)
+        for row in rows:
+            row["sha"], row["cached"] = sha, False
+        _print(rows, sha, fmt)
 
-    if all(row["ok"] for row in rows):
-        cache = read_cache(repo)
-        cache[sha] = {
-            "at": int(time.time()),
-            "ok": True,
-            "steps": [{k: row[k] for k in COLUMNS} for row in rows],
-        }
-        write_cache(repo, cache)
-    return EXIT_OK if all(row["ok"] for row in rows) else EXIT_FAILED
+        if all(row["ok"] for row in rows):
+            with _cache_lock(repo):
+                cache = read_cache(repo)
+                cache[sha] = {
+                    "at": int(time.time()),
+                    "ok": True,
+                    "steps": [{k: row[k] for k in COLUMNS} for row in rows],
+                }
+                write_cache(repo, cache)
+        return EXIT_OK if all(row["ok"] for row in rows) else EXIT_FAILED

@@ -57,6 +57,7 @@ pytest_serial      — run a workspace pytest in-process (``-n 0``) instead of
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -108,6 +109,12 @@ _MIRROR_IGNORE = shutil.ignore_patterns(
     ".git", ".agent", "__pycache__", ".pytest_cache", ".mypy_cache",
     ".venv", "venv", "node_modules", ".tox", "*.egg-info",
 )
+
+#: HARDEN-29 A: the registry, one JSON list of directory names, that records
+#: every workspace this executor created. `_prune_old_workspaces` only ever
+#: deletes a directory whose name is in it — a directory without the mark is
+#: not the executor's, so it is never a candidate.
+_WORKSPACE_REGISTRY = ".agent-workspaces.json"
 
 
 # Result dataclass
@@ -423,6 +430,10 @@ class Executor:
         if workspace.exists():
             shutil.rmtree(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
+        # HARDEN-29 A: the executor owns the workspace it just made; the mark is
+        # what pruning may later use to tell it from an unrelated directory that
+        # happens to live under the same root.
+        self._mark_workspace(workspace)
 
         # The whole repo is mirrored into the workspace before target files are overlaid, so checks can see helpers (AUTO-FIX-1).
         try:
@@ -519,6 +530,59 @@ class Executor:
 
         return workspace
 
+    def _read_workspace_registry(self) -> set[str]:
+        """The directory names this executor marked as its own workspaces.
+
+        HARDEN-29 A: fail-open. A registry that is missing, unreadable or not a
+        JSON list is an empty set, so pruning simply finds no candidate and
+        deletes nothing — never the wrong directory.
+        """
+        path = self._registry_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        if not isinstance(data, list):
+            return set()
+        return {str(x) for x in data if isinstance(x, str)}
+
+    def _mark_workspace(self, workspace: Path) -> None:
+        """Record *workspace* as one this executor created (HARDEN-29 A).
+
+        The registry lives beside ``workspace_root`` (see ``_registry_path``),
+        never inside a workspace, so it is not mirrored into a task and cannot
+        be mistaken for task output. A failed write only disables pruning — it
+        never raises.
+        """
+        try:
+            names = self._read_workspace_registry()
+        except Exception:  # noqa: BLE001 — the mark is best-effort, pruning may then just find no candidates
+            names = set()
+        names.add(workspace.name)
+        registry = self._registry_path()
+        try:
+            registry.parent.mkdir(parents=True, exist_ok=True)
+            tmp = registry.with_name(f"{registry.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(sorted(names), indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, registry)
+        except OSError as exc:
+            logger.warning(
+                "_mark_workspace: could not record %s (%s) — "
+                "workspace pruning is disabled for this root", workspace, exc,
+            )
+
+    def _registry_path(self) -> Path:
+        """The ownership registry's location (HARDEN-29 A).
+
+        The registry lives *beside* ``workspace_root`` — the default
+        ``.agent/workspace`` keeps it at ``.agent/.agent-workspaces.json`` —
+        never inside ``workspace_root``, so the per-task workspace mirrors
+        are the only entries that directory ever lists, and never inside a
+        workspace itself, so a registry write cannot refresh a workspace's
+        mtime (the stamp that orders pruning).
+        """
+        return self._workspace_root.parent / _WORKSPACE_REGISTRY
+
     def _prune_old_workspaces(self, keep: Path) -> None:
         """Remove old per-task workspace mirrors beyond the retention limit.
 
@@ -528,6 +592,13 @@ class Executor:
         checks), so without pruning these directories accumulate forever
         and fill the disk. Keep only the ``max_retained_workspaces`` most
         recently modified sibling directories (plus the one just built).
+
+        HARDEN-29 A: only directories this executor created are ever pruned
+        (a directory without the executor's mark is never a candidate), and
+        the source repository, every ancestor of it and anything that
+        contains it are never deleted, marked or not. A ``workspace_root``
+        that would put the source among the candidates therefore prunes
+        nothing rather than delete it.
         """
         if self._max_retained_workspaces <= 0:
             return
@@ -538,6 +609,27 @@ class Executor:
             ]
         except (OSError, FileNotFoundError):
             return
+        marked = self._read_workspace_registry()
+        base_resolved = self._base_dir.resolve()
+
+        def _is_protected(p: Path) -> bool:
+            """True when *p* is (or contains) the source repository.
+
+            The source repo, every ancestor of it and anything that contains
+            it are never pruned, marked or not — an explicit shared
+            ``workspace_root`` must not make the agent delete its own base.
+            """
+            try:
+                p_res = p.resolve()
+            except OSError:
+                return True
+            try:
+                base_resolved.relative_to(p_res)
+                return True
+            except ValueError:
+                return False
+
+        siblings = [p for p in siblings if p.name in marked and not _is_protected(p)]
         # Oldest first among the other task workspaces; a sibling removed mid-scan must not raise (BUGFIX).
         def _safe_mtime(p: Path) -> float:
             try:

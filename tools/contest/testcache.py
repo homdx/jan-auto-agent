@@ -54,12 +54,16 @@ class PytestRun:
     each as one string (``-x``, ``-k=slow``, ``--maxfail=3``, ``-vv``).
     ``cwd`` — the effective working directory a ``cd`` put the run in, as a
     normalised path (``""`` when the command names none, HARDEN-28 C).
+    ``env`` — the ``VAR=value`` assignments that reach pytest, each as one
+    string, excluding the variables that cannot change a test's outcome
+    (HARDEN-29 F). ``frozenset()`` when the command names none.
     Frozen and hashable: it is a dictionary key in the store.
     """
 
     roots: frozenset = field(default_factory=frozenset)
     flags: frozenset = field(default_factory=frozenset)
     cwd: str = ""
+    env: frozenset = field(default_factory=frozenset)
 
 
 @dataclass
@@ -225,6 +229,28 @@ _ENV_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.S)
 _PYTHON = re.compile(r"python(\d+(\.\d+)?)?")
 _REDIRECT = re.compile(r"^(\d*|&)(>>?|<<?<?)(.*)$", re.S)
 
+#: HARDEN-29 F: variables whose value cannot change a test's outcome, so an
+#: assignment to one is not part of the cache key. Every other variable
+#: counts.
+_IGNORED_ENV_VARS = frozenset({
+    "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "TERM", "COLUMNS",
+})
+
+#: HARDEN-29 F: single values of a counting variable that a plain run already
+#: has. ``PYTHONPATH=.`` puts the checkout itself on the path, and the pinned
+#: corpus parses ``env PYTHONPATH=. …`` as the plain run; ``PYTHONPATH=src``
+#: or any other value counts.
+_IGNORED_ENV_VALUES = {"PYTHONPATH": frozenset({".", "./"})}
+
+#: ``env`` options that empty the environment pytest gets: such a run is not
+#: cached at all, like ``env -u``.
+_ENV_CLEARING = frozenset({"-i", "-", "--ignore-environment", "-u", "--unset"})
+
+
+def _env_counts(var: str, value: str) -> bool:
+    """True when ``var=value`` is part of the cache key (HARDEN-29 F)."""
+    return var not in _IGNORED_ENV_VARS and value not in _IGNORED_ENV_VALUES.get(var, ())
+
 #: Wrappers that run the rest of their line; the value-taking options of each.
 _WRAPPERS = {
     "time": ("-f", "--format", "-o", "--output"),
@@ -310,7 +336,20 @@ def _skip_redirect(args: list, i: int) -> int | None:
     return i + 1
 
 
-def _pytest_run(args: list, cwd: str = "") -> PytestRun:
+def _env_word(word: str) -> "tuple[str, str] | None":
+    """``(VAR, value)`` for a ``VAR=value`` word, else ``None``."""
+    if not _ENV_ASSIGN.fullmatch(word):
+        return None
+    var, value = word.split("=", 1)
+    return var, value
+
+
+def _env_readable(value: str) -> bool:
+    """False for a value the parser cannot read (``$(…)``, a backtick, ``$OTHER``)."""
+    return "$" not in value and "`" not in value
+
+
+def _pytest_run(args: list, cwd: str = "", env: "dict | None" = None) -> PytestRun:
     """Reduce the argv after ``pytest`` to roots and meaningful flags."""
     roots: set = set()
     flags: set = set()
@@ -392,20 +431,39 @@ def _pytest_run(args: list, cwd: str = "") -> PytestRun:
         flags.add("-" + "v" * verbose)
     if quiet:
         flags.add("-" + "q" * quiet)
-    return PytestRun(frozenset(roots), frozenset(flags), cwd)
+    env_set = frozenset(
+        f"{k}={v}" for k, v in sorted((env or {}).items())
+    )
+    return PytestRun(frozenset(roots), frozenset(flags), cwd, env_set)
 
 
-def _past_wrappers(words: list) -> int:
-    """Index of the real command word of *words*; ``len(words)`` if none."""
+def _split_env_and_wrappers(words: list) -> "tuple[int, dict, bool]":
+    """The command word of *words*, the env that feeds it, and ``unreadable``.
+
+    HARDEN-29 F: skips the leading ``VAR=v`` prefixes and the wrappers
+    (``time``, ``env``, ``nice``, …) exactly as ``_past_wrappers`` did, and
+    collects every readable assignment that reaches the command. ``unreadable``
+    is ``True`` when an assignment's value cannot be read statically
+    (``$(…)``, a backtick, ``$OTHER``) or ``env -u``/``--unset`` removes a
+    variable — such a command is not cached at all.
+    """
+    env: dict = {}
+    unreadable = False
     i = 0
     while i < len(words):
         word = words[i]
-        if _ENV_ASSIGN.fullmatch(word):
+        parsed = _env_word(word)
+        if parsed is not None:
+            var, value = parsed
+            if not _env_readable(value):
+                unreadable = True
+            elif _env_counts(var, value):
+                env[var] = value
             i += 1
             continue
         name = word.rsplit("/", 1)[-1]
         if name not in _WRAPPERS:
-            return i
+            return i, env, unreadable
         takes = _WRAPPERS[name]
         i += 1
         while i < len(words) and words[i].startswith("-") and words[i] != "--":
@@ -413,30 +471,41 @@ def _past_wrappers(words: list) -> int:
             i += 1
             if flag in takes and i < len(words):
                 i += 1
+        if name == "env" and _ENV_CLEARING.intersection(words[:i]):
+            unreadable = True
         if i < len(words) and words[i] == "--":
             i += 1
         if name == "timeout" and i < len(words):
             i += 1                          # the duration
-    return i
+    return i, env, unreadable
 
 
-def _runs_in_segment(words: list, depth: int, cwd: str) -> list:
-    """The pytest runs one simple command stands for (usually 0 or 1)."""
-    start = _past_wrappers(words)
+def _runs_in_segment(words: list, depth: int, cwd: str,
+                     env: "dict | None" = None) -> "list | None":
+    """The pytest runs one simple command stands for (usually 0 or 1).
+
+    ``None`` when an environment assignment the parser cannot read reaches the
+    command — the whole command is then not cached (HARDEN-29 F).
+    """
+    start, local_env, unreadable = _split_env_and_wrappers(words)
+    if unreadable:
+        return None
     if start >= len(words):
         return []
+    merged = dict(env or {})
+    merged.update(local_env)
     head = words[start].rsplit("/", 1)[-1]
     rest = words[start + 1:]
     if head in ("pytest", "py.test"):
-        return [_pytest_run(rest, cwd)]
+        return [_pytest_run(rest, cwd, merged)]
     if _PYTHON.fullmatch(head):
         if rest[:2] == ["-m", "pytest"]:
-            return [_pytest_run(rest[2:], cwd)]
+            return [_pytest_run(rest[2:], cwd, merged)]
         return []
     if head in ("bash", "sh", "zsh", "dash") and depth < 3:
         # `bash -c "cd x && pytest tests"`: the string is a command line
         if "-c" in rest and rest.index("-c") + 1 < len(rest):
-            return _parse(rest[rest.index("-c") + 1], depth + 1, cwd)
+            return _parse(rest[rest.index("-c") + 1], depth + 1, cwd, env=merged)
     return []
 
 
@@ -470,18 +539,21 @@ def _cd_dest(words: list, cwd: str) -> "str | None":
     return "" if new == "." else new
 
 
-def _parse(command: str, depth: int, cwd: str = "") -> list:
+def _parse(command: str, depth: int, cwd: str = "",
+           env: "dict | None" = None) -> list:
     """Every pytest invocation in *command*, in order; ``[]`` when none, or
     when a ``cd``/``pushd`` cannot be resolved (then the command is not
-    cached at all — HARDEN-28 C)."""
+    cached at all — HARDEN-28 C), or when an environment assignment the
+    parser cannot read reaches a run (HARDEN-29 F)."""
     runs: list = []
     words: list = []
     cur = cwd
+    cur_env = dict(env or {})
     paren = 0
 
     def flush() -> bool:
         """Reduce the accumulated segment; ``False`` = not cacheable."""
-        nonlocal words, cur
+        nonlocal words, cur, cur_env
         if not words:
             return True
         head = words[0].rsplit("/", 1)[-1]
@@ -499,7 +571,43 @@ def _parse(command: str, depth: int, cwd: str = "") -> list:
             return True
         if head == "pushd":
             return False
-        runs.extend(_runs_in_segment(words, depth, cur))
+        # HARDEN-29 F: `unset` and `source`/`.` cannot be read statically, so
+        # a command carrying one is not cached at all.
+        if head in ("unset", "source", "."):
+            return False
+        if head == "export":
+            for w in words[1:]:
+                if "=" not in w:
+                    return False          # `export VAR`: the value is not readable here
+                var, value = w.split("=", 1)
+                if not _env_readable(value):
+                    return False
+                if _env_counts(var, value):
+                    cur_env[var] = value
+            words = []
+            return True
+        # A bare assignment segment (`VAR=v;` / `VAR=v` then `&&`): it sets a
+        # variable for the rest of the command line. An unreadable value is
+        # tolerated and simply not tracked — a timing helper such as
+        # `T0=$(date +%s)` must not make the whole run not cacheable — unless
+        # the line already set that variable: `export X=1; X=$(date); pytest`
+        # runs with the date, so keeping `X=1` in the key would be a wrong hit.
+        if all(_ENV_ASSIGN.fullmatch(w) for w in words):
+            for w in words:
+                var, value = _env_word(w)
+                if not _env_readable(value):
+                    if var in cur_env:
+                        return False
+                elif _env_counts(var, value):
+                    cur_env[var] = value
+                else:
+                    cur_env.pop(var, None)
+            words = []
+            return True
+        res = _runs_in_segment(words, depth, cur, cur_env)
+        if res is None:
+            return False
+        runs.extend(res)
         words = []
         return True
 
