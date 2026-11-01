@@ -20,39 +20,45 @@ def run(roots, flags=()):
 
 
 T, B = "tests", "tests_bugfix"
+SM, RG = ".smoke_tests", ".regression_tests"
 
 #: Corpus lines and the test runs found in them; `-n`, `--timeout` and `tail` are not counted.
+#: HARDEN-28 B: each selection keeps its own key, so the tier roots no longer
+#: fold into `tests`; HARDEN-28 C: a `cd` whose target cannot be read statically
+#: (``cd "$PWD"``) makes the command not cacheable (`[]`).
 EXPECTED = [
-    ("timeout 1200000 python3 -m pytest .smoke_tests/ -q 2>&1 | tail -20", [run([T], ["-q"])]),
-    ("timeout 1200000 python3 -m pytest .regression_tests/ -q 2>&1 | tail -20", [run([T], ["-q"])]),
+    ("timeout 1200000 python3 -m pytest .smoke_tests/ -q 2>&1 | tail -20", [run([SM], ["-q"])]),
+    ("timeout 1200000 python3 -m pytest .regression_tests/ -q 2>&1 | tail -20", [run([RG], ["-q"])]),
     ("timeout 1200000 python3 -m pytest tests_bugfix -n 4 -q 2>&1 | tail -20", [run([B], ["-q"])]),
     ("python3 -m pytest tests/test_sandbox_full_suite_900.py -q",
      [run(["tests/test_sandbox_full_suite_900.py"], ["-q"])]),
-    ("python3 -m pytest .smoke_tests/ -q --tb=no 2>&1 | tail -20", [run([T], ["-q", "--tb=no"])]),
+    ("python3 -m pytest .smoke_tests/ -q --tb=no 2>&1 | tail -20", [run([SM], ["-q", "--tb=no"])]),
     ("python3 -m pytest .smoke_tests/ .regression_tests/ -q --tb=no 2>&1 | tail -20",
-     [run([T], ["-q", "--tb=no"])]),
+     [run([SM, RG], ["-q", "--tb=no"])]),
     ("python3 -m pytest tests_bugfix -n 4 -q --tb=no 2>&1 | tail -20", [run([B], ["-q", "--tb=no"])]),
-    ("python3 -m pytest .smoke_tests/ .regression_tests/ -q 2>&1 | tail -30", [run([T], ["-q"])]),
+    ("python3 -m pytest .smoke_tests/ .regression_tests/ -q 2>&1 | tail -30", [run([SM, RG], ["-q"])]),
     ("python3 -m pytest tests_bugfix -n 4 -q 2>&1 | tail -30", [run([B], ["-q"])]),
     ("python3 -m pytest tests/test_sandbox_full_suite_900.py -q 2>&1 | tail -10",
      [run(["tests/test_sandbox_full_suite_900.py"], ["-q"])]),
     ("cat pytest.ini 2>/dev/null || cat pyproject.toml 2>/dev/null | head -50", []),
     ("python3 -m pytest .smoke_tests/ .regression_tests/ tests_bugfix -q -n 4 2>&1 | tail -20",
-     [run([T, B], ["-q"])]),
+     [run([SM, RG, B], ["-q"])]),
     ("time python3 -m pytest .smoke_tests/ .regression_tests/ tests_bugfix -q -n 4 2>&1 | tail -20",
-     [run([T, B], ["-q"])]),
+     [run([SM, RG, B], ["-q"])]),
     ("python3 -m pytest .smoke_tests/ && python3 -m pytest .regression_tests/ && python3 -m pytest tests_bugfix/",
-     [run([T]), run([T]), run([B])]),
+     [run([SM]), run([RG]), run([B])]),
     ("pytest -n auto tests/test_run_suite.py", [run(["tests/test_run_suite.py"])]),
     ("python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4 --durations=0",
-     [run([T], ["-q", "--durations=0"])]),
+     [run([SM, RG], ["-q", "--durations=0"])]),
     ("python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4 --durations=0 --timeout=1200000",
-     [run([T], ["-q", "--durations=0"])]),
+     [run([SM, RG], ["-q", "--durations=0"])]),
+    # `cd "$PWD"` cannot be read statically: the command is not cacheable (HARDEN-28 C).
     ('cd "$PWD" && { time python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4 ; } 2>&1 | tail -30',
-     [run([T], ["-q"])]),
+     []),
     ("cd /home/renat/Project/opensource/github/agent-offline/rounds/901-laguna-s-2-1 && "
      "/usr/bin/time -v python3 -m pytest .smoke_tests/ .regression_tests/ tests_bugfix -q -n 4 2>&1 | tail -30",
-     [run([T, B], ["-q"])]),
+     [PytestRun(frozenset({SM, RG, B}), frozenset({"-q"}),
+                "/home/renat/Project/opensource/github/agent-offline/rounds/901-laguna-s-2-1")]),
     # tests/smoke_tests does not exist in this repo: kept literally, not folded into `tests`
     ('python3 -m pytest tests/smoke_tests tests/regression_tests -q -n 4 --collect-only && echo "full suite -n 4 completed"',
      [run(["tests/smoke_tests", "tests/regression_tests"], ["-q", "--collect-only"])]),
@@ -61,19 +67,22 @@ EXPECTED = [
     ("python3 -m pytest tests -q -n 4 --timeout 600000", [run([T], ["-q"])]),
     ("cd /home/renat/Project/opensource/github/agent-offline/rounds/901-sensenova-6-7-flash-lite && "
      "{ time (python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4 && python3 -m pytest tests_bugfix -q -n 4); } 2>&1 | tail -60",
-     [run([T], ["-q"]), run([B], ["-q"])]),
+     [PytestRun(frozenset({SM, RG}), frozenset({"-q"}),
+                "/home/renat/Project/opensource/github/agent-offline/rounds/901-sensenova-6-7-flash-lite"),
+      PytestRun(frozenset({B}), frozenset({"-q"}),
+                "/home/renat/Project/opensource/github/agent-offline/rounds/901-sensenova-6-7-flash-lite")]),
     ("ls tests/ | head -40; echo ---; cat pytest.ini; echo ---; ls .smoke_tests .regression_tests tests_bugfix | head -40", []),
     ("""python3 -c "import xdist, pytest; print('xdist', xdist.__version__, 'pytest', pytest.__version__)"; """
      "ls tests/ | grep -c '^test_'; ls tests_bugfix | head; ls tests/*policy* 2>/dev/null | head -30", []),
     ('T0=$(date +%s); python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4; RC=$?; T1=$(date +%s); '
      'echo "RUN1_TIERS rc=$RC wall=$((T1-T0))s"; exit 0',
-     [run([T], ["-q"])]),
+     [run([SM, RG], ["-q"])]),
     ('ls tests/ | head -50 && echo "---" && ls .smoke_tests/ | head -20 && echo "---" && ls .regression_tests/ | head -20 '
      '&& echo "---" && ls tests_bugfix/ | head -30 && echo "---" && cat pytest.ini', []),
-    ("time python3 -m pytest .smoke_tests .regression_tests tests_bugfix -q -n 4", [run([T, B], ["-q"])]),
+    ("time python3 -m pytest .smoke_tests .regression_tests tests_bugfix -q -n 4", [run([SM, RG, B], ["-q"])]),
     ('cat pytest.ini 2>/dev/null || cat setup.cfg 2>/dev/null || cat pyproject.toml 2>/dev/null | grep -A 10 pytest '
      '|| echo "No pytest config found"', []),
-    ("time python3 -m pytest .smoke_tests/ .regression_tests/ tests_bugfix -q -n 4", [run([T, B], ["-q"])]),
+    ("time python3 -m pytest .smoke_tests/ .regression_tests/ tests_bugfix -q -n 4", [run([SM, RG, B], ["-q"])]),
 ]
 
 
@@ -94,10 +103,11 @@ def test_corpus_command_parses_to_written_runs(command, expected):
 
 
 def test_normalisation_equivalences():
-    """-n does not matter; the tier roots equal tests; -x, -k and trailing slashes do."""
+    """-n does not matter; the tier roots are three selections (HARDEN-28 B); -x, -k and trailing slashes do."""
     assert parse_pytest("pytest -n 4 tests") == parse_pytest("pytest -n 1 tests") == parse_pytest("pytest -nauto tests")
-    assert parse_pytest("pytest .smoke_tests .regression_tests") == parse_pytest("pytest tests/")
     assert parse_pytest("pytest ./tests/") == parse_pytest("pytest tests")
+    # A smoke selection is not the full suite: its cache key must not answer a `tests` run.
+    assert parse_pytest("pytest .smoke_tests .regression_tests") != parse_pytest("pytest tests")
     assert parse_pytest("pytest tests -x") != parse_pytest("pytest tests")
     assert parse_pytest("pytest tests -k a") != parse_pytest("pytest tests -k b")
     assert parse_pytest("pytest tests -p no:cacheprovider -W ignore --color=no --no-header --timeout=9") \
@@ -115,14 +125,25 @@ def test_normalisation_equivalences():
     ("nice -n 5 pytest tests", ["tests"]),
     ("env PYTHONPATH=. pytest tests", ["tests"]),
     ("PYTHONPATH=. timeout 600 pytest tests", ["tests"]),
-    ("(cd x; pytest tests)", ["tests"]),
     ("{ pytest tests; } | tee out.log", ["tests"]),
-    ('bash -c "cd x && pytest tests"', ["tests"]),
     ("pytest tests 2>&1 >out.txt", ["tests"]),
 ])
 def test_wrapper_forms(command, roots):
     """Wrappers, groups and prefixes are seen through."""
     assert parse_pytest(command) == [run(roots)]
+
+
+def test_cd_inside_subshell_or_unreadable_is_not_cached():
+    """HARDEN-28 C: a cd the parser cannot follow is not cached at all."""
+    # A `cd` inside a subshell the tokenizer flattened is not cacheable.
+    assert parse_pytest("(cd x; pytest tests)") == []
+    # A `cd` to a literal directory IS cacheable, and the directory is the key.
+    assert parse_pytest("bash -c \"cd x && pytest tests\"") == [
+        PytestRun(frozenset({"tests"}), frozenset(), "x")]
+    # An unresolvable `cd` is not looked up and not stored.
+    assert parse_pytest("cd \"$DIR\" && pytest tests") == []
+    assert parse_pytest("cd - && pytest tests") == []
+    assert parse_pytest("pushd x && pytest tests") == []
 
 
 @pytest.mark.parametrize("command", [
@@ -211,7 +232,7 @@ def test_classify_good_json():
     """A good answer is a parse, normalised like a mechanical one."""
     ans = '```json\n{"runs_tests": true, "roots": [".smoke_tests/", "tests_bugfix"], "flags": ["-x", "-k slow"]}\n```'
     got = classify_with_llm("make test", None, completion_fn=lambda s, u: ans)
-    assert got == run([T, B], ["-x", "-k=slow"])
+    assert got == run([SM, B], ["-x", "-k=slow"])
 
 
 def test_classify_not_a_test_run_is_none():

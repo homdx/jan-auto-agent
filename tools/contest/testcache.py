@@ -22,6 +22,7 @@ here raises: an unreadable command is ``[]``, an unreadable output is ``None``.
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 import shlex
 import threading
@@ -47,14 +48,18 @@ class PytestRun:
     """One pytest invocation, normalised so equal runs compare equal.
 
     ``roots`` — what was asked to run (``.smoke_tests``, ``.regression_tests``
-    and ``tests`` all become ``tests``; empty when the command names none).
+    and ``tests`` are three selections (HARDEN-28 B); empty when the command
+    names none).
     ``flags`` — only the options that change what runs or what is printed,
     each as one string (``-x``, ``-k=slow``, ``--maxfail=3``, ``-vv``).
+    ``cwd`` — the effective working directory a ``cd`` put the run in, as a
+    normalised path (``""`` when the command names none, HARDEN-28 C).
     Frozen and hashable: it is a dictionary key in the store.
     """
 
     roots: frozenset = field(default_factory=frozenset)
     flags: frozenset = field(default_factory=frozenset)
+    cwd: str = ""
 
 
 @dataclass
@@ -74,6 +79,14 @@ class Summary:
 
 #: Separators between simple commands. ``( ) { }`` group, ``\n`` is ``;``.
 _SEP = "SEP"
+
+#: Group punctuation, kept so ``_parse`` can tell a ``cd`` inside a subshell
+#: ``( … )`` from a top-level one — HARDEN-28 C: a ``cd`` the parser cannot
+#: follow (one inside a subshell, ``cd -``, ``cd "$X"``) makes the command
+#: not cacheable, and an untracked subshell ``cd`` would leak its directory
+#: onto later segments.
+_OPEN = "\x00OPEN"
+_CLOSE = "\x00CLOSE"
 
 #: The tool killed the call; whatever pytest printed before is not an answer.
 _KILLED = "terminated command after exceeding timeout"
@@ -167,6 +180,7 @@ def _tokenize(command: str) -> list:
             continue
         if ch in "()":
             sep()
+            tokens.append(_OPEN if ch == "(" else _CLOSE)
             i += 1
             continue
         if ch == "|":
@@ -264,18 +278,22 @@ _SHORT_VALUE = frozenset("kmnpWcorC")
 
 #: --opt forms that take their value only with `=` when optional (--durations 10 is two words).
 
-#: The roots that are all "the tests directory".
-_TEST_ROOTS = {".smoke_tests", ".regression_tests", "tests"}
-
-
 def _normalise_root(token: str) -> str:
-    """``./tests/`` → ``tests``; the tier roots → ``tests``; else cleaned path."""
+    """``./tests/`` → ``tests``; a tier root keeps its own key (HARDEN-28 B);
+    else the cleaned path."""
     root = token
     while root.startswith("./"):
         root = root[2:]
     root = root.rstrip("/") or root
-    if root in _TEST_ROOTS or root in ("tests/.smoke_tests", "tests/.regression_tests"):
-        return "tests"
+    # HARDEN-28 B: `.smoke_tests`, `.regression_tests` and `tests` are three
+    # selections — a cached green smoke run must not answer a later regression
+    # or full-suite run. `tests/.smoke_tests` is the smoke tier spelled with a
+    # `tests/` prefix; `./.smoke_tests/` already collapsed onto `.smoke_tests`
+    # above, so one tier shares one key across its spellings.
+    if root == "tests/.smoke_tests":
+        return ".smoke_tests"
+    if root == "tests/.regression_tests":
+        return ".regression_tests"
     return root
 
 
@@ -292,7 +310,7 @@ def _skip_redirect(args: list, i: int) -> int | None:
     return i + 1
 
 
-def _pytest_run(args: list) -> PytestRun:
+def _pytest_run(args: list, cwd: str = "") -> PytestRun:
     """Reduce the argv after ``pytest`` to roots and meaningful flags."""
     roots: set = set()
     flags: set = set()
@@ -374,7 +392,7 @@ def _pytest_run(args: list) -> PytestRun:
         flags.add("-" + "v" * verbose)
     if quiet:
         flags.add("-" + "q" * quiet)
-    return PytestRun(frozenset(roots), frozenset(flags))
+    return PytestRun(frozenset(roots), frozenset(flags), cwd)
 
 
 def _past_wrappers(words: list) -> int:
@@ -402,7 +420,7 @@ def _past_wrappers(words: list) -> int:
     return i
 
 
-def _runs_in_segment(words: list, depth: int) -> list:
+def _runs_in_segment(words: list, depth: int, cwd: str) -> list:
     """The pytest runs one simple command stands for (usually 0 or 1)."""
     start = _past_wrappers(words)
     if start >= len(words):
@@ -410,22 +428,93 @@ def _runs_in_segment(words: list, depth: int) -> list:
     head = words[start].rsplit("/", 1)[-1]
     rest = words[start + 1:]
     if head in ("pytest", "py.test"):
-        return [_pytest_run(rest)]
+        return [_pytest_run(rest, cwd)]
     if _PYTHON.fullmatch(head):
         if rest[:2] == ["-m", "pytest"]:
-            return [_pytest_run(rest[2:])]
+            return [_pytest_run(rest[2:], cwd)]
         return []
     if head in ("bash", "sh", "zsh", "dash") and depth < 3:
         # `bash -c "cd x && pytest tests"`: the string is a command line
         if "-c" in rest and rest.index("-c") + 1 < len(rest):
-            return _parse(rest[rest.index("-c") + 1], depth + 1)
+            return _parse(rest[rest.index("-c") + 1], depth + 1, cwd)
     return []
 
 
-def _parse(command: str, depth: int) -> list:
+def _cd_dest(words: list, cwd: str) -> "str | None":
+    """The working directory a ``cd`` command leaves, or ``None`` when unknown.
+
+    *words* is a ``cd`` segment: ``["cd", "DIR"]`` plus any ``-L``/``-P``
+    options. ``None`` — the caller then reports the whole command as not
+    cacheable (HARDEN-28 C) — for every target the parser cannot work out
+    statically: no argument (``cd`` alone goes home), ``cd -`` (``$OLDPWD``),
+    a ``~``/``$VAR``/backtick/``$(…)`` target, and any option it does not
+    recognise. A literal target is combined with the current directory and
+    normalised, so ``cd a && cd ..`` returns to the base (``""``).
+    """
+    target: "str | None" = None
+    for w in words[1:]:
+        if w.startswith("-") and w != "-":
+            continue
+        target = w
+        break
+    if target is None:
+        return None
+    if target == "-" or "~" in target or "$" in target or "`" in target:
+        return None
+    if target.startswith("/"):
+        new = posixpath.normpath(target)
+    else:
+        new = posixpath.normpath(
+            (cwd + "/" + target) if cwd else target
+        )
+    return "" if new == "." else new
+
+
+def _parse(command: str, depth: int, cwd: str = "") -> list:
+    """Every pytest invocation in *command*, in order; ``[]`` when none, or
+    when a ``cd``/``pushd`` cannot be resolved (then the command is not
+    cached at all — HARDEN-28 C)."""
     runs: list = []
-    for words in _segments(_tokenize(command)):
-        runs.extend(_runs_in_segment(words, depth))
+    words: list = []
+    cur = cwd
+    paren = 0
+
+    def flush() -> bool:
+        """Reduce the accumulated segment; ``False`` = not cacheable."""
+        nonlocal words, cur
+        if not words:
+            return True
+        head = words[0].rsplit("/", 1)[-1]
+        if head == "cd":
+            # A `cd` inside a subshell the parser cannot follow is not
+            # cacheable: the tokenizer has flattened the grouping, so it
+            # cannot know how far the directory change reaches.
+            if paren > 0:
+                return False
+            nxt = _cd_dest(words, cur)
+            if nxt is None:
+                return False
+            cur = nxt
+            words = []
+            return True
+        if head == "pushd":
+            return False
+        runs.extend(_runs_in_segment(words, depth, cur))
+        words = []
+        return True
+
+    for token in _tokenize(command):
+        if token == _OPEN:
+            paren += 1
+        elif token == _CLOSE:
+            paren = max(0, paren - 1)
+        elif token == _SEP:
+            if not flush():
+                return []
+        else:
+            words.append(token)
+    if not flush():
+        return []
     return runs
 
 

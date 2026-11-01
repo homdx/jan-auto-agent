@@ -39,8 +39,13 @@ _MAYBE_TESTS = re.compile(r"test|check|suite|ci\b|verify", re.I)
 
 
 def run_key(run: "testcache.PytestRun") -> str:
-    """The opaque cache key of a parsed run: roots and flags, order-free."""
-    return json.dumps([sorted(run.roots), sorted(run.flags)])
+    """The opaque cache key of a parsed run: roots and flags, order-free, and
+    the working directory a ``cd`` put it in (HARDEN-28 C). A run in the
+    worktree itself keeps the two-part key it always had."""
+    key = [sorted(run.roots), sorted(run.flags)]
+    if getattr(run, "cwd", ""):
+        key.append(run.cwd)
+    return json.dumps(key)
 
 
 def only_pytest_and_harmless(command: str) -> bool:
@@ -183,5 +188,6 @@ class TestCacheGate:
 
 
 def _run_from_key(key: Optional[str]) -> "testcache.PytestRun":
-    roots, flags = json.loads(key) if key else ([], [])
-    return testcache.PytestRun(roots=frozenset(roots), flags=frozenset(flags))
+    roots, flags, *rest = json.loads(key) if key else ([], [])
+    return testcache.PytestRun(roots=frozenset(roots), flags=frozenset(flags),
+                               cwd=(rest[0] if rest else "") or "")

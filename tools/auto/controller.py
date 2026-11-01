@@ -909,6 +909,22 @@ class AutoController:
                 task_id, exc,
             )
             return ""
+        if not diff.strip():
+            # HARDEN-28 E: an empty capture of a tree that has changes is a
+            # failed capture, not an empty patch — the caller resets the tree
+            # once a patch path comes back, and that reset would throw the only
+            # copy of the work away. A tree git cannot read is treated the same.
+            try:
+                dirty = self.git.user_changes()
+            except (GitError, OSError) as exc:
+                dirty = [f"<git status failed: {exc}>"]
+            if dirty:
+                logger.error(
+                    "task %s: the uncommitted work came back as an empty patch while "
+                    "the tree has %d changed path(s) — it stays only in the working tree.",
+                    task_id, len(dirty),
+                )
+                return ""
         try:
             # HARDEN-7 D: the patch is written as the bytes git printed.
             # ``diff_working_tree`` returns a str decoded with surrogateescape,

@@ -1021,8 +1021,21 @@ class StateStore:
         if path.exists():
             try:
                 bak = path.with_suffix(path.suffix + ".bak")
-                bak.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-            except OSError as exc:
+                # HARDEN-28 F: the backup refresh must never replace a GOOD
+                # backup with an unreadable or unparsable original. A crash can
+                # leave the primary file present but corrupt, and the .bak is
+                # the recovery copy — the old code read the original as UTF-8
+                # and raised UnicodeDecodeError (not an OSError, so it escaped
+                # the guard), or copied the corrupt bytes over the good backup.
+                # Decode as UTF-8 and, for the JSON state files, parse as JSON;
+                # on any failure the last good backup is kept and the write
+                # proceeds.
+                raw = path.read_bytes()
+                raw.decode("utf-8")
+                if path.suffix == ".json":
+                    json.loads(raw.decode("utf-8"))
+                bak.write_bytes(raw)
+            except (OSError, ValueError) as exc:
                 logger.debug(
                     "StateStore: could not refresh backup for %s: %s", path, exc,
                 )

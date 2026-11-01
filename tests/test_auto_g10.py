@@ -350,14 +350,14 @@ class TestPathTraversalGuard:
     """Path-traversal characters in task IDs are stripped before workspace use."""
 
     @pytest.mark.parametrize("evil_id, expected_safe", [
-        ("../../evil",           "evil"),
-        ("../etc/passwd",        "etc_passwd"),
-        ("/absolute/path",       "absolute_path"),
+        ("../../evil",           "~2e~~2e~~2f~~2e~~2e~~2f~evil"),
+        ("../etc/passwd",        "~2e~~2e~~2f~etc~2f~passwd"),
+        ("/absolute/path",       "~2f~absolute~2f~path"),
         ("normal-id",            "normal-id"),
         ("AUTO-T1",              "AUTO-T1"),
-        ("dots...in...name",     "dots___in___name"),
-        ("   spaces   ",         "spaces"),     # strip leading/trailing underscores
-        ("__double__leading",    "double__leading"),
+        ("dots...in...name",     "dots~2e~~2e~~2e~in~2e~~2e~~2e~name"),
+        ("   spaces   ",         "~20~~20~~20~spaces~20~~20~~20~"),
+        ("__double__leading",    "__double__leading"),
     ])
     def test_safe_dir_name_strips_traversal(self, evil_id, expected_safe):
         """AC-PATHTRAVERSAL: _safe_dir_name neutralises path-traversal inputs."""

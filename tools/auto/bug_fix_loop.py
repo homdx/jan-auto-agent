@@ -61,6 +61,9 @@ from tools.auto.ticket_store import (
 )
 
 from tools.auto.state import STATUS_BLOCKED, STATUS_DONE
+from tools.auto.commit_on_success import (
+    COMMIT_NOTHING_TO_COMMIT, CommitResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -582,10 +585,36 @@ class BugFixLoop:
         # ── 4a. Fix passed — commit and close ticket ──────────────────────────
         if getattr(outer_result, "passed", False):
             if self._cos is not None:
-                sha = self._cos.commit(fix_task, outer_result)
+                # HARDEN-28 D: the ticket closes from the commit's REAL outcome,
+                # not from a DONE status the outer loop wrote before the commit.
+                # A pre-commit hook that rejects the commit leaves HEAD where it
+                # was while the task already reads DONE — the old `settled`
+                # check read that status and closed the regression ticket as
+                # fixed with nothing committed.
+                classify = getattr(self._cos, "commit_result", None)
+                result = classify(fix_task, outer_result) if callable(classify) else None
+                if isinstance(result, CommitResult):
+                    sha = result.sha
+                    # A commit that made nothing (nothing staged) is a real
+                    # "already fixed" outcome, so it settles like a sha; a git
+                    # error does not.
+                    settled = result.committed or result.outcome == COMMIT_NOTHING_TO_COMMIT
+                else:
+                    # An older helper (or a test double) that does not classify:
+                    # a None is a commit only when the commit call itself settled
+                    # the task (the nothing-staged success writes DONE with an
+                    # empty commit). A DONE the outer loop wrote BEFORE the commit
+                    # proves nothing, so the record is compared across the call.
+                    before = dict(self._state.get_task(fix_id) or {})
+                    sha = self._cos.commit(fix_task, outer_result)
+                    after = self._state.get_task(fix_id) or {}
+                    settled = bool(sha) or (
+                        after.get("status") == STATUS_DONE and dict(after) != before
+                    )
             else:
                 # Without git there is no commit sha; the fix is marked done by hand, as the controller does (non-fatal git setup).
                 sha = None
+                settled = True
                 try:
                     self._state.set_task_status(fix_id, STATUS_DONE)
                 except Exception as exc:        # pragma: no cover — defensive
@@ -599,7 +628,6 @@ class BugFixLoop:
                 )
 
             # A commit that returns no sha (error or nothing staged) marks nothing done; the status follows the real outcome.
-            settled = (self._state.get_task(fix_id) or {}).get("status") == STATUS_DONE
             if not sha and not settled:
                 # No-git mode has no git commit at all, so report the state-store failure rather than a git error (AUTO-FIX).
                 no_git_mode = self._cos is None

@@ -2273,19 +2273,29 @@ class Coder(_llm_stream.LLMClientBase):
             # Delete flag: same guards as writes; the original is backed up to .coder.bak; deleting an absent file is a no-op (pullrun-sim).
             if _is_truthy_delete(item.get("delete")):
                 try:
-                    if dest.exists():
-                        backup = dest.with_suffix(dest.suffix + ".coder.bak")
+                    # HARDEN-28 A: a delete removes the path the model wrote —
+                    # the link itself when `rel` is a symlink — never its
+                    # resolved target. The containment check above still ran on
+                    # `dest` (the resolved path), so a link that leads out of
+                    # base_dir was already refused; deleting the link changes
+                    # nothing outside it.
+                    link_path = base_dir / rel
+                    if link_path.exists() or link_path.is_symlink():
+                        backup = link_path.with_suffix(link_path.suffix + ".coder.bak")
                         # HARDEN-13 B: the backup of a file is made by the FIRST
                         # write of a task run and kept by the later ones, so the
                         # retry of a task cannot copy what the first attempt wrote
                         # over the only copy of the original. A stale backup from
                         # an earlier run is replaced, as before.
-                        if self._backup_is_new(str(dest.resolve()), task_id):
+                        if self._backup_is_new(str(link_path.resolve()), task_id):
                             # Backups keep the original bytes and mode, so no encoding or BOM is changed.
                             backup.unlink(missing_ok=True)    # copy2 keeps a read-only mode: it could not overwrite
-                            shutil.copy2(dest, backup)
-                            self._backup_made(str(dest.resolve()), task_id)
-                        dest.unlink()
+                            # follow_symlinks=False: a symlink is backed up as a
+                            # link, so the backup of a deleted link is the link
+                            # again, not whatever it pointed at.
+                            shutil.copy2(link_path, backup, follow_symlinks=False)
+                            self._backup_made(str(link_path.resolve()), task_id)
+                        link_path.unlink()
                         logger.info(
                             "coder._write_files [%s]: DELETED %s (backup: %s)",
                             task_id, rel, backup.name,

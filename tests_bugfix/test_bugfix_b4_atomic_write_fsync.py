@@ -98,9 +98,12 @@ class TestPreservedBehaviour:
         self, store: StateStore, tmp_path: Path
     ) -> None:
         target = tmp_path / "state.json"
-        store._atomic_write(target, "first")
-        store._atomic_write(target, "second")
-        assert (tmp_path / "state.json.bak").read_text(encoding="utf-8") == "first"
+        # HARDEN-28 F: a `.json` state file is only snapshotted when it is
+        # still a readable, parsable original — so the .bak refresh is pinned
+        # on valid JSON content.
+        store._atomic_write(target, '{"v": 1}')
+        store._atomic_write(target, '{"v": 2}')
+        assert (tmp_path / "state.json.bak").read_text(encoding="utf-8") == '{"v": 1}'
 
     def test_oserror_is_rewrapped_naming_the_path(
         self, store: StateStore, tmp_path: Path
