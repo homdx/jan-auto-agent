@@ -1911,6 +1911,73 @@ def test_an_own_worktree_spelling_that_lands_on_a_sibling_stays_forbidden(tmp_pa
     assert gate.calls == []
 
 
+@pytest.mark.parametrize("command, target", [
+    ("cat {own}/peek/x.py", "86-b/x.py"),            # a link in the middle of the path
+    ("cat {own}/link.py", "86-b/scripts/x.py"),      # a link at the last component
+    ("cat ./link.py", "86-b/scripts/x.py"),          # a relative token starts in the worktree, not the runner's cwd
+    ("cat {own}/peek/*", "86-b"),                    # a glob under a linked directory
+])
+def test_a_forbidden_reject_names_the_target_a_symlink_leads_to(tmp_path, command, target):
+    """KC-3: ``<own>/peek/x.py`` is not under the rounds folder as written, so
+    the reason names the sibling it resolves to, flags the link, then names the entry."""
+    rounds, own, ctx = _rounds(tmp_path)
+    sibling = rounds / "86-b"
+    (sibling / "scripts" / "x.py").write_text("x = 1\n")
+    (own / "peek").symlink_to(sibling)
+    (own / "link.py").symlink_to(sibling / "scripts" / "x.py")
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, _bash(command.format(own=own)), own, **ctx)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    # cut at the same length Decision cuts at, so a long tmp_path cannot make this flaky
+    expected = f"forbidden: {rounds / target} (symlink) is at or under {rounds}"
+    assert decision.reason == expected[:policy_mod.MAX_REASON_CHARS]
+    assert gate.calls == []
+
+
+def test_the_symlink_flag_survives_the_length_of_a_real_rounds_path():
+    """KC-3: with the rounds folder and a sibling's file as long as the ones in
+    epic-task 90 (~58 and ~100 characters) the whole reason fits under
+    ``MAX_REASON_CHARS``; with paths ~20 characters longer the cut takes the end
+    of the entry, which is also the front of the target, and never the flag."""
+    rounds = Path("/home/renat/Project/opensource/github/agent-offline/rounds")
+    own = rounds / "86-step-3-7-flash"
+    target = rounds / "86-other-model-name" / "tests" / "test_stress_suite.py"
+    spelled = f"{own}/peek/tests/test_stress_suite.py"
+
+    reason = Decision("reject", "mechanical",
+                      policy_mod._forbidden_reason(target, (spelled,), rounds, own)).reason
+    assert reason == f"forbidden: {target} (symlink) is at or under {rounds}"
+
+    longer = Path("/home/renat/Project/opensource/github/agent-offline-contest-bench/rounds")
+    far = longer / "86-other-model-name-two" / "tests" / "test_stress_suite.py"
+    reason = Decision("reject", "mechanical", policy_mod._forbidden_reason(
+        far, (f"{longer}/86-step-3-7-flash/peek/tests/test_stress_suite.py",), longer,
+        longer / "86-step-3-7-flash")).reason
+    assert len(reason) == policy_mod.MAX_REASON_CHARS
+    assert reason.startswith(f"forbidden: {far} (symlink) is at or under {longer}"[:policy_mod.MAX_REASON_CHARS])
+    assert "(symlink)" in reason
+
+
+@pytest.mark.parametrize("spelling", ["plain", "dotdot"])
+def test_a_forbidden_reject_without_a_symlink_keeps_its_spelling(tmp_path, spelling):
+    """KC-3: a path that needs no link to land on the sibling — written out or
+    through a ``..`` — keeps the spelling it was written in, with no note."""
+    rounds, own, ctx = _rounds(tmp_path)
+    path = (f"{rounds}/86-b/scripts/x.py" if spelling == "plain"
+            else f"{own}/../86-b/scripts/x.py")
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, _bash(f"cat {path}"), own, **ctx)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert decision.reason == f"forbidden: {path} is at or under {rounds}"[:policy_mod.MAX_REASON_CHARS]
+    assert gate.calls == []
+
+
 # KC-55: the gate rides out a rate limit inside a bounded wait
 
 #: The body the fake opener answers with: one allow verdict, as the wire carries it.
