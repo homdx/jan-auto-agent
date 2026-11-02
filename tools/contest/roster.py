@@ -318,7 +318,7 @@ class AgentSpec:
         """
         if not self.models:
             return replace(self, variant=variant)
-        refs = tuple(ModelRef(p, m, v if v else variant) for p, m, v in self.models)
+        refs = tuple(replace(ref, variant=ref.variant or variant) for ref in self.models)
         current = refs[self.model_index]
         return replace(self, models=refs, variant=current.variant)
 
