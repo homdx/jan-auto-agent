@@ -35,6 +35,33 @@ round N, the way `RUN-THE-EPIC-COMPETITION.md` says it must.
 
 ---
 
+## Operator commands
+
+These lived in `AGENTS.md` until round 328. Kilo reads `AGENTS.md` into every
+agent's session, and the agents of 328 spent their reasoning on hooks,
+`revive_round.py` and the claim check, none of which a coder needs. `AGENTS.md`
+now holds only what a coder needs and points here.
+
+- `git config core.hooksPath githooks` — enable the pre-commit tier/stray-file hook.
+- `python3 -m tools.contest draft --target REPO "brief"` — auto mode writes and commits `epic-tasks/NN-<slug>.md`; `[contest_draft_llm]` and `[contest_gate_llm]` in `contest.local.ini` must be two different models (accounts). Stage D below.
+- `python3 -m tools.contest run --ticket NN` — the round; patches, `entrants.json` and `SUMMARY.md` in `contest-out/NN/`.
+- `python3 -m tools.contest run --ticket NN --dry-run` — intake, the round's worktrees, the plan and the first agent's prompt, then stop: no `kilo serve`, no session, no gate call.
+- `python3 -m tools.contest status --ticket NN [--out DIR]` — the SUMMARY table off `contest-out/NN/state.json`; touches nothing, works mid-round, exits 1 with no `state.json`.
+- `scripts/revive_round.py NN [--dry-run]` — sets a stopped round's `STALLED`/`GAVE_UP`/`ERROR` agents back to `WAITING`, so `run --ticket NN --resume` takes them up again; a round of legs resolves to its last leg.
+- `python3 scripts/py_model_test.py [--find-free PROVIDER…] MODEL…` — one coding task through `kilo run`, 15 checks; pick the round's `--models` with it.
+- The claim check (EPIC CC) — a review's claims judged by three free voters with the cited code in front of them, and `scripts/claim_diff.py` for the same claims at two commits (`FIXED`/`STILL`/`NEW`): `docs/claim-check/RUNBOOK.md`.
+
+This page covers stage R (`scripts/contest_reset.sh`), the RUN stage, reading
+the gate's `decisions.jsonl`, the hand-over to the epic runbook's stages 3–5,
+and the first round on record.
+
+**Pull requests** state the ticket, the behavior before and after, the exact
+test command run, and link the relevant `epic-tasks/*.md` entry. Include logs
+or screenshots for run-output changes. Keep one concern per commit outside a
+round. Inside a round, the round's own rule wins: exactly one commit.
+
+---
+
 ## What you need, once
 
 | need | where | why |

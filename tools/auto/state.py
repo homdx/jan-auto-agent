@@ -295,6 +295,7 @@ class StateStore:
 
         self._plan: dict     = {}
         self._progress: dict = {}
+        self._emission_path  = self.agent_dir / "plan.emitted"
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -406,6 +407,41 @@ class StateStore:
 
     def get_progress(self) -> dict:
         return dict(self._progress)
+
+    # ── Plan-emission marker ─────────────────────────────────────────────────
+
+    def emission_state(self) -> str | None:
+        """Return the plan-emission marker: ``"started"``, ``"complete"``, or None.
+
+        ``"started"`` means an emission began but did not finish (an
+        interruption left ``plan.json`` possibly partial). ``"complete"`` means
+        the emission finished and ``plan.json`` holds the full validated task
+        set. None means no emission has ever run (a fresh store, or tasks
+        seeded outside :meth:`emit`).
+
+        Fail-open: a missing or unreadable marker reads as None.
+        """
+        try:
+            text = self._emission_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return text or None
+
+    def mark_emission_started(self) -> None:
+        """Record that a plan emission has begun (incomplete until completed)."""
+        try:
+            self._atomic_write(self._emission_path, "started\n")
+        except OSError as exc:
+            logger.warning(
+                "StateStore: could not mark emission started: %s", exc)
+
+    def mark_emission_complete(self) -> None:
+        """Record that a plan emission finished (plan.json holds the full set)."""
+        try:
+            self._atomic_write(self._emission_path, "complete\n")
+        except OSError as exc:
+            logger.warning(
+                "StateStore: could not mark emission complete: %s", exc)
 
     # ── Mutating API ─────────────────────────────────────────────────────────
 
@@ -1021,8 +1057,21 @@ class StateStore:
         if path.exists():
             try:
                 bak = path.with_suffix(path.suffix + ".bak")
-                bak.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
-            except OSError as exc:
+                # HARDEN-28 F: the backup refresh must never replace a GOOD
+                # backup with an unreadable or unparsable original. A crash can
+                # leave the primary file present but corrupt, and the .bak is
+                # the recovery copy — the old code read the original as UTF-8
+                # and raised UnicodeDecodeError (not an OSError, so it escaped
+                # the guard), or copied the corrupt bytes over the good backup.
+                # Decode as UTF-8 and, for the JSON state files, parse as JSON;
+                # on any failure the last good backup is kept and the write
+                # proceeds.
+                raw = path.read_bytes()
+                raw.decode("utf-8")
+                if path.suffix == ".json":
+                    json.loads(raw.decode("utf-8"))
+                bak.write_bytes(raw)
+            except (OSError, ValueError) as exc:
                 logger.debug(
                     "StateStore: could not refresh backup for %s: %s", path, exc,
                 )

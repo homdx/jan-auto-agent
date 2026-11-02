@@ -43,13 +43,19 @@ def safe_filename_component(value: str) -> str:
 
     Strips path separators, leading dots, and anything else that could let a
     crafted id (e.g. ``"../../evil"``) escape the intended directory when
-    interpolated into a path. Keeps only alphanumerics, hyphens, and
-    underscores. Shared by StateStore (task directories) and TicketStore
+    interpolated into a path. An id that is already safe (only alphanumerics,
+    hyphens and underscores) is returned unchanged; every other character is
+    escaped as ``~<hex>~``, so two different ids never share a directory
+    (HARDEN-28 G) and the ``~`` of an escape can never be confused with a
+    literal one. Shared by StateStore (task directories) and TicketStore
     (ticket files) so both apply the identical rule to ids that flow between
     them (a ticket id is typically derived from a task id).
     """
-    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", value)
-    safe = safe.strip("_") or "task"
+    safe = re.sub(
+        r"[^A-Za-z0-9_\-]",
+        lambda m: "~%x~" % ord(m.group(0)),
+        value,
+    ) or "task"
 
     # Over-long names are truncated with a digest of the full value, so they stay unique and deterministic (bugfix).
     if len(safe) > _MAX_FILENAME_COMPONENT:

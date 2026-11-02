@@ -163,6 +163,11 @@ RUNS=5 scripts/run_claim_check.sh report.md --profiles a b c
 Writes `claims.json`, `votes.json`, `extract.log`, `vote.log` there; the last
 line of `vote.log` is the verdict counts and the models that returned no votes.
 
+Three voters of three families judge each claim, and a verdict comes only when
+they agree. Voters and budgets live in `[claim_vote]` of `contest.ini`. Gate 1's
+own vote is `[gate1] claim_vote` in `agents.ini`, off by default. (This paragraph
+was the claim check's line in `AGENTS.md` until round 328.)
+
 ## With the code in front of the voters: into `truth.csv` and the stage-3 queue (CC-8)
 
 ```bash

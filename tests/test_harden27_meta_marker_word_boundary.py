@@ -175,10 +175,12 @@ class TestLinearTime:
         def fastest(chars: int) -> tuple[float, str]:
             out = ""
             best = float("inf")
+            # CPU time, not the wall clock: under three full suites at once the wall-clock
+            # ratio read 36x for the 10x input that costs 10x of CPU.
             for _ in range(repeats):
-                start = time.perf_counter()
+                start = time.process_time()
                 out = run(chars)
-                best = min(best, time.perf_counter() - start)
+                best = min(best, time.process_time() - start)
             return best, out
 
         STRIP("fact (" + ("a " * 2_000) + "shoulder here.)")   # warm up

@@ -373,6 +373,20 @@ def _last_tail_section(tail: list[str]) -> list[str]:
     return tail
 
 
+def _any_root_ran(summary: str) -> bool:
+    """True when at least one pytest root actually executed.
+
+    A root that is `absent` (the directory does not exist) or
+    `links-to-tests` (only symlinks into `tests/`) did not run — when *every*
+    root is one of those, nothing was scored and the run is not a pass.
+    """
+    for token in summary.split():
+        _, _, status = token.partition(":")
+        if status and status not in ("absent", "links-to-tests"):
+            return True
+    return False
+
+
 def _tests_slow_reason(budget: float, tail: list[str]) -> Reason:
     """`tests_slow`: the roots blew the harvest's wall-clock budget.
 
@@ -609,6 +623,14 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
                         "tests_failed",
                         f"the tests do not pass: {summary}\n"
                         + "\n".join(tail),
+                    ))
+                elif not _any_root_ran(summary):
+                    # Every root was absent or only linked into tests/ — nothing
+                    # was scored, so a green tree with no tests is not a pass.
+                    reasons.append(Reason(
+                        "tests_failed",
+                        "no tests ran — every root was absent or only linked "
+                        "into tests/, so nothing was scored",
                     ))
             if outside:
                 reasons.append(_uncommitted_reason(outside))

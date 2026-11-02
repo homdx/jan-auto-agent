@@ -562,12 +562,18 @@ def judge_worktree(name, path, base, declared, want_tests):
     tests = [f for f in files if re.search(r"(^|/)tests?[_/]|/test_|^\.smoke_tests/|^\.regression_tests/", f)]
     row["test_files"] = len(tests)
     new_tests = 0
+    shipped = 0
     for f in tests:
         # The scorecard counts test lines as text, so a non-UTF-8 byte cannot crash harvest.
         blob = subprocess.run(["git", "show", f"HEAD:{f}"], cwd=path,
                               capture_output=True, text=True, errors="replace")
         if blob.returncode == 0:
+            # A test file counts as shipped only when it exists in the scored
+            # commit — added or modified there, never deleted. A rename's old
+            # side is gone from HEAD and does not count; its destination does.
+            shipped += 1
             new_tests += len(re.findall(r"^\s*def test_", blob.stdout, re.M))
+    row["test_files"] = shipped
     row["test_funcs"] = new_tests
 
     # A rename's old side is not an off-ticket change, even when it shows as a deletion (KC-5).

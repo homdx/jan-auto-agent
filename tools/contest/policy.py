@@ -1313,6 +1313,33 @@ def is_full_suite_command(command) -> bool:
         return False
 
 
+def _spell_target(original: str, base: "Path | None" = None) -> str:
+    """The absolute spelling of one *original* path token, before any symlink is followed.
+
+    The steps ``_extract_paths`` takes ahead of ``_resolve``, kept in one place
+    so the forbidden reject can tell a path that was *spelled* under a place
+    from one that only *resolves* there (KC-3): a trailing ``/*`` stripped,
+    ``$HOME/`` and ``$PWD/`` rewritten, a leading ``~`` expanded, and a
+    relative token joined to *base*.
+    """
+    # "/*" strips to the root, not to the empty string, so rm -rf /* is not auto-approved (KC-52).
+    target = original.removesuffix("/*") or "/"
+    # $HOME and $PWD are rewritten to the spelling the policy reads, not expanded (KC-13, KC-51).
+    for var in ("${HOME}/", "$HOME/"):
+        if target.startswith(var):
+            target = "~/" + target[len(var):]
+    for var in ("${PWD}/", "$PWD/"):
+        if target.startswith(var):
+            target = "./" + target[len(var):]
+    if target.startswith("~"):
+        # ``~/.ssh/x`` must land on the home denylist, not under the cwd
+        target = os.path.expanduser(target)
+    if base is not None and not Path(target).is_absolute():
+        # A relative command token resolves against the worktree the command starts in (KC-51).
+        target = str(Path(base) / target)
+    return target
+
+
 def _extract_paths(props: dict, base: "Path | None" = None) -> list:
     """The event's paths as ``(resolved, (original, ...))`` pairs.
 
@@ -1368,21 +1395,7 @@ def _extract_paths(props: dict, base: "Path | None" = None) -> list:
             file_ask and not any(ch in original for ch in _NOT_A_PATH)
         ):
             continue
-        # "/*" strips to the root, not to the empty string, so rm -rf /* is not auto-approved (KC-52).
-        target = original.removesuffix("/*") or "/"
-        # $HOME and $PWD are rewritten to the spelling the policy reads, not expanded (KC-13, KC-51).
-        for var in ("${HOME}/", "$HOME/"):
-            if target.startswith(var):
-                target = "~/" + target[len(var):]
-        for var in ("${PWD}/", "$PWD/"):
-            if target.startswith(var):
-                target = "./" + target[len(var):]
-        if target.startswith("~"):
-            # ``~/.ssh/x`` must land on the home denylist, not under the cwd
-            target = os.path.expanduser(target)
-        if base is not None and not Path(target).is_absolute():
-            # A relative command token resolves against the worktree the command starts in (KC-51).
-            target = str(Path(base) / target)
+        target = _spell_target(original, base)
         resolved = _resolve(target)
         if resolved is None:
             continue
@@ -1421,6 +1434,39 @@ def _forbidden_match(path: Path, forbidden, worktree: "Path | None" = None) -> "
         if not _exact_only(entry) and _inside(path, entry):
             return entry
     return None
+
+
+def _forbidden_reason(resolved: Path, originals: tuple, entry: Path,
+                      worktree: "Path | None" = None) -> str:
+    """The reject reason for a path at or under the forbidden *entry* (KC-3).
+
+    A spelling that is only *lexically* somewhere else — a symlink in the
+    agent's own worktree that points at a sibling's — is not at or under
+    *entry* as written, so the reason names the place it resolves to and
+    flags the link: ``<target> (symlink) is at or under <entry>``. The
+    spelling is compared with the resolved path after ``_spell_target`` and
+    ``os.path.normpath``, so a ``..`` that needs no link, a glob's ``/*`` and
+    a relative token are judged on the same footing as an absolute one, and a
+    link anywhere in the chain counts, not only a link at the last component.
+    A path with no link in it keeps the spelling it was written in.
+
+    The flag sits between the target and the entry and is short on purpose:
+    ``Decision`` cuts a reason at ``MAX_REASON_CHARS``, and a sibling
+    worktree's file plus the rounds folder already run to ~185 characters.
+    What the cut takes is the *end*, so that is where the part that costs
+    least goes: *entry* is always an ancestor of *resolved*, so it is already
+    the front of the target even when its own tail is clipped. The spelling is
+    not repeated: decisions.jsonl records ``patterns`` and ``command`` beside
+    the reason, and a long spelling is what would be clipped.
+    """
+    for original in originals:
+        try:
+            lexical = os.path.normpath(_spell_target(original, worktree))
+        except (TypeError, ValueError):
+            continue
+        if lexical != str(resolved):
+            return f"forbidden: {resolved} (symlink) is at or under {entry}"
+    return f"forbidden: {', '.join(originals)} is at or under {entry}"
 
 
 def _glob_spellings(glob: str) -> tuple:
@@ -2112,7 +2158,7 @@ class Policy:
             if entry is not None:
                 return Decision(
                     "reject", "mechanical",
-                    f"forbidden: {', '.join(originals)} is at or under {entry}",
+                    _forbidden_reason(resolved, originals, entry, worktree),
                 )
 
         if permission in _FILE_PERMISSIONS and any(

@@ -83,6 +83,9 @@ STALE_CAUSE_FILES = "files"
 STALE_CAUSE_COLLECTOR = "collector_version"
 STALE_CAUSE_SKIP_DIRS = "skip_dirs"
 STALE_CAUSE_UNSUMMARIZED = "unsummarized"
+#: HARDEN-28 H: a `[collect] sibling_profiles` config changed (or the primary
+#: profile moved) — the `.ini` files `CONFIG_MAP.md` is built from.
+STALE_CAUSE_PROFILES = "profiles"
 
 #: Test-code paths come from tools.collect.test_paths, the same rule test_map uses, so producer and reader agree. tools/collect/test_map.py is shipped code.
 
@@ -97,7 +100,59 @@ def _staleness_policy(config: Optional[configparser.ConfigParser]) -> str:
     return raw if raw in VALID_STALENESS else DEFAULT_STALENESS
 
 
-def _stale_cause_labels(manifest, skip_dirs: Iterable[str]) -> Tuple[str, ...]:
+def _profile_hashes_for(root, config, config_path, manifest=None):
+    """The ``{ini: sha256}`` map of the profiles `CONFIG_MAP.md` depends on.
+
+    HARDEN-28 H: the CLI's ``--check``/``--collect`` verdict hashes the primary
+    config plus every ``[collect] sibling_profiles`` entry into the manifest's
+    ``profile_hashes``, and the loaders used to call ``is_fresh`` without them
+    — so after a sibling profile changed the CLI said *stale* and both loaders
+    said *fresh*. ``{}`` when there are no profiles to hash (a tree that names
+    no ``sibling_profiles`` still tracks no profile). Fail open: a missing or
+    unreadable profile is simply absent from the map.
+
+    Without a ``config_path`` (the Gate 1 vote calls ``load_readonly`` with the
+    config alone) the primary file is unknown, but the siblings are not: the
+    map is the *manifest's* own, with every sibling it records re-hashed, so a
+    sibling edit is stale and an untouched tree stays fresh. ``None`` (no
+    profile comparison) when there is neither a ``config_path`` nor a manifest.
+    """
+    if config_path:
+        try:
+            paths = cli_mod._profile_paths(Path(root), config, config_path)
+        except Exception:   # noqa: BLE001 — no profile comparison, never a raise
+            return None
+        if not paths:
+            return {}
+        return manifest_mod.hash_tree(Path(root), paths)
+    recorded = dict(getattr(manifest, "profile_hashes", None) or {})
+    if not recorded:
+        return None
+    try:
+        raw = config.get("collect", "sibling_profiles", fallback="") if config is not None else ""
+        names = [n.strip() for n in raw.split(",") if n.strip()] if isinstance(raw, str) else []
+        base = Path(root).resolve()
+        siblings = []
+        for name in names:
+            resolved = (Path(root) / name).resolve()
+            try:
+                siblings.append(resolved.relative_to(base).as_posix())
+            except ValueError:
+                siblings.append(resolved.as_posix())
+        current = manifest_mod.hash_tree(Path(root), siblings)
+    except Exception:   # noqa: BLE001 — no profile comparison, never a raise
+        return None
+    for key in siblings:
+        if key in recorded:
+            if key in current:
+                recorded[key] = current[key]
+            else:
+                recorded.pop(key)       # a recorded sibling that is gone is a change too
+    return recorded
+
+
+def _stale_cause_labels(manifest, skip_dirs: Iterable[str],
+                        profile_hashes: Optional[Dict[str, str]] = None) -> Tuple[str, ...]:
     """The causes a stale artifact has besides its files, in the words CC-13's operator line uses.
     The wording is pinned by tests and out of scope for change; the codes `_stale_causes` returns are
     what a consumer that can serve part of a stale artifact asks instead."""
@@ -109,16 +164,21 @@ def _stale_cause_labels(manifest, skip_dirs: Iterable[str]) -> Tuple[str, ...]:
     if manifest.unsummarized:
         n = len(manifest.unsummarized)
         labels.append(f"{n} module{'' if n == 1 else 's'} without a summary")
+    if profile_hashes is not None and dict(profile_hashes) != dict(manifest.profile_hashes):
+        labels.append("a collect profile config changed")
     return tuple(labels)
 
 
-def _stale_reason(manifest, changed: int, skip_dirs: Iterable[str]) -> str:
+def _stale_reason(manifest, changed: int, skip_dirs: Iterable[str],
+                  profile_hashes: Optional[Dict[str, str]] = None) -> str:
     """The one-line reason a stale artifact is stale, naming every cause (CC-13).
 
     HARDEN-6 E: shared by `load` and `load_readonly` so the operator sees the same line whichever
     reader was used — and so the pack's own log line names the cause that actually kept it off. A
     manifest whose only cause is a module without a summary says exactly that, instead of the
     "a tracked file changed" `load` used to hard-code for every staleness.
+    HARDEN-28 H: a changed sibling profile names itself (the CLI already says
+    "a collect profile config changed") instead of blaming a tracked file.
     """
     reasons = [f"{changed} tracked file(s) changed"] if changed else []
     reasons += [
@@ -126,12 +186,13 @@ def _stale_reason(manifest, changed: int, skip_dirs: Iterable[str]) -> str:
         f"current is {manifest_mod.COLLECTOR_VERSION!r}" if c == "collector version" else
         f"manifest recorded skip_dirs {list(manifest.skip_dirs)}, "
         f"the config says {sorted(skip_dirs)}" if c == "skip_dirs changed" else c
-        for c in _stale_cause_labels(manifest, skip_dirs)
+        for c in _stale_cause_labels(manifest, skip_dirs, profile_hashes)
     ]
     return "artifact is stale (" + "; ".join(reasons or ["a tracked file changed"]) + ")"
 
 
-def _stale_causes(manifest, changed: int, skip_dirs: Iterable[str]) -> Tuple[str, ...]:
+def _stale_causes(manifest, changed: int, skip_dirs: Iterable[str],
+                  profile_hashes: Optional[Dict[str, str]] = None) -> Tuple[str, ...]:
     """Which causes a stale artifact has, as codes (HARDEN-6 E). `files` is appended when the tree
     itself moved, since that is a cause of its own for every consumer."""
     causes: List[str] = []
@@ -141,6 +202,8 @@ def _stale_causes(manifest, changed: int, skip_dirs: Iterable[str]) -> Tuple[str
         causes.append(STALE_CAUSE_SKIP_DIRS)
     if manifest.unsummarized:
         causes.append(STALE_CAUSE_UNSUMMARIZED)
+    if profile_hashes is not None and dict(profile_hashes) != dict(manifest.profile_hashes):
+        causes.append(STALE_CAUSE_PROFILES)
     if changed:
         causes.append(STALE_CAUSE_FILES)
     return tuple(causes)
@@ -544,15 +607,22 @@ def load(
     # The effective skip_dirs list is recorded, so changing only that setting reports stale.
     skip_dirs = manifest_mod.skip_dirs_from_config(config)
     hashes = manifest_mod.hash_tree(root, current_paths)
+    # HARDEN-28 H: the profiles CONFIG_MAP.md is built from are part of the
+    # freshness test, exactly as the CLI's --check does — otherwise a changed
+    # sibling `.ini` made the CLI say stale and both loaders say fresh.
+    profile_hashes = _profile_hashes_for(root, config, config_path, existing_manifest)
     fresh = manifest_mod.is_fresh(existing_manifest, root, files=current_paths,
-                                  hashes=hashes, skip_dirs=skip_dirs)
+                                  hashes=hashes, skip_dirs=skip_dirs,
+                                  profile_hashes=profile_hashes)
     if fresh:
         return _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
 
     diff = manifest_mod.diff_files(existing_manifest.file_hashes, hashes)
     changed = len(diff.added | diff.modified | diff.removed)
-    causes = _stale_causes(existing_manifest, changed=changed, skip_dirs=skip_dirs)
-    reason = _stale_reason(existing_manifest, changed, skip_dirs)
+    causes = _stale_causes(existing_manifest, changed=changed, skip_dirs=skip_dirs,
+                           profile_hashes=profile_hashes)
+    reason = _stale_reason(existing_manifest, changed, skip_dirs,
+                           profile_hashes=profile_hashes)
 
     policy = _staleness_policy(config)
     if policy == "ignore":
@@ -613,6 +683,7 @@ def load_readonly(
     root: Path,
     *,
     config: Optional[configparser.ConfigParser] = None,
+    config_path: Optional[str] = None,
 ) -> CollectRead:
     """The collect model of `root` by `load`'s own freshness test, without ever
     writing anything to disk.
@@ -630,8 +701,11 @@ def load_readonly(
       * `refresh` — **not** honoured here: the artifact is left on disk and no
                      model is returned, `status` stays `stale`.
 
-    Nothing here raises: an absent, unreadable, truncated or malformed artifact
-    is `absent`, and the caller's pack is exactly what it is today.
+    `config_path` names the profile `.ini` files the freshness test hashes
+    (HARDEN-28 H), so a changed sibling profile is stale here exactly as the
+    CLI reports it. Nothing here raises: an absent, unreadable, truncated or
+    malformed artifact is `absent`, and the caller's pack is exactly what it is
+    today.
     """
     try:
         root = Path(root)
@@ -648,8 +722,10 @@ def load_readonly(
         skip = manifest_mod.skip_dirs_from_config(config)
         paths = [m.path for m in scan_repo(root, config=config)]
         hashes = manifest_mod.hash_tree(root, paths)
+        profile_hashes = _profile_hashes_for(root, config, config_path, man)
 
-        if manifest_mod.is_fresh(man, root, files=paths, hashes=hashes, skip_dirs=skip):
+        if manifest_mod.is_fresh(man, root, files=paths, hashes=hashes, skip_dirs=skip,
+                                 profile_hashes=profile_hashes):
             model = _load_from_dir(collect_dir, status=STATUS_FRESH, root=root)
             if not model.available:
                 return CollectRead(reason=model.reason or "artifact is unreadable — treated as absent")
@@ -658,9 +734,10 @@ def load_readonly(
         diff = manifest_mod.diff_files(man.file_hashes, hashes)
         changed = len(diff.added | diff.modified | diff.removed)
         # Names every cause of staleness, not only the changed files (CC-13).
-        causes = _stale_cause_labels(man, skip)
-        reason = _stale_reason(man, changed, skip)
-        stale_causes = _stale_causes(man, changed=changed, skip_dirs=skip)
+        causes = _stale_cause_labels(man, skip, profile_hashes)
+        reason = _stale_reason(man, changed, skip, profile_hashes)
+        stale_causes = _stale_causes(man, changed=changed, skip_dirs=skip,
+                                     profile_hashes=profile_hashes)
 
         policy = _staleness_policy(config)
         if policy == "ignore":

@@ -125,6 +125,10 @@ class PlanEmitter:
             The git commit hash if a commit was created; ``None`` if there
             were no changes to commit (idempotent re-run).
         """
+        # 0. Mark the emission as in progress so an interrupted resume re-runs
+        # the plan phase instead of trusting a possibly-partial plan.json.
+        self._state.mark_emission_started()
+
         # 1. Write IMPROVEMENTS.md to repo root.
         md_content  = to_improvements_md(backlog)
         md_path     = self._base_dir / IMPROVEMENTS_FILENAME
@@ -160,6 +164,10 @@ class PlanEmitter:
                 f"{IMPROVEMENTS_FILENAME} were not added to plan.json "
                 f"({', '.join(rejected)})"
             )
+
+        # All validated tasks are now in plan.json — mark the emission complete
+        # so a resume trusts this plan instead of re-running the plan phase.
+        self._state.mark_emission_complete()
 
         # 3. Update cluster hashes (re-run cheapness).
         if clusters is not None:

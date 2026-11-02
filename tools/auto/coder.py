@@ -2042,6 +2042,27 @@ class Coder(_llm_stream.LLMClientBase):
         reply_symbols = {name: text for kind, name, text in reply_segments if kind == "symbol"}
         reply_imports = next((text for kind, _n, text in reply_segments if kind == "imports"), None)
         orig_names = {name for kind, name, _t in orig_segments if kind == "symbol"}
+        # HARDEN-29 D: module-level statements, matched by identity. A reply
+        # statement that matches an original one is a change, applied over the
+        # original in the pass below; a reply-only statement is new code.
+        orig_stmts = {key: text for kind, key, text in orig_segments if kind == "stmt"}
+        reply_stmts = {key: text for kind, key, text in reply_segments if kind == "stmt"}
+        if len(orig_stmts) != sum(1 for k, _n, _t in orig_segments if k == "stmt") \
+                or len(reply_stmts) != sum(1 for k, _n, _t in reply_segments if k == "stmt"):
+            return None          # a repeated statement key cannot be placed unambiguously
+        # HARDEN-29 D: a complete reply — the model reproduced every symbol it
+        # was never shown, no stub left — is written as the model wrote it, so
+        # a changed or removed module-level statement lands exactly as the
+        # reply has it. A reply that drops an unseen symbol is not complete:
+        # it goes through the splice, which keeps the unseen code, and the
+        # guard below still refuses a bare drop (REL-6 #59 / AUDIT3-1).
+        if hidden and hidden <= reply_symbols.keys() \
+                and not _NOT_INCLUDED_STUB_RE.search(content):
+            try:
+                ast.parse(content)
+            except SyntaxError:
+                return None
+            return content
         # A module-level line the original already holds is not new — a reply that carries
         # the whole file (the original replayed with one edit) must not double it.
         orig_gap_lines = {ln.strip() for kind, _n, t in orig_segments if kind == "gap"
@@ -2058,6 +2079,13 @@ class Coder(_llm_stream.LLMClientBase):
                 anchor = name
             elif kind == "symbol":
                 inserts.setdefault(anchor, []).append(text)
+            elif kind == "stmt":
+                # HARDEN-29 D: a statement that matches an original one is a
+                # change applied in the original pass; only genuinely new
+                # module-level code is inserted here, never merged beside the
+                # original. A changed statement replaces the one it changes.
+                if name not in orig_stmts:
+                    inserts.setdefault(anchor, []).append(text)
             else:   # a gap of the reply: a stub moves the anchor to the symbol it stands for;
                     # what is left, but a "..." note or a blank line, is new code
                 kept: list[str] = []
@@ -2098,6 +2126,15 @@ class Coder(_llm_stream.LLMClientBase):
                     out.append(text)            # never shown: kept as it was
                 else:
                     dropped = True              # shown and left out: deleted on purpose
+                key = name
+            elif kind == "stmt":
+                # HARDEN-29 D: a changed module-level statement replaces the
+                # one it changes; an unmentioned one is kept (the model never
+                # saw it — a partial reply cannot remove what it never saw).
+                if name in reply_stmts and reply_stmts[name].strip() != text.strip():
+                    out.append(_block(reply_stmts[name]))
+                else:
+                    out.append(text)
                 key = name
             else:
                 out.append(text)                # module-level code the view never showed
@@ -2273,19 +2310,29 @@ class Coder(_llm_stream.LLMClientBase):
             # Delete flag: same guards as writes; the original is backed up to .coder.bak; deleting an absent file is a no-op (pullrun-sim).
             if _is_truthy_delete(item.get("delete")):
                 try:
-                    if dest.exists():
-                        backup = dest.with_suffix(dest.suffix + ".coder.bak")
+                    # HARDEN-28 A: a delete removes the path the model wrote —
+                    # the link itself when `rel` is a symlink — never its
+                    # resolved target. The containment check above still ran on
+                    # `dest` (the resolved path), so a link that leads out of
+                    # base_dir was already refused; deleting the link changes
+                    # nothing outside it.
+                    link_path = base_dir / rel
+                    if link_path.exists() or link_path.is_symlink():
+                        backup = link_path.with_suffix(link_path.suffix + ".coder.bak")
                         # HARDEN-13 B: the backup of a file is made by the FIRST
                         # write of a task run and kept by the later ones, so the
                         # retry of a task cannot copy what the first attempt wrote
                         # over the only copy of the original. A stale backup from
                         # an earlier run is replaced, as before.
-                        if self._backup_is_new(str(dest.resolve()), task_id):
+                        if self._backup_is_new(str(link_path.resolve()), task_id):
                             # Backups keep the original bytes and mode, so no encoding or BOM is changed.
                             backup.unlink(missing_ok=True)    # copy2 keeps a read-only mode: it could not overwrite
-                            shutil.copy2(dest, backup)
-                            self._backup_made(str(dest.resolve()), task_id)
-                        dest.unlink()
+                            # follow_symlinks=False: a symlink is backed up as a
+                            # link, so the backup of a deleted link is the link
+                            # again, not whatever it pointed at.
+                            shutil.copy2(link_path, backup, follow_symlinks=False)
+                            self._backup_made(str(link_path.resolve()), task_id)
+                        link_path.unlink()
                         logger.info(
                             "coder._write_files [%s]: DELETED %s (backup: %s)",
                             task_id, rel, backup.name,
@@ -2653,13 +2700,52 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
 _NOT_INCLUDED_STUB_RE = re.compile(r"(?m)^# \[(.+?) — \d+ chars, not included\]$")
 
 
+def _stmt_key(node: ast.AST, source: str) -> str:
+    """A stable identity for a top-level non-def/class statement.
+
+    HARDEN-29 D: two statements with the same key are the *same* module-level
+    statement, so a reply that changes one replaces it instead of inserting a
+    second copy beside it. An assignment is keyed by its target names, an
+    ``if``/``for``/``with``/``try`` by its header, anything else by its own
+    source text.
+    """
+    if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names = []
+        for t in targets:
+            if isinstance(t, ast.Name):
+                names.append(t.id)
+            else:
+                names.append(ast.get_source_segment(source, t) or ast.dump(t))
+        return "assign:" + "|".join(sorted(names))
+    if isinstance(node, ast.If):
+        cond = ast.get_source_segment(source, node.test) or ast.dump(node.test)
+        return "if:" + " ".join(cond.split())
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        target = ast.get_source_segment(source, node.target) or ast.dump(node.target)
+        return ("async-for:" if isinstance(node, ast.AsyncFor) else "for:") \
+            + " ".join(target.split())
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        return "async-with:" if isinstance(node, ast.AsyncWith) else "with:"
+    if isinstance(node, ast.Try):
+        return "try:"
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return "import:"
+    seg = ast.get_source_segment(source, node) or ast.dump(node)
+    return node.__class__.__name__ + ":" + " ".join(seg.split())
+
+
 def _python_segments(source: str) -> "list[tuple[str, str, str]] | None":
     """*source* cut into ``(kind, name, text)`` pieces that join back to it exactly.
 
-    ``kind`` is ``"imports"`` (the leading block `chunk_file` shows), ``"symbol"`` (a
-    top-level def or class, decorators included) or ``"gap"`` (any other module-level
-    text). ``None`` when the source does not parse, a top-level name repeats, or a block
-    cannot be placed — the splice that reads this then does not run (REL-6 #59).
+    ``kind`` is ``"imports"`` (the leading block `chunk_file` shows),
+    ``"symbol"`` (a top-level def or class, decorators included), ``"stmt"``
+    (a module-level statement that is not an import or a symbol — an
+    assignment, an ``if``/``for``/``with`` block, HARDEN-29 D) or ``"gap"``
+    (any other module-level text, e.g. blank lines and comments). ``None``
+    when the source does not parse, a top-level name repeats, a statement
+    key repeats, or a block cannot be placed — the splice that reads this
+    then does not run (REL-6 #59, HARDEN-29 D).
     """
     try:
         tree = ast.parse(source)
@@ -2676,8 +2762,25 @@ def _python_segments(source: str) -> "list[tuple[str, str, str]] | None":
     segments: "list[tuple[str, str, str]]" = [("imports", "imports", imports)] if imports else []
     pos = len(imports)
     seen: set = set()
+    stmt_keys: set = set()
     for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue        # in the leading imports block, or a gap's text otherwise
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # A module-level statement: matched by identity against the reply (HARDEN-29 D).
+            if node.end_lineno is None:
+                return None
+            start, end = offsets[node.lineno - 1], offsets[node.end_lineno]
+            if start < pos:
+                return None
+            if start > pos:
+                segments.append(("gap", "", source[pos:start]))
+            key = _stmt_key(node, source)
+            if key in stmt_keys:
+                return None
+            stmt_keys.add(key)
+            segments.append(("stmt", key, source[start:end]))
+            pos = end
             continue
         if node.name in seen or node.end_lineno is None:
             return None

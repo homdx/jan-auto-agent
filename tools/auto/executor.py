@@ -57,6 +57,7 @@ pytest_serial      — run a workspace pytest in-process (``-n 0``) instead of
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -108,6 +109,12 @@ _MIRROR_IGNORE = shutil.ignore_patterns(
     ".git", ".agent", "__pycache__", ".pytest_cache", ".mypy_cache",
     ".venv", "venv", "node_modules", ".tox", "*.egg-info",
 )
+
+#: HARDEN-29 A: the registry, one JSON list of directory names, that records
+#: every workspace this executor created. `_prune_old_workspaces` only ever
+#: deletes a directory whose name is in it — a directory without the mark is
+#: not the executor's, so it is never a candidate.
+_WORKSPACE_REGISTRY = ".agent-workspaces.json"
 
 
 # Result dataclass
@@ -423,6 +430,10 @@ class Executor:
         if workspace.exists():
             shutil.rmtree(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
+        # HARDEN-29 A: the executor owns the workspace it just made; the mark is
+        # what pruning may later use to tell it from an unrelated directory that
+        # happens to live under the same root.
+        self._mark_workspace(workspace)
 
         # The whole repo is mirrored into the workspace before target files are overlaid, so checks can see helpers (AUTO-FIX-1).
         try:
@@ -519,6 +530,59 @@ class Executor:
 
         return workspace
 
+    def _read_workspace_registry(self) -> set[str]:
+        """The directory names this executor marked as its own workspaces.
+
+        HARDEN-29 A: fail-open. A registry that is missing, unreadable or not a
+        JSON list is an empty set, so pruning simply finds no candidate and
+        deletes nothing — never the wrong directory.
+        """
+        path = self._registry_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        if not isinstance(data, list):
+            return set()
+        return {str(x) for x in data if isinstance(x, str)}
+
+    def _mark_workspace(self, workspace: Path) -> None:
+        """Record *workspace* as one this executor created (HARDEN-29 A).
+
+        The registry lives beside ``workspace_root`` (see ``_registry_path``),
+        never inside a workspace, so it is not mirrored into a task and cannot
+        be mistaken for task output. A failed write only disables pruning — it
+        never raises.
+        """
+        try:
+            names = self._read_workspace_registry()
+        except Exception:  # noqa: BLE001 — the mark is best-effort, pruning may then just find no candidates
+            names = set()
+        names.add(workspace.name)
+        registry = self._registry_path()
+        try:
+            registry.parent.mkdir(parents=True, exist_ok=True)
+            tmp = registry.with_name(f"{registry.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(sorted(names), indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, registry)
+        except OSError as exc:
+            logger.warning(
+                "_mark_workspace: could not record %s (%s) — "
+                "workspace pruning is disabled for this root", workspace, exc,
+            )
+
+    def _registry_path(self) -> Path:
+        """The ownership registry's location (HARDEN-29 A).
+
+        The registry lives *beside* ``workspace_root`` — the default
+        ``.agent/workspace`` keeps it at ``.agent/.agent-workspaces.json`` —
+        never inside ``workspace_root``, so the per-task workspace mirrors
+        are the only entries that directory ever lists, and never inside a
+        workspace itself, so a registry write cannot refresh a workspace's
+        mtime (the stamp that orders pruning).
+        """
+        return self._workspace_root.parent / _WORKSPACE_REGISTRY
+
     def _prune_old_workspaces(self, keep: Path) -> None:
         """Remove old per-task workspace mirrors beyond the retention limit.
 
@@ -528,6 +592,13 @@ class Executor:
         checks), so without pruning these directories accumulate forever
         and fill the disk. Keep only the ``max_retained_workspaces`` most
         recently modified sibling directories (plus the one just built).
+
+        HARDEN-29 A: only directories this executor created are ever pruned
+        (a directory without the executor's mark is never a candidate), and
+        the source repository, every ancestor of it and anything that
+        contains it are never deleted, marked or not. A ``workspace_root``
+        that would put the source among the candidates therefore prunes
+        nothing rather than delete it.
         """
         if self._max_retained_workspaces <= 0:
             return
@@ -538,6 +609,27 @@ class Executor:
             ]
         except (OSError, FileNotFoundError):
             return
+        marked = self._read_workspace_registry()
+        base_resolved = self._base_dir.resolve()
+
+        def _is_protected(p: Path) -> bool:
+            """True when *p* is (or contains) the source repository.
+
+            The source repo, every ancestor of it and anything that contains
+            it are never pruned, marked or not — an explicit shared
+            ``workspace_root`` must not make the agent delete its own base.
+            """
+            try:
+                p_res = p.resolve()
+            except OSError:
+                return True
+            try:
+                base_resolved.relative_to(p_res)
+                return True
+            except ValueError:
+                return False
+
+        siblings = [p for p in siblings if p.name in marked and not _is_protected(p)]
         # Oldest first among the other task workspaces; a sibling removed mid-scan must not raise (BUGFIX).
         def _safe_mtime(p: Path) -> float:
             try:
@@ -804,7 +896,10 @@ class Executor:
         command:
             Shell command string.
         cwd:
-            Working directory for the child process.
+            Working directory for the child process.  When called from
+            :meth:`run` this is the per-task workspace, which :meth:`_build_env`
+            places first on the child's ``PYTHONPATH``.  :meth:`run_raw` calls
+            with ``base_dir`` (or an explicit override) and keeps its behaviour.
         task_id:
             Attached to the returned :class:`ExecutionResult`.
 
@@ -814,7 +909,18 @@ class Executor:
             Always returns — subprocess.TimeoutExpired and OSError are caught
             and mapped to the result fields.
         """
-        env = self._build_env()
+        # Only a run() cwd that lives under the workspace root is a task
+        # workspace; run_raw()'s base_dir (or any override outside it) is not,
+        # so run_raw keeps its base_dir-first PYTHONPATH behaviour unchanged.
+        try:
+            cwd_resolved = cwd.resolve()
+            ws_root = self._workspace_root.resolve()
+            _workspace = cwd_resolved if (
+                cwd_resolved == ws_root or ws_root in cwd_resolved.parents
+            ) else None
+        except (OSError, RuntimeError):
+            _workspace = None
+        env = self._build_env(workspace=_workspace)
         # An explicit timeout check: a zero timeout means an immediate timeout, not "no timeout" (0.0 is falsy).
         timeout = self._timeout_sec if self._timeout_sec > 0 else None
         # The command is redacted only for storing and logging; the real command is what runs (BUGFIX).
@@ -937,8 +1043,19 @@ class Executor:
             out_file.close()
             err_file.close()
 
-    def _build_env(self) -> dict[str, str]:
-        """Return a child-process environment with proxy vars cleared."""
+    def _build_env(self, *, workspace: Optional[Path] = None) -> dict[str, str]:
+        """Return a child-process environment with proxy vars cleared.
+
+        ``PYTHONPATH`` is built so the check imports from the right place:
+
+        * ``run()`` (*workspace* given): the workspace comes first, and the
+          source repository never appears on it. An inherited entry that
+          points into the source repository is replaced by the same directory
+          of the workspace (dropped when the mirror has none), so it cannot
+          take precedence over the workspace either.
+        * ``run_raw()`` (*workspace* None): ``base_dir`` first, then the
+          inherited path — unchanged behaviour.
+        """
         env = os.environ.copy()
         for var in _PROXY_SERVER_VARS:
             env.pop(var, None)
@@ -947,14 +1064,35 @@ class Executor:
         # Children run in UTF-8 mode: the Windows default codec cannot decode every byte (PEP 540).
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
-        
+
+        entries: list[str] = []
         base_dir_str = str(self._base_dir)
-        existing_pythonpath = env.get("PYTHONPATH", "")
-        if existing_pythonpath:
-            env["PYTHONPATH"] = f"{base_dir_str}{os.pathsep}{existing_pythonpath}"
+        if workspace is not None:
+            # The check imports from the workspace it runs in: the workspace
+            # comes first, and the source repository never appears here.
+            entries.append(str(workspace))
+            existing = env.get("PYTHONPATH", "")
+            for entry in existing.split(os.pathsep):
+                if not entry:
+                    continue
+                if not _path_inside(entry, self._base_dir):
+                    entries.append(entry)
+                    continue
+                # An entry into the source (`<repo>/src`) becomes the same directory of the
+                # mirror, so a src-layout check still imports the project, from the workspace.
+                rel = Path(entry).resolve().relative_to(self._base_dir.resolve())
+                mirrored = workspace / rel
+                if mirrored.is_dir() and str(mirrored) not in entries:
+                    entries.append(str(mirrored))
         else:
-            env["PYTHONPATH"] = base_dir_str
-            
+            # run_raw(): no workspace — base_dir first, then the inherited path.
+            entries.append(base_dir_str)
+            existing = env.get("PYTHONPATH", "")
+            for entry in existing.split(os.pathsep):
+                if entry:
+                    entries.append(entry)
+        env["PYTHONPATH"] = os.pathsep.join(entries)
+
         return env
 
 
@@ -993,6 +1131,20 @@ def _truncate(text: str, max_chars: int) -> str:
         return text
     notice = f"\n... [truncated — {len(text) - max_chars} chars omitted]"
     return text[:max_chars] + notice
+
+
+def _path_inside(path_str: str, base_dir: Path) -> bool:
+    """True when *path_str* resolves to *base_dir* or somewhere beneath it.
+
+    A missing path still resolves (non-strict), so an inherited PYTHONPATH
+    entry that names a directory the repo no longer has is still recognised
+    and kept off the child's path.
+    """
+    try:
+        Path(path_str).resolve().relative_to(base_dir.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def _wait_bounded(proc: "subprocess.Popen", timeout: "float | None", files) -> bool:
