@@ -46,9 +46,10 @@ def _long_file_body():
     original = "".join(lines)
     reply = mask_api_key(original).replace("x1 = 1", "x1 = 9", 1)
     reply = "# head\n" + reply + "# tail\n"
-    started = time.monotonic()
+    # CPU time, not the wall clock: three full suites at once stretched 0.3 s of work to 8 s of waiting.
+    started = time.process_time()
     out = restore_masked_secrets(original, reply)
-    assert time.monotonic() - started < 8.0
+    assert time.process_time() - started < 8.0
     assert KA in out
 
 

@@ -52,6 +52,7 @@ Public surface::
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Sequence
@@ -155,6 +156,14 @@ class ContextBroker:
             if not remaining:
                 break
             abs_path = base_dir / rel
+            # HARDEN-29 B: a target that resolves outside base_dir (a link out
+            # of the repository, a ../ path) is never read — no outside file
+            # may reach a model's context.
+            if not self._contained(abs_path, base_dir):
+                logger.debug(
+                    "ContextBroker: target %r resolves outside %s — skipping", rel, base_dir,
+                )
+                continue
             source, ext = self._read_file(abs_path)
             if source is None:
                 continue
@@ -278,37 +287,30 @@ class ContextBroker:
         if low.endswith((".md", ".txt", ".markdown")):
             p = base_dir / token
             # A token that escapes base_dir (e.g. ../secret.md) is refused before it is read (BUGFIX).
-            try:
-                p.resolve().relative_to(base_dir.resolve())
-                _escapes_base = False
-            except ValueError:
-                _escapes_base = True
-            if not _escapes_base and p.is_file() and not _is_target(p):
+            if self._contained(p, base_dir) and p.is_file() and not _is_target(p):
                 candidates.append(p)
         # Chapter-number reference (chapter_2, chapter 2, Chapter_02 …).
         m = _CHAPTER_RE.search(token)
         if m and not candidates:
             want = int(m.group(1))
-            for path in base_dir.rglob("*"):
-                if not path.is_file():
-                    continue
-                if path.suffix.lower() not in _PROSE_EXTS:
-                    continue
-                if _is_target(path):
-                    continue
+            for path in self._iter_project_files(base_dir, target_files, prose_only=True):
                 cm = _CHAPTER_RE.search(path.name)
                 if cm and int(cm.group(1)) == want:
                     candidates.append(path)
                     break
         # Bare stem match (e.g. "prologue" → prologue.md) as a last resort.
         if not candidates:
-            for path in base_dir.rglob("*"):
-                if path.is_file() and path.suffix.lower() in _PROSE_EXTS \
-                        and path.stem.lower() == low and not _is_target(path):
+            for path in self._iter_project_files(base_dir, target_files, prose_only=True):
+                if path.stem.lower() == low:
                     candidates.append(path)
                     break
 
         for p in candidates:
+            # HARDEN-29 B: every candidate is checked on its resolved path
+            # before it is read — a link that leaves the repository, a dangling
+            # link or a resolution error means no content, never an outside file.
+            if not self._contained(p, base_dir):
+                continue
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
                 if text.strip():
@@ -354,6 +356,22 @@ class ContextBroker:
         )
 
     @staticmethod
+    def _contained(abs_path: Path, base_dir: Path) -> bool:
+        """True when *abs_path* resolves to a path inside *base_dir*.
+
+        HARDEN-29 B: one containment check on the resolved path, applied to
+        every candidate before it is read. A link that leaves the repository,
+        a dangling link and a resolution error all mean ``False`` — an
+        outside file never reaches a model's context. A link that stays
+        inside the repository keeps resolving, as before.
+        """
+        try:
+            abs_path.resolve().relative_to(base_dir.resolve())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
     def _read_file(abs_path: Path) -> tuple[str | None, str]:
         """Read *abs_path* and return ``(source, extension)``."""
         try:
@@ -366,6 +384,7 @@ class ContextBroker:
     def _iter_project_files(
         base_dir: Path,
         already_searched: Sequence[str],
+        prose_only: bool = False,
     ):
         """Yield project source files, skipping already-searched ones and
         well-known noise directories.
@@ -376,27 +395,48 @@ class ContextBroker:
         (AUTO-CR-6). Non-chapter files keep their existing alphabetical
         order, unaffected by this — they simply sort after every numbered
         chapter.
+
+        HARDEN-29 C: ignored directories (``.git``, ``.venv``, … and ``.agent``,
+        the run's own state, mirrors included) are pruned before descending,
+        not filtered after a full ``rglob``, so a stale ``.agent/workspace``
+        copy is never a source of context and the live source wins. The walk
+        does not follow a symlinked directory, and every yielded file is
+        checked once on its resolved path (HARDEN-29 B), so a link that
+        leaves the repository never reaches the caller.
         """
         skip_dirs = frozenset({
             "__pycache__", ".git", ".hg", ".svn",
             "node_modules", "venv", ".venv", "dist", "build", ".tox",
+            ".agent",
         })
         searched_abs = frozenset(
             str((base_dir / r).resolve()) for r in already_searched
         )
+        exts = _PROSE_EXTS if prose_only else _SEARCHABLE_EXTS
+        base_resolved = base_dir.resolve()
 
         def _sort_key(path: Path) -> tuple[float, str]:
             m = _CHAPTER_RE.search(path.name)
             chapter_num = float(m.group(1)) if m else float("inf")
             return (chapter_num, str(path))
 
-        for path in sorted(base_dir.rglob("*"), key=_sort_key):
-            if any(part in skip_dirs for part in path.parts):
-                continue
-            if path.suffix.lower() not in _SEARCHABLE_EXTS:
-                continue
-            if not path.is_file():
-                continue
-            if str(path.resolve()) in searched_abs:
-                continue
-            yield path
+        collected: list[Path] = []
+        for dirpath, dirnames, filenames in os.walk(base_dir):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            for fn in filenames:
+                path = Path(dirpath) / fn
+                if path.suffix.lower() not in exts:
+                    continue
+                try:
+                    resolved = path.resolve()
+                except OSError:
+                    continue
+                if str(resolved) in searched_abs:
+                    continue
+                try:
+                    resolved.relative_to(base_resolved)
+                except ValueError:
+                    continue
+                collected.append(path)
+        collected.sort(key=_sort_key)
+        yield from collected

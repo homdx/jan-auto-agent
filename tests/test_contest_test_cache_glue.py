@@ -30,13 +30,33 @@ def _part(call, output=OUT, status="completed"):
             "state": {"status": status, "output": output, "time": {"start": 1000, "end": 95000}}}
 
 
-def test_a_recorded_run_is_served_to_the_same_and_to_another_spelling(tmp_path):
+def test_a_recorded_run_is_served_to_another_spelling_of_the_same_selection(tmp_path):
     wt = _repo(tmp_path / "wt")
     gate = TestCacheGate(tmp_path / "c.jsonl", agent="a")
     assert gate.ask(_ask("python3 -m pytest .smoke_tests/ .regression_tests/ -q -n 4 2>&1 | tail -20"), wt) is None
     assert gate.harvest([_part("call_1")]) == 1
-    hit = gate.ask(_ask("time python3 -m pytest tests -q -n 1 | tail -5", "call_2"), wt)
+    hit = gate.ask(_ask("time python3 -m pytest .smoke_tests .regression_tests -q -n 1 | tail -5", "call_2"), wt)
     assert hit.startswith("cached: ") and "7262 passed" in hit and "\n" not in hit
+
+
+def test_a_different_selection_is_not_answered_by_a_smoke_result(tmp_path):
+    """HARDEN-28 B: a cached green smoke run must not answer a full-suite run."""
+    wt = _repo(tmp_path / "wt")
+    gate = TestCacheGate(tmp_path / "c.jsonl", agent="a")
+    gate.ask(_ask("python3 -m pytest .smoke_tests/ -q -n 4 2>&1 | tail -20"), wt)
+    gate.harvest([_part("call_1")])
+    assert gate.ask(_ask("python3 -m pytest tests -q -n 4 2>&1 | tail -20", "call_2"), wt) is None
+    assert gate.ask(_ask("python3 -m pytest .regression_tests/ -q -n 4 2>&1 | tail -20", "call_3"), wt) is None
+
+
+def test_a_cd_is_part_of_the_key(tmp_path):
+    """HARDEN-28 C: `cd package_a && pytest tests` must not answer `cd package_b && pytest tests`."""
+    wt = _repo(tmp_path / "wt")
+    gate = TestCacheGate(tmp_path / "c.jsonl", agent="a")
+    gate.ask(_ask("cd package_a && pytest tests -q"), wt)
+    gate.harvest([_part("call_1")])
+    assert gate.ask(_ask("cd package_b && pytest tests -q", "call_2"), wt) is None
+    assert gate.ask(_ask("cd package_a && pytest tests -q", "call_3"), wt)
 
 
 def test_a_changed_tree_misses(tmp_path):

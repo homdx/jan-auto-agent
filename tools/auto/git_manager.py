@@ -582,15 +582,29 @@ class GitManager:
         """
         # No HEAD yet (a repo with no commit): the index diff is the whole patch.
         base = "HEAD" if self._has_head() else "--cached"
-        parts = [self._run_bytes(["git", "diff", base, "--binary", "--"],
-                                 "git diff failed").decode("utf-8", "surrogateescape")]
+        # HARDEN-28 E: the recovery patch must be git's OWN bytes. A configured
+        # `diff.external` driver or a textconv filter can print anything (with
+        # `diff.external=true` the capture came back empty and the reset that
+        # followed threw the work away), and `color.ui=always` would decorate
+        # the patch so `git apply` refused it — so all three are disabled and
+        # the output is taken as bytes, never through a pager (the pipe has no
+        # TTY, and `--no-color` keeps a forced color out). The a/ and b/
+        # prefixes are named outright: `diff.noprefix` or `diff.mnemonicPrefix`
+        # would otherwise write headers the `git apply -p1` of a recovery
+        # cannot read.
+        parts = [self._run_bytes(
+            ["git", "diff", base, "--binary", "--no-ext-diff", "--no-textconv",
+             "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--"],
+            "git diff failed",
+        ).decode("utf-8", "surrogateescape")]
         collect = self._collect_dir()
         for path in self.untracked_paths():
             if collect is not None and path.startswith(collect):
                 continue   # the discard keeps the collect artifact, and a patch that adds it again does not apply
             # --no-index exits 1 when the files differ, which is the normal case.
             proc = run_git(
-                ["git", "diff", "--no-index", "--binary", "--",
+                ["git", "diff", "--no-index", "--binary", "--no-ext-diff",
+                 "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--",
                  os.devnull, path],
                 cwd=self.repo_dir, timeout=120, text=False, retries=1,
             )
