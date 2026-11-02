@@ -1733,6 +1733,11 @@ class AgentRun:
         # KC-43: a round of one leg writes the state.json it always wrote
         if not data.get("leg_note"):
             data.pop("leg_note", None)
+        # KC-185: a single-model agent keeps the exact state.json bytes of the
+        # pre-failover shape; only a `|` list carries the list and its index.
+        if not self.agent.models:
+            data["agent"].pop("models", None)
+            data["agent"].pop("model_index", None)
         # deadline_commit is always written, so state.json says whether the entry was the model's or the runner's (KC-41).
         data["deadline_commit"] = bool(self.deadline_commit)
         return data
@@ -1741,7 +1746,7 @@ class AgentRun:
     def from_dict(cls, data: dict) -> "AgentRun":
         ws = dict(data["workspace"])
         ws["path"] = Path(ws["path"])
-        run = cls(agent=AgentSpec(**data["agent"]), workspace=Workspace(**ws))
+        run = cls(agent=AgentSpec.from_dict(data["agent"]), workspace=Workspace(**ws))
         for name in ("session_id", "attempt", "turns", "permissions", "questions",
                      "last_error", "resumable", "commit", "cost", "tokens", "reaped",
                       "deadline_commit", "continues", "compactions", "sessions",
@@ -1850,10 +1855,17 @@ class RoundState:
                    server_silent=silent if isinstance(silent, dict) else None)
 
     def table_rows(self) -> list:
-        """One dict per agent — the SUMMARY's inputs; KC-7 renders them."""
+        """One dict per agent — the SUMMARY's inputs; KC-7 renders them.
+
+        KC-185: ``model`` is the model in use — ``zai/glm-4.7-flash (2/2)`` once
+        the agent has moved off the first of its list — and ``models``, only on
+        an agent that carries a list, names the whole list for the SUMMARY row
+        of one that switched.
+        """
         return [{
             "name": run.agent.name,
-            "model": run.agent.model,
+            "model": run.agent.model_label,
+            "models": run.agent.models_label if run.agent.models else None,
             "state": run.state.value,
             "attempts": run.attempt,
             "sessions": run.sessions,
@@ -5029,6 +5041,59 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         except Exception as exc:  # noqa: BLE001 — the overflow still ends the turn
             _log.warning("%s: context memory: %s", spec.name, _brief(str(exc)))
 
+    def _failover_model(turn: dict, reason: str) -> bool:
+        """KC-185: move the agent to its next model; True when it switched, False
+        when the list is exhausted and the agent ends as today.
+
+        The session is the same — only the model the next prompt names changes,
+        so the agent's conversation and worktree stay as they are. The retry
+        budget starts over for the new model, and the switch is logged and
+        recorded on the turn as ``cause: failover``. The list is a ring with one
+        pass: after the last model the agent goes back to the first one only
+        when at least one turn has finished since the previous switch.
+        """
+        nonlocal spec, session, retries_used, turns_since_switch, retry_text, tried_models
+        models = getattr(spec, "models", None) or ()
+        if len(models) < 2:
+            return False
+        index = getattr(spec, "model_index", 0) or 0
+        count = len(models)
+        if index + 1 < count:
+            nxt = index + 1
+        elif turns_since_switch > 0:
+            nxt = 0
+        else:
+            return False
+        nxt_ref = models[nxt]
+        from_model = spec.model
+        to_model = nxt_ref.model
+        spec = replace(spec, provider_id=nxt_ref.provider_id,
+                       model_id=nxt_ref.model_id, variant=nxt_ref.variant,
+                       model_index=nxt)
+        run.agent = spec
+        if session is not None:
+            session = replace(session, provider_id=nxt_ref.provider_id,
+                              model_id=nxt_ref.model_id, variant=nxt_ref.variant)
+        retries_used = 0
+        turns_since_switch = 0
+        if to_model not in tried_models:
+            tried_models.append(to_model)
+        turn["cause"] = "failover"
+        turn["provider_from"] = from_model
+        turn["provider_to"] = to_model
+        run.turns.append(turn)
+        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+        _log.info("%s: provider %s → %s — %s", spec.name, from_model, to_model, reason)
+        retry_text = RETRY_PROMPT.format(reason=f"{reason} — switched to {to_model}")
+        return True
+
+    def _tried_text() -> str:
+        """KC-185: the models an agent that used its list up already tried, as
+        `` — tried: a, b``; ``""`` for one model (today's ERROR text)."""
+        if len(tried_models) < 2:
+            return ""
+        return " — tried: " + ", ".join(tried_models)
+
     try:
         # Remove the untracked project file a PATCH /config left, so a resumed agent does not read it (round 148, 151).
         drop_stale_kilo_file(ws.path, assume_stale=True)
@@ -5061,6 +5126,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         continue_text = None
         retries_used = 0
         local_retries = 0
+        # KC-185: good turns since the last provider switch; 0 means a switch at
+        # the end of the list ends the agent instead of wrapping the ring.
+        turns_since_switch = 0
+        # KC-185: every model this run has tried, in order — the ERROR of an
+        # agent that used the list up names them all.
+        tried_models = [spec.model]
         # KC-75: empty idle turns in a row (a rate-limited free model).
         silent_retries = 0
         while True:
@@ -5364,7 +5435,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             and not isinstance(at, bool) else "")
                     text = _brief(_error_message(idle.error))
                     reason = text + when if text else when.strip()
-                    error = f"provider_quota: {reason}".rstrip()
+                    # KC-185: a quota is a provider error — fall over to the next
+                    # model when there is one; only the last ends the agent.
+                    if not stalled and _failover_model(turn, f"provider_quota: {reason}"):
+                        continue
+                    error = f"provider_quota: {reason}".rstrip() + _tried_text()
                     state = AgentState.ERROR
                 else:
                     # A provider outage is never retried here, since Kilo already retried it (KC-64).
@@ -5396,12 +5471,19 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         continue
                     # The count of finished replies is read only for a provider rejection (KC-45).
                     retryable = False
-                    if not overflow and not down and retries_used < int(config.max_error_retries):
+                    if not overflow and not down and not _is_local_store(idle.error):
                         retryable = _retryable(idle.error)
                         if not retryable and _rejected_request(idle.error):
                             retryable = _retryable(
                                 idle.error, finished=_finished_replies(backend, session))
-                    if retryable:
+                    # KC-185: a retryable provider error whose budget is spent is
+                    # a provider error too — fall over to the next model. The
+                    # retry itself (below) keeps today's path while the budget holds.
+                    if (not overflow and not down and retryable
+                            and retries_used >= int(config.max_error_retries)
+                            and not stalled and _failover_model(turn, _retry_reason(idle.error))):
+                        continue
+                    if retryable and retries_used < int(config.max_error_retries):
                         run.turns.append(turn)
                         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                         retries_used += 1
@@ -5422,11 +5504,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         retry_text = RETRY_PROMPT.format(reason=_retry_reason(idle.error))
                         continue
                     if down:
-                        # The hint sits after the cut, since an exhausted plan reads like an outage (KC-64).
+                        # KC-185: an outage is a provider error — fall over to the
+                        # next model when there is one; only the last ends the agent.
                         data = (idle.error or {}).get("data") or {}
+                        reason = (f"provider_unavailable after {data.get('attempts')} "
+                                  f"retries: {_brief(data.get('message') or '')}")
+                        if not stalled and _failover_model(turn, reason):
+                            continue
+                        # The hint sits after the cut, since an exhausted plan reads like an outage (KC-64).
                         error = (f"provider_unavailable after {data.get('attempts')} retries: "
                                  f"{_brief(data.get('message') or '')}"
-                                 f"{_PLAN_HINT}")
+                                 f"{_PLAN_HINT}{_tried_text()}")
                         state = AgentState.ERROR
                     elif not overflow:
                         # An overflow sets its own error above; this is the fallback for other session errors.
@@ -5443,6 +5531,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # An idle turn is a good answer, so the error budgets start over (KC-62).
                 retries_used = 0
                 local_retries = 0
+                # KC-185: a turn that finished on this model is the progress the
+                # ring's wrap-around requires before a second pass is allowed.
+                turns_since_switch += 1
                 idle_kind = classify_idle(backend, session, turn["sent_at"], ws)
                 turn["idle_kind"] = idle_kind.value
                 # A silent turn during a provider error is retried with a longer wait, on its own budget (KC-75).

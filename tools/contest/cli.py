@@ -94,6 +94,7 @@ from tools.contest.roster import (
     AgentSpec,
     ContestConfig,
     LOCAL_FILENAME,
+    ModelRef,
     RosterError,
     load_roster,
 )
@@ -411,20 +412,31 @@ def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
     """
     parsed = []
     for item in filter(None, (m.strip() for m in models.split(","))):
-        item, _, variant = item.partition("@")
-        # The split is at the first slash, as the roster does: kilo is the provider.
-        prov, slash, model_id = item.partition("/")
-        if not slash:
-            prov, model_id = "", item
+        refs = []
+        # KC-185: `|` joins several models of one agent, tried in this order.
+        for part in item.split("|"):
+            part = part.strip()
+            if not part:
+                continue
+            part, _, variant = part.partition("@")
+            # The split is at the first slash, as the roster does: kilo is the provider.
+            prov, slash, model_id = part.partition("/")
+            if not slash:
+                prov, model_id = "", part
+            refs.append((prov or provider, model_id, variant.strip() or None))
+        if not refs:
+            continue
+        # The name comes from the first model, as today; a `|` list never adds
+        # a `-varN` suffix of its own, so one comma item is one name occurrence.
         name = "".join(c if c.isalnum() or c in "_-" else "-"
-                       for c in model_id.rpartition("/")[2].split(":")[0].lower())
-        parsed.append((name.lstrip("_-"), prov or provider, model_id, variant.strip() or None))
+                       for c in refs[0][1].rpartition("/")[2].split(":")[0].lower())
+        parsed.append((name.lstrip("_-"), tuple(refs)))
 
-    counts = Counter(name for name, _, _, _ in parsed)
+    counts = Counter(name for name, _ in parsed)
     taken = {name for name, count in counts.items() if count == 1}
     last: dict = {}
     specs = []
-    for name, prov, model_id, variant in parsed:
+    for name, refs in parsed:
         if counts[name] > 1:
             number = last.get(name, 0)
             while True:
@@ -435,8 +447,13 @@ def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
             last[name] = number
             taken.add(candidate)
             name = candidate
-        specs.append(AgentSpec(name=name, provider_id=prov, model_id=model_id,
-                               variant=variant))
+        refs_t = tuple(ModelRef(provider_id=p, model_id=m, variant=v)
+                       for p, m, v in refs)
+        first = refs_t[0]
+        specs.append(AgentSpec(name=name, provider_id=first.provider_id,
+                               model_id=first.model_id, variant=first.variant,
+                               models=refs_t if len(refs_t) > 1 else (),
+                               model_index=0))
     return tuple(specs)
 
 
@@ -1940,8 +1957,8 @@ def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConf
     # Agents with no variant of their own get --variant, else [contest] variant, else highest (KC-49).
     variant = getattr(args, "variant", None) or config.variant or HIGHEST
     config = replace(config, agents=tuple(
-        replace(agent, variant=None) if (agent.variant or variant) == DEFAULT
-        else agent if agent.variant else replace(agent, variant=variant)
+        agent.with_default_variant(None) if (agent.variant or variant) == DEFAULT
+        else agent if agent.variant else agent.with_default_variant(variant)
         for agent in config.agents))
     if args.max_parallel is not None:
         config = replace(config, max_parallel=int(args.max_parallel))

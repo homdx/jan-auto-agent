@@ -48,7 +48,7 @@ import logging
 import math
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from tools.auto.llm_profile import LlmSettings, resolve_llm_profile
@@ -71,6 +71,7 @@ __all__ = [
     "LOCAL_FILENAME",
     "AgentSpec",
     "ContestConfig",
+    "ModelRef",
     "RosterError",
     "load_roster",
 ]
@@ -236,12 +237,40 @@ class RosterError(ValueError):
 
 
 @dataclass(frozen=True)
+class ModelRef:
+    """One model of an agent's model list (KC-185).
+
+    ``provider_id`` / ``model_id`` are the two halves of one ``model`` value,
+    split at its first ``/``; ``variant`` is that model's own ``@variant``, so
+    ``a/m@high|b/m`` gives ``high`` to the first model only.
+    """
+
+    provider_id: str
+    model_id: str
+    variant: str | None = None
+
+    @property
+    def model(self) -> str:
+        """``providerID/modelID`` — the shape the probe sent and ``kilo models`` prints."""
+        return f"{self.provider_id}/{self.model_id}"
+
+
+@dataclass(frozen=True)
 class AgentSpec:
     """One competing model, from one ``[contest.agent.<name>]`` section.
 
     ``name`` becomes a branch and a folder, so it must match
     ``[a-z0-9][a-z0-9_-]*``. ``provider_id`` / ``model_id`` are the two halves
     of the section's ``model`` value, split at its first ``/``.
+
+    KC-185: a ``--models`` item (or a roster ``model``) may name several
+    providers of one model joined with ``|`` — ``kenary/glm-4-7-flash:free|
+    zai/glm-4.7-flash``. Then ``models`` holds the list in order and
+    ``model_index`` the position of the model in use; ``provider_id`` /
+    ``model_id`` / ``variant`` always name that current model, so the rest of
+    the runner reads the spec as it always did. A spec with an empty ``models``
+    is a single model — exactly the pre-KC-185 shape, byte for byte in
+    ``state.json``.
     """
 
     name: str
@@ -251,11 +280,74 @@ class AgentSpec:
     variant: str | None = None
     #: The model's context limit from GET /provider, set at intake; None when unknown (KC-56).
     context_limit: int | None = None
+    #: The whole model list, in order; empty is the legacy single model (KC-185).
+    models: tuple = ()
+    #: Index into *models* of the model in use; 0 for a single model (KC-185).
+    model_index: int = 0
 
     @property
     def model(self) -> str:
         """``providerID/modelID`` — the shape the probe sent and ``kilo models`` prints."""
         return f"{self.provider_id}/{self.model_id}"
+
+    @property
+    def model_count(self) -> int:
+        """The size of the model list; 1 for a single model (KC-185)."""
+        return len(self.models) if self.models else 1
+
+    @property
+    def model_label(self) -> str:
+        """`zai/glm-4.7-flash (2/2)` — the model in use, with its position once
+        the agent has moved off the first (KC-185, the ``status`` column)."""
+        label = self.model
+        if self.model_count > 1 and self.model_index > 0:
+            label = f"{label} ({self.model_index + 1}/{self.model_count})"
+        return label
+
+    @property
+    def models_label(self) -> str:
+        """`kenary/glm-4-7-flash:free|zai/glm-4.7-flash` — the whole list, for
+        the SUMMARY row of an agent that switched (KC-185)."""
+        if not self.models:
+            return self.model
+        return "|".join(ref.model for ref in self.models)
+
+    def with_default_variant(self, variant: str | None) -> "AgentSpec":
+        """KC-185: *variant* for every model that names none; the current model
+        keeps whatever it now has. A single-model spec is today's behaviour.
+        """
+        if not self.models:
+            return replace(self, variant=variant)
+        refs = tuple(ModelRef(p, m, v if v else variant) for p, m, v in self.models)
+        current = refs[self.model_index]
+        return replace(self, models=refs, variant=current.variant)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AgentSpec":
+        """An ``AgentSpec`` off a ``state.json`` agent row (KC-185).
+
+        A row written before this change has no ``models`` key and reads as a
+        list of one — ``models`` empty, ``model_index`` 0 — exactly as the
+        legacy single-model spec. A malformed list or index fails open to the
+        first model, never a refusal.
+        """
+        models = data.get("models") or ()
+        refs = tuple(ModelRef(**m) for m in models if isinstance(m, dict))
+        index = int(data.get("model_index") or 0)
+        if refs and not (0 <= index < len(refs)):
+            index = 0
+        if refs and 0 <= index < len(refs):
+            current = refs[index]
+            provider_id, model_id, variant = (current.provider_id, current.model_id,
+                                              current.variant)
+        else:
+            provider_id = data["provider_id"]
+            model_id = data["model_id"]
+            variant = data.get("variant")
+        return cls(name=data["name"], provider_id=provider_id, model_id=model_id,
+                   kilo_agent=data.get("kilo_agent"), variant=variant,
+                   context_limit=data.get("context_limit"), models=refs,
+                   model_index=index)
 
 
 #: Ticket 212: the bash patterns that must reach the permission handler for the test cache.
@@ -525,20 +617,38 @@ def _parse_agents(parser: configparser.ConfigParser) -> tuple[AgentSpec, ...]:
         model = parser.get(section, "model", fallback="").strip()
         if not model:
             raise RosterError(f"[{section}] is missing 'model' (providerID/modelID)")
-        provider_id, slash, model_id = model.partition("/")
-        if not slash or not model_id:
-            raise RosterError(
-                f"[{section}] model {model!r} must be providerID/modelID — it is "
-                f"split at the first '/', as `kilo models` prints it "
-                f"(kilo/~anthropic/x is provider 'kilo')"
-            )
+        # KC-185: `|` joins several providers of one model; `@variant` belongs to
+        # each model on its own (`a/m@high|b/m` gives `high` to the first only),
+        # and the section's own `variant` key is the fallback for a model that
+        # names none.
+        section_variant = _optional(parser, section, "variant")
+        refs = []
+        for part in model.split("|"):
+            part = part.strip()
+            if not part:
+                continue
+            item, _, item_variant = part.partition("@")
+            provider_id, slash, model_id = item.partition("/")
+            if not slash or not model_id:
+                raise RosterError(
+                    f"[{section}] model {model!r} must be providerID/modelID — it is "
+                    f"split at the first '/', as `kilo models` prints it "
+                    f"(kilo/~anthropic/x is provider 'kilo')"
+                )
+            refs.append(ModelRef(provider_id=provider_id, model_id=model_id,
+                                 variant=item_variant.strip() or section_variant))
+        if not refs:
+            raise RosterError(f"[{section}] is missing 'model' (providerID/modelID)")
+        refs = tuple(refs)
+        first = refs[0]
         agents.append(
             AgentSpec(
                 name=name,
-                provider_id=provider_id,
-                model_id=model_id,
+                provider_id=first.provider_id,
+                model_id=first.model_id,
                 kilo_agent=_optional(parser, section, "kilo_agent"),
-                variant=_optional(parser, section, "variant"),
+                variant=first.variant,
+                models=refs if len(refs) > 1 else (),
             )
         )
 

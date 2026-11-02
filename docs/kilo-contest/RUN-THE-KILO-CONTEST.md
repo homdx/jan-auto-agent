@@ -270,12 +270,20 @@ bynara/space-bunny-alpha-bynara,laguna-s-2-1:free,agnes-3-0-flash:free,glm-4-7-f
 How `--models` reads that list:
 - An id split at its first `/` is `provider/model`. An id with no `/` goes to
   the default provider (`kenary`, or `--provider ID`).
+- `|` joins several models of one agent, tried in that order:
+  `kenary/glm-4-7-flash:free|zai/glm-4.7-flash` is one agent that falls over to
+  z.ai when kenary ends a turn on a provider error (KC-185). It stays one agent
+  with one name — the first model's — and never adds a `-varN` of its own.
 - The agent's name is the model id without its `:tag`, made branch-safe.
 - A name given twice is run twice, as `-var1`, `-var2`, … in list order:
   `sensenova-6-8-flash-lite-var1`, `…-var2`. Each gets its own checkout and
   branch.
-- `model@high` sets that agent's reasoning variant.
-- `--resume` must get the same `--models` string; the names come from it.
+- `model@high` sets that agent's reasoning variant. On a `|` list the variant
+  belongs to each model on its own: `a/m@high|b/m` gives `high` to the first
+  only.
+- `--resume` must get the same `--models` string; the names come from it. The
+  model an agent was on survives the restart; `revive_round.py` puts an `ERROR`
+  agent back on the first model of its list.
 - `--max-parallel` at or above the number of agents starts them all at once.
 
 Add `--dry-run` to the same line first: it shows the agents' names and the
@@ -513,7 +521,7 @@ checks and runs end to end on the fake Kilo, which emits
 | `--target REPO_PATH` | the git repo the round runs on (default: the current one); see `2legs/MULTI-LEG-RUNBOOK.md` (KC-76) |
 | `--roster PATH` | the roster ini (default `contest.ini`; `contest.local.ini` beside it overrides it) |
 | `--base REF` | the ref the worktrees start from (default `HEAD`) |
-| `--models a:free,b:free` | these models run instead of the roster's agents; `model@variant` names a variant |
+| `--models a:free,b:free` | these models run instead of the roster's agents; `model@variant` names a variant, `a/m\|b/m` runs several providers of one agent (KC-185) |
 | `--backend kilo\|openrouter` | override the roster's backend |
 | `--provider ID` | the provider behind a `--models` id that names none (default `kenary` / `openrouter`) |
 | `--variant NAME` | the reasoning variant of every agent that names none: `highest` (default), `default`, or a name |

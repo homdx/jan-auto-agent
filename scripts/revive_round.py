@@ -94,12 +94,52 @@ def agent_name(entry) -> str:
     return spec if isinstance(spec, str) and spec else "?"
 
 
+def agent_model(entry) -> str:
+    """The model an agent row will resume on, ``provider/model`` — for the print.
+
+    An agent revived from `ERROR` starts again at the first model of its list
+    (KC-185), so after `revive_agents` this is the row's current `provider_id`/
+    `model_id`. A damaged row, or one with no model, is ``"?"``.
+    """
+    spec = entry.get("agent") if isinstance(entry, dict) else None
+    if not isinstance(spec, dict):
+        return "?"
+    provider = spec.get("provider_id")
+    model = spec.get("model_id")
+    return f"{provider}/{model}" if provider and model else "?"
+
+
+def _restart_at_first_model(agent: dict) -> None:
+    """KC-185: a revived agent starts over at the first model of its list.
+
+    A single-model agent (no `models` key) is already there. A malformed list
+    fails open to the first entry, never a refusal.
+    """
+    spec = agent.get("agent")
+    if not isinstance(spec, dict):
+        return
+    models = spec.get("models")
+    if not isinstance(models, list) or not models:
+        spec["model_index"] = 0
+        return
+    first = models[0]
+    if not isinstance(first, dict):
+        spec["model_index"] = 0
+        return
+    spec["model_index"] = 0
+    spec["provider_id"] = first.get("provider_id", spec.get("provider_id"))
+    spec["model_id"] = first.get("model_id", spec.get("model_id"))
+    if first.get("variant") is not None:
+        spec["variant"] = first.get("variant")
+
+
 def revive_agents(agents: list[dict], only: str | None = None, dead: bool = False) -> list[str]:
     """Set the revivable agents in *agents* back to WAITING, in place; the revived names.
 
     STALLED, GAVE_UP and ERROR are revivable, and DEAD only with *dead*. *only*
     narrows it to the agent of that name. The old state, attempt and error stay
-    on the agent under `revived_from`.
+    on the agent under `revived_from`. KC-185: a revived agent with a model list
+    starts again at the first model of it.
     """
     states = (*REVIVE, DEAD_STATE) if dead else REVIVE
     revived: list[str] = []
@@ -114,6 +154,7 @@ def revive_agents(agents: list[dict], only: str | None = None, dead: bool = Fals
                                  "last_error": agent.get("last_error")}
         agent["state"] = REVIVED_STATE
         agent["last_error"] = None
+        _restart_at_first_model(agent)
         revived.append(name)
     return revived
 
@@ -175,10 +216,16 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(agent, dict):
             continue
         name = agent_name(agent)
+        # KC-185: only an agent with a model list gets the model named — a
+        # single-model agent's model is its name, and the line stays as before.
+        spec = agent.get("agent") if isinstance(agent, dict) else None
+        has_list = isinstance(spec, dict) and isinstance(spec.get("models"), list) \
+            and spec.get("models")
+        suffix = f" on {agent_model(agent)}" if has_list else ""
         if name in names:
-            print(f"{name}: {agent['revived_from']['state']} -> {REVIVED_STATE}")
+            print(f"{name}: {agent['revived_from']['state']} -> {REVIVED_STATE}{suffix}")
         else:
-            print(f"{name}: {agent.get('state')} (kept)")
+            print(f"{name}: {agent.get('state')}{suffix} (kept)")
 
     if args.dry_run or not revived:
         print(f"{revived} to revive" + (" (dry run, nothing written)" if args.dry_run else ""))

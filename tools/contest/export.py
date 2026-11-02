@@ -479,13 +479,18 @@ def _wall(started_at, ended_at) -> str:
     return f"{max(0.0, seconds):.0f} s"
 
 
-def render_table(state, paths) -> list:
+def render_table(state, paths, *, full_models: bool = False) -> list:
     """The SUMMARY table as markdown lines, one row per agent — `status` prints it too.
 
     `state.table_rows()` gives the facts, *paths* gives each agent's exported
     file. Every row is printed even when the row has no file: an agent that ended
     `STALLED` on a clean tree has nothing to score, and dropping it from the table
     would make the table disagree with the round.
+
+    *full_models* (KC-185): the SUMMARY's own view — the ``model`` cell of an
+    agent that carries a model list names the whole list, so a row of one that
+    switched says both providers. ``False`` is `status`'s view: the model in use,
+    with its position — ``zai/glm-4.7-flash (2/2)``.
     """
     rows = []
     try:
@@ -503,9 +508,10 @@ def render_table(state, paths) -> list:
         came_in, went_out = _token_pair(row.get("tokens"))
         cost = row.get("cost")
         commit = str(row.get("commit") or "")
+        model_cell = row.get("models") if full_models and row.get("models") else row.get("model")
         cells = [
             row.get("name"),
-            row.get("model"),
+            model_cell,
             row.get("state"),
             row.get("attempts"),
             _number(row.get("sessions")),
@@ -665,7 +671,7 @@ def write_summary(out_dir, state, base_sha, paths, *, repo=None, gate="") -> Pat
         header.append(f"- {label}: {value}")
     header.append("")
 
-    body = ["## Agents", ""] + render_table(state, paths) + [""]
+    body = ["## Agents", ""] + render_table(state, paths, full_models=True) + [""]
     never_started = _never_started_line(state)
     if never_started:
         body += [never_started, ""]
