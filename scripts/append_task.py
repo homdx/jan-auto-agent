@@ -28,19 +28,60 @@ try:
     from tools.file_lock import locked  # noqa: E402
 except ImportError:
     # GYRO-01: an external --target repo gets this script alone, without tools/file_lock.py
-    # (llama.cpp even has a tools/ of its own); the same parent-directory flock, inline.
+    # (llama.cpp even has a tools/ of its own); the same locks, inline. A lock the filesystem
+    # cannot take at all (a network mount, a sandboxed FS) degrades to unlocked instead of
+    # crashing the agent's one write. A Windows lock another agent holds is waited for, as in
+    # tools/file_lock.py (about five minutes, then TimeoutError), never written through.
     import contextlib
 
     @contextlib.contextmanager
     def locked(path):
-        parent = os.path.dirname(os.path.realpath(path))
+        real = os.path.realpath(path)
+        parent = os.path.dirname(real)
         os.makedirs(parent, exist_ok=True)
-        fd = None
-        if os.name != "nt":
-            import fcntl
-            fd = os.open(parent, os.O_RDONLY)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        if os.name == "nt":
+            import errno
+            import msvcrt
+            busy = {getattr(errno, n) for n in ("EDEADLOCK", "EDEADLK") if hasattr(errno, n)}
+            lock_path = os.path.join(parent, f".{os.path.basename(real)}.lock")
+            fh, held, refused = None, False, False
+            try:
+                fh = open(lock_path, "a+b")
+                for _ in range(30):    # LK_LOCK waits ~10 s a call
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                        held = True
+                        break
+                    except OSError as exc:
+                        if exc.errno not in busy:
+                            raise
+            except OSError:
+                refused = True    # no lock on this share at all: unlocked
+            if not held and fh is not None:
+                fh.close()
+            if not held and not refused:
+                raise TimeoutError(f"{lock_path} still held by another process after 30 attempts")
+            try:
+                yield
+            finally:
+                if held:
+                    fh.seek(0)
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    finally:
+                        fh.close()
+            return
+        import fcntl
         try:
+            fd = os.open(parent, os.O_RDONLY)
+        except OSError:
+            fd = None
+        try:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                except OSError:
+                    pass    # no lock on a directory here: unlocked, as before
             yield
         finally:
             if fd is not None:
