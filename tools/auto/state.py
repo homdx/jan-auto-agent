@@ -295,6 +295,7 @@ class StateStore:
 
         self._plan: dict     = {}
         self._progress: dict = {}
+        self._emission_path  = self.agent_dir / "plan.emitted"
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -406,6 +407,41 @@ class StateStore:
 
     def get_progress(self) -> dict:
         return dict(self._progress)
+
+    # ── Plan-emission marker ─────────────────────────────────────────────────
+
+    def emission_state(self) -> str | None:
+        """Return the plan-emission marker: ``"started"``, ``"complete"``, or None.
+
+        ``"started"`` means an emission began but did not finish (an
+        interruption left ``plan.json`` possibly partial). ``"complete"`` means
+        the emission finished and ``plan.json`` holds the full validated task
+        set. None means no emission has ever run (a fresh store, or tasks
+        seeded outside :meth:`emit`).
+
+        Fail-open: a missing or unreadable marker reads as None.
+        """
+        try:
+            text = self._emission_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return text or None
+
+    def mark_emission_started(self) -> None:
+        """Record that a plan emission has begun (incomplete until completed)."""
+        try:
+            self._atomic_write(self._emission_path, "started\n")
+        except OSError as exc:
+            logger.warning(
+                "StateStore: could not mark emission started: %s", exc)
+
+    def mark_emission_complete(self) -> None:
+        """Record that a plan emission finished (plan.json holds the full set)."""
+        try:
+            self._atomic_write(self._emission_path, "complete\n")
+        except OSError as exc:
+            logger.warning(
+                "StateStore: could not mark emission complete: %s", exc)
 
     # ── Mutating API ─────────────────────────────────────────────────────────
 

@@ -8,6 +8,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
+from tools.auto.utils import atomic_write_text
+
 if TYPE_CHECKING:  # avoid circular imports at runtime
     from tools.auto.controller import AutoController
 
@@ -182,8 +184,12 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     exists but is empty (edge case from interrupted very-first run).
     """
     has_plan = bool(controller.state.all_tasks())
+    emission = controller.state.emission_state()
 
-    if has_plan:
+    if has_plan and emission != "started":
+        # A complete emission (or a plan seeded outside emit) is trusted as-is;
+        # only an interrupted ("started") emission is re-run, so its missing
+        # tasks are not lost for good.
         logger.info("plan_phase: plan already exists — skipping (resume)")
         controller.state.log("plan phase: skipped (plan already present)")
         if controller.run_trace:
@@ -412,17 +418,32 @@ def _emit_without_git(
     clusters,
 ) -> None:
     """Fallback: upsert tasks + write IMPROVEMENTS.md when git is unavailable."""
+    # Mark the emission in progress so an interrupted resume re-runs the plan
+    # phase instead of trusting a possibly-partial plan.json.
+    controller.state.mark_emission_started()
+
     md_content = to_improvements_md(backlog)
     md_path = controller.base_dir / IMPROVEMENTS_FILENAME
-    md_path.write_text(md_content, encoding="utf-8")
+    atomic_write_text(md_path, md_content)
     logger.info("_emit_without_git: wrote %s", md_path)
 
+    # A task the schema rejects is skipped, as PlanEmitter.emit does: raising here left the
+    # emission "started" for good, so every resume planned again and died on the same task.
+    upserted = 0
     for task in backlog.to_state_tasks():
-        controller.state.upsert_task(task)
-    logger.info(
-        "_emit_without_git: upserted %d task(s) into plan.json",
-        len(backlog.auto_tasks),
-    )
+        try:
+            controller.state.upsert_task(task)
+        except ValueError as exc:
+            task_id = task.get("id", "<no id>") if isinstance(task, dict) else "<not a dict>"
+            logger.error("_emit_without_git: task %s rejected by the plan schema — %s; "
+                         "skipping it", task_id, exc)
+            controller.state.log(f"emit: task {task_id} rejected — {exc}")
+        else:
+            upserted += 1
+
+    # All validated tasks are in plan.json — mark the emission complete.
+    controller.state.mark_emission_complete()
+    logger.info("_emit_without_git: upserted %d task(s) into plan.json", upserted)
 
 
 # Helpers

@@ -199,29 +199,34 @@ class BugFixLoop:
         try:
             tdir = self._state.task_dir(fix_id)
             rounds = sorted(tdir.glob("feedback_round_*.md"))
-            if not rounds:
-                return
-            # Archive stamps are UTC, matching the run log and ticket timestamps (FIX-1 #8).
-            stamp   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            archive = tdir / f"previous_attempt_{stamp}"
-            # Two archives in the same second get a suffix; without it the second would overwrite the first's feedback (bugfix).
-            suffix_n = 0
-            # Retry mkdir on collision instead of checking first, so a concurrent writer cannot make archiving fail silently (bugfix).
-            while True:
-                try:
-                    archive.mkdir(parents=True)
-                    break
-                except FileExistsError:
-                    suffix_n += 1
-                    archive = tdir / f"previous_attempt_{stamp}-{suffix_n:03d}"
-            for f in rounds:
-                f.rename(archive / f.name)
-            logger.info(
-                "BugFixLoop: archived %d stale feedback round(s) for %s to %s "
-                "so the retry starts from round 1",
-                len(rounds), fix_id, archive.name,
-            )
-            # Reset the time budget too: a stale deadline ledger would re-block the retry at once (bugfix).
+            # Archive existing feedback rounds (as today). An explicit reset
+            # clears the time-budget ledger whether or not there are rounds to
+            # archive: an attempt that ended before writing any feedback still
+            # leaves a spent ledger that must not be inherited by the retry.
+            if rounds:
+                # Archive stamps are UTC, matching the run log and ticket timestamps (FIX-1 #8).
+                stamp   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                archive = tdir / f"previous_attempt_{stamp}"
+                # Two archives in the same second get a suffix; without it the second would overwrite the first's feedback (bugfix).
+                suffix_n = 0
+                # Retry mkdir on collision instead of checking first, so a concurrent writer cannot make archiving fail silently (bugfix).
+                while True:
+                    try:
+                        archive.mkdir(parents=True)
+                        break
+                    except FileExistsError:
+                        suffix_n += 1
+                        archive = tdir / f"previous_attempt_{stamp}-{suffix_n:03d}"
+                for f in rounds:
+                    f.rename(archive / f.name)
+                logger.info(
+                    "BugFixLoop: archived %d stale feedback round(s) for %s to %s "
+                    "so the retry starts from round 1",
+                    len(rounds), fix_id, archive.name,
+                )
+            # Reset the time budget too: a stale deadline ledger would re-block
+            # the retry at once, so it is removed even when there are no
+            # feedback rounds to archive (bugfix).
             deadline_path = tdir / "deadline_started_at.txt"
             if deadline_path.exists():
                 try:
