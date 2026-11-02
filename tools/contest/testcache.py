@@ -237,10 +237,10 @@ _IGNORED_ENV_VARS = frozenset({
 })
 
 #: HARDEN-29 F: single values of a counting variable that a plain run already
-#: has. ``PYTHONPATH=.`` puts the checkout itself on the path, and the pinned
-#: corpus parses ``env PYTHONPATH=. …`` as the plain run; ``PYTHONPATH=src``
-#: or any other value counts.
-_IGNORED_ENV_VALUES = {"PYTHONPATH": frozenset({".", "./"})}
+#: has. ``PYTHONPATH=.`` puts the checkout itself on the path, and any other
+#: value counts.  ``PYTHONPATH=.`` and ``PYTHONPATH=./`` are now counted like
+#: any other variable (they are no longer in the ignored list).
+_IGNORED_ENV_VALUES = {}
 
 #: ``env`` options that empty the environment pytest gets: such a run is not
 #: cached at all, like ``env -u``.

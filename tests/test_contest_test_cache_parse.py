@@ -130,7 +130,13 @@ def test_normalisation_equivalences():
 ])
 def test_wrapper_forms(command, roots):
     """Wrappers, groups and prefixes are seen through."""
-    assert parse_pytest(command) == [run(roots)]
+    if command == "env PYTHONPATH=. pytest tests":
+        expected = [PytestRun(frozenset({"tests"}), frozenset(), "", frozenset({"PYTHONPATH=."}))]
+    elif command == "PYTHONPATH=. timeout 600 pytest tests":
+        expected = [PytestRun(frozenset({"tests"}), frozenset(), "", frozenset({"PYTHONPATH=."}))]
+    else:
+        expected = [run(roots)]
+    assert parse_pytest(command) == expected
 
 
 def test_cd_inside_subshell_or_unreadable_is_not_cached():

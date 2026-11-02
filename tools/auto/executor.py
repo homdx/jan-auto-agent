@@ -536,6 +536,9 @@ class Executor:
         HARDEN-29 A: fail-open. A registry that is missing, unreadable or not a
         JSON list is an empty set, so pruning simply finds no candidate and
         deletes nothing — never the wrong directory.
+
+        Old registries (plain list of names) are treated as "no marks" so that
+        directories previously marked under other roots are never deleted.
         """
         path = self._registry_path()
         try:
@@ -543,6 +546,11 @@ class Executor:
         except (OSError, ValueError):
             return set()
         if not isinstance(data, list):
+            return set()
+        # Backward compat: if the list contains simple names (no '/' and not
+        # an absolute path), treat it as an old-format registry and return
+        # empty set so nothing is pruned until new workspaces are recorded.
+        if data and all(isinstance(x, str) and not '/' in x and not x.startswith("/") for x in data):
             return set()
         return {str(x) for x in data if isinstance(x, str)}
 
@@ -558,7 +566,7 @@ class Executor:
             names = self._read_workspace_registry()
         except Exception:  # noqa: BLE001 — the mark is best-effort, pruning may then just find no candidates
             names = set()
-        names.add(workspace.name)
+        names.add(str(workspace.resolve()))
         registry = self._registry_path()
         try:
             registry.parent.mkdir(parents=True, exist_ok=True)
@@ -629,7 +637,7 @@ class Executor:
             except ValueError:
                 return False
 
-        siblings = [p for p in siblings if p.name in marked and not _is_protected(p)]
+        siblings = [p for p in siblings if str(p.resolve()) in marked and not _is_protected(p)]
         # Oldest first among the other task workspaces; a sibling removed mid-scan must not raise (BUGFIX).
         def _safe_mtime(p: Path) -> float:
             try:
