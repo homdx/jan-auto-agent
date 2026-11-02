@@ -5,31 +5,29 @@ builds a structural model of a target repo, `--auto` plans (Architect → Gate 1
 backlog) and executes tasks with a Coder, gates and validators. `--dry-run` and
 `--validate-plan` exercise the same planning path without executing.
 
+This page is for whoever changes the code. Running a contest, reviving a round,
+picking models and the claim check are operator work: their commands are in
+`docs/kilo-contest/RUN-THE-KILO-CONTEST.md` (section "Operator commands").
+
 ## Project Structure & Module Organization
 
 - `main.py` — CLI entry point (`--collect`, `--auto`, `--dry-run`, `--validate-plan`).
 - `tools/auto/` — pipeline stages: `architect.py`, `gate1_filter.py`, `controller.py`, `executor.py`, `inner_loop.py`, `coder.py`, `git_manager.py`.
 - `tools/collect/` — repo scanner, symbol/AST facts, contract and test maps, renderer.
+- `tools/contest/`, `tools/arena/` — the model contest and its judge.
 - `tools/` (root) — shared services: `llm_stream.py`, `prompt_store.py`, `skills/`, `validator_agent.py`.
 - `tests/` — sole source of truth for feature tests; `.smoke_tests/` and `.regression_tests/` are symlink tiers into it. `tests_bugfix/` pins historical bug fixes.
 - `scripts/` — repo tooling (`sync_test_tiers.py`, `collect_metrics.py`, `run_flows.sh`). `epic-tasks/`, `docs/`, `examples/` — specs and worked examples.
 
-## Build, Test, and Development Commands
+## Build and Test Commands
 
 - `pip install -r requirements.txt` — optional Java parsing backend.
-- `python3 -m pytest .smoke_tests/` — fast pre-commit gate.
+- `python3 -m pytest .smoke_tests/` — fast check.
 - `python3 -m pytest .smoke_tests/ .regression_tests/` — full suite, each file once.
 - `python3 -m pytest tests_bugfix -n 4 -q` — regression guards for fixed bugs.
 - `python3 scripts/sync_test_tiers.py` — regenerate tier symlinks (never by hand); `--check` verifies them.
-- `git config core.hooksPath githooks` — enable the pre-commit tier/stray-file hook.
-- `python3 -m tools.contest draft --target REPO "brief"` — auto mode writes and commits `epic-tasks/NN-<slug>.md`; `[contest_draft_llm]` and `[contest_gate_llm]` in `contest.local.ini` must be two different models (accounts). Stage D of the runbook.
-- `python3 -m tools.contest run --ticket NN` — the round; patches, `entrants.json` and `SUMMARY.md` in `contest-out/NN/`.
-- `python3 -m tools.contest run --ticket NN --dry-run` — intake, the round's worktrees, the plan and the first agent's prompt, then stop: no `kilo serve`, no session, no gate call.
-- `python3 -m tools.contest status --ticket NN [--out DIR]` — the SUMMARY table off `contest-out/NN/state.json`; touches nothing, works mid-round, exits 1 with no `state.json`.
-- `scripts/revive_round.py NN [--dry-run]` — sets a stopped round's `STALLED`/`GAVE_UP`/`ERROR` agents back to `WAITING`, so `run --ticket NN --resume` takes them up again; a round of legs resolves to its last leg.
-- `python3 scripts/py_model_test.py [--find-free PROVIDER…] MODEL…` — one coding task through `kilo run`, 15 checks; pick the round's `--models` with it.
-- `scripts/run_claim_check.sh report.md [--target . --ref HEAD]` — the claim check (EPIC CC): cut a review's claims, three free voters of three families judge each with the cited code in front of them, a verdict only when they agree; `scripts/claim_diff.py` judges the same claims at two commits (`FIXED`/`STILL`/`NEW`). Voters and budgets in `[claim_vote]` of `contest.ini`; `docs/claim-check/RUNBOOK.md`. Gate 1's own vote is `[gate1] claim_vote` in `agents.ini`, off by default.
-- `docs/kilo-contest/RUN-THE-KILO-CONTEST.md` — the contest's operator runbook: stage R (`scripts/contest_reset.sh`), the RUN stage, reading the gate's `decisions.jsonl`, the hand-over to the epic runbook's stages 3–5, and the first round on record.
+
+`python` is not on PATH — use `python3`.
 
 ## Coding Style & Naming Conventions
 
@@ -46,10 +44,9 @@ in the test's own process needs no group. Name files
 `tests/test_<area>_<feature>.py` and add a one-line docstring. New feature tests go in
 `tests/` and must be tiered via `scripts/sync_test_tiers.py`.
 
-## Commit & Pull Request Guidelines
+## Commits
 
 Commit subjects are terse and prefixed by ticket (`GATE1-LEARN-2: …`, `RUN-3: …`),
-describing the behavior change, not the file touched. Keep one concern per commit.
-Pull requests should state the ticket, the behavior before/after, the exact test
-command run, and link the relevant `epic-tasks/*.md` entry; include logs or
-screenshots for run-output changes.
+describing the behavior change, not the file touched. A ticket or a contest round's
+prompt that says otherwise wins over this page: a round wants exactly one commit,
+touching only the files its ticket names.
