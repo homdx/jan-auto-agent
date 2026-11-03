@@ -110,6 +110,8 @@ QUOTA_PHRASES = (
     # Round 145: an empty wallet ended as session.error instead of provider_quota.
     "wallet balance",
     "recharge",
+    # Round 330: apinex's daily free allowance ended as session.error instead of provider_quota.
+    "allowance reached",
 )
 QUOTA_DEFAULT = " | ".join(QUOTA_PHRASES)
 
@@ -123,6 +125,7 @@ QUOTA_TEXTS = (
     "generativelanguage.googleapis.com/generate_content_free_tier_requests",
     "insufficient_quota",
     "You exceeded your current quota. Please check your plan and billing details.",
+    "[APINEX] Daily free token allowance reached.",
 )
 
 #: Not quotas: the bynara 503 (also an exhausted plan on 2026-09-25) and KC-19's transients, which keep their retry path.
