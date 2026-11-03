@@ -1972,10 +1972,13 @@ their own, so read them before you start:
 """
 
 
-def _house_repo(ticket_path, base_sha: str) -> bool:
+def _house_repo(ticket_path, base_sha: str, repo=None) -> bool:
     """True when the round's repo carries `BRIDGE` at *base_sha*, i.e. it is jan-auto-agent itself.
 
-    Read off the ticket's own checkout. Fail-open to True: anything unreadable
+    Read off the ticket's own checkout, unless *repo* is given — then off the
+    agent's own checkout. A ticket copied outside the repo says nothing about the
+    repo, so a caller that has the agent's checkout passes it; a caller that
+    does not gets today's behaviour. Fail-open to True: anything unreadable
     keeps the prompt as it always was.
     """
     def present(obj: str) -> bool:
@@ -1983,7 +1986,7 @@ def _house_repo(ticket_path, base_sha: str) -> bool:
                               text=True, timeout=30).returncode == 0
 
     try:
-        cwd = Path(ticket_path).resolve().parent
+        cwd = Path(repo).resolve() if repo is not None else Path(ticket_path).resolve().parent
         # A base git cannot read (no repo, an unknown sha) is not proof of an external repo.
         return not present(f"{base_sha}^{{commit}}") or present(f"{base_sha}:{BRIDGE}")
     except (OSError, TypeError, ValueError, subprocess.SubprocessError):
@@ -2057,12 +2060,16 @@ def _scratch_note(agent_name: str, tmp_roots, tmp_dir: str = "") -> str:
 
 
 def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: str = "",
-                 tmp_dir: str = "", tmp_roots=(), leg_note: str = "") -> str:
+                 tmp_dir: str = "", tmp_roots=(), leg_note: str = "", repo=None) -> str:
     """The runbook's prompt for *agent_name*, plus the base sha and the permission rule.
 
     The ticket is not repeated: the session reads it from its own worktree via
     `next_task.py`; *ticket_path* only tells jan-auto-agent's own rounds from an
     external --target, whose prompt carries no `CollectBridge`/ini rules (GYRO-01).
+    A ticket copied outside the repo says nothing about the repo, so *repo* lets a
+    caller that has the agent's checkout pass it to `_house_repo`; without it the
+    repo is read off the ticket's folder, as today. Every existing caller passes
+    none and gets the unchanged text.
     When *tmp_dir* is non-empty (KC-59), the sentence that names the agent's own
     scratch dir is appended first; when *dirty* is non-empty (a `--resume` into a
     worktree that still holds uncommitted work, KC-22), the `continue_message`
@@ -2075,7 +2082,7 @@ def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: st
     paragraph: `leg_message`'s account of the relay so far and the instruction to
     continue. Every existing caller passes none of them and gets the unchanged text.
     """
-    house = _house_repo(ticket_path, base_sha)
+    house = _house_repo(ticket_path, base_sha, repo=repo)
     text = _PROMPT.format(name=agent_name, base_sha=base_sha,
                           rules=_HOUSE_RULES if house else _TARGET_RULES,
                           status_example=" (the original 24 used `68b78a0`)" if house else "",
@@ -4249,7 +4256,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         run.turns.append(turn)
         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
         prompt = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
-                              tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
+                              tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots), repo=ws.path)
         continue_text = (note + "\n\n" + prompt) if note else prompt
         run.continues += 1
         return None
@@ -4379,7 +4386,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 return failed
             summary = turn.pop("summary_text", "") or "(the previous session wrote no summary)"
             continue_text = (round_prompt(spec.name, ticket_path, ws.base_sha,
-                                          tmp_dir=scratch_arg)
+                                          tmp_dir=scratch_arg, repo=ws.path)
                              + "\n\n" + CONTEXT_CONTINUE_NOTE.format(summary=summary)
                              + _carry_note())
         run.continues += 1
@@ -5157,11 +5164,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     # The worktree may hold work from before a --resume; the fresh session is told (KC-22).
                     text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
                                         tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots),
-                                        leg_note=leg_note)
+                                        leg_note=leg_note, repo=ws.path)
                     run.dirty_on_resume = ""  # only the first prompt carries it
                 else:
                     text = round_prompt(spec.name, ticket_path, ws.base_sha, tmp_dir=scratch_arg,
-                                        tmp_roots=tuple(tmp_roots), leg_note=leg_note)
+                                        tmp_roots=tuple(tmp_roots), leg_note=leg_note, repo=ws.path)
                 run.leg_note = ""  # only the first prompt carries it
             turn = {"kind": kind, "attempt": run.attempt, "sent_at": time.time()}
             if kind == "continue":
@@ -5200,7 +5207,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 summary = turn.pop("summary_text", "") or "(the previous session wrote no summary)"
                 carried = _carry_note()
                 text = (round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
-                                      tmp_dir=scratch_arg)
+                                      tmp_dir=scratch_arg, repo=ws.path)
                         + "\n\n" + CONTEXT_CONTINUE_NOTE.format(summary=summary)
                         + carried
                         + "\n\n" + text)
@@ -5301,7 +5308,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                     continue_text = round_prompt(
                         spec.name, ticket_path, ws.base_sha, dirty="",
-                        tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
+                        tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots), repo=ws.path)
                     continue
             if (context_aborted[0] and idle.status == "error"
                     and _is_external_abort(idle.error)):
@@ -5654,7 +5661,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                               {"agent": spec.name, **turn})
                                 continue_text = (round_prompt(
                                     spec.name, ticket_path, ws.base_sha, dirty=dirty,
-                                    tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
+                                    tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots), repo=ws.path)
                                     + _carry_note())
                                 continue
                             continue_text = CUT_OFF_MESSAGE if cut else continue_message(dirty)

@@ -2193,7 +2193,7 @@ def _first_prompt(config: ContestConfig, workspace, ticket_path) -> str:
     scratch_dir = agent_tmp_dir(tmp_roots, workspace.agent)
     return round_prompt(workspace.agent, ticket_path, workspace.base_sha,
                         tmp_dir=str(scratch_dir) if scratch_dir is not None else "",
-                        tmp_roots=tmp_roots)
+                        tmp_roots=tmp_roots, repo=workspace.path)
 
 
 def _dry_run(repo, result: Intake, config: ContestConfig, out_dir: Path, args, *,

@@ -52,3 +52,33 @@ def test_rework_names_shrink_only_when_the_base_has_a_bridge():
     house = Harvest("REWORK", reasons, None, {"shrink": "same"}, 0.0)
     assert "CollectBridge" not in rework_message(external, 1, 2)
     assert "CollectBridge._shrink" in rework_message(house, 1, 2)
+
+
+def test_ticket_copied_out_of_the_repo_is_judged_by_the_checkout(tmp_path):
+    """GYRO-02: a ticket copied outside its repo is judged by the caller's checkout."""
+    repo = tmp_path / "repo"
+    ticket, sha = _repo(repo, with_bridge=False)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    copied = outside / ticket.name
+    copied.write_text(ticket.read_text(encoding="utf-8"), encoding="utf-8")
+    text = round_prompt("a", copied, sha, repo=repo)
+    for house in ("CollectBridge", "agents_128k.ini", "fail-open", "68b78a0"):
+        assert house not in text
+    assert "One local commit." in text and "A test ships with the change" in text
+    # Without repo= the unreadable base fails open to house rules (unchanged).
+    text_no_repo = round_prompt("a", copied, sha)
+    for house in ("CollectBridge", "agents_128k.ini", "68b78a0"):
+        assert house in text_no_repo
+
+
+def test_checkout_with_a_bridge_keeps_house_rules_for_a_copied_ticket(tmp_path):
+    """GYRO-02: a copied ticket judged by a checkout that has BRIDGE keeps house rules."""
+    repo = tmp_path / "repo"
+    ticket, sha = _repo(repo, with_bridge=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    copied = outside / ticket.name
+    copied.write_text(ticket.read_text(encoding="utf-8"), encoding="utf-8")
+    text = round_prompt("a", copied, sha, repo=repo)
+    assert "CollectBridge._shrink" in text and "agents_128k.ini" in text
