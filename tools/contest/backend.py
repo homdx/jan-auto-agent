@@ -1713,6 +1713,8 @@ class _Agent:
                 break
             if line.get("type") == "abort":
                 raise _AgentStopped("aborted")
+            raise _AgentStopped("protocol error: expected permission.reply, got %s"
+                                % line.get("type"))
         return reply, message
 
     # ── the model ───────────────────────────────────────────────────────────

@@ -443,8 +443,8 @@ class LLMGate2Validator:
                 if found:
                     block = next(iter(found.values())).get("code", "")[:budget_per]
                     parts.append(f"### {sym}\n{block}")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("search fetch failed for %s: %s", sym, exc)
         return "\n\n".join(parts)
 
     def _language_directive(self, coder_result, base_dir) -> str:

@@ -270,8 +270,8 @@ class ExhaustionHandler:
         exist — degrading gracefully instead of losing the whole BLOCKED
         transition over a ticket-write failure.
         """
-        ts = make_ticket_store(self._state.agent_dir)
         try:
+            ts = make_ticket_store(self._state.agent_dir)
             # make_ticket() runs inside the try, so a malformed field cannot escape the last-resort handler.
             ticket = make_ticket(
                 id=ticket_id,
@@ -285,6 +285,7 @@ class ExhaustionHandler:
                 logger.debug("_open_ticket: %s already exists — skipping create", ticket_id)
             else:
                 ts.create(ticket)
+            return ts.path(ticket_id)
         except (OSError, TicketError) as exc:
             logger.error(
                 "ExhaustionHandler: failed to create ticket %s for task %s — %s "
@@ -292,7 +293,7 @@ class ExhaustionHandler:
                 "itself is missing/incomplete)",
                 ticket_id, linked_task, exc,
             )
-        return ts.path(ticket_id)
+            return Path(self._state.agent_dir) / "tickets" / f"{ticket_id}.json"
 
 
 # Factory

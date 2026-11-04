@@ -297,9 +297,13 @@ class _TestRunsLock:
             self._entries.setdefault(key, {})["waiting"] = time.monotonic()
         self._inner.acquire()
         with self._guard:
-            asked = self._entries[key].get("waiting")
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = {}
+                self._entries[key] = entry
+            asked = entry.get("waiting")
             got = time.monotonic()
-            self._entries[key]["running"] = got
+            entry["running"] = got
         return max(0.0, got - (asked if asked is not None else got))
 
     def exit(self, agent: str = "") -> None:
@@ -2636,7 +2640,7 @@ def _turn_deadline(run: AgentRun, config: ContestConfig, working=None) -> _TurnC
     ws, spec = run.workspace, run.agent
     nominal = float(config.turn_timeout_sec or 0)
     cap = float(getattr(config, "turn_max_sec", 0) or 0)
-    ceiling = cap if cap > 0 else nominal
+    ceiling = cap if cap > 0 else float("inf")
 
     def on_deadline(elapsed: float) -> float | None:
         current = _churn(ws)
@@ -2720,6 +2724,8 @@ class _FirstTouch:
         self.ceiling = max(0, int(ceiling))
         #: What this turn's watch did (nudged, dead); the attempt's totals live on the run (KC-42).
         self.nudged = 0
+        #: A session that refused a nudge is not nudged again; the next deadline escalates (332 BUG-3).
+        self.refused = False
         self.dead = False
         self._touched = False
         self._stop = threading.Event()
@@ -2816,11 +2822,14 @@ class _FirstTouch:
         opens does not start over with a full one: a round that asked for one
         nudge gets one nudge, one reset and then `DEAD`, whether that is one
         turn's worth of waiting or two.
+
+        A nudge counts only once it is sent: a refused one spends nothing and
+        queues no idle. The session that refused it is not asked again, so the
+        next deadline goes straight to the reset — without that, a session that
+        refuses every nudge would be nudged forever and never reset or `DEAD`.
         """
         spent = int(getattr(self.run, "first_touch_nudges_used", 0) or 0)
-        if spent < self.nudges:
-            self.run.first_touch_nudges_used = spent + 1
-            self.nudged += 1
+        if spent < self.nudges and not self.refused:
             # Read before the re-arm moves the origin, so each nudge reports its real time into the turn.
             elapsed = self.elapsed()
             self._deadline = time.monotonic() + self.budget
@@ -2828,7 +2837,10 @@ class _FirstTouch:
                       self.spec.name, _age(self.budget), spent + 1, self.nudges)
             try:
                 self._nudge(elapsed)
+                self.run.first_touch_nudges_used = spent + 1
+                self.nudged += 1
             except Exception as exc:  # noqa: BLE001 — a refused nudge is not a reason
+                self.refused = True
                 _log.warning("%s: first-touch nudge: %s: %s", self.spec.name,
                              type(exc).__name__, _brief(str(exc)))
             return not self._stop.is_set()
@@ -4131,7 +4143,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     try:
                         queued = float(_SUITE_SLOTS.acquire(
                             spec.name, ws.path, ceiling=_suite_ceiling(config),
-                            stop=lambda: bool(stalled) or bool(backend.interrupted())))
+                            stop=lambda: bool(stalled) or bool(escalate[0]) or bool(backend.interrupted())))
                     finally:
                         if paused:
                             resume_time_up()
@@ -4383,6 +4395,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                       else f"left {left:.1f}% of {size:,}")
             failed = swap_session(turn)
             if failed:
+                run.turns.append(turn)
+                _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                 return failed
             summary = turn.pop("summary_text", "") or "(the previous session wrote no summary)"
             continue_text = (round_prompt(spec.name, ticket_path, ws.base_sha,
@@ -6229,7 +6243,7 @@ def _leg_cap(count: int, budget: int, ceiling: int) -> int:
     if count <= 0 or budget <= 0:
         return 0
     if count <= ceiling:
-        return count if 1 + count <= budget else max(0, budget - 1)
+        return count if 1 + count <= budget else max(0, budget - 2)
     return ceiling if 2 + ceiling <= budget else max(0, budget - 2)
 
 

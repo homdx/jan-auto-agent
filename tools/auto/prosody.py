@@ -376,11 +376,13 @@ def analyze_ru(text: str, *, syllable_tolerance: int = 2) -> ProsodyReport:
     syllable_regular = True
     ref = stanza_infos[0].syllables
     for info in stanza_infos[1:]:
+        if len(info.syllables) != len(ref):
+            syllable_regular = False
+            break
         for pos, count in enumerate(info.syllables):
-            if pos < len(ref):
-                if abs(count - ref[pos]) > syllable_tolerance:
-                    syllable_regular = False
-                    break
+            if abs(count - ref[pos]) > syllable_tolerance:
+                syllable_regular = False
+                break
         if not syllable_regular:
             break
 
@@ -534,8 +536,15 @@ def _check_prosody_inner(
     if require_rhythm and not report.syllable_regular:
         ref = report.stanzas[0].syllables
         for info in report.stanzas[1:]:
+            if len(info.syllables) != len(ref):
+                reason = (
+                    f"stanza {info.index} has {len(info.syllables)} lines "
+                    f"vs {len(ref)} in stanza 1; "
+                    f"keep stanzas the same length"
+                )
+                return ProsodyVerdict(approved=False, reason=reason)
             for pos, count in enumerate(info.syllables):
-                if pos < len(ref) and abs(count - ref[pos]) > syllable_tolerance:
+                if abs(count - ref[pos]) > syllable_tolerance:
                     reason = (
                         f"line {pos + 1}: {count} syllables in stanza {info.index} "
                         f"vs {ref[pos]} in stanza 1; "
