@@ -108,9 +108,13 @@ class PromptStore:
             return _get_hardcoded(agent_name)
         current_version = entry.get("current_version", len(stack))
         # Find the entry matching current_version; fall back to top of stack.
-        for item in reversed(stack):
-            if item.get("version") == current_version:
-                return item["prompt"]
+        # 333-F9: an explicit `current_version: null` is a missing value, not a
+        # version: without the guard, `item.get("version") == None` matches the
+        # first record that lacks a version instead of the stack top.
+        if current_version is not None:
+            for item in reversed(stack):
+                if item.get("version") == current_version:
+                    return item["prompt"]
         return stack[-1]["prompt"]
 
     def get_store_summary(self, agent_names: list) -> str:
@@ -138,11 +142,18 @@ class PromptStore:
             # Current version label + score
             if stack:
                 current_version = entry.get("current_version", stack[-1].get("version"))
-                current = next(
-                    (item for item in reversed(stack)
-                     if isinstance(item, dict) and item.get("version") == current_version),
-                    stack[-1],
-                )
+                # 333-F9: an explicit `current_version: null` is a missing value, not a
+                # version (the same guard `get_version_label` already carries): without
+                # it, `item.get("version") == None` matches the first record that lacks
+                # a version (a HARDEN-1 A3 record) instead of the stack top.
+                if current_version is not None:
+                    current = next(
+                        (item for item in reversed(stack)
+                         if isinstance(item, dict) and item.get("version") == current_version),
+                        stack[-1],
+                    )
+                else:
+                    current = stack[-1]
                 label = _version_label(current)
                 score = current.get("score") if isinstance(current, dict) else None
                 score_str = f"(score {score:.2f})" if isinstance(score, (int, float)) else "(no score)"

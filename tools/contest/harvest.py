@@ -45,6 +45,7 @@ from typing import Literal
 from tools.contest.gates import (
     BRIDGE,
     DEADLINE_COMMIT_EMAIL,
+    GIT_TIMEOUT_S,
     declared_files,
     git,
     judge_worktree,
@@ -249,9 +250,10 @@ def _status_lines(ws: Workspace) -> list[str]:
     never a raise.
     """
     try:
+        # 333-F1: bounded — a hung git reads as "no status", the way an OSError already does.
         r = run_git(["git", "--no-optional-locks", "status", "--porcelain",
-                     "--untracked-files=all"], cwd=str(ws.path))
-    except OSError:
+                     "--untracked-files=all"], cwd=str(ws.path), timeout=GIT_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
         return []
     if r.returncode:
         return []
@@ -289,11 +291,12 @@ def _commit_worktree(ws: Workspace, commit: str) -> tuple[str | None, str | None
         return None, None, f"no temp directory for the checkout: {exc}"
     target = os.path.join(parent, "commit")
     try:
+        # 333-F1: bounded — a timeout is read like any other git failure below (no checkout, no roots).
         r = run_git(["git", "worktree", "add", "-q", "--detach", target, commit],
-                    cwd=str(ws.path))
+                    cwd=str(ws.path), timeout=GIT_TIMEOUT_S)
         error = "" if r.returncode == 0 and os.path.isdir(target) else (
             (r.stderr or r.stdout or "").strip() or f"exit {r.returncode}")
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         error = str(exc)
     if error:
         _drop_worktree(ws, parent)
@@ -315,15 +318,17 @@ def _drop_worktree(ws: Workspace, parent: str | None) -> None:
         return
     removed = False
     try:
+        # 333-F1: bounded — a timed-out remove is a failed remove; the prune below then runs.
         removed = run_git(["git", "worktree", "remove", "--force",
-                           os.path.join(parent, "commit")], cwd=str(ws.path)).returncode == 0
-    except OSError:
+                           os.path.join(parent, "commit")],
+                          cwd=str(ws.path), timeout=GIT_TIMEOUT_S).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
         pass
     shutil.rmtree(parent, ignore_errors=True)
     if not removed:
         try:
-            run_git(["git", "worktree", "prune"], cwd=str(ws.path))
-        except OSError:
+            run_git(["git", "worktree", "prune"], cwd=str(ws.path), timeout=GIT_TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired):
             pass
 
 

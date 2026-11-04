@@ -64,6 +64,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SHARED_SANDBOX = REPO_ROOT / "examples" / "hello-world"
+#: 333-F1: a generous bound for the git reads below — the same bound the contest's
+#: git calls carry (AUDIT3-17, `GIT_TIMEOUT_S` in `tools/contest/gates.py`).
+GIT_TIMEOUT_S = 300
 
 TASKS = (1, 2, 3, 4)
 TASK_SKILL = {
@@ -131,10 +134,16 @@ def _read(path: Path) -> str:
 
 def _baseline(name: str) -> str:
     """The committed baseline for *name*, read from git rather than assumed."""
-    result = subprocess.run(
-        ["git", "show", f"HEAD:examples/hello-world/{name}"],
-        cwd=str(REPO_ROOT), capture_output=True, text=True,
-    )
+    try:
+        # 333-F1: bounded — a hung git is "no baseline" (""), the way a non-zero
+        # exit already was, never a check that never ends.
+        result = subprocess.run(
+            ["git", "show", f"HEAD:examples/hello-world/{name}"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+            timeout=GIT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return ""
     return result.stdout if result.returncode == 0 else ""
 
 

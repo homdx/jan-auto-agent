@@ -98,9 +98,17 @@ def git(cwd, *args, check=False):
 
 
 def extract_shrink(cwd, rev):
-    """The text of `def _shrink` at *rev*, or None if the file/def is absent."""
-    src = subprocess.run(["git", "show", f"{rev}:{BRIDGE}"], cwd=cwd,
-                         capture_output=True, text=True, errors="replace")
+    """The text of `def _shrink` at *rev*, or None if the file/def is absent.
+
+    333-F1: the read carries GIT_TIMEOUT_S — a hung git reads as "git could not
+    answer" (None), the way `git` in this module already does, instead of
+    holding the harvest forever."""
+    try:
+        src = subprocess.run(["git", "show", f"{rev}:{BRIDGE}"], cwd=cwd,
+                             capture_output=True, text=True, errors="replace",
+                             timeout=GIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return None
     if src.returncode:
         return None
     lines = src.stdout.splitlines()
@@ -565,9 +573,14 @@ def judge_worktree(name, path, base, declared, want_tests):
     shipped = 0
     for f in tests:
         # The scorecard counts test lines as text, so a non-UTF-8 byte cannot crash harvest.
-        blob = subprocess.run(["git", "show", f"HEAD:{f}"], cwd=path,
-                              capture_output=True, text=True, errors="replace")
-        if blob.returncode == 0:
+        # 333-F1: bounded — a timeout is "git could not answer", and the test does not count.
+        try:
+            blob = subprocess.run(["git", "show", f"HEAD:{f}"], cwd=path,
+                                  capture_output=True, text=True, errors="replace",
+                                  timeout=GIT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            blob = None
+        if blob is not None and blob.returncode == 0:
             # A test file counts as shipped only when it exists in the scored
             # commit — added or modified there, never deleted. A rename's old
             # side is gone from HEAD and does not count; its destination does.

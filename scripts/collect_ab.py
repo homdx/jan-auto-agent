@@ -105,6 +105,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+#: 333-F1: a generous bound for the git calls below — the same bound the contest's
+#: git calls carry (AUDIT3-17, `GIT_TIMEOUT_S` in `tools/contest/gates.py`).
+GIT_TIMEOUT_S = 300
 
 # The block under test: must match context_assembler._COLLECT_HEADER byte for byte.
 COLLECT_HEADER = "COLLECT MODEL (static facts, do not contradict):"
@@ -832,8 +835,10 @@ def clone_tree(src: os.PathLike, dst: os.PathLike) -> None:
     if dst.exists():
         shutil.rmtree(dst)
     if (src / ".git").exists():
+        # 333-F1: bounded — a hung clone (stuck remote, dead mount) is a loud
+        # operator failure (check=True already is one), not a run that never ends.
         subprocess.run(["git", "clone", "--quiet", "--shared", str(src), str(dst)],
-                       check=True, capture_output=True, text=True)
+                       check=True, capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
         if (src / ".collect").is_dir() and not (dst / ".collect").is_dir():
             shutil.copytree(src / ".collect", dst / ".collect")
     else:

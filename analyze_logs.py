@@ -576,7 +576,12 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
         # Gate-1 rejection (pre-execution filter)
         elif kind == "rejected":
             g1_key = f"gate1:{params.get('title', '?')}"
-            run["tasks"].setdefault(g1_key, {
+            # 333-F8: `setdefault` returns the existing record unchanged, so a
+            # second rejected event with a matching title was dropped and the
+            # "Gate-1 rejected: N tasks" summary understated the filter. The
+            # counter is incremented on the record instead: one event is one
+            # rejection, duplicate titles included.
+            g1_rec = run["tasks"].setdefault(g1_key, {
                 "task_id":    g1_key,
                 "title":      params.get("title", "?"),
                 "start_ts":   ts,
@@ -584,10 +589,11 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "status":     "GATE1_REJECTED",
                 "iterations": 0,
                 "approved":   0,
-                "rejected":   1,
+                "rejected":   0,
                 "reason":     params.get("reason", ""),
                 "commit":     None,
             })
+            g1_rec["rejected"] = g1_rec.get("rejected", 0) + 1
 
         # AUTO-CR-27: inner-loop gate decisions (kind=decision, target inner_loop); stages are read generically by the stage field.
         elif kind == "decision" and tgt == "inner_loop":
@@ -624,8 +630,11 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
 
                 # "overall" is the authoritative attempt-level outcome.
                 if stage == "overall":
+                    # 333-F6: a hand-edited or truncated trace may carry a non-integer
+                    # attempt; read it the way every other param here is read — as the
+                    # default, not as a ValueError out of the whole analysis.
                     target_task["iterations"] = max(
-                        target_task.get("iterations", 0), int(attempt)
+                        target_task.get("iterations", 0), _int_or(attempt, 0)
                     )
                     if verdict == "APPROVED":
                         target_task["approved"] = target_task.get("approved", 0) + 1
@@ -741,7 +750,9 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
         elif kind == "probe_config":
             run["probe_config"] = {
                 "ts":              ts,
-                "usable":          str(params.get("usable", "False")) == "True",
+                # 333-F7: through `_flag`, the way the other bool params in this file are
+                # read — "true"/"1"/"yes" are not "False".
+                "usable":          _flag(params.get("usable", "False")),
                 "reason":          str(params.get("reason", "?")),
                 "max_rounds":      int(params.get("max_rounds", 0) or 0),
                 "max_total_chars": int(params.get("max_total_chars", 0) or 0),
@@ -785,7 +796,8 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "cluster": params.get("cluster", "?"),
                 "step":    _int_or(params.get("step"), 0),
                 "new_cap": _int_or(params.get("new_cap"), 0),
-                "seeded":  str(params.get("seeded", "False")) == "True",
+                # 333-F7: through `_flag`, the seeded twin of the probe_config "usable" above.
+                "seeded":  _flag(params.get("seeded", "False")),
             })
 
         # ── auto-tuner prompt rewrite outcomes (score, promoted or denied) ──
@@ -1127,7 +1139,10 @@ def render_run_summary(run: dict) -> None:
           f"blocked={red(str(len(blocked_tasks)))}  "
           f"other={str(len(other_tasks))}")
     if gate1r:
-        print(f"  {bold('Gate-1 rejected')}: {yellow(str(len(gate1r)))} tasks filtered before execution")
+        # 333-F8: count the rejected EVENTS, not the distinct records — duplicate titles
+        # share one record, and its counter holds the multiplicity (one event, one rejection).
+        _n_gate1_rejected = sum(t.get("rejected", 0) for t in gate1r.values())
+        print(f"  {bold('Gate-1 rejected')}: {yellow(str(_n_gate1_rejected))} tasks filtered before execution")
     print(f"  {bold('Iterations')}:      total={bold(str(total_iters))}  "
           f"approved={green(str(total_approved))}  "
           f"rejected={red(str(total_rejected))}")

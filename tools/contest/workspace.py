@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from tools.contest.gates import GIT_TIMEOUT_S
 from tools.contest.roster import ContestConfig
 from tools.git_run import run_git
 
@@ -160,8 +161,17 @@ def _git(cwd: Path, args: list[str], *, check: bool = True) -> subprocess.Comple
     for it instead of taking the first 128 as final (FL-2) — in a round of N
     agents against one repository a collision here used to cost an agent its
     workspace before the round even started.
+
+    333-F1: every call carries ``GIT_TIMEOUT_S``; a hung git is a
+    ``WorkspaceError`` (the module's one "git cannot answer" exception) rather
+    than a round that never ends.
     """
-    proc = run_git(["git", "-C", str(cwd), *args])
+    try:
+        proc = run_git(["git", "-C", str(cwd), *args], timeout=GIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise WorkspaceError(
+            f"git {' '.join(args)} in {cwd} timed out after {exc.timeout:g} s"
+        ) from exc
     if check and proc.returncode != 0:
         raise WorkspaceError(
             f"git {' '.join(args)} in {cwd} failed ({proc.returncode}): "

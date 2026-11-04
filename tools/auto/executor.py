@@ -116,6 +116,11 @@ _MIRROR_IGNORE = shutil.ignore_patterns(
 #: not the executor's, so it is never a candidate.
 _WORKSPACE_REGISTRY = ".agent-workspaces.json"
 
+#: 333-F2: a Windows absolute path (`C:\repo\...`, `C:/repo/...`, `\\srv\share\...`) —
+#: invisible to the Unix-style checks (`no '/'`, `not startswith("/")`) that
+#: `_read_workspace_registry` uses to recognise an old-format registry of simple names.
+_WIN_ABS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
 
 # Result dataclass
 
@@ -550,7 +555,17 @@ class Executor:
         # Backward compat: if the list contains simple names (no '/' and not
         # an absolute path), treat it as an old-format registry and return
         # empty set so nothing is pruned until new workspaces are recorded.
-        if data and all(isinstance(x, str) and not '/' in x and not x.startswith("/") for x in data):
+        # 333-F2: a Windows path ("C:\\repo\\.agent\\workspace\\T1") has no '/' and does
+        # not start with one either, but _mark_workspace stores
+        # str(workspace.resolve()) — on Windows that is a drive or UNC path. Read
+        # it as the absolute mark it is, not as an old-format name: a registry of
+        # such paths read as "old format" prunes nothing and the per-task
+        # mirrors accumulate unbounded.
+        if data and all(
+            isinstance(x, str) and not '/' in x and not x.startswith("/")
+            and not _WIN_ABS_PATH_RE.match(x)
+            for x in data
+        ):
             return set()
         return {str(x) for x in data if isinstance(x, str)}
 

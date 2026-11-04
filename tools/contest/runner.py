@@ -220,7 +220,7 @@ from tools.contest import context_memory
 from tools.contest.backend import (ContestBackend, ContestBackendError, KiloLimitKept,
                                   KiloLimitRefused, KiloTapReconnectError,
                                   drop_stale_kilo_file)
-from tools.contest.gates import BRIDGE, DEADLINE_COMMIT_EMAIL, declared_files, git
+from tools.contest.gates import BRIDGE, DEADLINE_COMMIT_EMAIL, GIT_TIMEOUT_S, declared_files, git
 from tools.contest.harvest import harvest, rework_message
 from tools.contest.kilo_client import (
     AGENT_TEST_TIMEOUT_MS,
@@ -2158,8 +2158,9 @@ def _dirty_tree(ws: Workspace) -> str:
     """
     try:
         # --no-optional-locks: status only reads, so it never takes the index lock an agent may need.
+        # 333-F1: bounded — a timeout is a read error, the way a failed status already is.
         r = run_git(["git", "--no-optional-locks", "status", "--porcelain",
-                     "--untracked-files=all"], cwd=ws.path)
+                     "--untracked-files=all"], cwd=ws.path, timeout=GIT_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError) as exc:
         raise TreeReadError(f"git status in {ws.path} did not run: {exc}") from exc
     if r.returncode != 0:
@@ -2202,11 +2203,13 @@ def _diff_signature(ws: Workspace) -> str:
     not be read must never look like the repeat that opens a new session.
     """
     try:
-        staged = run_git(["git", "add", "-A", "-N"], cwd=ws.path)
+        # 333-F1: bounded — a timeout is "cannot compare" (""), the way a failed git already is.
+        staged = run_git(["git", "add", "-A", "-N"], cwd=ws.path, timeout=GIT_TIMEOUT_S)
         if staged.returncode != 0:
             # Untracked files would be missing from the diff, so such a diff is never a repeat.
             return ""
-        diff = run_git(["git", "diff", "HEAD", "--no-color", "--", ":!runs"], cwd=ws.path)
+        diff = run_git(["git", "diff", "HEAD", "--no-color", "--", ":!runs"], cwd=ws.path,
+                       timeout=GIT_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return ""
     if diff.returncode != 0:
@@ -2382,12 +2385,13 @@ def _deadline_commit(ws: Workspace, *, reason: str, ticket=None) -> str | None:
     body = _deadline_body(reason, who, name)
     try:
         # runs/ is added with the rest and removed from the index after, since git add fails on ignored paths (round 48).
-        add = run_git(["git", "add", "-A"], cwd=ws.path)
+        # 333-F1: bounded — a timeout is a "did not run" refusal (None), like any other failure below.
+        add = run_git(["git", "add", "-A"], cwd=ws.path, timeout=GIT_TIMEOUT_S)
         if add.returncode != 0:
             _log.warning("%s: git add for the deadline commit exited %d: %s",
                          who, add.returncode, _brief(add.stderr or add.stdout))
             return None
-        unstage = run_git(["git", "reset", "-q", "--", "runs"], cwd=ws.path)
+        unstage = run_git(["git", "reset", "-q", "--", "runs"], cwd=ws.path, timeout=GIT_TIMEOUT_S)
         if unstage.returncode != 0:
             _log.warning("%s: could not keep runs/ out of the deadline commit (exit %d): %s",
                          who, unstage.returncode, _brief(unstage.stderr or unstage.stdout))
@@ -2398,7 +2402,7 @@ def _deadline_commit(ws: Workspace, *, reason: str, ticket=None) -> str | None:
                           "-c", "commit.gpgsign=false",
                           "commit", "-q", "--no-verify",
                           "-m", subject, "-m", body],
-                         cwd=ws.path)
+                         cwd=ws.path, timeout=GIT_TIMEOUT_S)
         if commit.returncode != 0:
             _log.warning("%s: the deadline commit exited %d: %s",
                          who, commit.returncode, _brief(commit.stderr or commit.stdout))

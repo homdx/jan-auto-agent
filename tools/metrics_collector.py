@@ -121,10 +121,17 @@ class MetricsCollector:
                         if fsync_due:
                             os.fsync(f.fileno())
                             self._last_fsync_monotonic = now
+                    # 333-F3: the rename is in the guard too — a failed os.replace
+                    # (ENOSPC on the target directory, a target race) unlinks the
+                    # temp file instead of leaving a .metrics_tmp_*.json orphan
+                    # for the outer handler to log past.
+                    os.replace(tmp_path, self.metrics_path)
                 except Exception:
-                    os.unlink(tmp_path)
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
                     raise
-                os.replace(tmp_path, self.metrics_path)
                 self._cache = records
                 self._cache_items = items
                 try:

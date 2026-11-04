@@ -80,6 +80,9 @@ VOTE_SKIPPED = re.compile(r"Gate 1 vote: .*?, skipped (\d+)")
 #: contest.ini's section of this script
 INI_SECTION = "gate1_layer2"
 DEFAULT_OFF_RUNS = 2
+#: 333-F1: a generous bound for the clone/checkout git calls below — the same bound the
+#: contest's git calls carry (AUDIT3-17, `GIT_TIMEOUT_S` in `tools/contest/gates.py`).
+GIT_TIMEOUT_S = 300
 #: The line Gate 1 prints at the start of a run; a stale line names why in parentheses (CC-13).
 COLLECT_LINE = re.compile(r"collect: (fresh|stale(?: \([^)]*\))?|present|absent)"
                           r" — reader: (used|not used), vote pack: (used|not used)")
@@ -204,8 +207,9 @@ def build_ini(dest: Path, local: configparser.ConfigParser, base_ini: Path, mode
 
 
 def prepare_target(work: Path, repo: Path, sha: str, plan: Path) -> None:
-    subprocess.run(["git", "clone", "-q", str(repo), str(work)], check=True)
-    subprocess.run(["git", "-C", str(work), "checkout", "-q", sha], check=True)
+    # 333-F1: bounded — a hung clone is a traceback the operator reads, not a script that never ends.
+    subprocess.run(["git", "clone", "-q", str(repo), str(work)], check=True, timeout=GIT_TIMEOUT_S)
+    subprocess.run(["git", "-C", str(work), "checkout", "-q", sha], check=True, timeout=GIT_TIMEOUT_S)
     (work / ".agent").mkdir(exist_ok=True)
     shutil.copy(plan, work / ".agent" / "plan.json")
 
@@ -337,8 +341,9 @@ def check_and_install(artifact_dir: Path, repo: Path, sha: str, scratch: Path,
         cfg = _cp.ConfigParser(inline_comment_prefixes=(";", "#"))
         cfg.read(ini, encoding="utf-8-sig")
     try:
-        subprocess.run(["git", "clone", "-q", str(repo), str(work)], check=True)
-        subprocess.run(["git", "-C", str(work), "checkout", "-q", sha], check=True)
+        # 333-F1: bounded — a hung clone is a failure the operator reads, not a preflight that never ends.
+        subprocess.run(["git", "clone", "-q", str(repo), str(work)], check=True, timeout=GIT_TIMEOUT_S)
+        subprocess.run(["git", "-C", str(work), "checkout", "-q", sha], check=True, timeout=GIT_TIMEOUT_S)
         problem = check_collect(artifact_dir, work, cfg)
         if problem or ini is None:
             return problem

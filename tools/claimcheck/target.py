@@ -136,6 +136,10 @@ _GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIREC
                  "GIT_EXTERNAL_DIFF")
 #: seconds one `view().git(...)` call may take (CC-4: a hung git is a note, not a hang)
 VIEW_GIT_TIMEOUT = 20.0
+#: 333-F1: the bound for every non-view git call — the same generous bound the contest's
+#: git calls carry (`GIT_TIMEOUT_S` in `tools/contest/gates.py`, AUDIT3-17). A hung
+#: `worktree add` / `rev-parse` / `status` is a `TargetError` from below, never a hang.
+GIT_TIMEOUT_S = 300.0
 #: no hook of the operator's repository runs in a tree we make (`post-checkout`), no gc.
 _SAFE_C = ("-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0", "-c", "core.fsmonitor=false")
 
@@ -153,13 +157,17 @@ def _run_git(cwd: Optional[Path], *args: str, view: bool = False) -> subprocess.
 
     *view*: a read for evidence — the operator's global and system config are not read
     (`color.ui=always`, `diff.noprefix` changed what a voter is shown) and the call is
-    killed after `VIEW_GIT_TIMEOUT` seconds."""
+    killed after `VIEW_GIT_TIMEOUT` seconds. A non-view call (a tree we make: a
+    `worktree add`, a `rev-parse` of a ref) carries `GIT_TIMEOUT_S` instead of none
+    (333-F1): a hung git is a `TargetError`, the way every other git failure in this
+    module is — a claim-check that never ends is no answer."""
     env = _env()
     if view:
         env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
     try:
         proc = subprocess.run(["git", *_SAFE_C, *args], cwd=None if cwd is None else str(cwd),
-                              capture_output=True, env=env, timeout=VIEW_GIT_TIMEOUT if view else None)
+                              capture_output=True, env=env,
+                              timeout=VIEW_GIT_TIMEOUT if view else GIT_TIMEOUT_S)
     except subprocess.TimeoutExpired as err:
         raise TargetError(f"git {' '.join(args)}: timed out after {err.timeout:g} s") from err
     except OSError as err:
@@ -240,7 +248,12 @@ class _Lock:
         """Move the stale lock *seen* aside and delete it. Two waiters that both judged the dead
         lock stale: the first breaks it and takes a new one, and the second's rename used to move
         that NEW, live lock aside and delete it — both then held "the" lock. What was moved is
-        checked against what was judged, and a lock that is not the one judged is put back."""
+        checked against what was judged, and a lock that is not the one judged is put back.
+        333-F4: when the put-back fails (a third waiter is already on the path, or the parking
+        moved a live lock the judgment misread as dead) the parked lock is NOT deleted on the
+        way out: ownership is re-verified first, and a live owner keeps it. Two processes that
+        both believe they hold the lock may then `worktree add` the same tree at once — a
+        spurious `TargetError`, not a corrupted one — but no live lock's ground is taken from it."""
         aside = self.path.with_name(f"{self.path.name}.stale-{uuid.uuid4().hex[:8]}")
         try:
             self.path.rename(aside)
@@ -256,6 +269,14 @@ class _Lock:
                 return
             except OSError:
                 pass                        # a third lock is there already: this one cannot go back
+        # Re-verify ownership before the delete: while the lock sat at `aside` a third waiter
+        # may have taken the path, and the parked copy may hold a live owner's record.
+        try:
+            now = (aside / "owner").read_text(encoding="utf-8")
+        except OSError:
+            now = None
+        if now != moved or not _owner_gone(now):
+            return
         shutil.rmtree(aside, ignore_errors=True)
 
     def __exit__(self, *exc) -> None:
@@ -285,6 +306,21 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _owner_gone(owner: "str | None") -> bool:
+    """Whether the lock whose owner record is *owner* can no longer be held: no record, or a
+    record whose pid is not alive on this host (the same liveness rule `_stale` judges by —
+    an owner behind a pid this host cannot see is invisible to it, the way `_stale` already
+    misjudged). A live owner's token is always ``<pid>-<uuid>`` (written at line 216), so an
+    unparseable token is not a live claim. 333-F4: the re-verification `_break` does before
+    deleting a parked lock — a live owner keeps it."""
+    if owner is None:
+        return True
+    pid = _token_pid(owner)
+    if pid is None:
+        return True
+    return not _pid_alive(pid)
 
 
 # ── the view ──────────────────────────────────────────────────────────────────

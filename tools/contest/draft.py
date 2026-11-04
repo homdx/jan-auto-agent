@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tools.collect.cli import action_collect
+from tools.contest.gates import GIT_TIMEOUT_S
 from tools.git_run import run_git
 from tools.llm_stream import (
     build_chat_request,
@@ -1080,7 +1081,8 @@ def _git(repo, *args) -> tuple:
     refusal the operator can read, not an exception in the draft.
     """
     try:
-        proc = run_git(("git", *args), cwd=str(repo))
+        # 333-F1: bounded — a hung git comes back as the "could not be run" refusal below.
+        proc = run_git(("git", *args), cwd=str(repo), timeout=GIT_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
         return 1, "", "git could not be run"
     return proc.returncode, proc.stdout or "", proc.stderr or ""

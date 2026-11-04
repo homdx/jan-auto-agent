@@ -243,7 +243,7 @@ def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # Real analyze_logs.py site: the guard/access pair must be recorded exactly once (the line pin is updated as the file grows).
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1695", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1710", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 

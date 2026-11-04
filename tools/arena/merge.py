@@ -437,9 +437,15 @@ def _cached_paths(repo: Path) -> list[str]:
 
     `--no-renames` keeps a rename's deletion visible, so the source and the
     destination land in the commit together.
-    """
+
+    333-F5: `strip=False`, the way this module's other `-z` readers
+    (`status_paths` / `ls_tree_names`) already read: `-z` turns quoting off, so a
+    path with a leading space comes out as `" x.py\\0…"`, and `git()`'s default
+    whole-output `strip()` eats exactly that first path's leading space — the
+    later `commit -- <path>` would then name the wrong path."""
     return [part for part in
-            git(repo, "diff", "--cached", "--name-only", "--no-renames", "-z").split("\x00")
+            git(repo, "diff", "--cached", "--name-only", "--no-renames", "-z",
+                strip=False).split("\x00")
             if part]
 
 
