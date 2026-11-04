@@ -396,6 +396,17 @@ def _validate_candidate_placeholders(candidate: str) -> Optional[str]:
         if head == "" or head.isdigit():
             return f"positional placeholder {{{field}}} — only named placeholders are filled"
 
+    # `{iteration[0]}` (an int) and `{imports[x]}` (a list) parse fine and name a known
+    # field, but raise TypeError on every real call. A trial format with values of the real
+    # types catches indexing, attribute and format-spec mistakes the parse above cannot see.
+    try:
+        candidate.format(
+            task="task", iteration=1, max_iter=3, target_block="block",
+            imports=["import os"], related_code="{}", missing_refs=["ref"],
+        )
+    except (KeyError, ValueError, IndexError, AttributeError, TypeError) as exc:
+        return f"candidate fails a trial format(): {type(exc).__name__}: {exc}"
+
     return None
 
 

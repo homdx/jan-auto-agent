@@ -43,6 +43,30 @@ _PROSE_WORDS = frozenset((
 _PROSE_WORD_RE = re.compile(r"\b(?:" + "|".join(sorted(_PROSE_WORDS, key=len, reverse=True)) + r")\b", re.IGNORECASE)
 
 
+#: Nouns that name what the user wants done rather than a symbol: "fix bug in a.py", "fix error
+#: handling in a.py". Like `_PROSE_WORDS` with a source, such a word is the target only when the
+#: source *defines* it; a mere occurrence (a comment, a string, `except E as error`) is not enough.
+_VAGUE_NOUNS = frozenset((
+    "bug", "bugs", "error", "errors", "issue", "issues", "problem", "problems", "typo", "typos",
+    "code", "logic",
+))
+
+
+def _is_defined_in_source(name: str, source: str) -> bool:
+    """True when *name* is introduced as a symbol in *source*, not merely mentioned.
+
+    A definition is a declaration keyword before the name (`def work`, `class work`,
+    `function work`, `const work`, ...) or an assignment at the start of a line (`work = ...`).
+    Strategy C accepts any other word that occurs in the source, which is right for a real
+    symbol but wrong for a prose word: `return`, `how` and `bug` occur in almost every file
+    (as a keyword, in a docstring, in a comment) without naming anything.
+    """
+    n = re.escape(name)
+    if re.search(r'(?<![\w.])(?:def|class|function|func|fn|interface|struct|enum|trait|type|const|let|var)\s+' + n + r'\b', source):
+        return True
+    return bool(re.search(r'^[ \t]*' + n + r'[ \t]*=(?!=)', source, re.MULTILINE))
+
+
 def _declaration_head_is_a_symbol(remainder: str, match: "re.Match[str]", source: str) -> bool:
     """True when Strategy A's head names a **symbol** rather than a verb (HARDEN-20 C).
 
@@ -146,6 +170,12 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
                     re.search(r'\b' + re.escape(part) + r'\b', source)
                     for part in candidate.split(".")
                 ):
+                    continue
+                # A prose word or a vague noun ("return", "how", "bug") occurs in nearly every
+                # source without naming a symbol, so with a source it needs a definition, not
+                # just an occurrence. A symbol really called `fail` or `bug` still passes.
+                if (source and candidate.lower() in (_PROSE_WORDS | _VAGUE_NOUNS)
+                        and not _is_defined_in_source(candidate, source)):
                     continue
                 target_name = candidate
                 break

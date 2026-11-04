@@ -302,9 +302,14 @@ class SearchAgent:
                 if str_path in already_searched_files:
                     continue
 
-                # Guard: File size limit
-                if p.exists() and (p.stat().st_size / 1024) <= self.max_file_kb:
-                    valid_candidates.append(str_path)
+                # Guard: File size limit. A file that vanished or became unreadable since it was
+                # listed is skipped on its own; an uncaught OSError here reached the outer
+                # `except` and sent every reference of the run to not_found.
+                try:
+                    if (p.stat().st_size / 1024) <= self.max_file_kb:
+                        valid_candidates.append(str_path)
+                except OSError:
+                    continue
 
             # 2. Scan for References
             refs_to_search = [r for r in references if r not in visited_names]
