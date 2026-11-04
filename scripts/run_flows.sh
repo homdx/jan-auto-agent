@@ -39,7 +39,8 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-[ ${#TASKS[@]} -eq 0 ] && TASKS=(1 2 3 4)
+# RUN-12: task 4 needs a second real provider, so it runs only when named (RUNBOOK.md).
+[ ${#TASKS[@]} -eq 0 ] && TASKS=(1 2 3)
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }
