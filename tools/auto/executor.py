@@ -932,6 +932,10 @@ class Executor:
             Always returns — subprocess.TimeoutExpired and OSError are caught
             and mapped to the result fields.
         """
+        # SIGTERM-1: `_ACTIVE_PROC` is a module-level slot the signal handler
+        # reads; `_execute` writes it (right after Popen, cleared in the finally)
+        # and must therefore declare it global or the assignments would be local.
+        global _ACTIVE_PROC
         # Only a run() cwd that lives under the workspace root is a task
         # workspace; run_raw()'s base_dir (or any override outside it) is not,
         # so run_raw keeps its base_dir-first PYTHONPATH behaviour unchanged.
@@ -956,6 +960,24 @@ class Executor:
         # `_MAX_OUTPUT_FILE_BYTES` kills the group, so the disk is not filled either.
         out_file = tempfile.TemporaryFile()
         err_file = tempfile.TemporaryFile()
+        # SIGTERM-1: the child runs in a session of its own (start_new_session), so a
+        # SIGTERM to the --auto process never reaches it, and Python's default SIGTERM
+        # disposition would kill the parent outright with the command (the acceptance
+        # check, a pytest with workers, minutes long) left running unattended. Install
+        # a handler for the Popen/wait window that SIGKILLs the active child's group
+        # and then terminates the parent (see _sigterm_handler); restore it in the
+        # finally. Windows: `signal.signal(SIGTERM)`'s semantics differ, the child
+        # never got `start_new_session` there, and the Ctrl-C / timeout group-kills
+        # already cover it — leave the default disposition in place.
+        prev_sigterm = None
+        if os.name != "nt":
+            try:
+                prev_sigterm = signal.signal(signal.SIGTERM, _sigterm_handler)
+            except ValueError:
+                # Not the main thread (the threaded interrupt tests, a library
+                # embedding the executor): signal.signal is main-thread-only, and the
+                # orphan fix only ever needs the real --auto process anyway.
+                prev_sigterm = None
         try:
             # Own session, so a timeout kills the whole group (pytest's xdist workers too), not the shell alone.
             proc = subprocess.Popen(
@@ -970,6 +992,10 @@ class Executor:
                 stderr=err_file,
                 start_new_session=os.name != "nt",
             )
+            # SIGTERM-1: from here until the group is killed and reaped on every path,
+            # the handler knows which child to take down. Set immediately after Popen
+            # so the window with a live-but-untracked child is as small as it gets.
+            _ACTIVE_PROC = proc
             over_cap = False
             try:
                 over_cap = _wait_bounded(proc, timeout, (out_file, err_file))
@@ -1063,6 +1089,12 @@ class Executor:
                 task_id   = task_id,
             )
         finally:
+            # SIGTERM-1: the Popen/wait window is over — the group was killed and
+            # reaped on every path (normal exit, timeout, Ctrl-C, SIGTERM) — so stop
+            # tracking the child and put the previous SIGTERM disposition back.
+            _ACTIVE_PROC = None
+            if prev_sigterm is not None:
+                signal.signal(signal.SIGTERM, prev_sigterm)
             out_file.close()
             err_file.close()
 
@@ -1235,6 +1267,36 @@ def _kill_process_group(proc: "subprocess.Popen") -> None:
         proc.kill()
     except OSError:
         pass
+
+
+# SIGTERM-1: the child `_execute` is currently running, or None outside its
+# Popen/wait window. The SIGTERM handler reads it: a signal that arrives while a
+# child is mid-flight must take that child's whole group down, not only kill the
+# parent — the orphan this fix exists for.
+_ACTIVE_PROC: subprocess.Popen | None = None
+
+
+def _sigterm_handler(signum: int, frame) -> None:
+    """SIGTERM-1: kill the running child's group, then let the parent die.
+
+    ``start_new_session=True`` (fix 35) puts the child and its whole tree in a
+    session of their own, so a SIGTERM to the ``--auto`` process never reaches
+    them — and Python's default SIGTERM disposition kills the parent outright,
+    with no exception for ``_execute``'s ``except BaseException`` reaper (the
+    Ctrl-C path) to run. The command (typically the acceptance check, a
+    ``pytest`` with workers, minutes long) then runs to completion unattended.
+
+    Kill the active child's group, then raise ``SystemExit(128 + signum)`` so
+    the parent still dies (the killer expects it) and — when the signal lands
+    inside the wait block — ``_execute``'s ``except BaseException`` reaper runs
+    ``wait()`` on the already-killed process instead of leaving a zombie.
+    Outside the Popen/wait window ``_ACTIVE_PROC`` is ``None``: there is
+    nothing to kill, and the parent still terminates.
+    """
+    proc = _ACTIVE_PROC
+    if proc is not None:
+        _kill_process_group(proc)
+    raise SystemExit(128 + signum)
 
 
 def _pytest_addopts(root: Path) -> list:
