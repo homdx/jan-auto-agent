@@ -36,6 +36,7 @@ import logging
 import math
 import re as _re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -485,6 +486,20 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 "range(0, len(files), step), so 0 raises "
                 "'range() arg 3 must not be zero' for every cluster"
             )
+        # [architect] max_parallel_requests: ceiling on in-flight Architect requests.
+        # 1 (default when absent or malformed) preserves today's serial behaviour.
+        # Values above one bound the worker pool; the value is a ceiling, not fan-out.
+        try:
+            _mp = int(config.get(arch, "max_parallel_requests", fallback="1"))
+            if _mp < 1:
+                raise ValueError(f"{_mp} is not a positive integer")
+            self._max_parallel_requests = _mp
+        except ValueError as exc:
+            logger.warning("config [%s] max_parallel_requests is malformed (%s) — using 1", arch, exc)
+            self._max_parallel_requests = 1
+        # Tokens go to the console only when one request streams at a time (335).
+        self._stream_to_console = True
+
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         active_profile = config.get("api", "active", fallback="local")
         try:
@@ -677,7 +692,6 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             in cluster order.  Ungrounded candidates are logged and dropped.
         """
         base_dir = Path(base_dir)
-        all_candidates: list[CandidateTask] = []
 
         # ── Load checkpoint (if any) ──────────────────────────────────────────
         checkpoint: dict[str, list[dict]] = {}
@@ -701,6 +715,49 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         checkpoint_path, exc,
                     )
                     checkpoint = {}
+
+        # ── Concurrency ───────────────────────────────────────────────────────
+        effective_parallel = self._max_parallel_requests
+        if effective_parallel > 1 and self._probe_enabled:
+            # The collect probe is shared per-run state (set_batch_files /
+            # reset are called per batch), so it cannot be used safely across
+            # concurrent batches.  Fall back to serial and say so.
+            if self._get_probe(base_dir) is not None:
+                logger.warning(
+                    "architect: max_parallel_requests=%d but the collect probe is "
+                    "available this run — probe state is shared per run, so "
+                    "Architect requests run sequentially (concurrency limited to 1).",
+                    effective_parallel,
+                )
+                effective_parallel = 1
+
+        logger.info(
+            "architect: max_parallel_requests=%d — %s",
+            effective_parallel,
+            "parallel requests" if effective_parallel > 1 else "serial requests",
+        )
+
+        self._stream_to_console = effective_parallel <= 1
+        if effective_parallel <= 1:
+            return self._review_clusters_serial(
+                clusters, base_dir, goal, checkpoint, checkpoint_path, on_cluster_done,
+            )
+        return self._review_clusters_parallel(
+            clusters, base_dir, goal, checkpoint, checkpoint_path, on_cluster_done,
+            effective_parallel,
+        )
+
+    def _review_clusters_serial(
+        self,
+        clusters: list[RepoCluster],
+        base_dir: Path,
+        goal: str,
+        checkpoint: dict[str, list[dict]],
+        checkpoint_path: "Path | None",
+        on_cluster_done,
+    ) -> list[CandidateTask]:
+        """Serial implementation — one request at a time (existing behaviour)."""
+        all_candidates: list[CandidateTask] = []
 
         for cluster in clusters:
             if not cluster.files:
@@ -756,22 +813,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
                 # Only non-empty results are checkpointed, so a retry after fixing the inputs is not skipped.
                 if checkpoint_path is not None and batch_results:
-                    checkpoint[batch_key] = _serialise_candidates(batch_results)
-                    try:
-                        # Atomic write (temp file, then replace): a kill mid-write cannot leave invalid checkpoint JSON (bugfix).
-                        atomic_write_text(
-                            checkpoint_path,
-                            json.dumps(checkpoint, indent=2, ensure_ascii=False),
-                        )
-                        logger.debug(
-                            "review_clusters: checkpoint saved — %d batch key(s) total",
-                            len(checkpoint),
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "review_clusters: could not write checkpoint %s: %s",
-                            checkpoint_path, exc,
-                        )
+                    _save_checkpoint(checkpoint, checkpoint_path, batch_key, batch_results)
 
             # Batch sub-clusters are named "<cluster> (batch N/M)"; restore the plain name so Gate 1's file check still finds the cluster.
             for _c in cluster_candidates:
@@ -780,34 +822,195 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             print(f"   → {len(cluster_candidates)} grounded candidate(s)")
 
             # Batches of one cluster can propose the same task; drop exact duplicates before merging (AUTO-BUG-3).
-            if len(batches) > 1 and len(cluster_candidates) > 1:
-                from tools.auto.gate1_filter import _fingerprint, _target_fingerprint  # noqa: PLC0415
-                _seen: set[str] = set()
-                _seen_targets: set[str] = set()
-                _deduped: list[CandidateTask] = []
-                for _c in cluster_candidates:
-                    _fp = _fingerprint(_c)
-                    _tfp = _target_fingerprint(_c) if self._task_mode == "creative" else None
-                    if _fp in _seen or (_tfp is not None and _tfp in _seen_targets):
-                        logger.info(
-                            "review_clusters: dropped cross-batch duplicate candidate "
-                            "%r (cluster=%r)", _c.title, cluster.name,
-                        )
-                        continue
-                    _seen.add(_fp)
-                    if _tfp is not None:
-                        _seen_targets.add(_tfp)
-                    _deduped.append(_c)
-                if len(_deduped) != len(cluster_candidates):
-                    print(f"   → {len(cluster_candidates) - len(_deduped)} cross-batch "
-                          f"duplicate(s) dropped, {len(_deduped)} remaining")
-                cluster_candidates = _deduped
+            if len(batches) > 1:
+                cluster_candidates = self._drop_cross_batch_duplicates(cluster_candidates, cluster.name)
 
             all_candidates.extend(cluster_candidates)
             _fire_callback(on_cluster_done)
 
         print(f"\n✅ Architect done — {len(all_candidates)} total candidate(s) across all clusters\n")
         return all_candidates
+
+    def _review_clusters_parallel(
+        self,
+        clusters: list[RepoCluster],
+        base_dir: Path,
+        goal: str,
+        checkpoint: dict[str, list[dict]],
+        checkpoint_path: "Path | None",
+        on_cluster_done,
+        max_parallel: int,
+    ) -> list[CandidateTask]:
+        """Parallel implementation — bounded worker pool, results in input order.
+
+        Every batch that needs a live LLM call is submitted to a
+        ``ThreadPoolExecutor`` capped at *max_parallel* workers.  Results are
+        placed in order slots keyed by (cluster index, batch index) so the
+        final output follows the original cluster/batch order regardless of
+        which request finishes first.
+
+        Checkpoint hits are resolved synchronously before any live call is
+        submitted.  Checkpoint writes happen on the calling thread, one completion
+        at a time, so they cannot lose one another's entries.  A failed or empty
+        batch is not checkpointed and stays retryable on the next run.
+
+        ``on_cluster_done`` fires exactly once per cluster, after all of that
+        cluster's batches (checkpoint hits and live calls alike) have either
+        completed or failed.
+        """
+        all_candidates: list[CandidateTask] = []
+
+        # Order slots: (cluster_idx, batch_idx) -> list[CandidateTask] | None
+        batch_results: dict[tuple[int, int], list[CandidateTask] | None] = {}
+        # Per-cluster count of batches still pending; checkpoint hits count as
+        # resolved immediately in pass 1, live batches in pass 2.
+        cluster_pending: dict[int, int] = {}
+        # Batches per non-empty cluster, for assembling them in order in pass 3.
+        cluster_batches: dict[int, int] = {}
+
+        # ── Pass 1: resolve checkpoint hits synchronously, queue live batches ──
+        live_work: list[tuple[int, int, RepoCluster, str, "list[str] | None"]] = []
+        for ci, cluster in enumerate(clusters):
+            if not cluster.files:
+                logger.debug("review_clusters: skipping empty cluster %r", cluster.name)
+                _fire_callback(on_cluster_done)
+                continue
+
+            files = cluster.files
+            batches = [
+                files[i:i + self._max_files_per_review]
+                for i in range(0, len(files), self._max_files_per_review)
+            ]
+            extra = f", {len(batches)} batches" if len(batches) > 1 else ""
+            print(f"\n🔍 Architect reviewing cluster: [{cluster.name}] "
+                  f"({len(files)} files{extra})")
+
+            cluster_pending[ci] = cluster_batches[ci] = len(batches)
+
+            for bi, batch_files in enumerate(batches):
+                sub = cluster if len(batches) == 1 else RepoCluster(
+                    name=f"{cluster.name} (batch {bi + 1}/{len(batches)})",
+                    patterns=cluster.patterns,
+                    files=batch_files,
+                )
+                batch_key = f"{sub.name}||{goal}||{_batch_fingerprint(base_dir, sub.files)}"
+                _all_files = files if (len(batches) > 1 and self._task_mode == "creative") else None
+
+                # ── Checkpoint hit: skip LLM call, reuse saved candidates ────
+                if checkpoint_path is not None and batch_key in checkpoint:
+                    saved = checkpoint[batch_key]
+                    try:
+                        restored = _deserialise_candidates(saved)
+                    except Exception as exc:  # noqa: BLE001 — fall back to a live call
+                        logger.warning(
+                            "review_clusters: could not restore checkpoint for "
+                            "'%s' (%s) — making a live LLM call instead",
+                            sub.name, exc,
+                        )
+                    else:
+                        print(f"   ♻️  Cluster/batch '{sub.name}' restored from checkpoint "
+                              f"({len(restored)} candidate(s)) — skipping LLM call")
+                        batch_results[(ci, bi)] = restored
+                        cluster_pending[ci] -= 1
+                        if cluster_pending[ci] == 0:
+                            _fire_callback(on_cluster_done)
+                        continue
+
+                live_work.append((ci, bi, sub, batch_key, _all_files))
+
+        # ── Pass 2: submit live batches to a bounded worker pool ───────────────
+        # Results land here on the calling thread, one at a time, so the checkpoint's
+        # read/modify/write and on_cluster_done are serialized without a lock of their own.
+        if live_work:
+            pool = ThreadPoolExecutor(max_workers=max_parallel, thread_name_prefix="architect")
+            try:
+                future_to_slot = {
+                    pool.submit(self._review_one_cluster, sub, base_dir, goal, all_files=_all_files):
+                        (ci, bi, sub, batch_key)
+                    for ci, bi, sub, batch_key, _all_files in live_work
+                }
+                for future in as_completed(future_to_slot):
+                    ci, bi, sub, batch_key = future_to_slot[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:  # noqa: BLE001 — a failed batch must not cancel others
+                        logger.warning(
+                            "review_clusters: batch '%s' raised %s — treating as failed batch",
+                            sub.name, exc,
+                        )
+                        result = None
+
+                    batch_results[(ci, bi)] = result
+                    print(f"   ✔ Reviewed '{sub.name}': "
+                          + ("request failed" if result is None else f"{len(result)} candidate(s)"))
+
+                    # Only non-empty results are checkpointed, so a failed or empty
+                    # batch stays retryable on the next run.
+                    if checkpoint_path is not None and result:
+                        _save_checkpoint(checkpoint, checkpoint_path, batch_key, result)
+
+                    cluster_pending[ci] -= 1
+                    if cluster_pending[ci] == 0:
+                        _fire_callback(on_cluster_done)
+            except BaseException:
+                # Ctrl-C stops here, as the serial loop does: the queued batches never start. The
+                # ones in flight end on their own request deadline, and are retried next run.
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            pool.shutdown()
+
+        # ── Pass 3: assemble in original cluster/batch order, dedup per cluster ─
+        for ci, cluster in enumerate(clusters):
+            batch_count = cluster_batches.get(ci, 0)
+            if not batch_count:
+                continue
+
+            cluster_candidates: list[CandidateTask] = []
+            for bi in range(batch_count):
+                cluster_candidates.extend(batch_results.get((ci, bi)) or [])
+
+            # Batch sub-clusters are named "<cluster> (batch N/M)"; restore the plain name so Gate 1's file check still finds the cluster.
+            for _c in cluster_candidates:
+                _c.cluster = cluster.name
+
+            print(f"   → [{cluster.name}] {len(cluster_candidates)} grounded candidate(s)")
+
+            # Batches of one cluster can propose the same task; drop exact duplicates before merging (AUTO-BUG-3).
+            if batch_count > 1:
+                cluster_candidates = self._drop_cross_batch_duplicates(cluster_candidates, cluster.name)
+
+            all_candidates.extend(cluster_candidates)
+
+        print(f"\n✅ Architect done — {len(all_candidates)} total candidate(s) across all clusters\n")
+        return all_candidates
+
+    def _drop_cross_batch_duplicates(
+        self, candidates: list[CandidateTask], cluster_name: str,
+    ) -> list[CandidateTask]:
+        """Keep the first of each proposal, in the order the batches were given (AUTO-BUG-3)."""
+        if len(candidates) < 2:
+            return candidates
+        from tools.auto.gate1_filter import _fingerprint, _target_fingerprint  # noqa: PLC0415
+        _seen: set[str] = set()
+        _seen_targets: set[str] = set()
+        _deduped: list[CandidateTask] = []
+        for _c in candidates:
+            _fp = _fingerprint(_c)
+            _tfp = _target_fingerprint(_c) if self._task_mode == "creative" else None
+            if _fp in _seen or (_tfp is not None and _tfp in _seen_targets):
+                logger.info(
+                    "review_clusters: dropped cross-batch duplicate candidate "
+                    "%r (cluster=%r)", _c.title, cluster_name,
+                )
+                continue
+            _seen.add(_fp)
+            if _tfp is not None:
+                _seen_targets.add(_tfp)
+            _deduped.append(_c)
+        if len(_deduped) != len(candidates):
+            print(f"   → {len(candidates) - len(_deduped)} cross-batch "
+                  f"duplicate(s) dropped, {len(_deduped)} remaining")
+        return _deduped
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
@@ -1177,13 +1380,16 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     def streaming_callback(token: str) -> None:
                         # B1: a closed stdout must not drop the batch. The write is
                         # cosmetic; tokens_list is what the parse actually reads.
-                        _safe_stdout_write(token)
+                        # Concurrent requests would interleave their tokens into noise (335).
+                        if self._stream_to_console:
+                            _safe_stdout_write(token)
                         tokens_list.append(token)
 
                     # B1: the banner, the token callback and the closing rule
                     # are all cosmetic writes; none may reach the except below,
                     # which means "the LLM call failed" and would drop the batch.
-                    _safe_print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
+                    if self._stream_to_console:
+                        _safe_print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
                     returned = _llm_stream.request_completion(
                         url=url,
                         headers=headers,
@@ -1197,7 +1403,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     )
                     # The full response is preferred, falling back to the streamed tokens when it is empty.
                     raw_text = returned or "".join(tokens_list)
-                    _safe_print("\n" + "═" * 80 + "\n")
+                    if self._stream_to_console:
+                        _safe_print("\n" + "═" * 80 + "\n")
                     last_exc = None
                     break  # success — exit retry loop
 
@@ -2039,6 +2246,28 @@ def _batch_fingerprint(base_dir: "Path", files: list[str]) -> str:
     out of sync with each other again.
     """
     return file_set_fingerprint(base_dir, files)
+
+
+def _save_checkpoint(
+    checkpoint: dict, checkpoint_path: Path, batch_key: str, candidates: list[CandidateTask],
+) -> None:
+    """Record one reviewed batch; a write that fails is logged, never fatal."""
+    checkpoint[batch_key] = _serialise_candidates(candidates)
+    try:
+        # Atomic write (temp file, then replace): a kill mid-write cannot leave invalid checkpoint JSON (bugfix).
+        atomic_write_text(
+            checkpoint_path,
+            json.dumps(checkpoint, indent=2, ensure_ascii=False),
+        )
+        logger.debug(
+            "review_clusters: checkpoint saved — %d batch key(s) total",
+            len(checkpoint),
+        )
+    except Exception as exc:
+        logger.warning(
+            "review_clusters: could not write checkpoint %s: %s",
+            checkpoint_path, exc,
+        )
 
 
 def _serialise_candidates(candidates: list[CandidateTask]) -> list[dict]:
