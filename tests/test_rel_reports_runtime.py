@@ -109,12 +109,19 @@ def test_overlapping_ticket_updates_keep_both_fields(tmp_path):
 
 # REL-7 AR-1: a holder still mid-start (its parent's words, or none) is waited on.
 def _fake_proc(root: Path, pid: int, words: list, ppid: int, state: str = "S") -> None:
+    """A `/proc` entry, each file replaced whole: the real `/proc` is never read half-written,
+    and a reader that finds an empty `stat` here takes a live holder for a dead one."""
+    def put(path: Path, data: bytes) -> None:
+        temp = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+        temp.write_bytes(data)
+        os.replace(temp, path)
+
     (root / str(pid)).mkdir(parents=True, exist_ok=True)
-    (root / str(pid) / "cmdline").write_bytes(b"\0".join(w.encode() for w in words) + b"\0")
+    put(root / str(pid) / "cmdline", b"\0".join(w.encode() for w in words) + b"\0")
     ticks = os.sysconf("SC_CLK_TCK")
-    (root / str(pid) / "stat").write_text(
-        f"{pid} (py) {state} {ppid} " + " ".join(["0"] * 17) + f" {100 * ticks} 0\n")
-    (root / "uptime").write_text("100.5 0\n")
+    put(root / str(pid) / "stat",
+        (f"{pid} (py) {state} {ppid} " + " ".join(["0"] * 17) + f" {100 * ticks} 0\n").encode())
+    put(root / "uptime", b"100.5 0\n")
 
 
 @posix_only

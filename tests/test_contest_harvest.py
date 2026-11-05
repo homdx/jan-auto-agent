@@ -663,14 +663,19 @@ def test_run_tests_detail_ends_the_suite_at_the_harvest_budget(round_, tmp_path,
         took = time.monotonic() - start
 
         assert summary.startswith("tests:budget✗")
-        assert took < budget + 12                       # the budget, not the 90 s suite
+        assert took < budget + 25                       # the budget, not the 90 s suite
         assert len(ended) == 1                          # the group was ended, once
-        try:
-            os.killpg(ended[0], 0)
-        except ProcessLookupError:
-            pass                                       # every member of it is gone
-        else:
-            pytest.fail("the harvest's pytest process group is still alive")
+        # A killed member stays in the group until it is reaped, later on a busy machine;
+        # one the kill missed sleeps through this wait, its test runs for 90 s.
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                os.killpg(ended[0], 0)
+            except ProcessLookupError:
+                break                                  # every member of it is gone
+            if time.monotonic() >= deadline:
+                pytest.fail("the harvest's pytest process group is still alive")
+            time.sleep(0.1)
         time.sleep(0.5)
         assert _live_pytest(wt.path) == []
         assert any("--- tests: ended after the harvest budget" in line for line in tail), tail

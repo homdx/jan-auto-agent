@@ -54,6 +54,7 @@ import logging
 import os
 import re
 import shutil
+import queue
 import socket
 import subprocess
 import threading
@@ -808,6 +809,9 @@ class EventTap:
         self._socket = None
         self._log = None
         self._last_flush: float | None = None
+        # The log has a thread of its own: the disk never holds up the reader (336).
+        self._log_queue: "queue.SimpleQueue | None" = None
+        self._log_thread: threading.Thread | None = None
 
     def start(self) -> "EventTap":
         """Start the reader thread (already running: no change)."""
@@ -817,13 +821,17 @@ class EventTap:
         os.makedirs(parent, exist_ok=True)
         self._log = open(self.log_path, "a", encoding="utf-8")
         self._stop.clear()
+        self._log_queue = queue.SimpleQueue()
+        self._log_thread = threading.Thread(target=self._drain_log, args=(self._log_queue,),
+                                            name="kilo-event-log", daemon=True)
         thread = threading.Thread(target=self._run, name="kilo-event-tap", daemon=True)
         self._thread = thread
         try:
+            self._log_thread.start()
             thread.start()
         except BaseException:
-            self._log.close()
-            self._log, self._thread = None, None
+            self._close_log()
+            self._thread = None
             raise
         return self
 
@@ -871,39 +879,44 @@ class EventTap:
             self._record(event)
 
     def _record(self, event: dict) -> None:
-        """Keep the event in memory and append it to the log, as the probe did.
+        """Keep the event in memory and hand it to the log's own thread.
 
         A log that cannot be written (a full disk, a closed handle) does not
         stop the reader: the in-memory list is the copy a caller waits on.
 
-        The in-memory copy is published *first*, and waiters are woken before
-        the log is touched at all (FL-1, round 84) — what a caller's silence
-        clock measures must not include this tap's own bookkeeping.
+        What a caller's silence clock measures must not include this tap's own
+        bookkeeping (FL-1, round 84). Publishing first was not enough: the next
+        line of the stream is read by this same thread, so a `write(2)` or a
+        flush blocked on a busy disk still stopped the events, and an agent
+        working the whole time was declared stalled (336). Here nothing waits
+        on the disk.
         """
         with self._cond:
             self.events.append(event)
             self._cond.notify_all()
-        try:
-            self._write_log({"t": time.time(), "event": event})
-        except (OSError, ValueError, TypeError):
-            pass
+        log_queue = self._log_queue
+        if log_queue is not None:
+            log_queue.put({"t": time.time(), "event": event})
+
+    def _drain_log(self, log_queue: "queue.SimpleQueue") -> None:
+        """The log's thread: every entry in arrival order, until the `None` that ends it."""
+        while True:
+            entry = log_queue.get()
+            if entry is None:
+                return
+            try:
+                self._write_log(entry)
+            except (OSError, ValueError, TypeError):
+                pass
 
     def _write_log(self, entry: dict) -> None:
         """Append one entry, flushing on a bounded cadence rather than per event.
 
-        FL-1 (round 84): this used to ``flush()`` on every single event, on
-        the reader thread, so the next line of the stream was not read until
-        that write returned. A ``write(2)`` is not free when the page cache
-        is full — under dirty-page writeback throttling it blocks, and on a
-        box running four ``pytest -n 8`` invocations it blocked for
-        *seconds*. The caller's silence clock counts that as the session
-        going quiet, so a turn that was emitting the whole time got declared
-        stalled and aborted: the agent's own event log starved the agent.
-
-        The same hazard family as the metrics lock spanning ``fsync`` — a
-        blocking disk operation on a path that a timing guard depends on.
-        Buffered writes still land in order and ``_close_log`` flushes, so
-        the on-disk format and completeness at ``stop()`` are unchanged.
+        A `write(2)` is not free when the page cache is full: under dirty-page
+        writeback throttling it blocks, on a box running four `pytest -n 8`
+        invocations for *seconds*. Buffered writes still land in order and
+        `_close_log` flushes, so the on-disk format and completeness at `stop()`
+        are unchanged.
         """
         log = self._log
         if log is None:
@@ -919,6 +932,12 @@ class EventTap:
         self._record({"type": "tap.closed", "properties": {"error": reason}})
 
     def _close_log(self) -> None:
+        log_queue, thread = self._log_queue, self._log_thread
+        self._log_queue, self._log_thread = None, None
+        if log_queue is not None:
+            log_queue.put(None)
+            if thread is not None and thread.is_alive():
+                thread.join()                           # the log is whole once the reader has ended
         log, self._log = self._log, None
         if log is not None:
             try:

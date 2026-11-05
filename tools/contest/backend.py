@@ -58,7 +58,6 @@ from __future__ import annotations
 
 import argparse
 import collections
-import contextlib
 import json
 import logging
 import os
@@ -72,6 +71,7 @@ import time
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
+from tools.process_reap import reap_killed, stop_signals_held
 from tools.contest.kilo_client import (
     EventTap,
     IdleResult,
@@ -1531,35 +1531,6 @@ def _agent_tools() -> list:
 
 
 #: the signals that stop the agent: Ctrl-C, and the runner's abort (`proc.terminate()`)
-_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
-
-
-@contextlib.contextmanager
-def _stop_signals_held():
-    """Hold a stop signal that arrives inside the block; yields the list of those that did.
-
-    The caller re-raises them (``signal.raise_signal``) once it can clean up, so the
-    handler that was in place still runs, just later. Off the main thread, where
-    no handler can be set, nothing is held; neither is a signal whose handler is not
-    Python's (ignored, or the default that ends the process anyway).
-    """
-    held: list = []
-    if threading.current_thread() is not threading.main_thread():
-        yield held
-        return
-    previous = {}
-    for signum in _STOP_SIGNALS:
-        handler = signal.getsignal(signum)
-        if callable(handler):
-            previous[signum] = handler
-            signal.signal(signum, lambda num, frame: held.append(num))
-    try:
-        yield held
-    finally:
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
-
-
 def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
     """``bash -c command`` in its own process group: ``(returncode, stdout, stderr)``.
 
@@ -1584,7 +1555,7 @@ def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
             # `try:` is not reached yet); a Ctrl-C there escaped the kill below and
             # left the command running. It is held until `proc` is known — and so
             # is the runner's SIGTERM (AGENT-TERM).
-            with _stop_signals_held() as held:
+            with stop_signals_held() as held:
                 proc = subprocess.Popen(["bash", "-c", command], cwd=cwd,
                                         stdout=out_f, stderr=err_f,
                                         stdin=subprocess.DEVNULL,
@@ -1606,7 +1577,7 @@ def _run_bash_group(command: str, cwd: str, timeout: float) -> tuple:
                     proc.kill()
             except OSError:
                 pass
-            proc.wait()
+            reap_killed(proc)
             raise
         out_f.seek(0)
         err_f.seek(0)

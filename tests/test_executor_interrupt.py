@@ -39,7 +39,7 @@ def _pid_state(pid: int) -> str | None:
         return None
 
 
-def _assert_gone(pid: int, label: str, timeout: float = 5.0) -> None:
+def _assert_gone(pid: int, label: str, timeout: float = 30.0) -> None:
     """Fail unless *pid* is dead **and reaped** within *timeout*.
 
     ``SIGKILL`` is synchronous but the corpse is not gone at the same instant: the

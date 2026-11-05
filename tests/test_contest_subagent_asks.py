@@ -104,15 +104,14 @@ def test_a_subagent_s_question_is_rejected_like_the_agent_s_own(tmp_path):
 
 
 def test_a_working_subagent_keeps_the_silence_clock_from_firing(tmp_path):
-    """The parent is silent for 3 s while its subagent beats `busy`: a 1.5 s
+    """The parent is silent for 4 s while its subagent beats `busy`: a 3 s
     silence clock that only read the parent would call that a stall. The child
-    beats every 0.1 s, so a loaded machine has 1.4 s of slack per beat, not the
-    0.5 s a beat every 0.5 s against a 1 s clock left it (flaky under 3x load)."""
+    beats every 0.1 s, so a loaded machine has 2.9 s of slack per beat."""
     scenario = {"turns": [{"events": ["busy"],
-                           "subagent": {"work_sec": 3, "beat_sec": 0.1},
+                           "subagent": {"work_sec": 4, "beat_sec": 0.1},
                            "assistant": "done"}]}
     with tk._probe(tmp_path, scenario) as h:
-        res = _wait(h, silence=1.5)
+        res = _wait(h, silence=3)
 
     assert res.status == "idle", res
 

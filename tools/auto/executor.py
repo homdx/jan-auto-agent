@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Optional
 
 from tools.agent_trace import tracer
+from tools.process_reap import stop_signals_held
 from tools.auto.utils import is_pytest_command, is_xdist_flag, pytest_piece_spans   # RUN-3
 
 logger = logging.getLogger(__name__)
@@ -980,24 +981,30 @@ class Executor:
                 prev_sigterm = None
         try:
             # Own session, so a timeout kills the whole group (pytest's xdist workers too), not the shell alone.
-            proc = subprocess.Popen(
-                command,
-                shell=True,
-                cwd=str(cwd),
-                env=env,
-                # REL-1 #2: never the agent's own stdin — the command could read what the user
-                # types, and one that waits for input waited out the whole timeout.
-                stdin=subprocess.DEVNULL,
-                stdout=out_file,
-                stderr=err_file,
-                start_new_session=os.name != "nt",
-            )
-            # SIGTERM-1: from here until the group is killed and reaped on every path,
-            # the handler knows which child to take down. Set immediately after Popen
-            # so the window with a live-but-untracked child is as small as it gets.
-            _ACTIVE_PROC = proc
+            # A shell already running while Popen has not returned would be nobody's to kill:
+            # the handler would end the parent and leave the group running (336). A stop
+            # signal in that window is held until the child is known, and raised below,
+            # inside the `try` that takes the group down.
+            with stop_signals_held() as held:
+                proc = subprocess.Popen(
+                    command,
+                    shell=True,
+                    cwd=str(cwd),
+                    env=env,
+                    # REL-1 #2: never the agent's own stdin — the command could read what the user
+                    # types, and one that waits for input waited out the whole timeout.
+                    stdin=subprocess.DEVNULL,
+                    stdout=out_file,
+                    stderr=err_file,
+                    start_new_session=os.name != "nt",
+                )
+                # SIGTERM-1: from here until the group is killed and reaped on every path,
+                # the handler knows which child to take down.
+                _ACTIVE_PROC = proc
             over_cap = False
             try:
+                for signum in dict.fromkeys(held):
+                    signal.raise_signal(signum)
                 over_cap = _wait_bounded(proc, timeout, (out_file, err_file))
             except subprocess.TimeoutExpired:
                 _kill_process_group(proc)

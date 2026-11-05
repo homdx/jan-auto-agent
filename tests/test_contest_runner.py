@@ -25,6 +25,7 @@ run needs.
 from __future__ import annotations
 
 import configparser
+import itertools
 import json
 import logging
 import os
@@ -5545,10 +5546,11 @@ def test_the_runners_own_child_in_the_worktree_is_not_the_agents_leftover(tmp_pa
     assert [i["pid"] for i in _by_name(state)["agent-a"].reaped] == [stray.pid]
 
 
-def test_two_runs_on_one_model_id_extend_on_their_own_churn(tmp_path):
+def test_two_runs_on_one_model_id_extend_on_their_own_churn(tmp_path, monkeypatch):
     """KC-36 §6: `hy3-var1` and `hy3-var2` share a model id and have their own
     worktrees. The one still writing is extended and runs on; the one that went
-    flat stalls at the nominal clock."""
+    flat stalls at the nominal clock. The samples are scripted per worktree: real
+    writes on a busy disk can miss a 1 s tick, and that is not what is pinned."""
     from dataclasses import replace
     base = make_config(["hy3-var1", "hy3-var2"], max_parallel=2, turn_timeout_sec=1,
                        turn_extend_sec=1, turn_max_sec=4, idle_event_timeout_sec=0)
@@ -5560,13 +5562,10 @@ def test_two_runs_on_one_model_id_extend_on_their_own_churn(tmp_path):
     sb = Sandbox(tmp_path, ["hy3-var1", "hy3-var2"])
     scenario = {"turns": [{"events": ["busy"], "idle": False}]}
 
-    def on_prompt(directory, text):
-        if "hy3-var1" in directory:
-            _grow(Path(directory), 5.0, every=0.01)
-        else:
-            time.sleep(5)
-
-    scenario["turns"][0]["on_prompt"] = on_prompt
+    samples = itertools.count(1)
+    monkeypatch.setattr(_runner_module, "_churn",
+                        lambda ws: (1, next(samples)) if "hy3-var1" in str(ws.path) else (0, 0))
+    scenario["turns"][0]["on_prompt"] = lambda directory, text: time.sleep(5)
     with _BenchFake(scenario) as fake:
         state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
                           make_backend=_make_backend(fake, sb.out_dir),
@@ -6026,6 +6025,13 @@ def _suite_slots_are_clean():
     _runner_module._SUITE_SLOTS.reset()
 
 
+def _all_stacks() -> str:
+    """Where every thread stands: what a wait that ran out has to say for itself."""
+    import traceback  # noqa: PLC0415
+    return "\n".join(f"-- {tid}\n" + "".join(traceback.format_stack(frame))
+                     for tid, frame in sys._current_frames().items())
+
+
 def _wait_for(predicate, timeout: float = 30.0) -> bool:
     """Poll *predicate* until it is true or the deadline passes — no event to wire."""
     end = time.monotonic() + timeout
@@ -6259,7 +6265,7 @@ def test_a_stalled_holder_gives_its_slot_to_the_next_waiter(tmp_path, monkeypatc
         assert slots.status(names[1])[0] == "queued"
         assert not fb.calls(method="POST", prefix="/permission/")
 
-        assert _wait_for(lambda: not ta.is_alive(), 60)     # agent-a stalls
+        assert _wait_for(lambda: not ta.is_alive(), 240), _all_stacks()     # agent-a stalls
         ta.join(60)
         assert slots.status(names[0]) is None, "the slot must not survive its agent"
         assert _wait_for(lambda: fb.calls(method="POST", prefix="/permission/"), 60), \
@@ -6496,7 +6502,7 @@ def _silent_warnings(caplog):
             if r.levelno >= logging.WARNING and "kilo serve silent" in r.message]
 
 
-def _wait_for(pred, timeout=3.0, step=0.05):
+def _wait_for(pred, timeout=60.0, step=0.05):  # only a failure waits this long
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if pred():
@@ -6512,9 +6518,9 @@ def test_kilo_silent_warns_once_when_events_and_log_are_still(tmp_path, caplog):
     sb, hb, state, saved, log_file, restore = _kilo_silent_harness(tmp_path)
     try:
         hb.start()
-        assert _wait_for(lambda: _silent_warnings(caplog), timeout=4.0), caplog.text
-        hb.stop()
+        assert _wait_for(lambda: _silent_warnings(caplog), timeout=60.0), caplog.text
     finally:
+        hb.stop()
         _runner_module._worktree_files, _runner_module._commits_above = restore
     warns = _silent_warnings(caplog)
     assert len(warns) == 1, warns
@@ -6638,15 +6644,15 @@ def test_kilo_silent_warns_again_after_a_second_spell(tmp_path, caplog):
     event.parent.mkdir(parents=True, exist_ok=True)
     try:
         hb.start()
-        assert _wait_for(lambda: len(_silent_warnings(caplog)) >= 1, timeout=4.0), caplog.text
+        assert _wait_for(lambda: len(_silent_warnings(caplog)) >= 1, timeout=60.0), caplog.text
         # something moves: one event ends the spell
         event.write_text('{"t": %s, "event": {"type": "busy"}}\n' % time.time(),
                          encoding="utf-8")
-        assert _wait_for(lambda: hb._silent_warned is False, timeout=2.0)
+        assert _wait_for(lambda: hb._silent_warned is False, timeout=60.0)
         # silence again: the second spell warns on its own
-        assert _wait_for(lambda: len(_silent_warnings(caplog)) >= 2, timeout=4.0), caplog.text
-        hb.stop()
+        assert _wait_for(lambda: len(_silent_warnings(caplog)) >= 2, timeout=60.0), caplog.text
     finally:
+        hb.stop()
         _runner_module._worktree_files, _runner_module._commits_above = restore
     warns = _silent_warnings(caplog)
     assert len(warns) == 2, warns
@@ -6664,8 +6670,8 @@ def test_kilo_silent_zero_never_warns(tmp_path, caplog):
     try:
         hb.start()
         time.sleep(0.5)
-        hb.stop()
     finally:
+        hb.stop()
         _runner_module._worktree_files, _runner_module._commits_above = restore
     assert not _silent_warnings(caplog), caplog.text
     assert state.server_silent is None
@@ -6679,9 +6685,9 @@ def test_kilo_silent_without_a_log_path_says_log_unknown(tmp_path, caplog):
     assert log_file is None
     try:
         hb.start()
-        assert _wait_for(lambda: _silent_warnings(caplog), timeout=4.0), caplog.text
-        hb.stop()
+        assert _wait_for(lambda: _silent_warnings(caplog), timeout=60.0), caplog.text
     finally:
+        hb.stop()
         _runner_module._worktree_files, _runner_module._commits_above = restore
     (note,) = _silent_warnings(caplog)
     assert "log ?" in note, note
@@ -6751,8 +6757,8 @@ def test_kilo_silent_is_quiet_while_every_live_agent_harvests(tmp_path, caplog):
     try:
         hb.start()
         time.sleep(1.0)
-        hb.stop()
     finally:
+        hb.stop()
         _runner_module._worktree_files, _runner_module._commits_above = restore
     assert not _silent_warnings(caplog), caplog.text
     assert state.server_silent is None
@@ -6767,13 +6773,14 @@ def test_kilo_silent_line_and_state_carry_how_long_it_has_been_silent(tmp_path, 
     os.utime(log_file, (past, past))
     try:
         hb.start()
-        assert _wait_for(lambda: _silent_warnings(caplog), timeout=4.0), caplog.text
-        hb.stop()
+        assert _wait_for(lambda: _silent_warnings(caplog), timeout=60.0), caplog.text
     finally:
+        hb.stop()
         _runner_module._worktree_files, _runner_module._commits_above = restore
     note = _silent_warnings(caplog)[0]
-    assert re.search(r"kilo serve silent (29|3\d|4\d)s:", note), note
-    assert 29 <= state.server_silent["seconds"] <= 50, state.server_silent
+    # 40 s old and read within the 60 s wait above: the log's age counts, not the check's
+    assert 29 <= int(re.search(r"kilo serve silent (\d+)s:", note).group(1)) <= 110, note
+    assert 29 <= state.server_silent["seconds"] <= 110, state.server_silent
 
 
 def test_kilo_silent_is_off_on_an_openrouter_round(tmp_path, monkeypatch):
@@ -7053,20 +7060,21 @@ def test_the_suite_wait_is_granted_back_and_the_silence_clock_runs_from_the_repl
     the wait as `suite_wait_sec` — the seconds its deadline was moved by."""
     names = ("agent-a",)
     sb = Sandbox(tmp_path, names)
-    cfg = make_config(names, agent_suite_slots=1, idle_event_timeout_sec=1, max_continues_per_attempt=0)
+    cfg = make_config(names, agent_suite_slots=1, idle_event_timeout_sec=5, max_continues_per_attempt=0)
     monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
     monkeypatch.setattr(_runner_module, "_suite_pids", lambda worktree, proc_root=None: set())
     slots = _runner_module._SUITE_SLOTS
     # someone else's suite holds the only slot, released by hand below
     slots.acquire("other:harvest", tmp_path, scoped=True)
     try:
+        # 5 s, not 1: the prompt hook's git commit runs before the first event, inside this window
         with _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, on_prompt=work_ready)) as fake:
             h = Harness(sb, fake, cfg, agent=names[0])
             result = {}
             thread = threading.Thread(target=lambda: result.update(run=h.go()), daemon=True)
             thread.start()
             assert _wait_for(lambda: (slots.status(names[0]) or ("",))[0] == "queued")
-            time.sleep(2.2)             # clock: claim — C5: twice the silence window, in the queue
+            time.sleep(10.2)            # clock: claim — C5: twice the silence window, in the queue
             assert not fake.calls(method="POST", prefix="/permission/")
             slots.release("other:harvest")
             thread.join(60)
@@ -7077,7 +7085,7 @@ def test_the_suite_wait_is_granted_back_and_the_silence_clock_runs_from_the_repl
                  (sb.out_dir / names[0] / "turns.jsonl").read_text().splitlines()]
         # The turn idled on its own, not through a silence stall the harvest rescued.
         assert turns[0]["idle_status"] == "idle", turns[0]
-        assert turns[0]["suite_wait_sec"] >= 2, turns[0]
+        assert turns[0]["suite_wait_sec"] >= 10, turns[0]
     finally:
         slots.release("other:harvest")
 
@@ -7093,16 +7101,50 @@ def test_grant_suite_is_kept_out_of_the_churn_room():
     assert clock.granted == 0.0 and clock.gate_added == 0.0
 
 
+class _TimeUpTimers:
+    """Stands in for `threading.Timer` where the runner arms `agent_max_sec`, so a test reads
+    the limit itself: on a busy disk the agent's own git work spends any short real limit."""
+
+    class _Timer:
+        def __init__(self, seconds):
+            self.seconds, self.cancelled, self.daemon = float(seconds), False, False
+            self.armed_at = time.monotonic()
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    def __init__(self, monkeypatch):
+        self.armed = []
+        owner, real = self, threading
+
+        class _Threading:
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            @staticmethod
+            def Timer(interval, function, args=None, kwargs=None):
+                if getattr(function, "__name__", "") != "stall":
+                    return real.Timer(interval, function, args=args, kwargs=kwargs)
+                owner.armed.append(owner._Timer(interval))
+                return owner.armed[-1]
+
+        monkeypatch.setattr(_runner_module, "threading", _Threading())
+
+
 def test_the_suite_queue_does_not_count_against_agent_max_sec(tmp_path, monkeypatch):
     """An agent stuck in the suite queue is not at fault: `agent_max_sec` is
     paused while its permission waits for a slot and resumed with what it had
-    left. Here the queue alone outlasts the whole limit, and the agent still
-    gets its reply, idles on its own and ends READY — not `time up`."""
+    left, none of the queue taken off it; the agent gets its reply, idles on its
+    own and ends READY."""
     names = ("agent-a",)
     sb = Sandbox(tmp_path, names)
-    cfg = make_config(names, agent_suite_slots=1, agent_max_sec=2, idle_event_timeout_sec=0)
+    cfg = make_config(names, agent_suite_slots=1, agent_max_sec=1000, idle_event_timeout_sec=0)
     monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
     monkeypatch.setattr(_runner_module, "_suite_pids", lambda worktree, proc_root=None: set())
+    timers = _TimeUpTimers(monkeypatch)
     slots = _runner_module._SUITE_SLOTS
     slots.acquire("other:harvest", tmp_path, scoped=True)
     try:
@@ -7112,18 +7154,22 @@ def test_the_suite_queue_does_not_count_against_agent_max_sec(tmp_path, monkeypa
             thread = threading.Thread(target=lambda: result.update(run=h.go()), daemon=True)
             thread.start()
             assert _wait_for(lambda: (slots.status(names[0]) or ("",))[0] == "queued")
-            time.sleep(3.0)             # longer than the agent's whole limit
+            assert _wait_for(lambda: timers.armed and timers.armed[0].cancelled), "the limit runs on in the queue"
+            spent_before_the_queue = time.monotonic() - timers.armed[0].armed_at
+            time.sleep(1.0)
             assert thread.is_alive(), "the queue must not end the agent"
+            assert len(timers.armed) == 1, "the limit came back while the agent still queued"
             slots.release("other:harvest")
-            thread.join(60)
+            thread.join(240)
             assert not thread.is_alive()
         run = result["run"]
         assert run.state is AgentState.READY, run.last_error
-        assert "time up" not in (run.last_error or "")
+        # 0.5: the two clocks are read a moment apart, and the queue's whole second would show
+        assert timers.armed[1].seconds >= 1000 - spent_before_the_queue - 0.5, "the queue was taken off the limit"
         turns = [json.loads(line) for line in
                  (sb.out_dir / names[0] / "turns.jsonl").read_text().splitlines()]
         assert turns[0]["idle_status"] == "idle", turns[0]
-        assert turns[0]["suite_wait_sec"] >= 3, turns[0]
+        assert turns[0]["suite_wait_sec"] >= 1, turns[0]
     finally:
         slots.release("other:harvest")
 
@@ -7151,14 +7197,15 @@ def test_the_harvest_does_not_count_against_agent_max_sec(tmp_path, monkeypatch)
     REWORK it returns goes out, and the agent ends READY, not `time up`."""
     names = ("agent-a",)
     sb = Sandbox(tmp_path, names)
-    cfg = make_config(names, agent_max_sec=2, idle_event_timeout_sec=0)
+    cfg = make_config(names, agent_max_sec=1000, idle_event_timeout_sec=0)
+    timers = _TimeUpTimers(monkeypatch)
     real = _runner_module._harvest
     calls = []
 
     def slow_first(*args, **kwargs):
-        calls.append(1)
+        calls.append((timers.armed[-1].cancelled, time.monotonic() - timers.armed[0].armed_at))
         if len(calls) == 1:
-            time.sleep(3.0)             # longer than the agent's whole limit
+            time.sleep(1.0)
         return real(*args, **kwargs)
 
     monkeypatch.setattr(_runner_module, "_harvest", slow_first)
@@ -7169,8 +7216,10 @@ def test_the_harvest_does_not_count_against_agent_max_sec(tmp_path, monkeypatch)
     with _BenchFake(scenario) as fake:
         run = Harness(sb, fake, cfg, agent=names[0]).go()
     assert run.state is AgentState.READY, run.last_error
-    assert "time up" not in (run.last_error or "")
     assert len(calls) == 2
+    assert calls[0][0], "the limit runs on through the harvest"
+    # 0.5: the two clocks are read a moment apart, and the harvest's whole second would show
+    assert timers.armed[1].seconds >= 1000 - calls[0][1] - 0.5, "the harvest was taken off the limit"
 
 
 # KC-10: the fill is read before every prompt, and a session at 80% of a model with no declared limit is compacted
@@ -7464,7 +7513,7 @@ def test_first_touch_nudge_reset_and_dead(tmp_path, monkeypatch):
     # abort_idles is the live server's answer to an abort: the turn ends and the wait comes back at once.
     scenario = {"abort_idles": True, "turns": [dict(NEVER_TOUCHES)] * 4}
     sb = Sandbox(tmp_path)
-    cfg = _ft_config()
+    cfg = _ft_config(first_touch_sec=6)     # the reset's new session must open within one deadline
     with _BenchFake(scenario) as fake:
         run = Harness(sb, fake, cfg).go()
         prompts = _prompts(fake)
@@ -7477,7 +7526,7 @@ def test_first_touch_nudge_reset_and_dead(tmp_path, monkeypatch):
     assert "Nothing has been modified" in nudge
     assert "pkg/thing.py" in nudge and "tests/test_thing.py" in nudge
     # the time is the deadline's, read before the re-arm: it said "0s" once
-    assert "0s into this turn" not in nudge and "2s into this turn" in nudge
+    assert int(re.search(r"(\d+)s into this turn", nudge).group(1)) >= 6, nudge
 
     # two sessions, and the round prompt is what the second one is opened with
     assert len(fake.sessions()) == 2 and run.sessions == 2

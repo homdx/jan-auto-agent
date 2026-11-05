@@ -59,10 +59,10 @@ def _pid_state(pid: int) -> str | None:
         return None
 
 
-def _assert_gone(pid: int, label: str, timeout: float = 5.0) -> None:
+def _assert_gone(pid: int, label: str, timeout: float = 30.0) -> None:
     """Fail unless *pid* is dead **and reaped** within *timeout* (poll: SIGKILL is
-    synchronous but the corpse takes a moment to be reaped; see the same helper in
-    test_executor_interrupt.py)."""
+    synchronous but the corpse takes a moment to be reaped, longer on a busy machine;
+    one the kill missed sleeps through this, its `sleep` runs for 60 s)."""
     deadline = time.monotonic() + timeout
     last = _pid_state(pid)
     while last is not None and time.monotonic() < deadline:
@@ -73,7 +73,7 @@ def _assert_gone(pid: int, label: str, timeout: float = 5.0) -> None:
     )
 
 
-def _wait_for(path: Path, timeout: float = 10.0) -> int:
+def _wait_for(path: Path, timeout: float = 60.0) -> int:
     """Block until *path* holds a pid and return it. The command writes the pid
     files itself, so a non-empty file means the member it names is up."""
     deadline = time.monotonic() + timeout
@@ -98,7 +98,7 @@ def test_sigterm_while_a_child_runs_kills_the_whole_group(tmp_path: Path) -> Non
         shell_pid = _wait_for(pid_file)
         sleep_pid = _wait_for(sleep_file)
         proc.send_signal(signal.SIGTERM)
-        code = proc.wait(timeout=10)
+        code = proc.wait(timeout=60)
         assert code == 128 + signal.SIGTERM, (
             f"the executor did not die on SIGTERM: exit {code}"
         )

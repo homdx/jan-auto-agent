@@ -94,7 +94,7 @@ def test_run_raw_still_runs_in_base_dir(tmp_path: Path) -> None:
         "from pathlib import Path\nPath(__file__).with_name('raw_marker.txt').write_text('raw')\n",
         encoding="utf-8",
     )
-    ex = Executor(base_dir=repo, workspace_root=tmp_path / "ws", timeout_sec=5)
+    ex = Executor(base_dir=repo, workspace_root=tmp_path / "ws", timeout_sec=60)  # not what is pinned
     result = ex.run_raw(f"{sys.executable} mark.py")
     assert result.passed, result.stderr
     # run_raw runs in base_dir: the marker lands next to mark.py in the repo.
