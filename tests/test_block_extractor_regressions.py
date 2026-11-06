@@ -242,3 +242,15 @@ def test_a_class_field_arrow_function_is_a_definition():
     assert "a + 1;" in block and "next" not in block
     # a plain field that is not an arrow function is not a definition of a function
     assert extract_block("class C {\n  value = 5;\n  other = 2;\n}\n", "value", ".ts") == ""
+
+
+def test_declaration_inside_a_block_comment_is_not_a_definition():
+    """AGNES-1 T79: `int proto(int a);` inside a `/* … */` comment names nothing the
+    file compiles, so it must not answer for `proto` — the real declaration, when there
+    is one, is still the one found."""
+    src = "/*\nint proto(int a);\n*/\nint other(void) { return 0; }\n"
+    assert extract_block(src, "proto", ".c") == ""
+    real = "/*\nint proto(int a);\n*/\nint proto(void) { return 0; }\n"
+    blk = extract_block(real, "proto", ".c")
+    assert "int proto(void) { return 0; }" in blk
+    assert "int proto(int a);" not in blk

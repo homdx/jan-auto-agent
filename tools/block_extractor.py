@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import functools
 import io
 import keyword
 import re
@@ -170,15 +171,41 @@ def _extract_python_block_fallback(source: str, target_name: str) -> str:
     while decorator_start > 0 and re.match(r"^\s*@\S+", lines[decorator_start - 1]):
         decorator_start -= 1
 
-    # Find the end of the signature (colon at paren depth zero).
+    # Find the end of the signature (colon at paren depth zero). A `#` starts a
+    # comment only outside a string literal, and brackets inside a string are not
+    # delimiters: `def f(x="a#b"):` and `def f(x="(", y="#"):` must both stop at
+    # their own `:` (AGNES-1 T89). String state carries across lines, so a
+    # multi-line triple-quoted default value keeps the scan inside the string.
     sig_depth = 0
     body_start_idx = None
     for i in range(start_idx, len(lines)):
         line = lines[i]
-        # Roughly ignore comments for signature scanning.
-        code_part = line.split("#", 1)[0]
-
-        for ch in code_part:
+        j = 0
+        n = len(line)
+        in_str = ""            # "", "'", '"', "'''" or '"""' — the open quote run
+        while j < n:
+            ch = line[j]
+            if in_str:
+                if ch == "\\":
+                    j += 2
+                    continue
+                if line.startswith(in_str, j):
+                    j += len(in_str)
+                    in_str = ""
+                    continue
+                j += 1
+                continue
+            if ch in "'\"":
+                # A triple-quoted string is a run of three quotes; otherwise one.
+                if line.startswith(ch * 3, j):
+                    in_str = ch * 3
+                    j += 3
+                else:
+                    in_str = ch
+                    j += 1
+                continue
+            if ch == "#":
+                break
             if ch in "([{":
                 sig_depth += 1
             elif ch in ")]}":
@@ -186,6 +213,7 @@ def _extract_python_block_fallback(source: str, target_name: str) -> str:
             elif ch == ":" and sig_depth == 0:
                 body_start_idx = i + 1
                 break
+            j += 1
         if body_start_idx is not None:
             break
 
@@ -247,7 +275,19 @@ def _lang_skip(source: str, i: int, lang: str) -> Optional[int]:
             nl = source.find("\n", nl + 1)
         return len(source) if nl < 0 else nl
     if lang == "js" and ch == "/" and source[i + 1:i + 2] not in ("/", "*") and _js_regex_can_start(source, i):
-        return _js_regex_end(source, i)
+        end = _js_regex_end(source, i)
+        if end is not None:
+            return end
+        # An unterminated regex literal (no closing `/` before the line ends) is a
+        # syntax error in real JS, but the scanner must not let its `{` inflate the
+        # brace count and run the block past the target's own `}`: read the rest of
+        # the line as one regex token and resume at the newline (AGNES-1 T93). A
+        # `/` followed by `>` is a JSX self-closing tag (`<input … />`), never a
+        # regex, and its `)` must still be seen by the brace scan.
+        if source[i + 1:i + 2] == ">":
+            return None
+        nl = source.find("\n", i)
+        return len(source) if nl < 0 else nl
     return None
 
 
@@ -292,6 +332,111 @@ def _js_regex_end(source: str, i: int) -> Optional[int]:
             return j
         j += 1
     return None
+
+
+@functools.lru_cache(maxsize=8)
+def _code_mask(source: str, lang: str = "") -> bytearray:
+    """A bytearray with 1 where *source[i]* is real code and 0 where it is inside a
+    comment, a string or a char literal — the lexer state machine of
+    `_brace_scan_end`, recorded as it walks. A candidate definition head whose
+    first character is 0 names nothing this file compiles, so it is not a
+    definition: `int proto(int a);` inside a `/* … */` comment is not the
+    declaration of `proto` (AGNES-1 T79). The skipped spans of `_lang_skip`
+    (a JS regex, a C preprocessor line, a Rust lifetime/char) are still code —
+    they are neither comments nor strings. Cached and read only: extracting many
+    symbols of one file walks it once."""
+    n = len(source)
+    code = bytearray(b"\x01") * n
+    state = "code"  # code, single, double, backtick, line_comment, block_comment, char
+    escape = False
+    i = 0
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+
+        if state == "line_comment":
+            code[i] = 0
+            if ch == "\n":
+                state = "code"
+            i += 1
+            continue
+
+        if state == "block_comment":
+            code[i] = 0
+            if ch == "*" and nxt == "/":
+                state = "code"
+                code[i + 1] = 0
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if state in {"single", "double", "backtick", "char"}:
+            code[i] = 0
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            quote = {"single": "'", "double": '"', "backtick": "`", "char": "'"}[state]
+            if ch == quote:
+                state = "code"
+            elif ch == "\n" and state != "backtick":
+                # Only a backtick string spans lines. A lone quote is a JSX text's `don't`
+                # or a regex the scan could not tell from a division; left open, it would
+                # hide every definition below it.
+                state = "code"
+                code[i] = 1
+            i += 1
+            continue
+
+        # code
+        if lang:
+            skip = _lang_skip(source, i, lang)
+            if skip is not None:
+                i = skip
+                continue
+        if ch == "/" and nxt == "/":
+            state = "line_comment"
+            code[i] = code[i + 1] = 0
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            state = "block_comment"
+            code[i] = code[i + 1] = 0
+            i += 2
+            continue
+        if ch == "'":
+            state = "single"
+            code[i] = 0
+            i += 1
+            continue
+        if ch == '"':
+            state = "double"
+            code[i] = 0
+            i += 1
+            continue
+        if ch == "`":
+            state = "backtick"
+            code[i] = 0
+            i += 1
+            continue
+        i += 1
+    return code
+
+
+def _iter_code_matches(pat: re.Pattern[str], source: str, code_mask: Optional[bytearray]):
+    """`pat.finditer(source)` restricted to candidate matches whose head starts in
+    real code — a head whose first character is inside a comment or a string is
+    skipped, because it names nothing the file defines (AGNES-1 T79). With no
+    *code_mask* every match is yielded, so a caller that does not filter keeps the
+    old behaviour."""
+    for match in pat.finditer(source):
+        if code_mask is None or code_mask[_effective_match_start(source, match.start())]:
+            yield match
 
 
 def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", close_ch: str = "}",
@@ -959,12 +1104,16 @@ def _find_earliest_genuine_definition(
     even when they'd have found the real, correctly-ordered definition.
     """
     patterns = _brace_candidate_patterns(target_name)
+    # AGNES-1 T79: a candidate head whose first character is inside a comment or a
+    # string is not a definition of anything this file compiles, so every pass
+    # shares one comment/string mask to reject such a match the moment it appears.
+    code_mask = _code_mask(source, lang)
     best_start = None
     best_match_start = None
     best_open_brace = None
 
     for pat in patterns:
-        for match in pat.finditer(source):
+        for match in _iter_code_matches(pat, source, code_mask):
             if _head_is_call(source, match, target_name):
                 # HARDEN-6 A: a call of the name written before the definition is not a head. It
                 # used to be accepted, and the brace search after its argument list walked past the
@@ -986,14 +1135,14 @@ def _find_earliest_genuine_definition(
         end = _brace_scan_end(source, best_open_brace, lang=lang)
         return (best_match_start, best_open_brace, end)
 
-    bodyless = _find_earliest_bodyless_definition(source, target_name, lang)
+    bodyless = _find_earliest_bodyless_definition(source, target_name, lang, code_mask)
     if bodyless is not None:
         return bodyless
 
     # HARDEN-6 B: a declaration that has no body at all (`int proto(int a);`,
     # `declare function f(x: number): void;`) used to answer "not found" — which Gate 1 reads as a
     # hallucination. Last of the three passes, so it can only turn a "not found" into a block.
-    declaration = _find_earliest_declaration(source, target_name, lang)
+    declaration = _find_earliest_declaration(source, target_name, lang, code_mask)
     if declaration is not None:
         return declaration
 
@@ -1001,12 +1150,13 @@ def _find_earliest_genuine_definition(
     # has no `const` and no `function` in front of it, and it is how handlers, reducers, route
     # tables and action maps are written. It is last of the four passes, so it can only turn a
     # "not found" into a found block.
-    prop = _find_earliest_property_arrow_definition(source, target_name, lang, typed_lang=typed_lang)
+    prop = _find_earliest_property_arrow_definition(source, target_name, lang, typed_lang=typed_lang,
+                                                    code_mask=code_mask)
     if prop is not None:
         return prop
 
     # EXTRACT-GAPS: the fifth pass, last for the same reason.
-    return _find_earliest_assigned_definition(source, target_name, lang, ext)
+    return _find_earliest_assigned_definition(source, target_name, lang, ext, code_mask)
 
 
 def _property_arrow_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
@@ -1289,7 +1439,8 @@ def _property_arrow_tail(source: str, match: "re.Match[str]") -> "tuple[int | No
 
 
 def _find_earliest_property_arrow_definition(
-    source: str, target_name: str, lang: str = "", typed_lang: bool = False
+    source: str, target_name: str, lang: str = "", typed_lang: bool = False,
+    code_mask: Optional[bytearray] = None,
 ) -> Optional[tuple]:
     """The earliest object-literal-property arrow definition of `target_name`
     (HARDEN-9 E, HARDEN-14 B2), as `(match_start, open_brace, end)`.
@@ -1305,6 +1456,9 @@ def _find_earliest_property_arrow_definition(
     order as the two passes above it, so a braced body always wins over a one-liner. Last of
     the four passes, so it can only turn a "not found" into a found block: every block that
     was found today is still found, from the same place.
+
+    *code_mask* is the shared comment/string mask (AGNES-1 T79): a head whose first
+    character is inside a comment or a string is skipped, because it names nothing.
     """
     best_start = None
     best_match_start = None
@@ -1312,7 +1466,7 @@ def _find_earliest_property_arrow_definition(
     best_end = None
 
     for pat in _property_arrow_candidate_patterns(target_name):
-        for match in pat.finditer(source):
+        for match in _iter_code_matches(pat, source, code_mask):
             if _head_is_call(source, match, target_name):
                 continue
             tail_start, head_typed = _property_arrow_tail(source, match)
@@ -1346,7 +1500,7 @@ def _find_earliest_property_arrow_definition(
     # The single-expression form: `save: (u) => persist(u)` has no `{` to scan to. The comma of the
     # object literal ends it, since it is not the property's body.
     for pat in _property_arrow_candidate_patterns(target_name):
-        for match in pat.finditer(source):
+        for match in _iter_code_matches(pat, source, code_mask):
             if _head_is_call(source, match, target_name):
                 continue
             tail_start, head_typed = _property_arrow_tail(source, match)
@@ -1375,20 +1529,23 @@ def _find_earliest_property_arrow_definition(
     return (best_match_start, None, best_end)
 
 
-def _find_earliest_bodyless_definition(source: str, target_name: str, lang: str = "") -> Optional[tuple]:
+def _find_earliest_bodyless_definition(source: str, target_name: str, lang: str = "",
+                                       code_mask: Optional[bytearray] = None) -> Optional[tuple]:
     """The earliest definition of `target_name` that has no braced body (HARDEN-4 D2), as
     `(match_start, None, end)` — the same tuple `_find_earliest_genuine_definition` returns, with
     `None` in the open-brace slot because there is none.
 
     Only reached when the braced search above found nothing at all, so it can only turn a "not
     found" into a found block; it never changes a block that was already being returned.
+
+    *code_mask* is the shared comment/string mask (AGNES-1 T79).
     """
     best_start = None
     best_match_start = None
     best_end = None
 
     for pat in _bodyless_candidate_patterns(target_name):
-        for match in pat.finditer(source):
+        for match in _iter_code_matches(pat, source, code_mask):
             has_arg_list = match.group(0).rstrip().endswith("(")
             end = _find_definition_end_bodyless(source, match.end(), has_arg_list, lang)
             if end is None:
@@ -1586,7 +1743,8 @@ def _find_definition_end_declaration(source: str, scan_from: int, has_arg_list: 
     return None
 
 
-def _find_earliest_declaration(source: str, target_name: str, lang: str = "") -> Optional[tuple]:
+def _find_earliest_declaration(source: str, target_name: str, lang: str = "",
+                               code_mask: Optional[bytearray] = None) -> Optional[tuple]:
     """The earliest declaration of `target_name` that has no body (HARDEN-6 B), as
     `(match_start, None, end)`.
 
@@ -1594,13 +1752,16 @@ def _find_earliest_declaration(source: str, target_name: str, lang: str = "") ->
     only turn a "not found" into a found block. A head whose prefix is a call's position is skipped
     here, which is what keeps `ambient(1);`, `return ambient(1);`, `const x = ambient(1);`,
     `x.ambient(1);` and `export default ambient(1);` at "not found".
+
+    *code_mask* is the shared comment/string mask (AGNES-1 T79): `int proto(int a);` inside a
+    `/* … */` comment names nothing, so it is not the declaration of `proto`.
     """
     best_start = None
     best_match_start = None
     best_end = None
 
     for pat in _declaration_candidate_patterns(target_name):
-        for match in pat.finditer(source):
+        for match in _iter_code_matches(pat, source, code_mask):
             has_arg_list = match.group(0).rstrip().endswith("(")
             found = _find_definition_end_declaration(source, match.end(), has_arg_list, lang)
             if found is None:
@@ -1806,12 +1967,13 @@ def _assigned_candidate_patterns(target_name: str) -> list:
     ]
 
 
-def _expression_bodied_end(source: str, target_name: str, ext: str) -> Optional[tuple]:
+def _expression_bodied_end(source: str, target_name: str, ext: str,
+                           code_mask: Optional[bytearray] = None) -> Optional[tuple]:
     """C# and Dart: `… Area(…) => expr;`, `… Name => expr;`, `… get full => expr;`."""
     name = re.escape(target_name)
     head = re.compile(rf"(?m)^[ \t]*(?P<prefix>[^\n();={{}}]{{0,200}}?[\w>\]?])[ \t]+{name}\b"
                       rf"[ \t]*(?:<[^<>\n]{{0,200}}>)?[ \t]*")
-    for m in head.finditer(source):
+    for m in _iter_code_matches(head, source, code_mask):
         words = m.group("prefix").split()
         if not words or words[-1] in _NOT_A_DECLARATION_WORDS or words[-1].endswith("."):
             continue
@@ -1831,14 +1993,14 @@ def _expression_bodied_end(source: str, target_name: str, ext: str) -> Optional[
     return None
 
 
-def _scala_def_end(source: str, target_name: str) -> Optional[tuple]:
+def _scala_def_end(source: str, target_name: str, code_mask: Optional[bytearray] = None) -> Optional[tuple]:
     """Scala: `def area(w: Int, h: Int): Int = w * h`, `def tw(x: Int) =` / `  x * 2`."""
     name = re.escape(target_name)
     head = re.compile(rf"(?m)^[ \t]*(?:(?:override|private|protected|final|implicit|inline|lazy|"
                       rf"abstract|sealed)(?:\[[^\]\n]*\])?[ \t]+)*def[ \t]+{name}\b[ \t]*"
                       rf"(?:\[[^\]\n]{{0,200}}\])?")
     n = len(source)
-    for m in head.finditer(source):
+    for m in _iter_code_matches(head, source, code_mask):
         j = _skip_space(source, m.end(), newlines=False)
         while source.startswith("(", j):
             j = _paren_end(source, j, "")
@@ -1864,19 +2026,19 @@ def _scala_def_end(source: str, target_name: str) -> Optional[tuple]:
 
 
 def _find_earliest_assigned_definition(source: str, target_name: str, lang: str = "",
-                                       ext: str = "") -> Optional[tuple]:
+                                       ext: str = "", code_mask: Optional[bytearray] = None) -> Optional[tuple]:
     """EXTRACT-GAPS: the fifth pass, `(match_start, None, end)` or None (see the note above)."""
     if not target_name or not re.fullmatch(r"[\w$]+", target_name):
         return None
     if ext in (".cs", ".dart"):
-        return _expression_bodied_end(source, target_name, ext)
+        return _expression_bodied_end(source, target_name, ext, code_mask)
     if ext in (".scala", ".sc"):
-        return _scala_def_end(source, target_name)
+        return _scala_def_end(source, target_name, code_mask)
     if lang != "js":
         return None
     best = None
     for pat, wrappers in _assigned_candidate_patterns(target_name):
-        for m in pat.finditer(source):
+        for m in _iter_code_matches(pat, source, code_mask):
             start = _effective_match_start(source, m.start())
             if best is not None and start >= best[0]:
                 continue

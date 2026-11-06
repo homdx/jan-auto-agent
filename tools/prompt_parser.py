@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import keyword
 import re
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -41,6 +42,33 @@ _PROSE_WORDS = frozenset((
     "behave", "behaves", "handle", "handles", "break", "breaks", "crash", "crashes", "wrong",
 ))
 _PROSE_WORD_RE = re.compile(r"\b(?:" + "|".join(sorted(_PROSE_WORDS, key=len, reverse=True)) + r")\b", re.IGNORECASE)
+
+
+#: The reserved words of the languages Strategy A's declaration keywords name
+#: (AGNES-1 T96). A reserved word names the language's grammar, never a
+#: definition, so `def return`, `function class` or `func type` is not a symbol
+#: request — the real symbol is found by the later strategies instead.
+_JS_RESERVED_WORDS = frozenset((
+    "await", "break", "case", "catch", "class", "const", "continue", "debugger",
+    "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally",
+    "for", "function", "if", "implements", "import", "in", "instanceof", "interface",
+    "let", "new", "null", "package", "private", "protected", "public", "return",
+    "static", "super", "switch", "this", "throw", "true", "try", "typeof", "var",
+    "void", "while", "with", "yield",
+))
+_GO_RESERVED_WORDS = frozenset((
+    "break", "case", "chan", "const", "continue", "default", "defer", "else",
+    "fallthrough", "for", "func", "go", "goto", "if", "import", "interface",
+    "map", "package", "range", "return", "select", "struct", "switch", "type", "var",
+))
+#: declaration keyword → the reserved words of the language it introduces.
+#: `class` is shared by Python and JS, so either language's words are refused.
+_RESERVED_AFTER_KEYWORD = {
+    "def": frozenset(keyword.kwlist),
+    "func": _GO_RESERVED_WORDS,
+    "function": _JS_RESERVED_WORDS,
+    "class": frozenset(keyword.kwlist) | _JS_RESERVED_WORDS,
+}
 
 
 #: Nouns that name what the user wants done rather than a symbol: "fix bug in a.py", "fix error
@@ -86,6 +114,14 @@ def _declaration_head_is_a_symbol(remainder: str, match: "re.Match[str]", source
     an unverifiable match is not a rejection.
     """
     name = re.escape(match.group(2))
+    if (match.group(2) in _RESERVED_AFTER_KEYWORD.get(match.group(1), ())
+            and not re.search(r'(?m)^[ \t]*(?:def|class|function|func)[ \t]+' + name + r'\b', source)):
+        # AGNES-1 T96: a reserved word after the declaration keyword names the
+        # grammar, not a definition — `def return`, `function class`, `func type`.
+        # The later strategies find the real symbol (or none), and a non-keyword
+        # name absent from the source is still accepted below. A word reserved only
+        # in another language is a name when this source defines it: `class function:`.
+        return False
     if not source:
         # Nothing to verify against, so the name cannot be looked up: a prose word after the keyword
         # ("function return", "class represent") is a verb, a code reference (`def f(`, `class A:`)
