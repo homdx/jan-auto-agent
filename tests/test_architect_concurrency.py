@@ -502,3 +502,21 @@ class TestProbeSafety:
         assert fake.peak >= 2, f"expected overlap when probe unusable, got peak={fake.peak}"
         assert fake.peak <= 3, f"expected peak <= 3, got peak={fake.peak}"
         assert len(results) == 3
+
+
+# ── Shipped profiles ────────────────────────────────────────────────────────
+
+_PROFILES = sorted(Path(__file__).resolve().parent.parent.glob("agents*.ini"))
+
+
+def test_the_shipped_profiles_are_found():
+    assert len(_PROFILES) >= 9, [p.name for p in _PROFILES]
+
+
+@pytest.mark.parametrize("profile", _PROFILES, ids=[p.name for p in _PROFILES])
+def test_a_shipped_profile_plans_with_three_parallel_requests(profile: Path):
+    """Every profile ships the same ceiling, and its probe does not turn it back to serial."""
+    cfg = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
+    cfg.read(profile, encoding="utf-8")
+    assert _reviewer(cfg)._max_parallel_requests == 3
+    assert cfg.getboolean("architect", "probe_enabled") is False
