@@ -30,6 +30,54 @@ def load_scenarios(path: Path):
     return mod
 
 
+def _move_aside(out_path: Path, why: str) -> None:
+    """Warn and move a damaged `results.json` to a free `.corrupt` name, so it can still be read."""
+    corrupt = out_path.with_name(out_path.name + ".corrupt")
+    n = 1
+    while corrupt.exists():
+        corrupt = out_path.with_name(f"{out_path.name}.corrupt.{n}")
+        n += 1
+    try:
+        os.replace(out_path, corrupt)
+    except OSError:
+        pass
+    print(f"WARNING: {out_path} {why}; moved to {corrupt} and starting from empty results",
+          file=sys.stderr)
+
+
+def _load_results(out_path: Path) -> dict:
+    """The merged results, or `{}` when the file is absent or unreadable.
+
+    A truncated or otherwise corrupt `results.json` used to raise out of
+    `json.loads` and block every rerun. Now it is moved aside and the run starts
+    from empty results — a broken artifact degrades to "no results yet", never an exit.
+    """
+    if not out_path.exists():
+        return {}
+    try:
+        loaded = json.loads(out_path.read_text())
+    except (OSError, ValueError) as exc:
+        _move_aside(out_path, f"is not readable JSON ({exc})")
+        return {}
+    if not isinstance(loaded, dict):
+        _move_aside(out_path, "is not a JSON object")
+        return {}
+    return loaded
+
+
+def _write_results(out_path: Path, results: dict) -> None:
+    """Write *results* atomically: a reader never sees a half-written file."""
+    tmp = out_path.with_name(out_path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(results, indent=1, default=str))
+        os.replace(tmp, out_path)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wt", required=True, help="directory holding one worktree per entrant")
@@ -47,7 +95,7 @@ def main():
     names = [f for f in a.filters if f not in ALL] or sorted(p.name for p in WT.iterdir() if p.is_dir())
     scen_names = only or ALL
     out_path = Path(a.out)
-    results = json.loads(out_path.read_text()) if out_path.exists() else {}
+    results = _load_results(out_path)
     t0 = time.time()
     for n in names:
         results.setdefault(n, {})
@@ -71,7 +119,7 @@ def main():
             ok = sum(1 for c in res["checks"] if c["ok"]); tot = len(res["checks"])
             err = ("  ERROR: " + res["error"].strip().splitlines()[-1][:100]) if res.get("error") else ""
             print(f"{n:12s} {sc:44s} {ok:2d}/{tot:2d}{err}", flush=True)
-        out_path.write_text(json.dumps(results, indent=1, default=str))
+        _write_results(out_path, results)
     print(f"done in {time.time() - t0:.0f}s → {out_path}")
 
 

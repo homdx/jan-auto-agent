@@ -289,14 +289,21 @@ def _tickets(tasks_dir, at=None) -> list:
     """
     tasks_dir = Path(tasks_dir)
     if at:
-        names = [name.rsplit("/", 1)[-1]
+        # `ls-tree -r` names a nested ticket by its path under the folder
+        # (`epic-tasks/sub/007-fix.md`). Keep that path relative to *tasks_dir*
+        # so `git show` reads the nested body, and match `_TICKET_RE` on the
+        # basename: the anchored pattern cannot match a name that still holds
+        # the slashes.
+        prefix = Path(tasks_dir).name + "/"
+        names = [name[len(prefix):] if name.startswith(prefix) else name
                  for name in _tree_names(tasks_dir.parent, at, Path(tasks_dir).name,
                                          recursive=True)]
     else:
+        # A disk listing stays flat: `glob` does not descend into subfolders.
         names = [path.name for path in tasks_dir.glob("*.md")]
     found = []
     for name in names:
-        match = _TICKET_RE.match(name)
+        match = _TICKET_RE.match(name.rsplit("/", 1)[-1])
         if match:
             body = _ticket_body(tasks_dir, name, at)
             found.append((int(match.group(1)), tasks_dir / name, _status_of(body), body))

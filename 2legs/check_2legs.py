@@ -37,19 +37,43 @@ def _run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
-def _winners(target: Path) -> dict[int, tuple[str, str]]:
+def _winners(target: Path) -> tuple[dict[int, tuple[str, str]], list[str]]:
+    """`(round -> (agent, sha), malformed rows)` read from `contest-out/winners.txt`.
+
+    A blank line, a row without exactly three fields or a round that is not a
+    number used to raise `ValueError` out of the checker and hide the whole
+    run. The valid rows are still kept, and every malformed row is returned as
+    a line the caller reports as FAIL: corrupt winner data must not hide a
+    failed contest.
+    """
     path = target / "contest-out" / "winners.txt"
     out: dict[int, tuple[str, str]] = {}
-    if path.is_file():
-        for line in path.read_text().splitlines():
-            n, agent, sha = line.split()
-            out[int(n)] = (agent, sha)
-    return out
+    malformed: list[str] = []
+    if not path.is_file():
+        return out, malformed
+    try:
+        lines = path.read_text().splitlines()
+    except (OSError, UnicodeError) as exc:
+        return out, [f"cannot read {path}: {exc}"]
+    for number, line in enumerate(lines, 1):
+        fields = line.split()
+        if len(fields) != 3:
+            malformed.append(f"line {number} has {len(fields)} field(s), expected 3: {line!r}")
+            continue
+        try:
+            n = int(fields[0])
+        except ValueError:
+            malformed.append(f"line {number} round is not a number: {line!r}")
+            continue
+        out[n] = (fields[1], fields[2])
+    return out, malformed
 
 
 def checks(target: Path) -> list[tuple[bool, str]]:
     res: list[tuple[bool, str]] = []
-    winners = _winners(target)
+    winners, malformed = _winners(target)
+    for problem in malformed:
+        res.append((False, f"contest-out/winners.txt: {problem}"))
 
     for n, sub in ROUNDS.items():
         state = target / "contest-out" / sub / "state.json"
@@ -72,10 +96,19 @@ def checks(target: Path) -> list[tuple[bool, str]]:
             res.append((False, f"leg {n}: no winner recorded in contest-out/winners.txt"))
 
     beh = _run([sys.executable, "-c", _BEHAVIOUR], target)
+    detail = ""
+    if beh.returncode != 0:
+        err_lines = beh.stderr.strip().splitlines()
+        detail = f" — {err_lines[-1] if err_lines else 'no stderr'}"
     res.append((beh.returncode == 0, "Calc: __repr__ and __eq__ behave as tickets demand"
-                + ("" if beh.returncode == 0 else f" — {beh.stderr.strip().splitlines()[-1]}")))
+                + detail))
 
-    tests = (target / "tests" / "test_calc.py").read_text()
+    tests_path = target / "tests" / "test_calc.py"
+    try:
+        tests = tests_path.read_text()
+    except (OSError, UnicodeError):
+        res.append((False, "tests/test_calc.py: cannot read it (the tickets demand it)"))
+        tests = ""
     for name in ("test_repr", "test_eq"):
         res.append((re.search(rf"^def {name}\b", tests, re.M) is not None,
                     f"tests/test_calc.py defines {name}"))
@@ -92,10 +125,18 @@ def checks(target: Path) -> list[tuple[bool, str]]:
 
 
 def main(argv: list[str]) -> int:
+    usage = __doc__.split("Usage:")[1].split("\n")[0].strip()
     if len(argv) != 1:
-        print(__doc__.split("Usage:")[1].split("\n")[0].strip(), file=sys.stderr)
+        print(usage, file=sys.stderr)
         return 2
-    results = checks(Path(argv[0]).resolve())
+    target = Path(argv[0]).resolve()
+    if not target.is_dir():
+        # Every check runs a subprocess with cwd=target, so a missing target
+        # used to raise FileNotFoundError before the first line was printed.
+        print(f"no such directory: {argv[0]}", file=sys.stderr)
+        print(usage, file=sys.stderr)
+        return 2
+    results = checks(target)
     for ok, msg in results:
         print(f"{'PASS' if ok else 'FAIL'}  {msg}")
     failed = sum(not ok for ok, _ in results)

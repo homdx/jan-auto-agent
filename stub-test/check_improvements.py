@@ -116,7 +116,10 @@ def parse_improvements(path: Path) -> list[dict]:
 
 
 _GT_SECTION_RE = re.compile(
-    r"^##\s*(?:Bucket\s*\d+\s*[—\-–]\s*)?.*FALSE POSITIVE.*?\n(.*?)(?=^##\s|\Z)",
+    # The heading line only: `[^\n]*` keeps a greedy match from running past
+    # the first `## Bucket N — FALSE POSITIVE` into a later one, which under
+    # DOTALL made two sections read as one.
+    r"^##[^\n]*FALSE POSITIVE[^\n]*\n(.*?)(?=^##\s|\Z)",
     re.MULTILINE | re.DOTALL,
 )
 _GT_ROW_ID_RE = re.compile(r"^T(\d+)(?:/T(\d+))*$")
@@ -132,35 +135,38 @@ def _parse_ground_truth_table(text: str) -> list[dict]:
     function's job is to answer "which candidate IDs does the ground
     truth confirm as true false positives", not to catalogue everything.
     """
-    section_match = _GT_SECTION_RE.search(text)
-    if not section_match:
+    # Every FALSE POSITIVE section, not only the first: a ground-truth file may
+    # split the confirmed positives over several `## Bucket N — ...` headings.
+    sections = list(_GT_SECTION_RE.finditer(text))
+    if not sections:
         return []
 
     tasks = []
-    for line in section_match.group(1).splitlines():
-        line = line.strip()
-        if not line.startswith("|"):
-            continue
-        cells = [cell.strip() for cell in line.strip("|").split("|")]
-        if len(cells) < 3:
-            continue
-        m = _GT_ROW_ID_RE.match(cells[0])
-        if not m:
-            continue  # header row ("ID"), separator row ("----"), etc.
+    for section_match in sections:
+        for line in section_match.group(1).splitlines():
+            line = line.strip()
+            if not line.startswith("|"):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+            m = _GT_ROW_ID_RE.match(cells[0])
+            if not m:
+                continue  # header row ("ID"), separator row ("----"), etc.
 
-        ids = re.findall(r"T(\d+)", cells[0])
-        location, reason = cells[1], cells[2]
-        target_files = _normalise_files(location) | _normalise_files(reason)
+            ids = re.findall(r"T(\d+)", cells[0])
+            location, reason = cells[1], cells[2]
+            target_files = _normalise_files(location) | _normalise_files(reason)
 
-        for num in ids:
-            tasks.append({
-                "id":           f"AUTO-T{num}",
-                "title":        location,
-                "location":     location,
-                "target_files": target_files,
-                "reason":       reason[:200],
-                "instruction":  "",
-            })
+            for num in ids:
+                tasks.append({
+                    "id":           f"AUTO-T{num}",
+                    "title":        location,
+                    "location":     location,
+                    "target_files": target_files,
+                    "reason":       reason[:200],
+                    "instruction":  "",
+                })
     return tasks
 
 

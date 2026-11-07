@@ -14,14 +14,24 @@ Two bugs, both in check_improvements.py's ground-truth handling:
    rows (`T3/T5`) that real GROUND-TRUTH.md files use — silently treating
    the whole file as empty.
 """
+import importlib.util
 import sys
 from pathlib import Path
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from check_improvements import find_false_positive, _parse_ground_truth_table
+
+
+def _load(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def test_title_fallback_matches_when_only_one_side_has_target_files():
@@ -97,3 +107,25 @@ def test_ground_truth_table_still_parses_plain_heading():
     )
     tasks = _parse_ground_truth_table(text)
     assert [t["id"] for t in tasks] == ["AUTO-T1"]
+
+
+_TWO_SECTIONS = (
+    "## Bucket 1 \u2014 FALSE POSITIVE a\n\n"
+    "| ID | Location | Reason |\n"
+    "|----|----------|--------|\n"
+    "| T1 | a.py:1 | first bucket |\n"
+    "\n"
+    "## Bucket 2 \u2014 FALSE POSITIVE b\n\n"
+    "| ID | Location | Reason |\n"
+    "|----|----------|--------|\n"
+    "| T2 | b.py:2 | second bucket |\n"
+)
+
+
+@pytest.mark.parametrize("rel", ["check_improvements.py",
+                                 "stub-test/check_improvements.py"])
+def test_every_false_positive_section_is_read(rel):
+    """The greedy `.*` under DOTALL matched the last heading, hiding the first."""
+    mod = _load(PROJECT_ROOT / rel, "ci_two_sections_" + rel.replace("/", "_"))
+    assert [t["id"] for t in mod._parse_ground_truth_table(_TWO_SECTIONS)] == [
+        "AUTO-T1", "AUTO-T2"]

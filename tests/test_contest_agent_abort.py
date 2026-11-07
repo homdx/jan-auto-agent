@@ -63,7 +63,11 @@ def _gone(pid):
         os.kill(pid, 0)
     except ProcessLookupError:
         return True
-    os.killpg(pid, signal.SIGKILL)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        # The process exited between the two calls: that is gone, not a failure.
+        return True
     return False
 
 
@@ -93,6 +97,25 @@ def test_the_runners_terminate_kills_the_command_the_agent_runs(tmp_path):
         if agent.poll() is None:
             agent.kill()
             agent.wait()
+
+
+def test_gone_counts_a_process_that_exits_between_the_two_calls(monkeypatch):
+    """AUTO-T17: the process can exit after the liveness check.
+
+    `start_new_session` makes the command its own group leader, so the second
+    call is `killpg`; when the process exits in that window `killpg` raises
+    `ProcessLookupError`. That is gone, not a test failure.
+    """
+    calls = []
+    monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+
+    def killpg(pid, sig):
+        calls.append((pid, sig))
+        raise ProcessLookupError
+    monkeypatch.setattr(os, "killpg", killpg)
+
+    assert _gone(424242) is True
+    assert calls == [(424242, signal.SIGKILL)]
 
 
 def test_a_terminate_while_the_command_starts_still_kills_it(tmp_path):
