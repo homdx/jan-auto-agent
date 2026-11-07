@@ -19,7 +19,7 @@ branch, so a trailing slash is harmless regardless of api_format.
 
 from __future__ import annotations
 
-from tools.llm_stream import build_chat_request
+from tools.llm_stream import build_chat_request, ollama_chat_url
 
 
 class TestOpenAIBranchTrailingSlash:
@@ -77,3 +77,62 @@ class TestOpenAIBranchTrailingSlash:
             system="s", user_msg="u", think=False,
         )
         assert url_with_slash == url_without_slash
+
+
+class TestOllamaBranchUrlNormalization:
+    """Ollama's /api/chat endpoint must be reached regardless of trailing
+    slash on base_url. A bare /chat (the old broken behaviour) is wrong."""
+
+    def test_ollama_chat_url_strips_trailing_slash(self):
+        assert ollama_chat_url("http://localhost:11434/") == "http://localhost:11434/api/chat"
+
+    def test_ollama_chat_url_without_trailing_slash(self):
+        assert ollama_chat_url("http://localhost:11434") == "http://localhost:11434/api/chat"
+
+    def test_ollama_chat_url_never_produces_bare_chat(self):
+        """Normalisation must append /api/chat, not /chat (the pre-fix bug)."""
+        for base in ("http://localhost:11434/", "http://localhost:11434",
+                     "http://localhost:11434//"):
+            url = ollama_chat_url(base)
+            assert url == "http://localhost:11434/api/chat", f"{base!r} -> {url!r}"
+            assert "/chat" not in url.replace("/api/chat", ""), f"{base!r} -> {url!r}"
+
+    def test_build_chat_request_ollama_normalises_trailing_slash(self):
+        url, _, _ = build_chat_request(
+            base_url="http://localhost:11434/", api_key="k", model="m",
+            api_format="ollama", temperature=0.1, max_tokens=100,
+            system="s", user_msg="u",
+        )
+        assert url == "http://localhost:11434/api/chat"
+
+    def test_build_chat_request_ollama_normalises_no_trailing_slash(self):
+        url, _, _ = build_chat_request(
+            base_url="http://localhost:11434", api_key="k", model="m",
+            api_format="ollama", temperature=0.1, max_tokens=100,
+            system="s", user_msg="u",
+        )
+        assert url == "http://localhost:11434/api/chat"
+
+
+class TestOllamaBranchTrailingSlash:
+    """T43: the Ollama branch normalises the base URL to the real
+    ``/api/chat`` endpoint — a bare host and one with a trailing slash must
+    agree, and the result must be the full ``/api/chat`` path, never the
+    broken ``/chat`` that an over-eager strip used to produce."""
+
+    def test_both_base_urls_normalise_to_api_chat(self):
+        for base_url in ("http://localhost:11434", "http://localhost:11434/"):
+            url, _, _ = build_chat_request(
+                base_url=base_url, api_key="ollama", model="m",
+                api_format="ollama", temperature=0.1, max_tokens=100,
+                system="s", user_msg="u",
+            )
+            assert url == "http://localhost:11434/api/chat", base_url
+
+    def test_result_is_not_the_broken_chat_path(self):
+        url, _, _ = build_chat_request(
+            base_url="http://localhost:11434/", api_key="ollama", model="m",
+            api_format="ollama", temperature=0.1, max_tokens=100,
+            system="s", user_msg="u",
+        )
+        assert url != "http://localhost:11434/chat"

@@ -29,6 +29,7 @@ import http.server
 import json
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -55,13 +56,28 @@ class _NonStreamHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+@contextmanager
 def _serve_once(body):
+    """Serve one scripted body; the teardown closes the listening socket,
+    not merely stops serving it.
+
+    T33: `shutdown()` alone leaves the socket's fileno nonnegative (the
+    descriptor stays open until the object is collected), while
+    `server_close()` releases it — the teardown asserts that, so a test
+    that leaks its socket fails loudly instead of hiding the leak.
+    """
     handler_cls = type("Handler", (_NonStreamHandler,), {"body": body})
     server = http.server.HTTPServer(("127.0.0.1", 0), handler_cls)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    return server, port
+    try:
+        yield server, port
+    finally:
+        server.shutdown()
+        assert server.fileno() >= 0, "shutdown must leave the listening socket open"
+        server.server_close()
+        assert server.fileno() == -1, "server_close must release the listening socket"
 
 
 class TestExtractContentNullMessage:
@@ -120,8 +136,7 @@ class TestNullMessageEndToEnd:
         """HTTP 200 + `"message": null` must surface as the same descriptive
         ValueError class as the other parse failures — not as a raw
         TypeError from inside the hot path."""
-        server, port = _serve_once({"message": None, "done": True})
-        try:
+        with _serve_once({"message": None, "done": True}) as (server, port):
             with pytest.raises(ValueError) as excinfo:
                 request_completion(
                     f"http://127.0.0.1:{port}/api/chat",
@@ -130,14 +145,11 @@ class TestNullMessageEndToEnd:
                     timeout=5, stream=False, api_format="ollama",
                     error_retries=0, error_retry_wait_sec=0,
                 )
-        finally:
-            server.shutdown()
         assert not isinstance(excinfo.value, TypeError)
         assert "message" in str(excinfo.value)
 
     def test_openai_format_end_to_end(self):
-        server, port = _serve_once({"choices": [{"message": None}]})
-        try:
+        with _serve_once({"choices": [{"message": None}]}) as (server, port):
             with pytest.raises(ValueError) as excinfo:
                 request_completion(
                     f"http://127.0.0.1:{port}/v1/chat/completions",
@@ -146,16 +158,13 @@ class TestNullMessageEndToEnd:
                     timeout=5, stream=False, api_format="openai",
                     error_retries=0, error_retry_wait_sec=0,
                 )
-        finally:
-            server.shutdown()
         assert not isinstance(excinfo.value, TypeError)
         assert "message" in str(excinfo.value)
 
     def test_good_response_still_returns_text(self):
-        server, port = _serve_once(
+        with _serve_once(
             {"message": {"role": "assistant", "content": "fine"}, "done": True}
-        )
-        try:
+        ) as (server, port):
             result = request_completion(
                 f"http://127.0.0.1:{port}/api/chat",
                 {"Content-Type": "application/json"},
@@ -163,6 +172,4 @@ class TestNullMessageEndToEnd:
                 timeout=5, stream=False, api_format="ollama",
                 error_retries=0, error_retry_wait_sec=0,
             )
-        finally:
-            server.shutdown()
         assert result == "fine"

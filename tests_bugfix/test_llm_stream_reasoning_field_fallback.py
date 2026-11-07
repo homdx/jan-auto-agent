@@ -176,6 +176,31 @@ class TestReasoningFieldFallback:
             server.shutdown()
         assert handler_cls.request_count == 2
 
+    def test_two_identical_400s_with_zero_retries_make_two_requests(self):
+        """T44: the SAME reasoning 400 twice, with error_retries=0 (fail-fast
+        opt-out), still makes exactly two requests — the strip is a
+        payload-shape fix orthogonal to the retry budget — the second
+        payload omits reasoning, and the final RuntimeError names HTTP 400."""
+        server, port, handler_cls = _serve_script([
+            ("error", 400, _GEMINI_400_BODY, {}),
+            ("error", 400, _GEMINI_400_BODY, {}),
+        ])
+        try:
+            with pytest.raises(RuntimeError, match="HTTP 400"):
+                request_completion(
+                    f"http://127.0.0.1:{port}/v1beta/openai/chat/completions",
+                    {"Content-Type": "application/json"},
+                    {"model": "gemini-x", "messages": [],
+                     "reasoning": {"effort": "low", "exclude": True}},
+                    timeout=5, stream=False, api_format="openai",
+                    error_retries=0,
+                )
+        finally:
+            server.shutdown()
+        assert handler_cls.request_count == 2
+        assert "reasoning" in handler_cls.received_bodies[0]
+        assert "reasoning" not in handler_cls.received_bodies[1]
+
     def test_400_without_reasoning_field_in_payload_is_not_touched(self):
         """A 400 that mentions 'reasoning' in its error text but whose
         OUTGOING payload never had a 'reasoning' key must not loop or

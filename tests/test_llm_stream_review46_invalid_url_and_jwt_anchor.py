@@ -49,6 +49,17 @@ def test_a_jwt_is_masked_whatever_letter_it_is_glued_to(prefix):
     assert masked.startswith(prefix)
 
 
+@pytest.mark.parametrize("suffix", ["токен", "é", "ключ:", "!", " ", ",", ""])
+def test_a_jwt_is_masked_whatever_it_is_glued_to(suffix):
+    """T24: a JWT whose run is followed by a Cyrillic letter, an accented
+    letter, punctuation or a space must still be masked — the base64url run
+    ends where the non-ASCII/non-word character starts, so the run itself
+    is a JWT regardless of what comes after it."""
+    masked = mask_api_key(f"{_JWT}{suffix}")
+    assert "eyJ" not in masked
+    assert masked.endswith(suffix)
+
+
 def test_a_dotted_name_after_a_cyrillic_word_is_not_taken_for_a_jwt():
     line = "смотри config.section.key_name"
     assert mask_api_key(line) == line

@@ -181,7 +181,7 @@ class TestUnusableButWellFormedJsonIsNotRetried:
         retries = []
         server, port = _serve(json.dumps({"message": None}).encode())
         try:
-            with pytest.raises(ValueError):
+            with pytest.raises(ValueError) as excinfo:
                 request_completion(
                     f"http://127.0.0.1:{port}/api/chat",
                     _HEADERS, _PAYLOAD, timeout=5, stream=False,
@@ -192,6 +192,10 @@ class TestUnusableButWellFormedJsonIsNotRetried:
         finally:
             server.shutdown()
         assert len(retries) == 0, retries
+        # T32: the descriptive error names the problem, so an operator can
+        # tell a null-message reply apart from an unreadable body.
+        assert "message" in str(excinfo.value)
+        assert "is not a JSON object" in str(excinfo.value)
 
 
 class TestUtf8Bom:

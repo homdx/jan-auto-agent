@@ -89,6 +89,16 @@ def _trickled_body(h):
         time.sleep(0.2)
 
 
+def _slow_initial_head(h):
+    """A server that accepts the connection and stalls before sending the
+    HTTP response head, so the client's read of the status line waits until
+    the socket timeout the deadline imposed (T23)."""
+    end = time.monotonic() + RUNS
+    while time.monotonic() < end:
+        time.sleep(0.2)
+    _stream_head(h)
+
+
 @pytest.mark.parametrize("handler, stream, what", [
     (_keepalive, True, "the stream"),
     (_slow_tokens, True, "the stream"),
@@ -102,6 +112,30 @@ def test_a_reply_that_keeps_coming_stops_at_the_deadline(handler, stream, what):
             llm_stream.request_completion(url, {"Content-Type": "application/json"}, PAYLOAD, 10, stream=stream,
                                           error_retries=0, deadline=time.monotonic() + 0.5)
         assert time.monotonic() - t0 < RUNS / 3
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_a_slow_initial_header_ends_at_the_deadline():
+    """T23: the deadline bounds the connect/header read too. A server that
+    accepts the connection and never sends the response head makes the
+    socket read time out; with a deadline the timeout is the time left, so
+    the call ends at the deadline with the transport TimeoutError — not
+    with a "deadline reached" RuntimeError, which the word `deadline`
+    appearing in the message would tell us happened."""
+    srv, url = _serve(_slow_initial_head)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(RuntimeError) as exc:
+            llm_stream.request_completion(url, {"Content-Type": "application/json"}, PAYLOAD, 10,
+                                          stream=True, error_retries=0,
+                                          deadline=time.monotonic() + 0.5)
+        msg = str(exc.value)
+        assert "TimeoutError" in msg, msg
+        assert "timed out" in msg, msg
+        assert "deadline" not in msg, msg
+        assert time.monotonic() - t0 < RUNS / 6
     finally:
         srv.shutdown()
         srv.server_close()

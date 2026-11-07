@@ -29,6 +29,7 @@ import http.server
 import json
 import sys
 import threading
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -137,11 +138,20 @@ class TestNonJsonBodyUsesTheRetryLadder:
             "budget without changing the outcome"
         )
 
-    def test_truly_unreachable_host_still_retries(self):
-        """Sanity: the original networking path must keep using the ladder."""
+    def test_truly_unreachable_host_still_retries(self, monkeypatch):
+        """Sanity: the original networking path must keep using the ladder.
+
+        No port is guaranteed closed on a shared machine, so the failure is
+        injected: urlopen itself raises ConnectionError, exactly as it does
+        against an unreachable host — and it must be retried like a dropped
+        connection, not raised raw (T31)."""
+        def _refused(req, timeout=None, context=None):
+            raise ConnectionError("connection refused")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _refused)
         with pytest.raises(RuntimeError) as exc_info:
             request_completion(
-                "http://127.0.0.1:9/v1/chat/completions",
+                "http://127.0.0.1:1/v1/chat/completions",
                 {"Content-Type": "application/json"},
                 PAYLOAD,
                 timeout=1, stream=False, api_format="openai",

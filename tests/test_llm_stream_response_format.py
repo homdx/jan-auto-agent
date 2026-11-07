@@ -357,6 +357,30 @@ class TestResponseFormat400Fallback:
             server.shutdown()
         assert handler_cls.request_count == 2
 
+    def test_two_identical_rejections_make_two_requests_and_second_omits_field(self):
+        """T25: the SAME response_format 400 twice — not an unrelated error
+        on the retry — must still make exactly two requests (one strip, one
+        honest retry), the second payload must have no response_format, and
+        the final RuntimeError must name HTTP 400."""
+        server, port, handler_cls = _serve_script([
+            ("error", 400, _REJECT_RESPONSE_FORMAT_400, {}),
+            ("error", 400, _REJECT_RESPONSE_FORMAT_400, {}),
+        ])
+        try:
+            with pytest.raises(RuntimeError, match="HTTP 400"):
+                request_completion(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    {"Content-Type": "application/json"},
+                    {"model": "m", "messages": [],
+                     "response_format": {"type": "json_object"}},
+                    timeout=5, stream=False, api_format="openai",
+                )
+        finally:
+            server.shutdown()
+        assert handler_cls.request_count == 2
+        assert "response_format" in handler_cls.received_bodies[0]
+        assert "response_format" not in handler_cls.received_bodies[1]
+
     def test_400_without_response_format_in_payload_is_not_touched(self):
         """A 400 whose OUTGOING payload never had response_format/format
         must not be treated as a JSON-mode rejection — raises normally."""

@@ -74,7 +74,13 @@ def _sse_no_done(chunks) -> bytes:
 
 
 class _Response:
-    """A minimal HTTPResponse stand-in that iterates lines and can read()."""
+    """A minimal HTTPResponse stand-in that iterates lines and can read().
+
+    read1() is random-access, not consuming: a second call with the same n
+    returns the same bytes, as io.BytesIO does — the stand-in is not a
+    stream that advances. n=0 asks for nothing and returns b'' (EOF probe),
+    never the whole body.
+    """
 
     def __init__(self, body: bytes, *, raises_on_read=None,
                  raises_on_iter_after=0, raises_on_iter=None):
@@ -114,7 +120,9 @@ class _Response:
     def read1(self, n=-1):
         if self._raises_on_read is not None:
             raise self._raises_on_read
-        return self._body[:n] if n > 0 else self._body
+        if n < 0:
+            return self._body
+        return self._body[:n]
 
 
 class FakeUrlopen:
@@ -287,6 +295,45 @@ class TestTheGoodShapesReturn:
                                   _sleep_fn=lambda w: None)
         assert text == ""
         assert len(f.sent) == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# T78 — the _Response stand-in's read1 is honest about the sizes it agrees on
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestResponseRead1Sizes:
+    """_Response.read1 must agree with io.BytesIO on the sizes the real
+    code path depends on: read1(0) is an EOF probe returning b'', a short
+    n returns that many bytes, a large n (or n=-1) returns the whole body,
+    and — unlike a consuming stream — a second call with the same n returns
+    the same bytes."""
+
+    _BODY = b"0123456789"
+
+    def test_read1_zero_is_empty_bytes(self):
+        """io.BytesIO.read1(0) is b'' — the fake must not hand back the
+        whole body when asked for nothing (the old shape did)."""
+        assert _Response(self._BODY).read1(0) == b""
+
+    def test_read1_short_n_returns_that_many_bytes(self):
+        assert _Response(self._BODY).read1(3) == b"012"
+
+    def test_read1_exact_length_returns_whole_body(self):
+        assert _Response(self._BODY).read1(len(self._BODY)) == self._BODY
+
+    def test_read1_beyond_length_returns_whole_body(self):
+        assert _Response(self._BODY).read1(len(self._BODY) + 100) == self._BODY
+
+    def test_read1_negative_one_returns_whole_body(self):
+        assert _Response(self._BODY).read1(-1) == self._BODY
+
+    def test_read1_does_not_consume(self):
+        """The stand-in is random-access, not a consuming stream: repeated
+        read1 calls with the same n return the same bytes, as io.BytesIO
+        does — the fake never claims to be a stream that advances."""
+        resp = _Response(self._BODY)
+        assert resp.read1(5) == b"01234"
+        assert resp.read1(5) == b"01234"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

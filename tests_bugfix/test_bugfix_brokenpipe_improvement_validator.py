@@ -46,6 +46,30 @@ class _BrokenStdout(io.StringIO):
         pass
 
 
+class _BrokenStdoutAfter(io.StringIO):
+    """Stdout stand-in whose write() raises BrokenPipeError from the Nth call
+    on — the pipe closes mid-stream, after N-1 tokens were printed fine."""
+    def __init__(self, break_at: int):
+        super().__init__()
+        self._writes = 0
+        self._break_at = break_at
+
+    def write(self, s: str) -> int:
+        self._writes += 1
+        if self._writes >= self._break_at:
+            raise BrokenPipeError("pipe closed")
+        return super().write(s)
+
+    def flush(self) -> None:
+        pass
+
+
+def _split_tokens(text: str, width: int = 4) -> list[str]:
+    """Chunk *text* into fixed-width tokens, as a streamed reply would
+    arrive on the wire."""
+    return [text[i:i + width] for i in range(0, len(text), width)]
+
+
 def _pipe_breaks_during_stream(answer: str, call_counter: list):
     """
     Return a request_completion stub that simulates a pipe closing
@@ -65,6 +89,30 @@ def _pipe_breaks_during_stream(answer: str, call_counter: list):
             sys.stdout = _BrokenStdout()
             try:
                 on_token(answer)    # BrokenPipeError fires here; _safe_stdout_write must catch it
+            finally:
+                sys.stdout = real   # restore so post-call prints still work
+        return answer
+    return _fake
+
+
+def _pipe_breaks_on_nth_token(answer: str, call_counter: list, break_at: int):
+    """
+    Return a request_completion stub that streams *answer* as several
+    tokens and makes the pipe close on the *break_at*-th one: tokens
+    1..break_at-1 print fine, token break_at raises BrokenPipeError, and
+    _safe_stdout_write must swallow it so the caller still sees the whole
+    reply returned and completes normally. This pins the Nth-token failure
+    mode, not only the single-token-holding-the-whole-answer one.
+    """
+    def _fake(*args, **kwargs):
+        call_counter.append(1)
+        on_token = kwargs.get("on_token")
+        if on_token is not None:
+            real = sys.stdout
+            sys.stdout = _BrokenStdoutAfter(break_at)
+            try:
+                for tok in _split_tokens(answer):
+                    on_token(tok)
             finally:
                 sys.stdout = real   # restore so post-call prints still work
         return answer
@@ -173,6 +221,34 @@ class TestImprovementAgentBrokenPipe:
                 "prompt": "fix it",
             })
 
+    @pytest.mark.parametrize("break_at", [1, 2, 3])
+    def test_broken_pipe_on_nth_token_is_single_call(self, break_at):
+        """T29: the pipe closing on the Nth token — not only on a single
+        token holding the whole answer — is still swallowed by
+        _safe_stdout_write, so the LLM is called exactly once and process()
+        completes with the full reply."""
+        agent = self._agent()
+        calls: list = []
+        answer = '{"content": "ok"}'
+        with patch(
+            "tools.improvement_agent.request_completion",
+            side_effect=_pipe_breaks_on_nth_token(answer, calls, break_at=break_at),
+        ):
+            result = agent.process("improve", {
+                "code": "def f(): pass",
+                "feedback": "add docstring",
+                "goal": "test",
+                "prompt": "improve it",
+            })
+        assert len(calls) == 1, (
+            f"Expected exactly 1 LLM call (pipe-close on token {break_at} "
+            f"must not trigger retry), got {len(calls)}"
+        )
+        assert result == {"content": "ok"}, (
+            f"process() must return the whole reply even when the pipe closed "
+            f"on token {break_at}, got {result!r}"
+        )
+
 
 class TestValidatorAgentBrokenPipe:
     """ValidatorAgent.validate() with stream=True: same property."""
@@ -221,3 +297,28 @@ class TestValidatorAgentBrokenPipe:
         assert isinstance(result, dict), (
             f"validate() must return a dict, got {type(result)}"
         )
+
+    @pytest.mark.parametrize("break_at", [1, 2, 3])
+    def test_broken_pipe_on_nth_token_returns_dict(self, break_at):
+        """T29: the pipe closing on the Nth token is swallowed, the LLM is
+        called exactly once, and validate() still returns a dict."""
+        agent = self._agent()
+        calls: list = []
+        valid_reply = '{"status": "approved", "feedback": "ok"}'
+        with patch(
+            "tools.validator_agent.request_completion",
+            side_effect=_pipe_breaks_on_nth_token(valid_reply, calls, break_at=break_at),
+        ):
+            result = agent.validate({
+                "code": "x = 1",
+                "instruction": "fix",
+                "iteration": 1,
+            })
+        assert len(calls) == 1, (
+            f"Expected exactly 1 LLM call, got {len(calls)}"
+        )
+        assert isinstance(result, dict), (
+            f"validate() must return a dict even when the pipe closed on "
+            f"token {break_at}, got {type(result)}"
+        )
+        assert result == {"status": "approved", "feedback": "ok"}

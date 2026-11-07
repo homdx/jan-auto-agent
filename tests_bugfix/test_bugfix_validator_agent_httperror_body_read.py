@@ -102,6 +102,25 @@ class TestHttpErrorBodyReadFailure:
         monkeypatch.setattr(va, "request_completion", _raise(_httperror_with_bad_body(503)))
         result = _make_agent().validate(_PAYLOAD)
         assert "503" in result["feedback"]
+        # T36: the body-read exception must be contained — it never escapes
+        # validate() as an exception (the call returns normally), the verdict
+        # is the usual dict, and the placeholder body names it as unreadable
+        # rather than leaving the feedback empty.
+        assert isinstance(result, dict)
+        assert result["_api_error"] is True
+        assert "unreadable" in result["feedback"].lower()
+
+    @pytest.mark.parametrize("code", [400, 401, 403, 404, 429, 500, 502, 503])
+    def test_no_body_read_exception_leaks_for_any_status(self, monkeypatch, code):
+        """No matter the HTTP status, an unreadable error body must not
+        leak an exception out of validate()."""
+        monkeypatch.setattr(va, "request_completion",
+                            _raise(_httperror_with_bad_body(code, OSError("connection reset"))))
+        result = _make_agent().validate(_PAYLOAD)
+        assert isinstance(result, dict)
+        assert result["status"] == "needs_fix"
+        assert result["_api_error"] is True
+        assert str(code) in result["feedback"]
 
     def test_feedback_still_names_the_api_error(self, monkeypatch):
         monkeypatch.setattr(va, "request_completion", _raise(_httperror_with_bad_body(429)))
