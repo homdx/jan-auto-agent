@@ -142,8 +142,20 @@ def flow_line(flow) -> str:
 
 
 def flow_json(flow) -> list:
-    """The same steps as `[{"step": …, "state": …}]` for `-o json`."""
-    return [{"step": _one_line(item[0]), "state": _one_line(item[1])} for item in flow or ()]
+    """The same steps as `[{"step": …, "state": …}]` for `-o json`.
+
+    A step that carries the third element `flow_line` renders (`(step, state,
+    detail)`) keeps it as `"detail"`, so `-o json` shows exactly what the text
+    block does. A two-element step, like an empty detail, has no `detail` key.
+    """
+    out = []
+    for item in flow or ():
+        entry = {"step": _one_line(item[0]), "state": _one_line(item[1])}
+        detail = _one_line(item[2]) if len(item) > 2 else ""
+        if detail:
+            entry["detail"] = detail
+        out.append(entry)
+    return out
 
 
 def _one_line(text: str) -> str:

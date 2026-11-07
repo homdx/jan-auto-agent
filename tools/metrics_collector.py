@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -44,6 +45,11 @@ class RunRecord:
     validator_feedback: str
     improvement_json_ok: Optional[bool]  # None = not applicable (show/show_imports); excluded from rate
     elapsed_seconds: float
+
+
+def _usable_iterations(value) -> bool:
+    """A real, finite count: `json.loads` also lets a damaged record carry NaN and Infinity."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 class MetricsCollector:
@@ -219,7 +225,20 @@ class MetricsCollector:
                 "worst_intent": None,
             }
 
-        avg_iterations = sum(r.get("iterations_used", 0) for r in window) / total
+        # A hand-edited or truncated record can carry a non-numeric
+        # iterations_used ("three", null). Such a record still counts in
+        # total_runs but is left out of the averages: only real int/float
+        # values participate (a missing key still counts as 0, as before),
+        # and the average divides by the count of valid values (0.0 when
+        # there are none) instead of crashing the summary.
+        valid_iters = [
+            r.get("iterations_used", 0) for r in window
+            if _usable_iterations(r.get("iterations_used", 0))
+        ]
+        if valid_iters:
+            avg_iterations = round(sum(valid_iters) / len(valid_iters), 3)
+        else:
+            avg_iterations = 0.0
 
         improvement_runs = [r for r in window if r.get("improvement_json_ok") is not None]
         if improvement_runs:
@@ -242,12 +261,21 @@ class MetricsCollector:
         top_phrases = [phrase for phrase, _ in Counter(meaningful).most_common(3)]
 
         # Records missing a key group under "<unknown>" instead of crashing the summary (AUTO-METRICS-GUARD-1).
+        # A record whose iterations_used is not a usable number is left out of
+        # worst_intent too — an intent that only has such records never enters
+        # the comparison, and when no record is usable there is no worst intent.
         intent_iters: Dict[str, List[int]] = {}
         for r in window:
+            iters = r.get("iterations_used", 0)
+            if not _usable_iterations(iters):
+                continue
             intent_iters.setdefault(
                 r.get("intent", "<unknown>"), []
-            ).append(r.get("iterations_used", 0))
-        worst_intent = max(intent_iters, key=lambda k: sum(intent_iters[k]) / len(intent_iters[k]))
+            ).append(iters)
+        worst_intent = (
+            max(intent_iters, key=lambda k: sum(intent_iters[k]) / len(intent_iters[k]))
+            if intent_iters else None
+        )
 
         return {
             "total_runs": total,

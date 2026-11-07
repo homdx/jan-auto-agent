@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 
 from tools.auto.architect import CandidateTask
 from tools.auto.state import make_task
+from tools.ui import safe_print
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +243,7 @@ class BacklogPrioritiser:
                 )
                 manual_suggestions.append(c)
 
-        print(
+        safe_print(
             f"\n📋 Backlog split: "
             f"{len(auto_candidates)} auto task(s), "
             f"{len(manual_suggestions)} manual suggestion(s)"
@@ -265,7 +266,7 @@ class BacklogPrioritiser:
         # ── 4. Topological sort ───────────────────────────────────────────────
         ordered = _topological_sort(ready_tasks)
 
-        print(
+        safe_print(
             f"✅ Backlog ordered — {len(ordered)} auto task(s) ready\n"
         )
 

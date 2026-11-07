@@ -180,9 +180,11 @@ class AgentTracer:
         # Never do blocking I/O while holding the lock: a stalled write would make every other event() call queue behind it.
         if self.console_echo or (self.llm_debug >= 2 and kind == "llm_request"):
             # A closed stdout (| head) must not crash the run: the console echo is diagnostic, so its errors are swallowed.
+            # ValueError covers a closed stream ("I/O operation on closed file") and, as its subclass, the
+            # UnicodeEncodeError an ASCII stdout raises on an emoji — neither is a reason to lose the event.
             try:
                 self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
-            except OSError:
+            except (OSError, ValueError):
                 pass
 
         try:

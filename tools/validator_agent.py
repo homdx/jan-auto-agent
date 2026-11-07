@@ -12,6 +12,7 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url, s
 # `feedback` this agent returns (see validate()'s last step).
 from tools.llm_stream import reply_text
 from tools.ui import safe_stdout_write as _safe_stdout_write
+from tools.ui import safe_print as _safe_print
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +154,7 @@ class ValidatorAgent:
         try:
             if self.stream:
                 ts = time.strftime("%H:%M:%S")
-                print(f"\n[{ts}] validator_agent → llm  (iter {payload.get('iteration')}/{self.max_iter}):")
+                _safe_print(f"\n[{ts}] validator_agent → llm  (iter {payload.get('iteration')}/{self.max_iter}):")
                 content = request_completion(
                     url, headers, req_payload, self.timeout,
                     stream=True,
@@ -162,10 +163,10 @@ class ValidatorAgent:
                     ssl_context=self.ssl_context,
                 )
                 ts_done = time.strftime("%H:%M:%S")
-                print(f"\n[{ts_done}] validator_agent ← llm  (response received)")
+                _safe_print(f"\n[{ts_done}] validator_agent ← llm  (response received)")
             else:
                 ts = time.strftime("%H:%M:%S")
-                print(f"[{ts}] validator_agent → llm  (iter {payload.get('iteration')}/{self.max_iter})  waiting…")
+                _safe_print(f"[{ts}] validator_agent → llm  (iter {payload.get('iteration')}/{self.max_iter})  waiting…")
                 content = request_completion(url, headers, req_payload, self.timeout,
                                              api_format=self.api_format,
                                              ssl_context=self.ssl_context)

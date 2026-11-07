@@ -188,7 +188,10 @@ def find_trace_file(path_arg: str) -> Path:
 def load_events(trace_file: Path) -> list[dict]:
     events = []
     # Decode with errors="replace": a file truncated mid multi-byte character still yields its events.
-    with trace_file.open(encoding="utf-8", errors="replace") as fh:
+    # utf-8-sig (not utf-8) strips a leading BOM, so a hand-edited or exported
+    # JSONL whose first line begins with \ufeff keeps its first event instead
+    # of having it dropped as an unparseable line.
+    with trace_file.open(encoding="utf-8-sig", errors="replace") as fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:

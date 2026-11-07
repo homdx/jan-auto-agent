@@ -145,7 +145,8 @@ def test_the_json_block_carries_the_folded_newlines_and_nothing_else_changed():
         "error": "boom line2",
         "where": "w here",
         "ticket": "t icket",
-        "flow": [{"step": "a", "state": "ok"}, {"step": "b", "state": "fail"}],
+        "flow": [{"step": "a", "state": "ok"},
+                 {"step": "b", "state": "fail", "detail": "why so"}],
         "hints": [{"why": "why one", "command": "cmd one"}],
     }
     flat = json.dumps(obj, ensure_ascii=False)

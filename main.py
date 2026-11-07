@@ -456,7 +456,20 @@ class Orchestrator(OrchestratorActions):
             iteration        = resume_state.get("iteration", 1)
             refs             = resume_state.get("refs", refs)
             already_searched = resume_state.get("already_searched", already_searched)
-            search_result    = resume_state.get("search_result", search_result)
+            # A hand-edited checkpoint can carry a null / non-dict search_result.
+            # It used to flow through as None and crash the improvement-context
+            # build (and the formatter) with AttributeError, so a formatter guard
+            # alone was not enough: replace it with the default empty result at
+            # the read, so the resumed run starts from "nothing found yet".
+            _restored_search = resume_state.get("search_result", search_result)
+            if not isinstance(_restored_search, dict):
+                logger.warning(
+                    "run_pipeline: resume_state['search_result'] is %s, not a "
+                    "dict — starting from the empty result",
+                    type(_restored_search).__name__,
+                )
+                _restored_search = {"found": {}, "not_found": [], "searched_files": []}
+            search_result    = _restored_search
             # Refs may have grown since the checkpoint, so recompute the cap from the restored refs.
             _refs_cap = len(refs) + self.validator_agent.max_hints
             print(f"[{_ts()}] ▶  Resuming run_pipeline from iteration {iteration} "
