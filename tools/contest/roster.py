@@ -884,8 +884,13 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
                 "the agents' own base_url and api_key, as [contest_gate_llm] is "
                 "for the gate")
         try:
+            # The OpenRouter profile's model is deliberately blank (contest.ini
+            # "unused: per-agent from the roster"): each agent's model id comes
+            # from its [contest.agent.<name>] section, so this caller supplies
+            # the model per use and opts out of the blank-model check.
             openrouter_settings, _ = resolve_llm_profile(
-                parser, "contest", "openrouter_llm_profile", defaults=DEFAULTS_OPENROUTER
+                parser, "contest", "openrouter_llm_profile", defaults=DEFAULTS_OPENROUTER,
+                allow_blank_model=True,
             )
         except ValueError as exc:
             raise RosterError(f"[contest] openrouter_llm_profile: {exc}") from exc

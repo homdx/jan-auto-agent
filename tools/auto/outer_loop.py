@@ -244,11 +244,70 @@ class OuterLoop:
         task_id = task.get("id", "?")
 
         # The task budget ledger opens before the first round and closes in finally, so every exit path records the time once (RUN-2).
-        _budget = self._begin_task_budget(task_id)
+        # The open is a state read/write of its own, and it sits OUTSIDE the _run_rounds guard, so it gets one of its own:
+        # an error opening the ledger must fail this task, not the whole run, since the controller calls run_task
+        # with no task-level catch (AUTO-T60).
+        try:
+            _budget = self._begin_task_budget(task_id)
+        except Exception as exc:
+            logger.exception(
+                "OuterLoop: could not open the budget ledger for %s — %s; "
+                "failing the task so the run continues",
+                task_id, exc,
+            )
+            return OuterLoopResult(task_id, False, 0, False)
+
         try:
             return self._run_rounds(task, base_dir, task_id, _budget)
+        except Exception as exc:
+            # The inner loop already has its own guard (AUTO-OUTER-GUARD-1), but an error from a state
+            # write or the round bookkeeping around it — set_task_status, log, counter, feedback read —
+            # used to escape here and kill the whole --auto run (AUTO-T60).
+            # Log it, fail only this task, and leave the run to the next task.
+            logger.exception(
+                "OuterLoop: bookkeeping raised for %s — %s; failing the "
+                "task so the run continues",
+                task_id, exc,
+            )
+            self._record_bookkeeping_failure(task_id, exc)
+            return OuterLoopResult(
+                task_id, False, self._completed_rounds(task_id), True,
+            )
         finally:
             self._end_task_budget(task_id, _budget)
+
+    def _record_bookkeeping_failure(self, task_id: str, exc: Exception) -> None:
+        """After a bookkeeping escape, park the task BLOCKED and record the error.
+
+        Each write is best-effort (AUTO-T60): the write that just failed may be
+        the very reason the state is broken, so none of these may re-raise —
+        the run has to reach the next task.
+        """
+        try:
+            self.state.set_task_status(task_id, STATUS_BLOCKED)
+        except Exception:
+            logger.debug(
+                "OuterLoop: could not set %s BLOCKED after the bookkeeping "
+                "error — it keeps its last written status", task_id,
+            )
+        try:
+            self.state.log(
+                f"{task_id}: bookkeeping raised — "
+                f"{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass  # run.log itself is unwritable — already logged above
+        tracer.event("outer_loop", "controller", "result",
+                     params={"task": task_id, "passed": False,
+                             "error": f"{type(exc).__name__}: {exc}"})
+
+    def _completed_rounds(self, task_id: str) -> int:
+        """The rounds already completed for *task_id*; 0 when the state that
+        records them is itself broken (AUTO-T60)."""
+        try:
+            return self._existing_rounds(task_id)
+        except Exception:
+            return 0
 
     def _run_rounds(
         self, task: dict, base_dir: str | Path, task_id: str, budget: _TaskBudget

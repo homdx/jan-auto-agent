@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import glob
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +70,13 @@ _TEST_RUNNER_RE = re.compile(
 
 #: How a test file is recognised when deciding whether a suite exists.
 _TEST_FILE_RE = re.compile(r"(^test_.*\.py$)|(.*_test\.py$)|(^conftest\.py$)")
+
+#: Directory names that hold vendor-installed test files, not the project's
+#: own suite (AUTO-T53). A repo root ``venv/lib/site-packages/test_vendor.py``
+#: used to count as "the repository has tests" and hide the phantom-suite
+#: check on ordinary targets. Pruned from the walk, not filtered after the
+#: fact, so neither these trees nor any dot-directory is ever descended into.
+_VENDOR_TEST_DIRS = frozenset(("venv", "node_modules", "site-packages"))
 
 #: Only inline code spans are read for file references; prose mentions are not claims.
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
@@ -263,11 +271,21 @@ class ExistenceValidator:
 
     @staticmethod
     def _repo_has_tests(base_dir: Path) -> bool:
-        for path in base_dir.rglob("*.py"):
-            if _is_hidden(path, base_dir):
-                continue
-            if _TEST_FILE_RE.match(path.name):
-                return True
+        # Prune the walk instead of filtering after an rglob (AUTO-T53):
+        # vendor trees (venv/, node_modules/, site-packages/ at any depth) and
+        # dot-directories hold their own test files and are never the
+        # project's suite, so they are not even descended into. The names of
+        # the directories inside the walk — never the base path's own
+        # components, which keeps a base under ``/home/u/.cache/repo``
+        # working (A6) — decide the pruning.
+        for _root, dirs, files in os.walk(base_dir):
+            dirs[:] = [
+                d for d in dirs
+                if not d.startswith(".") and d not in _VENDOR_TEST_DIRS
+            ]
+            for name in files:
+                if _TEST_FILE_RE.match(name):
+                    return True
         return False
 
     # ── main entry ───────────────────────────────────────────────────────────

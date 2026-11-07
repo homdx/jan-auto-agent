@@ -132,7 +132,7 @@ class GitManager:
     def ensure_repo(self) -> bool:
         """Ensure *repo_dir* is a git repository.
 
-        Runs ``git init`` if no ``.git`` directory is found.
+        Runs ``git init`` if no ``.git`` entry is found.
 
         Returns
         -------
@@ -140,7 +140,12 @@ class GitManager:
             ``True`` if a new repo was initialised; ``False`` if one
             already existed.
         """
-        if (self.repo_dir / ".git").is_dir():
+        git_entry = self.repo_dir / ".git"
+        if git_entry.is_dir() or git_entry.is_file():
+            # A linked worktree's .git is a FILE ("gitdir: ..."), not a directory (AUTO-T58):
+            # it already belongs to a repository, so nothing is executed —
+            # running `git init` there would re-initialise the worktree's git
+            # directory under the main repo.
             logger.debug("ensure_repo: repo already exists at %s", self.repo_dir)
             return False
 

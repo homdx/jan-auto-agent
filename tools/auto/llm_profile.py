@@ -71,7 +71,8 @@ _OPTIONAL_STR_FIELDS = ("api_format",)
 
 
 def resolve_llm_profile(
-    config, section: str, key: str, *, defaults: LlmSettings
+    config, section: str, key: str, *, defaults: LlmSettings,
+    allow_blank_model: bool = False,
 ) -> tuple[LlmSettings, Optional[str]]:
     """Resolve an optional named-profile override of *defaults*.
 
@@ -88,6 +89,15 @@ def resolve_llm_profile(
         The settings to use when no profile is configured, and the
         fallback source for every optional field a configured profile
         doesn't itself set.
+    allow_blank_model:
+        ``False`` (the default) is the documented contract: a blank
+        ``model`` in the profile raises, because nothing downstream
+        fills it in. ``True`` is for callers that hand the model in
+        themselves per use — the contest's OpenRouter backend, whose
+        profile's ``model`` is deliberately empty because each agent
+        gets its own model id from its roster section. A blank
+        ``base_url`` is meaningless to any caller, so it raises either
+        way; a blank ``api_key`` stays allowed in both.
 
     Returns
     -------
@@ -102,9 +112,13 @@ def resolve_llm_profile(
     ------
     ValueError:
         The named section doesn't exist, or exists but is missing one of
-        base_url / api_key / model. Both raise at call time — i.e. at
-        construction, not at request time — so a misconfigured profile is
-        never discovered mid-run.
+        base_url / api_key / model, or base_url is present but blank, or
+        model is present but blank and *allow_blank_model* is ``False``
+        (an empty value fails the request the same way a missing one
+        does; a blank api_key is always allowed — a local server needs
+        no credential). These raise at call time — i.e. at
+        construction, not at request time — so a misconfigured profile
+        is never discovered mid-run.
     """
     profile_name = config.get(section, key, fallback="").strip()
 
@@ -135,6 +149,30 @@ def resolve_llm_profile(
             f"base_url/api_key/model from the shared provider, since that "
             f"could send a different provider's credential to the wrong "
             f"host."
+        )
+
+    # Present but blank is as good as missing for the two fields that name
+    # the connection target: a request to an empty base_url, or with an empty
+    # model, can only fail at request time, and that is the failure this
+    # module exists to prevent (AUTO-T56). A blank api_key stays allowed —
+    # a local server needs no credential. The model alone has a documented
+    # exception: a caller that supplies it per use (the contest's OpenRouter
+    # backend) opts in with allow_blank_model=True.
+    blank = [
+        opt for opt in ("base_url", "model")
+        if not config.get(profile_name, opt).strip()
+    ]
+    if allow_blank_model:
+        blank = [opt for opt in blank if opt != "model"]
+    if blank:
+        raise ValueError(
+            f"[{profile_name}] ({key}) has blank required option(s): "
+            f"{', '.join(blank)}. A profile must fully specify its own "
+            f"connection details — it never silently inherits "
+            f"base_url/api_key/model from the shared provider, since that "
+            f"could send a different provider's credential to the wrong "
+            f"host. A blank api_key is allowed (a local server needs no "
+            f"credential); a blank base_url or model is not."
         )
 
     overrides: dict = {

@@ -274,7 +274,10 @@ class PlanEmitter:
             return {}
         try:
             data = json.loads(self._hashes_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as exc:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            # A non-UTF-8 hash file (e.g. b"\xff\xfe" in front of the JSON)
+            # is unreadable, not readable-with-a-different-encoding, so it degrades to no stored hash —
+            # same warning and same fallback as a corrupt file (AUTO-T61).
             logger.warning("_load_cluster_hashes: could not read hash file: %s", exc)
             return {}
         # A non-dict hash file counts as no stored hash, as a missing or corrupt file does.
