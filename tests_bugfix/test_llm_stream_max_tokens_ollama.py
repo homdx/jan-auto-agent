@@ -49,6 +49,84 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.llm_stream import _build_payload  # noqa: E402
 
 
+class TestGate1PresenceThroughBuildChatRequest:
+    """T40: the presence check builds its request through build_chat_request,
+    so its configured `_presence_max_tokens` must reach Ollama as
+    options.num_predict — not as a top-level max_tokens it ignores."""
+
+    def test_presence_max_tokens_reaches_ollama_as_num_predict(self, tmp_path):
+        import configparser
+        import textwrap
+
+        from tools.auto.architect import CandidateTask, CitedLocation
+        from tools.auto.gate1_filter import Gate1Filter
+
+        (tmp_path / "tools").mkdir()
+        (tmp_path / "tools" / "utils.py").write_text(
+            textwrap.dedent("""\
+                def parse_config(raw):
+                    return raw
+            """),
+            encoding="utf-8",
+        )
+
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({
+            "api": {"active": "local", "verify_ssl": "false"},
+            "api_local": {
+                "base_url": "http://localhost:11434",
+                "api_key": "ollama",
+                "model": "llama3.1:8b",
+                "api_format": "ollama",
+            },
+            "gate1": {
+                "temperature": "0.0", "max_tokens": "64", "skip_llm": "false",
+                # A distinct presence profile makes the presence budget differ
+                # from the shared [gate1] one, so this test fails if the shared
+                # value is what reaches Ollama.
+                "presence_llm_profile": "gate1_llm",
+            },
+            "gate1_llm": {
+                "base_url": "http://localhost:11434",
+                "api_key": "ollama",
+                "model": "llama3.1:8b",
+                "api_format": "ollama",
+                "max_tokens": "777",
+            },
+            "loop": {"timeout_seconds": "10"},
+        })
+        filt = Gate1Filter(
+            config=cfg, base_url="http://localhost:11434", api_key="ollama",
+            model="llama3.1:8b", api_format="ollama", verify_ssl=False,
+        )
+        assert filt._presence_max_tokens == 777
+        assert filt._max_tokens == 64
+        candidate = CandidateTask(
+            title="Add input validation",
+            instruction="validate that raw is a dict",
+            target_files=["tools/utils.py"],
+            acceptance_check="true",
+            cited_location=CitedLocation(
+                file="tools/utils.py", symbol="parse_config", new_file=False,
+            ),
+        )
+
+        captured: dict = {}
+
+        def _fake_completion(**kwargs):
+            captured.update(kwargs["payload"])
+            return ('{"verdict": "confirmed", "evidence": "return raw", '
+                    '"reason": "still missing validation"}')
+
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_completion):
+            accepted, _rejected = filt.filter([candidate], tmp_path)
+
+        assert len(accepted) == 1
+        assert captured["options"]["num_predict"] == 777
+        assert "max_tokens" not in captured
+
+
 class TestBuildPayloadMaxTokensForOllama:
     def test_max_tokens_moves_to_options_num_predict(self):
         body = _build_payload(

@@ -17,11 +17,17 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.formatter import OutputFormatter
 
 
-def _render(show_iter: bool) -> str:
+def _render(show_iter: bool, *, omit_iter_key: bool = False) -> str:
     parsed = SimpleNamespace(
         target_type="function", target_name="foo",
         file_path="x.py", intent="show",
     )
+    output_config = {
+        "show_timing": False,
+        "max_iterations": 3,
+    }
+    if not omit_iter_key:
+        output_config["show_iteration_count"] = show_iter
     buf = io.StringIO()
     old = sys.stdout
     sys.stdout = buf
@@ -34,11 +40,7 @@ def _render(show_iter: bool) -> str:
             improvement={},
             elapsed_time=1.0,
             iteration=2,
-            output_config={
-                "show_timing": False,
-                "show_iteration_count": show_iter,
-                "max_iterations": 3,
-            },
+            output_config=output_config,
         )
     finally:
         sys.stdout = old
@@ -52,3 +54,8 @@ def test_iteration_count_shown_when_enabled():
 def test_iteration_count_hidden_when_disabled():
     # The key 'show_iteration_count' must be honoured; a mismatch would default to True.
     assert "iter:" not in _render(False)
+
+
+def test_iteration_count_defaults_to_shown_when_key_omitted():
+    # An older caller that does not pass the key at all keeps the default (show).
+    assert "iter: 2/3" in _render(True, omit_iter_key=True)

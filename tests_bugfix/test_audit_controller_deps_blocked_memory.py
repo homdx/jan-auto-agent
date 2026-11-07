@@ -25,7 +25,9 @@ from tools.auto.commit_on_success import (
 from tools.auto.controller import AutoController, RunLimits
 from tools.auto.git_manager import make_git_manager
 from tools.auto.outer_loop import OuterLoopResult
-from tools.auto.state import STATUS_BLOCKED, STATUS_DONE, StateStore, make_task
+from tools.auto.state import (
+    STATUS_BLOCKED, STATUS_DONE, STATUS_TODO, StateStore, make_task,
+)
 
 _USER, _EMAIL = "auto-agent-test", "auto-agent-test@localhost"
 
@@ -105,9 +107,15 @@ def _run(ctrl, outer):
 def test_task_before_its_dependency_runs_after_it(tmp_path):
     ctrl = _controller(tmp_path, [_task("B", ["A"]), _task("A")])
     ran: list[str] = []
+    transient: dict[str, str] = {}
 
     def run_task(t, base_dir):
         ran.append(t["id"])
+        if t["id"] == "A":
+            # B was listed before A: while A runs, B must be waiting as TODO.
+            # A deferred task is never marked BLOCKED on sight (a BLOCKED task
+            # is not pending again, so it could never run after A completes).
+            transient["B"] = ctrl.state.get_task("B")["status"]
         (Path(base_dir) / f"{t['id']}.py").write_text("x = 1\n")
         return _passed(t["id"])
 
@@ -116,6 +124,10 @@ def test_task_before_its_dependency_runs_after_it(tmp_path):
     _reason, done = _run(ctrl, outer)
 
     assert ran == ["A", "B"]
+    assert transient["B"] == STATUS_TODO, (
+        f"B was {transient['B']!r} while its dependency ran, not TODO — "
+        "deferring must not leave the old transient BLOCKED state behind"
+    )
     assert done == 2
     assert ctrl.state.get_task("B")["status"] == STATUS_DONE
 

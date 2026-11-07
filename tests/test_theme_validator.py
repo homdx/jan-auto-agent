@@ -60,6 +60,41 @@ def test_fail_open_on_unparseable_reply():
     assert r.unparseable
 
 
+def test_unclear_first_reply_then_failed_followup_is_fail_open():
+    """VERDICT-ASK retry: an unclear first reply is asked once; if that second
+    call fails, the first reply still stands and is flagged unparseable."""
+    calls: list[str] = []
+
+    def llm(system, user):
+        calls.append(user)
+        if len(calls) == 1:
+            return "ну, вроде норм"
+        raise ConnectionError("follow-up call failed")
+
+    v = ThemeValidator(llm, GUIDELINES)
+    r = v.check("глава")
+
+    assert len(calls) == 2
+    assert r.approved
+    assert r.unparseable
+
+
+def test_clear_revise_makes_one_call():
+    """A clear REVISE is settled immediately: the retry path is not entered."""
+    calls: list[str] = []
+
+    def llm(system, user):
+        calls.append(user)
+        return "REVISE: глава подаёт курение как бонус — показать цену."
+
+    v = ThemeValidator(llm, GUIDELINES)
+    r = v.check("глянцевая глава")
+
+    assert len(calls) == 1
+    assert not r.approved
+    assert not r.unparseable
+
+
 def test_no_guidelines_short_circuits_without_llm_call():
     calls = []
 

@@ -78,6 +78,32 @@ class TestValidatorSeesCode:
             assert "def fetch_json(url, timeout=30)" in captured["user"]
             assert "--- v2/angie_ops.py ---" in captured["user"]
 
+    def test_two_changed_files_are_both_in_the_prompt(self):
+        """A multi-file change must show every file's content, not just the first."""
+        second_code = ("def load_config(path):\n"
+                       "    return {'path': path}\n")
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "v2").mkdir()
+            (d / "v2/angie_ops.py").write_text(_CODE, encoding="utf-8")
+            (d / "v2/config.py").write_text(second_code, encoding="utf-8")
+
+            v = LLMGate2Validator(base_url="http://x/v1", model="m",
+                                  base_dir=str(d))
+            captured, p = _capture_prompt('{"approved": true, "feedback": ""}')
+            with p:
+                approved, _ = v.approve(
+                    TASK, FakeExecResult(),
+                    FakeCoderResult(files_written=["v2/angie_ops.py",
+                                                   "v2/config.py"]),
+                )
+
+            assert approved is True
+            assert "--- v2/angie_ops.py ---" in captured["user"]
+            assert "def fetch_json(url, timeout=30)" in captured["user"]
+            assert "--- v2/config.py ---" in captured["user"]
+            assert "def load_config(path)" in captured["user"]
+
     def test_missing_file_is_reported_not_crashed(self):
         with tempfile.TemporaryDirectory() as d:
             v = LLMGate2Validator(base_url="http://x/v1", model="m", base_dir=d)

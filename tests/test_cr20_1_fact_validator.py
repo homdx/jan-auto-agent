@@ -111,6 +111,48 @@ def test_check_never_raises_on_llm_error():
     verdict = v.check(task, text)
 
     assert verdict.approved is True
+    # An exception is not an unparseable reply: there was no reply to parse.
+    assert verdict.unparseable is False
+    assert "llm error" in verdict.reason.lower()
+
+
+def test_unclear_first_reply_then_failed_followup_is_fail_open():
+    """VERDICT-ASK retry: an unclear first reply is asked once; if that second
+    call fails, the first reply still stands and is flagged unparseable."""
+    calls: list[str] = []
+
+    def llm(system, user):
+        calls.append(user)
+        if len(calls) == 1:
+            return ("Well, let me think about this carefully. The text seems "
+                    "mostly fine but there could be some issues.")
+        raise ConnectionError("follow-up call failed")
+
+    v = FactValidator(llm)
+    verdict = v.check(_task("Describe the home."), "Дом был тихим и уютным.")
+
+    assert len(calls) == 2
+    assert verdict.approved is True
+    assert verdict.unparseable is True
+
+
+def test_clear_revise_makes_one_call():
+    """A clear REVISE is settled immediately: the retry path is not entered."""
+    calls: list[str] = []
+
+    def llm(system, user):
+        calls.append(user)
+        return "REVISE: TASK says she does not work but TEXT says she does"
+
+    v = FactValidator(llm)
+    verdict = v.check(
+        _task("She does not work (мама не работает)."),
+        "Мама работает учителем в школе.",
+    )
+
+    assert len(calls) == 1
+    assert verdict.approved is False
+    assert verdict.unparseable is False
 
 
 # ── FactVerdict.feedback() ────────────────────────────────────────────────────

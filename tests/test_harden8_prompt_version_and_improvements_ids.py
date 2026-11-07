@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.auto.plan_validator import _remove_from_improvements_md, _task_section_pattern  # noqa: E402
+from tools.auto.plan_validator import _remove_from_improvements_md  # noqa: E402
 from tools.prompt_store import PromptStore  # noqa: E402
 
 
@@ -134,13 +134,15 @@ def test_a_note_inside_an_entrys_text_does_not_end_it(tmp_path):
     assert "### beta:" in out and "## Manual Suggestions" in out
 
 
-def test_a_fenced_block_inside_an_entry_still_does_not_end_it():
+def test_a_fenced_block_inside_an_entry_still_does_not_end_it(tmp_path):
     """FIX-2 #8's own shape, with letters-only ids: the fence is body, the separator is not."""
     doc = ("## Autonomous Tasks\n\n### alpha: first task\n\nInstruction:\n\n"
            "```markdown\n---\n### Example heading\nbody\n```\n\nAcceptance: done.\n\n---\n\n"
            "### beta: second task\n\nInstruction: nothing special.\n\n---\n\n"
            "## Manual Suggestions\n\n- a manual note\n")
-    out = _task_section_pattern("alpha").sub("", doc)
+    (tmp_path / "IMPROVEMENTS.md").write_text(doc, encoding="utf-8")
+    _remove_from_improvements_md(tmp_path, ["alpha"])
+    out = (tmp_path / "IMPROVEMENTS.md").read_text(encoding="utf-8")
     assert "alpha" not in out and "### Example heading" not in out and "Acceptance: done." not in out
     assert "### beta:" in out and "## Manual Suggestions" in out
 
@@ -167,3 +169,16 @@ def test_an_id_the_file_does_not_hold_changes_nothing(tmp_path):
 
 def test_a_missing_file_is_a_no_op(tmp_path):
     _remove_from_improvements_md(tmp_path, ["alpha"])
+
+
+def test_a_manual_suggestions_heading_inside_a_fence_does_not_end_the_entry(tmp_path):
+    """The fence is what protects it: outside a fence that heading ends the entry."""
+    doc = ("## Autonomous Tasks\n\n### alpha: first task\n\nInstruction:\n\n"
+           "```markdown\n## Manual Suggestions\nquoted\n```\n\nAcceptance: done.\n\n---\n\n"
+           "### beta: second task\n\nInstruction: nothing special.\n\n---\n\n"
+           "## Manual Suggestions\n\n- a manual note\n")
+    (tmp_path / "IMPROVEMENTS.md").write_text(doc, encoding="utf-8")
+    _remove_from_improvements_md(tmp_path, ["alpha"])
+    out = (tmp_path / "IMPROVEMENTS.md").read_text(encoding="utf-8")
+    assert "alpha" not in out and "quoted" not in out and "Acceptance: done." not in out
+    assert "### beta:" in out and "- a manual note" in out

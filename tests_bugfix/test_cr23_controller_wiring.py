@@ -78,12 +78,17 @@ def test_commit_on_success_accepts_and_uses_bible(tmp_path, monkeypatch):
     assert "зелёной куртке" in seen.get("text", "")
 
 
-def test_code_mode_skips_bible(tmp_path):
+def test_code_mode_skips_bible(tmp_path, monkeypatch):
+    # The chapter exists, so nothing but the mode stands between it and an update.
+    (tmp_path / "chapter_1.txt").write_text("Глава 1.", encoding="utf-8")
     bible = _build_like_controller(_creative_cfg(enabled=True), tmp_path)
+    seen = []
+    monkeypatch.setattr(bible, "update", lambda text: seen.append(text))
     cos = CommitOnSuccess(
         None, None,
         summary_memory=None, task_mode="code",
         base_dir=tmp_path, story_bible=bible,
     )
-    # code mode → hook is a no-op (no exception, no update)
+    # code mode → hook is a no-op: the bible is never asked to take an update
     cos._update_story_bible({"target_files": ["chapter_1.txt"], "id": "t1"})
+    assert seen == []

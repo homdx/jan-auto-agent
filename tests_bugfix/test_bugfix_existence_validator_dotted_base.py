@@ -135,6 +135,9 @@ class TestGenuinelyMissingFilesStillRejected:
         (base / "main.py").write_text("print(1)\n", encoding="utf-8")
         verdict = validator.check("Run `pytest` to test.", base, rel_path="")
         assert verdict.phantom_tests is True
+        assert verdict.missing == [], (
+            f"`pytest` names no file, so the only finding is the phantom suite: {verdict}"
+        )
         assert verdict.approved is False
 
     def test_feedback_names_the_offenders(self, tmp_path, validator):

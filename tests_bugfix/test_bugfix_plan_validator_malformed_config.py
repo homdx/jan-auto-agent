@@ -111,7 +111,13 @@ class TestPlanMaxRevisionsMalformedMaxRewrites:
 
     def test_malformed_max_rewrites_does_not_crash_pipeline(self, tmp_path):
         """A malformed max_rewrites must not crash _run_plan_phase; the
-        outer getint's fallback=1 should be used instead."""
+        outer getint's fallback=1 should be used instead.
+
+        The plan validator must be present here: with `_build_plan_validator`
+        patched to None the `if _plan_validator is not None` block — the only
+        place max_rewrites is read — never runs, so this test would pass
+        without exercising the branch it names.
+        """
         from tools.auto.pipeline import _run_plan_phase
         from types import SimpleNamespace
         from unittest.mock import MagicMock
@@ -141,14 +147,19 @@ class TestPlanMaxRevisionsMalformedMaxRewrites:
             _get_collect_bridge=lambda mode: None,
         )
 
-        # The plan validator returns None, so the revision loop is skipped.
+        # The validator IS built, so the malformed max_rewrites read runs inside
+        # the guarded block and must degrade to 1 rather than raise.
+        plan_validator = MagicMock()
+        plan_validator.validate_plan.return_value = (True, "")
+
         from tools.auto.backlog_prioritiser import PrioritisedBacklog
 
         def _noop_backlog(candidates, task_id_prefix="AUTO-T"):
             return PrioritisedBacklog(auto_tasks=[], manual_suggestions=[])
 
         with (
-            patch("tools.auto.pipeline._build_plan_validator", return_value=None),
+            patch("tools.auto.pipeline._build_plan_validator",
+                  return_value=plan_validator),
             patch("tools.auto.pipeline.ingest_repo", return_value=[]),
             patch("tools.auto.pipeline.review_clusters", return_value=[]),
             patch("tools.auto.pipeline.filter_candidates", side_effect=lambda c, *a, **k: ([], [])),
@@ -157,3 +168,5 @@ class TestPlanMaxRevisionsMalformedMaxRewrites:
         ):
             # Must not raise ValueError from the nested getint
             _run_plan_phase(controller, cfg)
+
+        plan_validator.validate_plan.assert_called_once_with("test goal", [])
