@@ -56,3 +56,34 @@ def test_a_real_regex_literal_is_still_skipped():
         "}\n"
     )
     assert "/ab+c/g;" in extract_block(src, "Reg", ".ts")
+
+
+def test_a_self_closing_jsx_tag_does_not_swallow_the_following_function():
+    # T85: `/>` after a `}` (here `<Foo bar={y} />`) is a self-closing tag, not
+    # a regex opening; the `}` that closes the surrounding `{ok && ...}` must
+    # still be counted so the block ends at its own function.
+    src = (
+        "export function A({ok}) {\n"
+        "  return <div>{ok && <Foo bar={y} />}\n"
+        "}\n"
+        "export function Other() { return 1; }\n"
+    )
+    blk = extract_block(src, "A", ".tsx")
+    assert "Other" not in blk
+    assert blk.rstrip().endswith("}")
+
+
+def test_a_typescript_comparison_with_a_regex_keeps_both_literals_and_excludes_the_next_function():
+    # T85: a `<` used as a comparison before a regex literal must not be read
+    # as a JSX closing tag and lose the `/…/` after it; both literals survive
+    # and the block ends before the next function.
+    src = (
+        "function Cmp(a, b) {\n"
+        "  return a < /x/.test(b) && b > /y/.test(a);\n"
+        "}\n"
+        "export function Other() { return 1; }\n"
+    )
+    blk = extract_block(src, "Cmp", ".ts")
+    assert "/x/" in blk and "/y/" in blk
+    assert "Other" not in blk
+    assert blk.rstrip().endswith("}")

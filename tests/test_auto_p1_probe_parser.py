@@ -202,6 +202,31 @@ class TestArchProbeExecutor:
         assert "truncated" in out
         assert len(out) < 1200
 
+    def test_budget_accounting_is_exact_and_a_miss_is_charged(self) -> None:
+        """AC-P1E-5, with the real numbers: every formatted block counts.
+
+        A block is ``### <op>\\n<body>``, so a miss is not free — the
+        ``(not found)`` line is charged against the total exactly like a hit's
+        body. The ``## Probe results`` header is not a block and is not
+        charged. (Only asserting ``chars_used > 0`` is what let a
+        zero-cost-miss mutant pass.)
+        """
+        probe = ArchProbe(_FakeBridge({"good": "module: ok"}), max_chars=2000,
+                          max_total_chars=6000)
+        out = probe.execute(_ops("good", "nope"))
+        good = "### facts good\nmodule: ok"
+        miss = "### facts nope\n(not found)"
+        assert out == "## Probe results\n" + good + "\n\n" + miss
+        assert probe.chars_used == len(good) + len(miss) == 25 + 26
+        assert probe.run_chars_used == probe.chars_used
+
+    def test_an_all_miss_round_still_charges_its_miss_lines(self) -> None:
+        """A miss is charged even when the round returns ``""`` — the model that
+        spent its allowance on names that do not exist does not get them free."""
+        probe = ArchProbe(_FakeBridge({}), max_chars=2000, max_total_chars=6000)
+        assert probe.execute(_ops("nope")) == ""
+        assert probe.chars_used == len("### facts nope\n(not found)") == 26
+
     def test_total_budget_stops_remaining_ops(self) -> None:
         """AC-P1E-5: the total cap is what actually protects the context
         window — the per-op cap alone would let eight hot symbols through."""

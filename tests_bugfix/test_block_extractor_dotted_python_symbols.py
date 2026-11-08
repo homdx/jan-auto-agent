@@ -88,6 +88,10 @@ def test_bare_name_lookup_still_works_unqualified():
 
     blk2 = _extract("cached_method")
     assert "def cached_method" in blk2
+    # T82: a bare name repeated in two scopes pins the FIRST DFS match (Outer's,
+    # `return 42`), not a later Sibling.cached_method and not either at random.
+    assert "return 42" in blk2
+    assert 'return "sibling"' not in blk2
 
 
 def test_nonexistent_dotted_symbol_returns_empty():

@@ -33,10 +33,27 @@ def test_the_labels_have_one_colon():
     assert lines[3].startswith("  flow:   [✓] branch found")
 
 
+def _value_column(line: str) -> int:
+    """The 0-based column the VALUE starts at: after the first colon and its
+    padding, never the column of a label whose text the value happens to repeat."""
+    prefix, rest = line.split(":", 1)
+    return len(prefix) + 1 + (len(rest) - len(rest.lstrip()))
+
+
 def test_the_three_values_start_in_one_column():
     _, lines = _text(**FULL)
-    columns = {lines[i].index(lines[i].split(":", 1)[1].lstrip()) for i in (1, 2, 3)}
-    assert columns == {10}
+    assert {_value_column(lines[i]) for i in (1, 2, 3)} == {10}
+
+
+def test_overlapping_label_text_does_not_move_the_value_column():
+    """T83: with `where=where` and `ticket=ticket` the old measurement found the
+    label's own text at column 2; the value is still at column 10."""
+    _, lines = _text(where="where", ticket="ticket")
+    assert lines[1] == "  where:  where"
+    assert lines[2] == "  ticket: ticket"
+    assert lines[1][:10] == "  where:  " and lines[1][10:] == "where"
+    assert lines[2][10:] == "ticket"
+    assert {_value_column(lines[i]) for i in (1, 2, 3)} == {10}
 
 
 def test_a_wrapped_value_continues_under_the_value_not_the_label():

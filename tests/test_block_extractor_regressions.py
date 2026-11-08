@@ -122,6 +122,15 @@ def test_bodyless_kotlin_expression_body_stops_at_end_of_line():
     assert "gg" not in blk
 
 
+def test_bodyless_kotlin_multiline_expression_body_keeps_its_continuation():
+    # T75: an expression body wrapped over two lines stays whole — the line
+    # ending on an operator continues — and stops before the next function.
+    src = "fun ff() = 1 +\n    2\nfun gg() = 3\n"
+    blk = extract_block(src, "ff", ".kt")
+    assert blk == "fun ff() = 1 +\n    2"
+    assert "gg" not in blk
+
+
 def test_bodyless_definition_does_not_run_into_the_next_one():
     src = "const a = (x) => x + 1;\nconst b = (x) => x + 2;\n"
     blk = extract_block(src, "a", ".ts")

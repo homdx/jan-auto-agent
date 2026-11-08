@@ -17,6 +17,13 @@ HOSTILE = {"deep 20,000": "[" * 20000 + "]" * 20000, "deep 5,000": "[" * 5000 + 
            "unclosed lists": "[1, " * 30000 + "]", "unclosed objects": "{" * 30000}
 
 
+@pytest.mark.parametrize("text", ["", "   ", "\n\t  \n"])
+def test_an_empty_or_whitespace_reply_is_no_votes(text):
+    """T86: nothing to read is no vote from either parser, not an error."""
+    assert judge.parse_votes_v2(text, [0]) == {}
+    assert cv.parse_votes(text, [0]) == {}
+
+
 @pytest.mark.parametrize("name", sorted(HOSTILE))
 def test_a_hostile_reply_is_no_votes_never_an_exception(name):
     started = time.monotonic()

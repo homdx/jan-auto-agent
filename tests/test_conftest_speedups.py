@@ -54,6 +54,46 @@ def test_auto_workers_floor_and_override(monkeypatch):
     assert conftest.pytest_xdist_auto_num_workers(None) == 2
 
 
+def test_repeated_live_root_scans_return_the_same_list_object(monkeypatch):
+    """T103: the cache hands back the SAME list, not a copy.
+
+    `_is_the_live_scan` keys on that identity, so a copied list silently loses
+    the shared derived tables; conftest.py must keep returning the cached object.
+    """
+    sentinel = [object()]
+    monkeypatch.setattr(conftest, "_repo_scan_cache", {})
+    monkeypatch.setattr(conftest, "_scan_repo_shared", lambda: sentinel)
+
+    first = conftest._cached_scan_repo(conftest.ROOT)
+    second = conftest._cached_scan_repo(conftest.ROOT)
+    assert first is second is sentinel
+    assert conftest._is_the_live_scan(conftest.ROOT, second)
+    assert not conftest._is_the_live_scan(conftest.ROOT, list(second))
+
+
+def test_live_root_derived_tables_go_through_the_shared_cache(monkeypatch):
+    """T103: the test map and the fail-open registry of the live root are built
+    behind `_shared`, so every worker reuses the one table for the unchanged tree."""
+    modules = [object()]
+    monkeypatch.setattr(conftest, "_repo_scan_cache", {conftest.ROOT: modules})
+    calls: list[str] = []
+
+    def shared(name, compute):
+        calls.append(name)
+        return compute()
+
+    monkeypatch.setattr(conftest, "_shared", shared)
+    monkeypatch.setattr(conftest, "_real_build_test_map",
+                        lambda root, mods: {"root": root, "same": mods is modules})
+    monkeypatch.setattr(conftest, "_real_build_fail_open_registry",
+                        lambda mods, root=None: [mods is modules])
+
+    assert conftest._cached_build_test_map(conftest.ROOT, modules) == {
+        "root": conftest.ROOT, "same": True}
+    assert conftest._cached_build_fail_open_registry(modules, root=conftest.ROOT) == [True]
+    assert calls == ["build_test_map", "build_fail_open_registry"]
+
+
 def test_the_live_scan_reads_the_repository_not_what_runs_left_in_it(tmp_path, monkeypatch):
     """CC review fixes 45: round output and untracked sandboxes are not part of the live scan.
 

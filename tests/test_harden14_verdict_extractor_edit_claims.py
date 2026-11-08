@@ -172,7 +172,9 @@ _B3_FOUND = [
     ("~I() = default;\n", "~I"),
 ]
 
-_B3_NOT_DECLARATIONS = ["int x = 0;\n", "a = b;\n"]
+#: T77: explicit source and name pairs — `source.split()[1]` picked `=` for
+#: `a = b;`, so that case asserted a lookup of `=` and tested nothing.
+_B3_NOT_DECLARATIONS = [("int x = 0;\n", "x"), ("a = b;\n", "a")]
 
 
 @pytest.mark.parametrize("source, name", _B3_FOUND)
@@ -180,10 +182,9 @@ def test_b3_a_bodyless_cpp_declaration_is_found(source, name):
     assert extract_block(source, name, ".cpp").rstrip().endswith(";"), repr(source)
 
 
-@pytest.mark.parametrize("source", _B3_NOT_DECLARATIONS)
-def test_b3_an_initialiser_is_not_a_function_declaration(source):
-    name = source.split()[1].split("(")[0]
-    assert extract_block(source, name, ".cpp") == "", source
+@pytest.mark.parametrize("source, name", _B3_NOT_DECLARATIONS)
+def test_b3_an_initialiser_is_not_a_function_declaration(source, name):
+    assert extract_block(source, name, ".cpp") == "", (source, name)
 
 
 # ── Part D — a `## Claims:` heading opens the section ──────────────────────────

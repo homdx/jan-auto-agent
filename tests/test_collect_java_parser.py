@@ -5,10 +5,12 @@ a syntactically broken .java file returns a `parse_error`, never an
 exception; a scan of the surrounding tree is not aborted by one bad file.
 """
 
+import configparser
+
 import pytest
 
 from tools.collect.java_parser import is_available, parse_java
-from tools.collect.scanner import scan_java_module
+from tools.collect.scanner import scan_java_module, scan_repo
 
 pytestmark = pytest.mark.skipif(
     not is_available(), reason="tree-sitter-java not installed"
@@ -58,6 +60,18 @@ public class Broken {
         this is not valid java at all !!!
 """
 
+JAVA17_COUNTER = """
+package com.example;
+
+public class Counter {
+    private int n;
+
+    public int inc() {
+        return ++n;
+    }
+}
+"""
+
 
 def test_parse_record():
     result = parse_java(JAVA17_RECORD, "Point.java")
@@ -96,3 +110,24 @@ def test_scan_java_module_broken_file_has_parse_error_not_exception():
     record = scan_java_module(BROKEN_JAVA, "com/example/Broken.java")
     assert record.parse_error is not None
     assert record.language == "java"
+
+
+def test_scan_repo_parses_two_java_sources_in_sequence(tmp_path):
+    # T74: the real whole-tree caller, not parse_java directly — two sources in
+    # one scan must each come back with their own symbols, so a cached parser or
+    # tree cannot leak the first file's facts into the second.
+    (tmp_path / "Point.java").write_text(JAVA17_RECORD, encoding="utf-8")
+    (tmp_path / "Counter.java").write_text(JAVA17_COUNTER, encoding="utf-8")
+    config = configparser.ConfigParser()
+    config["collect"] = {"languages": "java"}
+
+    modules = {m.path: m for m in scan_repo(tmp_path, config=config)}
+    assert set(modules) == {"Point.java", "Counter.java"}
+
+    point = {s.qualname.rsplit(":", 1)[-1] for s in modules["Point.java"].public_symbols}
+    counter = {s.qualname.rsplit(":", 1)[-1] for s in modules["Counter.java"].public_symbols}
+    assert {"Point", "Point.sum"} <= point
+    assert {"Counter", "Counter.inc"} <= counter
+    assert "Counter" not in point and "Point" not in counter
+    assert modules["Point.java"].parse_error is None
+    assert modules["Counter.java"].parse_error is None

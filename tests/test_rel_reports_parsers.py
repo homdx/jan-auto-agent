@@ -73,6 +73,8 @@ _ARR = json.dumps([_item("one"), _item("two")])
     (_ARR + "\nLet me know if you need more.", 2), ("Sure!\n```json\n" + _ARR + "\n```", 2),
     (json.dumps({"tasks": [_item("one"), _item("two")]}), 2), (json.dumps(_item("one")), 1),
     ("Nothing to do: []", 0),
+    # T80: a mixed array keeps its one task object and is neither truncated nor unsalvageable.
+    (json.dumps([_item("one"), "not a task", 42]), 1),
 ])
 def test_complete_candidates_are_not_truncated(reply, n):
     cands, truncated, unsalvageable = _reviewer()._parse_candidates_ex(reply, "c")

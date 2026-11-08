@@ -5,7 +5,9 @@ Bug: `voter_settings` names the profile to resolve by WRITING it into the parser
 `main` shares ONE parser between the `--parallel` worker threads, so a thread that
 set `_pick` could have it overwritten by another before it read it: the vote the
 model `prof_a` was asked for was then cast by `prof_b`'s endpoint and recorded under
-`prof_a`'s name. The write and the read are one step now, under a lock.
+`prof_a`'s name. The fix is not a lock: `voter_settings` deep-copies the parser and
+sets `_pick` on its own copy, so no two voters ever share the section state a resolve
+reads (and a test that cannot tell a lock from the deepcopy is not a test).
 """
 
 import sys
@@ -28,22 +30,28 @@ def _parser(names):
 
 
 def test_concurrent_voters_each_get_their_own_profile(monkeypatch):
+    """T88: the two voters must actually rendezvous (a lock serialising the write
+    and the read would time the barrier out), and each resolve must be handed its
+    OWN deep copy — never the one shared parser."""
     real = cv.resolve_llm_profile
     barrier = threading.Barrier(2)
+    errors: list = []
+    seen: list = []
+    shared = _parser(["prof_a", "prof_b"])
 
     def rendezvous_then_resolve(parser, section, key, defaults=None):
-        try:                         # both threads have written `_pick` before either reads it
-            barrier.wait(timeout=1)
-        except threading.BrokenBarrierError:
-            pass
+        try:                         # both threads reach here only if nothing serialises them
+            barrier.wait(timeout=10)
+        except threading.BrokenBarrierError as exc:
+            errors.append(exc)       # recorded, not swallowed: a broken barrier fails the test
+        seen.append(parser)
         return real(parser, section, key, defaults=defaults)
 
     monkeypatch.setattr(cv, "resolve_llm_profile", rendezvous_then_resolve)
-    parser = _parser(["prof_a", "prof_b"])
     got = {}
 
     def work(name):
-        got[name] = cv.voter_settings(name, parser).model
+        got[name] = cv.voter_settings(name, shared).model
 
     threads = [threading.Thread(target=work, args=(n,)) for n in ("prof_a", "prof_b")]
     for t in threads:
@@ -51,6 +59,9 @@ def test_concurrent_voters_each_get_their_own_profile(monkeypatch):
     for t in threads:
         t.join()
     assert got == {"prof_a": "model-of-prof_a", "prof_b": "model-of-prof_b"}
+    assert errors == [], "the two voters must resolve concurrently, not under one shared lock"
+    assert len(seen) == 2 and all(p is not shared for p in seen)
+    assert seen[0] is not seen[1], "each voter resolves against its own deepcopy"
 
 
 def test_one_voter_after_another_is_unchanged():
