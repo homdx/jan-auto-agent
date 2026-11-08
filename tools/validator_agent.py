@@ -115,6 +115,13 @@ class ValidatorAgent:
             )
             template = VALIDATOR_PROMPT_HARDCODED
 
+        # An absent related_code (no key, or None) is the empty dict; another falsy
+        # value is sent as itself (a list stays a list, "" stays a string), so
+        # nothing is silently reshaped into a dict.
+        related_code = payload.get("related_code")
+        if related_code is None:
+            related_code = {}
+
         try:
             prompt = template.format(
                 task=payload.get("task"),
@@ -122,7 +129,7 @@ class ValidatorAgent:
                 max_iter=self.max_iter,
                 target_block=payload.get("target_block"),
                 imports=payload.get("imports"),
-                related_code=json.dumps(payload.get("related_code"), indent=2),
+                related_code=json.dumps(related_code, indent=2),
                 missing_refs=payload.get("missing_refs"),
             )
         except (KeyError, ValueError, IndexError, AttributeError, TypeError) as fmt_err:  # AUDIT3-13: "{}" / "{0}" raise IndexError; "{iteration[0]}" on an int, "{imports[x]}" on a list raise TypeError
@@ -136,7 +143,7 @@ class ValidatorAgent:
                 max_iter=self.max_iter,
                 target_block=payload.get("target_block"),
                 imports=payload.get("imports"),
-                related_code=json.dumps(payload.get("related_code"), indent=2),
+                related_code=json.dumps(related_code, indent=2),
                 missing_refs=payload.get("missing_refs"),
             )
 

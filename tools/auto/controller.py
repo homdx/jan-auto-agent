@@ -150,7 +150,8 @@ class RunLimits:
         return (
             f"RunLimits(max_runtime_sec={self.max_runtime_sec}, "
             f"max_tasks_per_run={self.max_tasks_per_run}, "
-            f"exec_timeout_sec={self.exec_timeout_sec})"
+            f"exec_timeout_sec={self.exec_timeout_sec}, "
+            f"workspace_retain_count={self.workspace_retain_count})"
         )
 
 

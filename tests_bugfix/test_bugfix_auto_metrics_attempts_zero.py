@@ -44,13 +44,23 @@ class TestRecordGate2AttemptsZero:
         )
 
     def test_attempts_used_none_falls_back_to_attempts(self, tmp_path):
-        """When attempts_used is not passed (defaults to 0), the legacy
+        """When attempts_used is omitted (its default is ``None``), the legacy
         ``attempts`` parameter is used, matching the pre-fix behaviour."""
         s = _stream(tmp_path)
         s.record_gate2("T1", approved=True, feedback="ok", attempts=3)
         records = s.collector.load_recent(10)
         assert len(records) == 1
         assert records[0].iterations_used == 3
+
+    def test_explicit_attempts_used_none_falls_back_to_attempts(self, tmp_path):
+        """An explicit ``attempts_used=None`` is the same as omitting it: the
+        legacy ``attempts`` parameter is used."""
+        s = _stream(tmp_path)
+        s.record_gate2("T1", approved=True, feedback="ok",
+                       attempts_used=None, attempts=4)
+        records = s.collector.load_recent(10)
+        assert len(records) == 1
+        assert records[0].iterations_used == 4
 
     def test_attempts_used_nonzero_still_wins(self, tmp_path):
         """Sanity: the normal case (attempts_used > 0) is unchanged."""

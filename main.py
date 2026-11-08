@@ -236,6 +236,13 @@ class Orchestrator(OrchestratorActions):
                     f"{config_path} is not a valid .ini file: {exc}"
                 ) from exc
             self.config = _new_config
+        else:
+            # An absent path keeps whatever config is already loaded (empty on startup,
+            # the last-good file on /reload), so do not claim the built-in defaults are in use.
+            logger.warning(
+                "load_config: config file not found: %s — keeping the current configuration",
+                config_path,
+            )
         
         # The typed helpers turn a malformed value into the coded default instead of an exception.
         self.max_iterations = self._getint("loop", "max_iterations", 3)

@@ -538,7 +538,12 @@ class SummaryMemory:
         on recursion depth, which is what guarantees the process always
         terminates and never loops. Returns the best summary available when the
         cap is hit, even if it is still long. Never raises.
+
+        Blank input is an empty summary and costs no LLM call: an empty chapter
+        fits the budget, so the short-input path would otherwise summarise "".
         """
+        if not chapter_text or not chapter_text.strip():
+            return ""
         return self._compress(chapter_text, passes_used=0)
 
     def update(self, chapter_file: str, base_dir: "str | Path | None" = None) -> None:

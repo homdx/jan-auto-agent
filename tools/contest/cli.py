@@ -135,6 +135,8 @@ from tools.contest.think_probe import (
 from tools.contest.workspace import LegCarry, WorkspaceError, agent_tmp_dir, prepare_round
 from tools.git_run import run_git
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "DEFAULT_PROVIDER",
     "DEFAULT_ROSTER",
@@ -271,6 +273,10 @@ def _tree_names(repo, at, folder, recursive=False) -> list:
     proc = run_git(["git", *args], cwd=str(repo), encoding="utf-8",
                    errors="surrogateescape")
     if proc.returncode:
+        logger.warning(
+            "_tree_names: git ls-tree %s %s failed (exit %s): %s",
+            at, folder, proc.returncode, (proc.stderr or "").strip(),
+        )
         return []
     return [name for name in proc.stdout.split("\0") if name]
 

@@ -64,8 +64,24 @@ def truth_of(row: dict, side: str) -> Optional[bool]:
 
 
 def _index(rows: list[dict]) -> tuple[dict, dict]:
-    return ({r["id"]: r for r in rows if r.get("id")},
-            {r["claim"]: r for r in rows})
+    """Index the claim rows by id and by text, refusing a malformed row.
+
+    ``score()`` reads a row's ``claim`` after this, and a truth row dropped
+    here would silently change the denominator, so a row that cannot be
+    indexed is a configuration error rather than a row to skip.
+    """
+    by_id: dict = {}
+    by_text: dict = {}
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"claim row {i} is not an object")
+        claim = row.get("claim")
+        if not isinstance(claim, str) or not claim.strip():
+            raise ValueError(f"claim row {i} has no claim text")
+        if row.get("id"):
+            by_id[row["id"]] = row
+        by_text[claim] = row
+    return by_id, by_text
 
 
 def _match(vote: dict, by_id: dict, by_text: dict) -> Optional[dict]:
@@ -184,8 +200,40 @@ def _metric(table: dict, path: Optional[str]):
     return node
 
 
+_TARGET_REQUIRED = ("id", "metric", "op", "value")
+
+
+def _validate_targets(thresholds: list[dict]) -> None:
+    """Refuse a target the scorer cannot evaluate or the CLI cannot render.
+
+    ``metric`` may be ``None`` (the target is then reported ``n/a``), but the
+    key must be there: rendering reads ``c["metric"]`` as well as ``c["op"]``,
+    so a missing field is a configuration error, not an ``n/a`` row.
+    """
+    for i, t in enumerate(thresholds):
+        if not isinstance(t, dict):
+            raise ValueError(f"threshold target {i} is not an object")
+        label = t.get("id", f"#{i}")
+        missing = [f for f in _TARGET_REQUIRED if f not in t]
+        if missing:
+            raise ValueError(
+                f"threshold target {label} is missing required field(s): "
+                + ", ".join(missing)
+            )
+        if t["op"] not in _OPS:
+            raise ValueError(
+                f"threshold target {label} has unknown op {t['op']!r} "
+                f"(expected one of {', '.join(_OPS)})"
+            )
+
+
 def check_thresholds(table: dict, thresholds: list[dict]) -> list[dict]:
-    """One row per target of this set: ``ok`` True/False, or None (n/a)."""
+    """One row per target of this set: ``ok`` True/False, or None (n/a).
+
+    Every target is validated first, even one that this run's set skips: a
+    bad file is a configuration error wherever the target is used.
+    """
+    _validate_targets(thresholds)
     out = []
     for t in thresholds:
         if t.get("set") not in (None, table.get("set")):
@@ -229,14 +277,25 @@ def main(argv=None) -> int:
     ap.add_argument("--thresholds", type=Path)
     ap.add_argument("--json", action="store_true", help="print the table as JSON")
     args = ap.parse_args(argv)
-    votes = json.loads(args.votes.read_text(encoding="utf-8"))
-    truth = json.loads(args.claims.read_text(encoding="utf-8"))
-    is_delta = isinstance(votes, list) or "deltas" in votes
-    table = score_deltas(votes, truth) if is_delta else score(votes, truth, args.side)
+    try:
+        votes = json.loads(args.votes.read_text(encoding="utf-8"))
+        truth = json.loads(args.claims.read_text(encoding="utf-8"))
+        is_delta = isinstance(votes, list) or "deltas" in votes
+        table = score_deltas(votes, truth) if is_delta else score(votes, truth, args.side)
+        if not args.thresholds:
+            print(json.dumps(table, indent=1) if args.json else render(table))
+            return 0
+        thresholds = json.loads(args.thresholds.read_text(encoding="utf-8"))
+        targets = thresholds.get("targets") if isinstance(thresholds, dict) else None
+        if not isinstance(targets, list) or not targets:
+            raise ValueError(
+                f"{args.thresholds}: no 'targets' to check"
+            )
+        checks = check_thresholds(table, targets)
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError) as exc:
+        print(f"score_cc: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(table, indent=1) if args.json else render(table))
-    if not args.thresholds:
-        return 0
-    checks = check_thresholds(table, json.loads(args.thresholds.read_text(encoding="utf-8"))["targets"])
     for c in checks:
         mark = {True: "ok  ", False: "MISS", None: "n/a "}[c["ok"]]
         print(f"{mark} {c['id']}: {c['metric']} {c['op']} {c['value']} (observed {c['observed']})")

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 DATA = Path(__file__).with_name("free_votes.json")
@@ -37,7 +38,16 @@ SETS = {
 
 
 def accept(votes: list, rule: str, quorum: int = QUORUM) -> int:
-    """+1 / -1 accepted TRUE / FALSE, 0 not accepted. *votes*: one entry per voter of the set."""
+    """+1 / -1 accepted TRUE / FALSE, 0 not accepted. *votes*: one entry per voter of the set.
+
+    T144: a vote outside -1, 0, 1 is refused (ValueError) before anything is
+    counted, including a uniform bad set — ``[2, 2, 2]`` used to come back
+    accepted as +1-TRUE through the quorum check, and ``[2, 1, 1]`` was only
+    refused later, by the disagreement check.
+    """
+    bad = [v for v in votes if v not in (-1, 0, 1)]
+    if bad:
+        raise ValueError(f"vote {bad[0]!r} is outside -1, 0, 1 — refusing the row")
     committed = [v for v in votes if v != 0]
     if len(set(committed)) != 1 or len(committed) < quorum:
         return 0
@@ -68,7 +78,13 @@ def main(argv=None) -> int:
     rules = ("all", "committed") if opts.rule == "both" else (opts.rule,)
     print(f"{'set':9} {'voters':>6}  " + "  ".join(f"{r:>9} settled/wrong" for r in rules))
     for name, vs in sets.items():
-        print(f"{name:9} {len(vs):6d}  " + "  ".join(f"{'%d / %d' % replay(vs, r):>23}" for r in rules))
+        try:
+            cells = ["%d / %d" % replay(vs, r) for r in rules]
+        except ValueError as exc:
+            # T144: a recorded vote outside -1, 0, 1 is refused, not counted — a clear error and a nonzero exit.
+            print(f"replay_rules: set {name!r}: {exc}", file=sys.stderr)
+            return 2
+        print(f"{name:9} {len(vs):6d}  " + "  ".join(f"{c:>23}" for c in cells))
     return 0
 
 
