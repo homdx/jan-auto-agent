@@ -74,15 +74,19 @@ class Spinner:
 
     def spin(self):
         """Advance one frame (used internally by the background thread)."""
+        # Formatted before the try: a ValueError raised while building the line is a bug in the
+        # message, not a closed stream, and must not be swallowed with the output errors below.
+        line = f"\r{self.frames[self.idx % len(self.frames)]} {self.message}..."
         try:
-            sys.stdout.write(f"\r{self.frames[self.idx % len(self.frames)]} {self.message}...")
+            sys.stdout.write(line)
             sys.stdout.flush()
         except UnicodeEncodeError:
             # AUDIT3-18: a stdout that cannot hold the Braille frames gets ASCII ones.
             self.frames = ["|", "/", "-", "\\"]
             safe_stdout_write(f"\r{self.frames[self.idx % len(self.frames)]} {self.message}...")
-        except (BrokenPipeError, OSError):
-            # Stdout closed early (e.g. | head): stop the thread instead of spinning on a dead pipe.
+        except (BrokenPipeError, OSError, ValueError):
+            # Stdout closed early (e.g. | head) or the stream was closed outright
+            # (a closed file raises ValueError): stop the thread instead of spinning on a dead pipe.
             self.running = False
             return
         self.idx += 1
@@ -108,7 +112,8 @@ class Spinner:
         try:
             sys.stdout.write("\r" + " " * (len(self.message) + 6) + "\r")
             sys.stdout.flush()
-        except (BrokenPipeError, OSError, UnicodeEncodeError):
+        except (BrokenPipeError, OSError, UnicodeEncodeError, ValueError):
+            # A broken pipe or a closed stream swallows the clear line; stop() still finishes.
             pass
 
     # ── context-manager support ──────────────────────────────────────────
@@ -147,8 +152,9 @@ def stream_tracker():
         except UnicodeEncodeError:
             # AUDIT3-18: a non-UTF-8 stdout must not kill a paid streaming call.
             safe_stdout_write(t)
-        except (BrokenPipeError, OSError):
-            # Stdout closed early: streaming output is cosmetic, so keep tracking tokens and do not crash.
+        except (BrokenPipeError, OSError, ValueError):
+            # Stdout closed early or the stream was closed outright (a closed file raises
+            # ValueError): streaming output is cosmetic, so keep tracking tokens and do not crash.
             pass
 
     def stats() -> str:
