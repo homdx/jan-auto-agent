@@ -254,3 +254,139 @@ def test_a_second_ideal_moves_the_existing_tree_before_the_judge_runs(repo, monk
     rec.lines.clear()
     code, out, _ = _judge(capsys, "184", "--ideal", second, "--dry-run")
     assert code == 0 and rec.lines == [] and "checkout -q --detach" in out
+
+
+# ── AGNES-9: an ideal that is not the round's own worktree is refused ────────
+@pytest.fixture
+def round_repo(tmp_path, monkeypatch):
+    """A real git repo whose round folder `contest-out/184` sits inside it.
+
+    A stale `wt/ideal` here is a plain directory *inside* the repo, so `git -C
+    wt/ideal` walks up and finds the main checkout — the case AGNES-9 guards.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(repo / "contest.ini", INI)
+    _write(repo / "f.txt", "one")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "one")
+    first = _git(repo, "rev-parse", "HEAD")
+    _write(repo / "f.txt", "two")
+    _git(repo, "commit", "-qam", "two")
+    second = _git(repo, "rev-parse", "HEAD")
+    folder = repo / "contest-out" / "184"
+    _write(folder / "entrants.json", json.dumps({"base": first, "entrants": {}}))
+    monkeypatch.setattr(cli, "REPO_ROOT", repo)
+    monkeypatch.setattr(judging, "round_alive", lambda *_a, **_k: False)
+    monkeypatch.setattr(judging, "LOADAVG", lambda: (0.1, 0.1, 0.1))
+    return repo, folder, first, second
+
+
+def _snapshot(repo: Path) -> tuple:
+    """The main repo's HEAD, branch and tracked bytes — what must not change."""
+    return (_git(repo, "rev-parse", "HEAD"),
+            _git(repo, "symbolic-ref", "--short", "HEAD"),
+            _git(repo, "show", "HEAD:f.txt"))
+
+
+def test_plan_ideal_move_refuses_an_ideal_that_is_not_the_rounds_worktree(round_repo):
+    repo, folder, first, second = round_repo
+    ideal = folder / "wt" / "ideal"
+    ideal.mkdir(parents=True)
+    with pytest.raises(judging.RoundError, match="ideal"):
+        judging.plan_ideal_move(repo, folder, second)
+
+
+def test_a_stale_plain_ideal_directory_is_refused_before_any_command(round_repo, monkeypatch, capsys):
+    repo, folder, first, second = round_repo
+    ideal = folder / "wt" / "ideal"
+    ideal.mkdir(parents=True)
+    _write(ideal / "f.txt", "stale")
+    before = _snapshot(repo)
+    rec = Recorder()
+    monkeypatch.setattr(judging, "RUN", rec)
+    code, _, err = _judge(capsys, "184", "--ideal", first)
+    assert code == 2 and "ideal" in err and rec.lines == []
+    assert _snapshot(repo) == before
+
+
+def test_a_symlink_ideal_to_the_main_checkout_is_refused(round_repo, monkeypatch, capsys):
+    repo, folder, first, second = round_repo
+    ideal = folder / "wt" / "ideal"
+    ideal.parent.mkdir(parents=True)
+    ideal.symlink_to(repo)
+    before = _snapshot(repo)
+    rec = Recorder()
+    monkeypatch.setattr(judging, "RUN", rec)
+    code, _, err = _judge(capsys, "184", "--ideal", first)
+    assert code == 2 and "ideal" in err and rec.lines == []
+    assert _snapshot(repo) == before
+
+
+def test_an_ideal_redirected_outside_the_round_is_refused(round_repo, monkeypatch, capsys):
+    repo, folder, first, second = round_repo
+    other = repo / "contest-out" / "other"
+    _git(repo, "worktree", "add", "-q", "--detach", str(other), first)
+    ideal = folder / "wt" / "ideal"
+    ideal.parent.mkdir(parents=True)
+    ideal.symlink_to(other)
+    before = _snapshot(repo)
+    rec = Recorder()
+    monkeypatch.setattr(judging, "RUN", rec)
+    code, _, err = _judge(capsys, "184", "--ideal", second)
+    assert code == 2 and "ideal" in err and rec.lines == []
+    assert _snapshot(repo) == before
+
+
+def test_a_real_detached_ideal_worktree_is_accepted_and_moves(round_repo, monkeypatch, capsys):
+    repo, folder, first, second = round_repo
+    _git(repo, "worktree", "add", "-q", "--detach", str(folder / "wt" / "ideal"), first)
+    rec = Recorder()
+    monkeypatch.setattr(judging, "RUN", rec)
+    code, out, _ = _judge(capsys, "184", "--ideal", second)
+    assert code == 0
+    assert rec.lines[0][:3] == ["git", "-C", str(folder / "wt" / "ideal")]
+    assert rec.lines[0][-1] == second
+    assert "judge_epic_round.py" in rec.lines[1][1]
+
+
+def test_an_ideal_with_an_empty_dot_git_directory_is_refused(round_repo):
+    """git ignores an empty `.git` and walks up to the main checkout, so it is no worktree."""
+    repo, folder, first, second = round_repo
+    ideal = folder / "wt" / "ideal"
+    (ideal / ".git").mkdir(parents=True)
+    before = _snapshot(repo)
+    with pytest.raises(judging.RoundError, match="ideal"):
+        judging.plan_ideal_move(repo, folder, second)
+    assert _snapshot(repo) == before
+
+
+def test_an_ideal_that_is_a_file_or_a_dangling_symlink_is_refused(round_repo):
+    repo, folder, first, second = round_repo
+    ideal = folder / "wt" / "ideal"
+    ideal.parent.mkdir(parents=True)
+    ideal.write_text("not a tree")
+    with pytest.raises(judging.RoundError, match="ideal"):
+        judging.plan_ideal_move(repo, folder, second)
+    ideal.unlink()
+    ideal.symlink_to(folder / "wt" / "nowhere")
+    with pytest.raises(judging.RoundError, match="ideal"):
+        judging.plan_ideal_move(repo, folder, second)
+
+
+def test_a_stale_ideal_is_refused_even_when_no_ref_is_given(round_repo):
+    """The judge itself would score the stale tree, so it is refused with or without `--ideal`."""
+    repo, folder, first, second = round_repo
+    (folder / "wt" / "ideal").mkdir(parents=True)
+    with pytest.raises(judging.RoundError, match="ideal"):
+        judging.plan_ideal_move(repo, folder, None)
+
+
+def test_a_real_worktree_is_accepted_when_the_repo_is_reached_through_a_symlink(round_repo, tmp_path):
+    """The check compares resolved paths on both sides: an alias of the repo is not a redirect."""
+    repo, folder, first, second = round_repo
+    _git(repo, "worktree", "add", "-q", "--detach", str(folder / "wt" / "ideal"), first)
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo)
+    assert judging.plan_ideal_move(alias, alias / "contest-out" / "184", second) == second

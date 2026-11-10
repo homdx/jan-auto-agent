@@ -80,14 +80,54 @@ def build_lines(repo: Path, nn: int, folder: Path, base: str,
     return lines
 
 
+def _ideal_refusal(repo: Path, folder: Path, tree: Path) -> Optional[str]:
+    """Why an existing `wt/ideal` is unsafe to run `checkout` in, or None.
+
+    A stale plain directory, a symlink to the main checkout or a path that
+    redirects outside the round folder would make `git -C wt/ideal checkout`
+    walk up and land on another checkout: the main one, or one the round does
+    not own. `is-inside-work-tree` does not tell that apart, and
+    `resolve(show-toplevel) == resolve(ideal)` passes a symlink to the main
+    checkout (both resolve to it), so the resolved top-level is checked against
+    the round folder and against the main checkout. Refusing is the only safe
+    answer — nothing is deleted, recreated or switched.
+    """
+    if not (tree.exists() or tree.is_symlink()):
+        return None
+    try:
+        tree_res = tree.resolve()
+        folder_res = folder.resolve()
+    except OSError as err:
+        return f"cannot resolve {tree}: {err}"
+    top = _git(tree, "rev-parse", "--show-toplevel")
+    if not top:
+        return f"{tree} is not a Git worktree"
+    top_res = Path(top).resolve()
+    if top_res != tree_res:
+        return f"{tree} is not its own Git top-level (it reports {top})"
+    if folder_res != top_res and folder_res not in top_res.parents:
+        return f"{tree} is outside the round folder {folder}"
+    main = _git(repo, "rev-parse", "--show-toplevel")
+    if main and Path(main).resolve() == top_res:
+        return f"{tree} is the main checkout of {repo}"
+    return None
+
+
 def plan_ideal_move(repo: Path, folder: Path, ref: Optional[str]) -> Optional[str]:
     """The commit `wt/ideal` must move to, or None when it is already there.
 
     `setup_worktrees.py` skips a tree that exists, so a second `--ideal` would
     otherwise be scored against the first one's checkout without a word.
-    Raises `RoundError` for a ref git cannot resolve.
+    An existing `wt/ideal` that is not a real detached worktree of *repo* inside
+    *folder* — a stale plain directory, a symlink to the main checkout, a path
+    redirecting outside the round — is refused: `git -C wt/ideal checkout` would
+    walk up and land on another checkout.
+    Raises `RoundError` for a ref git cannot resolve, or for such an `ideal`.
     """
     tree = folder / "wt" / "ideal"
+    bad = _ideal_refusal(repo, folder, tree)
+    if bad:
+        raise RoundError(f"--ideal {tree}: {bad}")
     if not ref or not tree.exists():
         return None
     want = _git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
