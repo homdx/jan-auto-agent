@@ -1687,6 +1687,14 @@ class Coder(_llm_stream.LLMClientBase):
             )
             body = _salvaged
 
+        # AGNES-10: normalise CRLF marker lines before the line-oriented marker
+        # split below, so `<<<FILE: path>>>\r\n` and `<<<END>>>\r\n` are treated
+        # as markers instead of falling through to the single-file fallback and
+        # leaking their delimiters into a chapter.  Only a reply that has a marker
+        # line is normalised: a plain CRLF chapter keeps its line endings.
+        if "\r\n" in body and re.search(r"^<<<(?:FILE|END)", body, re.MULTILINE | re.IGNORECASE):
+            body = body.replace("\r\n", "\n")
+
         # Strip every CONTEXT_REQUEST line, not just those in the last three lines (BUGFIX).
         lines = body.splitlines()
         kept_lines = [
@@ -1726,13 +1734,51 @@ class Coder(_llm_stream.LLMClientBase):
             return [], msg
 
         # ── Multi-file marker split ─────────────────────────────────────────
-        _FILE_OPEN  = re.compile(r"^<<<FILE:\s*(.+?)\s*>>>$", re.MULTILINE)
+        # `(.*?)` not `(.+?)`: an opener with an empty path (`<<<FILE:>>>`,
+        # `<<<FILE: >>>`) still matches, so it is recognised below as a
+        # malformed attempt and refused instead of leaking into a chapter
+        # (AGNES-10).
+        _FILE_OPEN  = re.compile(r"^<<<FILE:\s*(.*?)\s*>>>$", re.MULTILINE)
         _FILE_CLOSE = re.compile(r"^<<<END>>>$", re.MULTILINE)
+        # A line that *begins* like a marker is a marker attempt; one that is
+        # not well-formed (empty path, no colon, unterminated opener, a mangled
+        # END) refuses the whole reply instead of leaking the delimiters (AGNES-10).
+        _OPEN_ATTEMPT = re.compile(r"^<<<FILE\b.*$", re.MULTILINE)
+        _END_ATTEMPT  = re.compile(r"^<<<END\b.*$", re.MULTILINE)
 
         open_matches = list(_FILE_OPEN.finditer(body))
+        close_matches = list(_FILE_CLOSE.finditer(body))
+
+        # A marker-looking line that is not a well-formed marker is malformed.
+        # Refuse the whole attempt so the caller retries and no delimiter ever
+        # reaches a chapter — an existing file must not be overwritten by an
+        # ambiguous reply (AGNES-10).
+        for _m in _OPEN_ATTEMPT.finditer(body):
+            _line = _m.group(0)
+            _wf = _FILE_OPEN.match(_line)
+            if not _wf or not _wf.group(1).strip():
+                msg = (
+                    "creative coder: malformed FILE marker — expected "
+                    "<<<FILE: relative/path>>> with a non-empty path, got "
+                    f"{_line!r}. Nothing was written."
+                )
+                logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+                return [], msg
+        for _m in _END_ATTEMPT.finditer(body):
+            _line = _m.group(0)
+            if not _FILE_CLOSE.match(_line):
+                msg = (
+                    "creative coder: malformed END marker — expected "
+                    "<<<END>>> on its own line, got "
+                    f"{_line!r}. Nothing was written."
+                )
+                logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+                return [], msg
+
         # Marker extraction runs whenever markers are present, for single- and multi-file tasks (FIX).
         if open_matches:
             parsed: list[dict] = []
+            used_closer_starts: "set[int]" = set()
             for i, m_open in enumerate(open_matches):
                 relpath = m_open.group(1).strip()
                 content_start = m_open.end()
@@ -1741,22 +1787,43 @@ class Coder(_llm_stream.LLMClientBase):
                 # A missing closer must not match a later file's marker; the closer is searched only before the next opener (BUGFIX).
                 close_match = _FILE_CLOSE.search(body, content_start, boundary)
                 content_end = close_match.start() if close_match else boundary
+                if close_match:
+                    used_closer_starts.add(close_match.start())
                 chunk = body[content_start:content_end].strip()
                 chunk = re.sub(r"\s*<<<END>>>\s*$", "", chunk)
-                if chunk:
-                    parsed.append({"path": relpath, "content": chunk + "\n"})
-                else:
-                    logger.debug(
-                        "coder._parse_response_prose [%s]: marker %r had empty body — skipped",
-                        task_id, relpath,
+                if not chunk:
+                    # An empty block (an opener/closer pair with nothing between)
+                    # is ambiguous: refuse instead of writing nothing over an
+                    # existing chapter (AGNES-10).
+                    msg = (
+                        "creative coder: FILE marker "
+                        f"{relpath!r} had an empty body — nothing to write, "
+                        "refusing so an existing chapter is not overwritten. "
+                        "Emit the complete chapter text."
                     )
-            if parsed:
-                return parsed, ""
-            # Markers present but all bodies empty — fall through to single-file.
-            logger.warning(
-                "coder._parse_response_prose [%s]: FILE markers produced no content "
-                "— falling back to single-file mode", task_id,
+                    logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+                    return [], msg
+                parsed.append({"path": relpath, "content": chunk + "\n"})
+            # A closer that closed no opener (e.g. a lone <<<END>>> line) is
+            # malformed — refuse rather than leak it (AGNES-10).
+            for _cm in close_matches:
+                if _cm.start() not in used_closer_starts:
+                    msg = (
+                        "creative coder: found a <<<END>>> with no matching "
+                        "<<<FILE: ...>>> opener — refusing so the delimiter is "
+                        "not written into a chapter."
+                    )
+                    logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+                    return [], msg
+            return parsed, ""
+        if close_matches:
+            # Openers absent but a closer present — a lone <<<END>>> line (AGNES-10).
+            msg = (
+                "creative coder: found <<<END>>> with no <<<FILE: ...>>> opener "
+                "— refusing so the delimiter is not written into a chapter."
             )
+            logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+            return [], msg
 
         # ── Single-file (default) ────────────────────────────────────────────
         if target_files:
