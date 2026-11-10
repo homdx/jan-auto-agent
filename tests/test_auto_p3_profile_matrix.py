@@ -46,7 +46,10 @@ from tools.auto.architect import ClusterReviewer
 from tools.auto.controller import _lint_probe_config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PROFILES = sorted(p.name for p in REPO_ROOT.glob("agents*.ini"))
+# An operator's own agents*.local.ini is git-ignored, not shipped: the matrix covers shipped profiles only.
+PROFILES = sorted(
+    p.name for p in REPO_ROOT.glob("agents*.ini") if not p.name.endswith(".local.ini")
+)
 
 # Guards against a profile being added later and silently escaping the matrix.
 _EXPECTED_MIN_PROFILES = 8

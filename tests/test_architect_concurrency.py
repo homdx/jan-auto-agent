@@ -506,7 +506,11 @@ class TestProbeSafety:
 
 # ── Shipped profiles ────────────────────────────────────────────────────────
 
-_PROFILES = sorted(Path(__file__).resolve().parent.parent.glob("agents*.ini"))
+# An operator's own agents*.local.ini is git-ignored, not shipped: it is not held to the shipped ceiling.
+_PROFILES = sorted(
+    p for p in Path(__file__).resolve().parent.parent.glob("agents*.ini")
+    if not p.name.endswith(".local.ini")
+)
 
 
 def test_the_shipped_profiles_are_found():
