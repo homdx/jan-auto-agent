@@ -754,10 +754,10 @@ class AutoController:
                         # is on disk — destroying the tree when the patch write
                         # failed would lose the only copy. B9's rule still
                         # applies: a GitError is logged and the run continues.
-                        self._discard_exhausted_residue(
-                            task["id"],
-                            reason="commit failed, work saved as a patch",
-                        )
+                        if not self._discard_exhausted_residue(
+                                task["id"],
+                                reason="commit failed, work saved as a patch"):
+                            unsaved_work_task = task["id"]      # the reset failed: the edit is still in the tree
                     else:
                         # Same hazard as a failed state write: the edit stays in the tree with no patch,
                         # and the next task's commit would take it in. The run stops after this task.
@@ -842,16 +842,16 @@ class AutoController:
                 # patch is on disk — otherwise the next task's commit would sweep it in, or a reset would
                 # throw the only copy away.
                 patch_path = self._save_uncommitted_patch(task, result)
-                self.state.log(
+                # Writing the run log is best effort here: the log may be the very thing that failed, and
+                # a raise from it would skip the reset below and the next task would run over the edit.
+                self._log_quietly(
                     f"task {task['id']} accepted but NOT recorded (state write failed) — "
                     + (f"work saved to {patch_path}; the tree goes back to HEAD" if patch_path
                        else "could not save the work as a patch; it stays in the working tree")
                 )
-                if patch_path:
-                    self._discard_exhausted_residue(
-                        task["id"], reason="state write failed, work saved as a patch",
-                    )
-                else:
+                if not patch_path or not self._discard_exhausted_residue(
+                        task["id"], reason="state write failed, work saved as a patch"):
+                    # no patch, or the tree could not be reset: the edit is still in it
                     unsaved_work_task = task["id"]
 
             else:
@@ -910,9 +910,9 @@ class AutoController:
             if unsaved_work_task:
                 # The accepted edit is in the tree and nothing else holds it: the next task's commit would
                 # take it in under its own id while this one stays blocked. Stop, tree untouched.
-                self.state.log(
-                    f"run stopped: {unsaved_work_task} left accepted work in the working tree with no patch "
-                    f"of it — not starting another task over it"
+                self._log_quietly(
+                    f"run stopped: {unsaved_work_task} left accepted work in the working tree (no patch of "
+                    f"it, or the tree could not be reset) — not starting another task over it"
                 )
                 self._log_collect_summary(collect_bridge)
                 return STOP_UNSAVED_WORK, tasks_done
@@ -937,6 +937,11 @@ class AutoController:
         """
         task_id = safe_filename_component(task.get("id") or "unknown")
         patch_path = self.agent_dir / f"uncommitted-{task_id}.patch"
+        if self.git is None:
+            # --no-git: there is no diff to take, so the edit stays in the tree and the caller stops the run
+            logger.error("task %s: git is not in use, so the uncommitted work cannot be captured as a "
+                         "patch — it stays only in the working tree.", task_id)
+            return ""
         try:
             patch_path.parent.mkdir(parents=True, exist_ok=True)
             diff = self.git.diff_working_tree()
@@ -1030,7 +1035,7 @@ class AutoController:
 
     def _discard_exhausted_residue(
         self, task_id: str, reason: str = "exhausted",
-    ) -> None:
+    ) -> bool:
         """Discard the uncommitted edits left behind by a task that did not commit.
 
         ``reason`` names the run.log line: ``exhausted`` (the AUTO-G4 path) or
@@ -1058,9 +1063,13 @@ class AutoController:
         The failure is written to ``state.log`` as well as ``logger``: the
         run log is what gets read during a postmortem, and ``logger`` may be
         configured to a level that drops the warning entirely.
+
+        Returns True when the tree is clean of the task's edit (discarded, or git is not in use), False when
+        the discard failed and the edit is still in the tree: a caller that has just saved that edit as
+        its only record stops the run on False instead of letting the next commit sweep it in.
         """
         if self.git is None:
-            return
+            return True
         try:
             self.git.discard_working_changes()
         except GitError as exc:
@@ -1069,16 +1078,24 @@ class AutoController:
                 "continuing (residue may be swept into the next commit): %s",
                 task_id, reason, exc,
             )
-            self.state.log(
+            self._log_quietly(
                 f"task {task_id} uncommitted edits NOT discarded "
                 f"(git discard failed: {exc}) — residue may be swept into "
                 f"the next commit"
             )
-            return
-        self.state.log(
+            return False
+        self._log_quietly(
             f"task {task_id} uncommitted edits discarded "
             f"({reason}, not committed)"
         )
+        return True
+
+    def _log_quietly(self, message: str) -> None:
+        """``state.log`` that never raises: a diagnostic line must not cut a recovery step short."""
+        try:
+            self.state.log(message)
+        except Exception as exc:
+            logger.error("run.log write failed (%s) — %s", exc, message)
 
     def _check_regressions(
         self,
@@ -1207,7 +1224,7 @@ class AutoController:
         if self.run_trace:
             self.run_trace.log_run_capped(stop_reason)
         self.state.update_progress(status="capped", stop_reason=stop_reason)
-        self.state.log(
+        self._log_quietly(
             f"run capped: reason={stop_reason} "
             f"elapsed={elapsed:.1f}s tasks_done={tasks_done}"
         )
@@ -1215,8 +1232,8 @@ class AutoController:
         ts = _ts()
         if stop_reason == STOP_UNSAVED_WORK:
             print(
-                f"[{ts}] ⛔ Stopped: a task's accepted work could not be saved as a patch and is still "
-                f"in the working tree — commit or save it, then resume. Nothing was reset."
+                f"[{ts}] ⛔ Stopped: a task's accepted work is still in the working tree (it could not be "
+                f"saved as a patch, or the tree could not be reset) — commit or save it, then resume."
             )
         elif stop_reason == STOP_RUNTIME_CAP:
             mins = self.limits.max_runtime_sec / 60

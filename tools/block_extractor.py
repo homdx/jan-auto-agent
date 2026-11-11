@@ -6,6 +6,7 @@ import functools
 import io
 import keyword
 import re
+import threading
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -338,13 +339,8 @@ def _js_regex_can_start(source: str, i: int) -> bool:
         # cannot follow a `++`/`--` (the prefix form takes an operand, not a literal), and read
         # as one it swallowed the line up to the next `/` — and the next function with it.
         return False
-    if source[j] == "!" and j >= 1 and (source[j - 1].isalnum() or source[j - 1] in "_$)]"):
-        # TypeScript's non-null assertion, `x! / 2`: an operand ended with `!`, so the `/` divides —
-        # unless the word is a keyword that takes an operand (`return!/re/.test(s)`, a prefix `!`).
-        k = j - 1
-        while k >= 0 and (source[k].isalnum() or source[k] in "_$"):
-            k -= 1
-        return source[k + 1:j] in _JS_REGEX_AFTER_WORD
+    if source[j] == "!":
+        return _js_bang_is_a_prefix(source, j)
     if source[j] == "}" and _js_brace_closes_an_expression(source, j):
         return False        # `{valueOf: () => 4} / 2`: an object literal is an operand, a block is not
     if source[j] in "(,=:[!&|?{};+-*%>~^}":
@@ -355,42 +351,186 @@ def _js_regex_can_start(source: str, i: int) -> bool:
     return source[k + 1:j + 1] in _JS_REGEX_AFTER_WORD
 
 
+#: Words after which a `{` opens an object literal (an operand), not a block.
+_JS_OBJECT_OPERAND_WORDS = frozenset(("return", "typeof", "void", "delete", "throw", "in", "of", "new",
+                                      "await", "yield", "instanceof", "case"))
+#: `if (…)`, `while (…)`, `for (…)`, `with (…)`: the `)` closes a condition, so a `!` after it is a prefix.
+_JS_CONDITION_WORDS = frozenset(("if", "while", "for", "with"))
+
+_PAIRING = threading.local()
+
+
+def _js_pairs_for(source: str) -> dict:
+    """close index -> open index of every `)`/`}`/`]` of *source* the JS lexer sees as code (strings,
+    comments, template text and regex literals hold none). While the pairing itself is being built, the
+    pairs found so far answer, since it asks about the brackets that came before its position."""
+    building = getattr(_PAIRING, "pairs", None)
+    return building if building is not None else _js_bracket_pairs(source)
+
+
+@functools.lru_cache(maxsize=8)
+def _js_bracket_pairs(source: str) -> dict:
+    pairs: dict = {}
+    previous = getattr(_PAIRING, "pairs", None)
+    _PAIRING.pairs = pairs
+    try:
+        n, i = len(source), 0
+        stack: list = []
+        interpolations: list = []        # unclosed `{` count of each open `${ … }`
+        state = "code"                   # code, ' " (single-line strings), ` (template text)
+        while i < n:
+            ch = source[i]
+            if state == "code":
+                skip = _lang_skip(source, i, "js")
+                if skip is not None:
+                    i = skip
+                    continue
+                nxt = source[i + 1:i + 2]
+                if ch == "/" and nxt == "/":
+                    end = source.find("\n", i)
+                    i = n if end < 0 else end
+                    continue
+                if ch == "/" and nxt == "*":
+                    end = source.find("*/", i + 2)
+                    i = n if end < 0 else end + 2
+                    continue
+                if ch in "'\"`":
+                    state = ch
+                elif ch in "([{":
+                    stack.append((ch, i))
+                    if ch == "{" and interpolations:
+                        interpolations[-1] += 1
+                elif ch in ")]}":
+                    if ch == "}" and interpolations and interpolations[-1] == 0:
+                        interpolations.pop()           # the `}` of a `${ … }`
+                        state = "`"
+                    else:
+                        if ch == "}" and interpolations:
+                            interpolations[-1] -= 1
+                        want = {")": "(", "]": "[", "}": "{"}[ch]
+                        if stack and stack[-1][0] == want:
+                            pairs[i] = stack.pop()[1]
+                i += 1
+                continue
+            if ch == "\\":
+                i += 2
+                continue
+            if state == "`" and ch == "$" and source[i + 1:i + 2] == "{":
+                interpolations.append(0)
+                state = "code"
+                i += 2
+                continue
+            if ch == state or (ch == "\n" and state != "`"):
+                state = "code"
+            i += 1
+    finally:
+        _PAIRING.pairs = previous
+    return pairs
+
+
+def _js_prev_code(source: str, j: int) -> int:
+    """The index of the last character at or before *j* that is neither blank nor inside a `/* … */`."""
+    while j >= 0:
+        if source[j] in " \t\r\n":
+            j -= 1
+        elif source[j] == "/" and j >= 1 and source[j - 1] == "*":
+            start = source.rfind("/*", 0, j - 1)
+            if start < 0:
+                return j
+            j = start - 1
+        else:
+            return j
+    return -1
+
+
+def _js_word_ending_at(source: str, j: int) -> str:
+    k = j
+    while k >= 0 and (source[k].isalnum() or source[k] in "_$"):
+        k -= 1
+    return source[k + 1:j + 1]
+
+
+def _js_bang_is_a_prefix(source: str, j: int) -> bool:
+    """True when the `!` at *j*, right before a `/`, is the logical NOT, so a regex literal may follow;
+    False when it is TypeScript's non-null assertion on an operand (`x! / 2`, `x!! / 2`, `x ! / 2`,
+    `f(a)! / 2`, `a[0]! / 2`), so the `/` divides. The operand before it decides: a name, `]`, or a `)`
+    that is not the end of an `if`/`while`/`for`/`with` condition (`if (x)!/re/.test(s)` is a NOT)."""
+    k = _js_prev_code(source, j - 1)
+    while k >= 0 and source[k] == "!":                     # `x!!`
+        k = _js_prev_code(source, k - 1)
+    if k < 0:
+        return True
+    c = source[k]
+    if c == ")":
+        opener = _js_pairs_for(source).get(k)
+        if opener is None:
+            return True
+        before = _js_prev_code(source, opener - 1)
+        return before >= 0 and _js_word_ending_at(source, before) in _JS_CONDITION_WORDS
+    if c == "]":
+        return False
+    if c.isalnum() or c in "_$":
+        return _js_word_ending_at(source, k) in _JS_REGEX_AFTER_WORD
+    return True
+
+
 def _js_brace_closes_an_expression(source: str, close: int) -> bool:
     """True when the `}` at *close* ends an object literal used as an operand (`return {a: 1} / 2`,
-    `x = {} / 2`, `f({}) / 2`'s inner one), False for the `}` of a block — a function body, an `if`,
-    a class — after which a statement, and so a regex literal, may start. Decided by what stands
-    before the matching `{`: an operator, `(`, `,`, `:`, `[` or a keyword that takes an operand
-    makes it an expression; `)`, `;`, `{`, `}`, `=>`, `else`/`do`/`try`/`finally` or the start of the
-    file make it a block. The match is found by counting braces backwards over a bounded span; where
-    it cannot be found the old answer (a block, so a regex may follow) stays."""
-    depth, k = 0, close
-    floor = max(0, close - 4000)
-    while k >= floor:
-        ch = source[k]
-        if ch == "}":
-            depth += 1
-        elif ch == "{":
-            depth -= 1
-            if depth == 0:
-                break
-        k -= 1
-    else:
-        return False
-    if k < floor or depth != 0:
-        return False
-    j = k - 1
-    while j >= 0 and source[j] in " \t\r\n":
-        j -= 1
+    `x = {} / 2`), False for the `}` of a block — a function body, `if`, `else`, a labeled block, a
+    class — after which a statement, and so a regex literal, may start. The matching `{` comes from the
+    lexer's own pairing (a `}` inside a string or a comment is not counted); what stands before it decides."""
+    opener = _js_pairs_for(source).get(close)
+    return opener is not None and _js_open_brace_is_an_object(source, opener, 0)
+
+
+def _js_open_brace_is_an_object(source: str, opener: int, depth: int) -> bool:
+    j = _js_prev_code(source, opener - 1)
     if j < 0:
         return False
-    if source[j] == ">" and j >= 1 and source[j - 1] == "=":
-        return False                                  # `=> { … }`: an arrow's block body
-    if source[j] in "=(,:[?&|+-*%<>!~^":
+    c = source[j]
+    if c == ">" and j >= 1 and source[j - 1] == "=":
+        return False                                       # `=> { … }`: an arrow's block body
+    if c == ":":
+        return _js_colon_leads_to_an_object(source, j, depth)
+    if c in "=(,[?&|+-*%!~^":
         return True
-    w = j
-    while w >= 0 and (source[w].isalnum() or source[w] in "_$"):
-        w -= 1
-    return source[w + 1:j + 1] in _JS_REGEX_AFTER_WORD
+    word = _js_word_ending_at(source, j)
+    if word in _JS_OBJECT_OPERAND_WORDS:
+        # `return` and `yield` end at a newline (ASI): the `{` on the next line is a block
+        return not (word in ("return", "yield") and "\n" in source[j + 1:opener])
+    return False                                           # `)`, `;`, `{`, `}`, `else`, `do`, `try`, a name…
+
+
+def _js_colon_leads_to_an_object(source: str, colon: int, depth: int) -> bool:
+    """`{` after `:`: a property value or a ternary branch is an object literal; a label or a `case`/
+    `default` clause starts a block. Decided by the token before the colon and what precedes it."""
+    k = _js_prev_code(source, colon - 1)
+    if k < 0:
+        return True
+    if source[k] in "'\"`":
+        quote = source[k]
+        start = source.rfind(quote, 0, k)
+        k = _js_prev_code(source, (start if start >= 0 else k) - 1)
+        key = ""
+    elif source[k].isalnum() or source[k] in "_$":
+        key = _js_word_ending_at(source, k)
+        k = _js_prev_code(source, k - len(key))
+    else:
+        return True                                        # `[computed]: {`, `) : {`
+    if key == "default":
+        return False
+    if k < 0:
+        return False                                       # a label at the start of the file
+    c = source[k]
+    if c in ",?":
+        return True
+    if c in ";}":
+        return False                                       # a label after a statement or a block
+    if c == "{":
+        return depth < 4 and _js_open_brace_is_an_object(source, k, depth + 1)   # property of an object, label in a block
+    if c.isalnum() or c in "_$":
+        return _js_word_ending_at(source, k) != "case"     # `case X: {`
+    return True
 
 
 def _js_regex_end(source: str, i: int) -> Optional[int]:

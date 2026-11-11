@@ -329,3 +329,64 @@ def test_the_prompt_parser_reads_the_source_in_the_files_own_language() -> None:
     java = 'class A {\n String s = """\n/* x\n""";\n}\nclass error {}\n'
     parsed = _parse_via_regex("show error in A.java", java)
     assert parsed is not None and parsed.target_name == "error"
+
+
+# ── T93 follow-up: block or object, NOT or non-null — decided by the lexer's own bracket pairing ──
+
+_JS_NEIGHBOR = "\nfunction neighbor() { return 42; }\n"
+
+
+def _extracts_itself(target: str, extension: str = ".js") -> bool:
+    return extract_block(target + _JS_NEIGHBOR, "target", extension) == target
+
+
+def test_a_regex_after_the_closing_brace_of_a_block_is_still_a_regex() -> None:
+    """`else { … }`, a labeled block, `if` with a `{` in a string or a comment, `return` + newline + block."""
+    for target in (
+        "function target(x) { if (x) { x = 1; } else { x = 2; } /}/.test(String(x)); return x; }",
+        "function target(x) { label: { x = 1; } /}/.test(String(x)); return x; }",
+        "function target(x) { return\n { x = 1; } /}/.test(String(x)); return x; }",
+        'function target(x) { if (x) { const s = "={"; } /}/.test(String(x)); return x; }',
+        "function target(x) { if (x) { /* = { */ x = 1; } /}/.test(String(x)); return x; }",
+        "function target(x) { switch (x) { case 1: { x = 2; } } /}/.test(String(x)); return x; }",
+    ):
+        assert _extracts_itself(target), target
+
+
+def test_a_slash_after_an_object_literal_is_a_division_even_with_a_brace_in_a_string_or_comment() -> None:
+    for target in (
+        'function target() { return {valueOf: () => 4, text: "{"} / 2; }',
+        'function target() { return {value: "}"} / 2; }',
+        "function target() { return {valueOf: () => 4 /* { */} / 2; }",
+        "function target(c) { return c ? 1 : {valueOf: () => 4} / 2; }",
+        "function target() { const o = {a: {b: 1} / 2}; return o; }",
+    ):
+        assert _extracts_itself(target), target
+
+
+def test_a_not_after_a_condition_is_a_prefix_and_a_bang_after_an_operand_is_a_ts_assertion() -> None:
+    for target in (
+        "function target(x) { if (x)!/}/.test(String(x)); return 42; }",
+        "function target(x) { for (; false;)!/}/.test(String(x)); return 42; }",
+        "function target(x) { while (x)!/}/.test(String(x)); return 42; }",
+        "function target(x) { return!/}/.test(x); }",
+    ):
+        assert _extracts_itself(target), target
+    for target in (
+        "function target(x: number | null) { return x ! / 2; }",
+        "function target(x: number | null) { return x!! / 2; }",
+        "function target(x: number | null) { return x /* valid */ ! / 2; }",
+        "function target(f: () => number | null) { return f()! / 2; }",
+    ):
+        assert _extracts_itself(target, ".ts"), target
+
+
+def test_the_bracket_pairing_is_linear_on_a_large_file() -> None:
+    import time
+    body = "".join(
+        f"function f{i}(x) {{ if (x) {{ x = x / 2; }} else {{ x = {{a: 1}}.a / 3; }} "
+        f"return /}}/.test(String(x)) ? {{k: \"{{\"}} : x++ / 2; }}\n" for i in range(1500)
+    )
+    started = time.monotonic()
+    assert extract_block(body, "f1499", ".js").startswith("function f1499(x)")
+    assert time.monotonic() - started < 5
