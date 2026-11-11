@@ -92,7 +92,8 @@ def _ideal_refusal(repo: Path, folder: Path, tree: Path) -> Optional[str]:
     the round folder and against the main checkout, and the tree's git metadata
     must be a worktree entry the repo registered (`_unregistered_worktree`): a
     foreign repository at that path, or a `.git` file redirecting to the main
-    `.git`, is no worktree of this round. Refusing is the only safe answer —
+    `.git`, or a symlink to another worktree of the round, is no worktree of
+    this round's `ideal`. Refusing is the only safe answer —
     nothing is deleted, recreated or switched.
     """
     if not (tree.exists() or tree.is_symlink()):
@@ -100,6 +101,13 @@ def _ideal_refusal(repo: Path, folder: Path, tree: Path) -> Optional[str]:
     try:
         tree_res = tree.resolve()
         folder_res = folder.resolve()
+        # `wt/ideal` must be the worktree itself, not a way to another one: a link to
+        # the round's `wt/base` is registered, inside the round and its own top-level
+        # once resolved, yet `checkout` through it would move `base`.
+        if tree.is_symlink():
+            return f"{tree} is a symlink to {tree_res}, not a worktree of its own"
+        if tree.parent.resolve() != folder_res / "wt":
+            return f"{tree} does not sit directly in {folder / 'wt'} (its wt is a redirect)"
     except OSError as err:
         return f"cannot resolve {tree}: {err}"
     top = _git(tree, "rev-parse", "--show-toplevel")
@@ -139,7 +147,8 @@ def _unregistered_worktree(repo: Path, tree: Path) -> Optional[str]:
         if own_res.parent != common_res / "worktrees":
             return f"{tree} is not a worktree registered in {repo} (its git dir is {own})"
         back = (own_res / "gitdir").read_text(encoding="utf-8").strip()
-        if Path(back).resolve() != (tree / ".git").resolve():
+        # the tree's own path with only its parents resolved: `tree.resolve()` would follow a link
+        if Path(back).resolve() != tree.parent.resolve() / tree.name / ".git":
             return f"{tree} points at the worktree entry of {back}, not its own"
     except (OSError, ValueError) as err:
         return f"cannot verify {tree} against {repo}: {err}"

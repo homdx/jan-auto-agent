@@ -303,11 +303,25 @@ def _deleted_container_names(target: ast.expr) -> Set[str]:
     return out
 
 
-def _forget_alias(aliases: Dict[str, str], name: str) -> None:
-    """Drop every alias link that mentions *name*, as alias or as source (it no longer names that object)."""
-    aliases.pop(name, None)
-    for alias in [a for a, source in aliases.items() if source == name]:
-        del aliases[alias]
+def _alias_group(aliases: Dict[str, str], name: str) -> Set[str]:
+    """*name* and every name linked to it through `alias -> source` links, at any distance.
+
+    `b = a; c = b` makes `c`, `b` and `a` one list: a `c.pop()` empties what `a` holds, so
+    all three lose their guard — not just `c` and its direct source. The links are read as
+    undirected and are never dropped when a name is unbound (`del b`): the walker is
+    flow-insensitive about them, so a `del b` in a branch that did not run, or one in the
+    middle of a chain, must leave `c -> b -> a` standing. A link that outlives its name only
+    ever invalidates more, the safe direction; a rebind (`b = []`) still breaks it.
+    """
+    group = {name}
+    grew = True
+    while grew:
+        grew = False
+        for alias, source in aliases.items():
+            if (alias in group) != (source in group):
+                group.update((alias, source))
+                grew = True
+    return group
 
 
 def _unbound_names_in_stmt(stmt: ast.stmt) -> Set[str]:
@@ -563,16 +577,9 @@ def _rebound_names_in(
         elif isinstance(s, (ast.For, ast.AsyncFor)) and isinstance(s.target, ast.Name):
             names.add(s.target.id)
             aliases.pop(s.target.id, None)  # rebound by the loop — alias broken
-        for unbound in _unbound_names_in_stmt(s):
-            names.add(unbound)
-            _forget_alias(aliases, unbound)
+        names |= _unbound_names_in_stmt(s)      # only the name itself: its aliases still hold the object
         for mutated in _mutated_name_in_stmt(s):
-            names.add(mutated)
-            if mutated in aliases:
-                names.add(aliases[mutated])
-            for alias_name, source_name in aliases.items():
-                if source_name == mutated:
-                    names.add(alias_name)
+            names |= _alias_group(aliases, mutated)
         if _MATCH is not None and isinstance(s, _MATCH):
             bound = _pattern_bound_names(s)
             names |= bound
@@ -804,21 +811,15 @@ class _FunctionGuardWalker:
                 else:
                     self._aliases.pop(alias_target, None)
 
-            # Unbinding a name drops its own guard and alias link, never an alias's guard.
+            # Unbinding a name drops its own guard, never an alias's, and leaves the alias links alone.
             for unbound in _unbound_names_in_stmt(stmt):
                 guarded_names.discard(unbound)
                 guard_desc.pop(unbound, None)
                 for pair in {p for p in guarded_pairs if p[0] == unbound}:
                     guarded_pairs.discard(pair)
-                _forget_alias(self._aliases, unbound)
 
             for mutated in _mutated_name_in_stmt(stmt):
-                to_invalidate = {mutated}
-                if mutated in self._aliases:
-                    to_invalidate.add(self._aliases[mutated])
-                to_invalidate.update(
-                    alias for alias, source in self._aliases.items() if source == mutated
-                )
+                to_invalidate = _alias_group(self._aliases, mutated)
                 for name in to_invalidate:
                     guarded_names.discard(name)
                     guard_desc.pop(name, None)

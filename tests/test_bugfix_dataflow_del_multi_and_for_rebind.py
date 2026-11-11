@@ -311,3 +311,65 @@ def f(a):
     return a[-1]
 """
         assert _last_status(src) == "GUARDED"
+
+
+class TestUnbindingKeepsTheAliasChainAlive:
+    """`del b` unbinds a name; the links between the names that still hold the list stay,
+    so a later mutation through any of them still empties the guarded original."""
+
+    @staticmethod
+    def _src(middle: str, tail: str = "c.pop()") -> str:
+        return f"""
+def f(a, flag, c):
+    if not a: return None
+    b = a
+    c = b
+{middle}
+    {tail}
+    return a[-1]
+"""
+
+    def test_a_chain_is_followed_to_the_original_with_or_without_the_delete(self):
+        assert _last_status(self._src("    pass")) != "GUARDED"
+        assert _last_status(self._src("    del b")) != "GUARDED"
+
+    def test_a_conditional_unbinding_does_not_hide_a_mutation_through_the_alias(self):
+        for body in ("if flag:\n        del b",
+                     "if flag:\n        del b\n        return None",
+                     "if flag:\n        del (b, flag)",
+                     "for unused in []:\n        del b",
+                     "while flag:\n        del b\n        break"):
+            src = f"""
+def f(a, flag):
+    if not a: return None
+    b = a
+    {body}
+    b.clear()
+    return a[-1]
+"""
+            assert _last_status(src) != "GUARDED", body
+
+    def test_an_unbinding_alone_still_leaves_the_original_guarded(self):
+        for body in ("del b", "if flag:\n        del b"):
+            src = f"""
+def f(a, flag):
+    if not a: return None
+    b = a
+    {body}
+    return a[-1]
+"""
+            assert _last_status(src) == "GUARDED", body
+
+    def test_a_longer_chain_and_a_mutation_at_either_end(self):
+        for mutate in ("d.pop()", "b.clear()", "c.pop()"):
+            src = f"""
+def f(a):
+    if not a: return None
+    b = a
+    c = b
+    d = c
+    del c
+    {mutate}
+    return a[-1]
+"""
+            assert _last_status(src) != "GUARDED", mutate

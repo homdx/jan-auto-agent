@@ -440,3 +440,28 @@ def test_a_refused_redirect_leaves_the_main_checkout_on_its_branch_through_the_c
     before = _snapshot(repo)
     code, _out, _err = _judge(capsys, "184", "--ideal", second)
     assert code != 0 and rec.lines == [] and _snapshot(repo) == before
+
+
+def test_an_ideal_that_is_a_symlink_to_another_worktree_of_the_round_is_refused(round_repo, monkeypatch, capsys):
+    """Registered, inside the round, its own top-level once resolved — and `checkout` through it would move `base`."""
+    repo, folder, first, second = round_repo
+    base = folder / "wt" / "base"
+    _git(repo, "worktree", "add", "-q", "--detach", str(base), first)
+    ideal = folder / "wt" / "ideal"
+    ideal.symlink_to(base)
+    rec = Recorder()
+    monkeypatch.setattr(judging, "RUN", rec)
+    with pytest.raises(judging.RoundError, match="symlink"):
+        judging.plan_ideal_move(repo, folder, second)
+    code, _out, _err = _judge(capsys, "184", "--ideal", second)
+    assert code != 0 and rec.lines == []
+    assert _git(base, "rev-parse", "HEAD") == first            # base did not move
+
+
+def test_a_wt_folder_that_is_a_link_to_another_folder_is_refused(round_repo):
+    repo, folder, first, second = round_repo
+    real = folder / "elsewhere"
+    _git(repo, "worktree", "add", "-q", "--detach", str(real / "ideal"), first)
+    (folder / "wt").symlink_to(real)
+    with pytest.raises(judging.RoundError, match="ideal"):
+        judging.plan_ideal_move(repo, folder, second)
