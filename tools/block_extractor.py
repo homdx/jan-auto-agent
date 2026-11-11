@@ -330,32 +330,122 @@ _JS_PUNCT = re.compile(r">>>=|\.\.\.|===|!==|\*\*=|<<=|>>=|>>>|&&=|\|\|=|\?\?=|=
                        r"|\?\.(?![0-9])|\+\+|--|\+=|-=|\*=|%=|&=|\|=|\^=|<<|>>|\*\*|\S")
 
 
-_TS_TYPE_PARAMS = re.compile(r"<\s*[A-Za-z_$][\w$]*(?:\s+extends\s+[^(){};=]+?|\s*,\s*[A-Za-z_$][\w$]*(?:\s+extends\s+[^(){};=,]+?)?)*\s*,?\s*>\s*\(")
+_TS_PARAM_NAME = re.compile(r"[A-Za-z_$][\w$]*\s*(?:,|>|=(?!>)|extends\b)")
+_TS_OPENERS = {"(": ")", "[": "]", "{": "}"}
+#: what a `/` may follow for it to start a regex inside a parameter list (a default value, a type)
+_TS_REGEX_AFTER = frozenset("=(,:[!&|?{};")
+
+
+def _ts_skip_atom(source: str, k: int) -> int:
+    """The index after the string, template, comment or regex literal that starts at *k*, else *k*.
+    -1 when one is never closed."""
+    c = source[k]
+    if c in "'\"`":
+        j = k + 1
+        while j < len(source) and source[j] != c:
+            j += 2 if source[j] == "\\" else 1
+        return j + 1 if j < len(source) else -1
+    if source.startswith("//", k):
+        nl = source.find("\n", k)
+        return len(source) if nl < 0 else nl
+    if source.startswith("/*", k):
+        close = source.find("*/", k + 2)
+        return -1 if close < 0 else close + 2
+    if c == "/":
+        j = k - 1
+        while j >= 0 and source[j].isspace():
+            j -= 1
+        if j >= 0 and source[j] in _TS_REGEX_AFTER:
+            j, in_class = k + 1, False
+            while j < len(source) and source[j] != "\n":
+                d = source[j]
+                if d == "\\":
+                    j += 1
+                elif d == "[":
+                    in_class = True
+                elif d == "]":
+                    in_class = False
+                elif d == "/" and not in_class:
+                    return j + 1
+                j += 1
+            return -1
+    return k
+
+
+def _ts_match_close(source: str, k: int, limit: int, angle: bool = False) -> int:
+    """The index of the bracket that closes the one opened at *k* (`(`, `[`, `{`, or `<` when *angle*),
+    strings, templates, comments and regex literals skipped; -1 when none within *limit*. `=>` is no `>`."""
+    close = {"<": ">", **_TS_OPENERS}[source[k]]
+    stack = [close]
+    k += 1
+    while k < limit:
+        c = source[k]
+        moved = _ts_skip_atom(source, k) if c in "'\"`/" else k
+        if moved < 0:
+            return -1
+        if moved != k:
+            k = moved
+            continue
+        if c == "=" and source.startswith("=>", k):
+            k += 2
+            continue
+        if c in _TS_OPENERS or (c == "<" and angle):
+            stack.append(_TS_OPENERS.get(c, ">"))
+        elif c == stack[-1]:
+            stack.pop()
+            if not stack:
+                return k
+        k += 1
+    return -1
 
 
 def _is_generic_arrow_head(source: str, i: int) -> bool:
     """True when the `<` at *i* opens the type parameters of a TypeScript generic arrow function —
-    `<T,>(v: T) => v`, `<T extends U>(v: T): T => v` — and not a JSX element. `<A>(x)</A>` has the same
-    first characters and is an element; what differs is behind the parameter list: an arrow's `)` is
-    followed by `=>` or by a return type's `:`, an element's text by the closing tag."""
-    m = _TS_TYPE_PARAMS.match(source, i)
-    if not m:
+    `<T,>(v: T) => v`, `<T extends {id: string}>(v: T): T => v`, `<T = number,>(v: T) => v` — and not a
+    JSX element. `<A>(x)</A>` has the same first characters and is an element; what differs is behind the
+    parameter list: an arrow's `)` is followed by `=>` or by a return type that ends in one, an element's
+    text by the closing tag (`<A>(x): Foo</A>` has a colon too)."""
+    limit = min(len(source), i + 4000)
+    if not _TS_PARAM_NAME.match(source, i + 1 + (len(source[i + 1:]) - len(source[i + 1:].lstrip()))):
         return False
-    depth, k, n = 0, m.end() - 1, min(len(source), m.end() + 4000)
-    while k < n:
+    gt = _ts_match_close(source, i, limit, angle=True)
+    if gt < 0:
+        return False
+    k = _js_next_code_index(source, gt + 1)
+    if k < 0 or source[k] != "(":
+        return False
+    rp = _ts_match_close(source, k, limit)
+    if rp < 0:
+        return False
+    at = _js_next_code_index(source, rp + 1)
+    if at < 0:
+        return False
+    if source.startswith("=>", at):
+        return True
+    if source[at] != ":":
+        return False
+    # a return type: brackets balanced, up to an `=>` at its own level; a closing tag or the end says text
+    k, depth = at + 1, 0
+    while k < limit:
         c = source[k]
-        if c in "'\"`":
-            end = source.find(c, k + 1)
-            if end < 0:
-                return False
-            k = end
-        elif c == "(":
+        moved = _ts_skip_atom(source, k) if c in "'\"`/" else k
+        if moved < 0:
+            return False
+        if moved != k:
+            k = moved
+            continue
+        if depth == 0 and source.startswith("=>", k):
+            return True
+        if depth == 0 and (source.startswith("</", k) or c in ";}"):
+            return False
+        if c in "([{<":
             depth += 1
-        elif c == ")":
+        elif c in ")]}":
             depth -= 1
-            if depth == 0:
-                at = _js_next_code_index(source, k + 1)
-                return at >= 0 and (source[at] == ":" or source.startswith("=>", at))
+        elif c == ">" and source[k - 1] != "=":
+            depth -= 1
+        if depth < 0:
+            return False
         k += 1
     return False
 
@@ -835,6 +925,8 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
         if lang:
             skip = _lang_skip(source, i, lang)
             if skip is not None:
+                if lang in _JS_LANGS:
+                    code[i:skip] = bytes(skip - i)       # a regex, or a JSX text: no declaration in it
                 i = skip
                 continue
         if ch == "/" and nxt == "/":

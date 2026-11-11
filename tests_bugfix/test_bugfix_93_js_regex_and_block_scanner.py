@@ -369,6 +369,18 @@ TYPED_HEADS = [
     ("const el = <A>(x {1}) </A>;", ".jsx"),
     ("const el = <B>({x})</B>;", ".jsx"),
     ("const el = <A>(x)</A>; if (x) { x = 1 }\n/}/.test(x);", ".jsx"),
+    ("const el = <A>(x): Foo</A>;", ".tsx"),
+    ("const el = <A>(x): Foo\n</A>;", ".tsx"),
+    ("const id = <T extends string>(v: T /* ) */) => v;", ".tsx"),
+    ("const id = <T extends string>(v: T /* ( */) => v;", ".tsx"),
+    ("const id = <T extends string>(v: T // )\n) => v;", ".tsx"),
+    ("const id = <T,>(s: string = \"a\\\")\") => s;", ".tsx"),
+    ("const id = <T,>(s = 'it\\'s )') => s;", ".tsx"),
+    ("const id = <T,>(r = /\\)/) => r;", ".tsx"),
+    ("const id = <T = string,>(v: T) => v;", ".tsx"),
+    ("const id = <T = number,>(v: T) => v;", ".tsx"),
+    ("const id = <T extends {id: string}>(v: T) => v;", ".tsx"),
+    ("const id = <T extends {a: (x: 1) => 2}, U = {b: 3}>(v: T): Promise<U> => v;", ".tsx"),
 ]
 
 
@@ -377,3 +389,14 @@ def test_typescript_generics_and_parenthesized_jsx_text(head, ext):
     """A generic arrow (`<T,>(v: T) => v`) and a type assertion (`<string>x`) open no element; `<A>(x)</A>` does."""
     target = "function target(x) { " + head + " return /}/.test(String(x)); }"
     assert extract_block(target + NEIGHBOR, "target", ext) == target
+
+
+@pytest.mark.parametrize("source", [
+    "const a = <p>declare function ghost(): void;</p>;\n",
+    "const a = <p>\n  shown:\n  declare function ghost(): void;\n</p>;\n",
+    "const r = /declare function ghost(): void;/;\n",
+])
+def test_jsx_text_and_regex_define_no_symbol(source):
+    """A declaration printed inside JSX text, or spelled in a regex, is not a declaration of that name."""
+    assert extract_block(source, "ghost", ".tsx") == ""
+    assert extract_block(source + "function ghost() {return 42;}\n", "ghost", ".tsx") == "function ghost() {return 42;}"
