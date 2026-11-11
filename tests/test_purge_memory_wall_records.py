@@ -111,3 +111,87 @@ def test_a_missing_or_broken_memory_file_is_one_line_and_exit_one(tmp_path, caps
     memory.write_text('{"a": 1}', encoding="utf-8")
     assert purge.main(["--repo", str(tmp_path)]) == 1
     assert "not a list" in capsys.readouterr().err
+
+
+def test_a_second_apply_with_a_new_record_refuses_to_overwrite_the_backup(tmp_path, capsys):
+    out = tmp_path / "contest-out"
+    first = _record(agent="apertus-70b-instruct", round_="157")
+    second = _record(agent="glm", round_="158")
+    _events(out, "157", "apertus-70b-instruct", (WALL_MESSAGE, NOW - 9))    # 9 s before
+    _events(out, "158", "glm", (WALL_MESSAGE, NOW - 45))                   # 45 s before
+    memory = _memory(tmp_path, [first, second])
+    original = memory.read_text(encoding="utf-8")
+    backup = memory.with_name("context-memory.json" + purge.BACKUP_SUFFIX)
+
+    # a narrow window drops only the first record: a normal first purge
+    assert purge.main(["--repo", str(tmp_path), "--apply", "--window", "30"]) == 0
+    capsys.readouterr()
+    assert json.loads(memory.read_text(encoding="utf-8")) == [second]
+    assert backup.read_text(encoding="utf-8") == original
+
+    # a wider window wants to drop the second one: the backup is already here
+    assert purge.main(["--repo", str(tmp_path), "--apply", "--window", "60"]) == 1
+    err = capsys.readouterr().err
+    assert "refusing" in err and "already exists" in err
+    assert json.loads(memory.read_text(encoding="utf-8")) == [second]       # nothing written
+    assert backup.read_text(encoding="utf-8") == original                  # the first one kept
+
+    # a rerun with nothing new to drop still succeeds and touches no backup
+    assert purge.main(["--repo", str(tmp_path), "--apply", "--window", "30"]) == 0
+    capsys.readouterr()
+    assert json.loads(memory.read_text(encoding="utf-8")) == [second]
+    assert backup.read_text(encoding="utf-8") == original
+
+
+# ── beyond the first/second purge: backups that are not a plain file, and what must still work ──
+def _wall_memory(tmp_path, *agents):
+    out = tmp_path / "contest-out"
+    for agent in agents:
+        _events(out, "157", agent, (WALL_MESSAGE, NOW - 9))
+    return _memory(tmp_path, [_record(agent=a) for a in agents])
+
+
+def test_an_existing_backup_that_is_a_directory_is_refused_not_copied_into(tmp_path, capsys):
+    memory = _wall_memory(tmp_path, "a")
+    backup = memory.with_name("context-memory.json" + purge.BACKUP_SUFFIX)
+    backup.mkdir()
+    before = memory.read_text(encoding="utf-8")
+    assert purge.main(["--repo", str(tmp_path), "--apply"]) == 1
+    assert memory.read_text(encoding="utf-8") == before and list(backup.iterdir()) == []
+
+
+def test_a_backup_that_is_a_symlink_never_writes_through_to_its_target(tmp_path, capsys):
+    memory = _wall_memory(tmp_path, "a")
+    backup = memory.with_name("context-memory.json" + purge.BACKUP_SUFFIX)
+    precious = tmp_path / "precious.txt"
+    precious.write_text("do not touch\n", encoding="utf-8")
+    backup.symlink_to(precious)
+    assert purge.main(["--repo", str(tmp_path), "--apply"]) == 1
+    assert precious.read_text(encoding="utf-8") == "do not touch\n"
+    precious.unlink()                      # now the link dangles: `exists()` is False, the link is still there
+    before = memory.read_text(encoding="utf-8")
+    assert purge.main(["--repo", str(tmp_path), "--apply"]) == 1
+    assert not precious.exists() and memory.read_text(encoding="utf-8") == before
+
+
+def test_an_empty_leftover_backup_is_still_somebodys_backup(tmp_path, capsys):
+    memory = _wall_memory(tmp_path, "a")
+    backup = memory.with_name("context-memory.json" + purge.BACKUP_SUFFIX)
+    backup.write_text("", encoding="utf-8")
+    assert purge.main(["--repo", str(tmp_path), "--apply"]) == 1
+    assert backup.read_text(encoding="utf-8") == ""
+
+
+def test_a_dry_run_with_a_backup_present_writes_nothing_and_succeeds(tmp_path, capsys):
+    memory = _wall_memory(tmp_path, "a")
+    backup = memory.with_name("context-memory.json" + purge.BACKUP_SUFFIX)
+    backup.write_text("older\n", encoding="utf-8")
+    before = memory.read_text(encoding="utf-8")
+    assert purge.main(["--repo", str(tmp_path)]) == 0
+    assert memory.read_text(encoding="utf-8") == before and backup.read_text(encoding="utf-8") == "older\n"
+
+
+def test_a_run_with_nothing_to_drop_makes_no_backup(tmp_path, capsys):
+    memory = _memory(tmp_path, [_record(limit=262_144)])
+    assert purge.main(["--repo", str(tmp_path), "--apply"]) == 0
+    assert not memory.with_name("context-memory.json" + purge.BACKUP_SUFFIX).exists()

@@ -20,7 +20,9 @@ A record goes only when both hold, so a provider's own overflow is never touched
     written (a record whose round folder is gone stays: nothing proves it).
 
 Run it only when no round is running: a live runner adds records to the same file.
-The file as it was is copied to `context-memory.json.bak-before-wall-purge`.
+The file as it was is copied to `context-memory.json.bak-before-wall-purge`;
+a later `--apply` that still has new records to drop refuses instead of
+overwriting that backup.
 """
 
 from __future__ import annotations
@@ -118,6 +120,10 @@ def main(argv: list | None = None) -> int:
         return 0
 
     backup = memory.with_name(memory.name + BACKUP_SUFFIX)
+    if backup.exists() or backup.is_symlink():   # a dangling link would be written through
+        print(f"refusing: {backup.name} already exists; restore or delete it "
+              f"before dropping the new records", file=sys.stderr)
+        return 1
     shutil.copy2(memory, backup)
     tmp = memory.with_name(memory.name + ".tmp")
     tmp.write_text(json.dumps(keep, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
