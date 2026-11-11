@@ -249,8 +249,12 @@ def _extract_python_block_fallback(source: str, target_name: str) -> str:
 _LANG_OF_EXT = {
     ".rs": "rust",
     **{e: "c" for e in (".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx")},
-    **{e: "js" for e in (".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts")},
+    **{e: "js" for e in (".js", ".jsx", ".mjs", ".cjs", ".tsx")},
+    #: no JSX in a plain `.ts`: there `<` is a comparison or a type (`<string>x`, `<T>(v: T) => v`), never an element
+    **{e: "ts" for e in (".ts", ".mts", ".cts")},
 }
+#: the languages the JS lexer reads
+_JS_LANGS = ("js", "ts")
 #: HARDEN-20 A: the extensions whose `=>` sits in a **typed** language. Only there can the bare word
 #: after a property arrow's `=>` be a *type* (`onSave: (v: string) => void`) rather than the
 #: arrow's body (`noop: () => undefined`, `isOn: () => true`, `f: (a) => fallback`). JavaScript has
@@ -281,8 +285,8 @@ def _lang_skip(source: str, i: int, lang: str) -> Optional[int]:
             # the block being counted (HARDEN-4 D4).
             nl = source.find("\n", nl + 1)
         return len(source) if nl < 0 else nl
-    if lang == "js":
-        return _js_regex_spans(source).get(i)
+    if lang in _JS_LANGS:
+        return _js_regex_spans(source, lang == "js").get(i)
     return None
 
 
@@ -320,16 +324,44 @@ _JS_DECLARATION_WORDS = frozenset(("class", "interface", "enum", "namespace", "m
 _JS_BRACE_KINDS = ("block", "object", "fn", "tmpl")
 #: what follows the `/` of `</div>`, `</ns:tag >`, `</A.B>`, `</>`; `x </a}/.test(s)` is a regex, not this
 _JS_CLOSING_TAG = re.compile(r"(?:[A-Za-z_$][\w$.:-]*[ \t]*)?>")
-#: TypeScript's `<T>(x: T) => x`, `<T extends U, V,>(…)`: type parameters before an arrow's parameter list, no element
-_TS_GENERIC_HEAD = re.compile(r"<\s*[A-Z][A-Za-z0-9]?\s*>\s*\(|<\s*[A-Za-z_$][\w$]*(?:\s+extends\s+[^<>(){}]+|\s*,\s*[A-Za-z_$][\w$]*)+\s*,?\s*>\s*\(")
 _JS_NAME = re.compile(r"(?:[^\W\d]|[$#])[\w$]*")
 _JS_NUMBER = re.compile(r"\.?[0-9](?:[\w.]|(?<=[eE])[+-])*")
 _JS_PUNCT = re.compile(r">>>=|\.\.\.|===|!==|\*\*=|<<=|>>=|>>>|&&=|\|\|=|\?\?=|=>|==|!=|<=|>=|&&|\|\||\?\?"
                        r"|\?\.(?![0-9])|\+\+|--|\+=|-=|\*=|%=|&=|\|=|\^=|<<|>>|\*\*|\S")
 
 
-def _js_next_code_char(source: str, k: int) -> str:
-    """The first character at or after *k* that is neither blank nor in a comment, "" at the end."""
+_TS_TYPE_PARAMS = re.compile(r"<\s*[A-Za-z_$][\w$]*(?:\s+extends\s+[^(){};=]+?|\s*,\s*[A-Za-z_$][\w$]*(?:\s+extends\s+[^(){};=,]+?)?)*\s*,?\s*>\s*\(")
+
+
+def _is_generic_arrow_head(source: str, i: int) -> bool:
+    """True when the `<` at *i* opens the type parameters of a TypeScript generic arrow function —
+    `<T,>(v: T) => v`, `<T extends U>(v: T): T => v` — and not a JSX element. `<A>(x)</A>` has the same
+    first characters and is an element; what differs is behind the parameter list: an arrow's `)` is
+    followed by `=>` or by a return type's `:`, an element's text by the closing tag."""
+    m = _TS_TYPE_PARAMS.match(source, i)
+    if not m:
+        return False
+    depth, k, n = 0, m.end() - 1, min(len(source), m.end() + 4000)
+    while k < n:
+        c = source[k]
+        if c in "'\"`":
+            end = source.find(c, k + 1)
+            if end < 0:
+                return False
+            k = end
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                at = _js_next_code_index(source, k + 1)
+                return at >= 0 and (source[at] == ":" or source.startswith("=>", at))
+        k += 1
+    return False
+
+
+def _js_next_code_index(source: str, k: int) -> int:
+    """The index of the first character at or after *k* that is neither blank nor in a comment, -1 at the end."""
     n = len(source)
     while k < n:
         if source[k].isspace():
@@ -341,8 +373,14 @@ def _js_next_code_char(source: str, k: int) -> str:
             close = source.find("*/", k + 2)
             k = n if close < 0 else close + 2
         else:
-            return source[k]
-    return ""
+            return k
+    return -1
+
+
+def _js_next_code_char(source: str, k: int) -> str:
+    """The first character at or after *k* that is neither blank nor in a comment, "" at the end."""
+    at = _js_next_code_index(source, k)
+    return source[at] if at >= 0 else ""
 
 
 class _JsScanner:
@@ -358,8 +396,9 @@ class _JsScanner:
     body. Comments, strings, template text (with its `${ … }` code) and regex literals are lexed as such,
     so a keyword in a comment, in a string or after a `.` (`x.class`, `{case: 1}`) is never read as one."""
 
-    def __init__(self, source: str):
+    def __init__(self, source: str, jsx: bool = True):
         self.source = source
+        self.jsx = jsx
         self.spans: dict = {}
         #: [kind, ternary `?` still open] — "block"/"object"/"fn"/"tmpl" braces, ["paren", n, cond, fn], ["bracket", n]
         self.stack: list = [["block", 0]]
@@ -447,6 +486,8 @@ class _JsScanner:
         (a closing tag): `<` starts a tag where an operand may start (`return <div>`, `(<a/>)`, `&& <b>`)
         or among the children of an open element, and `</name>` closes one only there."""
         source = self.source
+        if not self.jsx:
+            return 0
         nxt = source[i + 1:i + 2]
         children = self.in_children()
         if nxt == "/":
@@ -456,7 +497,7 @@ class _JsScanner:
             self.jsx_levels.pop()
             self.token("operand", "", m.end(), False)
             return m.end()
-        if nxt and (nxt.isalpha() or nxt in "_$>") and (self.allowed or children) and not _TS_GENERIC_HEAD.match(source, i):
+        if nxt and (nxt.isalpha() or nxt in "_$>") and (self.allowed or children) and not _is_generic_arrow_head(source, i):
             self.tags.append(len(self.stack))
             self.token("punct", "<", i + 1, True)
             return i + 1
@@ -677,9 +718,10 @@ class _JsScanner:
 
 
 @functools.lru_cache(maxsize=8)
-def _js_regex_spans(source: str) -> dict:
-    """start index -> end index of every regex literal of the JS *source* (see `_JsScanner`)."""
-    return _JsScanner(source).run()
+def _js_regex_spans(source: str, jsx: bool = True) -> dict:
+    """start index -> end index of every regex literal and every JSX text of the JS *source* (see
+    `_JsScanner`); *jsx* is False for plain TypeScript, where `<` never opens an element."""
+    return _JsScanner(source, jsx).run()
 
 
 def _js_regex_end(source: str, i: int) -> Optional[int]:
@@ -769,7 +811,7 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
                 escape = True
                 i += 1
                 continue
-            if state == "backtick" and lang == "js" and ch == "$" and nxt == "{":
+            if state == "backtick" and lang in _JS_LANGS and ch == "$" and nxt == "{":
                 # `${ … }` holds executable JS (an IIFE with its own `function foo`): the text around
                 # it is the string, the expression is code until its matching `}`.
                 code[i + 1] = 0
@@ -1305,7 +1347,7 @@ def _prefix_is_js_void_operator(prefix: str, lang: str) -> bool:
     abstract `run(): void;`) have a modifier or nothing in front of their name, never `void`
     (HARDEN-16 A).
     """
-    if lang != "js":
+    if lang not in _JS_LANGS:
         return False
     return re.findall(r"[A-Za-z_$][\w$]*", prefix.strip()) == ["void"]
 
@@ -2471,7 +2513,7 @@ def _find_earliest_assigned_definition(source: str, target_name: str, lang: str 
         return _expression_bodied_end(source, target_name, ext, code_mask)
     if ext in (".scala", ".sc"):
         return _scala_def_end(source, target_name, code_mask)
-    if lang != "js":
+    if lang not in _JS_LANGS:
         return None
     best = None
     for pat, wrappers in _assigned_candidate_patterns(target_name):

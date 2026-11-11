@@ -285,7 +285,7 @@ def test_random_valid_js_is_extracted_whole(seed):
 # JSX has no engine to ask (gjs and node parse plain JavaScript): these are valid by construction. Each
 # element, in every nesting of tags, attribute `{…}` containers and text with apostrophes, slashes and
 # regex-like `</a>/` lookalikes, must be extracted whole.
-TEXT = ["hello", "don't stop", "5 / 3", "a / b / c", "it's \"quoted\"", "path/to/file", "100%", "x &amp; y", "// not a comment", "/* nor this */",
+TEXT = ["(x)", "(a {1}) b", "({x})", "(a) / (b)", "hello", "don't stop", "5 / 3", "a / b / c", "it's \"quoted\"", "path/to/file", "100%", "x &amp; y", "// not a comment", "/* nor this */",
         "(parens) [brackets]", "x = y", "a ? b : c", "ok;"]
 EXPR = ["x", "{a: 1}.a / 2", "/}/.test(x)", "x </a>/.test(x)", "x < y", "x </div>/.test(x)", "c && <b>t</b>", "c ? <i/> : null",
         "items.map(i => <li key={i}>{i}</li>)", "(() => { return {} })() ? 1 : 2", "`${x}}`", "'}'", "x > {} / 2", "/* } */ x", "[1, 2].map(n => n / 2)",
@@ -318,7 +318,8 @@ def gen_jsx(r):
     tail = r.choice(["", " /}/.test(x);", "\n/}/.test(x);", " v = {a: 1}.a / 2; // }", "\nif (c) { v = 1 }\n/}/.test(x);", " x </a>/.test(x);"])
     if stmt.startswith("return") :
         tail = ""
-    return "function target(x, c, v, items, f, p) {\n  " + stmt + tail + "\n}"
+    pre = r.choice(["", "", "const id = <T,>(v: T) => v;\n  ", "const id = <T extends U>(v: T): T => v;\n  ", "const w = <A>(x)</A>;\n  ", "const w = <A>(x {1})</A>;\n  "])
+    return "function target(x, c, v, items, f, p) {\n  " + pre + stmt + tail + "\n}"
 
 
 JSX_CASES = {
@@ -348,4 +349,31 @@ def test_random_jsx_is_extracted_whole(seed):
     r = random.Random(seed)
     for _ in range(300):
         target = gen_jsx(r)
-        assert extract_block(target + NEIGHBOR, "target", ".jsx") == target, target
+        ext = ".tsx" if "<T" in target else ".jsx"
+        assert extract_block(target + NEIGHBOR, "target", ext) == target, target
+
+
+TYPED_HEADS = [
+    ("const y = <string>x;", ".ts"),
+    ("const y = <Array<string>>x;", ".ts"),
+    ("const id = <Value>(v: Value) => v;", ".ts"),
+    ("const id = <T>(v: T) => v;", ".ts"),
+    ("const id = <T extends Foo<Bar>>(v: T): T => v;", ".ts"),
+    ("const id = <T,>(v: T) => v;", ".tsx"),
+    ("const id = <T, U>(v: T) => v;", ".tsx"),
+    ("const id = <T, U extends V>(v: T, w: U): T => v;", ".tsx"),
+    ("const id = <T extends unknown>(v: T) => v;", ".tsx"),
+    ("const id = async <T,>(v: T) => v;", ".tsx"),
+    ("const el = <A>(x)</A>;", ".tsx"),
+    ("const el = <A>(x)</A>;", ".jsx"),
+    ("const el = <A>(x {1}) </A>;", ".jsx"),
+    ("const el = <B>({x})</B>;", ".jsx"),
+    ("const el = <A>(x)</A>; if (x) { x = 1 }\n/}/.test(x);", ".jsx"),
+]
+
+
+@pytest.mark.parametrize("head,ext", TYPED_HEADS)
+def test_typescript_generics_and_parenthesized_jsx_text(head, ext):
+    """A generic arrow (`<T,>(v: T) => v`) and a type assertion (`<string>x`) open no element; `<A>(x)</A>` does."""
+    target = "function target(x) { " + head + " return /}/.test(String(x)); }"
+    assert extract_block(target + NEIGHBOR, "target", ext) == target
