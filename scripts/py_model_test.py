@@ -471,7 +471,8 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
     if isinstance(data, list):
         models = data
     elif isinstance(data, dict):
-        models = data.get("text") or data.get("data") or data.get("models")
+        # `is None` chain, not `or`: an empty list is a real (empty) model list, not "key absent".
+        models = next((data[k] for k in ("text", "data", "models") if data.get(k) is not None), None)
         # A 200 whose body is an error object is reported as a failure, never as zero models (bug 208).
         if models is None and data.get("error") is not None:
             raise ValueError(f"/models reply is an error: {str(data.get('error'))[:80]!r}")

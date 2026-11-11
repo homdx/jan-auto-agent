@@ -184,7 +184,11 @@ def ticket_for_round(tasks_dir, n):
     it with a message naming the file, rather than an `IndexError` out of the
     read.
     """
-    for name in sorted(os.listdir(tasks_dir)):
+    try:
+        names = sorted(os.listdir(tasks_dir))
+    except OSError:               # no such folder (a mistyped --tasks): no ticket in it, for the caller to refuse
+        return None, None, []
+    for name in names:
         m = re.match(r"^0*(\d+)-.*\.md$", name)
         if m and int(m.group(1)) == n:
             body = Path(os.path.join(tasks_dir, name)).read_text(encoding="utf-8")

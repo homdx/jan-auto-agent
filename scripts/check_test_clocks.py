@@ -189,6 +189,9 @@ class _Buckets:
             self.compares.append(node)
         elif isinstance(node, ast.Assign):
             self.assigns.append(node)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            # `elapsed: float = t1 - t0` is the same assignment with a type on it.
+            self.assigns.append(ast.copy_location(ast.Assign(targets=[node.target], value=node.value), node))
         elif isinstance(node, ast.Assert):
             self.asserts.append(node)
         elif isinstance(node, ast.Name):

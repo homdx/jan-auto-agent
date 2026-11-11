@@ -28,8 +28,8 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-TESTS_DIR = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TESTS_DIR = REPO_ROOT / "tests"
 for _p in (str(REPO_ROOT), str(TESTS_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)

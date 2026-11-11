@@ -124,8 +124,8 @@ def _test_spans(claim: str):
 
 def _is_rename(claim: str, start: int, end: int) -> bool:
     """`a.py => b.py`, `{a => b}.py`: git's rename form, not a file of ours."""
-    return (claim[max(0, start - 4):start].rstrip().endswith("=>")
-            or claim[end:end + 4].lstrip().startswith("=>"))
+    return (re.search(r"=>\s*$", claim[:start]) is not None
+            or re.match(r"\s*=>", claim[end:]) is not None)
 
 
 #: A quoted path with a space in it; the quotes mark its ends, and an apostrophe does not.

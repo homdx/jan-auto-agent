@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -85,7 +86,7 @@ def test_unparse_missing_falls_back_to_placeholder(monkeypatch):
 
 
 def test_two_extractions_are_byte_identical_on_a_real_module():
-    src = open("tools/llm_stream.py", encoding="utf-8").read()
+    src = (Path(__file__).resolve().parents[1] / "tools" / "llm_stream.py").read_text(encoding="utf-8")
     first = [s.signature for s in extract_symbols(ast.parse(src), "tools/llm_stream.py")]
     second = [s.signature for s in extract_symbols(ast.parse(src), "tools/llm_stream.py")]
     assert first == second

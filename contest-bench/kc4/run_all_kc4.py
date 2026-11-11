@@ -45,18 +45,26 @@ def main():
     for name in names:
         entry = results.setdefault(name, {})
         for scen in SCENARIOS:
-            p = subprocess.run(
-                [sys.executable, str(HERE / "run_one_kc4.py"), str(wt / name), scen],
-                capture_output=True, text=True, timeout=120,
-            )
-            line = next((l for l in p.stdout.splitlines() if l.startswith("@@RESULT@@")), None)
-            if line is None:
-                entry[scen] = {"checks": [{"name": "subprocess", "ok": False,
-                                            "detail": (p.stdout + p.stderr)[-500:]}]}
-            else:
-                entry[scen] = json.loads(line[len("@@RESULT@@"):])
+            try:
+                p = subprocess.run(
+                    [sys.executable, str(HERE / "run_one_kc4.py"), str(wt / name), scen],
+                    capture_output=True, text=True, timeout=120,
+                )
+                line = next((l for l in p.stdout.splitlines() if l.startswith("@@RESULT@@")), None)
+                detail = (p.stdout + p.stderr)[-500:]
+            except subprocess.TimeoutExpired:
+                line, detail = None, "timed out after 120 s"
+            try:
+                entry[scen] = json.loads(line[len("@@RESULT@@"):]) if line is not None else None
+            except ValueError:
+                entry[scen] = None
+                detail = f"unreadable result line: {line[:200]!r}"
+            if entry[scen] is None:
+                # one lost cell is a failed check, not the end of the suite
+                entry[scen] = {"checks": [{"name": "subprocess", "ok": False, "detail": detail}]}
             print(f"[{name}] {scen}: "
                   f"{sum(c['ok'] for c in entry[scen]['checks'])}/{len(entry[scen]['checks'])}")
+            out_path.write_text(json.dumps(results, indent=2, sort_keys=True))   # kept if a later cell dies
     out_path.write_text(json.dumps(results, indent=2, sort_keys=True))
 
 

@@ -184,7 +184,7 @@ def _read_ini(path: Path) -> Optional[configparser.ConfigParser]:
     package)."""
     parser = configparser.ConfigParser(interpolation=None)
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8-sig") as fh:
             parser.read_file(fh)
     except (OSError, configparser.Error, UnicodeDecodeError):
         return None

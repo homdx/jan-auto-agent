@@ -115,8 +115,8 @@ def load_profiles(repo: Path) -> tuple[dict[str, dict[str, str]], str]:
         if path.is_file():
             try:
                 parser.read(path, encoding="utf-8-sig")
-            except configparser.Error as err:
-                # A broken header or an unknown key is one refusal line naming the file, never a traceback.
+            except (configparser.Error, UnicodeDecodeError) as err:
+                # A broken header, an unknown key or bytes that are no UTF-8 are one refusal line naming the file, never a traceback.
                 raise ProfileError(f"{name}: {_one_line(err)}") from err
 
     profiles: dict[str, dict[str, str]] = {}

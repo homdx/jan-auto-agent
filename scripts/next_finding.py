@@ -45,7 +45,7 @@ def parse_improvements(path):
 def recorded_ids(csv_path):
     if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
         return set()
-    with open(csv_path, newline="", encoding="utf-8") as fh:
+    with open(csv_path, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
         return {(r.get("task_id") or "").strip() for r in csv.DictReader(fh)}
 
 

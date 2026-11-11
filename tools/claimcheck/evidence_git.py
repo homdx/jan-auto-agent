@@ -159,6 +159,14 @@ class Hunk:
         return (self.new_start, self.new_end) if self.at else (0, 0)
 
     def text(self, max_chars: int = 2400) -> str:
+        """`_text` held to *max_chars*: the headers and the cut markers are budgeted, but a
+        budget smaller than they are is still a ceiling, so the tail is dropped with a `…`."""
+        out = self._text(max_chars)
+        if len(out) <= max_chars:
+            return out
+        return out[:max_chars - 1] + "…" if max_chars > 0 else ""
+
+    def _text(self, max_chars: int) -> str:
         """The file header, the `@@` line and the hunk's lines behind a new-side gutter.
 
         Longer than *max_chars*: the hunk's head, then `RADIUS` lines around each line

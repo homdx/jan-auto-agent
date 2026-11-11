@@ -159,7 +159,7 @@ def parse_skill_md(path: Path) -> SkillDoc:
     """
     if not path.is_file():
         raise SkillNotFoundError(f"SKILL.md not found: {path}")
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")   # an editor's BOM is no part of the frontmatter
 
     name = path.parent.name
     description = ""

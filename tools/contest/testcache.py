@@ -105,7 +105,10 @@ def _tokenize(command: str) -> list:
     ``$( … )`` and backticks are kept inside their word, balanced, and never
     executed; ``2>&1`` and ``&>`` keep their ``&``; ``{`` and ``}`` separate
     only as whole words (shell reserved words). Quotes are stripped from the
-    words, so ``"tests"`` and ``tests`` are the same word.
+    words, so ``"tests"`` and ``tests`` are the same word. A quote, backtick or
+    ``$(`` that is never closed is a syntax error in the shell, so it raises
+    ``ValueError`` (``parse_pytest`` turns that into "no run": a command the shell
+    refuses must not be answered from a cached green summary).
     """
     tokens: list = []
     word: list = []
@@ -138,7 +141,8 @@ def _tokenize(command: str) -> list:
             continue
         if ch == "'":
             end = command.find("'", i + 1)
-            end = n if end < 0 else end
+            if end < 0:
+                raise ValueError("unclosed single quote")
             word.append(command[i + 1:end])
             in_word = True
             i = end + 1
@@ -149,13 +153,16 @@ def _tokenize(command: str) -> list:
                 if command[j] == "\\" and j + 1 < n:
                     j += 1
                 j += 1
+            if j >= n:
+                raise ValueError("unclosed double quote")
             word.append(command[i + 1:j].replace('\\"', '"'))
             in_word = True
             i = j + 1
             continue
         if ch == "`":
             end = command.find("`", i + 1)
-            end = n - 1 if end < 0 else end
+            if end < 0:
+                raise ValueError("unclosed backtick")
             word.append(command[i:end + 1])
             in_word = True
             i = end + 1
@@ -170,6 +177,8 @@ def _tokenize(command: str) -> list:
                     if depth == 0:
                         break
                 j += 1
+            if j >= n:
+                raise ValueError("unclosed command substitution")
             word.append(command[i:j + 1])
             in_word = True
             i = j + 1

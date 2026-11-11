@@ -45,7 +45,8 @@ def _make_config(src: str) -> str:
 
 
 def backoff_zero(src: str) -> bool:
-    return re.search(r"error_retry_backoff_sec\s*=\s*0\b", _make_config(src)) is not None
+    return re.search(r"error_retry_backoff_sec\s*=\s*0(?:\.0*)?(?=[ \t]*(?:[,)}\]#]|$))",
+                     _make_config(src), re.M) is not None
 
 
 def runner_off_port_group(src: str) -> bool:

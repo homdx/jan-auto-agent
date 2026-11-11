@@ -31,6 +31,7 @@ everything printed goes through `output.scrub`. A missing or malformed
 
 from __future__ import annotations
 
+import shlex
 import argparse
 import json
 import os
@@ -214,11 +215,23 @@ def _entry_name(source: str) -> Optional[tuple[str, str]]:
 
 
 def _untracked_names(text: str) -> list[str]:
-    """The names a `.diff`'s trailing `Untracked files:` comment lists."""
+    """The names a `.diff`'s trailing untracked-files comment lists.
+
+    The exporter writes `# untracked (not inlined): a b` (tools/contest/cli.py); the
+    older `Untracked files: a b` form is still read. A name git had to quote (it holds
+    a space) arrives double-quoted, so the list is split shell-style, and a line that
+    does not split that way falls back to plain whitespace.
+    """
     lines = [l for l in text.splitlines() if l.strip()]
     last = lines[-1] if lines else ""
-    marker = "Untracked files:"
-    return last[len(marker):].split() if last.startswith(marker) else []
+    for marker in ("# untracked (not inlined):", "Untracked files:"):
+        if last.startswith(marker):
+            rest = last[len(marker):]
+            try:
+                return shlex.split(rest)
+            except ValueError:
+                return rest.split()
+    return []
 
 
 def read_entry(folder: Path, agent: str) -> Optional[Entry]:

@@ -44,7 +44,7 @@ def reviewer_name(path):
 def load(paths):
     rows, problems = [], []
     for p in paths:
-        with open(p, newline="", encoding="utf-8") as fh:
+        with open(p, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
             reader = csv.DictReader(fh)
             missing = [c for c in COLUMNS if c not in (reader.fieldnames or [])]
             if missing:

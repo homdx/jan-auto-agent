@@ -117,12 +117,18 @@ def main():
     with _locked(out):
         existed = os.path.exists(out) and os.path.getsize(out) > 0
         if existed:
-            with open(out, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
-                for prev in csv.DictReader(fh):
-                    if (prev.get("finding") or "").strip() == row["finding"]:
-                        print(f"skipped: {row['finding']} is already decided as "
-                              f"{prev.get('truth')} — move on.", file=sys.stderr)
-                        return 2
+            try:
+                with open(out, newline="", encoding="utf-8-sig") as fh:   # a spreadsheet's BOM
+                    for prev in csv.DictReader(fh):
+                        if (prev.get("finding") or "").strip() == row["finding"]:
+                            print(f"skipped: {row['finding']} is already decided as "
+                                  f"{prev.get('truth')} — move on.", file=sys.stderr)
+                            return 2
+            except UnicodeDecodeError as err:
+                # A CSV saved in a legacy code page: nothing is written, the operator re-saves it as UTF-8.
+                print(f"error: {out} is not UTF-8 ({err.reason} at byte {err.start}); "
+                      f"nothing was appended", file=sys.stderr)
+                return 1
 
         tail = _missing_final_newline(out) if existed else ""
         with open(out, "a", newline="", encoding="utf-8") as fh:
