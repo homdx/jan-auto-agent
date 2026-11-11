@@ -83,6 +83,28 @@ CASES.update({
     "regex_with_letter_after_less_than": "function target(x) { return x </a}/.test(x); }",
     "regex_with_dollar_after_less_than": "function target(x) { return x </$[}]/.test(x); }",
     "regex_with_class_after_less_than": "function target(x) { return x </a[}]/.test(x); }",
+    "regex_that_looks_like_a_closing_tag": "function target(x) { return x </a>}/.test(x); }",
+    "regex_div_that_looks_like_a_closing_tag": "function target(x) { return x </div>/.test(x); }",
+    "regex_greater_than_after_less_than": "function target(x) { return x </>/.test(x); }",
+    "regex_namespace_tag_lookalike": "function target(x) { return x </a:b>/.test(x); }",
+    "regex_hyphen_tag_lookalike": "function target(x) { return x </a-b>/.test(x); }",
+    "regex_tag_lookalike_after_space": "function target(x) { return x < /a>}/.test(x); }",
+    "class_extends_function_expression": "function target() { return class Outer extends function Base() {} { static valueOf() { return 4; } } / 2; }",
+    "class_extends_anonymous_function": "function target() { return class extends function() {} { static valueOf() { return 4; } } / 2; }",
+    "class_extends_function_with_comment": "function target() { return class Outer extends function /* note */ Base() {} { static valueOf() { return 4; } } / 2; }",
+    "class_extends_object_literal": "function target() { return class extends {}.constructor {} / 2; }",
+    "class_declaration_extends_function": "function target(x) { class A extends function Base() {} {} /}/.test(String(x)); return 42; }",
+    "regex_that_looks_like_a_closing_tag": "function target(x) { return x </a>}/.test(x); }",
+    "regex_div_that_looks_like_a_closing_tag": "function target(x) { return x </div>/.test(x); }",
+    "regex_greater_than_after_less_than": "function target(x) { return x </>/.test(x); }",
+    "regex_namespace_tag_lookalike": "function target(x) { return x </a:b>/.test(x); }",
+    "regex_hyphen_tag_lookalike": "function target(x) { return x </a-b>/.test(x); }",
+    "regex_tag_lookalike_after_space": "function target(x) { return x < /a>}/.test(x); }",
+    "class_extends_function_expression": "function target() { return class Outer extends function Base() {} { static valueOf() { return 4; } } / 2; }",
+    "class_extends_anonymous_function": "function target() { return class extends function() {} { static valueOf() { return 4; } } / 2; }",
+    "class_extends_function_with_comment": "function target() { return class Outer extends function /* note */ Base() {} { static valueOf() { return 4; } } / 2; }",
+    "class_extends_object_literal": "function target() { return class extends {}.constructor {} / 2; }",
+    "class_declaration_extends_function": "function target(x) { class A extends function Base() {} {} /}/.test(String(x)); return 42; }",
     "object_method_division": "function target(x) { return {m() { return 1 }}.m() / 2 / {}; }",
 })
 
@@ -188,7 +210,7 @@ def lt_stmt(r):
     return r.choice(["v = x </}/.test(x);", "v = x < /}/.test(x);", "v = x</{/.test(x);", "v = (x) </[}]/.test(x);", "v = x <\n/}/.test(x);"])
 
 
-BASES = ["Object", "ns.Base", "ns.a.Base", "ns['Base']", "f()", "f(1, {a: 1})", "(c ? Object : Array)", "(class {})", "(class extends Object {})",
+BASES = ["function Base() { return {} }", "function() {}", "function /* n */ B() {}", "async function() {}", "{}.constructor", "{a: 1}.constructor", "function*() {}", "Object", "ns.Base", "ns.a.Base", "ns['Base']", "f()", "f(1, {a: 1})", "(c ? Object : Array)", "(class {})", "(class extends Object {})",
          "tag`x`", "tag`${1}`", "ns?.Base", "(0, ns.Base)", "[Object][0]", "(function() { return Object })()", "class_ => Object".replace("class_ => Object", "Object")]
 GAPS = ["", " ", "/* c */ ", "// c\n", "/* } */ ", "\n"]
 def heritage(r):
@@ -205,7 +227,8 @@ def class3_stmt(r):
     return d + r.choice(["\nv = {valueOf: () => 4} / 2;", "\n/}/.test(x);", " v = {a: {b: 1}} / 2 / 3; // }", "\nv = x > {} / 2;", "\nv = {case: {}} / 2;"])
 def lt2_stmt(r):
     t = r.choice(["a", "$", "_", "a[}]", "$[}]", "a}", "ab{", "A.b}", "x-y}", "a b}", "a:b}", "1}", "}"])
-    return r.choice(["v = x <%s/.test(x);", "v = x < %s/.test(x);", "v = x</%s/g.test(x);"]).replace("%s", "/" + t) if False else "v = x </" + t + "/.test(x);"
+    t2 = r.choice(["a>}", "div>", ">", "a:b>", "a-b>", "a>/", "A.b>{", "$>", "_>", " >}", "a >"])
+    return r.choice(["v = x </" + t + "/.test(x);", "v = x </" + t2 + "/.test(x);", "v = x < /" + t2 + "/.test(x);", "v = c ? x </" + t2 + "/.test(x) : 1;"])
 
 def wrap(r, s, d):
     if d == 0:
@@ -257,3 +280,72 @@ def test_random_valid_js_is_extracted_whole(seed):
     assert sum(accepted) > 300, "the generator must mostly produce valid JavaScript"
     wrong = [t for t, ok in zip(cases, accepted) if ok and _whole(t) != t]
     assert not wrong, wrong[0]
+
+
+# JSX has no engine to ask (gjs and node parse plain JavaScript): these are valid by construction. Each
+# element, in every nesting of tags, attribute `{…}` containers and text with apostrophes, slashes and
+# regex-like `</a>/` lookalikes, must be extracted whole.
+TEXT = ["hello", "don't stop", "5 / 3", "a / b / c", "it's \"quoted\"", "path/to/file", "100%", "x &amp; y", "// not a comment", "/* nor this */",
+        "(parens) [brackets]", "x = y", "a ? b : c", "ok;"]
+EXPR = ["x", "{a: 1}.a / 2", "/}/.test(x)", "x </a>/.test(x)", "x < y", "x </div>/.test(x)", "c && <b>t</b>", "c ? <i/> : null",
+        "items.map(i => <li key={i}>{i}</li>)", "(() => { return {} })() ? 1 : 2", "`${x}}`", "'}'", "x > {} / 2", "/* } */ x", "[1, 2].map(n => n / 2)",
+        "f(<a>{x}</a>)", "{valueOf: () => 4} / 2", "x /* c */ / 2"]
+NAMES = ["div", "a", "Foo", "ns:tag", "A.B", "my-tag"]
+def attrs(r):
+    out = []
+    for _ in range(r.randrange(0, 3)):
+        out.append(r.choice(['id="x"', "t='it\"s'", "n={" + r.choice(EXPR) + "}", "d", "{...p}", 'href="a/b>c"', "cb={() => x > 1}"]))
+    return (" " + " ".join(out)) if out else ""
+def elem(r, d):
+    nm = r.choice(NAMES)
+    if r.random() < .15:
+        return "<" + nm + attrs(r) + (" " if r.random() < .5 else "") + "/>"
+    kids = "".join(child(r, d) for _ in range(r.randrange(0, 4))) if d > 0 else r.choice(TEXT)
+    if r.random() < .15:
+        return "<>" + kids + "</>"
+    return "<" + nm + attrs(r) + ">" + kids + "</" + nm + (" " if r.random() < .2 else "") + ">"
+def child(r, d):
+    k = r.randrange(4)
+    if k == 0: return r.choice(TEXT)
+    if k == 1: return "{" + r.choice(EXPR) + "}"
+    if k == 2: return elem(r, d - 1)
+    return "\n  " + r.choice(TEXT) + " "
+def gen_jsx(r):
+    e = elem(r, r.randrange(1, 4))
+    use = r.choice(["return (%s);", "return %s;", "v = %s;", "v = c && %s;", "v = c ? %s : null;", "v = () => %s;", "v = [%s, %s];", "f(%s);",
+                    "return (\n %s\n);", "v = {k: %s};"])
+    stmt = use.replace("%s", e) if use != "v = [%s, %s];" else use % (e, elem(r, 1))
+    tail = r.choice(["", " /}/.test(x);", "\n/}/.test(x);", " v = {a: 1}.a / 2; // }", "\nif (c) { v = 1 }\n/}/.test(x);", " x </a>/.test(x);"])
+    if stmt.startswith("return") :
+        tail = ""
+    return "function target(x, c, v, items, f, p) {\n  " + stmt + tail + "\n}"
+
+
+JSX_CASES = {
+    "text_with_apostrophe": "function target() { return <p>don't {x} stop</p>; }",
+    "text_with_slash": "function target() { return <p>5 / 3 and a/b</p>; }",
+    "closing_tags_in_children": "function target(x) { return <ul><li>a</li><li>{x}</li></ul>; }",
+    "fragment": "function target(x) { return <>{x}<b>t</b></>; }",
+    "self_closing": "function target(x) { return <div><br /><img src=\"a/b.png\"/></div>; }",
+    "element_in_attribute": "function target(x) { return <A n={x && <b>t</b>} d>don't</A>; }",
+    "regex_lookalike_inside_container": "function target(x) { return <p>{x </a>/.test(x)}</p>; }",
+    "unclosed_element_does_not_swallow_the_next_function": "function target(x) { return <div>{x && <Foo y={1} />}\n}",
+    "generic_arrow_is_no_element": "function target(x) { const id = <T>(v: T) => v; return id(x) </a>}/.test(x); }",
+}
+
+
+@pytest.mark.parametrize("name", sorted(JSX_CASES))
+def test_jsx_is_extracted_whole(name):
+    target = JSX_CASES[name]
+    if name == "unclosed_element_does_not_swallow_the_next_function":
+        assert "neighbor" not in extract_block(target + NEIGHBOR, "target", ".jsx")
+        return
+    assert extract_block(target + NEIGHBOR, "target", ".tsx" if name.startswith("generic") else ".jsx") == target
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4])
+def test_random_jsx_is_extracted_whole(seed):
+    r = random.Random(seed)
+    for _ in range(300):
+        target = gen_jsx(r)
+        assert extract_block(target + NEIGHBOR, "target", ".jsx") == target, target

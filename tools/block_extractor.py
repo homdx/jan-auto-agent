@@ -267,7 +267,8 @@ def _lang_skip(source: str, i: int, lang: str) -> Optional[int]:
     """Where the code scan goes on when *source[i]* starts something of *lang* the generic scan misreads,
     else None: a Rust lifetime (`'a`, `'static`) is no string — read as one, a body with `&'static str` ran
     on to the next apostrophe, a later function's `// don't` — nor is a C preprocessor line (`#error don't
-    compile`), and a JS regex literal (`/}/.test(s)`) holds braces that are no block's."""
+    compile`), a JS regex literal (`/}/.test(s)`) holds braces that are no block's, and the text of a JSX
+    element (`<p>don't {x}</p>`) is no code at all — its apostrophe starts no string."""
     ch = source[i]
     if lang == "rust" and ch == "'":
         m = _RUST_CHAR.match(source, i)
@@ -280,7 +281,7 @@ def _lang_skip(source: str, i: int, lang: str) -> Optional[int]:
             # the block being counted (HARDEN-4 D4).
             nl = source.find("\n", nl + 1)
         return len(source) if nl < 0 else nl
-    if lang == "js" and ch == "/":
+    if lang == "js":
         return _js_regex_spans(source).get(i)
     return None
 
@@ -319,6 +320,8 @@ _JS_DECLARATION_WORDS = frozenset(("class", "interface", "enum", "namespace", "m
 _JS_BRACE_KINDS = ("block", "object", "fn", "tmpl")
 #: what follows the `/` of `</div>`, `</ns:tag >`, `</A.B>`, `</>`; `x </a}/.test(s)` is a regex, not this
 _JS_CLOSING_TAG = re.compile(r"(?:[A-Za-z_$][\w$.:-]*[ \t]*)?>")
+#: TypeScript's `<T>(x: T) => x`, `<T extends U, V,>(…)`: type parameters before an arrow's parameter list, no element
+_TS_GENERIC_HEAD = re.compile(r"<\s*[A-Z][A-Za-z0-9]?\s*>\s*\(|<\s*[A-Za-z_$][\w$]*(?:\s+extends\s+[^<>(){}]+|\s*,\s*[A-Za-z_$][\w$]*)+\s*,?\s*>\s*\(")
 _JS_NAME = re.compile(r"(?:[^\W\d]|[$#])[\w$]*")
 _JS_NUMBER = re.compile(r"\.?[0-9](?:[\w.]|(?<=[eE])[+-])*")
 _JS_PUNCT = re.compile(r">>>=|\.\.\.|===|!==|\*\*=|<<=|>>=|>>>|&&=|\|\|=|\?\?=|=>|==|!=|<=|>=|&&|\|\||\?\?"
@@ -368,6 +371,9 @@ class _JsScanner:
         self.pending_fn = None                            # a `function` keyword waits for its `(`: is it an expression
         self.pending_class: list = []                     # (stack depth, is an expression) of each `class` waiting for its body
         self.text = False                                 # inside template text
+        #: JSX: the stack depth of each open element's children; and the depth an opening tag is being read at
+        self.jsx_levels: list = []
+        self.tags: list = []          # likewise for each opening tag being read (an attribute `{…}` may hold another element)
 
     def token(self, pk: str, pv: str, end: int, allowed: bool, pdata=None) -> None:
         self.pprev = self.pv
@@ -385,7 +391,7 @@ class _JsScanner:
         if pk in ("none", "operand"):
             return False
         if pk == "word":
-            return pv in _JS_REGEX_AFTER_WORD and pv not in ("else", "do")
+            return (pv in _JS_REGEX_AFTER_WORD and pv not in ("else", "do")) or pv == "extends"
         if pv in (";", "}", ")"):
             return False
         if pv == "{":
@@ -396,7 +402,12 @@ class _JsScanner:
 
     def brace_kind(self, at: int) -> str:
         pk, pv = self.pk, self.pv
-        if self.pending_class and self.pending_class[-1][0] == len(self.stack):
+        if self.in_children():
+            return "object"                                # `<p>{x}</p>`: an expression container
+        if pk == "word" and pv == "extends":
+            return "object"                                # `class A extends {}.constructor {}`
+        if self.pending_class and self.pending_class[-1][0] == len(self.stack) and not (
+                pk == "punct" and pv == ")" and self.pdata is not None):          # `extends function F() {}`: a body
             # the body of `class A<T> extends ns.B {`, whatever token the heritage ends in: the body of a class
             # in an expression position ends an operand (`class {} / 2`)
             return "fn" if self.pending_class.pop()[1] else "block"
@@ -422,6 +433,43 @@ class _JsScanner:
             return "block"                                 # `class A<T> {`, `class A extends B<C<D>> {`
         return "object"
 
+    def in_open_tag(self) -> bool:
+        """Between `<Name` and its `>`, at the bracket level the tag opened at (not inside an attribute's `{…}`)."""
+        return bool(self.tags) and self.tags[-1] == len(self.stack)
+
+    def in_children(self) -> bool:
+        return bool(self.jsx_levels) and self.jsx_levels[-1] == len(self.stack) and not self.in_open_tag()
+
+    def jsx_at(self, i: int) -> int:
+        """Where the scan goes on when the `<` at *i* opens or closes a JSX element, else 0.
+
+        Only an open element tells `x </a>/.test(s)` (a regex after a comparison) from `<li>a</li>`
+        (a closing tag): `<` starts a tag where an operand may start (`return <div>`, `(<a/>)`, `&& <b>`)
+        or among the children of an open element, and `</name>` closes one only there."""
+        source = self.source
+        nxt = source[i + 1:i + 2]
+        children = self.in_children()
+        if nxt == "/":
+            m = _JS_CLOSING_TAG.match(source, i + 2) if children else None
+            if not m:
+                return 0
+            self.jsx_levels.pop()
+            self.token("operand", "", m.end(), False)
+            return m.end()
+        if nxt and (nxt.isalpha() or nxt in "_$>") and (self.allowed or children) and not _TS_GENERIC_HEAD.match(source, i):
+            self.tags.append(len(self.stack))
+            self.token("punct", "<", i + 1, True)
+            return i + 1
+        return 0
+
+    def forget_jsx(self) -> None:
+        """Drop the elements and the tag whose bracket level has closed under them."""
+        depth = len(self.stack)
+        while self.jsx_levels and self.jsx_levels[-1] > depth:
+            self.jsx_levels.pop()
+        while self.tags and self.tags[-1] > depth:
+            self.tags.pop()
+
     def forget_classes(self, depth: int) -> None:
         """A `class` whose body never came at its own bracket depth (the brackets closed first) is dropped."""
         while self.pending_class and self.pending_class[-1][0] > depth:
@@ -446,9 +494,35 @@ class _JsScanner:
                 i = self.template_text(i)
                 continue
             ch = source[i]
+            if self.in_children() and ch not in "<{}":
+                # JSX text is no code: an apostrophe in it starts no string, a slash divides nothing. A `}`
+                # is no text either (JSX has none): it closes the code around a tag that never closed
+                j = i
+                while j < n and source[j] not in "<{}":
+                    j += 1
+                self.spans[i] = j
+                self.token("operand", "", j, False)
+                i = j
+                continue
             if ch.isspace():
                 i += 1
                 continue
+            if self.in_open_tag() and (ch == ">" or source.startswith("/>", i)):
+                if ch == ">":
+                    i += 1
+                    self.tags.pop()
+                    self.jsx_levels.append(len(self.stack))
+                    self.token("punct", ">", i, False)
+                else:
+                    i += 2
+                    self.tags.pop()
+                    self.token("operand", "", i, False)         # `<br />`: an element, an operand
+                continue
+            if ch == "<":
+                j = self.jsx_at(i)
+                if j:
+                    i = j
+                    continue
             if ch == "/":
                 i = self.slash(i)
             elif ch in "'\"":
@@ -501,9 +575,7 @@ class _JsScanner:
         if nxt == "*":
             end = source.find("*/", i + 2)
             return n if end < 0 else end + 2
-        # `</li>`, `</>`: a JSX closing tag (a tag name or `>` follows the slash); `x </}/.test(s)` is a regex
-        jsx_close = source[i - 1:i] == "<" and bool(_JS_CLOSING_TAG.match(source, i + 1))
-        if self.allowed and not jsx_close:
+        if self.allowed:
             end = _js_regex_end(source, i)
             if end is None and nxt != ">":
                 # An unterminated regex literal is a syntax error in real JS, but its `{` must not inflate
@@ -552,14 +624,16 @@ class _JsScanner:
         elif tok == ")":
             entry = self.pop_to(("paren",))
             self.forget_classes(len(stack))
+            self.forget_jsx()
             cond, fn = (entry[2], entry[3]) if entry else (False, None)
-            self.token("punct", tok, end, bool(cond), bool(fn))
+            self.token("punct", tok, end, bool(cond), fn)        # fn: None, or whether a function's params closed
         elif tok == "[":
             stack.append(["bracket", 0])
             self.token("punct", tok, end, True)
         elif tok == "]":
             self.pop_to(("bracket",))
             self.forget_classes(len(stack))
+            self.forget_jsx()
             self.token("punct", tok, end, False)
         elif tok == "{":
             kind = self.brace_kind(start)
@@ -570,6 +644,8 @@ class _JsScanner:
         elif tok == "}":
             entry = self.pop_to(_JS_BRACE_KINDS)
             kind = entry[0] if entry else "block"
+            self.forget_classes(len(stack))
+            self.forget_jsx()
             self.decl = False
             self.pending_fn = None
             if kind == "tmpl":
