@@ -38,6 +38,12 @@ def _save(path: Path, results: dict) -> None:
     os.replace(tmp, path)
 
 
+def _well_formed(result) -> bool:
+    """A cell is ``{"checks": [{"ok": …}, …]}``; valid JSON of another shape is a lost cell, not a crash."""
+    checks = result.get("checks") if isinstance(result, dict) else None
+    return isinstance(checks, list) and all(isinstance(c, dict) and "ok" in c for c in checks)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wt", required=True)
@@ -67,6 +73,9 @@ def main():
             except ValueError:
                 entry[scen] = None
                 detail = f"unreadable result line: {line[:200]!r}"
+            if entry[scen] is not None and not _well_formed(entry[scen]):
+                detail = f"result of the wrong shape: {json.dumps(entry[scen])[:200]}"
+                entry[scen] = None
             if entry[scen] is None:
                 # one lost cell is a failed check, not the end of the suite
                 entry[scen] = {"checks": [{"name": "subprocess", "ok": False, "detail": detail}]}

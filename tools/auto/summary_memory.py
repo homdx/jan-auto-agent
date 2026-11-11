@@ -319,6 +319,16 @@ def _clean_bullet_list(reply: str) -> str:
     import re as _re
     _marker = _re.compile(r"^\s*(?:[\u2022\-\*]|\d+[.)])\s+")
     _bullet_only = _re.compile(r"^\s*[\u2022\-\*]\s+")
+    def _fact_of(text: str) -> str:
+        """*text* as a fact: no FIX: prefix, no meta note, and "" when only marker characters are left."""
+        if text[:4].upper() == "FIX:":
+            text = text[4:].strip()
+        text = _strip_meta_parentheticals(text)
+        # (bullet characters only: a leading number is the fact's own, "• 2024. The project launched".)
+        while _bullet_only.match(text + " "):
+            text = _bullet_only.sub("", text + " ", count=1).strip()
+        return "" if _re.fullmatch(r"[\u2022\-\*\s]*", text) else text
+
     out: list[str] = []
     any_marker = False
     for raw in reply.splitlines():
@@ -327,19 +337,13 @@ def _clean_bullet_list(reply: str) -> str:
             continue
         if not _marker.match(line):
             if line[:4].upper() == "FIX:":
-                fact = _strip_meta_parentheticals(line[4:].strip())
+                fact = _fact_of(line)
                 if fact:
                     out.append(f"• {fact}")
             continue
         any_marker = True
-        fact = _marker.sub("", line, count=1).strip()
-        # "• •", "- *": a second marker is no fact, it is the same noise twice.
-        # (bullet characters only: a leading number is the fact's own, "• 2024. The project launched".)
-        while _bullet_only.match(fact + " "):
-            fact = _bullet_only.sub("", fact + " ", count=1).strip()
-        if fact[:4].upper() == "FIX:":
-            fact = fact[4:].strip()
-        fact = _strip_meta_parentheticals(fact)
+        # "• •", "- *", "• FIX: •": a second marker is no fact, it is the same noise twice.
+        fact = _fact_of(_marker.sub("", line, count=1).strip())
         if fact:
             out.append(f"• {fact}")
 
@@ -354,7 +358,7 @@ def _clean_bullet_list(reply: str) -> str:
         return ""  # looks like narrative prose, not short facts — fail open
     fallback: list[str] = []
     for ln in candidate_lines:
-        fact = _strip_meta_parentheticals(ln)
+        fact = _fact_of(ln)
         if fact:
             fallback.append(f"• {fact}")
     return "\n".join(fallback)

@@ -296,8 +296,9 @@ def hello_probe(server, provider_id: str, model_id: str, *,
         directory = tempfile.mkdtemp(prefix="kilo-variant-")
         tap = None
         session = None
-        client = KiloClient(server, directory)
+        client = None
         try:
+            client = KiloClient(server, directory)
             tap = EventTap(server.base_url, directory,
                            os.path.join(directory, "events.jsonl")).start()
             _wait_for_stream(tap)

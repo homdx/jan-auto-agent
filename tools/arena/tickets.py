@@ -1272,6 +1272,18 @@ def _editor_path(repo: Path, name: str) -> Path:
     return tmp / name
 
 
+def _drop_editor_file(path: Path) -> None:
+    """Remove the temp file and its folder; a refusal that keeps the edit does not call this."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
+
+
 def _disk_bytes(repo: Path, rel: str) -> Optional[bytes]:
     """*rel*'s bytes in the checkout, `None` when there is no such file."""
     try:
@@ -1411,6 +1423,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
     try:
         proc = subprocess.run(shlex.split(editor) + [str(path)], cwd=str(repo), env=os.environ)
     except (OSError, ValueError) as err:
+        _drop_editor_file(path)     # nothing was edited, nothing to keep
         return _refuse(f"$EDITOR {editor!r} did not run: {err}", args, where=where, ticket=ticket,
                        flow=_flow(EDIT_FLOW, 6, str(err)),
                        hints=[{"why": "try again", "command": _cmd("edit", nn, branch)}])
@@ -1422,6 +1435,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
 
     new_text = read_utf8(path)
     if new_text == text:
+        _drop_editor_file(path)
         if out == "json":
             print(json.dumps(_scrubbed({"ticket": nn, "branch": branch, "from": word or "",
                                         "to": word or "", "commit": None})))
@@ -1494,11 +1508,7 @@ def issue_edit(repo: Path, args: argparse.Namespace, prof: dict) -> int:
                      {"why": "then the same command again", "command": _cmd("edit", nn, branch)}]
             return _refuse(message, args, where=where, ticket=ticket,
                            flow=_flow(EDIT_FLOW, 9, "the commit refused it"), hints=hints)
-    try:
-        path.unlink()
-        path.parent.rmdir()
-    except OSError:
-        pass
+    _drop_editor_file(path)
     if out == "json":
         print(json.dumps(_scrubbed({"ticket": nn, "branch": branch, "from": word or "",
                                     "to": new_word, "commit": sha})))

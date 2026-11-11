@@ -152,6 +152,23 @@ def _tokenize(command: str) -> list:
             while j < n and command[j] != '"':
                 if command[j] == "\\" and j + 1 < n:
                     j += 1
+                elif command[j] == "`":
+                    # a backtick inside double quotes runs a command and must close too
+                    j = command.find("`", j + 1)
+                    if j < 0:
+                        raise ValueError("unclosed backtick")
+                elif command[j] == "$" and command[j + 1:j + 2] == "(":
+                    depth, j = 0, j + 1
+                    while j < n:
+                        if command[j] == "(":
+                            depth += 1
+                        elif command[j] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        j += 1
+                    if j >= n:
+                        raise ValueError("unclosed command substitution")
                 j += 1
             if j >= n:
                 raise ValueError("unclosed double quote")
@@ -214,6 +231,18 @@ def _tokenize(command: str) -> list:
         i += 1
     flush()
     return [t for t in tokens]
+
+
+def is_well_formed(command: str) -> bool:
+    """False when the shell would refuse *command* for an unclosed quote, backtick or ``$(``.
+
+    Such a command ran nothing, so no answer for it may come from the cache or from a classifier.
+    """
+    try:
+        _tokenize(command)
+    except ValueError:
+        return False
+    return True
 
 
 def _segments(tokens: list) -> list:

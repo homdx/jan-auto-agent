@@ -654,6 +654,7 @@ class Executor:
                 return False
 
         siblings = [p for p in siblings if str(p.resolve()) in marked and not _is_protected(p)]
+        removed: set[str] = set()
         # Oldest first among the other task workspaces; a sibling removed mid-scan must not raise (BUGFIX).
         def _safe_mtime(p: Path) -> float:
             try:
@@ -665,12 +666,39 @@ class Executor:
         excess = len(siblings) - max(self._max_retained_workspaces - 1, 0)
         for old in siblings[:max(excess, 0)]:
             try:
+                mark = str(old.resolve())
                 shutil.rmtree(old)
+                removed.add(mark)
                 logger.debug("_prune_old_workspaces: removed stale workspace %s", old)
             except OSError as exc:
                 logger.warning(
                     "_prune_old_workspaces: could not remove %s (%s)", old, exc
                 )
+        self._forget_workspaces(removed)
+
+    def _forget_workspaces(self, removed: set[str]) -> None:
+        """Drop the marks of workspaces that are gone from the registry.
+
+        The registry is append-only otherwise: every pruned directory would
+        leave its path behind, and a long ``--auto`` run grows the file for
+        ever. A mark whose directory no longer exists is dropped with them.
+        A failed write keeps the longer registry — harmless, pruning only
+        ever deletes a directory that exists.
+        """
+        try:
+            marks = self._read_workspace_registry()
+        except Exception:  # noqa: BLE001 — best-effort, like _mark_workspace
+            return
+        kept = {m for m in marks if m not in removed and Path(m).exists()}
+        if kept == marks:
+            return
+        registry = self._registry_path()
+        try:
+            tmp = registry.with_name(f"{registry.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(sorted(kept), indent=2) + "\n", encoding="utf-8")
+            os.replace(tmp, registry)
+        except OSError as exc:
+            logger.warning("_forget_workspaces: could not trim %s (%s)", registry, exc)
 
     # ── Command resolution ────────────────────────────────────────────────────
 

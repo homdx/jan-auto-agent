@@ -123,9 +123,18 @@ def _test_spans(claim: str):
 
 
 def _is_rename(claim: str, start: int, end: int) -> bool:
-    """`a.py => b.py`, `{a => b}.py`: git's rename form, not a file of ours."""
-    return (re.search(r"=>\s*$", claim[:start]) is not None
-            or re.match(r"\s*=>", claim[end:]) is not None)
+    """`a.py => b.py`, `{a => b}.py`: git's rename form, not a file of ours.
+
+    The arrow must touch the path on its own line: a line break is no blank here, and only the
+    blanks next to the path are walked, never the whole text before it.
+    """
+    i = start
+    while i > 0 and claim[i - 1] in " \t":
+        i -= 1
+    j = end
+    while j < len(claim) and claim[j] in " \t":
+        j += 1
+    return claim[max(i - 2, 0):i] == "=>" or claim.startswith("=>", j)
 
 
 #: A quoted path with a space in it; the quotes mark its ends, and an apostrophe does not.

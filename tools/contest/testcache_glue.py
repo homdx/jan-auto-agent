@@ -101,6 +101,8 @@ class TestCacheGate:
     # ── what the command is ───────────────────────────────────────────────
 
     def _runs_of(self, command: str) -> list:
+        if not testcache.is_well_formed(command):
+            return []
         runs = testcache.parse_pytest(command)
         if runs or self._classify is None or not _MAYBE_TESTS.search(command):
             return runs
@@ -123,8 +125,8 @@ class TestCacheGate:
         """The cached one-line answer for this ask, or None to run as usual."""
         try:
             command = ((props.get("metadata") or {}).get("command")) or ""
-            if not command:
-                return None
+            if not command or not testcache.is_well_formed(command):
+                return None   # a command the shell refuses ran nothing: no cached green, no classifier
             parsed = testcache.parse_pytest(command)
             if parsed:
                 if not only_pytest_and_harmless(command):

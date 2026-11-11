@@ -233,10 +233,14 @@ def _empty_runs_dir(worktree: Path, agent: str) -> None:
     runs = worktree / "runs" / agent
     if runs.exists():
         for child in runs.iterdir():
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
+            # A leftover another process still holds is a stale scratch file, not a reason to drop the round.
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            except OSError as exc:
+                _log.warning("could not empty %s (%s) — the round goes on", child, exc)
     else:
         runs.mkdir(parents=True, exist_ok=True)
 

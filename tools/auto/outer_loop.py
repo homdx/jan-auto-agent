@@ -685,14 +685,15 @@ class OuterLoop:
         """
         if budget.max_seconds <= 0 or budget.session_started_at is None:
             return
-        elapsed = max(time.time() - budget.session_started_at, 0.0)
-        # Time spent in coder calls that died on the wire is taken back out of the task total (RUN-8).
-        elapsed = max(elapsed - max(budget.credit_s, 0.0), 0.0)
         try:
+            elapsed = max(time.time() - budget.session_started_at, 0.0)
+            # Time spent in coder calls that died on the wire is taken back out of the task total (RUN-8).
+            elapsed = max(elapsed - max(budget.credit_s, 0.0), 0.0)
             self.state.write_task_file(
                 task_id, _BUDGET_FILE, render_budget_file(budget.consumed_s + elapsed),
             )
-        except OSError as exc:
+        # TypeError/ValueError: a hand-set ledger field that is no number — run_task's ``finally`` must never raise.
+        except (OSError, TypeError, ValueError) as exc:
             logger.warning(
                 "OuterLoop: could not persist the consumed budget for %s — the "
                 "next resume will under-count this session's time: %s",

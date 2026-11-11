@@ -476,7 +476,7 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
         present = [data[k] for k in ("text", "data", "models") if data.get(k) is not None]
         models = next((m for m in present if m), present[0] if present else None)
         # A 200 whose body is an error object is reported as a failure, never as zero models (bug 208).
-        if models is None and data.get("error") is not None:
+        if not models and data.get("error") is not None:
             raise ValueError(f"/models reply is an error: {str(data.get('error'))[:80]!r}")
     else:
         models = None

@@ -24,7 +24,6 @@ import ast
 import re
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 RUNNER_TESTS = "tests/test_contest_runner.py"
@@ -41,16 +40,19 @@ def _show(target: Path, rev: str, path: str) -> str:
     return _git(target, "show", f"{rev}:{path}")
 
 
-def _make_config(src: str) -> str:
-    m = re.search(r"^def make_config\(.*?(?=^def |\Z)", src, re.M | re.S)
-    return m.group(0) if m else ""
-
-
 def backoff_zero(src: str) -> bool:
-    """make_config really sets `error_retry_backoff_sec` to the number 0 — in code, not in a comment or a string."""
+    """make_config really sets `error_retry_backoff_sec` to the number 0 — in code, not in a comment or a string.
+
+    The function is found in the parsed file (a decorator on the next function is no part of it), and
+    the setting that wins is the last one written: a keyword or an attribute assignment, else a dict key.
+    """
     try:
-        tree = ast.parse(textwrap.dedent(_make_config(src)))
+        tree = ast.parse(src)
     except SyntaxError:
+        return False
+    func = next((n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "make_config"), None)
+    if func is None:
         return False
     name = "error_retry_backoff_sec"
 
@@ -58,18 +60,22 @@ def backoff_zero(src: str) -> bool:
         return (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
                 and not isinstance(node.value, bool) and node.value == 0)
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.keyword) and node.arg == name and zero(node.value):
-            return True
-        if isinstance(node, ast.Assign) and zero(node.value) and any(
-                (isinstance(t, ast.Name) and t.id == name) or (isinstance(t, ast.Attribute) and t.attr == name)
-                for t in node.targets):
-            return True
-        if isinstance(node, ast.Dict):
+    sets: list = []     # (line, col, is_zero) of a keyword or an assignment
+    keys: list = []     # the same for a dict key
+    for node in ast.walk(func):
+        if isinstance(node, ast.keyword) and node.arg == name:
+            sets.append((node.value.lineno, node.value.col_offset, zero(node.value)))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any((isinstance(t, ast.Name) and t.id == name) or (isinstance(t, ast.Attribute) and t.attr == name)
+                   for t in targets):
+                sets.append((node.lineno, node.col_offset, zero(node.value)))
+        elif isinstance(node, ast.Dict):
             for k, v in zip(node.keys, node.values):
-                if isinstance(k, ast.Constant) and k.value == name and zero(v):
-                    return True
-    return False
+                if isinstance(k, ast.Constant) and k.value == name:
+                    keys.append((v.lineno, v.col_offset, zero(v)))
+    found = sets or keys
+    return bool(found) and max(found)[2]
 
 
 def runner_off_port_group(src: str) -> bool:
