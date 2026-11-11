@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import io
 import keyword
+import os
 import re
 import tokenize
 from dataclasses import dataclass
@@ -83,12 +84,21 @@ _VAGUE_NOUNS = frozenset((
 ))
 
 
+_PYTHON_EXTS = frozenset(("", ".py", ".pyi", ".pyw"))
+
+
 @functools.lru_cache(maxsize=8)
-def _code_only(source: str) -> str:
+def _code_only(source: str, ext: str = "") -> str:
     """*source* with every string, comment and docstring blanked (newlines kept), so a
     `def return()` written inside a triple-quoted string or a `# def class` comment is not
-    read as a definition. Python is tokenized; a source that does not tokenize (another
-    language, a syntax error) is masked by the extractor's own lexer state machine."""
+    read as a definition. Python is tokenized; any other file type, and a Python source that
+    does not tokenize, is masked by the extractor's own lexer state machine in the language
+    of *ext* — a C++ raw string `R"(/* … )"` or a Java text block is a string there, and
+    read in no language its `/*` would hide every class below it."""
+    from tools.block_extractor import _LANG_OF_EXT, _code_mask
+    if ext not in _PYTHON_EXTS:
+        mask = _code_mask(source, _LANG_OF_EXT.get(ext, ""))
+        return "".join(ch if mask[k] or ch == "\n" else " " for k, ch in enumerate(source))
     blanked = list(source)
     starts = [0]
     for line in source.split("\n"):
@@ -109,12 +119,11 @@ def _code_only(source: str) -> str:
                     blanked[k] = " "
         return "".join(blanked)
     except (tokenize.TokenError, SyntaxError, IndexError):
-        from tools.block_extractor import _code_mask
         mask = _code_mask(source, "")
         return "".join(ch if mask[k] or ch == "\n" else " " for k, ch in enumerate(source))
 
 
-def _is_defined_in_source(name: str, source: str) -> bool:
+def _is_defined_in_source(name: str, source: str, ext: str = "") -> bool:
     """True when *name* is introduced as a symbol in *source*, not merely mentioned.
 
     A definition is a declaration keyword before the name (`def work`, `class work`,
@@ -124,13 +133,13 @@ def _is_defined_in_source(name: str, source: str) -> bool:
     (as a keyword, in a docstring, in a comment) without naming anything.
     """
     n = re.escape(name)
-    source = _code_only(source)
+    source = _code_only(source, ext)
     if re.search(r'(?<![\w.])(?:def|class|function|func|fn|interface|struct|enum|trait|type|const|let|var)\s+' + n + r'\b', source):
         return True
     return bool(re.search(r'^[ \t]*' + n + r'[ \t]*=(?!=)', source, re.MULTILINE))
 
 
-def _declaration_head_is_a_symbol(remainder: str, match: "re.Match[str]", source: str) -> bool:
+def _declaration_head_is_a_symbol(remainder: str, match: "re.Match[str]", source: str, ext: str = "") -> bool:
     """True when Strategy A's head names a **symbol** rather than a verb (HARDEN-20 C).
 
     `parse_prompt`'s first strategy is `\\b(def|class|function|func)\\s+(name)\\b`, which takes
@@ -149,7 +158,7 @@ def _declaration_head_is_a_symbol(remainder: str, match: "re.Match[str]", source
     an unverifiable match is not a rejection.
     """
     name = re.escape(match.group(2))
-    source = _code_only(source)           # a definition written inside a string or a comment is none
+    source = _code_only(source, ext)      # a definition written inside a string or a comment is none
     if (match.group(2) in _RESERVED_AFTER_KEYWORD.get(match.group(1), ())
             and not re.search(r'(?m)^[ \t]*(?:def|class|function|func)[ \t]+' + name + r'\b', source)):
         # AGNES-1 T96: a reserved word after the declaration keyword names the
@@ -200,6 +209,7 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     file_match = in_matches[0] if in_matches else file_matches[0]
 
     file_path = file_match.group(2)
+    _ext = os.path.splitext(file_path.strip("`'\""))[1].lower()
     
     # Isolate remaining text to reduce token search spaces
     matched_segment = file_match.group(0)
@@ -213,7 +223,7 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     # validated before it wins — a verb after the keyword (`... function return`) falls through
     # to the strategies that find the real symbol.
     decl_match = re.search(r'\b(' + _DECLARATION_KEYWORDS + r')\s+([A-Za-z_][\w]*)\b', remainder)
-    if decl_match and _declaration_head_is_a_symbol(remainder, decl_match, source):
+    if decl_match and _declaration_head_is_a_symbol(remainder, decl_match, source, _ext):
         kw, name = decl_match.group(1), decl_match.group(2)
         target_name = name
         target_type = "class" if kw == "class" else "function"
@@ -247,7 +257,7 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
                 # source without naming a symbol, so with a source it needs a definition, not
                 # just an occurrence. A symbol really called `fail` or `bug` still passes.
                 if (source and candidate.lower() in (_PROSE_WORDS | _VAGUE_NOUNS)
-                        and not _is_defined_in_source(candidate, source)):
+                        and not _is_defined_in_source(candidate, source, _ext)):
                     continue
                 target_name = candidate
                 break

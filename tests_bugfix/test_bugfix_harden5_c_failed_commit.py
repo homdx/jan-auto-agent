@@ -247,7 +247,8 @@ def test_c_no_patch_keeps_the_work_in_the_tree(tmp_path):
     assert not (ctrl.agent_dir / "uncommitted-B2.patch").exists()
     # nothing was saved as a patch, so the edit is still in the tree
     assert (base / "work.py").exists()
-    assert reason is None
+    # the unsaved edit is all there is of the task: the run stops instead of letting a next task's commit take it in
+    assert reason == "unsaved_work"
 
 
 def test_c_a_normal_commit_is_unchanged(tmp_path):

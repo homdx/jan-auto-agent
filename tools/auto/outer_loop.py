@@ -243,6 +243,11 @@ class OuterLoop:
         self.max_rewrites           = max(0, int(max_rewrites))
         self.task_rewriter          = task_rewriter  # optional; None disables rewriting
 
+    def _accepted(self) -> dict:
+        """task id -> (round, inner results) of work the inner loop accepted in a run_task call still in
+        progress. Created on first use, so a loop built without `__init__` (a test double) still has it."""
+        return self.__dict__.setdefault("_accepted_work", {})
+
     def run_task(self, task: dict, base_dir: str | Path) -> OuterLoopResult:
         """Run the outer loop for *task*.  Resumes from the next unfinished
         round if feedback files already exist.  Never raises."""
@@ -262,6 +267,7 @@ class OuterLoop:
             )
             return OuterLoopResult(task_id, False, 0, False)
 
+        self._accepted().pop(task_id, None)
         try:
             return self._run_rounds(task, base_dir, task_id, _budget)
         except Exception as exc:
@@ -275,10 +281,18 @@ class OuterLoop:
                 task_id, exc,
             )
             self._record_bookkeeping_failure(task_id, exc)
+            accepted = self._accepted().get(task_id)
+            if accepted is not None:
+                # The inner loop passed this task before the bookkeeping raised: the work is a result, the
+                # state write is what failed. Not an exhaustion — the controller must save the edit before
+                # it cleans the tree.
+                return OuterLoopResult(task_id, False, accepted[0], True,
+                                       inner_results=accepted[1], work_passed=True)
             return OuterLoopResult(
                 task_id, False, self._completed_rounds(task_id), True,
             )
         finally:
+            self._accepted().pop(task_id, None)
             self._end_task_budget(task_id, _budget)
 
     def _record_bookkeeping_failure(self, task_id: str, exc: Exception) -> None:
@@ -410,6 +424,11 @@ class OuterLoop:
                                        feedback_files, inner_results,
                                        impl_versions_used)
             inner_results.append(res)
+            # From here on the working tree holds an accepted edit nobody has recorded: any bookkeeping
+            # that raises before the DONE write (the attempt counter, the budget credit) or in it must
+            # not be reported as an exhaustion, which resets the tree (AUTO-T60 follow-up).
+            if getattr(res, "passed", False) is True:
+                self._accepted()[task_id] = (rnd, inner_results)
             # Seconds a dead coder call used are credited back to the shared deadline (RUN-8).
             try:
                 _credit = float(getattr(res, "deadline_credit_s", 0.0) or 0.0)
@@ -453,25 +472,12 @@ class OuterLoop:
             impl_versions_used.append(impl_version)
 
             if getattr(res, "passed", False):
-                try:
-                    self.state.set_task_status(task_id, STATUS_DONE)
-                    self.state.log(f"{task_id}: passed in round {rnd} "
-                                   f"({getattr(res, 'attempts_used', '?')} attempts)")
-                    tracer.event("outer_loop", "controller", "result",
-                                 params={"task": task_id, "passed": True, "round": rnd,
-                                         "impl_version": impl_version})
-                except Exception as exc:
-                    # The work passed; only its record failed. Reported as an exhaustion, the controller
-                    # reset the tree and the accepted edit was gone with no patch and no commit. Say what
-                    # happened instead, so the edit is saved before anything is cleaned up.
-                    logger.exception(
-                        "OuterLoop: %s passed in round %d but recording it raised — %s; "
-                        "reporting the work as accepted-but-unrecorded", task_id, rnd, exc,
-                    )
-                    self._record_bookkeeping_failure(task_id, exc)
-                    return OuterLoopResult(task_id, False, rnd, True,
-                                           feedback_files, inner_results,
-                                           impl_versions_used, work_passed=True)
+                self.state.set_task_status(task_id, STATUS_DONE)
+                self.state.log(f"{task_id}: passed in round {rnd} "
+                               f"({getattr(res, 'attempts_used', '?')} attempts)")
+                tracer.event("controller", "outer_loop", "result",
+                             params={"task": task_id, "passed": True, "round": rnd,
+                                     "impl_version": impl_version})
                 return OuterLoopResult(task_id, True, rnd, False,
                                        feedback_files, inner_results,
                                        impl_versions_used)

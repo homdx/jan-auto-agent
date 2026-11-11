@@ -287,3 +287,45 @@ def test_a_cpp_raw_string_is_one_literal_up_to_its_own_delimiter() -> None:
     # inside a body the raw string's braces are not the body's
     body = 'int target() { const char *s = R"({ not a brace)"; return 1; }\nint after() { return 2; }\n'
     assert extract_block(body, "target", ".cpp").strip() == 'int target() { const char *s = R"({ not a brace)"; return 1; }'
+
+
+def test_a_slash_after_a_ts_non_null_bang_or_an_object_literal_is_a_division() -> None:
+    cases = (
+        (".ts", "function target(x: number | null) { return x! / 2; }"),
+        (".ts", "function target(a: number[]) { return a[0]! / 2; }"),
+        (".js", "function target() { return {valueOf: () => 4} / 2; }"),
+        (".js", "function target() { const y = 1; return y + {valueOf() { return 4; }} / 2; }"),
+    )
+    for extension, target in cases:
+        source = target + "\nfunction neighbor() { return 42; }\n"
+        assert extract_block(source, "target", extension) == target, target
+
+
+def test_a_regex_after_a_block_or_a_prefix_bang_is_still_a_regex() -> None:
+    """The `}` of a block, `!` before a literal and `return!/re/` keep their regex reading."""
+    cases = (
+        "function target(x) { return !/}/.test(x); }",
+        "function target(x) { return!/}/.test(x); }",
+        "function target(x) { if (x) { x = 1; }\n /}/.test(x); return 1; }",
+        "function target(s) { return ({}) / 2 + s.replace(/}/g, ''); }",
+    )
+    for target in cases:
+        source = target + "\nfunction neighbor() { return 42; }\n"
+        assert extract_block(source, "target", ".js") == target, target
+
+
+def test_the_prompt_parser_reads_the_source_in_the_files_own_language() -> None:
+    """A C++ raw string holding `/*` must not hide the class the prompt names; the mask knows the language."""
+    for name in ("error", "work"):
+        source = f'const char *s = R"(text\n/* ordinary string contents\n)";\nclass {name} {{}};\n'
+        assert extract_block(source, name, ".cpp").strip() == f"class {name} {{}}"
+        parsed = _parse_via_regex(f"show {name} in a.cpp", source)
+        assert parsed is not None and parsed.target_name == name
+    plain = _parse_via_regex("show error in a.cpp", "class error {};\n")
+    assert plain is not None and plain.target_name == "error"
+    # a real C++ comment still hides a mention, a Java text block does too
+    commented = _parse_via_regex("show the def return function in a.cpp", "/* def return */\nclass handle {};\n")
+    assert commented is not None and commented.target_name != "return"
+    java = 'class A {\n String s = """\n/* x\n""";\n}\nclass error {}\n'
+    parsed = _parse_via_regex("show error in A.java", java)
+    assert parsed is not None and parsed.target_name == "error"

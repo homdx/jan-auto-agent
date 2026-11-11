@@ -49,6 +49,9 @@ logger = logging.getLogger(__name__)
 # ── Stop-reason constants (written to progress.json) ────────────────────────
 STOP_RUNTIME_CAP = "runtime_cap"
 STOP_TASK_CAP    = "task_cap"
+#: Accepted work could not be saved as a patch and stays in the working tree: any further task would commit it
+#: under its own id, so the run stops until an operator deals with it.
+STOP_UNSAVED_WORK = "unsaved_work"
 
 
 # RunLimits: the two caps
@@ -647,6 +650,7 @@ class AutoController:
         # it (a cycle, or a dependency that is itself waiting), so it is blocked.
         queue = list(pending)
         stalled: set = set()
+        unsaved_work_task = ""        # set when accepted work is left in the tree with no patch of it
         while queue:
             task = queue.pop(0)
             # AUTO-A4: check caps BEFORE executing each task
@@ -754,6 +758,10 @@ class AutoController:
                             task["id"],
                             reason="commit failed, work saved as a patch",
                         )
+                    else:
+                        # Same hazard as a failed state write: the edit stays in the tree with no patch,
+                        # and the next task's commit would take it in. The run stops after this task.
+                        unsaved_work_task = task["id"]
                     logger.error(
                         "task %s: commit failed after a passing acceptance "
                         "check (%s) — not counted done, work %s",
@@ -843,6 +851,8 @@ class AutoController:
                     self._discard_exhausted_residue(
                         task["id"], reason="state write failed, work saved as a patch",
                     )
+                else:
+                    unsaved_work_task = task["id"]
 
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
@@ -896,6 +906,16 @@ class AutoController:
                         f"score={tune_outcome.new_prompt_score:.4f} — "
                         f"{getattr(tune_outcome, 'reason', '')}"
                     )
+
+            if unsaved_work_task:
+                # The accepted edit is in the tree and nothing else holds it: the next task's commit would
+                # take it in under its own id while this one stays blocked. Stop, tree untouched.
+                self.state.log(
+                    f"run stopped: {unsaved_work_task} left accepted work in the working tree with no patch "
+                    f"of it — not starting another task over it"
+                )
+                self._log_collect_summary(collect_bridge)
+                return STOP_UNSAVED_WORK, tasks_done
 
         self._log_collect_summary(collect_bridge)
         return None, tasks_done  # all tasks done / no tasks
@@ -1193,7 +1213,12 @@ class AutoController:
         )
 
         ts = _ts()
-        if stop_reason == STOP_RUNTIME_CAP:
+        if stop_reason == STOP_UNSAVED_WORK:
+            print(
+                f"[{ts}] ⛔ Stopped: a task's accepted work could not be saved as a patch and is still "
+                f"in the working tree — commit or save it, then resume. Nothing was reset."
+            )
+        elif stop_reason == STOP_RUNTIME_CAP:
             mins = self.limits.max_runtime_sec / 60
             print(
                 f"[{ts}] ⏱  Runtime cap reached "

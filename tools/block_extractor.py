@@ -338,12 +338,59 @@ def _js_regex_can_start(source: str, i: int) -> bool:
         # cannot follow a `++`/`--` (the prefix form takes an operand, not a literal), and read
         # as one it swallowed the line up to the next `/` — and the next function with it.
         return False
-    if source[j] in "(,=:[!&|?{};+-*%>~^":
+    if source[j] == "!" and j >= 1 and (source[j - 1].isalnum() or source[j - 1] in "_$)]"):
+        # TypeScript's non-null assertion, `x! / 2`: an operand ended with `!`, so the `/` divides —
+        # unless the word is a keyword that takes an operand (`return!/re/.test(s)`, a prefix `!`).
+        k = j - 1
+        while k >= 0 and (source[k].isalnum() or source[k] in "_$"):
+            k -= 1
+        return source[k + 1:j] in _JS_REGEX_AFTER_WORD
+    if source[j] == "}" and _js_brace_closes_an_expression(source, j):
+        return False        # `{valueOf: () => 4} / 2`: an object literal is an operand, a block is not
+    if source[j] in "(,=:[!&|?{};+-*%>~^}":
         return True
     k = j
     while k >= 0 and (source[k].isalnum() or source[k] in "_$"):
         k -= 1
     return source[k + 1:j + 1] in _JS_REGEX_AFTER_WORD
+
+
+def _js_brace_closes_an_expression(source: str, close: int) -> bool:
+    """True when the `}` at *close* ends an object literal used as an operand (`return {a: 1} / 2`,
+    `x = {} / 2`, `f({}) / 2`'s inner one), False for the `}` of a block — a function body, an `if`,
+    a class — after which a statement, and so a regex literal, may start. Decided by what stands
+    before the matching `{`: an operator, `(`, `,`, `:`, `[` or a keyword that takes an operand
+    makes it an expression; `)`, `;`, `{`, `}`, `=>`, `else`/`do`/`try`/`finally` or the start of the
+    file make it a block. The match is found by counting braces backwards over a bounded span; where
+    it cannot be found the old answer (a block, so a regex may follow) stays."""
+    depth, k = 0, close
+    floor = max(0, close - 4000)
+    while k >= floor:
+        ch = source[k]
+        if ch == "}":
+            depth += 1
+        elif ch == "{":
+            depth -= 1
+            if depth == 0:
+                break
+        k -= 1
+    else:
+        return False
+    if k < floor or depth != 0:
+        return False
+    j = k - 1
+    while j >= 0 and source[j] in " \t\r\n":
+        j -= 1
+    if j < 0:
+        return False
+    if source[j] == ">" and j >= 1 and source[j - 1] == "=":
+        return False                                  # `=> { … }`: an arrow's block body
+    if source[j] in "=(,:[?&|+-*%<>!~^":
+        return True
+    w = j
+    while w >= 0 and (source[w].isalnum() or source[w] in "_$"):
+        w -= 1
+    return source[w + 1:j + 1] in _JS_REGEX_AFTER_WORD
 
 
 def _js_regex_end(source: str, i: int) -> Optional[int]:
