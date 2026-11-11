@@ -268,6 +268,33 @@ def _pattern_bound_names(stmt) -> Set[str]:
 _INVALIDATING_MUTATOR_METHODS = frozenset({"pop", "clear", "popitem", "remove"})
 
 
+def _deleted_plain_names(target: ast.expr) -> Set[str]:
+    """The plain names a single `del` target removes, so the guard on each
+    of them must be invalidated.
+
+    A bare name (`del a`) is removed outright. `del a, b` is a target *list*
+    of two bare names; `del (a, b)` packs the same names in one tuple target
+    (and a target may nest either, `del a, (b, c)`), so both shapes — and
+    plain names packed in lists — are recursed through. A subscript target
+    `del x[i]` removes an element, not the name `x` itself, but it pokes at
+    `x`'s contents exactly the way a `.pop()` does, so its container `x`
+    counts (this is what the old Delete branch already did for
+    `del a[0], b[0]`, kept as the first branch here). An attribute target
+    `del x.a` removes only `a` from `x` — `x` itself still exists, and a
+    guard on `x` (its truthiness for indexed access) is unrelated to which
+    of its attributes survive, so nothing about `x` is invalidated here.
+    """
+    out: Set[str] = set()
+    if isinstance(target, ast.Name):
+        out.add(target.id)
+    elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+        out.add(target.value.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for el in target.elts:
+            out |= _deleted_plain_names(el)
+    return out
+
+
 def _mutated_name_in_stmt(stmt: ast.stmt) -> set:
     """The bare name(s) `stmt` mutates in place well enough to invalidate a
     prior truthy guard about them. Empty set if `stmt` isn't one of the
@@ -295,6 +322,14 @@ def _mutated_name_in_stmt(stmt: ast.stmt) -> set:
     returned on the first subscript target found in a multi-target
     `Delete`, silently leaving a guard on `b` uninvalidated. Now returns
     every recognized name at once instead of stopping at the first.
+
+    BUGFIX (AGNES-14): the same multi-target gap applied to *plain* names —
+    `del a, b` and `del (a, b)` removed the names outright, so a later
+    `a[-1]` would raise `NameError`/`IndexError`, yet `_deleted_plain_names`
+    did not exist and this returned only subscript containers, so the guard
+    on `a`/`b` wrongly survived the delete. Every target of a `Delete` is
+    now collected through `_deleted_plain_names`, which returns all plain
+    (and packed) names at once.
     """
     call: Optional[ast.Call] = None
     if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
@@ -312,11 +347,10 @@ def _mutated_name_in_stmt(stmt: ast.stmt) -> set:
     ):
         return {call.func.value.id}
     if isinstance(stmt, ast.Delete):
-        return {
-            target.value.id
-            for target in stmt.targets
-            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
-        }
+        out: set = set()
+        for target in stmt.targets:
+            out |= _deleted_plain_names(target)
+        return out
     return set()
 
 
