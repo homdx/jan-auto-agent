@@ -71,10 +71,14 @@ def settled(row: dict, models: Optional[dict] = None) -> Optional[str]:
 
 
 def families_behind(row: dict, models: Optional[dict] = None) -> int:
-    """How many families committed to *row*'s verdict; `MIN_FAMILIES` for a row without ``by_model``."""
+    """How many families committed to *row*'s verdict; 0 for an explicitly passed empty
+    ``by_model`` (a tally with no voters at all: a quorum nobody can stand behind), and
+    `MIN_FAMILIES` for a row without the ``by_model`` key (the legacy hand-made contract)."""
     by_model = row.get("by_model")
-    if not isinstance(by_model, dict) or not by_model:
+    if not isinstance(by_model, dict):
         return MIN_FAMILIES
+    if not by_model:
+        return 0
     models = models or {}
     return len({family_of(ref, models.get(ref)) for ref, v in by_model.items() if v == row.get("verdict")})
 

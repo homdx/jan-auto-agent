@@ -201,6 +201,59 @@ def test_only_unanimous_rows_are_settled_even_when_the_verdict_says_true():
     assert "`gates.py` checks the summary line." in tr.pending_markdown(votes)
 
 
+def test_an_empty_by_model_is_zero_families_not_the_quorum():
+    """AGNES-13: an explicit ``by_model: {}`` (a tally with no voters) is not three families:
+    the row settles neither REAL nor FALSE and lands in pending under FAMILIES; a row without
+    the key keeps the legacy contract, and three distinct supporting families still settle."""
+    for verdict in ("TRUE", "FALSE"):
+        row = {"verdict": verdict, "unanimous": True, "by_model": {}}
+        assert tr.families_behind(row) == 0
+        assert tr.settled(row) is None
+        assert tr.settled(row, models={}) is None
+        assert [r["truth"] for r in tr.to_truth_rows({"claims": [row]}, checked_by="x")] == []
+        assert tr.pending_rows({"claims": [row]}) == [(0, row)]
+    md = tr.pending_markdown({"claims": [{"verdict": "TRUE", "unanimous": True, "by_model": {},
+                                          "claim": "no voters", "kind": "world"}]})
+    assert "## " + tr.PENDING_TITLE["FAMILIES"] in md
+    # Legacy: a row without the key at all keeps the old contract.
+    assert tr.families_behind(_row("TRUE", True)) == tr.MIN_FAMILIES
+    assert tr.settled(_row("TRUE", True)) == "REAL"
+    assert tr.settled(_row("FALSE", True)) == "FALSE"
+    # Three different supporting families are accepted.
+    three = {"verdict": "TRUE", "unanimous": True,
+             "by_model": {"kenary/agnes-3-0-flash:free": "TRUE", "kenary/hy3:free": "TRUE",
+                          "tokenharbor/deepseek-v4-flash:free": "TRUE"}}
+    assert tr.families_behind(three) == 3
+    assert tr.settled(three) == "REAL"
+    # Three voters of two families are not independent (the rule counts families).
+    two = {"verdict": "FALSE", "unanimous": True,
+           "by_model": {"qwen/qwen3-235b:free": "FALSE", "qwen/qwen-2.5-72b:free": "FALSE",
+                        "kenary/agnes-3-0-flash:free": "FALSE"}}
+    assert tr.families_behind(two) == 2
+    assert tr.settled(two) is None
+
+
+def test_cli_on_an_imported_votes_file_with_an_empty_by_model(tmp_path):
+    """AGNES-13: `scripts/claimcheck_truth.py` (via `ct.main`) on an imported votes.json whose
+    unanimous claim has an empty ``by_model``: the claim does not reach truth.csv, it is the
+    pending list's FAMILIES entry; a legacy-shape claim (no key) still settles."""
+    empty = {"claim": "unanimous, but no voter voted", "verdict": "TRUE", "unanimous": True,
+             "by_model": {}, "kind": "code", "evidence": ["src:imported.py:1-2"],
+             "quotes": ["x = 1"]}
+    legacy = {"claim": "unanimous, no by_model at all", "verdict": "FALSE", "unanimous": True,
+              "kind": "world"}
+    v = _votes_file(tmp_path, [empty, legacy])
+    out = tmp_path / "t.csv"
+    assert ct.main([str(v), "--out", str(out), "--no-rebuild", "--no-lenz-hint"]) == 0
+    keys = harvest_report.load_truth(out)
+    assert list(keys) == [tr.claim_hash("unanimous, no by_model at all")]
+    assert keys[tr.claim_hash("unanimous, no by_model at all")] == "FALSE"
+    md = (tmp_path / "pending.md").read_text(encoding="utf-8")
+    assert "unanimous, but no voter voted" in md
+    assert "## " + tr.PENDING_TITLE["FAMILIES"] in md
+    assert "unanimous, no by_model at all" not in md
+
+
 def test_rows_from_the_real_chain(votes, repo, tmp_path):
     """Three settled claims of six (TRUE, FALSE, the world fact); the dissent, the missed claim
     and the split are pending, each once."""
@@ -532,3 +585,19 @@ def test_run_claim_check_old_form_unchanged(tmp_path):
                      "--out", f"{out}/votes.json", "--profiles", "a", "b"]]
     _, plain = _dry(tmp_path, "r.md", "--dry-run")
     assert plain[1][-2:] == ["--out", plain[1][-1]] and plain[1][-1].endswith("/votes.json")
+
+
+def test_only_an_empty_object_changes_a_present_non_object_by_model_keeps_the_legacy_count():
+    """AGNES-13 narrows the legacy contract by one case, the empty object. An explicit `null` (or any
+    other non-object) is a hand-made row, not claim_vote.py's, and is still counted as before; a
+    hand-made row is also refused earlier by `scripts/claimcheck_truth.py`'s shape check."""
+    for odd in (None, [], "x"):
+        row = _row("TRUE", True, by_model=odd)
+        assert tr.families_behind(row) == tr.MIN_FAMILIES and tr.settled(row) == "REAL"
+    empty = _row("TRUE", True, by_model={})
+    assert tr.families_behind(empty) == 0 and tr.settled(empty) is None
+
+
+def test_voters_of_other_verdicts_do_not_count_toward_the_quorum():
+    row = _row("TRUE", True, by_model={"a/qwen-1": "FALSE", "b/llama-2": "FALSE", "c/gemma-3": "FALSE"})
+    assert tr.families_behind(row) == 0 and tr.settled(row) is None
