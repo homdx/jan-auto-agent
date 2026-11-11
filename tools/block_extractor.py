@@ -347,14 +347,22 @@ class _JsScanner:
         self.allowed = True                               # a regex literal may start here
         self.decl = False                                 # inside a `class X<…>` / `interface` head
         self.pending_fn = None                            # a `function` keyword waits for its `(`: is it an expression
+        self.pending_class = None                         # (stack depth, is an expression) of a `class` waiting for its body
         self.text = False                                 # inside template text
 
     def token(self, pk: str, pv: str, end: int, allowed: bool, pdata=None) -> None:
         self.pprev = self.pv
         self.pk, self.pv, self.pdata, self.p_end, self.allowed = pk, pv, pdata, end, allowed
 
-    def fn_is_expression(self) -> bool:
+    def fn_is_expression(self, at: int) -> bool:
+        """Is the `function` / `class` / `async` keyword at *at* the start of an expression (so the body's
+        `}` ends an operand, and a `/` after it divides) rather than a declaration (a statement)?"""
         pk, pv = self.pk, self.pv
+        newline = "\n" in self.source[self.p_end:at]
+        if newline and (not self.allowed or (pk == "word" and pv in ("return", "yield", "break", "continue"))):
+            return False                                   # ASI: the line before ended, this one begins a statement
+        if pk == "word" and pv == "async" and self.pdata is not None and not newline:
+            return self.pdata                              # `async function`: as `async` itself stood
         if pk in ("none", "operand"):
             return False
         if pk == "word":
@@ -372,6 +380,11 @@ class _JsScanner:
         if pk in ("none", "operand"):
             return "block"
         top = self.stack[-1][0]
+        if self.pending_class and self.pending_class[0] == len(self.stack):
+            # the body of `class A<T> extends B {`: an expression's body ends an operand (`class {} / 2`)
+            kind = "fn" if self.pending_class[1] else "block"
+            self.pending_class = None
+            return kind
         if pk == "word":
             if pv in ("return", "yield"):
                 # ASI: a `{` on the line after a bare `return` is a block
@@ -465,7 +478,9 @@ class _JsScanner:
         if nxt == "*":
             end = source.find("*/", i + 2)
             return n if end < 0 else end + 2
-        if self.allowed and source[i - 1:i] != "<":        # `</li>`: a JSX closing tag, never a regex
+        # `</li>`, `</>`: a JSX closing tag (a tag name or `>` follows the slash); `x </}/.test(s)` is a regex
+        jsx_close = source[i - 1:i] == "<" and bool(nxt) and (nxt.isalpha() or nxt in "_$>:")
+        if self.allowed and not jsx_close:
             end = _js_regex_end(source, i)
             if end is None and nxt != ">":
                 # An unterminated regex literal is a syntax error in real JS, but its `{` must not inflate
@@ -485,13 +500,21 @@ class _JsScanner:
         if self.pk == "punct" and self.pv in (".", "?."):
             self.token("operand", "", end, False)          # `x.class`, `x.return`: a property, never a keyword
             return end
+        pdata = None
         if w == "function":
-            self.pending_fn = self.fn_is_expression()
+            self.pending_fn = self.fn_is_expression(start)
+        elif w == "async":
+            pdata = self.fn_is_expression(start)
         elif w in _JS_DECLARATION_WORDS:
             nxt = self.source[end:end + 40].lstrip()
             if nxt[:1].isalpha() or nxt[:1] in "_$" or (w == "class" and nxt[:1] == "{"):
                 self.decl = True                           # not `{class: 1}` or `{interface, enum}`
-        self.token("word", w, end, w in _JS_REGEX_AFTER_WORD)
+                if w == "class":
+                    self.pending_class = (len(self.stack), self.fn_is_expression(start))
+        # `break` / `continue` (and their label) end the statement: a `/` after them is never a division
+        ends_statement = w in ("break", "continue", "debugger") or (
+            self.pk == "word" and self.pv in ("break", "continue") and "\n" not in self.source[self.p_end:start])
+        self.token("word", w, end, w in _JS_REGEX_AFTER_WORD or ends_statement, pdata)
         return end
 
     def punct(self, tok: str, start: int) -> None:
@@ -531,7 +554,7 @@ class _JsScanner:
         elif tok == ";":
             stack[-1][1] = 0
             self.decl = False
-            self.pending_fn = None
+            self.pending_fn = self.pending_class = None
             self.token("punct", tok, end, True)
         elif tok == "?":
             stack[-1][1] += 1

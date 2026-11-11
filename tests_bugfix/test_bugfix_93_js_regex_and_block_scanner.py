@@ -47,6 +47,32 @@ CASES.update({
     "not_then_regex": "function target(x) { if (x) !/}/.test(x); return 1; }",
     "template_interpolation_object": "function target(x) { return `${ {a: 1}.a / 2 }${ /}/.source }`; }",
     "label_then_regex": "function target(x) { L: { x = 1 }\n/}/.test(x); }",
+    "class_expression_division": "function target() { return class {} / 2; }",
+    "named_class_expression_division": "function target() { return class Inner {} / 2; }",
+    "class_expression_with_method_division": "function target() { return class Inner { static valueOf() {return 4;} } / 2; }",
+    "class_expression_assigned": "function target() { const C = class Named { m() {} } / 2; return C; }",
+    "class_declaration_then_regex": "function target(x) { class K { m() {} }\n/}/.test(x); return 1; }",
+    "class_with_type_parameters_then_regex": "function target(x) { class K<T> { m() {} }\n/}/.test(x); return 1; }",
+    "async_function_expression_division": "function target() { return async function() {} / 2; }",
+    "async_function_declaration_then_regex": "function target(x) { async function helper() {} /}/.test(String(x)); return 42; }",
+    "async_declaration_after_return_newline": "function target(x) { if (x) return\nasync function helper() {} /}/.test(String(x)); return 42; }",
+    "break_then_regex": "function target(x) { while (true) { if (x) break\n/}/.test(String(x)); return 42; } return 0; }",
+    "continue_then_regex": "function target(x) { while (true) { if (x) continue\n/}/.test(String(x)); return 42; } }",
+    "labeled_break_then_regex": "function target(x) { L: while (true) { if (x) break L\n/}/.test(String(x)); return 42; } return 0; }",
+    "labeled_continue_then_regex": "function target(x) { L: while (true) { if (x) continue L\n/}/.test(String(x)); return 42; } }",
+    "regex_right_after_less_than": "function target(x) { return x </}/.test(x); }",
+    "regex_after_spaced_less_than": "function target(x) { return x < /}/.test(x); }",
+    "jsx_closing_tag_is_not_a_regex": "function target() { return <ul><li>a</li><li>{'}'}</li></ul>; }",
+    "declaration_after_return_newline": "function target(x) { if (x) return\nfunction helper() {} /}/.test(String(x)); return 42; }",
+    "declaration_after_return_comment": "function target(x) { if (x) return // stop\nfunction helper() {} /}/.test(String(x)); return 42; }",
+    "declaration_after_return_block_comment": "function target(x) { if (x) return /*\n*/ function helper() {} /}/.test(String(x)); return 42; }",
+    "generator_declaration_after_return_newline": "function target(x) { if (x) return\nfunction* helper() {} /}/.test(String(x)); return 42; }",
+    "declaration_after_postfix_increment": "function target(x) { x++\nfunction helper() {} /}/.test(String(x)); return 42; }",
+    "declaration_after_postfix_decrement": "function target(x) { x--\nfunction helper() {} /}/.test(String(x)); return 42; }",
+    "declaration_after_array_statement": "function target(x) { [1]\nfunction helper() {} /}/.test(String(x)); return 42; }",
+    "function_expression_division": "function target() { return function() {} / 2; }",
+    "function_expression_after_comma_newline": "function target() { return (0,\nfunction() {}) / 2; }",
+    "generator_expression_division": "function target() { return function*() {} / 2; }",
     "object_method_division": "function target(x) { return {m() { return 1 }}.m() / 2 / {}; }",
 })
 
@@ -129,6 +155,28 @@ def regex_stmt(r):
                      "v = c ? /}/ : /{/;", "x = `${/}/.source}`;", "x = `${'}'}${\"{\"}`;", "x = '\\'' + \"}\" + `{`;", "v = ((x)) / 2 / 3; if (c) /}/.test(x);",
                      "v = x\n++v\n/}/.test(x)", "v = c ? x : /}/.test(x)", "v = a => /}/.test(a);", "v = async () => { await 1 }; /}/.test(x);"])
 
+
+CLS = ["class {}", "class K {}", "class K { m() { return 1 } }", "class extends Object {}", "class K extends (c ? Object : Array) { m() {} }",
+       "class K { static s = {a: 1}; }", "class K { get g() { return 1 } }", "class K<T> {}".replace("<T>", "")]
+def cls_stmt(r):
+    return r.choice(["v = %s / 2;", "return %s / 2 / 3; ", "v = [%s][0] / 2; // }", "v = c ? 1 : %s / 2;", "v = (%s) / 2 / 3;",
+                     "v = typeof %s / 2;", "v = {k: %s / 2};", "%s\n/}/.test(x);".replace("%s", "class W%d {}" % r.randrange(10**6)) ]).replace("%s", r.choice(CLS)) if False else (
+        r.choice(["v = %s / 2;", "v = %s / 2 / 3; // }", "v = [%s][0] / 2;", "v = c ? 1 : %s / 2;", "v = typeof %s / 2;", "v = {k: %s / 2};"]).replace("%s", r.choice(CLS)))
+def asyn_stmt(r):
+    f = r.choice(["async function() {}", "async function h() {}", "function() {}", "function* () {}", "async function* () {}", "function h() {}"])
+    return r.choice(["v = %s / 2;", "v = %s / 2 / 3; // }", "v = c ? 1 : %s / 2;", "v = [%s][0] / 2;"]).replace("%s", f)
+def asi_stmt(r):
+    n = r.randrange(10**6)
+    kw = r.choice(["break", "continue", "break LL", "continue LL"])
+    pre = "LL: while (c) { if (x) %s\n/}/.test(x); v = 1 }" % kw
+    decl = r.choice(["return\nfunction h%d() {} /}/.test(x);" % n, "x++\nfunction h%d() {} /}/.test(x);" % n, "x--\nfunction h%d() {} /}/.test(x);" % n,
+                     "[1]\nfunction h%d() {} /}/.test(x);" % n, "return // c\nfunction* h%d() {} /}/.test(x);" % n,
+                     "return /*\n*/ function h%d() {} /}/.test(x);" % n, "return\nasync function h%d() {} /}/.test(x);" % n,
+                     "v = 1;\nasync function h%d() {} /}/.test(x);" % n, "v = {}\nfunction h%d() {}" % n])
+    return r.choice([pre, "if (c) { " + decl + " }"]) if True else decl
+def lt_stmt(r):
+    return r.choice(["v = x </}/.test(x);", "v = x < /}/.test(x);", "v = x</{/.test(x);", "v = (x) </[}]/.test(x);", "v = x <\n/}/.test(x);"])
+
 def wrap(r, s, d):
     if d == 0:
         return s
@@ -149,7 +197,7 @@ def wrap(r, s, d):
 def gen(r):
     parts = []
     for _ in range(r.randrange(1, 4)):
-        base = r.choice([a_stmt, b_stmt, case_b, div_stmt, ret_stmt, regex_stmt])(r)
+        base = r.choice([a_stmt, b_stmt, case_b, div_stmt, ret_stmt, regex_stmt, cls_stmt, asyn_stmt, asi_stmt, lt_stmt])(r)
         parts.append(wrap(r, base, r.randrange(0, 3)))
     body = "\n".join(parts)
     return "function target(x, c, v) {\n" + body + "\n}"
