@@ -89,8 +89,11 @@ def _ideal_refusal(repo: Path, folder: Path, tree: Path) -> Optional[str]:
     not own. `is-inside-work-tree` does not tell that apart, and
     `resolve(show-toplevel) == resolve(ideal)` passes a symlink to the main
     checkout (both resolve to it), so the resolved top-level is checked against
-    the round folder and against the main checkout. Refusing is the only safe
-    answer — nothing is deleted, recreated or switched.
+    the round folder and against the main checkout, and the tree's git metadata
+    must be a worktree entry the repo registered (`_unregistered_worktree`): a
+    foreign repository at that path, or a `.git` file redirecting to the main
+    `.git`, is no worktree of this round. Refusing is the only safe answer —
+    nothing is deleted, recreated or switched.
     """
     if not (tree.exists() or tree.is_symlink()):
         return None
@@ -110,6 +113,36 @@ def _ideal_refusal(repo: Path, folder: Path, tree: Path) -> Optional[str]:
     main = _git(repo, "rev-parse", "--show-toplevel")
     if main and Path(main).resolve() == top_res:
         return f"{tree} is the main checkout of {repo}"
+    return _unregistered_worktree(repo, tree)
+
+
+def _unregistered_worktree(repo: Path, tree: Path) -> Optional[str]:
+    """Why *tree* is not a linked worktree *repo* itself registered, or None.
+
+    Where the tree sits proves nothing: a separate repository created at
+    `wt/ideal`, or a `.git` file whose `gitdir:` line names the main `.git`
+    (or another worktree's admin dir), passes every location check, and then
+    `checkout` moves the main checkout's HEAD and index. So the git metadata is
+    read: the tree's common dir must be the repo's, its own git dir must be a
+    `worktrees/<name>` entry of that common dir, and that entry's `gitdir`
+    back-pointer must name this tree's `.git`.
+    """
+    own = _git(tree, "rev-parse", "--absolute-git-dir")
+    common = _git(tree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    mine = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not (own and common and mine):
+        return f"{tree} has no readable Git metadata"
+    try:
+        own_res, common_res = Path(own).resolve(), Path(common).resolve()
+        if common_res != Path(mine).resolve():
+            return f"{tree} belongs to another repository ({common}), not {repo}"
+        if own_res.parent != common_res / "worktrees":
+            return f"{tree} is not a worktree registered in {repo} (its git dir is {own})"
+        back = (own_res / "gitdir").read_text(encoding="utf-8").strip()
+        if Path(back).resolve() != (tree / ".git").resolve():
+            return f"{tree} points at the worktree entry of {back}, not its own"
+    except (OSError, ValueError) as err:
+        return f"cannot verify {tree} against {repo}: {err}"
     return None
 
 

@@ -40,12 +40,14 @@ SETS = {
 def accept(votes: list, rule: str, quorum: int = QUORUM) -> int:
     """+1 / -1 accepted TRUE / FALSE, 0 not accepted. *votes*: one entry per voter of the set.
 
-    T144: a vote outside -1, 0, 1 is refused (ValueError) before anything is
+    T144: a vote that is not an int in -1, 0, 1 (a bool, a float, a string, a
+    value outside the set) is refused (ValueError) before anything is
     counted, including a uniform bad set — ``[2, 2, 2]`` used to come back
     accepted as +1-TRUE through the quorum check, and ``[2, 1, 1]`` was only
     refused later, by the disagreement check.
     """
-    bad = [v for v in votes if v not in (-1, 0, 1)]
+    # `True == 1` and `False == 0`, and `1.0 == 1`: only a real int from the set is a vote.
+    bad = [v for v in votes if type(v) is not int or v not in (-1, 0, 1)]
     if bad:
         raise ValueError(f"vote {bad[0]!r} is outside -1, 0, 1 — refusing the row")
     committed = [v for v in votes if v != 0]

@@ -42,3 +42,19 @@ def test_signed_truths_are_not_booleans():
     assert replay_rules.accept([-1, -1, -1], "all") == -1
     assert replay_rules.accept([1, 1, 1], "all") == 1
     assert replay_rules.replay(list(VOTERS), "all", data=_data(-1, -1)) == (1, 0)
+
+@pytest.mark.parametrize("rule", ["all", "committed"])
+@pytest.mark.parametrize("votes", [
+    [True, True, True], [False, False, False], [True, 1, 1], [1.0, 1.0, 1.0],
+    ["1", "1", "1"], [None, None, None], [2, 2, 2], [-2, 1, 1],
+])
+def test_only_real_ints_from_the_set_are_votes(rule, votes):
+    """`True == 1` in Python, so a bool (or a float) must be refused by type, not by value."""
+    with pytest.raises(ValueError):
+        replay_rules.accept(votes, rule)
+
+
+def test_real_int_votes_are_still_accepted():
+    assert replay_rules.accept([1, 1, 1], "all") == 1
+    assert replay_rules.accept([-1, -1, -1, 0], "committed") == -1
+    assert replay_rules.accept([0, 0, 0], "all") == 0

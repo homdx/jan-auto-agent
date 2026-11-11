@@ -269,29 +269,57 @@ _INVALIDATING_MUTATOR_METHODS = frozenset({"pop", "clear", "popitem", "remove"})
 
 
 def _deleted_plain_names(target: ast.expr) -> Set[str]:
-    """The plain names a single `del` target removes, so the guard on each
-    of them must be invalidated.
+    """The plain names a single `del` target unbinds (`del a`, `del a, b`,
+    `del (a, b)`, `del a, (b, c)`, names packed in lists).
 
-    A bare name (`del a`) is removed outright. `del a, b` is a target *list*
-    of two bare names; `del (a, b)` packs the same names in one tuple target
-    (and a target may nest either, `del a, (b, c)`), so both shapes — and
-    plain names packed in lists — are recursed through. A subscript target
-    `del x[i]` removes an element, not the name `x` itself, but it pokes at
-    `x`'s contents exactly the way a `.pop()` does, so its container `x`
-    counts (this is what the old Delete branch already did for
-    `del a[0], b[0]`, kept as the first branch here). An attribute target
-    `del x.a` removes only `a` from `x` — `x` itself still exists, and a
-    guard on `x` (its truthiness for indexed access) is unrelated to which
-    of its attributes survive, so nothing about `x` is invalidated here.
+    Unbinding a name is not a change to the object it was bound to: after
+    `b = a; del b` the list `a` still holds what it held, so only the guard on
+    `b` goes (see `_unbound_names_in_stmt`). A subscript target is a different
+    thing — see `_deleted_container_names` — and an attribute target `del x.a`
+    removes only `a` from `x`, so it names nothing here.
     """
     out: Set[str] = set()
     if isinstance(target, ast.Name):
         out.add(target.id)
-    elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-        out.add(target.value.id)
     elif isinstance(target, (ast.Tuple, ast.List)):
         for el in target.elts:
             out |= _deleted_plain_names(el)
+    return out
+
+
+def _deleted_container_names(target: ast.expr) -> Set[str]:
+    """The bare names whose *contents* a single `del` target changes.
+
+    `del x[i]` removes an element and pokes at `x` exactly the way a `.pop()`
+    does, so `x` — and every alias of it — loses its guard. Reaches into the
+    same tuple/list packings `_deleted_plain_names` does (`del (a[0], b)`).
+    """
+    out: Set[str] = set()
+    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+        out.add(target.value.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for el in target.elts:
+            out |= _deleted_container_names(el)
+    return out
+
+
+def _forget_alias(aliases: Dict[str, str], name: str) -> None:
+    """Drop every alias link that mentions *name*, as alias or as source (it no longer names that object)."""
+    aliases.pop(name, None)
+    for alias in [a for a, source in aliases.items() if source == name]:
+        del aliases[alias]
+
+
+def _unbound_names_in_stmt(stmt: ast.stmt) -> Set[str]:
+    """The plain names a `del` statement unbinds; empty for any other statement.
+
+    Kept apart from `_mutated_name_in_stmt`: a mutation travels through aliases
+    (the same object changed), an unbinding does not (the object is untouched).
+    """
+    out: Set[str] = set()
+    if isinstance(stmt, ast.Delete):
+        for target in stmt.targets:
+            out |= _deleted_plain_names(target)
     return out
 
 
@@ -323,13 +351,11 @@ def _mutated_name_in_stmt(stmt: ast.stmt) -> set:
     `Delete`, silently leaving a guard on `b` uninvalidated. Now returns
     every recognized name at once instead of stopping at the first.
 
-    BUGFIX (AGNES-14): the same multi-target gap applied to *plain* names —
-    `del a, b` and `del (a, b)` removed the names outright, so a later
-    `a[-1]` would raise `NameError`/`IndexError`, yet `_deleted_plain_names`
-    did not exist and this returned only subscript containers, so the guard
-    on `a`/`b` wrongly survived the delete. Every target of a `Delete` is
-    now collected through `_deleted_plain_names`, which returns all plain
-    (and packed) names at once.
+    A `del` of a *plain* name (AGNES-14) is not a mutation of the object and
+    is not reported here: it unbinds only that name, so the guard on the name
+    goes but the one on an alias of the same list stays (`b = a; del b;
+    a[-1]` is still guarded). `_unbound_names_in_stmt` reports those; a
+    subscript `del b[0]` is a mutation and is reported here, with its aliases.
     """
     call: Optional[ast.Call] = None
     if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
@@ -349,7 +375,7 @@ def _mutated_name_in_stmt(stmt: ast.stmt) -> set:
     if isinstance(stmt, ast.Delete):
         out: set = set()
         for target in stmt.targets:
-            out |= _deleted_plain_names(target)
+            out |= _deleted_container_names(target)
         return out
     return set()
 
@@ -537,6 +563,9 @@ def _rebound_names_in(
         elif isinstance(s, (ast.For, ast.AsyncFor)) and isinstance(s.target, ast.Name):
             names.add(s.target.id)
             aliases.pop(s.target.id, None)  # rebound by the loop — alias broken
+        for unbound in _unbound_names_in_stmt(s):
+            names.add(unbound)
+            _forget_alias(aliases, unbound)
         for mutated in _mutated_name_in_stmt(s):
             names.add(mutated)
             if mutated in aliases:
@@ -774,6 +803,14 @@ class _FunctionGuardWalker:
                     self._aliases[alias_target] = stmt.value.id
                 else:
                     self._aliases.pop(alias_target, None)
+
+            # Unbinding a name drops its own guard and alias link, never an alias's guard.
+            for unbound in _unbound_names_in_stmt(stmt):
+                guarded_names.discard(unbound)
+                guard_desc.pop(unbound, None)
+                for pair in {p for p in guarded_pairs if p[0] == unbound}:
+                    guarded_pairs.discard(pair)
+                _forget_alias(self._aliases, unbound)
 
             for mutated in _mutated_name_in_stmt(stmt):
                 to_invalidate = {mutated}

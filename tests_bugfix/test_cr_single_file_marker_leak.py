@@ -279,3 +279,67 @@ def test_a_second_closer_after_a_complete_block_is_refused() -> None:
         f"<<<FILE: chapter_2.txt>>>\n{PROSE}\n<<<END>>>\n<<<END>>>", "A10-s", ["chapter_2.txt"],
     )
     assert parsed == [] and bool(err)
+
+
+def _generate(tmp_path: Path, monkeypatch, reply: str, targets=("chapter_3.txt",)):
+    monkeypatch.setattr("tools.auto.coder._llm_stream.request_completion", lambda **_k: reply)
+    task = {"id": "T12", "title": "improve", "instruction": "improve the prose",
+            "target_files": list(targets), "cited_locations": []}
+    return _coder().generate(task, tmp_path)
+
+
+def test_a_block_without_its_closer_is_refused_not_saved() -> None:
+    """The prompt requires `<<<END>>>`: an opener with none is a cut-off reply, so a retry."""
+    c = _coder()
+    parsed, err = c._parse_response_prose(f"<<<FILE: chapter.md>>>\n{PROSE}", "A10-n", ["chapter.md"])
+    assert parsed == [] and "<<<END>>>" in err
+    # the first block closed, the second did not: nothing of the reply is written
+    parsed, err = c._parse_response_prose(
+        f"<<<FILE: a.md>>>\n{PROSE}\n<<<END>>>\n<<<FILE: b.md>>>\n{PROSE}", "A10-n2", ["a.md", "b.md"],
+    )
+    assert parsed == [] and "b.md" in err
+
+
+def test_an_indented_marker_is_a_marker_in_the_check_and_in_the_extraction() -> None:
+    """Indent with spaces or a tab changes neither the verdict nor what is cut out."""
+    c = _coder()
+    for opener, closer in (("  <<<FILE: chapter_3.txt>>>", "\t<<<END>>>"),
+                           ("\t<<<FILE: chapter_3.txt>>>", "  <<<END>>>")):
+        parsed, err = c._parse_response_prose(f"{opener}\n{PROSE}\n{closer}", "A10-t", ["chapter_3.txt"])
+        assert not err and parsed[0]["path"] == "chapter_3.txt"
+        assert "<<<" not in parsed[0]["content"] and PROSE in parsed[0]["content"]
+    # a mangled indented closer is a marker attempt like an unindented one
+    for mangled in ("  <<<END >>>", "\t<<<END>>"):
+        parsed, err = c._parse_response_prose(
+            f"<<<FILE: chapter_3.txt>>>\n{PROSE}\n{mangled}", "A10-t2", ["chapter_3.txt"])
+        assert parsed == [] and bool(err), mangled
+    # an indented stray closer, and an indented opener with no path
+    parsed, err = c._parse_response_prose(f"{PROSE}\n  <<<END>>>", "A10-t3", ["chapter_3.txt"])
+    assert parsed == [] and bool(err)
+    parsed, err = c._parse_response_prose(f"  <<<FILE chapter_3.txt>>>\n{PROSE}\n<<<END>>>", "A10-t4", ["chapter_3.txt"])
+    assert parsed == [] and bool(err)
+
+
+def test_a_marker_in_the_middle_of_a_sentence_is_still_prose() -> None:
+    c = _coder()
+    text = f'She wrote "  <<<FILE: x.md>>>" and then "\t<<<END>>>" on the wall. {PROSE}'
+    parsed, err = c._parse_response_prose(text, "A10-l", ["chapter_3.txt"])
+    assert not err and "<<<FILE: x.md>>>" in parsed[0]["content"]
+
+
+def test_a_reply_with_indented_junk_markers_keeps_the_existing_chapter(tmp_path: Path, monkeypatch) -> None:
+    """Through `generate()`: the indented-marker reply that used to overwrite the chapter is a retry error."""
+    chapter = tmp_path / "chapter_3.txt"
+    original = "The original chapter three survives."
+    chapter.write_text(original, encoding="utf-8")
+    for reply in (f"  <<<FILE chapter_3.txt>>>\n{PROSE}\n\t<<<END >>>",
+                  f"  <<<FILE: chapter_3.txt>>>\n{PROSE}",
+                  f"<<<FILE: chapter_3.txt>>>\n{PROSE}\n  <<<END>>>\n\t<<<END>>>"):
+        result = _generate(tmp_path, monkeypatch, reply)
+        assert result.error and result.files_written == [], reply
+        assert chapter.read_text(encoding="utf-8") == original
+    # the well-formed indented reply still writes the chapter, with no delimiter in it
+    result = _generate(tmp_path, monkeypatch, f"  <<<FILE: chapter_3.txt>>>\n{PROSE}\n\t<<<END>>>")
+    assert not result.error
+    text = chapter.read_text(encoding="utf-8")
+    assert PROSE in text and "<<<" not in text

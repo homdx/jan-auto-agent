@@ -242,3 +242,72 @@ def f(a, b, c):
     return c[-1]
 """
         assert _last_status(src) != "GUARDED"
+
+
+class TestDeletingAnAliasKeepsTheOriginalGuarded:
+    """`del b` unbinds the name `b` and leaves the list alone: a guard on `a`
+    survives it, while `del b[0]` really changes the shared list."""
+
+    def test_unbinding_an_alias_keeps_the_original_guarded(self):
+        src = """
+def f(a):
+    if not a: return None
+    b = a
+    del b
+    return a[-1]
+"""
+        assert _last_status(src) == "GUARDED"
+
+    def test_unbinding_an_alias_inside_a_branch_keeps_the_original_guarded(self):
+        src = """
+def f(a, flag):
+    if not a: return None
+    b = a
+    if flag:
+        del b
+    return a[-1]
+"""
+        assert _last_status(src) == "GUARDED"
+
+    def test_unbinding_an_alias_in_a_tuple_target_keeps_the_original_guarded(self):
+        src = """
+def f(a, c):
+    if not a: return None
+    b = a
+    del (b, c)
+    return a[-1]
+"""
+        assert _last_status(src) == "GUARDED"
+
+    def test_unbinding_the_original_still_drops_its_own_guard(self):
+        src = """
+def f(a):
+    if not a: return None
+    b = a
+    del a
+    return a[-1]
+"""
+        assert _last_status(src) != "GUARDED"
+
+    def test_deleting_an_element_through_the_alias_still_invalidates_the_shared_list(self):
+        for stmt in ("del b[0]", "del (b[0], c)", "del c, b[0]"):
+            src = f"""
+def f(a, c):
+    if not a: return None
+    b = a
+    {stmt}
+    return a[-1]
+"""
+            assert _last_status(src) != "GUARDED", stmt
+
+    def test_a_rebound_name_after_the_unbinding_is_not_tied_to_the_old_alias(self):
+        src = """
+def f(a):
+    if not a: return None
+    b = a
+    del b
+    b = []
+    b.pop()
+    return a[-1]
+"""
+        assert _last_status(src) == "GUARDED"

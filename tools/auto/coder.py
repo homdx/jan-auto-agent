@@ -1668,8 +1668,14 @@ class Coder(_llm_stream.LLMClientBase):
         * **Truncation guard:** if the body ends mid-sentence AND its length is
           within 5 % of ``self._max_tokens * 4`` (chars), surface an actionable
           retry message instead of silently writing a truncated chapter.
-        * Returns ``([], error)`` **only** when the body is empty/whitespace
-          after stripping — that is the single legitimate failure mode.
+        * Returns ``([], error)`` when the body is empty/whitespace after
+          stripping, looks like a refusal, was cut off mid-sentence at the token
+          budget, or carries a marker that cannot be trusted: a malformed or
+          empty-path ``<<<FILE`` opener, a mangled or stray ``<<<END>>>``, an
+          opener with no ``<<<END>>>`` of its own, or a block with an empty
+          body. The caller retries and nothing is written. A marker is a line
+          that starts with ``<<<FILE`` / ``<<<END`` after optional spaces or
+          tabs; the same text inside a sentence is prose and is kept.
 
         Returns
         -------
@@ -1692,7 +1698,7 @@ class Coder(_llm_stream.LLMClientBase):
         # as markers instead of falling through to the single-file fallback and
         # leaking their delimiters into a chapter.  Only a reply that has a marker
         # line is normalised: a plain CRLF chapter keeps its line endings.
-        if "\r\n" in body and re.search(r"^<<<(?:FILE|END)", body, re.MULTILINE | re.IGNORECASE):
+        if "\r\n" in body and re.search(r"^[ \t]*<<<(?:FILE|END)", body, re.MULTILINE | re.IGNORECASE):
             body = body.replace("\r\n", "\n")
 
         # Strip every CONTEXT_REQUEST line, not just those in the last three lines (BUGFIX).
@@ -1738,13 +1744,16 @@ class Coder(_llm_stream.LLMClientBase):
         # `<<<FILE: >>>`) still matches, so it is recognised below as a
         # malformed attempt and refused instead of leaking into a chapter
         # (AGNES-10).
-        _FILE_OPEN  = re.compile(r"^<<<FILE:\s*(.*?)\s*>>>$", re.MULTILINE)
-        _FILE_CLOSE = re.compile(r"^<<<END>>>$", re.MULTILINE)
+        # A marker may carry horizontal indent (spaces or tabs): a model that
+        # indents it still means a delimiter, and the check and the extraction
+        # below must agree on what one is, or the line leaks into a chapter.
+        _FILE_OPEN  = re.compile(r"^[ \t]*<<<FILE:\s*(.*?)\s*>>>$", re.MULTILINE)
+        _FILE_CLOSE = re.compile(r"^[ \t]*<<<END>>>$", re.MULTILINE)
         # A line that *begins* like a marker is a marker attempt; one that is
         # not well-formed (empty path, no colon, unterminated opener, a mangled
         # END) refuses the whole reply instead of leaking the delimiters (AGNES-10).
-        _OPEN_ATTEMPT = re.compile(r"^<<<FILE\b.*$", re.MULTILINE)
-        _END_ATTEMPT  = re.compile(r"^<<<END\b.*$", re.MULTILINE)
+        _OPEN_ATTEMPT = re.compile(r"^[ \t]*<<<FILE\b.*$", re.MULTILINE)
+        _END_ATTEMPT  = re.compile(r"^[ \t]*<<<END\b.*$", re.MULTILINE)
 
         open_matches = list(_FILE_OPEN.finditer(body))
         close_matches = list(_FILE_CLOSE.finditer(body))
@@ -1786,9 +1795,19 @@ class Coder(_llm_stream.LLMClientBase):
                 boundary = next_open.start() if next_open else len(body)
                 # A missing closer must not match a later file's marker; the closer is searched only before the next opener (BUGFIX).
                 close_match = _FILE_CLOSE.search(body, content_start, boundary)
-                content_end = close_match.start() if close_match else boundary
-                if close_match:
-                    used_closer_starts.add(close_match.start())
+                if not close_match:
+                    # The prompt requires <<<END>>>; a block without one is a
+                    # cut-off or half-formed reply, so retry instead of writing it.
+                    msg = (
+                        "creative coder: FILE marker "
+                        f"{relpath!r} has no closing <<<END>>> — refusing so a "
+                        "cut-off chapter is not written. Close every block with "
+                        "<<<END>>> on its own line."
+                    )
+                    logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+                    return [], msg
+                content_end = close_match.start()
+                used_closer_starts.add(close_match.start())
                 chunk = body[content_start:content_end].strip()
                 chunk = re.sub(r"\s*<<<END>>>\s*$", "", chunk)
                 if not chunk:

@@ -390,3 +390,53 @@ def test_a_real_worktree_is_accepted_when_the_repo_is_reached_through_a_symlink(
     alias = tmp_path / "alias"
     alias.symlink_to(repo)
     assert judging.plan_ideal_move(alias, alias / "contest-out" / "184", second) == second
+
+
+def test_a_separate_repository_at_the_ideal_path_is_refused(round_repo):
+    """A nested foreign repo is its own top-level and sits inside the round, yet it is no worktree of the repo."""
+    repo, folder, first, second = round_repo
+    ideal = folder / "wt" / "ideal"
+    ideal.mkdir(parents=True)
+    _git(ideal, "init", "-q")
+    _write(ideal / "g.txt", "x")
+    _git(ideal, "add", "-A")
+    _git(ideal, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x")
+    before = _snapshot(repo)
+    with pytest.raises(judging.RoundError, match="another repository"):
+        judging.plan_ideal_move(repo, folder, second)
+    assert _snapshot(repo) == before
+
+
+def test_a_dot_git_file_redirecting_to_the_main_git_dir_is_refused(round_repo):
+    repo, folder, first, second = round_repo
+    ideal = folder / "wt" / "ideal"
+    ideal.mkdir(parents=True)
+    _write(ideal / ".git", f"gitdir: {repo / '.git'}\n")
+    before = _snapshot(repo)
+    with pytest.raises(judging.RoundError, match="ideal"):
+        judging.plan_ideal_move(repo, folder, second)
+    assert _snapshot(repo) == before
+
+
+def test_a_dot_git_file_redirecting_to_another_worktrees_entry_is_refused(round_repo):
+    """Registered, but registered for another tree: the entry's back-pointer names that tree, not this one."""
+    repo, folder, first, second = round_repo
+    other = folder / "wt" / "other"
+    _git(repo, "worktree", "add", "-q", "--detach", str(other), first)
+    ideal = folder / "wt" / "ideal"
+    ideal.mkdir(parents=True)
+    _write(ideal / ".git", (other / ".git").read_text(encoding="utf-8"))
+    with pytest.raises(judging.RoundError, match="not its own|ideal"):
+        judging.plan_ideal_move(repo, folder, second)
+
+
+def test_a_refused_redirect_leaves_the_main_checkout_on_its_branch_through_the_command(round_repo, monkeypatch, capsys):
+    repo, folder, first, second = round_repo
+    ideal = folder / "wt" / "ideal"
+    ideal.mkdir(parents=True)
+    _write(ideal / ".git", f"gitdir: {repo / '.git'}\n")
+    rec = Recorder()
+    monkeypatch.setattr(judging, "RUN", rec)
+    before = _snapshot(repo)
+    code, _out, _err = _judge(capsys, "184", "--ideal", second)
+    assert code != 0 and rec.lines == [] and _snapshot(repo) == before

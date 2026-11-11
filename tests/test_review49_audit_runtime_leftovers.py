@@ -135,9 +135,17 @@ def test_with_no_proc_a_live_pid_is_taken_at_its_word(tmp_path, monkeypatch):
 
 # ── AUDIT-6: a Ctrl-C ends the agent's command too ─────────────────────────
 
+# A shell's `cmd &`, `nohup` and cron start their children with SIGINT ignored, and a child
+# inherits that: Python then installs no KeyboardInterrupt handler, so a Ctrl-C does nothing
+# and both tests below failed whenever pytest itself was run that way. The agent under test
+# must hear a Ctrl-C, so it puts the default handler back first, whatever it inherited.
+_CTRL_C_LIVE = "import signal; signal.signal(signal.SIGINT, signal.default_int_handler)\n"
+
+
 def test_ctrl_c_in_the_agent_kills_its_command(tmp_path):
     pid_file = tmp_path / "bash.pid"
     code = (
+        _CTRL_C_LIVE +
         f"import sys; sys.path.insert(0, {str(REPO)!r})\n"
         "from tools.contest import backend\n"
         f"backend._run_bash_group('echo $$ > {pid_file}; sleep 30', {str(tmp_path)!r}, 60)\n"
@@ -172,6 +180,7 @@ def test_ctrl_c_while_the_command_starts_still_kills_it(tmp_path):
     # written) but Popen has not returned yet, so the Ctrl-C lands before `try:`.
     pid_file = tmp_path / "bash.pid"
     code = (
+        _CTRL_C_LIVE +
         f"import os, signal, sys, time; sys.path.insert(0, {str(REPO)!r})\n"
         "from tools.contest import backend\n"
         "real = backend.subprocess.Popen\n"
