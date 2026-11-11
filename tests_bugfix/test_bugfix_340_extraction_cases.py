@@ -390,3 +390,61 @@ def test_the_bracket_pairing_is_linear_on_a_large_file() -> None:
     started = time.monotonic()
     assert extract_block(body, "f1499", ".js").startswith("function f1499(x)")
     assert time.monotonic() - started < 5
+
+
+# ── T93 follow-up 2: the object-or-block call by the clause before the colon, at any depth ──
+
+def test_an_object_after_a_comparison_or_shift_operator_is_an_operand() -> None:
+    for operator in ("<", ">", "<<", ">>", "<=", ">=", "+", "-"):
+        target = f"function target(x) {{ return x {operator} {{valueOf: () => 4}} / 2; }}"
+        assert _extracts_itself(target), operator
+    # a `>` that closes type parameters opens a body, so a regex may follow it
+    assert _extracts_itself("function target(x) { class A<T> { m() {} } /}/.test(String(x)); return x; }")
+    assert _extracts_itself("function target(x) { interface X<T> { a: T } /}/.test(String(x)); return x; }", ".ts")
+
+
+def test_default_is_a_property_in_an_object_and_a_clause_in_a_switch() -> None:
+    for target in (
+        "function target() { return {default: {valueOf: () => 4} / 2}; }",
+        "function target() { return {other: 0, default: {valueOf: () => 4} / 2}; }",
+        'function target() { return {"default": {valueOf: () => 4} / 2}; }',
+        "function target(x) { switch (x) { default: { x = 2; } /}/.test(String(x)); } return x; }",
+    ):
+        assert _extracts_itself(target), target
+
+
+def test_object_nesting_has_no_depth_limit() -> None:
+    for depth in range(1, 40):
+        body = "{valueOf: () => 4} / 2"
+        for i in range(depth):
+            body = "{a" + str(i) + ": " + body + "}"
+        assert _extracts_itself("function target() { return " + body + "; }"), depth
+
+
+def test_compound_case_clauses_and_nested_labels_are_blocks() -> None:
+    for target in (
+        "function target(x) { switch (x) { case -1: { x = 2; } /}/.test(String(x)); } return x; }",
+        "function target(x) { switch (x) { case (1): { x = 2; } /}/.test(String(x)); } return x; }",
+        "function target(x) { switch (x) { case 1+2: { x = 2; } /}/.test(String(x)); } return x; }",
+        'function target(x) { switch (x) { case "a": { x = 2; } /}/.test(String(x)); } return x; }',
+        "function target(x) { switch (x) { case foo(1): { x = 2; } /}/.test(String(x)); } return x; }",
+        "function target(x) { first: second: { x = 1; } /}/.test(String(x)); return x; }",
+        "function target(x) { if (x) label: { x = 1; } /}/.test(String(x)); return x; }",
+        "function target(x) { if (x) { x = 1; } else label: { x = 1; } /}/.test(String(x)); return x; }",
+        "function target(x) { while (x) label: { x = 0; } /}/.test(String(x)); return x; }",
+        "function target(x) { for (;;) label: { break; } /}/.test(String(x)); return x; }",
+    ):
+        assert _extracts_itself(target), target
+
+
+def test_ternary_branches_and_case_objects_are_operands() -> None:
+    for target in (
+        'function target(c) { return c ? "" : {valueOf: () => 4} / 2; }',
+        "function target(c) { return c ? `a` : {valueOf: () => 4} / 2; }",
+        "function target(x) { return x ? {a: 1} : {valueOf: () => 4} / 2; }",
+        "function target(x) { let y; return x ? y=1 : {valueOf: () => 4} / 2; }",
+        "function target(x) { return {a: x ? {k: 1} : {valueOf: () => 4} / 2}; }",
+        "function target(x) { switch (x) { case {valueOf: () => 4} / 2: return 2; } return x; }",
+        "function target() { const x = /* note */ {valueOf: () => 4} / 2; return x; }",
+    ):
+        assert _extracts_itself(target), target

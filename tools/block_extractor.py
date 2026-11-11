@@ -483,16 +483,30 @@ def _js_brace_closes_an_expression(source: str, close: int) -> bool:
     return opener is not None and _js_open_brace_is_an_object(source, opener, 0)
 
 
-def _js_open_brace_is_an_object(source: str, opener: int, depth: int) -> bool:
+_JS_BLOCK_STATEMENT_WORDS = frozenset(("case", "if", "else", "do", "while", "for", "with"))
+#: a `>` that closes a declaration's type parameters (`class A<T> {`) is followed by a block, not an operand
+_JS_DECLARATION_WORD = re.compile(r"\b(?:class|interface|enum|namespace|module)\b")
+#: how many nested `{` / `:` hops one classification follows; deeper than any real source, and bounds recursion
+_JS_CLASSIFY_DEPTH = 200
+
+
+def _js_open_brace_is_an_object(source: str, opener: int, depth: int = 0) -> bool:
+    """True when the `{` at *opener* starts an object literal (an operand), False for a block."""
+    if depth > _JS_CLASSIFY_DEPTH:
+        return True
     j = _js_prev_code(source, opener - 1)
     if j < 0:
         return False
     c = source[j]
-    if c == ">" and j >= 1 and source[j - 1] == "=":
-        return False                                       # `=> { … }`: an arrow's block body
+    if c == ">":
+        if j >= 1 and source[j - 1] == "=":
+            return False                                   # `=> { … }`: an arrow's block body
+        # `x > {…}`, `x >> {…}` compare or shift an object; `class A<T> {` / `interface X<T> {` open a body
+        cut = max(source.rfind(";", 0, j), source.rfind("{", 0, j), source.rfind("}", 0, j), j - 400)
+        return not _JS_DECLARATION_WORD.search(source, max(cut, 0), j)
     if c == ":":
-        return _js_colon_leads_to_an_object(source, j, depth)
-    if c in "=(,[?&|+-*%!~^":
+        return _js_colon_leads_to_an_object(source, j, depth + 1)
+    if c in "=(,[?&|+-*%!~^<":
         return True
     word = _js_word_ending_at(source, j)
     if word in _JS_OBJECT_OPERAND_WORDS:
@@ -501,35 +515,62 @@ def _js_open_brace_is_an_object(source: str, opener: int, depth: int) -> bool:
     return False                                           # `)`, `;`, `{`, `}`, `else`, `do`, `try`, a name…
 
 
+def _js_clause_before(source: str, colon: int):
+    """``(text, boundary_index, boundary_char)`` of the clause that ends at the `:` at *colon*.
+
+    Walks back over the tokens of that clause at its own nesting level — a bracket group is jumped
+    from its closer to its opener, a string to its opening quote — up to the first `,` `;` `{` `}`
+    `:`, an unmatched `(` or `[`, or a ternary `?`. The boundary char is "" at the start of the file
+    and "?" when a ternary was found."""
+    pairs = _js_pairs_for(source)
+    k, floor = colon - 1, max(0, colon - 2000)
+    last = True                                    # the token right before the colon
+    while k >= floor:
+        k = _js_prev_code(source, k)
+        if k < floor:
+            break
+        c = source[k]
+        was_last, last = last, False
+        if c == "}" and was_last and pairs.get(k) is not None:
+            k = pairs[k] - 1                       # `c ? {a: 1} : {…}`: an object ends the branch before the colon
+        elif c in ")]":
+            opener = pairs.get(k)
+            if opener is None:
+                return "", k, c
+            k = opener - 1
+        elif c in "'\"`":
+            start = source.rfind(c, 0, k)
+            k = (start if start >= 0 else k) - 1
+        elif c == "?":
+            return source[k + 1:colon], k, "?"
+        elif c in ",;{}:([":
+            return source[k + 1:colon], k, c
+        else:
+            k -= 1
+    return source[max(k, 0):colon], max(k, 0), ""
+
+
 def _js_colon_leads_to_an_object(source: str, colon: int, depth: int) -> bool:
-    """`{` after `:`: a property value or a ternary branch is an object literal; a label or a `case`/
-    `default` clause starts a block. Decided by the token before the colon and what precedes it."""
-    k = _js_prev_code(source, colon - 1)
-    if k < 0:
+    """`{` after the `:` at *colon*: a property value or a ternary branch is an object literal; a
+    label, a `case` clause or `default:` starts a block. The clause before the colon decides, then
+    what bounds it (see `_js_clause_before`)."""
+    if depth > _JS_CLASSIFY_DEPTH:
         return True
-    if source[k] in "'\"`":
-        quote = source[k]
-        start = source.rfind(quote, 0, k)
-        k = _js_prev_code(source, (start if start >= 0 else k) - 1)
-        key = ""
-    elif source[k].isalnum() or source[k] in "_$":
-        key = _js_word_ending_at(source, k)
-        k = _js_prev_code(source, k - len(key))
-    else:
-        return True                                        # `[computed]: {`, `) : {`
-    if key == "default":
-        return False
-    if k < 0:
-        return False                                       # a label at the start of the file
-    c = source[k]
-    if c in ",?":
-        return True
-    if c in ";}":
-        return False                                       # a label after a statement or a block
-    if c == "{":
-        return depth < 4 and _js_open_brace_is_an_object(source, k, depth + 1)   # property of an object, label in a block
-    if c.isalnum() or c in "_$":
-        return _js_word_ending_at(source, k) != "case"     # `case X: {`
+    clause, at, boundary = _js_clause_before(source, colon)
+    words = re.findall(r"[A-Za-z_$][\w$]*", re.sub(r"/\*.*?\*/", " ", clause, flags=re.S))
+    if boundary == "?":
+        return True                                        # `c ? a : {…}`
+    if words and words[0] in _JS_BLOCK_STATEMENT_WORDS:
+        return False                                       # `case -1:`, `if (x) label:`, `else label:`
+    if boundary == "," or boundary in ("(", "["):
+        return True                                        # `{a: 1, b: {…}}`, a parameter's type
+    if boundary == "{":
+        # a property of an object literal, or a label / `default:` in a block or a switch body
+        return _js_open_brace_is_an_object(source, at, depth + 1)
+    if boundary == ":":
+        return _js_colon_leads_to_an_object(source, at, depth + 1)       # `first: second: {` or `a ? b : c : {`
+    if boundary in (";", "}", ""):
+        return False                                       # a label or `default:` after a statement or a block
     return True
 
 
