@@ -204,3 +204,69 @@ def test_kc4_runner_survives_a_timeout_and_a_bad_result_line(tmp_path, monkeypat
     assert data["a"][mod.SCENARIOS[0]]["checks"][0]["ok"] is False
     assert data["b"][mod.SCENARIOS[0]]["checks"][0]["ok"] is False
     assert data["b"][mod.SCENARIOS[1]]["checks"][0]["ok"] is True
+
+
+def test_a_number_that_starts_a_fact_is_kept():
+    from tools.auto.summary_memory import _clean_bullet_list
+    assert _clean_bullet_list("• 2024. The project launched\n- 3) steps") == "• 2024. The project launched\n• 3) steps"
+
+
+def test_the_first_non_empty_model_list_wins():
+    mod = _script("scripts/py_model_test.py")
+
+    class Reply(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    import urllib.request
+    body = b'{"text": [], "data": [{"id": "available-model"}]}'
+    orig = mod.urllib.request.urlopen
+    mod.urllib.request.urlopen = lambda *a, **k: Reply(body)
+    try:
+        out = mod.free_from_direct_api("http://x/v1", "k")
+    finally:
+        mod.urllib.request.urlopen = orig
+    assert out and "available-model" in str(out)
+
+
+def test_an_apostrophe_in_a_name_is_a_letter_and_git_quoting_is_undone():
+    from tools.arena.merge import _untracked_names
+    note = "d\n# untracked (not inlined): author's.py it's.py \"my file.py\" \"caf\\303\\251.py\""
+    assert _untracked_names(note) == ["author's.py", "it's.py", "my file.py", "caf\u00e9.py"]
+
+
+def test_a_real_git_export_names_apostrophe_files(tmp_path):
+    from tools.arena.merge import _untracked_names
+    from tools.contest import cli
+    names = ["author's.py", "it's.py", "plain.py"]
+    assert _untracked_names("d\n" + cli._UNTRACKED_NOTE + " ".join(names)) == names
+
+
+def test_kc4_checkpoint_survives_a_failed_second_write(tmp_path, monkeypatch):
+    mod = _script("contest-bench/kc4/run_all_kc4.py")
+    out = tmp_path / "r.json"
+    mod._save(out, {"a": 1})
+    real = Path.write_text
+
+    def boom(self, *a, **k):
+        real(self, "{half", encoding="utf-8")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", boom)
+    with pytest.raises(OSError):
+        mod._save(out, {"a": 1, "b": 2})
+    assert json.loads(out.read_text()) == {"a": 1}
+
+
+@pytest.mark.parametrize("body,zero", [
+    ("return Cfg(error_retry_backoff_sec=0.5)  # error_retry_backoff_sec=0", False),
+    ("x = 'error_retry_backoff_sec=0'\n    return Cfg(error_retry_backoff_sec=1)", False),
+    ("return Cfg(error_retry_backoff_sec=0)", True),
+    ("cfg.error_retry_backoff_sec = 0\n    return cfg", True),
+])
+def test_backoff_zero_reads_code_not_comments_or_strings(body, zero):
+    mod = _script("contest-bench/slow1/check_slow1.py")
+    assert mod.backoff_zero(f"def make_config(x):\n    {body}\n") is zero

@@ -318,6 +318,7 @@ def _clean_bullet_list(reply: str) -> str:
     """
     import re as _re
     _marker = _re.compile(r"^\s*(?:[\u2022\-\*]|\d+[.)])\s+")
+    _bullet_only = _re.compile(r"^\s*[\u2022\-\*]\s+")
     out: list[str] = []
     any_marker = False
     for raw in reply.splitlines():
@@ -333,8 +334,9 @@ def _clean_bullet_list(reply: str) -> str:
         any_marker = True
         fact = _marker.sub("", line, count=1).strip()
         # "• •", "- *": a second marker is no fact, it is the same noise twice.
-        while _marker.match(fact + " "):
-            fact = _marker.sub("", fact + " ", count=1).strip()
+        # (bullet characters only: a leading number is the fact's own, "• 2024. The project launched".)
+        while _bullet_only.match(fact + " "):
+            fact = _bullet_only.sub("", fact + " ", count=1).strip()
         if fact[:4].upper() == "FIX:":
             fact = fact[4:].strip()
         fact = _strip_meta_parentheticals(fact)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -28,6 +29,13 @@ SCENARIOS = [
     "worktree_of_other_repo",
     "repo_checkout_never_touched",
 ]
+
+
+def _save(path: Path, results: dict) -> None:
+    """The results file replaced whole: a failed write leaves the last good file, not half a JSON."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(results, indent=2, sort_keys=True))
+    os.replace(tmp, path)
 
 
 def main():
@@ -64,8 +72,8 @@ def main():
                 entry[scen] = {"checks": [{"name": "subprocess", "ok": False, "detail": detail}]}
             print(f"[{name}] {scen}: "
                   f"{sum(c['ok'] for c in entry[scen]['checks'])}/{len(entry[scen]['checks'])}")
-            out_path.write_text(json.dumps(results, indent=2, sort_keys=True))   # kept if a later cell dies
-    out_path.write_text(json.dumps(results, indent=2, sort_keys=True))
+            _save(out_path, results)   # kept if a later cell dies
+    _save(out_path, results)
 
 
 if __name__ == "__main__":

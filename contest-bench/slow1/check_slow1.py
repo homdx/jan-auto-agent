@@ -20,9 +20,11 @@ hold, 1 otherwise. Cause 3 is reported, never required.
 
 from __future__ import annotations
 
+import ast
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 RUNNER_TESTS = "tests/test_contest_runner.py"
@@ -45,8 +47,29 @@ def _make_config(src: str) -> str:
 
 
 def backoff_zero(src: str) -> bool:
-    return re.search(r"error_retry_backoff_sec\s*=\s*0(?:\.0*)?(?=[ \t]*(?:[,)}\]#]|$))",
-                     _make_config(src), re.M) is not None
+    """make_config really sets `error_retry_backoff_sec` to the number 0 — in code, not in a comment or a string."""
+    try:
+        tree = ast.parse(textwrap.dedent(_make_config(src)))
+    except SyntaxError:
+        return False
+    name = "error_retry_backoff_sec"
+
+    def zero(node) -> bool:
+        return (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool) and node.value == 0)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == name and zero(node.value):
+            return True
+        if isinstance(node, ast.Assign) and zero(node.value) and any(
+                (isinstance(t, ast.Name) and t.id == name) or (isinstance(t, ast.Attribute) and t.attr == name)
+                for t in node.targets):
+            return True
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if isinstance(k, ast.Constant) and k.value == name and zero(v):
+                    return True
+    return False
 
 
 def runner_off_port_group(src: str) -> bool:

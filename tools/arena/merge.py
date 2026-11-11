@@ -31,7 +31,6 @@ everything printed goes through `output.scrub`. A missing or malformed
 
 from __future__ import annotations
 
-import shlex
 import argparse
 import json
 import os
@@ -214,6 +213,36 @@ def _entry_name(source: str) -> Optional[tuple[str, str]]:
     return (match.group("kind"), match.group("state")) if match else None
 
 
+#: one name of the list: git's double-quoted C-style form, or a run of non-blanks (an apostrophe is a letter here)
+_UNTRACKED_NAME = re.compile(r'"(?:[^"\\]|\\.)*"|\S+')
+
+
+def _unquote_git_name(token: str) -> str:
+    """*token* as git printed the path: `"my file.py"` or `"caf\\303\\251.py"` unquoted, anything else as it is."""
+    if not (len(token) >= 2 and token[0] == token[-1] == '"'):
+        return token
+    raw = bytearray()
+    body, i = token[1:-1], 0
+    escapes = {"n": 10, "t": 9, "r": 13, "a": 7, "b": 8, "f": 12, "v": 11, '"': 34, "\\": 92}
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body):
+            nxt = body[i + 1]
+            if nxt in "01234567":
+                j = i + 1
+                while j < min(len(body), i + 4) and body[j] in "01234567":
+                    j += 1
+                raw.append(int(body[i + 1:j], 8) & 255)
+                i = j
+                continue
+            raw.append(escapes.get(nxt, ord(nxt) & 255))
+            i += 2
+            continue
+        raw.extend(c.encode("utf-8"))
+        i += 1
+    return raw.decode("utf-8", "replace")
+
+
 def _untracked_names(text: str) -> list[str]:
     """The names a `.diff`'s trailing untracked-files comment lists.
 
@@ -226,11 +255,7 @@ def _untracked_names(text: str) -> list[str]:
     last = lines[-1] if lines else ""
     for marker in ("# untracked (not inlined):", "Untracked files:"):
         if last.startswith(marker):
-            rest = last[len(marker):]
-            try:
-                return shlex.split(rest)
-            except ValueError:
-                return rest.split()
+            return [_unquote_git_name(m.group(0)) for m in _UNTRACKED_NAME.finditer(last[len(marker):])]
     return []
 
 
