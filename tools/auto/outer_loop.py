@@ -196,10 +196,15 @@ class OuterLoopResult:
     unavailable:         bool = False
     # Which stage left the round unavailable ("coder" or "gate2"), so the summary names the real outage (RUN-8).
     unavailable_stage:   str = ""
+    # True when the inner loop ACCEPTED the work but the bookkeeping after it (the DONE write, the log) raised:
+    # the task is not exhausted, and its edit in the working tree is a result nobody has committed (AUTO-T60 follow-up).
+    work_passed:         bool = False
 
     def summary(self) -> str:
         if self.passed:
             return f"[{self.task_id}] DONE in {self.rounds_used} round(s)"
+        if self.work_passed:
+            return f"[{self.task_id}] ACCEPTED but not recorded — the state write failed"
         if self.unavailable:
             if self.unavailable_stage == "coder":
                 return f"[{self.task_id}] LEFT TODO — coder transport failure"
@@ -448,12 +453,25 @@ class OuterLoop:
             impl_versions_used.append(impl_version)
 
             if getattr(res, "passed", False):
-                self.state.set_task_status(task_id, STATUS_DONE)
-                self.state.log(f"{task_id}: passed in round {rnd} "
-                               f"({getattr(res, 'attempts_used', '?')} attempts)")
-                tracer.event("outer_loop", "controller", "result",
-                             params={"task": task_id, "passed": True, "round": rnd,
-                                     "impl_version": impl_version})
+                try:
+                    self.state.set_task_status(task_id, STATUS_DONE)
+                    self.state.log(f"{task_id}: passed in round {rnd} "
+                                   f"({getattr(res, 'attempts_used', '?')} attempts)")
+                    tracer.event("outer_loop", "controller", "result",
+                                 params={"task": task_id, "passed": True, "round": rnd,
+                                         "impl_version": impl_version})
+                except Exception as exc:
+                    # The work passed; only its record failed. Reported as an exhaustion, the controller
+                    # reset the tree and the accepted edit was gone with no patch and no commit. Say what
+                    # happened instead, so the edit is saved before anything is cleaned up.
+                    logger.exception(
+                        "OuterLoop: %s passed in round %d but recording it raised — %s; "
+                        "reporting the work as accepted-but-unrecorded", task_id, rnd, exc,
+                    )
+                    self._record_bookkeeping_failure(task_id, exc)
+                    return OuterLoopResult(task_id, False, rnd, True,
+                                           feedback_files, inner_results,
+                                           impl_versions_used, work_passed=True)
                 return OuterLoopResult(task_id, True, rnd, False,
                                        feedback_files, inner_results,
                                        impl_versions_used)

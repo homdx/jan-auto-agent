@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import functools
+import io
 import keyword
 import re
+import tokenize
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -80,6 +83,37 @@ _VAGUE_NOUNS = frozenset((
 ))
 
 
+@functools.lru_cache(maxsize=8)
+def _code_only(source: str) -> str:
+    """*source* with every string, comment and docstring blanked (newlines kept), so a
+    `def return()` written inside a triple-quoted string or a `# def class` comment is not
+    read as a definition. Python is tokenized; a source that does not tokenize (another
+    language, a syntax error) is masked by the extractor's own lexer state machine."""
+    blanked = list(source)
+    starts = [0]
+    for line in source.split("\n"):
+        starts.append(starts[-1] + len(line) + 1)
+    try:
+        spans = []
+        skip = {tokenize.STRING, tokenize.COMMENT}
+        if hasattr(tokenize, "FSTRING_MIDDLE"):
+            skip.add(tokenize.FSTRING_MIDDLE)
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.ERRORTOKEN:
+                raise tokenize.TokenError("not Python", tok.start)
+            if tok.type in skip:
+                spans.append((starts[tok.start[0] - 1] + tok.start[1], starts[tok.end[0] - 1] + tok.end[1]))
+        for a, b in spans:
+            for k in range(a, min(b, len(blanked))):
+                if blanked[k] != "\n":
+                    blanked[k] = " "
+        return "".join(blanked)
+    except (tokenize.TokenError, SyntaxError, IndexError):
+        from tools.block_extractor import _code_mask
+        mask = _code_mask(source, "")
+        return "".join(ch if mask[k] or ch == "\n" else " " for k, ch in enumerate(source))
+
+
 def _is_defined_in_source(name: str, source: str) -> bool:
     """True when *name* is introduced as a symbol in *source*, not merely mentioned.
 
@@ -90,6 +124,7 @@ def _is_defined_in_source(name: str, source: str) -> bool:
     (as a keyword, in a docstring, in a comment) without naming anything.
     """
     n = re.escape(name)
+    source = _code_only(source)
     if re.search(r'(?<![\w.])(?:def|class|function|func|fn|interface|struct|enum|trait|type|const|let|var)\s+' + n + r'\b', source):
         return True
     return bool(re.search(r'^[ \t]*' + n + r'[ \t]*=(?!=)', source, re.MULTILINE))
@@ -114,6 +149,7 @@ def _declaration_head_is_a_symbol(remainder: str, match: "re.Match[str]", source
     an unverifiable match is not a rejection.
     """
     name = re.escape(match.group(2))
+    source = _code_only(source)           # a definition written inside a string or a comment is none
     if (match.group(2) in _RESERVED_AFTER_KEYWORD.get(match.group(1), ())
             and not re.search(r'(?m)^[ \t]*(?:def|class|function|func)[ \t]+' + name + r'\b', source)):
         # AGNES-1 T96: a reserved word after the declaration keyword names the

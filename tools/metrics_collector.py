@@ -49,7 +49,12 @@ class RunRecord:
 
 def _usable_iterations(value) -> bool:
     """A real, finite count: `json.loads` also lets a damaged record carry NaN and Infinity."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:       # a JSON integer too big for a float is a damaged count, not a crash
+        return False
 
 
 class MetricsCollector:

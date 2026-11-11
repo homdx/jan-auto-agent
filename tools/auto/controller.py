@@ -827,6 +827,23 @@ class AutoController:
                 )
                 self._discard_exhausted_residue(task["id"], reason=_u_label)
 
+            elif getattr(result, "work_passed", False) is True:
+                # The work passed acceptance and only the state write failed: this is no exhaustion (no
+                # knowledge note, no ticket), and the edit in the tree is a result nobody committed. It is
+                # saved as a patch before anything cleans the tree, and the tree is cleaned only once the
+                # patch is on disk — otherwise the next task's commit would sweep it in, or a reset would
+                # throw the only copy away.
+                patch_path = self._save_uncommitted_patch(task, result)
+                self.state.log(
+                    f"task {task['id']} accepted but NOT recorded (state write failed) — "
+                    + (f"work saved to {patch_path}; the tree goes back to HEAD" if patch_path
+                       else "could not save the work as a patch; it stays in the working tree")
+                )
+                if patch_path:
+                    self._discard_exhausted_residue(
+                        task["id"], reason="state write failed, work saved as a patch",
+                    )
+
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
                 ex_outcome = exhaustion_handler.handle(task, result)

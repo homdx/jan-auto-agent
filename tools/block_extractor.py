@@ -178,15 +178,17 @@ def _extract_python_block_fallback(source: str, target_name: str) -> str:
     # multi-line triple-quoted default value keeps the scan inside the string.
     sig_depth = 0
     body_start_idx = None
+    in_str = ""                # "", "'", '"', "'''" or '"""' — the open quote run; kept across lines
     for i in range(start_idx, len(lines)):
         line = lines[i]
         j = 0
         n = len(line)
-        in_str = ""            # "", "'", '"', "'''" or '"""' — the open quote run
+        continued = False      # a backslash ended this line inside a single-quoted string
         while j < n:
             ch = line[j]
             if in_str:
                 if ch == "\\":
+                    continued = line[j + 1:] in ("\n", "\r\n", "\r")
                     j += 2
                     continue
                 if line.startswith(in_str, j):
@@ -216,6 +218,10 @@ def _extract_python_block_fallback(source: str, target_name: str) -> str:
             j += 1
         if body_start_idx is not None:
             break
+        # Only a triple-quoted string spans lines; a lone quote ends with its line unless a
+        # backslash continues it, so it must not swallow the next line's brackets.
+        if len(in_str) == 1 and not continued:
+            in_str = ""
 
     if body_start_idx is None:
         return "".join(lines[decorator_start:])
@@ -291,6 +297,30 @@ def _lang_skip(source: str, i: int, lang: str) -> Optional[int]:
     return None
 
 
+_CPP_RAW_OPEN = re.compile(r'"([^()\\ \t\r\n"]{0,16})\(')
+
+
+def _cpp_raw_string_end(source: str, i: int) -> Optional[int]:
+    """The index past the C++ raw string literal `R"delim( … )delim"` whose `"` is at *i*, else None.
+
+    It spans lines and holds anything — `/*`, a quote, `int fake() {}` — up to `)delim"`, so
+    the generic scan, which ends a string at the line, took its `/*` for a comment and hid
+    every definition below (AGNES-1 T79). The prefix may be `R`, `u8R`, `uR`, `UR` or `LR`; an
+    unterminated one runs to the end of the file, as the compiler reads it."""
+    if i < 1 or source[i - 1] != "R":
+        return None
+    k = i - 2
+    while k >= 0 and source[k] in "u8UL":
+        k -= 1
+    if k >= 0 and (source[k].isalnum() or source[k] == "_"):
+        return None                     # `FOR"(`: an identifier ending in R, not a raw prefix
+    m = _CPP_RAW_OPEN.match(source, i)
+    if not m:
+        return None
+    close = source.find(")" + m.group(1) + '"', m.end())
+    return len(source) if close < 0 else close + len(m.group(1)) + 2
+
+
 def _js_regex_can_start(source: str, i: int) -> bool:
     j = i - 1
     while j >= 0 and source[j] in " \t\r\n":
@@ -302,6 +332,11 @@ def _js_regex_can_start(source: str, i: int) -> bool:
         # swallow everything to the next `/` on the line, `}` included, and every following function
         # came out as part of the target block. A `<` never starts a regex either (a comparison's `<`
         # is followed by an operand, never by `/`), so this is safe for plain JS/TS too.
+        return False
+    if source[j] in "+-" and j >= 1 and source[j - 1] == source[j]:
+        # `x++ / 2`, `x-- / 2`: a postfix operator ends an operand, so the `/` divides. A regex
+        # cannot follow a `++`/`--` (the prefix form takes an operand, not a literal), and read
+        # as one it swallowed the line up to the next `/` — and the next function with it.
         return False
     if source[j] in "(,=:[!&|?{};+-*%>~^":
         return True
@@ -347,12 +382,29 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
     symbols of one file walks it once."""
     n = len(source)
     code = bytearray(b"\x01") * n
-    state = "code"  # code, single, double, backtick, line_comment, block_comment, char
+    state = "code"  # code, single, double, triple, backtick, line_comment, block_comment, char
     escape = False
+    #: JS: one entry per open `${ … }` of a template string, its count of unclosed `{` inside it
+    interpolations: list = []
     i = 0
     while i < n:
         ch = source[i]
         nxt = source[i + 1] if i + 1 < n else ""
+
+        if state == "triple":
+            # A `"""` text block (Java, Kotlin, Scala, C#, Swift) spans lines and may hold `void fake() {}`.
+            code[i] = 0
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif source.startswith('"""', i):
+                code[i + 1] = code[i + 2] = 0
+                state = "code"
+                i += 3
+                continue
+            i += 1
+            continue
 
         if state == "line_comment":
             code[i] = 0
@@ -380,6 +432,14 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
             if ch == "\\":
                 escape = True
                 i += 1
+                continue
+            if state == "backtick" and lang == "js" and ch == "$" and nxt == "{":
+                # `${ … }` holds executable JS (an IIFE with its own `function foo`): the text around
+                # it is the string, the expression is code until its matching `}`.
+                code[i + 1] = 0
+                interpolations.append(0)
+                state = "code"
+                i += 2
                 continue
             quote = {"single": "'", "double": '"', "backtick": "`", "char": "'"}[state]
             if ch == quote:
@@ -415,6 +475,16 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
             i += 1
             continue
         if ch == '"':
+            raw_end = _cpp_raw_string_end(source, i) if lang == "c" else None
+            if raw_end is not None:
+                code[i - 1:raw_end] = bytes(raw_end - i + 1)      # the `R` prefix too
+                i = raw_end
+                continue
+            if not lang and source.startswith('"""', i):
+                state = "triple"
+                code[i] = code[i + 1] = code[i + 2] = 0
+                i += 3
+                continue
             state = "double"
             code[i] = 0
             i += 1
@@ -424,6 +494,17 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
             code[i] = 0
             i += 1
             continue
+        if interpolations:
+            if ch == "{":
+                interpolations[-1] += 1
+            elif ch == "}":
+                if interpolations[-1] == 0:
+                    interpolations.pop()
+                    state = "backtick"          # back in the template text
+                    code[i] = 0
+                    i += 1
+                    continue
+                interpolations[-1] -= 1
         i += 1
     return code
 
@@ -455,12 +536,24 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
     i = open_brace_index
     depth = 0
 
-    state = "code"  # code, single, double, backtick, line_comment, block_comment, char
+    state = "code"  # code, single, double, triple, backtick, line_comment, block_comment, char
     escape = False
 
     while i < n:
         ch = source[i]
         nxt = source[i + 1] if i + 1 < n else ""
+
+        if state == "triple":
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif source.startswith('"""', i):
+                state = "code"
+                i += 3
+                continue
+            i += 1
+            continue
 
         if state == "line_comment":
             if ch == "\n":
@@ -510,6 +603,14 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
             i += 1
             continue
         if ch == '"':
+            raw_end = _cpp_raw_string_end(source, i) if lang == "c" else None
+            if raw_end is not None:
+                i = raw_end
+                continue
+            if not lang and source.startswith('"""', i):
+                state = "triple"
+                i += 3
+                continue
             state = "double"
             i += 1
             continue

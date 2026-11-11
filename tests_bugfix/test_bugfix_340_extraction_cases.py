@@ -190,3 +190,100 @@ def test_a_capitalized_keyword_spelling_is_still_a_legal_identifier():
     )
     assert res is not None
     assert res.target_name == "Return"
+
+
+# ── 340 follow-up: the new masks and the signature scan must keep their own state ──
+
+def test_js_template_interpolation_is_code_but_the_template_text_is_not() -> None:
+    """`${ … }` holds executable JS (an IIFE with `function foo`); the text around it is a string."""
+    source = ("const text = `hello ${(() => {\n"
+              "function foo() { return 1; }\n"
+              "return foo();\n"
+              "})()}`;\n")
+    assert extract_block(source, "foo", ".js") == "function foo() { return 1; }"
+    text_only = "const t = `function bar() { return 1; } ${x}`;\nfunction real() { return 2; }\n"
+    assert extract_block(text_only, "bar", ".js") == ""
+    assert extract_block(text_only, "real", ".js").strip() == "function real() { return 2; }"
+
+
+def test_js_nested_templates_and_object_literals_inside_an_interpolation() -> None:
+    source = ("const t = `a ${ {k: 1}.k } b ${`c ${(() => {\n"
+              "  function inner() { return 2; }\n"
+              "  return inner(); })()}`}`;\n"
+              "function after() { return 3; }\n")
+    assert extract_block(source, "inner", ".js").strip() == "function inner() { return 2; }"
+    assert extract_block(source, "after", ".js").strip() == "function after() { return 3; }"
+
+
+def test_python_fallback_keeps_a_multiline_triple_quote_open_across_lines() -> None:
+    """A syntax error elsewhere forces the fallback; `f` must still end at its own `:`, before `after`."""
+    for inner in ("first\nsecond\nlast", "first\n(\nlast", "a\n):\nb"):
+        source = (f'def f(x="""{inner}"""):\n    return x\n\ndef after():\n    return 2\n\nbroken = (\n')
+        block = extract_block(source, "f", ".py")
+        assert "return x" in block, inner
+        assert "def after" not in block and "broken" not in block, inner
+
+
+def test_python_fallback_ends_a_lone_quote_at_its_line() -> None:
+    """Only a triple quote spans lines: a stray `'` must not swallow the next line's colon."""
+    source = "def f(x=1):  # it's\n    return x\n\ndef after():\n    return 2\n\nbroken = (\n"
+    block = extract_block(source, "f", ".py")
+    assert "return x" in block and "def after" not in block
+    continued = 'def g(x="a\\\n(b"):\n    return x\n\ndef after():\n    return 2\n\nbroken = (\n'
+    block = extract_block(continued, "g", ".py")
+    assert "return x" in block and "def after" not in block
+
+
+def test_java_text_block_holds_no_declaration() -> None:
+    source = ('class Demo {\n    String text = """\nvoid fake() {}\n""";\n    void real() {}\n}\n')
+    assert extract_block(source, "fake", ".java") == ""
+    assert extract_block(source, "real", ".java").strip() == "void real() {}"
+
+
+def test_a_text_block_with_an_unbalanced_brace_does_not_break_the_next_method() -> None:
+    source = ('class Demo {\n    String t = """\n  { not a body \\"""still text\n""";\n'
+              '    void real() { return; }\n    void other() {}\n}\n')
+    assert extract_block(source, "real", ".java").strip() == "void real() { return; }"
+
+
+def test_a_definition_inside_a_string_or_comment_is_not_what_the_prompt_names() -> None:
+    """`def return()` written in a docstring or a comment names nothing: `return` is prose."""
+    for source in ('DOC = """\ndef return():\n    pass\n"""\n\ndef handle():\n    return 1\n',
+                   "# def return\ndef handle():\n    return 1\n",
+                   "'''\ndef return(): pass\n'''\n"):
+        parsed = _parse_via_regex("show the def return function in a.py", source)
+        assert parsed is not None and parsed.target_name != "return", source
+    real = _parse_via_regex("show def handle in a.py", "def handle():\n    return 1\n")
+    assert real is not None and real.target_name == "handle"
+
+
+def test_a_slash_after_a_postfix_operator_is_a_division_not_a_regex() -> None:
+    """`x++ / 2` ends an operand, so the `/` divides; read as an unclosed regex it ate the next function."""
+    for operator in ("++", "--"):
+        target = f"function target(x) {{ return x{operator} / 2; }}"
+        source = target + "\nfunction neighbor() { return 42; }\n"
+        assert extract_block(source, "target", ".js") == target
+    # the unclosed regex of T93 is still read to the end of its line, and a spaced prefix form is no postfix
+    unclosed = "function target() { const r = /{;\nreturn 1;\n}\nfunction neighbor() { return 42; }\n"
+    assert extract_block(unclosed, "target", ".js") == "function target() { const r = /{;\nreturn 1;\n}"
+    regex_after_plus = "function target(s) { return 1 + /}/.test(s); }\nfunction neighbor() { return 42; }\n"
+    assert extract_block(regex_after_plus, "target", ".js") == "function target(s) { return 1 + /}/.test(s); }"
+
+
+def test_a_cpp_raw_string_is_one_literal_up_to_its_own_delimiter() -> None:
+    """`R"(…)"` spans lines and may hold `/*`, a quote or a whole fake function."""
+    cases = (
+        'const char *s = R"(text\n/* ordinary string contents\n)";\nint target() { return 1; }\n',
+        'const char *s = R"x(a )" /* b\n)x";\nint target() { return 1; }\nint other() { return 2; }\n',
+        'const char *s = u8R"(int target() { return 9; })";\nint target() { return 1; }\n',
+    )
+    for source in cases:
+        assert extract_block(source, "target", ".cpp").strip() == "int target() { return 1; }", source
+    # a real comment still hides a prototype, and an identifier ending in R before a quote is no raw prefix
+    assert extract_block("/*\nint target();\n*/\nint target() { return 1; }\n", "target", ".cpp").strip() \
+        == "int target() { return 1; }"
+    assert extract_block('#define FOR"(" \nint target() { return 1; }\n', "target", ".cpp").strip() \
+        == "int target() { return 1; }"
+    # inside a body the raw string's braces are not the body's
+    body = 'int target() { const char *s = R"({ not a brace)"; return 1; }\nint after() { return 2; }\n'
+    assert extract_block(body, "target", ".cpp").strip() == 'int target() { const char *s = R"({ not a brace)"; return 1; }'

@@ -373,3 +373,44 @@ def f(a):
     return a[-1]
 """
             assert _last_status(src) != "GUARDED", mutate
+
+
+class TestARebindKeepsTheChainAcrossIt:
+    """`b = a; c = b; b = []` leaves the list held by `a` and `c`: the chain ran through `b`."""
+
+    def test_a_mutation_through_the_far_end_after_the_middle_is_rebound(self):
+        src = """
+def f(a):
+    if not a: return None
+    b = a
+    c = b
+    b = []
+    c.pop()
+    return a[-1]
+"""
+        assert _last_status(src) != "GUARDED"
+
+    def test_every_way_of_rebinding_the_middle_keeps_the_chain(self):
+        for rebind in ("b = []", "b = make()", "for b in items:\n        pass", "b: list = []"):
+            src = f"""
+def f(a, items):
+    if not a: return None
+    b = a
+    c = b
+    {rebind}
+    c.clear()
+    return a[-1]
+"""
+            assert _last_status(src) != "GUARDED", rebind
+
+    def test_the_rebound_name_itself_is_no_longer_the_original(self):
+        src = """
+def f(a):
+    if not a: return None
+    b = a
+    c = b
+    b = []
+    b.pop()
+    return a[-1]
+"""
+        assert _last_status(src) == "GUARDED"

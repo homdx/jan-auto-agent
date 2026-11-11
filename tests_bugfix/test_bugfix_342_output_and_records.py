@@ -335,3 +335,19 @@ def test_only_a_finite_number_counts_towards_the_average(bad):
 
 def test_a_record_with_no_iterations_key_still_counts_as_zero():
     assert _summary([{"intent": "a"}, {"iterations_used": 4, "intent": "a"}])["avg_iterations"] == 2.0
+
+
+def test_summarize_failures_an_integer_too_big_for_a_float_is_a_damaged_record(tmp_path):
+    """`math.isfinite(10**400)` raises OverflowError: such a count is skipped like "three", not a crash."""
+    mc = MetricsCollector(metrics_path=tmp_path / "metrics.json")
+    big = "9" * 400
+    # json.dumps writes the int in full; the damaged file may as well hold it as a bare literal
+    mc.metrics_path.write_text(json.dumps([_metrics_record(), _metrics_record(iterations_used=10 ** 400)])
+                               + "\n", encoding="utf-8")
+    summary = mc.summarize_failures(n=10)
+    assert summary["total_runs"] == 2 and summary["avg_iterations"] == 3.0
+    only = tmp_path / "only.json"
+    only.write_text("[" + json.dumps(_metrics_record(iterations_used=1)).replace(": 1,", f": {big},", 1) + "]",
+                    encoding="utf-8")
+    summary = MetricsCollector(metrics_path=only).summarize_failures(n=10)
+    assert summary["total_runs"] == 1 and summary["avg_iterations"] == 0.0 and summary["worst_intent"] is None

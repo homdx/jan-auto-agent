@@ -303,6 +303,24 @@ def _deleted_container_names(target: ast.expr) -> Set[str]:
     return out
 
 
+def _break_alias(aliases: Dict[str, str], name: str) -> None:
+    """*name* no longer holds the object it aliased (a rebind): drop its own link, and hand the
+    names that aliased *name* on to what *name* aliased.
+
+    After `b = a; c = b; b = []` the list is still held by `a` and `c`, and the chain `c -> b -> a`
+    ran through `b`. Dropping `b -> a` alone cuts `c` off from `a`, and a `c.pop()` then leaves the
+    guard on `a` standing over an emptied list. A `name` that aliased nothing leaves its
+    dependents' links as they are — a link to a name that now holds something else only ever
+    invalidates more.
+    """
+    source = aliases.pop(name, None)
+    if source is None or source == name:
+        return
+    for alias, src in list(aliases.items()):
+        if src == name:
+            aliases[alias] = source
+
+
 def _alias_group(aliases: Dict[str, str], name: str) -> Set[str]:
     """*name* and every name linked to it through `alias -> source` links, at any distance.
 
@@ -559,24 +577,25 @@ def _rebound_names_in(
             # name is a rebind in this one (REL-2)
             if not isinstance(s, ast.Lambda):
                 names.add(s.name)
-                aliases.pop(s.name, None)
+                _break_alias(aliases, s.name)
             continue
         for bound in _stmt_bound_names(s):
             names.add(bound)
             if not (isinstance(s, ast.Assign) and len(s.targets) == 1
                     and isinstance(s.targets[0], ast.Name) and s.targets[0].id == bound):
-                aliases.pop(bound, None)
+                _break_alias(aliases, bound)
         if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
             names.add(s.targets[0].id)
             target = s.targets[0].id
             if isinstance(s.value, ast.Name):
+                _break_alias(aliases, target)
                 aliases[target] = s.value.id
             else:
-                aliases.pop(target, None)  # rebound to something else — alias broken
+                _break_alias(aliases, target)  # rebound to something else — alias broken
         # A for-loop variable rebinds its name, so it invalidates a guard on that name (BUGFIX).
         elif isinstance(s, (ast.For, ast.AsyncFor)) and isinstance(s.target, ast.Name):
             names.add(s.target.id)
-            aliases.pop(s.target.id, None)  # rebound by the loop — alias broken
+            _break_alias(aliases, s.target.id)  # rebound by the loop — alias broken
         names |= _unbound_names_in_stmt(s)      # only the name itself: its aliases still hold the object
         for mutated in _mutated_name_in_stmt(s):
             names |= _alias_group(aliases, mutated)
@@ -584,7 +603,7 @@ def _rebound_names_in(
             bound = _pattern_bound_names(s)
             names |= bound
             for name in bound:
-                aliases.pop(name, None)
+                _break_alias(aliases, name)
         for nested in _nested_stmt_lists(s):
             names |= _rebound_names_in(nested, aliases)
     return names
@@ -689,7 +708,7 @@ class _FunctionGuardWalker:
                 guarded_pairs.discard(pair)
             if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
                     and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == bound):
-                self._aliases.pop(bound, None)
+                _break_alias(self._aliases, bound)
         if isinstance(stmt, (ast.For, ast.AsyncFor)) and isinstance(stmt.target, ast.Name):
             target = stmt.target.id
             guarded_names.discard(target)
@@ -807,9 +826,10 @@ class _FunctionGuardWalker:
             ):
                 alias_target = stmt.targets[0].id
                 if isinstance(stmt.value, ast.Name):
+                    _break_alias(self._aliases, alias_target)
                     self._aliases[alias_target] = stmt.value.id
                 else:
-                    self._aliases.pop(alias_target, None)
+                    _break_alias(self._aliases, alias_target)
 
             # Unbinding a name drops its own guard, never an alias's, and leaves the alias links alone.
             for unbound in _unbound_names_in_stmt(stmt):
