@@ -317,10 +317,29 @@ _JS_CONDITION_WORDS = frozenset(("if", "while", "for", "with"))
 #: a declaration's head: a `>` that closes its type parameters (`class A<T> {`) is followed by a block
 _JS_DECLARATION_WORDS = frozenset(("class", "interface", "enum", "namespace", "module"))
 _JS_BRACE_KINDS = ("block", "object", "fn", "tmpl")
+#: what follows the `/` of `</div>`, `</ns:tag >`, `</A.B>`, `</>`; `x </a}/.test(s)` is a regex, not this
+_JS_CLOSING_TAG = re.compile(r"(?:[A-Za-z_$][\w$.:-]*[ \t]*)?>")
 _JS_NAME = re.compile(r"(?:[^\W\d]|[$#])[\w$]*")
 _JS_NUMBER = re.compile(r"\.?[0-9](?:[\w.]|(?<=[eE])[+-])*")
 _JS_PUNCT = re.compile(r">>>=|\.\.\.|===|!==|\*\*=|<<=|>>=|>>>|&&=|\|\|=|\?\?=|=>|==|!=|<=|>=|&&|\|\||\?\?"
                        r"|\?\.(?![0-9])|\+\+|--|\+=|-=|\*=|%=|&=|\|=|\^=|<<|>>|\*\*|\S")
+
+
+def _js_next_code_char(source: str, k: int) -> str:
+    """The first character at or after *k* that is neither blank nor in a comment, "" at the end."""
+    n = len(source)
+    while k < n:
+        if source[k].isspace():
+            k += 1
+        elif source.startswith("//", k):
+            nl = source.find("\n", k)
+            k = n if nl < 0 else nl
+        elif source.startswith("/*", k):
+            close = source.find("*/", k + 2)
+            k = n if close < 0 else close + 2
+        else:
+            return source[k]
+    return ""
 
 
 class _JsScanner:
@@ -347,7 +366,7 @@ class _JsScanner:
         self.allowed = True                               # a regex literal may start here
         self.decl = False                                 # inside a `class X<…>` / `interface` head
         self.pending_fn = None                            # a `function` keyword waits for its `(`: is it an expression
-        self.pending_class = None                         # (stack depth, is an expression) of a `class` waiting for its body
+        self.pending_class: list = []                     # (stack depth, is an expression) of each `class` waiting for its body
         self.text = False                                 # inside template text
 
     def token(self, pk: str, pv: str, end: int, allowed: bool, pdata=None) -> None:
@@ -377,14 +396,13 @@ class _JsScanner:
 
     def brace_kind(self, at: int) -> str:
         pk, pv = self.pk, self.pv
+        if self.pending_class and self.pending_class[-1][0] == len(self.stack):
+            # the body of `class A<T> extends ns.B {`, whatever token the heritage ends in: the body of a class
+            # in an expression position ends an operand (`class {} / 2`)
+            return "fn" if self.pending_class.pop()[1] else "block"
         if pk in ("none", "operand"):
             return "block"
         top = self.stack[-1][0]
-        if self.pending_class and self.pending_class[0] == len(self.stack):
-            # the body of `class A<T> extends B {`: an expression's body ends an operand (`class {} / 2`)
-            kind = "fn" if self.pending_class[1] else "block"
-            self.pending_class = None
-            return kind
         if pk == "word":
             if pv in ("return", "yield"):
                 # ASI: a `{` on the line after a bare `return` is a block
@@ -403,6 +421,11 @@ class _JsScanner:
         if pv in (">", ">>", ">>>") and self.decl:
             return "block"                                 # `class A<T> {`, `class A extends B<C<D>> {`
         return "object"
+
+    def forget_classes(self, depth: int) -> None:
+        """A `class` whose body never came at its own bracket depth (the brackets closed first) is dropped."""
+        while self.pending_class and self.pending_class[-1][0] > depth:
+            self.pending_class.pop()
 
     def pop_to(self, kinds) -> list:
         """Pop the stack through its topmost entry of *kinds* and return it; [] when none is open."""
@@ -479,7 +502,7 @@ class _JsScanner:
             end = source.find("*/", i + 2)
             return n if end < 0 else end + 2
         # `</li>`, `</>`: a JSX closing tag (a tag name or `>` follows the slash); `x </}/.test(s)` is a regex
-        jsx_close = source[i - 1:i] == "<" and bool(nxt) and (nxt.isalpha() or nxt in "_$>:")
+        jsx_close = source[i - 1:i] == "<" and bool(_JS_CLOSING_TAG.match(source, i + 1))
         if self.allowed and not jsx_close:
             end = _js_regex_end(source, i)
             if end is None and nxt != ">":
@@ -506,11 +529,11 @@ class _JsScanner:
         elif w == "async":
             pdata = self.fn_is_expression(start)
         elif w in _JS_DECLARATION_WORDS:
-            nxt = self.source[end:end + 40].lstrip()
-            if nxt[:1].isalpha() or nxt[:1] in "_$" or (w == "class" and nxt[:1] == "{"):
+            nxt = _js_next_code_char(self.source, end)
+            if nxt.isalpha() or nxt in ("_", "$") and nxt or (w == "class" and nxt == "{"):
                 self.decl = True                           # not `{class: 1}` or `{interface, enum}`
                 if w == "class":
-                    self.pending_class = (len(self.stack), self.fn_is_expression(start))
+                    self.pending_class.append((len(self.stack), self.fn_is_expression(start)))
         # `break` / `continue` (and their label) end the statement: a `/` after them is never a division
         ends_statement = w in ("break", "continue", "debugger") or (
             self.pk == "word" and self.pv in ("break", "continue") and "\n" not in self.source[self.p_end:start])
@@ -528,6 +551,7 @@ class _JsScanner:
             self.token("punct", tok, end, True)
         elif tok == ")":
             entry = self.pop_to(("paren",))
+            self.forget_classes(len(stack))
             cond, fn = (entry[2], entry[3]) if entry else (False, None)
             self.token("punct", tok, end, bool(cond), bool(fn))
         elif tok == "[":
@@ -535,6 +559,7 @@ class _JsScanner:
             self.token("punct", tok, end, True)
         elif tok == "]":
             self.pop_to(("bracket",))
+            self.forget_classes(len(stack))
             self.token("punct", tok, end, False)
         elif tok == "{":
             kind = self.brace_kind(start)
@@ -554,7 +579,8 @@ class _JsScanner:
         elif tok == ";":
             stack[-1][1] = 0
             self.decl = False
-            self.pending_fn = self.pending_class = None
+            self.pending_fn = None
+            self.forget_classes(len(stack) - 1)           # a `class` with no body by the `;` never gets one
             self.token("punct", tok, end, True)
         elif tok == "?":
             stack[-1][1] += 1

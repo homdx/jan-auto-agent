@@ -73,6 +73,16 @@ CASES.update({
     "function_expression_division": "function target() { return function() {} / 2; }",
     "function_expression_after_comma_newline": "function target() { return (0,\nfunction() {}) / 2; }",
     "generator_expression_division": "function target() { return function*() {} / 2; }",
+    "class_extends_member_then_object": "function target() { const ns = {Base: Object};\n class A extends ns.Base {}\n return {valueOf: () => 4} / 2; }",
+    "class_extends_tagged_template_then_object": "function target() { const tag = () => Object;\n class A extends tag`x` {}\n return {valueOf: () => 4} / 2; }",
+    "class_extends_call_then_regex": "function target(x) { class A extends Object.create(null).constructor {}\n /}/.test(x); return 1; }",
+    "class_expression_comment_after_keyword": "function target() { return class /* c */ {} / 2; }",
+    "class_expression_line_comment_after_keyword": "function target() { return class // c\n {} / 2; }",
+    "class_expression_nested_heritage": "function target() { return class extends (class {}) {} / 2; }",
+    "class_expression_member_heritage": "function target() { const ns = {Base: Object}; return class extends ns.Base {} / 2; }",
+    "regex_with_letter_after_less_than": "function target(x) { return x </a}/.test(x); }",
+    "regex_with_dollar_after_less_than": "function target(x) { return x </$[}]/.test(x); }",
+    "regex_with_class_after_less_than": "function target(x) { return x </a[}]/.test(x); }",
     "object_method_division": "function target(x) { return {m() { return 1 }}.m() / 2 / {}; }",
 })
 
@@ -177,6 +187,26 @@ def asi_stmt(r):
 def lt_stmt(r):
     return r.choice(["v = x </}/.test(x);", "v = x < /}/.test(x);", "v = x</{/.test(x);", "v = (x) </[}]/.test(x);", "v = x <\n/}/.test(x);"])
 
+
+BASES = ["Object", "ns.Base", "ns.a.Base", "ns['Base']", "f()", "f(1, {a: 1})", "(c ? Object : Array)", "(class {})", "(class extends Object {})",
+         "tag`x`", "tag`${1}`", "ns?.Base", "(0, ns.Base)", "[Object][0]", "(function() { return Object })()", "class_ => Object".replace("class_ => Object", "Object")]
+GAPS = ["", " ", "/* c */ ", "// c\n", "/* } */ ", "\n"]
+def heritage(r):
+    return r.choice(["", "extends " + r.choice(BASES) + " "])
+def class_expr(r):
+    return "class" + " " + r.choice(GAPS) + r.choice(["", "K "]) + r.choice(GAPS) + heritage(r) + "{ " + r.choice(["", "m() { return {} }", "static s = {a: 1};", "get g() { return 1 }"]) + " }"
+def class_decl(r):
+    return "class D%d " % r.randrange(10**6) + r.choice(GAPS) + heritage(r) + "{ m() { return 1 } }"
+def class2_stmt(r):
+    e = class_expr(r)
+    return r.choice(["v = %s / 2;", "v = %s / 2 / 3; // }", "v = [%s][0] / 2;", "v = c ? 1 : %s / 2;", "v = typeof %s / 2;"]).replace("%s", e)
+def class3_stmt(r):
+    d = class_decl(r)
+    return d + r.choice(["\nv = {valueOf: () => 4} / 2;", "\n/}/.test(x);", " v = {a: {b: 1}} / 2 / 3; // }", "\nv = x > {} / 2;", "\nv = {case: {}} / 2;"])
+def lt2_stmt(r):
+    t = r.choice(["a", "$", "_", "a[}]", "$[}]", "a}", "ab{", "A.b}", "x-y}", "a b}", "a:b}", "1}", "}"])
+    return r.choice(["v = x <%s/.test(x);", "v = x < %s/.test(x);", "v = x</%s/g.test(x);"]).replace("%s", "/" + t) if False else "v = x </" + t + "/.test(x);"
+
 def wrap(r, s, d):
     if d == 0:
         return s
@@ -197,7 +227,7 @@ def wrap(r, s, d):
 def gen(r):
     parts = []
     for _ in range(r.randrange(1, 4)):
-        base = r.choice([a_stmt, b_stmt, case_b, div_stmt, ret_stmt, regex_stmt, cls_stmt, asyn_stmt, asi_stmt, lt_stmt])(r)
+        base = r.choice([a_stmt, b_stmt, case_b, div_stmt, ret_stmt, regex_stmt, cls_stmt, asyn_stmt, asi_stmt, lt_stmt, class2_stmt, class3_stmt, lt2_stmt])(r)
         parts.append(wrap(r, base, r.randrange(0, 3)))
     body = "\n".join(parts)
     return "function target(x, c, v) {\n" + body + "\n}"
