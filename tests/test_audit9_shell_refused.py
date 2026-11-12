@@ -16,3 +16,17 @@ def test_valid_shell_controls_stay_accepted():
         "echo '>'", 'echo ")"', "echo '&&'", "a # > ) &&",
     ):
         assert is_well_formed(command), command
+
+
+def test_quoted_operands_and_case_patterns_keep_their_shell_meaning():
+    for command in (
+        "pytest -q > 'results.txt'",
+        'pytest -q | "cat"',
+        "pytest -q && 'true'",
+        "pytest -q > results\\ file",
+        "echo ${value:-)}",
+        '(echo ok)# comment with a "',
+        "case x in\n a|b) echo a;;\n *) echo b;;\nesac",
+    ):
+        assert is_well_formed(command), command
+    assert not is_well_formed("pytest -q > # missing target")

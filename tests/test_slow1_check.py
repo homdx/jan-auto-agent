@@ -163,6 +163,38 @@ def test_unreachable_updates_are_excluded_through_public_judge(tmp_path):
     assert "PASS  cause 1" in output
 
 
+@pytest.mark.parametrize("latest", [0, 1])
+@pytest.mark.parametrize("via_keyword", [False, True])
+def test_update_uses_the_mapping_final_value_and_keyword_precedence(tmp_path, latest, via_keyword):
+    argument = "patch, **override" if via_keyword else "patch"
+    final_patch = 1 - latest if via_keyword else latest
+    source = f"""def make_config():
+    kw = dict(error_retry_backoff_sec={1 - latest})
+    patch = dict(error_retry_backoff_sec={1 - final_patch})
+    patch["error_retry_backoff_sec"] = {final_patch}
+    override = dict(error_retry_backoff_sec={latest})
+    kw.update({argument})
+    return dict(**kw)
+
+def test_one():
+    assert make_config()
+"""
+    namespace = {}
+    exec(compile(source, "fixture.py", "exec"), namespace)
+    assert namespace["make_config"]()["error_retry_backoff_sec"] == latest
+    code, output = _judge_source(tmp_path, source)
+    assert code == (0 if latest == 0 else 1), output
+
+
+def test_deep_expression_does_not_break_the_public_judge(tmp_path):
+    expression = "+".join(["1"] * 1200)
+    source = (f"def make_config():\n    _noise = {expression}\n"
+              "    return dict(error_retry_backoff_sec=0)\n"
+              "\ndef test_one():\n    assert make_config()\n")
+    code, output = _judge_source(tmp_path, source)
+    assert code == 0, output
+
+
 def test_static_judge_keeps_supported_non_update_controls():
     from importlib.util import module_from_spec, spec_from_file_location
 

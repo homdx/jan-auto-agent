@@ -54,3 +54,44 @@ def test_cpp_digit_separator_and_spliced_line_comment_do_not_hide_body_end():
         assert "other()" not in result
         assert result.rstrip().endswith("}")
     assert "1'000" in extract_block(digit_sep, "f", ".cpp")
+
+
+def test_typescript_generic_head_and_body_stop_before_the_next_statement():
+    for definition, following in (
+        ("function f<T>(x: T): T { return x }", "function other<U>(x: U): U { return x }"),
+        ("function f(): void {}", "{ console.log('next'); }"),
+        ("function f(): number { return 1 }", "[1].forEach(console.log)"),
+    ):
+        assert _block(definition + "\n" + following) == definition
+
+
+def test_typescript_comments_are_not_control_conditions():
+    assert _block("// if ( text only\nfunction f() { return 1 }") == "function f() { return 1 }"
+    assert _block("class C {\n  // reason:\n  f() { return 1 }\n}") == "  f() { return 1 }"
+
+
+def test_a_lambda_after_a_call_does_not_end_the_multiline_condition():
+    for ext, caller, definition in (
+        (".cpp", "bool f();\nint main() {\n  if (true &&\n    f() && [] { return true; }()) {}\n}",
+         "bool f() { return true; }"),
+        (".ts", "function main() {\n  if (true &&\n    f() && (() => { return true; })()) {}\n}",
+         "function f() { return true; }"),
+    ):
+        assert _block(caller + "\n" + definition, ext) == definition
+
+
+def test_typescript_balances_object_constraints_and_return_types():
+    definition = "function f<T extends { id: number; name: string }>(x: T): { id: number } { return x }"
+    for ext in (".ts", ".tsx"):
+        assert _block(definition, ext) == definition
+    for name in ("is", "asserts"):
+        named_type = f"function f(): {name} {{ return 1 }}"
+        assert _block(f"type {name} = number;\n" + named_type) == named_type
+
+
+def test_cpp_character_literal_and_crlf_splice_preserve_exact_body():
+    for definition in (
+        "int f() { auto c = u8'a'; return c; }",
+        "int f() {\r\n  // note \\\r\n  }\r\n  return 1;\r\n}",
+    ):
+        assert _block(definition + "\nint other() { return 2; }", ".cpp") == definition

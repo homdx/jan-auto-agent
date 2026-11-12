@@ -294,25 +294,26 @@ def _tokenize(command: str) -> list:
 
 
 def is_well_formed(command: str) -> bool:
-    """False when the shell would refuse *command* for an unclosed quote, backtick or ``$(``.
+    """Reject incomplete quotes, substitutions, groups and trailing shell operators.
 
     Such a command ran nothing, so no answer for it may come from the cache or from a classifier.
     """
     try:
         _tokenize(command)
+        visible = _shell_syntax_view(command)
     except ValueError:
         return False
-    visible = _shell_syntax_view(command)
     tail = visible.rstrip()
     if re.search(r"(?:&&|\|\||\|)$", tail):
         return False
     if re.search(r"(?:\d*>>?|<<?|&>)$", tail):
         return False
-    # A right paren that closes no grouping is invalid, except for the reserved
-    # `case pattern)` delimiter. The case bodies are intentionally not parsed.
-    case_view = re.sub(r"\bcase\b[\s\S]*?\bin\b[ \t]+[^\s();|&]+\)", "case pattern in x ", visible, count=1)
+    # Case arms have their own parentheses, including a bare closing paren.
+    # Leave them to the existing tokenizer instead of counting them as groups.
+    if re.search(r"(?:^|[;\n|&({])\s*(?:(?:then|do|else)\s+)?case\s+[^\s;()|&]+\s+in\b", visible):
+        return True
     depth = 0
-    for ch in case_view:
+    for ch in visible:
         if ch == "(":
             depth += 1
         elif ch == ")":
@@ -325,50 +326,64 @@ def is_well_formed(command: str) -> bool:
 
 
 def _shell_syntax_view(command: str) -> str:
-    """Mask quoted strings, substitutions and comments for trailing-operator checks."""
+    """Hide syntax inside words, keeping each operand visible to the tail check."""
     out = list(command)
     i, n = 0, len(command)
+    in_word = False
+    parameter_start = -1
+    parameter_depth = 0
     while i < n:
         ch = command[i]
-        if ch == "\\":
-            out[i] = " "
-            if i + 1 < n:
-                out[i + 1] = " "
+        if ch == "\\" and i + 1 < n:
+            if command[i + 1] == "\n":
+                out[i:i + 2] = "  "
+            else:
+                out[i:i + 2] = "xx"
+                in_word = True
             i += 2
             continue
         if ch == "'":
             end = command.find("'", i + 1)
-            end = n - 1 if end < 0 else end
-            for j in range(i, end + 1):
-                out[j] = " "
-            i = end + 1
-            continue
-        if ch == '"':
+            if end < 0:
+                raise ValueError("unclosed single quote")
+        elif ch == '"':
             end = _dquote_end(command, i)
-            for j in range(i, end + 1):
-                out[j] = " "
-            i = end + 1
-            continue
-        if ch == "`":
+        elif ch == "`":
             end = _backtick_end(command, i)
-            for j in range(i, end + 1):
-                out[j] = " "
-            i = end + 1
-            continue
-        if ch == "$" and command[i + 1:i + 2] == "(":
+        elif ch == "$" and command[i + 1:i + 2] == "(":
             end = _subst_end(command, i)
-            for j in range(i, end + 1):
-                out[j] = "x"
-            i = end + 1
+        elif command.startswith("${", i):
+            if not parameter_depth:
+                parameter_start = i
+            parameter_depth += 1
+            in_word = True
+            i += 2
             continue
-        if ch == "#" and (i == 0 or command[i - 1].isspace() or command[i - 1] in ";&|("):
+        elif ch == "}" and parameter_depth:
+            parameter_depth -= 1
+            if not parameter_depth:
+                out[parameter_start:i + 1] = "x" * (i + 1 - parameter_start)
+            i += 1
+            continue
+        elif ch == "#" and not in_word and not parameter_depth:
             end = command.find("\n", i)
             end = n if end < 0 else end
-            for j in range(i, end):
-                out[j] = " "
+            out[i:end] = " " * (end - i)
             i = end
             continue
-        i += 1
+        else:
+            if parameter_depth or (ch == "&" and ((i > 0 and command[i - 1] in "><")
+                                    or (not in_word and command[i + 1:i + 2] == ">"))):
+                in_word = True
+            else:
+                in_word = ch not in " \t\r\n;()|&"
+            i += 1
+            continue
+        out[i:end + 1] = "x" * (end + 1 - i)
+        in_word = True
+        i = end + 1
+    if parameter_depth:
+        raise ValueError("unclosed parameter expansion")
     return "".join(out)
 
 
