@@ -51,7 +51,7 @@ def backoff_zero(src: str) -> bool:
     except SyntaxError:
         return False
     func = next((n for n in ast.walk(tree)
-                 if isinstance(n, ast.FunctionDef) and n.name == "make_config"), None)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "make_config"), None)
     if func is None:
         return False
     name = "error_retry_backoff_sec"

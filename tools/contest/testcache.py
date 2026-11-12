@@ -96,6 +96,93 @@ _CLOSE = "\x00CLOSE"
 _KILLED = "terminated command after exceeding timeout"
 
 
+def _backtick_end(command: str, i: int) -> int:
+    """Index of the backtick that closes the one at *i*; ``ValueError`` when none does.
+
+    A backslash escapes the next character (``\\``` stays inside).
+    """
+    j, n = i + 1, len(command)
+    while j < n:
+        if command[j] == "\\":
+            j += 2
+            continue
+        if command[j] == "`":
+            return j
+        j += 1
+    raise ValueError("unclosed backtick")
+
+
+def _dquote_end(command: str, i: int) -> int:
+    """Index of the ``"`` that closes the double quote opened at *i*.
+
+    The shell still reads ``$( … )`` and a backtick pair inside double quotes,
+    so each is skipped as a unit and a ``"`` inside one does not end the quote.
+    ``ValueError`` when the quote, or a substitution inside it, never closes.
+    """
+    j, n = i + 1, len(command)
+    while j < n:
+        ch = command[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == '"':
+            return j
+        if ch == "`":
+            j = _backtick_end(command, j) + 1
+            continue
+        if ch == "$" and command[j + 1:j + 2] == "(":
+            j = _subst_end(command, j) + 1
+            continue
+        j += 1
+    raise ValueError("unclosed double quote")
+
+
+def _subst_end(command: str, i: int) -> int:
+    """Index of the ``)`` that closes the ``$(`` at *i*; ``ValueError`` when none does.
+
+    Read as the shell reads it: a parenthesis inside quotes, inside a backtick
+    pair, after a backslash or in a comment is not a parenthesis of the
+    substitution, and a quote inside it must close. (``"$(echo ")"`` is an
+    unclosed substitution: the ``)`` belongs to the quoted string.)
+    """
+    j, n = i + 2, len(command)
+    depth = 1
+    while j < n:
+        ch = command[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == "'":
+            end = command.find("'", j + 1)
+            if end < 0:
+                raise ValueError("unclosed single quote")
+            j = end + 1
+            continue
+        if ch == '"':
+            j = _dquote_end(command, j) + 1
+            continue
+        if ch == "`":
+            j = _backtick_end(command, j) + 1
+            continue
+        if ch == "$" and command[j + 1:j + 2] == "(":
+            j = _subst_end(command, j) + 1
+            continue
+        if ch == "#" and (command[j - 1] in " \t\n;&|(" if j > i + 2 else True):
+            end = command.find("\n", j)
+            if end < 0:
+                break               # the comment swallows the closing parenthesis
+            j = end + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    raise ValueError("unclosed command substitution")
+
+
 def _tokenize(command: str) -> list:
     """*command* as a flat list of words, with ``_SEP`` between simple commands.
 
@@ -148,61 +235,31 @@ def _tokenize(command: str) -> list:
             i = end + 1
             continue
         if ch == '"':
-            j = i + 1
-            while j < n and command[j] != '"':
-                if command[j] == "\\" and j + 1 < n:
-                    j += 1
-                elif command[j] == "`":
-                    # a backtick inside double quotes runs a command and must close too
-                    j = command.find("`", j + 1)
-                    if j < 0:
-                        raise ValueError("unclosed backtick")
-                elif command[j] == "$" and command[j + 1:j + 2] == "(":
-                    depth, j = 0, j + 1
-                    while j < n:
-                        if command[j] == "(":
-                            depth += 1
-                        elif command[j] == ")":
-                            depth -= 1
-                            if depth == 0:
-                                break
-                        j += 1
-                    if j >= n:
-                        raise ValueError("unclosed command substitution")
-                j += 1
-            if j >= n:
-                raise ValueError("unclosed double quote")
+            j = _dquote_end(command, i)
             word.append(command[i + 1:j].replace('\\"', '"'))
             in_word = True
             i = j + 1
             continue
         if ch == "`":
-            end = command.find("`", i + 1)
-            if end < 0:
-                raise ValueError("unclosed backtick")
+            end = _backtick_end(command, i)
             word.append(command[i:end + 1])
             in_word = True
             i = end + 1
             continue
         if ch == "$" and command[i + 1:i + 2] == "(":
-            depth, j = 0, i + 1
-            while j < n:
-                if command[j] == "(":
-                    depth += 1
-                elif command[j] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                j += 1
-            if j >= n:
-                raise ValueError("unclosed command substitution")
-            word.append(command[i:j + 1])
+            end = _subst_end(command, i)
+            word.append(command[i:end + 1])
             in_word = True
-            i = j + 1
+            i = end + 1
             continue
         if ch in " \t\r":
             flush()
             i += 1
+            continue
+        if ch == "#" and not in_word:
+            # a comment runs to the end of the line; a quote in it opens nothing (``# don't``)
+            end = command.find("\n", i)
+            i = n if end < 0 else end
             continue
         if ch in "\n;":
             sep()
@@ -230,6 +287,9 @@ def _tokenize(command: str) -> list:
         in_word = True
         i += 1
     flush()
+    # A subshell that never closes is a syntax error too (a stray ``)`` is left alone: a ``case`` pattern has one).
+    if tokens.count(_OPEN) > tokens.count(_CLOSE):
+        raise ValueError("unclosed parenthesis")
     return [t for t in tokens]
 
 

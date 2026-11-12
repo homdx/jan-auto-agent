@@ -39,9 +39,9 @@ def _save(path: Path, results: dict) -> None:
 
 
 def _well_formed(result) -> bool:
-    """A cell is ``{"checks": [{"ok": …}, …]}``; valid JSON of another shape is a lost cell, not a crash."""
+    """A cell is ``{"checks": [{"ok": true|false}, …]}``; valid JSON of another shape (``"ok": "yes"`` too) is a lost cell, not a crash."""
     checks = result.get("checks") if isinstance(result, dict) else None
-    return isinstance(checks, list) and all(isinstance(c, dict) and "ok" in c for c in checks)
+    return isinstance(checks, list) and all(isinstance(c, dict) and isinstance(c.get("ok"), bool) for c in checks)
 
 
 def main():
