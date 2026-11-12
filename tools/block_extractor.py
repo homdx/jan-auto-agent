@@ -1587,6 +1587,38 @@ def _inside_control_condition(source: str, at: int, code_mask: bytearray) -> boo
     return False
 
 
+def _strip_trailing_comments(line: str) -> str:
+    """Remove comments outside quoted strings from one physical source line."""
+    quote = ""
+    escaped = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "'\"`":
+            quote = ch
+            i += 1
+            continue
+        if line.startswith("//", i):
+            return line[:i]
+        if line.startswith("/*", i):
+            end = line.find("*/", i + 2)
+            if end < 0:
+                return line[:i]
+            line = line[:i] + " " + line[end + 2:]
+            continue
+        i += 1
+    return line
+
+
 def _continued_call_head(source: str, line_start: int, match_start: int, head: str,
                          pos: int, target_name: str, code_mask: bytearray) -> bool:
     """Whether a bare head continues a prior operator/call line.
@@ -1606,10 +1638,10 @@ def _continued_call_head(source: str, line_start: int, match_start: int, head: s
     if previous_end <= 0:
         return False
     previous_start = source.rfind("\n", 0, previous_end) + 1
-    previous = source[previous_start:previous_end]
-    if not previous or previous.endswith(("/*", "*/")):
+    previous = _strip_trailing_comments(source[previous_start:previous_end]).rstrip()
+    if not previous:
         return False
-    last_code = previous_end - 1
+    last_code = previous_start + len(previous) - 1
     if not code_mask[last_code]:
         return False
     if previous.endswith(("&&", "||")):

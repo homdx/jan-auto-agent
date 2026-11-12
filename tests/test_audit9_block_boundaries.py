@@ -58,6 +58,15 @@ def test_call_like_head_continued_from_operator_is_skipped():
         result = _block(source)
         assert result == "function f(y) { return y; }"
 
+    source = (
+        "function g() {\n"
+        "  ready && // continued\n"
+        "    f(x) { run(); }\n"
+        "}\n"
+        "function f(y) { return y; }"
+    )
+    assert _block(source) == "function f(y) { return y; }"
+
 
 def test_object_method_after_comma_in_a_call_or_array_is_preserved():
     definition = "  f() { return 1 }"
