@@ -29,6 +29,7 @@ from pathlib import Path
 RUNNER_TESTS = "tests/test_contest_runner.py"
 COLLECT_TESTS = ("tests/test_collect_already_safe_query.py", "tests/test_collect_gates.py")
 TICKET_SUBJECT = "SLOW-1: ticket"
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 
 
 def _git(target: Path, *args: str) -> str:
@@ -41,10 +42,13 @@ def _show(target: Path, rev: str, path: str) -> str:
 
 
 def backoff_zero(src: str) -> bool:
-    """make_config really sets `error_retry_backoff_sec` to the number 0 — in code, not in a comment or a string.
+    """make_config returns an object whose `error_retry_backoff_sec` is the number 0 — in code, not in a comment or a string.
 
-    The function is found in the parsed file (a decorator on the next function is no part of it), and
-    the setting that wins is the last one written: a keyword or an attribute assignment, else a dict key.
+    The function is found in the parsed file (a decorator on the next function is no part of it). What counts
+    is the setting of the *returned* object: a keyword of the returned call, a dict key of the returned literal,
+    or — for a returned name — the call or dict it was bound to, then any attribute or key assigned to it later.
+    A setting on an object that is never returned is ignored. A return of another shape falls back to the last
+    setting written anywhere in the function.
     """
     try:
         tree = ast.parse(src)
@@ -60,20 +64,74 @@ def backoff_zero(src: str) -> bool:
         return (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
                 and not isinstance(node.value, bool) and node.value == 0)
 
-    sets: list = []     # (line, col, is_zero) of a keyword or an assignment
-    keys: list = []     # the same for a dict key
-    for node in ast.walk(func):
+    def own_nodes():
+        # the function's own statements, not those of a nested function, lambda or class
+        stack = [n for n in func.body if not isinstance(n, _SCOPES)]
+        while stack:
+            n = stack.pop()
+            yield n
+            stack.extend(c for c in ast.iter_child_nodes(n) if not isinstance(c, _SCOPES))
+
+    nodes = list(own_nodes())
+
+    def event(value_node):
+        return (value_node.lineno, value_node.col_offset, zero(value_node))
+
+    def of_value(node, before, depth):
+        """Settings (line, col, is_zero) of the object *node* builds or names."""
+        if isinstance(node, ast.Call):
+            own = [event(k.value) for k in node.keywords if k.arg == name]
+            if own or depth > 2:
+                return own
+            names = [a for a in (*node.args, *(k.value for k in node.keywords)) if isinstance(a, ast.Name)]
+            return [e for a in names for e in of_value(a, node.lineno, depth + 1)]
+        if isinstance(node, ast.Dict):
+            return [event(v) for k, v in zip(node.keys, node.values)
+                    if isinstance(k, ast.Constant) and k.value == name]
+        if isinstance(node, ast.Name) and depth <= 2:
+            return of_name(node.id, before, depth)
+        return []
+
+    def of_name(ident, before, depth):
+        binds = [n for n in nodes if isinstance(n, ast.Assign) and n.lineno < before
+                 and any(isinstance(t, ast.Name) and t.id == ident for t in n.targets)]
+        if not binds:
+            return []
+        bind = max(binds, key=lambda n: (n.lineno, n.col_offset))
+        found = of_value(bind.value, bind.lineno, depth + 1)
+        for n in nodes:
+            if not isinstance(n, ast.Assign) or not bind.lineno < n.lineno < before:
+                continue
+            for t in n.targets:
+                if (isinstance(t, ast.Attribute) and t.attr == name and isinstance(t.value, ast.Name)
+                        and t.value.id == ident) or (
+                        isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id == ident
+                        and isinstance(t.slice, ast.Constant) and t.slice.value == name):
+                    found.append(event(n.value))
+        return found
+
+    verdicts = []
+    for ret in (n for n in nodes if isinstance(n, ast.Return) and n.value is not None):
+        found = of_value(ret.value, ret.lineno, 0)
+        if found:
+            verdicts.append(max(found)[2])
+    if verdicts:
+        return all(verdicts)
+
+    # a return of another shape: the last setting written anywhere in the function
+    sets: list = []     # a keyword or an assignment
+    keys: list = []     # a dict key
+    for node in nodes:
         if isinstance(node, ast.keyword) and node.arg == name:
-            sets.append((node.value.lineno, node.value.col_offset, zero(node.value)))
+            sets.append(event(node.value))
         elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             if any((isinstance(t, ast.Name) and t.id == name) or (isinstance(t, ast.Attribute) and t.attr == name)
                    for t in targets):
-                sets.append((node.lineno, node.col_offset, zero(node.value)))
+                sets.append(event(node.value))
         elif isinstance(node, ast.Dict):
-            for k, v in zip(node.keys, node.values):
-                if isinstance(k, ast.Constant) and k.value == name:
-                    keys.append((v.lineno, v.col_offset, zero(v)))
+            keys.extend(event(v) for k, v in zip(node.keys, node.values)
+                        if isinstance(k, ast.Constant) and k.value == name)
     found = sets or keys
     return bool(found) and max(found)[2]
 

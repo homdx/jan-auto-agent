@@ -240,7 +240,15 @@ def _empty_runs_dir(worktree: Path, agent: str) -> None:
                 else:
                     child.unlink()
             except OSError as exc:
-                _log.warning("could not empty %s (%s) — the round goes on", child, exc)
+                _log.warning("could not empty %s (%s)", child, exc)
+        # Any other leftover is a stale scratch file, but the queue file is what ``next_task.py`` reads:
+        # a stale one would hand out nothing and the round would "finish" with the ticket unsolved.
+        stale = runs / "PROGRESS.csv"
+        if stale.exists() or stale.is_symlink():
+            raise WorkspaceError(
+                f"{stale} from a previous round cannot be removed — the agent {agent!r} would start with "
+                "its ticket marked done; free the file (or delete the workspace) and prepare it again"
+            )
     else:
         runs.mkdir(parents=True, exist_ok=True)
 
