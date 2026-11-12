@@ -314,6 +314,23 @@ def _cpp_raw_string_end(source: str, i: int) -> Optional[int]:
     return len(source) if close < 0 else close + len(m.group(1)) + 2
 
 
+def _cpp_digit_separator(source: str, i: int, lang: str) -> bool:
+    """Whether the apostrophe at *i* belongs to a C/C++ numeric token."""
+    digits = "0123456789abcdefABCDEF"
+    if (lang != "c" or not 0 < i < len(source) - 1
+            or source[i - 1] not in digits or source[i + 1] not in digits):
+        return False
+    start = i - 1
+    while start > 0 and (source[start - 1].isalnum() or source[start - 1] in "_'"):
+        start -= 1
+    # A digit next to an apostrophe is not sufficient: u8'a' is a char literal.
+    return source[start].isdigit()
+
+
+def _cpp_line_splice(source: str, i: int, lang: str) -> bool:
+    return lang == "c" and source[max(0, i - 2):i].endswith(("\\", "\\\r"))
+
+
 #: Words that, as an object key's value or an operand's left side, make the next `{` an object literal.
 _JS_OBJECT_AFTER_WORD = frozenset(("typeof", "void", "delete", "throw", "in", "of", "new", "await",
                                    "instanceof", "case", "default"))
@@ -837,8 +854,12 @@ def _js_regex_end(source: str, i: int) -> Optional[int]:
     return None
 
 
+_MASK_CODE = 1
+_MASK_COMMENT = 2
+
+
 @functools.lru_cache(maxsize=8)
-def _code_mask(source: str, lang: str = "") -> bytearray:
+def _code_mask(source: str, lang: str = "", *, mark_comments: bool = False) -> bytearray:
     """A bytearray with 1 where *source[i]* is real code and 0 where it is inside a
     comment, a string or a char literal — the lexer state machine of
     `_brace_scan_end`, recorded as it walks. A candidate definition head whose
@@ -846,10 +867,12 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
     definition: `int proto(int a);` inside a `/* … */` comment is not the
     declaration of `proto` (AGNES-1 T79). The skipped spans of `_lang_skip`
     (a JS regex, a C preprocessor line, a Rust lifetime/char) are still code —
-    they are neither comments nor strings. Cached and read only: extracting many
-    symbols of one file walks it once."""
+    they are neither comments nor strings. With *mark_comments*, comment bytes
+    are 2 so a continuation check can skip comments while keeping literals as
+    operands. Cached and read only: extracting many symbols of one file walks it once."""
     n = len(source)
     code = bytearray(b"\x01") * n
+    comment = _MASK_COMMENT if mark_comments else 0
     state = "code"  # code, single, double, triple, backtick, line_comment, block_comment, char
     escape = False
     #: JS: one entry per open `${ … }` of a template string, its count of unclosed `{` inside it
@@ -875,17 +898,18 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
             continue
 
         if state == "line_comment":
-            code[i] = 0
+            code[i] = comment
             if ch == "\n":
-                state = "code"
+                if not _cpp_line_splice(source, i, lang):
+                    state = "code"
             i += 1
             continue
 
         if state == "block_comment":
-            code[i] = 0
+            code[i] = comment
             if ch == "*" and nxt == "/":
                 state = "code"
-                code[i + 1] = 0
+                code[i + 1] = comment
                 i += 2
             else:
                 i += 1
@@ -931,13 +955,16 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
                 continue
         if ch == "/" and nxt == "/":
             state = "line_comment"
-            code[i] = code[i + 1] = 0
+            code[i] = code[i + 1] = comment
             i += 2
             continue
         if ch == "/" and nxt == "*":
             state = "block_comment"
-            code[i] = code[i + 1] = 0
+            code[i] = code[i + 1] = comment
             i += 2
+            continue
+        if ch == "'" and _cpp_digit_separator(source, i, lang):
+            i += 1
             continue
         if ch == "'":
             state = "single"
@@ -986,7 +1013,7 @@ def _iter_code_matches(pat: re.Pattern[str], source: str, code_mask: Optional[by
     *code_mask* every match is yielded, so a caller that does not filter keeps the
     old behaviour."""
     for match in pat.finditer(source):
-        if code_mask is None or code_mask[_effective_match_start(source, match.start())]:
+        if code_mask is None or code_mask[_effective_match_start(source, match.start())] == _MASK_CODE:
             yield match
 
 
@@ -1027,7 +1054,8 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
 
         if state == "line_comment":
             if ch == "\n":
-                state = "code"
+                if not _cpp_line_splice(source, i, lang):
+                    state = "code"
             i += 1
             continue
 
@@ -1068,7 +1096,7 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
             state = "block_comment"
             i += 2
             continue
-        if ch == "'":
+        if ch == "'" and not _cpp_digit_separator(source, i, lang):
             state = "single"
             i += 1
             continue
@@ -1134,7 +1162,59 @@ def _next_token_starts_statement(source: str, newline_index: int) -> bool:
     return source[i] in "#@"
 
 
-def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool, lang: str = "") -> Optional[int]:
+def _ts_body_brace(source: str, colon: int, limit: int) -> Optional[int]:
+    """Scan the type after a TypeScript return colon for the body's opening brace."""
+    i = colon + 1
+    needs_type = True
+    while i < limit:
+        ch = source[i]
+        if ch == "\n" and not needs_type and _next_token_starts_statement(source, i):
+            return None
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "{" and not needs_type:
+            return i
+        if ch in "({[<":
+            end = _ts_match_close(source, i, limit, angle=True)
+            if end < 0:
+                return None
+            i = end + 1
+            needs_type = False
+            continue
+        if ch in ";})=" and not source.startswith("=>", i):
+            return None
+        if source.startswith("=>", i):
+            i += 2
+            needs_type = True
+            continue
+        if ch in "'\"`/":
+            end = _ts_skip_atom(source, i)
+            if end < 0:
+                return None
+            if end != i:
+                if ch != "/":
+                    needs_type = False
+                i = end
+                continue
+        if ch.isalpha() or ch in "_$":
+            start = i
+            i += 1
+            while i < limit and (source[i].isalnum() or source[i] in "_$"):
+                i += 1
+            word = source[start:i]
+            needs_type = (not needs_type and word in {"extends", "is"}) or (
+                needs_type and word == "keyof"
+                and not source[colon + 1:start].rstrip().endswith(".")
+            )
+            continue
+        needs_type = ch in "|&?:."
+        i += 1
+    return None
+
+
+def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
+                                lang: str = "", typed_lang: bool = False) -> Optional[int]:
     """
     Starting at `scan_from` (the position right after a regex match for a
     candidate definition signature), determine whether this location is a
@@ -1191,6 +1271,8 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
 
     state = "code"
     escape = False
+    tail_depth = 0
+    first_tail_token = True
     bound = min(n, i + _DEFINITION_SCAN_BOUND)
 
     while i < bound:
@@ -1199,7 +1281,8 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
 
         if state == "line_comment":
             if ch == "\n":
-                state = "code"
+                if not _cpp_line_splice(source, i, lang):
+                    state = "code"
             i += 1
             continue
         if state == "block_comment":
@@ -1237,7 +1320,7 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
             state = "block_comment"
             i += 2
             continue
-        if ch == "'":
+        if ch == "'" and not _cpp_digit_separator(source, i, lang):
             state = "single"
             i += 1
             continue
@@ -1250,6 +1333,16 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
             i += 1
             continue
 
+        if first_tail_token and not ch.isspace():
+            first_tail_token = False
+            if typed_lang and has_arg_list and ch == ":":
+                return _ts_body_brace(source, i, bound)
+        if ch == "(":
+            tail_depth += 1
+        elif ch == ")":
+            if not tail_depth:
+                return None  # a call inside a group opened before its own arguments
+            tail_depth -= 1
         if ch == "{":
             return i
         if ch == ";":
@@ -1266,26 +1359,29 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
     return None
 
 
-def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
+def _brace_candidate_patterns(target_name: str, typed_lang: bool = False,
+                              inline_members: bool = False) -> list[re.Pattern[str]]:
     name = re.escape(target_name)
-    # Generic type parameters between the name and the parenthesis are allowed, so many languages' signatures are found.
     tp = r"(?:\s*<[^(){};]*>|\s*\[[^(){};]*\])?"
+    # For TS, stop at the opening angle and balance the type parameters in
+    # the scanner. A regex can consume the next function's generic head.
+    args = r"\s*[(<]" if typed_lang else rf"{tp}\s*\("
     # A word of a return type, with its scope qualification and its template arguments
     # (HARDEN-8 D): `std::string`, `std::vector<int>`, `Widget::Ptr`, `unsigned long int`.
     # The qualification is what a C++ out-of-line method returns, and the type then stands
     # on its own line above the name just as often as on the same line.
     word = (r"[A-Za-z_$][\w$.]*(?:::[A-Za-z_$][\w$.]*)*"
             r"(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?(?:\[\s*\])*")
-    return [
+    patterns = [
         # function foo(...) {   function* gen() {   function identity<T>(a: T): T {
-        re.compile(rf"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*{name}{tp}\s*\("),
+        re.compile(rf"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*{name}{args}"),
         # func foo(...) { / func (r T) foo(...) { / func Map[T, U any](...) {
-        re.compile(rf"(?m)^\s*func\s+(?:\([^)]+\)\s*)?{name}{tp}\s*\("),
+        re.compile(rf"(?m)^\s*func\s+(?:\([^)]+\)\s*)?{name}{args}"),
         # const foo = (...) => { / let foo = async (...) => { / const f = <T>(x: T): T => {
         re.compile(rf"(?m)^\s*(?:export\s+)?(?:const|let|var)\s+{name}\s*(?::[^=;]+?)?=\s*(?:async\s*)?"
                    rf"(?:<[^(){{}};]*>\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[^=;{{}}]+?)?\s*=>"),
         # C-like method and function definitions without a return type (foo(...) {, static foo(...) {).
-        re.compile(rf"(?m)^\s*(?:public|private|protected|static|async|final|export|default|\s)*\*?\s*{name}{tp}\s*\("),
+        re.compile(rf"(?m)^\s*(?:public|private|protected|static|async|final|export|default|\s)*\*?\s*{name}{args}"),
         # C-like definitions with a return type; nested generics are matched to two levels (BUGFIX).
         re.compile(
             rf"(?m)^\s*"
@@ -1300,10 +1396,10 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
             # and a type written on the line above (`std::string` / `Widget::label()`) needs the
             # newline as its separator (HARDEN-8 D).
             rf"(?:{word}(?:[ \t]*[*&]+[ \t]*|[ \t]+|\n)){{0,3}}{word}(?:\s*[*&]+\s*|\s+)"
-            rf"(?:[\w$]+::)*{name}{tp}\s*\("
+            rf"(?:[\w$]+::)*{name}{args}"
         ),
         # class X { foo(...) { ... } }
-        re.compile(rf"(?m)^\s*{name}{tp}\s*\("),
+        re.compile(rf"(?m)^\s*{name}{args}"),
         # exports.h = function (...) {   h: function(...) {   Foo.prototype.h = async function* (...) {
         re.compile(rf"(?m)^\s*(?:(?:module\.)?exports\.|[\w$]+\.prototype\.|this\.)?{name}\s*[:=]\s*"
                    rf"(?:async\s+)?function\s*\*?\s*[\w$]*\s*\("),
@@ -1331,6 +1427,12 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
         # `internal suspend inline fun <reified T : Any> load(`, `fun String.shout(`
         re.compile(_kotlin_fun_head(name)),
     ]
+
+    if inline_members:
+        patterns.append(re.compile(
+            rf"(?<=\}})[ \t]*(?:{word}[ \t]+)+{name}{args}"
+        ))
+    return patterns
 
 
 def _kotlin_fun_head(name: str) -> str:
@@ -1460,7 +1562,90 @@ def _declaration_prefix_is_call(prefix: str) -> bool:
     return bool(_QUALIFICATION_ONLY.match(stripped))
 
 
-def _head_is_call(source: str, match: "re.Match[str]", target_name: str) -> bool:
+def _inside_control_condition(source: str, at: int, code_mask: bytearray) -> bool:
+    """Find an enclosing control condition in the bounded span before a head."""
+    limit = max(0, at - _DEFINITION_SCAN_BOUND)
+    braces = parens = 0
+    for i in range(at - 1, limit - 1, -1):
+        if code_mask[i] != _MASK_CODE:
+            continue
+        ch = source[i]
+        if ch == "}":
+            braces += 1
+        elif ch == "{":
+            if not braces:
+                break  # a surrounding body, not part of the condition's head
+            braces -= 1
+        elif not braces and ch == ")":
+            parens += 1
+        elif not braces and ch == "(":
+            if parens:
+                parens -= 1
+                continue
+            j = i - 1
+            while j >= limit and (code_mask[j] != _MASK_CODE or source[j].isspace()):
+                j -= 1
+            end = j + 1
+            while j >= limit and (source[j].isalnum() or source[j] in "_$"):
+                j -= 1
+            if source[j + 1:end] in {"if", "while", "for"}:
+                return True
+    return False
+
+
+def _continued_call_head(source: str, line_start: int, match_start: int, head: str,
+                         pos: int, target_name: str, code_mask: bytearray) -> bool:
+    """Whether a bare head continues a prior operator/call line.
+
+    Object properties also follow commas and can look like bare method heads,
+    so the comma case checks for an enclosing object literal before refusing it.
+    """
+    after = head[pos + len(target_name):].lstrip(" \t")
+    if after.startswith((":", "?:")):
+        return False
+    prefix_kind = _head_prefix_kind(head[:pos])
+    if prefix_kind not in {"bare", "modifiers"}:
+        return False
+    previous = line_start - 1
+    while previous >= 0 and (source[previous].isspace() or code_mask[previous] == _MASK_COMMENT):
+        previous -= 1
+    if previous < 0 or code_mask[previous] != _MASK_CODE:
+        return False
+    operator = source[previous]
+    if operator not in ",(+-*/%=!&|?:":
+        return False
+    if operator != ",":
+        return True
+
+    # A comma inside a call/array continues its argument list. A comma at the
+    # outer level of an object literal separates members, as in `plain() {}`.
+    delimiters: list[str] = []
+    lower = max(0, match_start - 4000)
+    for i in range(match_start - 1, lower - 1, -1):
+        if code_mask[i] != _MASK_CODE:
+            continue
+        ch = source[i]
+        if ch in ")]}":
+            delimiters.append({")": "(", "]": "[", "}": "{"}[ch])
+        elif ch in "([{":
+            if delimiters and delimiters[-1] == ch:
+                delimiters.pop()
+            elif ch == "{":
+                # The nearest unmatched brace can open an object in an
+                # argument list or array as well as after an assignment.
+                j = i - 1
+                while j >= lower and (code_mask[j] != _MASK_CODE or source[j].isspace()):
+                    j -= 1
+                if j >= lower and source[j] in "=:(,[?":
+                    return False
+                return not re.search(r"\breturn$", source[lower:j + 1])
+            else:
+                return True
+    return True
+
+
+def _head_is_call(source: str, match: "re.Match[str]", target_name: str, *,
+                  inline: bool = False, code_mask: bytearray | None = None) -> bool:
     """True when the matched head is a *call* of *target_name* rather than its definition (HARDEN-6 A).
 
     A call written before the definition matches the bare `name(` heads and the return-typed head
@@ -1468,7 +1653,7 @@ def _head_is_call(source: str, match: "re.Match[str]", target_name: str) -> bool
     happily walks past the rest of the caller into the real definition. A head whose name stands in
     a call's position is therefore not a definition head at all.
     """
-    line_start = _line_start_index(source, match.start())
+    line_start = match.start() if inline else _line_start_index(source, match.start())
     head = source[line_start:match.end()]
     pos = _head_name_position(head, target_name)
     if pos is None:
@@ -1483,7 +1668,20 @@ def _head_is_call(source: str, match: "re.Match[str]", target_name: str) -> bool
         # `this.h = function (` / `Foo.prototype.h = async function (` — the prefix is a member
         # access, but the head assigns a function expression: a definition all the same.
         return False
-    return _head_prefix_kind(head[:pos]) == "call"
+    kind = _head_prefix_kind(head[:pos])
+    if kind == "call":
+        return True
+    if code_mask is not None:
+        name_start = line_start + pos
+        physical_line_start = _line_start_index(source, name_start)
+        physical_head = source[physical_line_start:match.end()]
+        physical_pos = name_start - physical_line_start
+        if (_inside_control_condition(source, match.start(), code_mask)
+                or _continued_call_head(source, physical_line_start, name_start,
+                                        physical_head, physical_pos, target_name,
+                                        code_mask)):
+            return True
+    return False
 
 #: Characters a line may end on and still continue on the next line (`const clamp = (a, b) =>`,
 #: `const total = a +\n  b;`). Everything else ends the logical line.
@@ -1674,29 +1872,42 @@ def _find_earliest_genuine_definition(
     call site appearing anywhere could pre-empt patterns later in the list
     even when they'd have found the real, correctly-ordered definition.
     """
-    patterns = _brace_candidate_patterns(target_name)
+    patterns = _brace_candidate_patterns(target_name, typed_lang, inline_members=lang == "c" or ext == ".java")
     # AGNES-1 T79: a candidate head whose first character is inside a comment or a
     # string is not a definition of anything this file compiles, so every pass
     # shares one comment/string mask to reject such a match the moment it appears.
-    code_mask = _code_mask(source, lang)
+    code_mask = _code_mask(source, lang, mark_comments=True)
     best_start = None
     best_match_start = None
     best_open_brace = None
 
     for pat in patterns:
         for match in _iter_code_matches(pat, source, code_mask):
-            if _head_is_call(source, match, target_name):
-                # HARDEN-6 A: a call of the name written before the definition is not a head. It
-                # used to be accepted, and the brace search after its argument list walked past the
-                # rest of its caller into the real definition, so the block started at the call.
+            offset = match.start()
+            inline = offset > 0 and source[offset - 1] == "}"
+            if inline and code_mask[offset - 1] != _MASK_CODE:
                 continue
-            has_arg_list = match.group(0).rstrip().endswith("(")
-            open_idx = _find_definition_open_brace(source, match.end(), has_arg_list, lang)
+            if _head_is_call(source, match, target_name, inline=inline, code_mask=code_mask):
+                continue
+            scan_from = match.end()
+            if typed_lang and source[scan_from - 1] == "<":
+                limit = min(len(source), scan_from + _DEFINITION_SCAN_BOUND)
+                gt = _ts_match_close(source, scan_from - 1, limit, angle=True)
+                if gt < 0:
+                    continue
+                scan_from = gt + 1
+                while scan_from < limit and source[scan_from].isspace():
+                    scan_from += 1
+                if scan_from == limit or source[scan_from] != "(":
+                    continue
+                scan_from += 1
+            has_arg_list = source[scan_from - 1] == "("
+            open_idx = _find_definition_open_brace(source, scan_from, has_arg_list, lang, typed_lang)
             if open_idx is None:
                 continue
 
-            effective_start = _effective_match_start(source, match.start())
-            start = _line_start_index(source, effective_start)
+            effective_start = offset if inline else _effective_match_start(source, offset)
+            start = effective_start if inline else _line_start_index(source, effective_start)
             if best_start is None or start < best_start:
                 best_start = start
                 best_match_start = effective_start
@@ -2038,7 +2249,7 @@ def _find_earliest_property_arrow_definition(
 
     for pat in _property_arrow_candidate_patterns(target_name):
         for match in _iter_code_matches(pat, source, code_mask):
-            if _head_is_call(source, match, target_name):
+            if _head_is_call(source, match, target_name, code_mask=code_mask):
                 continue
             tail_start, head_typed = _property_arrow_tail(source, match)
             if tail_start is None:
@@ -2072,7 +2283,7 @@ def _find_earliest_property_arrow_definition(
     # object literal ends it, since it is not the property's body.
     for pat in _property_arrow_candidate_patterns(target_name):
         for match in _iter_code_matches(pat, source, code_mask):
-            if _head_is_call(source, match, target_name):
+            if _head_is_call(source, match, target_name, code_mask=code_mask):
                 continue
             tail_start, head_typed = _property_arrow_tail(source, match)
             if tail_start is None:
@@ -2629,6 +2840,8 @@ def _extract_brace_block(source: str, target_name: str, lang: str = "",
 
     match_start, open_idx, end = found
     start = _line_start_index(source, match_start)
+    if open_idx is not None and match_start > 0 and source[match_start - 1] == "}":
+        return source[match_start:end].lstrip(" \t")
     return source[start:end]
 
 

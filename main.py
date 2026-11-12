@@ -230,7 +230,11 @@ class Orchestrator(OrchestratorActions):
             # Parse into a fresh instance and swap only on success, so a bad file keeps the last-good config.
             _new_config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
             try:
-                _new_config.read(config_path, encoding="utf-8")
+                _new_config.read(config_path, encoding="utf-8-sig")
+            except UnicodeDecodeError as exc:
+                raise configparser.Error(
+                    f"{config_path} is not valid UTF-8: {exc}"
+                ) from exc
             except configparser.Error as exc:
                 raise configparser.Error(
                     f"{config_path} is not a valid .ini file: {exc}"
@@ -926,7 +930,10 @@ def _validate_typed_config_values(config_path: str, base_dir: str) -> None:
 
     probe = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
     try:
-        probe.read(config_path, encoding="utf-8")
+        probe.read(config_path, encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        print(f"Error: cannot read config file {config_path!r}: invalid UTF-8: {exc}", file=sys.stderr)
+        sys.exit(2)
     except configparser.Error:
         return  # load_config() / the --config existence checks report this clearly already
 
@@ -1135,7 +1142,7 @@ def main():
                 args.config,
             )
         config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
-        config.read(args.config, encoding="utf-8")
+        config.read(args.config, encoding="utf-8-sig")
 
         # Pass B and Pass C run only when a summarizer LLM call is built; this path used to pass None.
         llm_call = None

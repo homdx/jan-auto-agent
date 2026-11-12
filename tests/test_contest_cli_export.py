@@ -24,6 +24,12 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Pytest may load this symlinked file as a standalone smoke/regression entry.
+# In that case the neighboring harness is in the real tests/ folder.
+_TESTS_DIR = str(Path(__file__).resolve().parent)
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
 # The KC-16 harness, reused: the sandbox, the fake, the helpers and the fixtures.
 from test_contest_cli import (  # noqa: E402
     ROUND,

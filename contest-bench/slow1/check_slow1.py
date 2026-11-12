@@ -65,13 +65,29 @@ def backoff_zero(src: str) -> bool:
         return (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
                 and not isinstance(node.value, bool) and node.value == 0)
 
+    def const_truth(test):
+        # True / False for a literal condition or its `not`; None when it is not decided statically
+        if isinstance(test, ast.Constant):
+            return bool(test.value)
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            inner = const_truth(test.operand)
+            return None if inner is None else not inner
+        return None
+
     def own_nodes():
         # the function's own statements, not those of a nested function, lambda or class
-        stack = [n for n in func.body if not isinstance(n, _SCOPES)]
+        stack = list(func.body)
         while stack:
             n = stack.pop()
+            if isinstance(n, _SCOPES):
+                continue
             yield n
-            stack.extend(c for c in ast.iter_child_nodes(n) if not isinstance(c, _SCOPES))
+            if isinstance(n, ast.If) and const_truth(n.test) is not None:
+                stack.extend(n.body if const_truth(n.test) else n.orelse)
+            elif isinstance(n, ast.While) and const_truth(n.test) is False:
+                stack.extend(n.orelse)
+            else:
+                stack.extend(ast.iter_child_nodes(n))
 
     nodes = list(own_nodes())
 
@@ -106,10 +122,17 @@ def backoff_zero(src: str) -> bool:
         """What `ident.update(...)` or `setattr(ident, "<name>", v)` writes: keywords, a dict, a dict call, a name."""
         func = call.func
         if isinstance(func, ast.Attribute) and func.attr == "update" and is_ident(func.value, ident):
-            out = [event(k.value) for k in call.keywords if k.arg == name]
-            for arg in call.args:
-                out += of_value(arg, call.lineno, depth + 1)
-            return out
+            # Resolve the mapping's final value before moving its event to
+            # the call. Otherwise tied positions let True win over False.
+            values = [e for arg in call.args for e in of_value(arg, call.lineno, depth + 1)]
+            for keyword in call.keywords:
+                if keyword.arg == name:
+                    values = [event(keyword.value)]
+                elif keyword.arg is None:
+                    expanded = of_value(keyword.value, call.lineno, depth + 1)
+                    if expanded:
+                        values = expanded
+            return [(call.lineno, call.col_offset, max(values)[2])] if values else []
         if (isinstance(func, ast.Name) and func.id == "setattr" and len(call.args) == 3
                 and is_ident(call.args[0], ident) and isinstance(call.args[1], ast.Constant)
                 and call.args[1].value == name):
