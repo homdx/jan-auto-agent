@@ -262,11 +262,25 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture(scope="module")
 def server():
-    os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1"
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{srv.server_address[1]}"
-    srv.shutdown()
+    """A local HTTP server for the malformed ``/models`` replies, with the proxy
+    variables pinned to ``127.0.0.1`` for exactly the fixture's lifetime.  Each of
+    ``NO_PROXY`` / ``no_proxy`` is restored independently to its own original value
+    (a variable that was absent is absent afterwards), and the pinning is undone
+    even when a consuming test fails and when the server cannot be built or started."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("NO_PROXY", "127.0.0.1")
+        mp.setenv("no_proxy", "127.0.0.1")
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        try:
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+        except Exception:
+            srv.server_close()      # nothing was served: release the port, then undo the pinning
+            raise
+        try:
+            yield f"http://127.0.0.1:{srv.server_address[1]}"
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 @pytest.fixture(scope="module")

@@ -46,7 +46,8 @@ def backoff_zero(src: str) -> bool:
 
     The function is found in the parsed file (a decorator on the next function is no part of it). What counts
     is the setting of the *returned* object: a keyword of the returned call, a dict key of the returned literal,
-    or — for a returned name — the call or dict it was bound to, then any attribute or key assigned to it later.
+    or — for a returned name — the call or dict it was bound to, then any attribute or key assigned to it later
+    (plain or annotated), an `.update(...)` or a `setattr` on it.
     A setting on an object that is never returned is ignored. A return of another shape falls back to the last
     setting written anywhere in the function.
     """
@@ -92,22 +93,49 @@ def backoff_zero(src: str) -> bool:
             return of_name(node.id, before, depth)
         return []
 
+    def is_ident(node, ident):
+        return isinstance(node, ast.Name) and node.id == ident
+
+    def sets_name(target, ident):
+        """`ident.<name>` or `ident["<name>"]` as an assignment target."""
+        return (isinstance(target, ast.Attribute) and target.attr == name and is_ident(target.value, ident)) or (
+            isinstance(target, ast.Subscript) and is_ident(target.value, ident)
+            and isinstance(target.slice, ast.Constant) and target.slice.value == name)
+
+    def of_update(call, ident, depth):
+        """What `ident.update(...)` or `setattr(ident, "<name>", v)` writes: keywords, a dict, a dict call, a name."""
+        func = call.func
+        if isinstance(func, ast.Attribute) and func.attr == "update" and is_ident(func.value, ident):
+            out = [event(k.value) for k in call.keywords if k.arg == name]
+            for arg in call.args:
+                out += of_value(arg, call.lineno, depth + 1)
+            return out
+        if (isinstance(func, ast.Name) and func.id == "setattr" and len(call.args) == 3
+                and is_ident(call.args[0], ident) and isinstance(call.args[1], ast.Constant)
+                and call.args[1].value == name):
+            return [event(call.args[2])]
+        return []
+
     def of_name(ident, before, depth):
-        binds = [n for n in nodes if isinstance(n, ast.Assign) and n.lineno < before
-                 and any(isinstance(t, ast.Name) and t.id == ident for t in n.targets)]
+        def binds_ident(n):
+            if isinstance(n, ast.Assign):
+                return any(is_ident(t, ident) for t in n.targets)
+            return isinstance(n, ast.AnnAssign) and n.value is not None and is_ident(n.target, ident)
+
+        binds = [n for n in nodes if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.lineno < before and binds_ident(n)]
         if not binds:
             return []
         bind = max(binds, key=lambda n: (n.lineno, n.col_offset))
         found = of_value(bind.value, bind.lineno, depth + 1)
         for n in nodes:
-            if not isinstance(n, ast.Assign) or not bind.lineno < n.lineno < before:
+            if not bind.lineno < getattr(n, "lineno", 0) < before:
                 continue
-            for t in n.targets:
-                if (isinstance(t, ast.Attribute) and t.attr == name and isinstance(t.value, ast.Name)
-                        and t.value.id == ident) or (
-                        isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id == ident
-                        and isinstance(t.slice, ast.Constant) and t.slice.value == name):
-                    found.append(event(n.value))
+            if isinstance(n, ast.Assign) and any(sets_name(t, ident) for t in n.targets):
+                found.append(event(n.value))
+            elif isinstance(n, ast.AnnAssign) and n.value is not None and sets_name(n.target, ident):
+                found.append(event(n.value))
+            elif isinstance(n, ast.Call):
+                found += of_update(n, ident, depth)
         return found
 
     verdicts = []
