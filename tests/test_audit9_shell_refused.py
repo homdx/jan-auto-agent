@@ -23,6 +23,24 @@ def test_case_pattern_closer_does_not_hide_later_unmatched_parentheses():
     assert is_well_formed("(case x in a) echo ok;; esac)")
     assert not is_well_formed("case x in a) echo ok;; esac )")
     assert not is_well_formed("case x in a) echo ok;;")
+    assert not is_well_formed("case x in a) echo ok ) ;; esac")
+    assert not is_well_formed("(case x in a) echo ok;; b) echo other;; esac))")
+    assert not is_well_formed("case x in () echo ok;; esac")
+
+
+def test_case_arms_balance_independently_of_surrounding_shell_groups():
+    for command in (
+        "(case x in a) echo a;; b) echo b;; esac)",
+        "case x in (a) echo a;; (b|c) (echo b);; esac",
+        "case x in esac",
+        "case in in in) echo in;; esac",
+        "case x in a) case y in b) echo b;; esac;;& c) echo c;; esac",
+        "case x in a) echo a;& b) echo b; esac",
+        "case { in '{') echo ok;; esac",
+        "case x in @(a|+(b))) echo ok;; esac",
+        "'case' x",
+    ):
+        assert is_well_formed(command), command
 
 
 def test_quoted_operands_and_case_patterns_keep_their_shell_meaning():

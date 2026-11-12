@@ -59,6 +59,18 @@ def test_call_like_head_continued_from_operator_is_skipped():
         assert result == "function f(y) { return y; }"
 
 
+def test_object_method_after_comma_in_a_call_or_array_is_preserved():
+    definition = "  f() { return 1 }"
+    obj = "{\n  a() {},\n" + definition + "\n}"
+    for source in (
+        "register(" + obj + ");",
+        "const items = [" + obj + "];",
+        "register(0, /* options */ " + obj + ");",
+        "const item = " + obj + ";",
+    ):
+        assert _block(source) == definition
+
+
 def test_cpp_digit_separator_and_spliced_line_comment_do_not_hide_body_end():
     digit_sep = "int f() {\n  int n = 1'000;\n  if (n) { return 1; }\n  return 2;\n}\nint other() { return 3; }\n"
     comment = "int f() {\n  // note \\\n  }\n  return 1;\n}\nint other() { return 3; }\n"

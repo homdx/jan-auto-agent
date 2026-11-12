@@ -1000,24 +1000,6 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
     return code
 
 
-@functools.lru_cache(maxsize=8)
-def _brace_context_by_line(source: str) -> dict[int, int]:
-    """Map physical line starts to the nearest unmatched code brace."""
-    mask = _code_mask(source)
-    stack: list[int] = []
-    context = {0: -1}
-    for i, ch in enumerate(source):
-        if i and source[i - 1] == "\n":
-            context[i] = stack[-1] if stack else -1
-        if not mask[i]:
-            continue
-        if ch == "{":
-            stack.append(i)
-        elif ch == "}" and stack:
-            stack.pop()
-    return context
-
-
 def _iter_code_matches(pat: re.Pattern[str], source: str, code_mask: Optional[bytearray]):
     """`pat.finditer(source)` restricted to candidate matches whose head starts in
     real code — a head whose first character is inside a comment or a string is
@@ -1651,15 +1633,17 @@ def _continued_call_head(source: str, line_start: int, match_start: int, head: s
         elif ch in "([{":
             if delimiters and delimiters[-1] == ch:
                 delimiters.pop()
-            elif ch in "([":
-                return True
+            elif ch == "{":
+                # The nearest unmatched brace can open an object in an
+                # argument list or array as well as after an assignment.
+                j = i - 1
+                while j >= lower and (not code_mask[j] or source[j].isspace()):
+                    j -= 1
+                if j >= lower and source[j] in "=:(,[?":
+                    return False
+                return not re.search(r"\breturn$", source[lower:j + 1])
             else:
-                break
-    open_brace = _brace_context_by_line(source).get(line_start, -1)
-    if open_brace >= 0:
-        before_open = source[:open_brace].rstrip()
-        if before_open.endswith(("=", ":", "return")):
-            return False
+                return True
     return True
 
 
@@ -1673,7 +1657,6 @@ def _head_is_call(source: str, match: "re.Match[str]", target_name: str, *,
     a call's position is therefore not a definition head at all.
     """
     line_start = match.start() if inline else _line_start_index(source, match.start())
-    physical_line_start = _line_start_index(source, match.start())
     head = source[line_start:match.end()]
     pos = _head_name_position(head, target_name)
     if pos is None:
@@ -1692,7 +1675,7 @@ def _head_is_call(source: str, match: "re.Match[str]", target_name: str, *,
     if kind == "call":
         return True
     if code_mask is not None:
-        name_start = match.start() + pos
+        name_start = line_start + pos
         physical_line_start = _line_start_index(source, name_start)
         physical_head = source[physical_line_start:match.end()]
         physical_pos = name_start - physical_line_start

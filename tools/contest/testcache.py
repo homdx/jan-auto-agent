@@ -91,6 +91,8 @@ _SEP = "SEP"
 #: onto later segments.
 _OPEN = "\x00OPEN"
 _CLOSE = "\x00CLOSE"
+_CASE_ARM_END = "\x00CASE_ARM_END"
+_LITERAL_WORD = "\x00LITERAL_WORD"
 
 #: The tool killed the call; whatever pytest printed before is not an answer.
 _KILLED = "terminated command after exceeding timeout"
@@ -219,7 +221,7 @@ def _parameter_end(command: str, i: int) -> int:
     raise ValueError("unclosed parameter expansion")
 
 
-def _tokenize(command: str) -> list:
+def _tokenize(command: str, *, syntax: bool = False) -> list:
     """*command* as a flat list of words, with ``_SEP`` between simple commands.
 
     A small hand-written scanner rather than ``shlex`` alone: shlex has no
@@ -232,22 +234,27 @@ def _tokenize(command: str) -> list:
     ``$(`` that is never closed is a syntax error in the shell, so it raises
     ``ValueError`` (``parse_pytest`` turns that into "no run": a command the shell
     refuses must not be answered from a cached green summary).
+
+    Syntax checks also need to distinguish case arm separators from ordinary
+    separators, and quoted words from shell keywords.
     """
     tokens: list = []
     word: list = []
-    in_word = False
+    in_word = quoted = False
     i, n = 0, len(command)
 
     def flush() -> None:
-        nonlocal in_word
+        nonlocal in_word, quoted
         if in_word:
             text = "".join(word)
-            if text in ("{", "}"):
+            if syntax and quoted:
+                tokens.append(_LITERAL_WORD)
+            elif not syntax and text in ("{", "}"):
                 tokens.append(_SEP)
             else:
                 tokens.append(text)
         word.clear()
-        in_word = False
+        in_word = quoted = False
 
     def sep() -> None:
         flush()
@@ -259,7 +266,7 @@ def _tokenize(command: str) -> list:
         if ch == "\\" and i + 1 < n:
             if command[i + 1] != "\n":
                 word.append(command[i + 1])
-                in_word = True
+                in_word = quoted = True
             i += 2
             continue
         if ch == "'":
@@ -267,13 +274,13 @@ def _tokenize(command: str) -> list:
             if end < 0:
                 raise ValueError("unclosed single quote")
             word.append(command[i + 1:end])
-            in_word = True
+            in_word = quoted = True
             i = end + 1
             continue
         if ch == '"':
             j = _dquote_end(command, i)
             word.append(command[i + 1:j].replace('\\"', '"'))
-            in_word = True
+            in_word = quoted = True
             i = j + 1
             continue
         if ch == "`":
@@ -303,6 +310,11 @@ def _tokenize(command: str) -> list:
             end = command.find("\n", i)
             i = n if end < 0 else end
             continue
+        if syntax and command.startswith((";;", ";&"), i):
+            flush()
+            tokens.append(_CASE_ARM_END)
+            i += 3 if command.startswith(";;&", i) else 2
+            continue
         if ch in "\n;":
             sep()
             i += 1
@@ -330,7 +342,7 @@ def _tokenize(command: str) -> list:
         i += 1
     flush()
     # A subshell that never closes is a syntax error too (a stray ``)`` is left alone: a ``case`` pattern has one).
-    if tokens.count(_OPEN) > tokens.count(_CLOSE):
+    if not syntax and tokens.count(_OPEN) > tokens.count(_CLOSE):
         raise ValueError("unclosed parenthesis")
     return [t for t in tokens]
 
@@ -341,7 +353,7 @@ def is_well_formed(command: str) -> bool:
     Such a command ran nothing, so no answer for it may come from the cache or from a classifier.
     """
     try:
-        tokens = _tokenize(command)
+        tokens = _tokenize(command, syntax=True)
         visible = _shell_syntax_view(command)
     except ValueError:
         return False
@@ -360,10 +372,62 @@ def is_well_formed(command: str) -> bool:
 def _shell_groups_well_formed(tokens: list) -> bool:
     """Balance shell groups and `case` arms in the tokenizer's token stream."""
     depth = 0
-    cases: list[str] = []
+    cases: list[tuple[int, str]] = []
+    pattern_depth = 0
     command_start = True
     for token in tokens:
-        if token == _SEP:
+        if cases:
+            case_depth, phase = cases[-1]
+            if phase != "body":
+                if token == _SEP:
+                    continue
+                if phase == "subject":
+                    if token in {_OPEN, _CLOSE, _CASE_ARM_END}:
+                        return False
+                    cases[-1] = (case_depth, "in")
+                elif phase == "in":
+                    if token != "in":
+                        return False
+                    cases[-1] = (case_depth, "pattern_start")
+                elif phase == "pattern_start" and token == "esac":
+                    cases.pop()
+                    command_start = False
+                elif token == _OPEN:
+                    if phase == "pattern_start":
+                        cases[-1] = (case_depth, "pattern_open")
+                    elif phase == "pattern":
+                        pattern_depth += 1
+                    else:
+                        return False
+                elif token == _CLOSE:
+                    if phase != "pattern":
+                        return False
+                    if pattern_depth:
+                        pattern_depth -= 1
+                    else:
+                        cases[-1] = (case_depth, "body")
+                        command_start = True
+                elif token == _CASE_ARM_END:
+                    return False
+                else:
+                    cases[-1] = (case_depth, "pattern")
+                continue
+            if token == _CASE_ARM_END:
+                if depth != case_depth:
+                    return False
+                cases[-1] = (case_depth, "pattern_start")
+                continue
+            if depth == case_depth:
+                if token == _CLOSE:
+                    return False
+                if command_start and token == "esac":
+                    cases.pop()
+                    command_start = False
+                    continue
+
+        if token == _CASE_ARM_END:
+            return False
+        if token in {_SEP, "{", "}"}:
             command_start = True
             continue
         if token == _OPEN:
@@ -371,10 +435,6 @@ def _shell_groups_well_formed(tokens: list) -> bool:
             command_start = True
             continue
         if token == _CLOSE:
-            if cases and (cases[-1] == "pattern" or (cases[-1] == "body" and depth == 0)):
-                cases[-1] = "body"
-                command_start = True
-                continue
             if depth == 0:
                 return False
             depth -= 1
@@ -382,19 +442,11 @@ def _shell_groups_well_formed(tokens: list) -> bool:
             continue
 
         if command_start and token == "case":
-            cases.append("expression")
+            cases.append((depth, "subject"))
             command_start = False
             continue
-        if cases and cases[-1] == "expression" and token == "in":
-            cases[-1] = "pattern"
-            command_start = True
-            continue
-        if cases and cases[-1] == "body" and command_start and token == "esac":
-            cases.pop()
-            command_start = True
-            continue
 
-        command_start = token in {"then", "do", "else", "elif"}
+        command_start = command_start and token in {"if", "while", "until", "then", "do", "else", "elif"}
 
     return depth == 0 and not cases
 
