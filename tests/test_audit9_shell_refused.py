@@ -18,6 +18,13 @@ def test_valid_shell_controls_stay_accepted():
         assert is_well_formed(command), command
 
 
+def test_case_pattern_closer_does_not_hide_later_unmatched_parentheses():
+    assert is_well_formed("case x in a) echo ok;; esac")
+    assert is_well_formed("(case x in a) echo ok;; esac)")
+    assert not is_well_formed("case x in a) echo ok;; esac )")
+    assert not is_well_formed("case x in a) echo ok;;")
+
+
 def test_quoted_operands_and_case_patterns_keep_their_shell_meaning():
     for command in (
         "pytest -q > 'results.txt'",

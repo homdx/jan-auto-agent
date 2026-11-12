@@ -1000,6 +1000,24 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
     return code
 
 
+@functools.lru_cache(maxsize=8)
+def _brace_context_by_line(source: str) -> dict[int, int]:
+    """Map physical line starts to the nearest unmatched code brace."""
+    mask = _code_mask(source)
+    stack: list[int] = []
+    context = {0: -1}
+    for i, ch in enumerate(source):
+        if i and source[i - 1] == "\n":
+            context[i] = stack[-1] if stack else -1
+        if not mask[i]:
+            continue
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            stack.pop()
+    return context
+
+
 def _iter_code_matches(pat: re.Pattern[str], source: str, code_mask: Optional[bytearray]):
     """`pat.finditer(source)` restricted to candidate matches whose head starts in
     real code — a head whose first character is inside a comment or a string is
@@ -1587,6 +1605,64 @@ def _inside_control_condition(source: str, at: int, code_mask: bytearray) -> boo
     return False
 
 
+def _continued_call_head(source: str, line_start: int, match_start: int, head: str,
+                         pos: int, target_name: str, code_mask: bytearray) -> bool:
+    """Whether a bare head continues a prior operator/call line.
+
+    Object properties also follow commas and can look like bare method heads,
+    so the comma case checks for an enclosing object literal before refusing it.
+    """
+    after = head[pos + len(target_name):].lstrip(" \t")
+    if after.startswith((":", "?:")):
+        return False
+    prefix_kind = _head_prefix_kind(head[:pos])
+    if prefix_kind not in {"bare", "modifiers"}:
+        return False
+    previous_end = line_start
+    while previous_end and source[previous_end - 1] in " \t\r\n":
+        previous_end -= 1
+    if previous_end <= 0:
+        return False
+    previous_start = source.rfind("\n", 0, previous_end) + 1
+    previous = source[previous_start:previous_end]
+    if not previous or previous.endswith(("/*", "*/")):
+        return False
+    last_code = previous_end - 1
+    if not code_mask[last_code]:
+        return False
+    if previous.endswith(("&&", "||")):
+        return True
+    operator_tail = (",", "(", "+", "-", "*", "/", "%", "=", "!", "&", "|", "?", ":")
+    if not previous.endswith(operator_tail):
+        return False
+    if not previous.endswith(","):
+        return True
+
+    # A comma inside a call/array continues its argument list. A comma at the
+    # outer level of an object literal separates members, as in `plain() {}`.
+    delimiters: list[str] = []
+    lower = max(0, match_start - 4000)
+    for i in range(match_start - 1, lower - 1, -1):
+        if not code_mask[i]:
+            continue
+        ch = source[i]
+        if ch in ")]}":
+            delimiters.append({")": "(", "]": "[", "}": "{"}[ch])
+        elif ch in "([{":
+            if delimiters and delimiters[-1] == ch:
+                delimiters.pop()
+            elif ch in "([":
+                return True
+            else:
+                break
+    open_brace = _brace_context_by_line(source).get(line_start, -1)
+    if open_brace >= 0:
+        before_open = source[:open_brace].rstrip()
+        if before_open.endswith(("=", ":", "return")):
+            return False
+    return True
+
+
 def _head_is_call(source: str, match: "re.Match[str]", target_name: str, *,
                   inline: bool = False, code_mask: bytearray | None = None) -> bool:
     """True when the matched head is a *call* of *target_name* rather than its definition (HARDEN-6 A).
@@ -1597,6 +1673,7 @@ def _head_is_call(source: str, match: "re.Match[str]", target_name: str, *,
     a call's position is therefore not a definition head at all.
     """
     line_start = match.start() if inline else _line_start_index(source, match.start())
+    physical_line_start = _line_start_index(source, match.start())
     head = source[line_start:match.end()]
     pos = _head_name_position(head, target_name)
     if pos is None:
@@ -1612,10 +1689,19 @@ def _head_is_call(source: str, match: "re.Match[str]", target_name: str, *,
         # access, but the head assigns a function expression: a definition all the same.
         return False
     kind = _head_prefix_kind(head[:pos])
-    return kind == "call" or (
-        kind in {"bare", "modifiers"} and code_mask is not None
-        and _inside_control_condition(source, match.start(), code_mask)
-    )
+    if kind == "call":
+        return True
+    if code_mask is not None:
+        name_start = match.start() + pos
+        physical_line_start = _line_start_index(source, name_start)
+        physical_head = source[physical_line_start:match.end()]
+        physical_pos = name_start - physical_line_start
+        if (_inside_control_condition(source, match.start(), code_mask)
+                or _continued_call_head(source, physical_line_start, name_start,
+                                        physical_head, physical_pos, target_name,
+                                        code_mask)):
+            return True
+    return False
 
 #: Characters a line may end on and still continue on the next line (`const clamp = (a, b) =>`,
 #: `const total = a +\n  b;`). Everything else ends the logical line.
@@ -2183,7 +2269,7 @@ def _find_earliest_property_arrow_definition(
 
     for pat in _property_arrow_candidate_patterns(target_name):
         for match in _iter_code_matches(pat, source, code_mask):
-            if _head_is_call(source, match, target_name):
+            if _head_is_call(source, match, target_name, code_mask=code_mask):
                 continue
             tail_start, head_typed = _property_arrow_tail(source, match)
             if tail_start is None:
@@ -2217,7 +2303,7 @@ def _find_earliest_property_arrow_definition(
     # object literal ends it, since it is not the property's body.
     for pat in _property_arrow_candidate_patterns(target_name):
         for match in _iter_code_matches(pat, source, code_mask):
-            if _head_is_call(source, match, target_name):
+            if _head_is_call(source, match, target_name, code_mask=code_mask):
                 continue
             tail_start, head_typed = _property_arrow_tail(source, match)
             if tail_start is None:

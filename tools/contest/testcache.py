@@ -183,6 +183,42 @@ def _subst_end(command: str, i: int) -> int:
     raise ValueError("unclosed command substitution")
 
 
+def _parameter_end(command: str, i: int) -> int:
+    """Index of the brace closing a ``${...}`` parameter expansion."""
+    j, n = i + 2, len(command)
+    depth = 1
+    while j < n:
+        ch = command[j]
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == "'":
+            end = command.find("'", j + 1)
+            if end < 0:
+                raise ValueError("unclosed single quote")
+            j = end + 1
+            continue
+        if ch == '"':
+            j = _dquote_end(command, j) + 1
+            continue
+        if ch == "`":
+            j = _backtick_end(command, j) + 1
+            continue
+        if ch == "$" and command[j + 1:j + 2] == "(":
+            j = _subst_end(command, j) + 1
+            continue
+        if command.startswith("${", j):
+            depth += 1
+            j += 2
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    raise ValueError("unclosed parameter expansion")
+
+
 def _tokenize(command: str) -> list:
     """*command* as a flat list of words, with ``_SEP`` between simple commands.
 
@@ -252,6 +288,12 @@ def _tokenize(command: str) -> list:
             in_word = True
             i = end + 1
             continue
+        if command.startswith("${", i):
+            end = _parameter_end(command, i)
+            word.append(command[i:end + 1])
+            in_word = True
+            i = end + 1
+            continue
         if ch in " \t\r":
             flush()
             i += 1
@@ -299,7 +341,7 @@ def is_well_formed(command: str) -> bool:
     Such a command ran nothing, so no answer for it may come from the cache or from a classifier.
     """
     try:
-        _tokenize(command)
+        tokens = _tokenize(command)
         visible = _shell_syntax_view(command)
     except ValueError:
         return False
@@ -308,21 +350,53 @@ def is_well_formed(command: str) -> bool:
         return False
     if re.search(r"(?:\d*>>?|<<?|&>)$", tail):
         return False
-    # Case arms have their own parentheses, including a bare closing paren.
-    # Leave them to the existing tokenizer instead of counting them as groups.
-    if re.search(r"(?:^|[;\n|&({])\s*(?:(?:then|do|else)\s+)?case\s+[^\s;()|&]+\s+in\b", visible):
-        return True
-    depth = 0
-    for ch in visible:
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth < 0:
-                return False
-    if depth:
+    # A case arm's `)` is a pattern delimiter rather than a subshell closer;
+    # consume that delimiter while still checking groups after `esac`.
+    if not _shell_groups_well_formed(tokens):
         return False
     return True
+
+
+def _shell_groups_well_formed(tokens: list) -> bool:
+    """Balance shell groups and `case` arms in the tokenizer's token stream."""
+    depth = 0
+    cases: list[str] = []
+    command_start = True
+    for token in tokens:
+        if token == _SEP:
+            command_start = True
+            continue
+        if token == _OPEN:
+            depth += 1
+            command_start = True
+            continue
+        if token == _CLOSE:
+            if cases and (cases[-1] == "pattern" or (cases[-1] == "body" and depth == 0)):
+                cases[-1] = "body"
+                command_start = True
+                continue
+            if depth == 0:
+                return False
+            depth -= 1
+            command_start = True
+            continue
+
+        if command_start and token == "case":
+            cases.append("expression")
+            command_start = False
+            continue
+        if cases and cases[-1] == "expression" and token == "in":
+            cases[-1] = "pattern"
+            command_start = True
+            continue
+        if cases and cases[-1] == "body" and command_start and token == "esac":
+            cases.pop()
+            command_start = True
+            continue
+
+        command_start = token in {"then", "do", "else", "elif"}
+
+    return depth == 0 and not cases
 
 
 def _shell_syntax_view(command: str) -> str:

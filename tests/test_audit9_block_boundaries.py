@@ -46,6 +46,19 @@ def test_multiline_if_call_before_definition_is_skipped_for_ts_java_cpp():
         assert "run();" not in result
 
 
+def test_call_like_head_continued_from_operator_is_skipped():
+    for continuation in ("&&", "||", "+"):
+        source = (
+            "function g() {\n"
+            f"  ready {continuation}\n"
+            "    f(x) { run(); }\n"
+            "}\n"
+            "function f(y) { return y; }"
+        )
+        result = _block(source)
+        assert result == "function f(y) { return y; }"
+
+
 def test_cpp_digit_separator_and_spliced_line_comment_do_not_hide_body_end():
     digit_sep = "int f() {\n  int n = 1'000;\n  if (n) { return 1; }\n  return 2;\n}\nint other() { return 3; }\n"
     comment = "int f() {\n  // note \\\n  }\n  return 1;\n}\nint other() { return 3; }\n"
