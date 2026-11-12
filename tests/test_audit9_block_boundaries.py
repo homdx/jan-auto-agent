@@ -80,6 +80,29 @@ def test_object_method_after_comma_in_a_call_or_array_is_preserved():
         assert _block(source) == definition
 
 
+def test_continuation_respects_comment_and_regex_boundaries():
+    definition = "function f() { return true; }"
+    for condition in (
+        "ready /* explanatory note */ &&",
+        "/[//]/.test('x') &&",
+        "ready && /* trailing\n    note */",
+        "ready &&\n    // note on its own line",
+        "ready && // " + "note " * 100,
+    ):
+        source = (
+            "function g(ready: boolean) {\n"
+            f"  return {condition}\n"
+            "    f() && (() => { return true; })();\n"
+            "}\n" + definition
+        )
+        assert _block(source) == definition
+
+
+def test_string_with_comment_markers_ends_the_class_field_before_a_method():
+    source = 'class C {\n  label = "/* text */ // text" // comment\n  f() { return 1 }\n}'
+    assert _block(source) == "  f() { return 1 }"
+
+
 def test_cpp_digit_separator_and_spliced_line_comment_do_not_hide_body_end():
     digit_sep = "int f() {\n  int n = 1'000;\n  if (n) { return 1; }\n  return 2;\n}\nint other() { return 3; }\n"
     comment = "int f() {\n  // note \\\n  }\n  return 1;\n}\nint other() { return 3; }\n"

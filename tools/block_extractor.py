@@ -854,8 +854,12 @@ def _js_regex_end(source: str, i: int) -> Optional[int]:
     return None
 
 
+_MASK_CODE = 1
+_MASK_COMMENT = 2
+
+
 @functools.lru_cache(maxsize=8)
-def _code_mask(source: str, lang: str = "") -> bytearray:
+def _code_mask(source: str, lang: str = "", *, mark_comments: bool = False) -> bytearray:
     """A bytearray with 1 where *source[i]* is real code and 0 where it is inside a
     comment, a string or a char literal — the lexer state machine of
     `_brace_scan_end`, recorded as it walks. A candidate definition head whose
@@ -863,10 +867,12 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
     definition: `int proto(int a);` inside a `/* … */` comment is not the
     declaration of `proto` (AGNES-1 T79). The skipped spans of `_lang_skip`
     (a JS regex, a C preprocessor line, a Rust lifetime/char) are still code —
-    they are neither comments nor strings. Cached and read only: extracting many
-    symbols of one file walks it once."""
+    they are neither comments nor strings. With *mark_comments*, comment bytes
+    are 2 so a continuation check can skip comments while keeping literals as
+    operands. Cached and read only: extracting many symbols of one file walks it once."""
     n = len(source)
     code = bytearray(b"\x01") * n
+    comment = _MASK_COMMENT if mark_comments else 0
     state = "code"  # code, single, double, triple, backtick, line_comment, block_comment, char
     escape = False
     #: JS: one entry per open `${ … }` of a template string, its count of unclosed `{` inside it
@@ -892,7 +898,7 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
             continue
 
         if state == "line_comment":
-            code[i] = 0
+            code[i] = comment
             if ch == "\n":
                 if not _cpp_line_splice(source, i, lang):
                     state = "code"
@@ -900,10 +906,10 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
             continue
 
         if state == "block_comment":
-            code[i] = 0
+            code[i] = comment
             if ch == "*" and nxt == "/":
                 state = "code"
-                code[i + 1] = 0
+                code[i + 1] = comment
                 i += 2
             else:
                 i += 1
@@ -949,12 +955,12 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
                 continue
         if ch == "/" and nxt == "/":
             state = "line_comment"
-            code[i] = code[i + 1] = 0
+            code[i] = code[i + 1] = comment
             i += 2
             continue
         if ch == "/" and nxt == "*":
             state = "block_comment"
-            code[i] = code[i + 1] = 0
+            code[i] = code[i + 1] = comment
             i += 2
             continue
         if ch == "'" and _cpp_digit_separator(source, i, lang):
@@ -1007,7 +1013,7 @@ def _iter_code_matches(pat: re.Pattern[str], source: str, code_mask: Optional[by
     *code_mask* every match is yielded, so a caller that does not filter keeps the
     old behaviour."""
     for match in pat.finditer(source):
-        if code_mask is None or code_mask[_effective_match_start(source, match.start())]:
+        if code_mask is None or code_mask[_effective_match_start(source, match.start())] == _MASK_CODE:
             yield match
 
 
@@ -1561,7 +1567,7 @@ def _inside_control_condition(source: str, at: int, code_mask: bytearray) -> boo
     limit = max(0, at - _DEFINITION_SCAN_BOUND)
     braces = parens = 0
     for i in range(at - 1, limit - 1, -1):
-        if not code_mask[i]:
+        if code_mask[i] != _MASK_CODE:
             continue
         ch = source[i]
         if ch == "}":
@@ -1577,7 +1583,7 @@ def _inside_control_condition(source: str, at: int, code_mask: bytearray) -> boo
                 parens -= 1
                 continue
             j = i - 1
-            while j >= limit and (not code_mask[j] or source[j].isspace()):
+            while j >= limit and (code_mask[j] != _MASK_CODE or source[j].isspace()):
                 j -= 1
             end = j + 1
             while j >= limit and (source[j].isalnum() or source[j] in "_$"):
@@ -1585,38 +1591,6 @@ def _inside_control_condition(source: str, at: int, code_mask: bytearray) -> boo
             if source[j + 1:end] in {"if", "while", "for"}:
                 return True
     return False
-
-
-def _strip_trailing_comments(line: str) -> str:
-    """Remove comments outside quoted strings from one physical source line."""
-    quote = ""
-    escaped = False
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if quote:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == quote:
-                quote = ""
-            i += 1
-            continue
-        if ch in "'\"`":
-            quote = ch
-            i += 1
-            continue
-        if line.startswith("//", i):
-            return line[:i]
-        if line.startswith("/*", i):
-            end = line.find("*/", i + 2)
-            if end < 0:
-                return line[:i]
-            line = line[:i] + " " + line[end + 2:]
-            continue
-        i += 1
-    return line
 
 
 def _continued_call_head(source: str, line_start: int, match_start: int, head: str,
@@ -1632,24 +1606,15 @@ def _continued_call_head(source: str, line_start: int, match_start: int, head: s
     prefix_kind = _head_prefix_kind(head[:pos])
     if prefix_kind not in {"bare", "modifiers"}:
         return False
-    previous_end = line_start
-    while previous_end and source[previous_end - 1] in " \t\r\n":
-        previous_end -= 1
-    if previous_end <= 0:
+    previous = line_start - 1
+    while previous >= 0 and (source[previous].isspace() or code_mask[previous] == _MASK_COMMENT):
+        previous -= 1
+    if previous < 0 or code_mask[previous] != _MASK_CODE:
         return False
-    previous_start = source.rfind("\n", 0, previous_end) + 1
-    previous = _strip_trailing_comments(source[previous_start:previous_end]).rstrip()
-    if not previous:
+    operator = source[previous]
+    if operator not in ",(+-*/%=!&|?:":
         return False
-    last_code = previous_start + len(previous) - 1
-    if not code_mask[last_code]:
-        return False
-    if previous.endswith(("&&", "||")):
-        return True
-    operator_tail = (",", "(", "+", "-", "*", "/", "%", "=", "!", "&", "|", "?", ":")
-    if not previous.endswith(operator_tail):
-        return False
-    if not previous.endswith(","):
+    if operator != ",":
         return True
 
     # A comma inside a call/array continues its argument list. A comma at the
@@ -1657,7 +1622,7 @@ def _continued_call_head(source: str, line_start: int, match_start: int, head: s
     delimiters: list[str] = []
     lower = max(0, match_start - 4000)
     for i in range(match_start - 1, lower - 1, -1):
-        if not code_mask[i]:
+        if code_mask[i] != _MASK_CODE:
             continue
         ch = source[i]
         if ch in ")]}":
@@ -1669,7 +1634,7 @@ def _continued_call_head(source: str, line_start: int, match_start: int, head: s
                 # The nearest unmatched brace can open an object in an
                 # argument list or array as well as after an assignment.
                 j = i - 1
-                while j >= lower and (not code_mask[j] or source[j].isspace()):
+                while j >= lower and (code_mask[j] != _MASK_CODE or source[j].isspace()):
                     j -= 1
                 if j >= lower and source[j] in "=:(,[?":
                     return False
@@ -1911,7 +1876,7 @@ def _find_earliest_genuine_definition(
     # AGNES-1 T79: a candidate head whose first character is inside a comment or a
     # string is not a definition of anything this file compiles, so every pass
     # shares one comment/string mask to reject such a match the moment it appears.
-    code_mask = _code_mask(source, lang)
+    code_mask = _code_mask(source, lang, mark_comments=True)
     best_start = None
     best_match_start = None
     best_open_brace = None
@@ -1920,7 +1885,7 @@ def _find_earliest_genuine_definition(
         for match in _iter_code_matches(pat, source, code_mask):
             offset = match.start()
             inline = offset > 0 and source[offset - 1] == "}"
-            if inline and not code_mask[offset - 1]:
+            if inline and code_mask[offset - 1] != _MASK_CODE:
                 continue
             if _head_is_call(source, match, target_name, inline=inline, code_mask=code_mask):
                 continue
