@@ -475,7 +475,7 @@ class OuterLoop:
                 self.state.set_task_status(task_id, STATUS_DONE)
                 self.state.log(f"{task_id}: passed in round {rnd} "
                                f"({getattr(res, 'attempts_used', '?')} attempts)")
-                tracer.event("controller", "outer_loop", "result",
+                tracer.event("outer_loop", "controller", "result",
                              params={"task": task_id, "passed": True, "round": rnd,
                                      "impl_version": impl_version})
                 return OuterLoopResult(task_id, True, rnd, False,

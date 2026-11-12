@@ -694,7 +694,7 @@ class Coder(_llm_stream.LLMClientBase):
                                error_kind="transport")
 
         # ── Strip think blocks; check for missing-context signal ─────────────
-        cleaned = strip_think(raw_text)
+        cleaned = _clean_coder_response(raw_text, self._task_mode)
         # Pull-model: context requests are captured; creative output is prose, so the prose extractor is used (AUTO-CR-19-2).
         if self._task_mode == "creative":
             missing_ctx = self._extract_context_request_prose(cleaned)
@@ -739,7 +739,7 @@ class Coder(_llm_stream.LLMClientBase):
                     )
                     raw_text = raw_text or "".join(_probe_tokens)
                     _safe_print("\n" + "═" * 80 + "\n")
-                    _probe_cleaned = strip_think(raw_text)
+                    _probe_cleaned = _clean_coder_response(raw_text, self._task_mode)
                     # A probe that succeeds but returns nothing must not discard the good first response (BUGFIX).
                     if _probe_cleaned.strip():
                         cleaned = _probe_cleaned
@@ -3073,6 +3073,31 @@ def _strip_outer_fence(text: str) -> str:
         if t.rstrip().endswith("```"):
             t = t.rstrip()[:-3]
     return t.strip()
+
+
+def _is_structured_json_reply(text: str) -> bool:
+    """Side-effect-free shape check for a Coder JSON response."""
+    try:
+        data = json.loads(_strip_outer_fence(text.strip()))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return isinstance(data, dict) and isinstance(data.get("files"), list)
+
+
+def _clean_coder_response(text: str | None, task_mode: str) -> str | None:
+    """Remove external reasoning wrappers without changing JSON string contents."""
+    if not text or task_mode == "creative":
+        return strip_think(text)
+    if _is_structured_json_reply(text):
+        return text
+    leading = text.lstrip()
+    if leading.startswith("<think>"):
+        close = leading.find("</think>", len("<think>"))
+        if close >= 0:
+            answer = leading[close + len("</think>"):].strip()
+            if _is_structured_json_reply(answer):
+                return answer
+    return strip_think(text)
 
 
 def _strip_code_fence(text: str) -> str:

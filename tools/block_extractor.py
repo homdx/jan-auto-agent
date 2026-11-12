@@ -314,6 +314,13 @@ def _cpp_raw_string_end(source: str, i: int) -> Optional[int]:
     return len(source) if close < 0 else close + len(m.group(1)) + 2
 
 
+def _cpp_digit_separator(source: str, i: int, lang: str) -> bool:
+    """Whether the apostrophe at *i* separates two C/C++ numeric digits."""
+    return (lang == "c" and 0 < i < len(source) - 1 and source[i] == "'"
+            and source[i - 1] in "0123456789abcdefABCDEF"
+            and source[i + 1] in "0123456789abcdefABCDEF")
+
+
 #: Words that, as an object key's value or an operand's left side, make the next `{` an object literal.
 _JS_OBJECT_AFTER_WORD = frozenset(("typeof", "void", "delete", "throw", "in", "of", "new", "await",
                                    "instanceof", "case", "default"))
@@ -877,7 +884,8 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
         if state == "line_comment":
             code[i] = 0
             if ch == "\n":
-                state = "code"
+                if not (lang == "c" and i > 0 and source[i - 1] == "\\"):
+                    state = "code"
             i += 1
             continue
 
@@ -939,6 +947,9 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
             code[i] = code[i + 1] = 0
             i += 2
             continue
+        if ch == "'" and _cpp_digit_separator(source, i, lang):
+            i += 1
+            continue
         if ch == "'":
             state = "single"
             code[i] = 0
@@ -977,6 +988,24 @@ def _code_mask(source: str, lang: str = "") -> bytearray:
                 interpolations[-1] -= 1
         i += 1
     return code
+
+
+@functools.lru_cache(maxsize=8)
+def _brace_context_by_line(source: str) -> dict[int, int]:
+    """Map each physical line start to its nearest unmatched code brace."""
+    mask = _code_mask(source)
+    stack: list[int] = []
+    contexts = {0: -1}
+    for i, ch in enumerate(source):
+        if i and source[i - 1] == "\n":
+            contexts[i] = stack[-1] if stack else -1
+        if not mask[i]:
+            continue
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            stack.pop()
+    return contexts
 
 
 def _iter_code_matches(pat: re.Pattern[str], source: str, code_mask: Optional[bytearray]):
@@ -1027,7 +1056,8 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
 
         if state == "line_comment":
             if ch == "\n":
-                state = "code"
+                if not (lang == "c" and i > 0 and source[i - 1] == "\\"):
+                    state = "code"
             i += 1
             continue
 
@@ -1068,7 +1098,7 @@ def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", clos
             state = "block_comment"
             i += 2
             continue
-        if ch == "'":
+        if ch == "'" and not _cpp_digit_separator(source, i, lang):
             state = "single"
             i += 1
             continue
@@ -1189,6 +1219,13 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
             return None
         i = close_paren
 
+    ts_return_type = False
+    if lang == "ts":
+        k = i
+        while k < n and source[k] in " \t\r\n":
+            k += 1
+        ts_return_type = k < n and source[k] == ":"
+
     state = "code"
     escape = False
     bound = min(n, i + _DEFINITION_SCAN_BOUND)
@@ -1199,7 +1236,8 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
 
         if state == "line_comment":
             if ch == "\n":
-                state = "code"
+                if not (lang == "c" and i > 0 and source[i - 1] == "\\"):
+                    state = "code"
             i += 1
             continue
         if state == "block_comment":
@@ -1237,7 +1275,7 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
             state = "block_comment"
             i += 2
             continue
-        if ch == "'":
+        if ch == "'" and not _cpp_digit_separator(source, i, lang):
             state = "single"
             i += 1
             continue
@@ -1250,6 +1288,16 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
             i += 1
             continue
 
+        if ch == "{" and ts_return_type:
+            # Object braces in a result type are followed by another type token
+            # or by the function body's opening brace. Skip the type as a unit.
+            type_end = _brace_scan_end(source, i, lang=lang)
+            k = type_end
+            while k < n and source[k] in " \t\r\n":
+                k += 1
+            if k < n and source[k] in "{<>|&?:[":
+                i = type_end
+                continue
         if ch == "{":
             return i
         if ch == ";":
@@ -1266,10 +1314,13 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
     return None
 
 
-def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
+def _brace_candidate_patterns(target_name: str, typed_lang: bool = False) -> list[re.Pattern[str]]:
     name = re.escape(target_name)
     # Generic type parameters between the name and the parenthesis are allowed, so many languages' signatures are found.
-    tp = r"(?:\s*<[^(){};]*>|\s*\[[^(){};]*\])?"
+    # Constraints can contain object and function types (including braces and
+    # parentheses); consume through the final `>` before the argument list.
+    tp = (r"(?:\s*<[^;]*>|\s*\[[^(){};]*\])?" if typed_lang
+          else r"(?:\s*<[^(){};]*>|\s*\[[^(){};]*\])?")
     # A word of a return type, with its scope qualification and its template arguments
     # (HARDEN-8 D): `std::string`, `std::vector<int>`, `Widget::Ptr`, `unsigned long int`.
     # The qualification is what a C++ out-of-line method returns, and the type then stands
@@ -1304,6 +1355,11 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
         ),
         # class X { foo(...) { ... } }
         re.compile(rf"(?m)^\s*{name}{tp}\s*\("),
+        # Minified Java/C++ members can follow a previous method's closing brace
+        # on the same line: `} int f(...) {`. Calls inside the previous method
+        # remain rejected by _head_is_call.
+        re.compile(rf"(?m)(?<=\}})[ \t]*(?:(?:public|private|protected|static|final|synchronized|inline|virtual|const|constexpr|override)\s+)*"
+                   rf"(?:[A-Za-z_$][\w$.]*(?:<[^;{{}}]*>)?\s+)+{name}{tp}\s*\("),
         # exports.h = function (...) {   h: function(...) {   Foo.prototype.h = async function* (...) {
         re.compile(rf"(?m)^\s*(?:(?:module\.)?exports\.|[\w$]+\.prototype\.|this\.)?{name}\s*[:=]\s*"
                    rf"(?:async\s+)?function\s*\*?\s*[\w$]*\s*\("),
@@ -1469,15 +1525,52 @@ def _head_is_call(source: str, match: "re.Match[str]", target_name: str) -> bool
     a call's position is therefore not a definition head at all.
     """
     line_start = _line_start_index(source, match.start())
+    physical_line_start = line_start
+    inline_close = source.rfind("}", line_start, match.start())
+    if inline_close >= 0:
+        line_start = inline_close + 1
     head = source[line_start:match.end()]
     pos = _head_name_position(head, target_name)
+    after_name = head[pos + len(target_name):] if pos is not None else ""
+    property_tail = after_name.lstrip(" \t")
+    property_head = property_tail.startswith(":") or property_tail.startswith("?:")
+    # A multiline control condition can put the candidate on a fresh line where
+    # its physical-line prefix looks like a declaration.
+    context_start = max(
+        source.rfind("{", 0, match.start()),
+        source.rfind(";", 0, match.start()),
+        source.rfind("}", 0, match.start()),
+    ) + 1
+    for opener in re.finditer(r"\b(?:if|while|for)\s*\(", source[context_start:match.start()]):
+        depth = 1
+        j = context_start + opener.end()
+        while j < match.start() and depth:
+            if source[j] == "(":
+                depth += 1
+            elif source[j] == ")":
+                depth -= 1
+            j += 1
+        if depth:
+            return True
+    prior = source[:line_start].rstrip(" \t\r\n")
+    if (prior and pos is not None and not property_head
+            and _head_prefix_kind(head[:pos]) in {"bare", "modifiers"}):
+        previous = prior.splitlines()[-1].rstrip()
+        object_member = False
+        open_brace = _brace_context_by_line(source).get(physical_line_start, -1)
+        if open_brace >= 0:
+            before_open = source[:open_brace].rstrip()
+            object_member = before_open.endswith(("=", ":", "return"))
+        if (not object_member and not previous.endswith(("/*", "*/")) and previous.endswith(
+            ("&&", "||", ",", "(", "+", "-", "*", "/", "%", "=", "!", "&", "|", "?", ":")
+        )):
+            return True
     if pos is None:
         return False
     if re.search(r"(?:^|[^\w$])function[ \t]*\*?[ \t]*$", head[:pos]):
         # `return function logger(req, res, next) {` — a named function expression is the name's
         # definition, whatever stands before the `function`.
         return False
-    after_name = head[pos + len(target_name):]
     follower = after_name.lstrip(" \t")
     if follower is not after_name and re.match(r"(?:async\s+)?function\b", follower):
         # `this.h = function (` / `Foo.prototype.h = async function (` — the prefix is a member
@@ -1674,7 +1767,7 @@ def _find_earliest_genuine_definition(
     call site appearing anywhere could pre-empt patterns later in the list
     even when they'd have found the real, correctly-ordered definition.
     """
-    patterns = _brace_candidate_patterns(target_name)
+    patterns = _brace_candidate_patterns(target_name, typed_lang)
     # AGNES-1 T79: a candidate head whose first character is inside a comment or a
     # string is not a definition of anything this file compiles, so every pass
     # shares one comment/string mask to reject such a match the moment it appears.
@@ -1695,8 +1788,15 @@ def _find_earliest_genuine_definition(
             if open_idx is None:
                 continue
 
-            effective_start = _effective_match_start(source, match.start())
-            start = _line_start_index(source, effective_start)
+            line_start = _line_start_index(source, match.start())
+            inline_close = source.rfind("}", line_start, match.start())
+            if inline_close >= 0:
+                effective_start = inline_close + 1
+                while effective_start < len(source) and source[effective_start] in " \t":
+                    effective_start += 1
+            else:
+                effective_start = _effective_match_start(source, match.start())
+            start = effective_start if inline_close >= 0 else _line_start_index(source, effective_start)
             if best_start is None or start < best_start:
                 best_start = start
                 best_match_start = effective_start
@@ -2629,6 +2729,11 @@ def _extract_brace_block(source: str, target_name: str, lang: str = "",
 
     match_start, open_idx, end = found
     start = _line_start_index(source, match_start)
+    inline_close = source.rfind("}", start, match_start)
+    if inline_close >= 0:
+        start = inline_close + 1
+        while start < match_start and source[start] in " \t":
+            start += 1
     return source[start:end]
 
 

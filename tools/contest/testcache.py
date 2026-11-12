@@ -302,7 +302,74 @@ def is_well_formed(command: str) -> bool:
         _tokenize(command)
     except ValueError:
         return False
+    visible = _shell_syntax_view(command)
+    tail = visible.rstrip()
+    if re.search(r"(?:&&|\|\||\|)$", tail):
+        return False
+    if re.search(r"(?:\d*>>?|<<?|&>)$", tail):
+        return False
+    # A right paren that closes no grouping is invalid, except for the reserved
+    # `case pattern)` delimiter. The case bodies are intentionally not parsed.
+    case_view = re.sub(r"\bcase\b[\s\S]*?\bin\b[ \t]+[^\s();|&]+\)", "case pattern in x ", visible, count=1)
+    depth = 0
+    for ch in case_view:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+    if depth:
+        return False
     return True
+
+
+def _shell_syntax_view(command: str) -> str:
+    """Mask quoted strings, substitutions and comments for trailing-operator checks."""
+    out = list(command)
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            out[i] = " "
+            if i + 1 < n:
+                out[i + 1] = " "
+            i += 2
+            continue
+        if ch == "'":
+            end = command.find("'", i + 1)
+            end = n - 1 if end < 0 else end
+            for j in range(i, end + 1):
+                out[j] = " "
+            i = end + 1
+            continue
+        if ch == '"':
+            end = _dquote_end(command, i)
+            for j in range(i, end + 1):
+                out[j] = " "
+            i = end + 1
+            continue
+        if ch == "`":
+            end = _backtick_end(command, i)
+            for j in range(i, end + 1):
+                out[j] = " "
+            i = end + 1
+            continue
+        if ch == "$" and command[i + 1:i + 2] == "(":
+            end = _subst_end(command, i)
+            for j in range(i, end + 1):
+                out[j] = "x"
+            i = end + 1
+            continue
+        if ch == "#" and (i == 0 or command[i - 1].isspace() or command[i - 1] in ";&|("):
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            for j in range(i, end):
+                out[j] = " "
+            i = end
+            continue
+        i += 1
+    return "".join(out)
 
 
 def _segments(tokens: list) -> list:

@@ -67,11 +67,19 @@ def backoff_zero(src: str) -> bool:
 
     def own_nodes():
         # the function's own statements, not those of a nested function, lambda or class
-        stack = [n for n in func.body if not isinstance(n, _SCOPES)]
-        while stack:
-            n = stack.pop()
-            yield n
-            stack.extend(c for c in ast.iter_child_nodes(n) if not isinstance(c, _SCOPES))
+        def visit(nodes):
+            for n in nodes:
+                if isinstance(n, _SCOPES):
+                    continue
+                yield n
+                if isinstance(n, ast.If) and isinstance(n.test, ast.Constant):
+                    yield from visit(n.body if bool(n.test.value) else n.orelse)
+                    continue
+                if isinstance(n, ast.While) and isinstance(n.test, ast.Constant) and not bool(n.test.value):
+                    yield from visit(n.orelse)
+                    continue
+                yield from visit(list(ast.iter_child_nodes(n)))
+        yield from visit(func.body)
 
     nodes = list(own_nodes())
 
@@ -108,7 +116,10 @@ def backoff_zero(src: str) -> bool:
         if isinstance(func, ast.Attribute) and func.attr == "update" and is_ident(func.value, ident):
             out = [event(k.value) for k in call.keywords if k.arg == name]
             for arg in call.args:
-                out += of_value(arg, call.lineno, depth + 1)
+                # A mapping's value takes effect at this call, not where the
+                # mapping literal was created. Keep the value but move its event.
+                out += [(call.lineno, call.col_offset, item[2])
+                        for item in of_value(arg, call.lineno, depth + 1)]
             return out
         if (isinstance(func, ast.Name) and func.id == "setattr" and len(call.args) == 3
                 and is_ident(call.args[0], ident) and isinstance(call.args[1], ast.Constant)

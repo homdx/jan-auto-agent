@@ -328,7 +328,9 @@ class AutoController:
         # A config file that exists but does not parse falls back to defaults, like a missing one (AUTO-FIX).
         if Path(config_path).exists():
             try:
-                self.config.read(config_path, encoding="utf-8")
+                self.config.read(config_path, encoding="utf-8-sig")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"config file {config_path!r} is not valid UTF-8: {exc}") from exc
             except configparser.Error as exc:
                 logger.warning(
                     "AutoController: %s is malformed (%s) — proceeding "
@@ -511,7 +513,7 @@ class AutoController:
             if self.run_trace:
                 self.run_trace.log_run_finished()
 
-        return 0
+        return 1 if stop_reason == STOP_UNSAVED_WORK else 0
 
     # Private helpers
 
@@ -1262,7 +1264,12 @@ class AutoController:
         if cfg is None:
             cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
             if Path(self.config_path).exists():
-                cfg.read(self.config_path, encoding="utf-8")
+                try:
+                    cfg.read(self.config_path, encoding="utf-8-sig")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        f"config file {self.config_path!r} is not valid UTF-8: {exc}"
+                    ) from exc
             self.config = cfg
         return cfg
 

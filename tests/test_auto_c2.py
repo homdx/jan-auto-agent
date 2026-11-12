@@ -268,6 +268,12 @@ class TestResponseParsing:
         assert r.succeeded
         assert "tools/module.py" in r.files_written
 
+    def test_plain_structured_reply_keeps_file_text_unchanged(self, tmp_path: Path) -> None:
+        content = 'import re\nPATTERN = re.compile("plain")\n'
+        r = self._run(tmp_path, _valid_llm_response([("tools/module.py", content)]))
+        assert r.succeeded
+        assert (tmp_path / "repo" / "tools" / "module.py").read_text() == content
+
     def test_valid_multi_file(self, tmp_path: Path) -> None:
         response = _valid_llm_response(
             [("tools/a.py", "a = 1\n"), ("tools/b.py", "b = 2\n")]
