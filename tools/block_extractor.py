@@ -3237,7 +3237,7 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
                     imports.append(alias.asname or alias.name)
         return _unique_preserve_order(imports)
 
-    if ext in {".js", ".jsx", ".ts", ".tsx"}:
+    if ext in {".js", ".jsx", ".ts", ".tsx", ".mts", ".cts"}:
         items: list[str] = []
 
         # An import statement ends at its semicolon or line end, so a bare side-effect import does not swallow the next one (bugfix).

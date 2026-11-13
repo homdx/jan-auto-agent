@@ -57,15 +57,16 @@ import re
 from pathlib import Path
 from typing import Sequence
 
-logger = logging.getLogger(__name__)
+from tools.file_reader import _SEARCHABLE_EXTS as _CODE_EXTS
 
-# Extensions we know block_extractor handles well (code, via extract_block).
-_SEARCHABLE_EXTS = frozenset({".py", ".js", ".ts", ".tsx", ".jsx", ".go",
-                               ".java", ".rs", ".c", ".cpp", ".h", ".hpp",
-                               ".md", ".txt"})
+logger = logging.getLogger(__name__)
 
 # Prose extensions go to extract_prose_section, not extract_block (AUTO-CR-6).
 _PROSE_EXTS = frozenset({".md", ".txt"})
+
+# Extensions we know block_extractor handles well (code, via extract_block) plus the prose ones.
+# The code suffixes are tools.file_reader's, so project search and this fallback scan agree.
+_SEARCHABLE_EXTS = _CODE_EXTS | _PROSE_EXTS
 
 # Chapter pattern, the same as context_assembler, so earlier-first means the same everywhere.
 _CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)

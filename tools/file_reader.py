@@ -82,10 +82,13 @@ def list_py_files(base_dir: str, skip_dirs: list) -> list[str]:
     return results
 
 
-# Extensions handled well by block_extractor — mirrors context_broker._SEARCHABLE_EXTS.
+# Extensions handled well by block_extractor — the one list of code suffixes: project search
+# enumerates it and tools.auto.context_broker derives its own from it, so the two cannot drift.
 _SEARCHABLE_EXTS: frozenset[str] = frozenset({
     ".py", ".js", ".ts", ".tsx", ".jsx",
     ".go", ".java", ".rs", ".c", ".cpp", ".h", ".hpp",
+    ".cc", ".cxx", ".hh", ".hxx",
+    ".mts", ".cts",
 })
 
 
