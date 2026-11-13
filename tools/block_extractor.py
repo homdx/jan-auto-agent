@@ -1593,8 +1593,90 @@ def _inside_control_condition(source: str, at: int, code_mask: bytearray) -> boo
     return False
 
 
+#: A line that holds nothing but access specifiers and a colon (`public:`, `private slots:`, `Q_SIGNALS:`).
+_ACCESS_LABEL = re.compile(
+    r"\s*(?:(?:public|protected|private|signals|slots|Q_SLOTS|Q_SIGNALS)\b\s*)+:\s*")
+#: Words that may follow a `*` or `&` in a return type (`char *const *`, `T &noexcept` never, but cv-qualifiers do).
+_TYPE_TAIL_WORDS = frozenset(("const", "volatile", "restrict", "__restrict", "__restrict__"))
+#: Words that start or continue an expression or a statement, so a line holding one is not a return type.
+_NON_TYPE_WORDS = _CALL_HEAD_WORDS | frozenset((
+    "co_return", "co_yield", "co_await", "goto", "sizeof", "alignof", "default", "bitand", "bitor",
+    "xor", "compl",
+))
+
+
+def _code_text_of_line(source: str, upto: int, code_mask: bytearray) -> str:
+    """The text of the line that holds *upto*, up to and including it, with comments and literals blanked."""
+    start = _line_start_index(source, upto)
+    return "".join(source[i] if code_mask[i] == _MASK_CODE else " " for i in range(start, upto + 1))
+
+
+def _line_is_a_return_type(text: str) -> bool:
+    """Whether *text*, which ends in `*` or `&`, can be nothing but the return type of a C++ definition.
+
+    `const char *`, `Item &`, `Item &&`, `std::map<int, int> *`, `char **` and `static const T &` are;
+    `a *`, `x = a *`, `return a &`, `ready && other &` and `a * 2 *` are expressions.
+    """
+    stripped = text
+    previous = None
+    while previous != stripped:  # drop template arguments, innermost first: `map<int, array<int, 3>>`
+        previous = stripped
+        stripped = re.sub(r"<[^<>]*>", " ", stripped)
+    if re.search(r"[^\w\s:*&]", stripped) or re.search(r"(?<!\w)\d", stripped):
+        return False
+    words = re.findall(r"[A-Za-z_]\w*", stripped)
+    if not words or any(w in _NON_TYPE_WORDS for w in words):
+        return False
+    first_pointer = re.search(r"[*&]", stripped)
+    assert first_pointer is not None
+    return all(w in _TYPE_TAIL_WORDS for w in re.findall(r"[A-Za-z_]\w*", stripped[first_pointer.start():]))
+
+
+def _head_is_followed_by_a_body(source: str, name_end: int, code_mask: bytearray) -> bool:
+    """Whether the parameter list that starts after *name_end* is followed by `{` (a body) rather than by
+    `;`, `,`, `=` or a closing bracket (a call, a declaration, `= default`)."""
+    i = name_end
+    limit = min(len(source), name_end + _DECLARATION_SCAN_BOUND)
+    while i < limit and (source[i].isspace() or code_mask[i] != _MASK_CODE):
+        i += 1
+    if i >= limit or source[i] != "(":
+        return True  # no parameter list to judge by: keep the verdict of the operator alone
+    depth = 0
+    while i < limit:
+        if code_mask[i] == _MASK_CODE:
+            ch = source[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    return False
+            elif depth == 0 and ch == "{":
+                return True
+            elif depth == 0 and ch in ";,=}":
+                return False
+        i += 1
+    return False
+
+
+def _operator_ends_a_cpp_declaration_line(source: str, operator_index: int, name_end: int,
+                                          code_mask: bytearray) -> bool:
+    """Whether the `*`, `&` or `:` that ends the previous line belongs to a C++ *declaration* (AUDIT-9 follow-up).
+
+    `*` and `&` end the return-type line of a definition whose name opens the next line
+    (`const char *` / `duplicate(`, `Item &` / `assign(`), and `:` ends an access label (`public:`)
+    in front of a constructor. A `*` or `&` only counts when the line is nothing but a type and a
+    body follows the parameter list, so `a *`, `ready &&` and `x = a &` keep continuing a call.
+    """
+    operator = source[operator_index]
+    text = _code_text_of_line(source, operator_index, code_mask)
+    if operator == ":":
+        return bool(_ACCESS_LABEL.fullmatch(text))
+    return _line_is_a_return_type(text) and _head_is_followed_by_a_body(source, name_end, code_mask)
+
+
 def _continued_call_head(source: str, line_start: int, match_start: int, head: str,
-                         pos: int, target_name: str, code_mask: bytearray) -> bool:
+                         pos: int, target_name: str, code_mask: bytearray, lang: str = "") -> bool:
     """Whether a bare head continues a prior operator/call line.
 
     Object properties also follow commas and can look like bare method heads,
@@ -1613,6 +1695,10 @@ def _continued_call_head(source: str, line_start: int, match_start: int, head: s
         return False
     operator = source[previous]
     if operator not in ",(+-*/%=!&|?:":
+        return False
+    if (operator in "*&:" and lang == "c" and not source.startswith("::", previous - 1)
+            and _operator_ends_a_cpp_declaration_line(
+                source, previous, match_start + len(target_name), code_mask)):
         return False
     if operator != ",":
         return True
@@ -1645,7 +1731,7 @@ def _continued_call_head(source: str, line_start: int, match_start: int, head: s
 
 
 def _head_is_call(source: str, match: "re.Match[str]", target_name: str, *,
-                  inline: bool = False, code_mask: bytearray | None = None) -> bool:
+                  inline: bool = False, code_mask: bytearray | None = None, lang: str = "") -> bool:
     """True when the matched head is a *call* of *target_name* rather than its definition (HARDEN-6 A).
 
     A call written before the definition matches the bare `name(` heads and the return-typed head
@@ -1679,7 +1765,7 @@ def _head_is_call(source: str, match: "re.Match[str]", target_name: str, *,
         if (_inside_control_condition(source, match.start(), code_mask)
                 or _continued_call_head(source, physical_line_start, name_start,
                                         physical_head, physical_pos, target_name,
-                                        code_mask)):
+                                        code_mask, lang)):
             return True
     return False
 
@@ -1887,7 +1973,7 @@ def _find_earliest_genuine_definition(
             inline = offset > 0 and source[offset - 1] == "}"
             if inline and code_mask[offset - 1] != _MASK_CODE:
                 continue
-            if _head_is_call(source, match, target_name, inline=inline, code_mask=code_mask):
+            if _head_is_call(source, match, target_name, inline=inline, code_mask=code_mask, lang=lang):
                 continue
             scan_from = match.end()
             if typed_lang and source[scan_from - 1] == "<":
