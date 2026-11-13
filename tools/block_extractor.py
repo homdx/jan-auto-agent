@@ -1343,6 +1343,10 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
             if not tail_depth:
                 return None  # a call inside a group opened before its own arguments
             tail_depth -= 1
+        if lang == "c" and tail_depth and ch == "{":
+            # A braced initializer inside `noexcept(noexcept(Item{}))` is part of the signature.
+            i = _brace_scan_end(source, i, lang=lang)
+            continue
         if ch == "{":
             return i
         if ch == ";":
@@ -1596,6 +1600,11 @@ def _inside_control_condition(source: str, at: int, code_mask: bytearray) -> boo
 #: A line that holds nothing but access specifiers and a colon (`public:`, `private slots:`, `Q_SIGNALS:`).
 _ACCESS_LABEL = re.compile(
     r"\s*(?:(?:public|protected|private|signals|slots|Q_SLOTS|Q_SIGNALS)\b\s*)+:\s*")
+_CPP_CLASS_HEAD = re.compile(
+    r"\b(?:class|struct|union)\s*(?:(?:\[\[[\s\S]*?\]\]|alignas\s*\([^()]*\)|[A-Za-z_]\w*\b)\s+)*"
+    r"(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*\s*"
+    r"(?:<[^;{}]*>\s*)?(?:final\b\s*)?(?::[^;{}]+)?\s*$")
+_CPP_DEFINITION_TAIL = re.compile(r"(?:const|volatile|noexcept|throw|override|final|requires|try)\b|\[\[")
 #: Words that may follow a `*` or `&` in a return type (`char *const *`, `T &noexcept` never, but cv-qualifiers do).
 _TYPE_TAIL_WORDS = frozenset(("const", "volatile", "restrict", "__restrict", "__restrict__"))
 #: Words that start or continue an expression or a statement, so a line holding one is not a return type.
@@ -1612,10 +1621,10 @@ def _code_text_of_line(source: str, upto: int, code_mask: bytearray) -> str:
 
 
 def _line_is_a_return_type(text: str) -> bool:
-    """Whether *text*, which ends in `*` or `&`, can be nothing but the return type of a C++ definition.
+    """Whether *text*, which ends in `*` or `&`, could be a C++ return type.
 
-    `const char *`, `Item &`, `Item &&`, `std::map<int, int> *`, `char **` and `static const T &` are;
-    `a *`, `x = a *`, `return a &`, `ready && other &` and `a * 2 *` are expressions.
+    `const char *` and `Item &` fit, as does `a *` in isolation. Reject clear expressions such as
+    `x = a *`, `return a &` and `a * 2 *` here and check the signature tail separately.
     """
     stripped = text
     previous = None
@@ -1632,47 +1641,84 @@ def _line_is_a_return_type(text: str) -> bool:
     return all(w in _TYPE_TAIL_WORDS for w in re.findall(r"[A-Za-z_]\w*", stripped[first_pointer.start():]))
 
 
-def _head_is_followed_by_a_body(source: str, name_end: int, code_mask: bytearray) -> bool:
-    """Whether the parameter list that starts after *name_end* is followed by `{` (a body) rather than by
-    `;`, `,`, `=` or a closing bracket (a call, a declaration, `= default`)."""
-    i = name_end
-    limit = min(len(source), name_end + _DECLARATION_SCAN_BOUND)
-    while i < limit and (source[i].isspace() or code_mask[i] != _MASK_CODE):
-        i += 1
-    if i >= limit or source[i] != "(":
-        return True  # no parameter list to judge by: keep the verdict of the operator alone
+def _inside_cpp_class_body(source: str, at: int, code_mask: bytearray) -> bool:
+    """Check the nearest enclosing brace, since a label inside a method is a statement label."""
     depth = 0
-    while i < limit:
-        if code_mask[i] == _MASK_CODE:
-            ch = source[i]
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
+    for i in range(at - 1, -1, -1):
+        if code_mask[i] != _MASK_CODE:
+            continue
+        if source[i] == "}":
+            depth += 1
+        elif source[i] == "{":
+            if depth:
                 depth -= 1
-                if depth < 0:
-                    return False
-            elif depth == 0 and ch == "{":
-                return True
-            elif depth == 0 and ch in ";,=}":
-                return False
-        i += 1
+                continue
+            start = i
+            limit = max(0, i - _DEFINITION_SCAN_BOUND)
+            while start > limit:
+                previous = start - 1
+                if code_mask[previous] == _MASK_CODE and source[previous] in ";{}":
+                    break
+                start = previous
+            header = "".join(source[j] if code_mask[j] == _MASK_CODE else " " for j in range(start, i))
+            class_head = _CPP_CLASS_HEAD.search(header)
+            # `auto run() -> struct Item {` opens a function body.
+            return class_head is not None and not header[:class_head.start()].rstrip().endswith("->")
     return False
 
 
-def _operator_ends_a_cpp_declaration_line(source: str, operator_index: int, name_end: int,
+def _head_can_have_cpp_body(source: str, params_open: int, code_mask: bytearray) -> bool:
+    """Check the first token after the parameters before searching for a body brace.
+
+    A split `a *\nscale(n) + int{1}` looks like a typed head until `+` proves it is a call.
+    Bare names can have an `&` or `&&` qualifier only in a class body. Qualified out-of-line
+    definitions are handled by the typed-head path before this check.
+    """
+    if source[params_open] != "(":
+        return False
+    limit = min(len(source), params_open + _DECLARATION_SCAN_BOUND)
+    depth = 0
+    for i in range(params_open, limit):
+        if code_mask[i] == _MASK_CODE:
+            if source[i] == "(":
+                depth += 1
+            elif source[i] == ")":
+                depth -= 1
+                if not depth:
+                    break
+    else:
+        return False
+    i += 1
+    while i < limit and (source[i].isspace() or code_mask[i] == _MASK_COMMENT):
+        i += 1
+    if i >= limit:
+        return False
+    if source[i] == "&":
+        qualifier = i
+        i += 2 if source.startswith("&&", i) else 1
+        while i < limit and (source[i].isspace() or code_mask[i] == _MASK_COMMENT):
+            i += 1
+        if not _inside_cpp_class_body(source, qualifier, code_mask):
+            return False
+        if i >= limit:
+            return False
+    return source[i] == "{" or _CPP_DEFINITION_TAIL.match(source, i, limit) is not None
+
+
+def _operator_ends_a_cpp_declaration_line(source: str, operator_index: int, params_open: int,
                                           code_mask: bytearray) -> bool:
     """Whether the `*`, `&` or `:` that ends the previous line belongs to a C++ *declaration* (AUDIT-9 follow-up).
 
     `*` and `&` end the return-type line of a definition whose name opens the next line
     (`const char *` / `duplicate(`, `Item &` / `assign(`), and `:` ends an access label (`public:`)
-    in front of a constructor. A `*` or `&` only counts when the line is nothing but a type and a
-    body follows the parameter list, so `a *`, `ready &&` and `x = a &` keep continuing a call.
+    in front of a constructor. Check the enclosing class for access labels and the parameter
+    tail for ambiguous `*` and `&` lines.
     """
     operator = source[operator_index]
     text = _code_text_of_line(source, operator_index, code_mask)
     if operator == ":":
-        return bool(_ACCESS_LABEL.fullmatch(text))
-    return _line_is_a_return_type(text) and _head_is_followed_by_a_body(source, name_end, code_mask)
+        return bool(_ACCESS_LABEL.fullmatch(text)) and _inside_cpp_class_body(source, operator_index, code_mask)
+    return _line_is_a_return_type(text) and _head_can_have_cpp_body(source, params_open, code_mask)
 
 
 def _continued_call_head(source: str, line_start: int, match_start: int, head: str,
@@ -1698,7 +1744,7 @@ def _continued_call_head(source: str, line_start: int, match_start: int, head: s
         return False
     if (operator in "*&:" and lang == "c" and not source.startswith("::", previous - 1)
             and _operator_ends_a_cpp_declaration_line(
-                source, previous, match_start + len(target_name), code_mask)):
+                source, previous, line_start + len(head) - 1, code_mask)):
         return False
     if operator != ",":
         return True
