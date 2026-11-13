@@ -55,3 +55,13 @@ def test_quoted_operands_and_case_patterns_keep_their_shell_meaning():
     ):
         assert is_well_formed(command), command
     assert not is_well_formed("pytest -q > # missing target")
+
+
+def test_trailing_pipe_with_stderr_is_refused_and_the_negation_word_keeps_a_command_position():
+    # `|&` is the pipe that also carries stderr; with nothing after it bash refuses the line, like `|`.
+    assert not is_well_formed("pytest -q |&")
+    assert is_well_formed("pytest -q |& tee out")
+    # `!` only negates the pipeline: the word after it is still a command, so `case` opens a group.
+    assert is_well_formed("! case x in a) echo a;; esac")
+    assert is_well_formed("! case x in a) esac # c")
+    assert not is_well_formed("! case x in a) echo a;;")

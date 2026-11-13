@@ -212,3 +212,18 @@ def test_static_judge_keeps_supported_non_update_controls():
     ]
     for source in controls:
         assert module.backoff_zero(source)
+
+
+def test_a_negated_constant_branch_is_decided_statically():
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    spec = spec_from_file_location("slow1_checker_not", SLOW1 / "check_slow1.py")
+    module = module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    template = ("def make_config():\n    kw = dict(error_retry_backoff_sec=1)\n    if {test}:\n"
+                "        kw.update(error_retry_backoff_sec=0)\n    return Cfg(**kw)")
+    assert not module.backoff_zero(template.format(test="not True"))
+    assert not module.backoff_zero(template.format(test="not 1"))
+    assert module.backoff_zero(template.format(test="not False"))
+    assert module.backoff_zero(template.format(test="True"))

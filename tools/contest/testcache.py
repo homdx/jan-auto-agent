@@ -358,7 +358,7 @@ def is_well_formed(command: str) -> bool:
     except ValueError:
         return False
     tail = visible.rstrip()
-    if re.search(r"(?:&&|\|\||\|)$", tail):
+    if re.search(r"(?:&&|\|\||\|&|\|)$", tail):
         return False
     if re.search(r"(?:\d*>>?|<<?|&>)$", tail):
         return False
@@ -446,7 +446,7 @@ def _shell_groups_well_formed(tokens: list) -> bool:
             command_start = False
             continue
 
-        command_start = command_start and token in {"if", "while", "until", "then", "do", "else", "elif"}
+        command_start = command_start and token in {"if", "while", "until", "then", "do", "else", "elif", "!"}
 
     return depth == 0 and not cases
 
