@@ -108,19 +108,26 @@ def _ideal_refusal(repo: Path, folder: Path, tree: Path) -> Optional[str]:
             return f"{tree} is a symlink to {tree_res}, not a worktree of its own"
         if tree.parent.resolve() != folder_res / "wt":
             return f"{tree} does not sit directly in {folder / 'wt'} (its wt is a redirect)"
-    except OSError as err:
+    except (OSError, RuntimeError, ValueError) as err:
         return f"cannot resolve {tree}: {err}"
     top = _git(tree, "rev-parse", "--show-toplevel")
     if not top:
         return f"{tree} is not a Git worktree"
-    top_res = Path(top).resolve()
+    try:
+        top_res = Path(top).resolve()
+    except (OSError, RuntimeError, ValueError) as err:
+        return f"cannot resolve Git top-level for {tree}: {err}"
     if top_res != tree_res:
         return f"{tree} is not its own Git top-level (it reports {top})"
     if folder_res != top_res and folder_res not in top_res.parents:
         return f"{tree} is outside the round folder {folder}"
     main = _git(repo, "rev-parse", "--show-toplevel")
-    if main and Path(main).resolve() == top_res:
-        return f"{tree} is the main checkout of {repo}"
+    if main:
+        try:
+            if Path(main).resolve() == top_res:
+                return f"{tree} is the main checkout of {repo}"
+        except (OSError, RuntimeError, ValueError) as err:
+            return f"cannot resolve main checkout for {repo}: {err}"
     return _unregistered_worktree(repo, tree)
 
 
@@ -150,7 +157,7 @@ def _unregistered_worktree(repo: Path, tree: Path) -> Optional[str]:
         # the tree's own path with only its parents resolved: `tree.resolve()` would follow a link
         if Path(back).resolve() != tree.parent.resolve() / tree.name / ".git":
             return f"{tree} points at the worktree entry of {back}, not its own"
-    except (OSError, ValueError) as err:
+    except (OSError, RuntimeError, ValueError) as err:
         return f"cannot verify {tree} against {repo}: {err}"
     return None
 

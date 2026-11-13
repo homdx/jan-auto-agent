@@ -465,3 +465,19 @@ def test_a_wt_folder_that_is_a_link_to_another_folder_is_refused(round_repo):
     (folder / "wt").symlink_to(real)
     with pytest.raises(judging.RoundError, match="ideal"):
         judging.plan_ideal_move(repo, folder, second)
+
+
+def test_an_ideal_symlink_loop_is_refused_without_running_commands(round_repo, monkeypatch, capsys):
+    repo, folder, first, second = round_repo
+    ideal = folder / "wt" / "ideal"
+    ideal.parent.mkdir(parents=True)
+    ideal.symlink_to("ideal")
+    before = _snapshot(repo)
+    rec = Recorder()
+    monkeypatch.setattr(judging, "RUN", rec)
+
+    with pytest.raises(judging.RoundError, match="cannot resolve"):
+        judging.plan_ideal_move(repo, folder, second)
+    code, _out, err = _judge(capsys, "184", "--ideal", second)
+    assert code == 2 and "cannot resolve" in err and rec.lines == []
+    assert _snapshot(repo) == before
