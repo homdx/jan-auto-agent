@@ -1,6 +1,8 @@
 """AUDIT-9 TypeScript, call-head and C++ lexical boundary regressions."""
 
-from tools.block_extractor import extract_block
+import pytest
+
+from tools.block_extractor import extract_block, get_context_lines
 
 
 def _block(source: str, ext: str = ".ts") -> str:
@@ -311,3 +313,51 @@ def test_gate1_existence_stage_accepts_the_recovered_cpp_symbols(tmp_path):
 def test_gate1_existence_stage_still_rejects_a_symbol_that_is_not_there(tmp_path):
     accepted, rejected = _gate1_existence(tmp_path, SPLIT_RETURN_TYPES[0][1] + "\n", "no_such_symbol")
     assert not accepted and len(rejected) == 1
+
+
+@pytest.mark.parametrize(("extension", "statement"), [
+    (".cpp", "    a *\n        scale(n) + int{1};"),
+    (".cpp", "    a &\n        scale(n) + int{1};"),
+    (".cpp", "    a *\n        scale(n) && int{1};"),
+    (".cpp", "    if (a) goto signals;\nsignals:\n    scale(n) + int{1};"),
+    (".c", "    if (a) goto public;\npublic:\n    scale(n) + (struct Box){1}.value;"),
+])
+def test_cpp_expression_brace_does_not_supply_a_definition(tmp_path, extension, statement):
+    (tmp_path / "scale.h").write_text("int scale(int n);\n", encoding="utf-8")
+    caller = ('#include "scale.h"\nstruct Box { int value; };\n'
+              f"int run(int a, int n) {{\n{statement}\n    return n;\n}}\n")
+    definition = "int scale(int n) { return 2 * n; }"
+    marker = "// Immediately before the definition.\n"
+    source = f"{caller}\n{marker}{definition}\n"
+    assert extract_block(source, "scale", extension) == definition
+    assert get_context_lines(source, "scale", before=1, file_ext=extension) == marker
+    assert extract_block(caller, "scale", extension) == ""
+    accepted, rejected = _gate1_existence(tmp_path, caller, "scale", f"sample{extension}")
+    assert not accepted and len(rejected) == 1
+    assert "symbol 'scale' not found" in rejected[0].reason
+
+
+def test_cpp_split_return_type_keeps_member_qualifiers():
+    definition = ("    Item &\n"
+                  "    assign(Item &value) & noexcept(noexcept(Item{}))\n"
+                  "    { return value; }")
+    source = f"struct Item {{}};\nstruct Owner {{\n{definition}\n}};\n"
+    assert extract_block(source, "assign", ".hpp") == definition
+
+
+@pytest.mark.parametrize("class_head", ["struct [[nodiscard]] Item", "struct alignas(8) Item"])
+def test_cpp_access_label_inside_class_with_attribute(class_head):
+    source = _class_with("public:\n").replace("struct Item", class_head)
+    assert extract_block(source, "Item", ".hpp").strip() == CTOR
+
+
+def test_cpp_trailing_struct_return_type_does_not_open_a_class_scope():
+    source = ('#include "scale.h"\n'
+              "struct Item {};\n"
+              "auto run(int n) -> struct Item {\n"
+              "    if (n) goto signals;\n"
+              "signals:\n"
+              "    scale(n) + int{1};\n"
+              "    return {};\n"
+              "}\n")
+    assert extract_block(source, "scale", ".cpp") == ""
