@@ -227,3 +227,24 @@ def test_a_negated_constant_branch_is_decided_statically():
     assert not module.backoff_zero(template.format(test="not 1"))
     assert module.backoff_zero(template.format(test="not False"))
     assert module.backoff_zero(template.format(test="True"))
+
+
+@pytest.mark.parametrize("statement, count, expected_exit", [
+    ("if", 1200, 1),
+    ("while", 1201, 0),
+])
+def test_deeply_negated_literal_keeps_the_judge_running(tmp_path, statement, count, expected_exit):
+    condition = "not " * count + "True"
+    source = ("def make_config():\n    kw = dict(error_retry_backoff_sec=0)\n"
+              f"    {statement} {condition}:\n"
+              "        kw.update(error_retry_backoff_sec=1)\n")
+    if statement == "while":
+        source += "        break\n"
+    source += "    return dict(**kw)\n\ndef test_one():\n    assert make_config()\n"
+    namespace = {}
+    exec(compile(source, "fixture.py", "exec"), namespace)
+    actual = namespace["make_config"]()["error_retry_backoff_sec"]
+    assert (actual != 0) == bool(expected_exit)
+    code, output = _judge_source(tmp_path, source)
+    assert code == expected_exit, output
+    assert ("PASS  cause 1" if expected_exit == 0 else "FAIL  cause 1") in output

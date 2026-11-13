@@ -66,13 +66,12 @@ def backoff_zero(src: str) -> bool:
                 and not isinstance(node.value, bool) and node.value == 0)
 
     def const_truth(test):
-        # True / False for a literal condition or its `not`; None when it is not decided statically
-        if isinstance(test, ast.Constant):
-            return bool(test.value)
-        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-            inner = const_truth(test.operand)
-            return None if inner is None else not inner
-        return None
+        # Keep long chains of `not` within the same iterative AST walk.
+        negated = False
+        while isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            negated = not negated
+            test = test.operand
+        return (bool(test.value) != negated) if isinstance(test, ast.Constant) else None
 
     def own_nodes():
         # the function's own statements, not those of a nested function, lambda or class
@@ -82,9 +81,10 @@ def backoff_zero(src: str) -> bool:
             if isinstance(n, _SCOPES):
                 continue
             yield n
-            if isinstance(n, ast.If) and const_truth(n.test) is not None:
-                stack.extend(n.body if const_truth(n.test) else n.orelse)
-            elif isinstance(n, ast.While) and const_truth(n.test) is False:
+            truth = const_truth(n.test) if isinstance(n, (ast.If, ast.While)) else None
+            if isinstance(n, ast.If) and truth is not None:
+                stack.extend(n.body if truth else n.orelse)
+            elif isinstance(n, ast.While) and truth is False:
                 stack.extend(n.orelse)
             else:
                 stack.extend(ast.iter_child_nodes(n))
