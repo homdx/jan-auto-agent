@@ -152,3 +152,162 @@ def test_cpp_character_literal_and_crlf_splice_preserve_exact_body():
         "int f() {\r\n  // note \\\r\n  }\r\n  return 1;\r\n}",
     ):
         assert _block(definition + "\nint other() { return 2; }", ".cpp") == definition
+
+
+# ── AUDIT-9 follow-up (357): a C++ definition is not a call continuation ─────────────────────────
+
+CPP_NEIGHBOUR = "int other(int v)\n{\n    return v + 1;\n}\n"
+CPP_BEFORE = "int before(int v)\n{\n    return v - 1;\n}\n"
+
+#: (symbol, the definition exactly as it stands in the source, the lines before it)
+SPLIT_RETURN_TYPES = [
+    ("duplicate", "const char *\nduplicate(const char *s)\n{\n    return s;\n}", ""),
+    ("assign", "Item &\nassign(Item &value)\n{\n    return value;\n}", "struct Item {};\n\n"),
+    ("move_it", "Item &&\nmove_it(Item &&value)\n{\n    return static_cast<Item &&>(value);\n}", "struct Item {};\n\n"),
+    ("make_vec", "std::vector<int> *\nmake_vec(int n)\n{\n    return new std::vector<int>(n);\n}", ""),
+    ("make_map", "std::map<int, int> *\nmake_map()\n{\n    return nullptr;\n}", ""),
+    ("split", "char **\nsplit(const char *s)\n{\n    return nullptr;\n}", ""),
+    ("lookup", "static const Item &\nlookup(int k)\n{\n    static Item it;\n    return it;\n}", "struct Item {};\n\n"),
+    ("get", "Foo::Bar *\nFoo::get(int k)\n{\n    return nullptr;\n}",
+     "struct Foo { struct Bar {}; Bar *get(int); };\n\n"),
+]
+
+
+def test_cpp_definition_whose_return_type_line_ends_in_star_or_ampersand_is_extracted_exactly():
+    for symbol, definition, preamble in SPLIT_RETURN_TYPES:
+        for ext in (".cpp", ".hpp", ".cc", ".c"):
+            alone = preamble + definition + "\n"
+            between = preamble + CPP_BEFORE + "\n" + definition + "\n\n" + CPP_NEIGHBOUR
+            assert extract_block(alone, symbol, ext).strip() == definition, (symbol, ext)
+            # A neighbour on each side: returning too much source fails as well as returning none.
+            assert extract_block(between, symbol, ext).strip() == definition, (symbol, ext)
+
+
+def test_cpp_split_return_type_definition_survives_crlf_line_ends():
+    definition = SPLIT_RETURN_TYPES[0][1]
+    source = (definition + "\n\n" + CPP_NEIGHBOUR).replace("\n", "\r\n")
+    assert extract_block(source, "duplicate", ".cpp").replace("\r\n", "\n").strip() == definition
+
+
+CTOR = "explicit Item(int n) : n_(n) {}"
+
+
+def _class_with(label_lines: str, ctor: str = CTOR, tail: str = "    int n_ = 0;\n") -> str:
+    return f"namespace N {{ struct Item {{\n{label_lines}    {ctor}\n{tail}}}; }}\n"
+
+
+def test_cpp_constructor_after_an_access_label_returns_its_own_block():
+    for labels in (
+        "public:\n", "protected:\n", "private:\n", "public: // the api\n", "public:\n\n", "private:  \n",
+        "public slots:\n", "Q_SIGNALS:\n", "public:\n    // the constructor follows\n",
+    ):
+        for tail in ("    int n_ = 0;\n", "private:\n    int n_;\n"):
+            source = _class_with(labels, tail=tail)
+            assert extract_block(source, "Item", ".cpp").strip() == CTOR, (labels, tail)
+
+
+def test_cpp_constructor_with_an_initializer_list_after_an_access_label():
+    ctor = "Item(int a, int b) : a_(a), b_(b) {}"
+    assert extract_block(_class_with("public:\n", ctor, "    int a_, b_;\n"), "Item", ".cpp").strip() == ctor
+
+
+def test_cpp_method_after_an_access_label_is_still_found():
+    method = "int size() const { return n_; }"
+    source = f"class Item {{\npublic:\n    {method}\nprivate:\n    int n_ = 0;\n}};\n"
+    assert extract_block(source, "size", ".cpp").strip() == method
+
+
+def _caller(body: str, callee: str = "scale") -> tuple[str, str]:
+    definition = f"int {callee}(int v)\n{{\n    return v * 2;\n}}"
+    return f"int run(int a, int z, bool ready)\n{{\n{body}\n}}\n\n{definition}\n", definition
+
+
+def test_cpp_call_after_a_line_that_ends_in_an_operator_stays_a_call():
+    lam = "scale(z, [](int q) { return q; })"
+    bodies = [
+        "    bool ok = ready &&\n        scale(z);\n    return ok;",
+        "    int y = a *\n        scale(z);\n    return y;",
+        "    int y = a &\n        scale(z);\n    return y;",
+        "    return a *\n        scale(z);",
+        "    return a &\n        scale(z);",
+        "    return ready &&\n        scale(z);",
+        "    int y = ready ? a :\n        scale(z);\n    return y;",
+        "    switch (a) {\n    case 1:\n        scale(z);\n        break;\n    }\n    return 0;",
+        "    if (a) goto done;\ndone:\n    scale(z);\n    return 0;",
+        "    int y = a +\n        // the scale of z\n        scale(z);\n    return y;",
+        "    bool ok = ready &&\n        " + lam + ";\n    return ok;",
+        "    int y = a *\n        " + lam + ";\n    return y;",
+        "    return a &\n        " + lam + ";",
+        "    switch (a) {\n    case 1:\n        " + lam + ";\n    }\n    return 0;",
+        "    if (a > 1 &&\n        scale(z) > 3) {\n        return 1;\n    }\n    return 0;",
+    ]
+    for ext in (".cpp", ".c"):
+        for body in bodies:
+            source, definition = _caller(body)
+            assert extract_block(source, "scale", ext).strip() == definition, (ext, body)
+
+
+def test_cpp_expression_line_that_looks_like_a_type_is_not_a_return_type():
+    # `ready &&` and `a *` read like `Item &&` and `Item *`; the parameter list that is not followed by a
+    # body is what tells a call from a definition.
+    for line in ("ready &&", "a *", "ready & flag &", "x * y *", "a * 2 *"):
+        source, definition = _caller(f"    bool ok = {line}\n        scale(z);\n    return ok;")
+        assert extract_block(source, "scale", ".cpp").strip() == definition, line
+    source, definition = _caller("    ready &&\n        scale(z);\n    return 0;")
+    assert extract_block(source, "scale", ".cpp").strip() == definition
+
+
+def test_cpp_initializer_list_members_are_not_definitions():
+    assert extract_block("struct Item {\n    int n_;\n    Item(int n) :\n        n_(n) {}\n};\n", "n_", ".cpp") == ""
+    assert extract_block("Item::Item(int n) :\n    base_(n)\n{\n}\n", "base_", ".cpp") == ""
+    assert extract_block("Item::Item(int a, int b) :\n    a_(a),\n    b_(b)\n{\n}\n", "b_", ".cpp") == ""
+
+
+def test_other_languages_keep_treating_a_trailing_star_or_colon_as_a_continuation():
+    ts = ("function run(a, z) {\n  return a *\n    scale(z);\n}\n\n"
+          "function scale(v) {\n  return v * 2;\n}\n")
+    assert extract_block(ts, "scale", ".ts").strip() == "function scale(v) {\n  return v * 2;\n}"
+    java = ("class A {\n  int run(boolean r, int z) {\n    boolean ok = r &&\n      scale(z) > 0;\n"
+            "    return ok ? 1 : 0;\n  }\n\n  int scale(int v) {\n    return v * 2;\n  }\n}\n")
+    assert extract_block(java, "scale", ".java").strip() == "int scale(int v) {\n    return v * 2;\n  }"
+    keyed = "const o = {\n  public:\n    first() { return 1; },\n};\n"
+    assert extract_block(keyed, "first", ".ts") == ""
+
+
+def _gate1_existence(tmp_path, source: str, symbol: str, filename: str = "sample.cpp"):
+    """The real Gate1Filter.filter() with skip_llm: only the existence stage runs, no model is called."""
+    import configparser
+
+    from tools.auto.architect import CandidateTask, CitedLocation
+    from tools.auto.gate1_filter import Gate1Filter
+
+    (tmp_path / filename).write_text(source, encoding="utf-8")
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({
+        "api": {"active": "local", "verify_ssl": "false"},
+        "api_local": {"base_url": "http://localhost:1/v1", "api_key": "t", "model": "m", "api_format": "openai"},
+        "gate1": {"skip_llm": "true"},
+        "loop": {"timeout_seconds": "5"},
+    })
+    gate = Gate1Filter(config=cfg, base_url="http://localhost:1/v1", api_key="t", model="m", verify_ssl=False)
+    candidate = CandidateTask(
+        title=f"fix {symbol}", instruction=f"fix {symbol}", target_files=[filename], acceptance_check="true",
+        cited_location=CitedLocation(file=filename, symbol=symbol))
+    return gate.filter([candidate], tmp_path)
+
+
+def test_gate1_existence_stage_accepts_the_recovered_cpp_symbols(tmp_path):
+    cases = [
+        ("duplicate", SPLIT_RETURN_TYPES[0][1] + "\n\n" + CPP_NEIGHBOUR),
+        ("assign", "struct Item {};\n\n" + SPLIT_RETURN_TYPES[1][1] + "\n"),
+        ("Item", "namespace N { struct Item {\npublic:\n    " + CTOR + "\nprivate:\n    int n_;\n}; }\n"),
+    ]
+    for symbol, source in cases:
+        accepted, rejected = _gate1_existence(tmp_path, source, symbol)
+        assert [c.cited_location.symbol for c in accepted] == [symbol], [r.reason for r in rejected]
+        assert not rejected
+
+
+def test_gate1_existence_stage_still_rejects_a_symbol_that_is_not_there(tmp_path):
+    accepted, rejected = _gate1_existence(tmp_path, SPLIT_RETURN_TYPES[0][1] + "\n", "no_such_symbol")
+    assert not accepted and len(rejected) == 1
