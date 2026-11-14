@@ -59,6 +59,13 @@ def _resolve_within_base(base_dir: str, file_path: str) -> "str | None":
 #: The legacy codecs a non-UTF-8 file may be written back in, most faithful first.
 #: `cp1251` leads because it is this repository's own codec, and on a tie it wins.
 _LEGACY_WRITE_ENCODINGS: Tuple[str, ...] = ("cp1251", "cp1252")
+
+#: The reasoning tags a model may wrap its reply in. Written with an escape so this source holds no
+#: literal tag: the editor must treat one inside a file as text, and so must a reader of this code.
+_THINK_OPEN = "\x3cthink>"
+_THINK_CLOSE = "\x3c/think>"
+#: How many `{` of a reply are tried as the start of the replacement object before the reply is refused.
+_EDIT_REPLY_OBJECT_TRIES = 64
 #: The PEP 263 coding cookie: `# coding: name`, `# coding=name`, `# -*- coding: name -*-`.
 _CODING_COOKIE_RE = re.compile(rb"coding[ \t]*[:=][ \t]*([A-Za-z0-9._-]+)")
 
@@ -1121,8 +1128,17 @@ class OrchestratorActions:
 
     def _edit_file_content(self, instruction: str, file_label: str,
                            source: str, feedback: str = None,
-                           previous_revised: str = None) -> "str | None":
+                           previous_revised: str = None) -> "tuple[str, str | None]":
         """Ask the model for the COMPLETE revised file content (no commentary).
+
+        Returns ``(status, content)``:
+          * ``("ok", content)`` — ``content`` is the complete revised file, read
+            verbatim from the JSON boundary the prompts request (a literal
+            a literal think tag in the file survives untouched).
+          * ``("invalid", None)`` — the reply was missing, malformed or truncated;
+            the diagnostic is printed here, the file is never written and no
+            backup is made (see :meth:`_parse_edit_reply`).
+          * ``("transient", None)`` — a transport/API failure; retried by the caller.
 
         Message structure depends on whether this is a first attempt or a retry:
 
@@ -1143,17 +1159,30 @@ class OrchestratorActions:
         of the original document. Putting feedback in a separate user turn after an
         assistant turn removes that ambiguity entirely.
         """
+        # AUDIT-9: the editor asks for the replacement file inside a JSON object so
+        # its content has an explicit boundary. A literal think tag in the
+        # file's own text (a string, a comment, a markdown example, a template) is
+        # then just text inside the "content" string — never model reasoning — so
+        # it reaches the validator and the disk verbatim. The boundary text is
+        # repeated in the system prompt AND in every retry prompt so the model
+        # keeps answering in the same shape after a rejection.
+        boundary = (
+            'Output ONLY a JSON object with the single string field "content": '
+            '{"content": "<the complete updated file content>"}. '
+            'The "content" field holds the whole file verbatim, every character '
+            "that should be in it — including literal \x3cthink> or \x3c/think> text, "
+            "quotes, indentation, blank lines and line endings. No explanations, "
+            "no commentary, no markdown code fences, no extra keys."
+        )
         system = (
             "You are a precise text/file editor. Apply the INSTRUCTION to the DOCUMENT. "
-            "Output ONLY the complete, updated file content — no explanations, no "
-            "commentary, no markdown code fences. Preserve everything that should not "
-            "change; fix what the instruction asks; if asked to add a question or note, "
-            "append it as plain text in the file."
+            + boundary
         )
 
         base_user = (
             f"DOCUMENT ({file_label}):\n-----\n{source}\n-----\n"
-            f"INSTRUCTION: {instruction}"
+            f"INSTRUCTION: {instruction}\n"
+            f"OUTPUT FORMAT: {boundary}"
         )
 
         if not feedback:
@@ -1170,8 +1199,7 @@ class OrchestratorActions:
                 f"That edit was rejected.\n\n"
                 f"Error: {feedback}\n\n"
                 f"Re-apply the INSTRUCTION to the DOCUMENT below, correcting "
-                f"the error above. Output ONLY the complete corrected file — "
-                f"no explanations, no code fences.\n\n"
+                f"the error above. {boundary}\n\n"
                 f"DOCUMENT ({file_label}):\n-----\n{source}\n-----\n"
                 f"INSTRUCTION: {instruction}"
             )
@@ -1195,7 +1223,7 @@ class OrchestratorActions:
                 f"Re-apply the INSTRUCTION to DOCUMENT ({file_label}), "
                 f"correcting the error above.\n"
                 f"INSTRUCTION (reminder): {instruction}\n"
-                "Output ONLY the complete corrected file content — no explanations, no code fences.\n"
+                f"OUTPUT FORMAT: {boundary}\n"
                 "---END CORRECTION---"
             )
             messages = [
@@ -1230,14 +1258,82 @@ class OrchestratorActions:
             print()
             if _s := _tok_stats():
                 print(f"[{_ts()}] {_s}")
-            out = self._strip_code_fence(strip_think(out))
-            tracer.event("file_editor", "orchestrator", "llm_response", content=out)
-            return out
+            # AUDIT-9: the replacement file is read from its JSON boundary, NOT by
+            # strip_think() over the whole reply — a literal think tag inside the
+            # file would otherwise be thrown away as reasoning. An outer reasoning
+            # wrapper is dropped at the response boundary only (see _parse_edit_reply);
+            # the content itself is returned verbatim, tags untouched.
+            content, error = self._parse_edit_reply(out)
+            tracer.event("file_editor", "orchestrator", "llm_response",
+                         content=content if error is None else f"(invalid: {error})")
+            if error is not None:
+                print(f"[{_ts()}] ❗ Invalid edit reply: {error}")
+                return ("invalid", None)
+            return ("ok", content)
         except Exception as e:
-            # A transient failure returns None, not "", so run_edit retries it instead of reporting no content.
+            # A transient failure returns ("transient", None), not "", so run_edit retries it instead of reporting no content.
             logger.error(f"file edit call failed: {e}")
             print(f"[{_ts()}] edit generation failed: {e}")
-            return None
+            return ("transient", None)
+
+    @staticmethod
+    def _parse_edit_reply(raw: "str | None") -> "tuple[str | None, str | None]":
+        """Extract the replacement file text from the editor's raw reply.
+
+        The editor asks for a JSON object ``{"content": "<file>"}`` (see the
+        ``boundary`` text in :meth:`_edit_file_content`), so a think tag written in
+        the file's own text is never mistaken for model reasoning: the replacement
+        is read verbatim from the ``content`` string. Only an outer reasoning
+        wrapper at the response boundary is removed, before the object is looked
+        for, and never anything inside the content.
+
+        Returns ``(content, error)``: ``content`` is the file text on success
+        (``error`` is ``None``); on a missing, malformed or truncated reply
+        ``content`` is ``None`` and ``error`` is a human-readable diagnostic.
+        The caller reports the diagnostic and retries or stops; the original file
+        is left byte-identical and no backup is made.
+
+        A reply that opens a reasoning block and never closes it cannot be
+        classified from that spelling alone (it is an unclosed wrapper or file text
+        that opens a tag), so it is unusable rather than silently truncated. There
+        is deliberately no plain-text compatibility path: a reply that carries no
+        JSON object with a string ``content`` is a malformed replacement.
+        """
+        if raw is None:
+            return None, "no reply from the model"
+        text = OrchestratorActions._strip_code_fence(raw).strip()
+        if not text:
+            return None, "empty reply from the model"
+        if text.startswith(_THINK_OPEN):
+            close = text.find(_THINK_CLOSE)
+            if close == -1:
+                return None, ("reply opens a reasoning block that never closes — "
+                              "ambiguous between reasoning and file content")
+            text = text[close + len(_THINK_CLOSE):].strip()
+        else:
+            # A wrapper whose opening tag the provider already consumed: the tail after the
+            # closing tag is the answer, provided no object precedes the tag (so a file
+            # that merely mentions the closing tag inside its JSON string is untouched).
+            close = text.find(_THINK_CLOSE)
+            if close != -1 and "{" not in text[:close]:
+                text = text[close + len(_THINK_CLOSE):].strip()
+        text = OrchestratorActions._strip_code_fence(text).strip()
+        # The first JSON object that carries a string "content" is the replacement; text
+        # before or after it (a sentence, a sign-off) is not part of the file.
+        decoder = json.JSONDecoder()
+        at = text.find("{")
+        for _ in range(_EDIT_REPLY_OBJECT_TRIES):
+            if at == -1:
+                break
+            try:
+                data, _end = decoder.raw_decode(text, at)
+            except ValueError:
+                data = None
+            if isinstance(data, dict) and isinstance(data.get("content"), str):
+                return data["content"], None
+            at = text.find("{", at + 1)
+        return None, ('reply is not the required JSON object '
+                      '{"content": "<complete file>"} — file left unchanged')
 
     def _validate_edit(self, instruction: str, original: str, revised: str,
                         stream_mode: bool = False) -> dict:
@@ -1431,11 +1527,43 @@ class OrchestratorActions:
                     _prev_to_pass = revised
 
             _step_start = time.time()
-            _new_revised = self._edit_file_content(
+            _edit_result = self._edit_file_content(
                 instruction, file_path, original,
                 feedback=feedback,
                 previous_revised=_prev_to_pass,
             )
+            # _edit_file_content returns (status, content): status is "ok" (content
+            # is the revision), "invalid" (content is None — a malformed/truncated
+            # reply) or "transient" (content is None — a transport failure). The
+            # existing /edit tests stub _edit_file_content to return a bare string,
+            # which is accepted as an "ok" revision.
+            if isinstance(_edit_result, tuple):
+                _edit_status, _new_revised = _edit_result
+            else:
+                _edit_status, _new_revised = "ok", _edit_result
+
+            if _edit_status == "invalid":
+                # AUDIT-9: an unusable replacement (missing, malformed, truncated)
+                # is never written by THIS iteration — if no usable revision ever
+                # arrived the original file stays byte-identical and no backup is
+                # made. The diagnostic was printed by _edit_file_content; retry (a
+                # bounded retry through the normal feedback path) or stop.
+                _api_err_count = 0
+                if iteration >= self.max_iterations:
+                    if revised.strip():
+                        # A usable revision arrived earlier (it only failed the
+                        # validator): write it best-effort, as a transient failure
+                        # at the same point would — not an empty file.
+                        print(f"[{_ts()}] ⚠️  Edit reply invalid after "
+                              f"{self.max_iterations} iteration(s) — using best "
+                              f"edit so far.")
+                        break
+                    print(f"[{_ts()}] ⚠️  Edit reply invalid after "
+                          f"{self.max_iterations} iteration(s) — file left unchanged.")
+                    return
+                feedback = "the reply was not the required JSON content boundary"
+                iteration += 1
+                continue
 
             if _new_revised is None:
                 # A transient generation failure is retried, as the validator call is, instead of ending /edit.

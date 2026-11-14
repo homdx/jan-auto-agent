@@ -389,14 +389,36 @@ def _ts_skip_atom(source: str, k: int) -> int:
     return k
 
 
-def _ts_match_close(source: str, k: int, limit: int, angle: bool = False) -> int:
+#: Words that open a statement and can never open a type: a line that begins with one ends an angle list that
+#: has not closed. The wider _STATEMENT_START_WORDS also holds `object`, `void`, `typeof`, `new` and `type`,
+#: and a wrapped type argument may well begin with one of those.
+_ANGLE_STATEMENT_WORDS = frozenset((
+    "const", "let", "var", "function", "class", "import", "export", "interface", "enum", "declare",
+    "namespace", "return", "throw", "if", "for", "while",
+))
+
+
+def _line_starts_a_statement(source: str, newline_index: int) -> bool:
+    """True when the line after the newline at *newline_index* begins with a word of _ANGLE_STATEMENT_WORDS."""
+    m = re.compile(r"[ \t\r]*([A-Za-z_$][\w$]*)").match(source, newline_index + 1)
+    return bool(m) and m.group(1) in _ANGLE_STATEMENT_WORDS
+
+
+def _ts_match_close(source: str, k: int, limit: int, angle: bool = False, statement_bound: bool = False) -> int:
     """The index of the bracket that closes the one opened at *k* (`(`, `[`, `{`, or `<` when *angle*),
-    strings, templates, comments and regex literals skipped; -1 when none within *limit*. `=>` is no `>`."""
+    strings, templates, comments and regex literals skipped; -1 when none within *limit*. `=>` is no `>`.
+
+    With *statement_bound* an angle list may not span a statement: a `;` directly between its `<`
+    and `>` (one inside a `{ … }` type literal is part of the type), or a line break after which a
+    statement begins, ends the scan with -1. A `<` that was never closed would otherwise be closed by
+    the `>` of the next statement (`const n = a>(b);`) and take everything between."""
     close = {"<": ">", **_TS_OPENERS}[source[k]]
     stack = [close]
     k += 1
     while k < limit:
         c = source[k]
+        if statement_bound and stack[-1] == ">" and (c == ";" or (c == "\n" and _line_starts_a_statement(source, k))):
+            return -1
         moved = _ts_skip_atom(source, k) if c in "'\"`/" else k
         if moved < 0:
             return -1
@@ -1347,11 +1369,15 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
             # A braced initializer inside `noexcept(noexcept(Item{}))` is part of the signature.
             i = _brace_scan_end(source, i, lang=lang)
             continue
-        if ch == "{":
+        if ch == "{" and not tail_depth:
             return i
         if ch == ";":
             return None
         if ch == "}":
+            # AUDIT-9 follow-up (361): a "{" met inside a parenthesized group — `=> ({ ...s, n })` — opens an
+            # object literal of an expression body, not the function's body. It is walked over like any other
+            # character, and the "}" that closes it returns None here just below, so the assigned-definition
+            # passes take the whole parenthesized value and the block ends at the outer ")".
             # HARDEN-6 A: a closer the head never opened means the head sits inside a block that is
             # already closing — the tail of a caller, not the start of a definition.
             return None
@@ -2735,6 +2761,8 @@ _NOT_A_DECLARATION_WORDS = frozenset(("return", "yield", "await", "var", "new", 
 _JS_IDENT = re.compile(r"[A-Za-z_$][\w$]*")
 _JS_DOTTED_IDENT = re.compile(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*")
 _ASSIGNED_SCAN_BOUND = 4000
+#: How far a type-parameter / type-argument list is followed to its closing `>`.
+_ANGLE_SCAN_BOUND = 400
 
 
 def _skip_space(source: str, i: int, newlines: bool = True) -> int:
@@ -2746,19 +2774,15 @@ def _skip_space(source: str, i: int, newlines: bool = True) -> int:
 
 
 def _angle_end(source: str, i: int) -> Optional[int]:
-    """The index just past the `>` that closes the `<` at *i* (type parameters), or None."""
-    depth = 0
-    for k in range(i, min(len(source), i + 400)):
-        ch = source[k]
-        if ch == "<":
-            depth += 1
-        elif ch == ">":
-            depth -= 1
-            if depth == 0:
-                return k + 1
-        elif ch in ";{}\n":
-            return None
-    return None
+    """The index just past the `>` that closes the `<` at *i* (type parameters or type arguments), or None.
+
+    The bounded TypeScript scanner balances what a type list holds — a constraint with braces
+    (`<T extends { id: number }>`), the `=>` of a function type (`useCallback<(x: number) => number>`),
+    a nested list (`memo<Map<string, Array<{ id: number }>>>`) — so none of them is taken for the
+    closer, and a list that wraps over lines is read whole. It stays inside one statement: a `<` that
+    is a comparison or never closes does not borrow the `>` of a later line."""
+    close = _ts_match_close(source, i, min(len(source), i + _ANGLE_SCAN_BOUND), angle=True, statement_bound=True)
+    return close + 1 if close >= 0 else None
 
 
 def _paren_end(source: str, i: int, lang: str) -> Optional[int]:
