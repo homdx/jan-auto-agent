@@ -129,12 +129,6 @@ def test_a_wrapper_whose_opening_tag_the_provider_already_took_is_dropped(monkey
     assert ed.saved == revised.encode("utf-8")
 
 
-def test_text_around_the_object_is_not_part_of_the_file(monkeypatch, tmp_path):
-    revised = _file("VALUE = 7")
-    ed = Editor(monkeypatch, tmp_path).run("Here is the file:\n" + reply(revised) + "\nDone.")
-    assert ed.saved == revised.encode("utf-8")
-
-
 # ── an unusable reply leaves the file byte-identical, makes no backup and stops ──────────────────────
 
 MALFORMED = {
@@ -149,6 +143,15 @@ MALFORMED = {
     "reasoning around an object only": f'{OPEN}{{"content": "draft"}}{CLOSE}',
     "prose only": "Sure, I updated the values.",
     "a bare array": '["before = 1"]',
+    "array containing a replacement": '[{"content": "Draft"}]',
+    "truncated outer object": '{"draft": {"content": "Draft"}',
+    "two replacements": '{"content": "Draft"}\n{"content": "Final"}',
+    "draft before a closing-only wrapper": '{"content": "Draft"}\n' + CLOSE + '\n{"content": "Final"}',
+    "unclosed fence": '```json\n{"content": "Draft"}',
+    "nested fence": '```json\n```json\n{"content": "Draft"}\n```\n```',
+    "extra key": '{"content": "Draft", "complete": false}',
+    "duplicate content": '{"content": "Draft", "content": "Final"}',
+    "unframed commentary": 'Here is the file:\n{"content": "Draft"}\nDone.',
 }
 
 
@@ -234,6 +237,6 @@ def test_the_parser_refuses_what_it_cannot_classify():
         assert content is None and error, raw
 
 
-def test_the_parser_gives_up_on_a_reply_of_many_braces_without_scanning_it_all():
+def test_the_parser_refuses_a_deeply_nested_truncated_reply():
     content, error = PARSE('{"a": ' * 5000)
     assert content is None and error

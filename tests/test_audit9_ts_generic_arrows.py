@@ -275,10 +275,30 @@ def test_gate1_evidence_is_the_whole_definition(tmp_path, definition):
     assert ok and _norm(block) == _norm(definition), block
 
 
+@pytest.mark.parametrize("ext", [".ts", ".tsx", ".mts", ".cts"])
+def test_gate1_evidence_keeps_a_long_parenthesized_arrow(tmp_path, ext):
+    fields = "".join(f"  field{i}: n + {i},\n" for i in range(50))
+    definition = f"const lookup = (n: number) => ({{\n{fields}}}).field49;"
+    source = f"{MARKER}{definition}\n{NEIGHBOUR}\n"
+    filename = f"sample{ext}"
+    (tmp_path / filename).write_text(source, encoding="utf-8")
+
+    assert get_context_lines(source, "lookup", before=1, file_ext=ext) == MARKER
+    ok, reason, block = _gate(tmp_path)._check_existence(_candidate(filename), tmp_path)
+    assert ok, reason
+    assert block == definition
+
+
+def test_long_parenthesized_arrow_can_end_at_eof():
+    definition = 'const lookup = () => ({ text: "' + "x" * 500 + '" })'
+    assert extract_block(definition, "lookup", ".ts") == definition
+
+
 @pytest.mark.parametrize("source", [
     f"function run() {{\n  lookup<T>(x);\n}}\n{NEIGHBOUR}\n",
     f"const lookup = a < b;\n{NEIGHBOUR}\n",
     f"const lookup = memo<Foo(props => 1);\nconst z = c>(d);\n{NEIGHBOUR}\n",
+    f"const lookup = () => ({{ n: 1 }};\nconst later = call(2));\n{NEIGHBOUR}\n",
 ])
 def test_gate1_still_rejects_what_is_not_a_definition(tmp_path, source):
     (tmp_path / "sample.ts").write_text(source, encoding="utf-8")

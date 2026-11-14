@@ -1891,7 +1891,8 @@ def _bodyless_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
 
 
 def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: bool, lang: str = "",
-                                  stop_at_comma: bool = False) -> Optional[int]:
+                                  stop_at_comma: bool = False, *,
+                                  after_arrow: bool = False) -> Optional[int]:
     """The end of a definition whose head matches but whose body has no `{ … }` (HARDEN-4 D2).
 
     Returns the index just past the `;` that ends the statement, or the end of its last logical
@@ -1901,7 +1902,8 @@ def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: boo
 
     With *stop_at_comma* a comma at depth 0 ends it instead of continuing, which is what an
     object-literal property needs (HARDEN-9 E): the comma belongs to the literal, not to the
-    property's value.
+    property's value. With *after_arrow*, a leading parenthesized expression is balanced
+    before applying the short scan bound to its suffix.
     """
     n = len(source)
     i = scan_from
@@ -1912,6 +1914,30 @@ def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: boo
         if close_paren >= n:
             return None
         i = close_paren
+
+    after_balanced_group = False
+    if after_arrow:
+        first = _js_next_code_index(source, i)
+        if first != -1 and source[first] == "(":
+            mask = _code_mask(source, lang, mark_comments=True)
+            closers: list[str] = []
+            for at in range(first, n):
+                if mask[at] != _MASK_CODE:
+                    continue
+                ch = source[at]
+                if ch in _TS_OPENERS:
+                    closers.append(_TS_OPENERS[ch])
+                elif ch in ")]}":
+                    if ch != closers.pop():
+                        return None
+                    if not closers:
+                        i = at + 1
+                        after_balanced_group = True
+                        break
+                elif ch == ";" and len(closers) == 1:
+                    return None  # a statement cannot start inside the unclosed outer group
+            else:
+                return None
 
     state = "code"
     escape = False
@@ -1997,6 +2023,9 @@ def _find_definition_end_bodyless(source: str, scan_from: int, has_arg_list: boo
                 return i
         i += 1
 
+    # A confirmed parenthesized arrow can also end at EOF without a semicolon.
+    if after_balanced_group and i == n and not depth and state in {"code", "line_comment"}:
+        return n
     return None
 
 
@@ -2486,8 +2515,9 @@ def _find_earliest_bodyless_definition(source: str, target_name: str, lang: str 
 
     for pat in _bodyless_candidate_patterns(target_name):
         for match in _iter_code_matches(pat, source, code_mask):
-            has_arg_list = match.group(0).rstrip().endswith("(")
-            end = _find_definition_end_bodyless(source, match.end(), has_arg_list, lang)
+            head = match.group(0).rstrip()
+            end = _find_definition_end_bodyless(source, match.end(), head.endswith("("), lang,
+                                                after_arrow=lang in _JS_LANGS and head.endswith("=>"))
             if end is None:
                 continue
 
@@ -2855,7 +2885,7 @@ def _arrow_value_end(source: str, i: int, lang: str) -> Optional[int]:
     k = _skip_space(source, arrow)
     if k < n and source[k] == "{":
         return _brace_scan_end(source, k, lang=lang)
-    return _find_definition_end_bodyless(source, k, False, lang)
+    return _find_definition_end_bodyless(source, k, False, lang, after_arrow=True)
 
 
 def _wrapper_value_end(source: str, i: int, lang: str) -> Optional[int]:

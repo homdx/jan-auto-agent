@@ -64,8 +64,6 @@ _LEGACY_WRITE_ENCODINGS: Tuple[str, ...] = ("cp1251", "cp1252")
 #: literal tag: the editor must treat one inside a file as text, and so must a reader of this code.
 _THINK_OPEN = "\x3cthink>"
 _THINK_CLOSE = "\x3c/think>"
-#: How many `{` of a reply are tried as the start of the replacement object before the reply is refused.
-_EDIT_REPLY_OBJECT_TRIES = 64
 #: The PEP 263 coding cookie: `# coding: name`, `# coding=name`, `# -*- coding: name -*-`.
 _CODING_COOKIE_RE = re.compile(rb"coding[ \t]*[:=][ \t]*([A-Za-z0-9._-]+)")
 
@@ -1108,24 +1106,6 @@ class OrchestratorActions:
         """Parse '/edit <instruction> in <file>' (or '/edit <file> :: <instruction>')."""
         return OrchestratorActions._parse_payload_and_file(user_input, "/edit")
 
-    @staticmethod
-    def _strip_code_fence(text: str) -> str:
-        """If the model wrapped the whole file in a ``` fence, return the inside.
-
-        BUGFIX: stripping fired on a leading "```" with no matching closer,
-        deleting the real first line of e.g. a markdown file that opens with
-        a fenced snippet. Requires a genuine whole-body wrap now.
-        """
-        t = text.strip()
-        if t.startswith("```"):
-            if "\n" not in t:
-                t = ""
-            else:
-                rest = t.split("\n", 1)[1]
-                if rest.rstrip().endswith("```"):
-                    t = rest.rstrip()[:-3]
-        return t.rstrip("\n") + "\n"
-
     def _edit_file_content(self, instruction: str, file_label: str,
                            source: str, feedback: str = None,
                            previous_revised: str = None) -> "tuple[str, str | None]":
@@ -1134,7 +1114,7 @@ class OrchestratorActions:
         Returns ``(status, content)``:
           * ``("ok", content)`` — ``content`` is the complete revised file, read
             verbatim from the JSON boundary the prompts request (a literal
-            a literal think tag in the file survives untouched).
+            think tag in the file survives untouched).
           * ``("invalid", None)`` — the reply was missing, malformed or truncated;
             the diagnostic is printed here, the file is never written and no
             backup is made (see :meth:`_parse_edit_reply`).
@@ -1301,37 +1281,47 @@ class OrchestratorActions:
         """
         if raw is None:
             return None, "no reply from the model"
-        text = OrchestratorActions._strip_code_fence(raw).strip()
+        text = raw.strip()
         if not text:
             return None, "empty reply from the model"
+
+        def unwrap_fence(reply: str) -> str:
+            head, _, body = reply.partition("\n")
+            rest, newline, tail = body.rpartition("\n")
+            if newline and head.rstrip().lower() in {"```json", "```"} and tail == "```":
+                return rest.strip()
+            return reply
+
+        def replacement_object(pairs: list[tuple[str, object]]) -> dict:
+            # A duplicate content field would otherwise silently pick one replacement.
+            if len(pairs) != 1 or pairs[0][0] != "content":
+                raise ValueError("expected exactly one content field")
+            return dict(pairs)
+
+        if text.startswith("```"):
+            text = unwrap_fence(text)
+        close = text.find(_THINK_CLOSE)
         if text.startswith(_THINK_OPEN):
-            close = text.find(_THINK_CLOSE)
             if close == -1:
                 return None, ("reply opens a reasoning block that never closes — "
                               "ambiguous between reasoning and file content")
-            text = text[close + len(_THINK_CLOSE):].strip()
-        else:
+        elif close != -1:
             # A wrapper whose opening tag the provider already consumed: the tail after the
-            # closing tag is the answer, provided no object precedes the tag (so a file
-            # that merely mentions the closing tag inside its JSON string is untouched).
-            close = text.find(_THINK_CLOSE)
-            if close != -1 and "{" not in text[:close]:
-                text = text[close + len(_THINK_CLOSE):].strip()
-        text = OrchestratorActions._strip_code_fence(text).strip()
-        # The first JSON object that carries a string "content" is the replacement; text
-        # before or after it (a sentence, a sign-off) is not part of the file.
-        decoder = json.JSONDecoder()
-        at = text.find("{")
-        for _ in range(_EDIT_REPLY_OBJECT_TRIES):
-            if at == -1:
-                break
-            try:
-                data, _end = decoder.raw_decode(text, at)
-            except ValueError:
-                data = None
-            if isinstance(data, dict) and isinstance(data.get("content"), str):
-                return data["content"], None
-            at = text.find("{", at + 1)
+            # closing tag is the answer only if no candidate object, array or fence precedes it.
+            prefix = text[:close]
+            if any(mark in prefix for mark in ("{", "}", "[", "```")):
+                close = -1
+        if close != -1:
+            text = unwrap_fence(text[close + len(_THINK_CLOSE):].strip())
+
+        # Parse the entire response body, so an inner object in a broken reply or a draft
+        # followed by another object cannot become the replacement.
+        try:
+            data = json.loads(text, object_pairs_hook=replacement_object)
+        except (ValueError, RecursionError):
+            data = None
+        if isinstance(data, dict) and isinstance(data.get("content"), str):
+            return data["content"], None
         return None, ('reply is not the required JSON object '
                       '{"content": "<complete file>"} — file left unchanged')
 
