@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -300,3 +302,220 @@ def test_a_landed_ticket_is_not_landed_twice(repo: Path, capsys) -> None:
     err = capsys.readouterr().err
     assert "already landed" in err and len(err.strip().splitlines()) == 1
     assert _git(repo, "rev-list", "--count", "HEAD") == commits
+
+
+# ── round 363: a rollback that cannot finish says so ──────────────────────────
+def _reject_commits(repo: Path, message: str = "no commits today") -> None:
+    """A `pre-commit` hook that refuses every commit with *message*."""
+    _git(repo, "config", "core.hooksPath", ".git/hooks")
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit 1\n", encoding="utf-8")
+    hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+
+
+def _fail_ticket_restore(monkeypatch, ticket: Path) -> None:
+    """Make the rollback's `Path.write_bytes()` of *ticket* raise, and nothing else."""
+    real = Path.write_bytes
+
+    def write_bytes(self, data):
+        if self == ticket:
+            raise OSError(errno.EIO, "injected restore error")
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", write_bytes)
+
+
+def _fail_unstage(monkeypatch) -> None:
+    """Make the rollback's `git reset` raise, and every other git call work."""
+    real = merge.git
+
+    def git(repo, *args, **kwargs):
+        if args and args[0] == "reset":
+            raise merge.GitRefError("injected reset error")
+        return real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(merge, "git", git)
+
+
+def test_a_refused_land_reports_the_refusal_and_restores_everything(repo: Path, capsys) -> None:
+    """Acceptance 1: the hook's refusal is the only error, HEAD stays, and the ticket,
+    INDEX row and staging all return to where they were; a retry then succeeds."""
+    _roster(repo)
+    _record(repo)
+    _reject_commits(repo)
+    before = _git(repo, "rev-parse", "HEAD")
+    ticket_before = (repo / "epic-tasks" / TICKET).read_text(encoding="utf-8")
+    rows_before = (repo / "epic-tasks" / "INDEX.md").read_text(encoding="utf-8")
+
+    assert _land(repo, capsys) == merge.EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "no commits today" in err
+    assert "rollback" not in err
+    assert _git(repo, "rev-parse", "HEAD") == before
+    assert (repo / "epic-tasks" / TICKET).read_text(encoding="utf-8") == ticket_before
+    assert (repo / "epic-tasks" / "INDEX.md").read_text(encoding="utf-8") == rows_before
+    assert _git(repo, "diff", "--cached", "--name-only") == ""
+
+    (repo / ".git" / "hooks" / "pre-commit").unlink()
+    assert _land(repo, capsys) == merge.EXIT_OK
+
+
+def test_a_failed_ticket_restore_is_reported_and_the_rest_still_runs(
+        repo: Path, capsys, monkeypatch) -> None:
+    """Acceptance 2: the original refusal, the failed path and error, and the incomplete
+    warning are all shown; the INDEX row is still restored and the staging still undone."""
+    _roster(repo)
+    _record(repo)
+    _reject_commits(repo)
+    ticket = repo / "epic-tasks" / TICKET
+    rows_before = (repo / "epic-tasks" / "INDEX.md").read_text(encoding="utf-8")
+    _fail_ticket_restore(monkeypatch, ticket)
+
+    assert _land(repo, capsys) == merge.EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "no commits today" in err
+    assert f"could not restore epic-tasks/{TICKET}" in err
+    assert "injected restore error" in err
+    assert "rollback incomplete" in err and "inspect the working tree and index" in err
+    # the independent steps still ran: the row is back and the staging is gone
+    assert (repo / "epic-tasks" / "INDEX.md").read_text(encoding="utf-8") == rows_before
+    assert _git(repo, "diff", "--cached", "--name-only") == ""
+    # the ticket could not be restored, so it stays landed on disk
+    assert "**Status:** landed" in ticket.read_text(encoding="utf-8")
+
+
+def test_a_failed_unstage_is_reported_and_the_files_are_still_restored(
+        repo: Path, capsys, monkeypatch) -> None:
+    """Acceptance 3: the original refusal and the failed git operation with its paths are
+    shown, and the file restorations still happen."""
+    _roster(repo)
+    _record(repo)
+    _reject_commits(repo)
+    ticket_before = (repo / "epic-tasks" / TICKET).read_text(encoding="utf-8")
+    rows_before = (repo / "epic-tasks" / "INDEX.md").read_text(encoding="utf-8")
+    _fail_unstage(monkeypatch)
+
+    assert _land(repo, capsys) == merge.EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "no commits today" in err
+    assert "could not unstage" in err
+    assert f"epic-tasks/{TICKET}" in err and "epic-tasks/INDEX.md" in err
+    assert "injected reset error" in err
+    assert "rollback incomplete" in err
+    # the files were restored even though the unstage failed
+    assert (repo / "epic-tasks" / TICKET).read_text(encoding="utf-8") == ticket_before
+    assert (repo / "epic-tasks" / "INDEX.md").read_text(encoding="utf-8") == rows_before
+    # the staging is still there, because the unstage is what failed
+    assert _git(repo, "diff", "--cached", "--name-only") != ""
+
+
+def test_both_rollback_failures_are_visible(repo: Path, capsys, monkeypatch) -> None:
+    """Acceptance 4: one failed step does not hide the other."""
+    _roster(repo)
+    _record(repo)
+    _reject_commits(repo)
+    _fail_ticket_restore(monkeypatch, repo / "epic-tasks" / TICKET)
+    _fail_unstage(monkeypatch)
+    _write(repo / "src" / "x.py", "x = 1\n")
+    _git(repo, "add", "--", "src/x.py")
+    staged = _git(repo, "show", ":src/x.py")
+    _write(repo / "src" / "x.py", "x = 2\n")
+
+    assert _land(repo, capsys, passthrough=["src/x.py"]) == merge.EXIT_USAGE
+    err = capsys.readouterr().err
+    assert "no commits today" in err
+    assert "could not restore" in err and "injected restore error" in err
+    assert "could not unstage" in err and "injected reset error" in err
+    assert "rollback incomplete" in err
+    assert _git(repo, "show", ":src/x.py") == staged
+    assert (repo / "src" / "x.py").read_text() == "x = 2\n"
+
+
+@pytest.mark.parametrize("path, staged, extras", [
+    ("src/x.py", "x = 1\n", ["src/x.py"]),
+    ("src/x.py", "x = 1\n", ["./src/x.py", "src/x.py"]),
+    ("src/x.py", "x = 1\n", ["src", "src/x.py"]),
+    ("epic-tasks/INDEX.md", f"# Index\n\n{ROW_131}\n{ROW_195}\n# staged edit\n", []),
+    (f"contest-bench/{NN}/new evidence.txt", "staged evidence\n", []),
+])
+def test_a_refused_land_preserves_the_exact_staged_and_worktree_versions(
+        repo: Path, capsys, path, staged, extras) -> None:
+    _write(repo / path, staged)
+    _git(repo, "add", "--", path)
+    working = staged + "# later edit\n"
+    _write(repo / path, working)
+    before = _git(repo, "diff", "--cached", "--binary")
+    _reject_commits(repo)
+
+    assert _land(repo, capsys, passthrough=extras) == merge.EXIT_USAGE
+    assert "no commits today" in capsys.readouterr().err
+    assert _git(repo, "diff", "--cached", "--binary") == before
+    assert (repo / path).read_text() == working
+
+    (repo / ".git/hooks/pre-commit").unlink()
+    assert _land(repo, capsys, passthrough=extras) == merge.EXIT_OK
+    assert "# later edit" in _git(repo, "show", f"HEAD:{path}")
+
+
+@pytest.mark.parametrize("staging", ["delete", "intent"])
+def test_a_refused_land_preserves_staged_deletion_and_intent_to_add(
+        repo: Path, capsys, staging) -> None:
+    path = "src/x.py" if staging == "delete" else "src/new.py"
+    if staging == "delete":
+        _git(repo, "rm", "--", path)
+    _write(repo / path, "x = 2\n")
+    if staging == "intent":
+        _git(repo, "add", "-N", "--", path)
+    before = _git(repo, "status", "--porcelain")
+    _reject_commits(repo)
+
+    assert _land(repo, capsys, passthrough=[path]) == merge.EXIT_USAGE
+    assert "no commits today" in capsys.readouterr().err
+    assert _git(repo, "status", "--porcelain") == before
+    assert (repo / path).read_text() == "x = 2\n"
+
+
+def test_snapshot_error_refuses_before_any_file_is_changed(repo: Path, capsys, monkeypatch) -> None:
+    ticket = repo / "epic-tasks" / TICKET
+    original = ticket.read_bytes()
+    read_bytes = Path.read_bytes
+    reads = 0
+
+    def read(path):
+        nonlocal reads
+        if path == repo / "epic-tasks/INDEX.md":
+            reads += 1
+            if reads == 2:
+                raise OSError(errno.EIO, "injected snapshot error")
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    assert _land(repo, capsys) == merge.EXIT_USAGE
+    assert "injected snapshot error" in capsys.readouterr().err
+    assert ticket.read_bytes() == original
+    assert _git(repo, "status", "--porcelain") == ""
+
+
+def test_partial_initial_write_restores_only_the_file_it_touched(
+        repo: Path, capsys, monkeypatch) -> None:
+    ticket = repo / "epic-tasks" / TICKET
+    original = ticket.read_bytes()
+    write_text, write_bytes = Path.write_text, Path.write_bytes
+
+    def write(path, *args, **kwargs):
+        if path == ticket:
+            write_bytes(path, b"partial")
+            raise OSError(errno.EIO, "injected initial write error")
+        return write_text(path, *args, **kwargs)
+
+    def restore(path, data):
+        assert path == ticket, "rollback touched a file that the command had not written"
+        return write_bytes(path, data)
+
+    monkeypatch.setattr(Path, "write_text", write)
+    monkeypatch.setattr(Path, "write_bytes", restore)
+    assert _land(repo, capsys) == merge.EXIT_USAGE
+    assert "injected initial write error" in capsys.readouterr().err
+    assert ticket.read_bytes() == original
+    assert _git(repo, "status", "--porcelain") == ""

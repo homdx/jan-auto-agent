@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import tempfile
 from dataclasses import dataclass
 from email import policy
@@ -470,20 +471,22 @@ def apply_patch(repo: Path, path: Path) -> tuple[bool, str]:
         return False, str(err)
 
 
-def _cached_paths(repo: Path) -> list[str]:
+def _cached_paths(repo: Path, *, include_intent_to_add: bool = False) -> list[str]:
     """The paths the index has changed against HEAD — the commit's, and only those.
 
     `--no-renames` keeps a rename's deletion visible, so the source and the
     destination land in the commit together.
+    Include intent-to-add entries when taking a snapshot of operator staging.
 
     333-F5: `strip=False`, the way this module's other `-z` readers
     (`status_paths` / `ls_tree_names`) already read: `-z` turns quoting off, so a
     path with a leading space comes out as `" x.py\\0…"`, and `git()`'s default
     whole-output `strip()` eats exactly that first path's leading space — the
     later `commit -- <path>` would then name the wrong path."""
+    intent = ["--ita-visible-in-index"] if include_intent_to_add else []
     return [part for part in
             git(repo, "diff", "--cached", "--name-only", "--no-renames", "-z",
-                strip=False).split("\x00")
+                *intent, strip=False).split("\x00")
             if part]
 
 
@@ -735,8 +738,8 @@ def _snapshot(path: Path) -> Optional[bytes]:
         return None
 
 
-def _undo_land(repo: Path, originals: dict[str, Optional[bytes]], paths: list[str],
-               staged_before: set[str]) -> None:
+def _undo_land(repo: Path, originals: dict[str, Optional[bytes]],
+               unstage: list[str], exclusions: list[str]) -> list[str]:
     """Put back what `issue_land` wrote before git refused: the files as they were and
     the paths it staged taken out of the index again (what the operator staged stays).
 
@@ -745,21 +748,28 @@ def _undo_land(repo: Path, originals: dict[str, Optional[bytes]], paths: list[st
     not take — left the ticket `landed` on disk and staged, against "a refused land
     leaves the checkout exactly as it was", and the next `issue land` then said "has
     uncommitted changes".
+
+    Round 363: a rollback step can fail too, and swallowing that left the operator
+    with a `landed` ticket and no commit and no hint why. Every step is still tried
+    after another fails, and each failure comes back as one line naming the operation
+    and the path(s) it could not recover; an empty list means the rollback was
+    complete. The caller prints these after the original refusal.
     """
+    errors: list[str] = []
     for rel, old in originals.items():
         try:
             if old is None:
                 (repo / rel).unlink(missing_ok=True)
             else:
                 (repo / rel).write_bytes(old)
-        except OSError:
-            pass
-    unstage = [path for path in paths if path not in staged_before]
+        except OSError as err:
+            errors.append(f"could not restore {rel}: {err}")
     if unstage:
         try:
-            git(repo, "reset", "-q", "--", *unstage)
-        except GitRefError:
-            pass
+            git(repo, "reset", "-q", "--", *unstage, *exclusions)
+        except GitRefError as err:
+            errors.append(f"could not unstage {', '.join(unstage)}: {err}")
+    return errors
 
 
 def issue_land(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> int:
@@ -824,23 +834,31 @@ def issue_land(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> in
     except (MergeError, GitRefError, rounds.RoundError, ValueError, OSError) as err:
         return output.refuse(str(err))
 
-    originals = {ticket_rel: _snapshot(repo / ticket_rel)}
+    writes = {ticket_rel: new_text}
     if new_rows is not None:
-        originals[INDEX_FILE] = _snapshot(repo / INDEX_FILE)
-    paths: list[str] = []
+        writes[INDEX_FILE] = new_rows
+    paths = [*writes, *bench_paths, *extras]
     try:
-        staged_before = set(_cached_paths(repo))
-    except GitRefError as err:
+        originals = {rel: _snapshot(repo / rel) for rel in writes}
+        staged_before = set(_cached_paths(repo, include_intent_to_add=True))
+    except (GitRefError, OSError) as err:
         return output.refuse(str(err))
+    # A path-limited commit takes the worktree version of paths Git already knows.
+    # Adding them first would overwrite the operator's staged version before Git
+    # can refuse the commit. Only stage paths the operator has not staged.
+    to_stage = [path for path in paths if path not in staged_before]
+    # An extra can also match a previously staged file through a directory or
+    # another spelling. Apply the same literal exclusions to add and reset.
+    exclusions = [f":(exclude,literal){path}" for path in sorted(staged_before)]
+    attempted_writes: dict[str, Optional[bytes]] = {}
+    attempted_stage: list[str] = []
     try:
-        (repo / ticket_rel).write_text(new_text, encoding="utf-8", errors="surrogateescape")
-        if new_rows is not None:
-            (repo / INDEX_FILE).write_text(new_rows, encoding="utf-8", errors="surrogateescape")
-        paths = [ticket_rel]
-        if new_rows is not None:
-            paths.append(INDEX_FILE)
-        paths += [*bench_paths, *extras]
-        git(repo, "add", "--", *paths)
+        for rel, content in writes.items():
+            attempted_writes[rel] = originals[rel]
+            (repo / rel).write_text(content, encoding="utf-8", errors="surrogateescape")
+        if to_stage:
+            attempted_stage = to_stage
+            git(repo, "add", "--", *to_stage, *exclusions)
         subject = (getattr(args, "message", None) or "").strip()
         if not subject:
             subject = f"{nn}: ticket landed"
@@ -864,8 +882,14 @@ def issue_land(repo: Path, args: argparse.Namespace, prof: dict[str, str]) -> in
         message += "\n"
         sha = _commit(repo, message, paths)
     except (MergeError, GitRefError, OSError) as err:
-        _undo_land(repo, originals, paths, staged_before)
-        return output.refuse(str(err))
+        rollback_errors = _undo_land(repo, attempted_writes, attempted_stage, exclusions)
+        code = output.refuse(str(err))
+        for line in rollback_errors:
+            print(output.scrub(f"arena: rollback: {line}"), file=sys.stderr)
+        if rollback_errors:
+            print(output.scrub("arena: rollback incomplete — inspect the working tree "
+                               "and index before retrying"), file=sys.stderr)
+        return code
 
     branch = _head_branch(repo) or round_branch(repo, nn, prof)
     print(output.scrub(f"landed {nn} @ {sha[:7]} — {', '.join(paths)}"))
