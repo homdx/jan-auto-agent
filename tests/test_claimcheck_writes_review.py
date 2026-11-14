@@ -12,7 +12,9 @@ import json
 import os
 import subprocess
 import sys
+from errno import EACCES, ENOSPC
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -189,3 +191,155 @@ def test_a_lock_with_a_garbled_owner_falls_back_to_its_age(tmp_path):
     path.mkdir()
     (path / "owner").write_text(".DS_Store", encoding="utf-8")
     assert tg._Lock(path)._stale() == (False, ".DS_Store")      # fresh: not stale
+
+
+# ── №25: the owner write is part of acquisition ─────────────────────────────────────────────
+
+def test_a_failed_owner_write_aborts_acquisition_and_cleans_up(tmp_path):
+    path = tmp_path / ".lock"
+    entered = False
+    with patch.object(Path, "write_text", side_effect=OSError(ENOSPC, "No space left on device")):
+        with pytest.raises(tg.TargetError) as err:
+            with tg._Lock(path, wait=0):
+                entered = True
+    assert not entered
+    message = str(err.value)
+    assert str(path) in message and "writing owner" in message and "No space left" in message
+    assert not path.exists()               # the failed acquisition left nothing behind
+    with tg._Lock(path, wait=0) as lock:   # a retry is possible immediately
+        assert (path / "owner").read_text(encoding="utf-8") == lock.token
+    assert not path.exists()
+
+
+def test_a_partial_owner_write_is_cleaned_up(tmp_path):
+    path = tmp_path / ".lock"
+    real = Path.write_text
+
+    def partial(self, data, *args, **kwargs):
+        if self.name == "owner":
+            real(self, data[:3], *args, **kwargs)   # part of the token reached the disk
+            raise OSError(ENOSPC, "No space left on device")
+        return real(self, data, *args, **kwargs)
+
+    with patch.object(Path, "write_text", partial):
+        with pytest.raises(tg.TargetError, match="writing owner"):
+            with tg._Lock(path, wait=0):
+                pytest.fail("the protected body ran without a recorded owner")
+    assert not path.exists()
+
+
+def test_another_callers_owner_record_survives_a_failed_acquisition(tmp_path):
+    path = tmp_path / ".lock"
+    real = Path.write_text
+    other = f"{os.getpid()}-another-owner"
+
+    def replace_owner(self, data, *args, **kwargs):
+        if self.name == "owner":
+            real(self, other, *args, **kwargs)
+            raise OSError(ENOSPC, "No space left on device")
+        return real(self, data, *args, **kwargs)
+
+    with patch.object(Path, "write_text", replace_owner):
+        with pytest.raises(tg.TargetError):
+            with tg._Lock(path, wait=0):
+                pytest.fail("the protected body ran")
+    assert (path / "owner").read_text(encoding="utf-8") == other
+
+
+@pytest.mark.parametrize("record_owner", [False, True])
+def test_a_replacement_lock_directory_survives_a_failed_acquisition(tmp_path, record_owner):
+    path = tmp_path / ".lock"
+    moved = tmp_path / ".lock.moved"
+    real = Path.write_text
+    other = f"{os.getpid()}-another-owner"
+
+    def swap_directory(self, data, *args, **kwargs):
+        if self.name == "owner":
+            self.parent.rename(moved)      # a waiter broke our lock and took the path
+            self.parent.mkdir()
+            if record_owner:
+                real(self.parent / "owner", other, *args, **kwargs)
+            raise OSError(ENOSPC, "No space left on device")
+        return real(self, data, *args, **kwargs)
+
+    with patch.object(Path, "write_text", swap_directory):
+        with pytest.raises(tg.TargetError):
+            with tg._Lock(path, wait=0):
+                pytest.fail("the protected body ran")
+    assert path.is_dir() and moved.is_dir()
+    if record_owner:
+        assert (path / "owner").read_text(encoding="utf-8") == other
+    else:
+        assert not (path / "owner").exists()
+
+
+@pytest.mark.parametrize("mode", ["unreadable", "invalid_utf8", "unrelated_entry"])
+def test_failed_owner_write_preserves_unverified_data(tmp_path, mode):
+    path = tmp_path / ".lock"
+    owner = path / "owner"
+    read = Path.read_text
+
+    def fail_write(self, token, *args, **kwargs):
+        if mode == "unrelated_entry":
+            (path / "keep").write_bytes(b"unrelated")
+        else:
+            owner.write_bytes(b"\xff" if mode == "invalid_utf8" else token.encode())
+        raise OSError(ENOSPC, "No space left on device")
+
+    def read_owner(self, *args, **kwargs):
+        if self == owner and mode == "unreadable":
+            raise OSError(EACCES, "Owner read denied")
+        return read(self, *args, **kwargs)
+
+    with patch.object(Path, "write_text", fail_write), patch.object(Path, "read_text", read_owner):
+        with pytest.raises(tg.TargetError, match="No space left.*could not be cleaned up"):
+            with tg._Lock(path, wait=0):
+                pytest.fail("the protected body ran")
+    if mode == "unrelated_entry":
+        assert (path / "keep").read_bytes() == b"unrelated"
+    else:
+        assert owner.is_file()
+
+
+def test_owner_read_cannot_authorize_cleanup_of_a_replacement_lock(tmp_path):
+    path = tmp_path / ".lock"
+    owner = path / "owner"
+    foreign = f"{os.getpid()}-another-owner"
+    read = Path.read_text
+    write = Path.write_text
+
+    def fail_write(self, token, *args, **kwargs):
+        write(self, token[:1], *args, **kwargs)
+        raise OSError(ENOSPC, "No space left on device")
+
+    def swap_after_read(self, *args, **kwargs):
+        record = read(self, *args, **kwargs)
+        path.rename(tmp_path / "old-lock")
+        path.mkdir()
+        write(owner, foreign, encoding="utf-8")
+        return record
+
+    with patch.object(Path, "write_text", fail_write), patch.object(Path, "read_text", swap_after_read):
+        with pytest.raises(tg.TargetError, match="No space left"):
+            with tg._Lock(path, wait=0):
+                pytest.fail("the protected body ran")
+    assert owner.read_text(encoding="utf-8") == foreign
+
+
+def test_a_cleanup_failure_is_reported_with_the_write_error(tmp_path):
+    path = tmp_path / ".lock"
+    real_rmdir = Path.rmdir
+
+    def refuse_rmdir(self, *args, **kwargs):
+        if self == path:
+            raise OSError(EACCES, "Permission denied")
+        return real_rmdir(self, *args, **kwargs)
+
+    with patch.object(Path, "write_text", side_effect=OSError(ENOSPC, "No space left on device")), \
+            patch.object(Path, "rmdir", refuse_rmdir):
+        with pytest.raises(tg.TargetError) as err:
+            with tg._Lock(path, wait=0):
+                pytest.fail("the protected body ran")
+    message = str(err.value)
+    assert "No space left on device" in message          # the original write error
+    assert "could not be cleaned up" in message and "Permission denied" in message

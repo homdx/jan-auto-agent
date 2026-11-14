@@ -7,7 +7,9 @@ import os
 import socket
 import subprocess
 import threading
+from errno import ENOSPC
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -324,6 +326,31 @@ def test_concurrent_opens_of_one_sha(repo, tmp_path):
     assert listed.count("worktree ") == 2   # the operator's checkout and one tree
     assert sum(t._created for t in results) == 1
     results[0].close(remove=True)
+
+
+def test_owner_write_failure_during_open_leaves_worktrees_unchanged(repo, tmp_path):
+    before = git(repo, "worktree", "list", "--porcelain")
+    with patch.object(Path, "write_text", side_effect=OSError(ENOSPC, "No space left on device")):
+        with pytest.raises(TargetError, match="writing owner"):
+            Target.open(repo, "main", scratch=tmp_path / "s")
+    assert git(repo, "worktree", "list", "--porcelain") == before
+    with Target.open(repo, "main", scratch=tmp_path / "s") as t:   # the retry works
+        assert (t.tree / "a.py").read_text() == "A = 2\n"
+    assert not t.tree.exists()
+
+
+def test_close_acquisition_failure_is_retryable(repo, tmp_path):
+    target = Target.open(repo, "main", scratch=tmp_path / "s")
+    tree, token = target.tree, target._token
+    with patch.object(Path, "write_text", side_effect=OSError(ENOSPC, "No space left on device")):
+        with pytest.raises(TargetError, match="writing owner"):
+            target.close()
+    assert target._closed is False
+    assert token.exists() and tree.exists()          # the failed attempt released nothing
+    target.close()                                    # a plain retry finishes the usual cleanup
+    assert not token.exists() and not tree.exists()
+    assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+    target.close()                                    # a repeat after success stays harmless
 
 
 def test_close_removes_what_it_made(repo, tmp_path):

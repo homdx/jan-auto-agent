@@ -221,10 +221,46 @@ class _Lock:
             except OSError as err:
                 raise TargetError(f"lock {self.path}: {err.strerror or err}") from err
             try:
+                lock_stat = self.path.lstat()
+            except OSError as err:
+                raise TargetError(f"lock {self.path}: identifying directory: {err.strerror or err}") from err
+            try:
+                # Recording the owner is part of acquisition: a lock without our record is
+                # not ours to release, so the protected operation must not run.
                 (self.path / "owner").write_text(self.token, encoding="utf-8")
-            except OSError:
-                pass
+            except OSError as err:
+                try:
+                    self._abort_acquisition(lock_stat)
+                    cleanup = ""
+                except (OSError, UnicodeError) as failure:
+                    cleanup = f"; the failed lock could not be cleaned up: {failure}"
+                raise TargetError(
+                    f"lock {self.path}: writing owner {self.path / 'owner'}: "
+                    f"{err.strerror or err}{cleanup}") from err
             return self
+
+    def _abort_acquisition(self, lock_stat: os.stat_result) -> None:
+        """Remove the failed owner write and its empty directory if they still belong to us."""
+        owner = self.path / "owner"
+        try:
+            if not os.path.samestat(lock_stat, self.path.lstat()):
+                return
+            try:
+                record = owner.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                record = None
+            if record is not None and not self.token.startswith(record):
+                return
+            # Reading the owner can race with a waiter moving the old lock aside.
+            if not os.path.samestat(lock_stat, self.path.lstat()):
+                return
+            if record is not None:
+                owner.unlink(missing_ok=True)
+            # Unrelated files make rmdir fail rather than being deleted.
+            if os.path.samestat(lock_stat, self.path.lstat()):
+                self.path.rmdir()
+        except FileNotFoundError:
+            pass  # the failed lock is already gone
 
     def _stale(self) -> tuple:
         """(stale, the owner token it was judged by, or None). A lock is broken only when its
@@ -714,10 +750,14 @@ class Target:
         then the last one to close removes it."""
         if self._closed and not remove:
             return
-        self._closed = True
         users = self.tree.parent / "users"
         marker = self.tree.parent / ".remove-when-free"
         with _Lock(self.tree.parent.parent / ".lock"):
+            # Marked only once the lock is held: an acquisition failure above leaves this
+            # target retryable, with its user entry and worktree still on disk.
+            if self._closed and not remove:
+                return
+            self._closed = True
             if self._token is not None:
                 self._token.unlink(missing_ok=True)
                 self._token = None
