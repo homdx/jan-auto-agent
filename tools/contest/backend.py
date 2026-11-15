@@ -844,12 +844,21 @@ class KiloBackend:
         seen = self._client.model_limits(provider_id, model_id)
         want_context = _context_limit_of((limit or {}).get("context"))
         want_input = _context_limit_of((limit or {}).get("input"))
-        if seen is None:
+        if not isinstance(seen, dict):
             raise KiloLimitKept(
                 f"the read-back for {provider_id}/{model_id} did not come back with a "
-                "limit — the offer shows none for the model, or it would not answer")
+                "limit — the offer shows none for the model, or it would not answer",
+                kept=None)
         got_context = _context_limit_of(seen.get("context"))
         got_input = _context_limit_of(seen.get("input"))
+        if got_context is None:
+            raise KiloLimitKept(
+                f"the read-back for {provider_id}/{model_id} did not report a usable "
+                "context limit")
+        if want_context is None:
+            raise KiloLimitKept(
+                f"the patch for {provider_id}/{model_id} did not ask for a usable "
+                "context limit", kept=got_context)
         if got_context != want_context or (want_input is not None
                                            and got_input != want_input):
             raise KiloLimitKept(

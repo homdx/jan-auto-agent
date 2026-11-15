@@ -57,8 +57,9 @@ _VALID_STATUSES = {STATUS_TODO, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED}
 # Counters that only move forward: a re-plan cannot reset the round or attempt budget (LOOP-2, LOOP-3).
 _MONOTONIC_TASK_FIELDS: tuple[str, ...] = ("round", "attempt", "impl_version")
 
-# Fields a fresh plan payload never carries: they are kept on a replace, since they link the task to its commit (commit, original instruction).
-_PRESERVED_TASK_FIELDS: tuple[str, ...] = ("commit", "original_instruction")
+# Falsy replanned instructions keep the original. The dict update alone handles
+# commit: an omitted field preserves the SHA and an explicit empty string clears it.
+_PRESERVED_TASK_FIELDS: tuple[str, ...] = ("original_instruction",)
 
 
 def merge_task_update(

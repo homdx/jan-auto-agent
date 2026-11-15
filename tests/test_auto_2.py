@@ -546,3 +546,32 @@ class TestLog:
         content = (tmp_path / ".agent" / "run.log").read_text()
         # Timestamps look like [2024-01-01T00:00:00Z]
         assert "[20" in content
+
+
+class TestCommitClearOnUpsert:
+    def test_omitted_commit_retains_prior_sha(self, tmp_path):
+        agent_dir = tmp_path / ".agent"
+        s = StateStore(agent_dir)
+        s.initialise("goal", tmp_path)
+        s.upsert_task(make_task(id="AUTO-T1", title="t", instruction="i", commit="abc123"))
+        s.upsert_task(make_task(id="AUTO-T1", title="t2", instruction="i"))
+        assert s.get_task("AUTO-T1")["commit"] == "abc123"
+
+    def test_explicit_empty_commit_persists_and_survives_reload(self, tmp_path):
+        agent_dir = tmp_path / ".agent"
+        s = StateStore(agent_dir)
+        s.initialise("goal", tmp_path)
+        s.upsert_task(make_task(id="AUTO-T1", title="t", instruction="i", commit="abc123"))
+        s.upsert_task(make_task(id="AUTO-T1", title="t2", instruction="i", commit=""))
+        assert s.get_task("AUTO-T1")["commit"] == ""
+        s2 = StateStore(agent_dir)
+        s2.initialise("goal", tmp_path)
+        assert s2.get_task("AUTO-T1")["commit"] == ""
+
+    def test_normal_replan_omitting_commit_keeps_prior_sha(self, tmp_path):
+        agent_dir = tmp_path / ".agent"
+        s = StateStore(agent_dir)
+        s.initialise("goal", tmp_path)
+        s.upsert_task(make_task(id="AUTO-T1", title="t", instruction="i", commit="deadbeef"))
+        s.upsert_task(make_task(id="AUTO-T1", title="t", instruction="i", status="todo", round=0, attempt=0, impl_version=1))
+        assert s.get_task("AUTO-T1")["commit"] == "deadbeef"

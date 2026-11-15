@@ -1389,8 +1389,45 @@ def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool,
     return None
 
 
+_JAVA_ANNOTATION_NAME = r"@[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*"
+_JAVA_ANNOTATION = re.compile(_JAVA_ANNOTATION_NAME)
+
+
+@functools.lru_cache(maxsize=8)
+def _java_annotation_head_source(source: str, lang: str) -> str:
+    """Blank annotation arguments while keeping offsets and line starts intact."""
+    code_mask = _code_mask(source, lang, mark_comments=True)
+    chunks: list[str] = []
+    end = 0
+    for name in _JAVA_ANNOTATION.finditer(source):
+        if name.start() < end or code_mask[name.start()] != _MASK_CODE:
+            continue
+        start = _skip_space(source, name.end())
+        if not source.startswith("(", start):
+            continue
+        depth = 0
+        limit = min(len(source), start + _DEFINITION_SCAN_BOUND)
+        for i in range(start, limit):
+            if code_mask[i] != _MASK_CODE:
+                continue
+            if source[i] == "(":
+                depth += 1
+            elif source[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    chunks.append(source[end:start])
+                    chunks.append(re.sub(r"[^\r\n]", " ", source[start:i + 1]))
+                    end = i + 1
+                    break
+    if not chunks:
+        return source
+    chunks.append(source[end:])
+    return "".join(chunks)
+
+
 def _brace_candidate_patterns(target_name: str, typed_lang: bool = False,
-                              inline_members: bool = False) -> list[re.Pattern[str]]:
+                              inline_members: bool = False,
+                              java_annotations: bool = False) -> list[re.Pattern[str]]:
     name = re.escape(target_name)
     tp = r"(?:\s*<[^(){};]*>|\s*\[[^(){};]*\])?"
     # For TS, stop at the opening angle and balance the type parameters in
@@ -1402,6 +1439,17 @@ def _brace_candidate_patterns(target_name: str, typed_lang: bool = False,
     # on its own line above the name just as often as on the same line.
     word = (r"[A-Za-z_$][\w$.]*(?:::[A-Za-z_$][\w$.]*)*"
             r"(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?(?:\[\s*\])*")
+    modifiers = (r"public|private|protected|static|final|abstract|synchronized|"
+                 r"native|default|transient|volatile|strictfp|export|async|inline|"
+                 r"virtual|const|extern|unsafe|suspend|open|override|fun|fn|pub")
+    if java_annotations:
+        # Argument contents were blanked by the Java head scan before matching.
+        annotation = rf"{_JAVA_ANNOTATION_NAME}(?=\s|@)\s*"
+        decoration = rf"(?:(?:{modifiers})\s+|{annotation})*"
+        type_parameters = rf"(?:<[^(){{}};]*>\s+(?:{annotation})*)?"
+    else:
+        decoration = rf"(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:(?:{modifiers})\s+)*"
+        type_parameters = r"(?:<[^(){};]*>\s+)?"
     patterns = [
         # function foo(...) {   function* gen() {   function identity<T>(a: T): T {
         re.compile(rf"(?m)^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*{name}{args}"),
@@ -1415,11 +1463,7 @@ def _brace_candidate_patterns(target_name: str, typed_lang: bool = False,
         # C-like definitions with a return type; nested generics are matched to two levels (BUGFIX).
         re.compile(
             rf"(?m)^\s*"
-            rf"(?:@[\w.]+(?:\([^)]*\))?\s*)*"
-            rf"(?:(?:public|private|protected|static|final|abstract|synchronized|"
-            rf"native|default|transient|volatile|strictfp|export|async|inline|"
-            rf"virtual|const|extern|unsafe|suspend|open|override|fun|fn|pub)\s+)*"
-            rf"(?:<[^(){{}};]*>\s+)?"
+            rf"{decoration}{type_parameters}"
             # The words of the return type are matched within a line, so a newline does not join them
             # — but a qualified type (`std::string Widget::label()`) or a template argument list
             # (`std::vector<int> Widget::items()`) needs the `::` and the `<…>` inside one word,
@@ -2059,22 +2103,24 @@ def _find_earliest_genuine_definition(
     call site appearing anywhere could pre-empt patterns later in the list
     even when they'd have found the real, correctly-ordered definition.
     """
-    patterns = _brace_candidate_patterns(target_name, typed_lang, inline_members=lang == "c" or ext == ".java")
+    patterns = _brace_candidate_patterns(target_name, typed_lang, inline_members=lang == "c" or ext == ".java",
+                                        java_annotations=ext == ".java")
     # AGNES-1 T79: a candidate head whose first character is inside a comment or a
     # string is not a definition of anything this file compiles, so every pass
     # shares one comment/string mask to reject such a match the moment it appears.
     code_mask = _code_mask(source, lang, mark_comments=True)
+    head_source = _java_annotation_head_source(source, lang) if ext == ".java" else source
     best_start = None
     best_match_start = None
     best_open_brace = None
 
     for pat in patterns:
-        for match in _iter_code_matches(pat, source, code_mask):
+        for match in _iter_code_matches(pat, head_source, code_mask):
             offset = match.start()
             inline = offset > 0 and source[offset - 1] == "}"
             if inline and code_mask[offset - 1] != _MASK_CODE:
                 continue
-            if _head_is_call(source, match, target_name, inline=inline, code_mask=code_mask, lang=lang):
+            if _head_is_call(head_source, match, target_name, inline=inline, code_mask=code_mask, lang=lang):
                 continue
             scan_from = match.end()
             if typed_lang and source[scan_from - 1] == "<":

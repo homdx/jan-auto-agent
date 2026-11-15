@@ -138,8 +138,7 @@ class TestIncomingNewerValuesWin:
         assert t["attempt"] == 2
 
     def test_missing_commit_does_not_erase_existing_one(self, tmp_path):
-        """An incoming dict without the key must not delete it, and an empty
-        incoming commit (no-git / empty-diff success) must not either."""
+        """An incoming dict without the key keeps the existing commit."""
         store = _store(tmp_path)
         store.upsert_task(make_task(
             id="AUTO-T1", title="t", instruction="i",
@@ -147,7 +146,6 @@ class TestIncomingNewerValuesWin:
         store.set_task_status("AUTO-T1", STATUS_DONE, commit="abc123")
         store.upsert_task(make_task(
             id="AUTO-T1", title="t", instruction="i", status=STATUS_DONE,
-            commit="",
         ))
         assert store.get_task("AUTO-T1")["commit"] == "abc123"
 
@@ -165,6 +163,7 @@ class TestIncomingNewerValuesWin:
             allow_downgrade=True,
         )
         assert store.get_task("AUTO-T1")["status"] == STATUS_TODO
+        assert store.get_task("AUTO-T1")["commit"] == ""
 
 
 class TestDowngradeGuard:

@@ -361,3 +361,38 @@ def test_cpp_trailing_struct_return_type_does_not_open_a_class_scope():
               "    return {};\n"
               "}\n")
     assert extract_block(source, "scale", ".cpp") == ""
+
+
+def test_java_type_use_annotations_before_return_type():
+    src = ("public class A {\n"
+           "  public @Nullable String create() { return null; }\n"
+           "  public <T> @Nullable T create2() { return null; }\n"
+           "  public int next() { return 1; }\n"
+           "}")
+    assert extract_block(src, "create", ".java") == "  public @Nullable String create() { return null; }"
+    assert "next()" not in extract_block(src, "create", ".java")
+    src2 = ("public class A {\n"
+            "  public @A @B @javax.annotation.Nullable(\"x\") String create() { return null; }\n"
+            "  public int next() { return 1; }\n"
+            "}")
+    assert extract_block(src2, "create", ".java") == "  public @A @B @javax.annotation.Nullable(\"x\") String create() { return null; }"
+
+
+@pytest.mark.parametrize("annotation", [
+    '@pkg.Note(value = ")" + "if")',
+    '@pkg.Note(value = @Nested("if"))',
+    '@pkg.Note(\n        value = {"if", ")"}\n    )',
+])
+def test_java_return_annotation_arguments_preserve_the_method(annotation):
+    method = f"    public <T> {annotation} T create() {{\n        return null;\n    }}"
+    source = (
+        "class Example {\n"
+        "    void caller(boolean x) {\n"
+        "        if (x &&\n"
+        "            create() != null) {}\n"
+        "    }\n"
+        f"{method}\n"
+        "    void other() {}\n"
+        "}\n"
+    )
+    assert extract_block(source, "create", ".java") == method

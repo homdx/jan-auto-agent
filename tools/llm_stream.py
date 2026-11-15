@@ -2040,11 +2040,27 @@ def _as_int_or_none(value) -> "int | None":
 
 
 def _content_of(container) -> str:
-    """The ``content`` string of a streamed message/delta, or ``""`` (AUDIT3-10b)."""
+    """The ``content`` string of a streamed message/delta, or ``""`` (AUDIT3-10b).
+
+    ``content`` may be a string (returned verbatim, including whitespace) or a
+    list of parts in the OpenAI multimodal shape — only parts shaped as
+    ``{"type": "text", "text": "..."}`` contribute, concatenated in order.
+    Anything else (``None``, a number, a malformed part) degrades to ``""``.
+    """
     if not isinstance(container, dict):
         return ""
     content = container.get("content", "")
-    return content if isinstance(content, str) else ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if (isinstance(part, dict)
+                    and part.get("type") == "text"
+                    and isinstance(part.get("text"), str)):
+                parts.append(part["text"])
+        return "".join(parts)
+    return ""
 
 
 def _meta_from_chunk(chunk, meta: CompletionMeta, api_format: str) -> None:

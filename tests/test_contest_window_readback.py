@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -218,3 +219,66 @@ def test_the_read_back_is_fresh_and_never_raises(tmp_path):
         client = KiloClient(KiloServer.attach(refused.url), str(tmp_path))
         assert client.model_limits("kenary", "hy3:free") is None, \
             "an offer it would not read is no read-back"
+
+
+def test_context_limit_of_normalizes_non_finite():
+    from tools.contest.kilo_client import _context_limit_of
+    assert _context_limit_of(float("nan")) is None
+    assert _context_limit_of(float("inf")) is None
+    assert _context_limit_of(float("-inf")) is None
+    assert _context_limit_of(True) is None
+    assert _context_limit_of(5) == 5
+    assert _context_limit_of(10 ** 400) == 10 ** 400
+    assert _context_limit_of(5.0) == 5
+    assert _context_limit_of("5,000") == 5000
+    assert _context_limit_of("nope") is None
+
+
+def test_readback_with_invalid_requested_context_keeps_reported_limit():
+    client = SimpleNamespace(model_limits=lambda *_: {"context": 8192})
+    agent = SimpleNamespace(_client=client)
+    with pytest.raises(KiloLimitKept) as caught:
+        KiloBackend._readback_limit(agent, "kenary", MODEL, {"context": None})
+    assert caught.value.kept == 8192
+
+
+def test_readback_missing_context_raises_kept_none(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with FakeKiloServer() as fake:
+        backend = KiloBackend(KiloServer.attach(fake.url), str(ws),
+                              events_log=str(tmp_path / "out" / "events.jsonl"))
+        backend.wait_ready()
+        backend._client.model_limits = lambda pid, mid: {"input": 10}
+        with pytest.raises(KiloLimitKept) as caught:
+            backend.set_model_limit("kenary", "hy3:free", {"context": 50000})
+        assert caught.value.kept is None
+        backend.close()
+
+
+def test_readback_invalid_context_raises_kept_none(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with FakeKiloServer() as fake:
+        backend = KiloBackend(KiloServer.attach(fake.url), str(ws),
+                              events_log=str(tmp_path / "out" / "events.jsonl"))
+        backend.wait_ready()
+        backend._client.model_limits = lambda pid, mid: {"context": float("nan"), "input": 10}
+        with pytest.raises(KiloLimitKept) as caught:
+            backend.set_model_limit("kenary", "hy3:free", {"context": 50000})
+        assert caught.value.kept is None
+        backend.close()
+
+
+def test_readback_input_mismatch_keeps_reported_context(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with FakeKiloServer() as fake:
+        backend = KiloBackend(KiloServer.attach(fake.url), str(ws),
+                              events_log=str(tmp_path / "out" / "events.jsonl"))
+        backend.wait_ready()
+        backend._client.model_limits = lambda pid, mid: {"context": 12345, "input": 999}
+        with pytest.raises(KiloLimitKept) as caught:
+            backend.set_model_limit("kenary", "hy3:free", {"context": 12345, "input": 1000})
+        assert caught.value.kept == 12345
+        backend.close()

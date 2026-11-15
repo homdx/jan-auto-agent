@@ -51,6 +51,7 @@ from __future__ import annotations
 import glob
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -1206,6 +1207,8 @@ def _context_limit_of(value) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
         number = int(value)
         return number if number > 0 else None
     if isinstance(value, str):

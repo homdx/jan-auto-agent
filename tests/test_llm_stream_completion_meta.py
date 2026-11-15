@@ -436,3 +436,25 @@ class TestStreamOptions:
         with pytest.raises(Exception):
             request_completion(url, headers, payload, 10, stream=True, error_retries=0)
         assert len(f.sent) == 2
+
+
+class TestListShapedStreamContent:
+
+    def test_stream_list_parts_concatenated(self, fake):
+        chunks = [
+            _chunk({"content": [{"type": "text", "text": "A"}, {"type": "text", "text": " B"}]}),
+            _chunk({"content": [{"type": "text", "text": "C"}]}),
+            _chunk({}, "stop"),
+            _usage_chunk(3),
+        ]
+        fake(_sse(chunks))
+        assert request_completion(URL, HEADERS, _payload(), 10, stream=True) == "A BC"
+
+    def test_stream_list_ignores_nontext_and_malformed(self, fake):
+        chunks = [
+            _chunk({"content": [{"type": "image"}, {"foo": "bar"}, {"type": "text", "text": "x y"}]}),
+            _chunk({}, "stop"),
+            _usage_chunk(1),
+        ]
+        fake(_sse(chunks))
+        assert request_completion(URL, HEADERS, _payload(), 10, stream=True) == "x y"
