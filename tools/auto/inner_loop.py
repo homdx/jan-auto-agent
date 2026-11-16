@@ -604,7 +604,9 @@ class LLMGate2Validator:
             return False, f"Reason: {_lang_reason}"
 
         try:
-            from tools.llm_stream import request_completion, strip_think
+            from tools.llm_stream import (
+                request_completion, strip_outer_think, strip_think,
+            )
 
             if self.api_format == "ollama":
                 from tools.llm_stream import ollama_chat_url
@@ -679,7 +681,10 @@ class LLMGate2Validator:
                     ssl_context=self.ssl_context,
                     **self._retry_kwargs,
                 )
-                return strip_think(_r or "")
+                _reply = _r or ""
+                if self.task_mode == "creative":
+                    return strip_think(_reply)
+                return strip_outer_think(_reply)
 
             raw = _call_validator(user_msg)
             # An empty reply is reported clearly, not as a JSON decoding error.

@@ -13,7 +13,7 @@ Public surface consumed by controller.py / the Architect stage:
     candidates = reviewer.review_clusters(clusters, base_dir)
     # candidates: list[CandidateTask] — pre-filtered, grounded
 
-Each call is traced via agent_trace and uses strip_think so reasoning-model
+Each call is traced via agent_trace and removes outer reasoning so reasoning-model
 "think" blocks are silently discarded before JSON parsing.  The call is
 fail-closed: a bad/missing JSON response is logged and produces zero candidates
 for that cluster rather than crashing the run.
@@ -48,7 +48,7 @@ from tools.auto import arch_probe as _arch_probe
 from tools.auto.repo_ingest import RepoCluster
 from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
-from tools.llm_stream import strip_think
+from tools.llm_stream import strip_outer_think
 from tools.config_safe import safe_getboolean
 from tools.auto.verdict_followup import STRICT_VERDICT_RULE
 from tools.ui import safe_print as _safe_print, safe_stdout_write as _safe_stdout_write
@@ -1442,8 +1442,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 # None means the call failed, distinct from an empty result; a failed batch is not checkpointed.
                 return None, False, False, []
 
-            # Strip reasoning tokens before JSON parsing.
-            cleaned = strip_think(raw_text)
+            # Strip an outer reasoning wrapper before JSON parsing; keep literals inside JSON strings.
+            cleaned = strip_outer_think(raw_text)
 
             tracer.event(
                 source="llm",
@@ -2552,7 +2552,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
                            task.get("id", "?"), exc)
             return task
 
-        cleaned = strip_think(raw or "")
+        cleaned = strip_outer_think(raw or "")
         tracer.event(
             source="llm",
             target="task_rewriter",

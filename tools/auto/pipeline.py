@@ -464,7 +464,10 @@ def _load_config(controller: "AutoController") -> configparser.ConfigParser:
     cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
     p = Path(controller.config_path)
     if p.exists():
-        cfg.read(p, encoding="utf-8")
+        try:
+            cfg.read(p, encoding="utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"config file {str(p)!r} is not valid UTF-8") from exc
     return cfg
 
 

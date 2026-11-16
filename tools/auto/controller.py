@@ -1615,6 +1615,10 @@ def run_auto(
             dry_run=dry_run,
             skill=skill,
         )
+    except configparser.InterpolationError as exc:
+        print(f"Error: {config_path!r}: invalid interpolation for "
+              f"[{exc.section}] {exc.option}", file=sys.stderr)
+        return 1
     except (ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

@@ -95,7 +95,7 @@ from tools.auto.gate1_grounding import (
 from tools.claimcheck.anchors import PathRepoView
 from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
-from tools.llm_stream import strip_think
+from tools.llm_stream import strip_outer_think
 # HARDEN-7 B: the shared reader of a reply field's type. One presence reply the
 # model sent with `evidence` as a list used to raise AttributeError out of
 # `filter()`, which `pipeline.py` and `plan_validator.py` call without a guard —
@@ -1554,7 +1554,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 **self._retry_kwargs,
                 **_until,
             )
-            cleaned = strip_think(text)
+            cleaned = strip_outer_think(text)
             meta = _meta_box[0] if _meta_box else None
             self._note_reasoning_despite_no_think(_think, meta)
             tracer.event(

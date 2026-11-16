@@ -382,7 +382,9 @@ def load_skill(
 
     adapter = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
     try:
-        adapter.read(adapter_path, encoding="utf-8")
+        adapter.read(adapter_path, encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise SkillFormatError(f"{adapter_path} is not valid UTF-8: {exc}") from exc
     except configparser.Error as exc:
         raise SkillFormatError(f"{adapter_path} is not a valid .ini file: {exc}") from exc
 

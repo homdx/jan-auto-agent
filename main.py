@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import configparser
+import re
 import textwrap
 from pathlib import Path
 from typing import Dict, Any, List
@@ -88,6 +89,23 @@ logger = logging.getLogger(__name__)
 
 # Must stay in sync with the --config argparse default.
 _DEFAULT_CONFIG_PATH = "agents.ini"
+_API_KEY_PERCENT = re.compile(r"%%|%\([^)]+\)s|(%)")
+
+
+def _read_api_key(config: configparser.ConfigParser, section: str) -> str:
+    """Allow literal percent signs in a key while honoring INI references."""
+    try:
+        try:
+            return config.get(section, "api_key", fallback="jan")
+        except configparser.InterpolationSyntaxError:
+            raw = config.get(section, "api_key", raw=True)
+            escaped = _API_KEY_PERCENT.sub(
+                lambda match: "%%" if match[1] else match[0], raw,
+            )
+            return config.get(section, "api_key", vars={"api_key": escaped})
+    except configparser.InterpolationError:
+        # ConfigParser's own exception can embed the entire credential.
+        raise configparser.Error(f"config [{section}] api_key has invalid interpolation") from None
 
 
 class MockFileUtilities:
@@ -262,7 +280,7 @@ class Orchestrator(OrchestratorActions):
 
         self.model      = self.config.get(section, "model",      fallback="qwen2.5-14b-instruct")
         self.base_url   = self.config.get(section, "base_url",   fallback="http://localhost:1337/v1")
-        self.api_key    = self.config.get(section, "api_key",    fallback="jan")
+        self.api_key    = _read_api_key(self.config, section)
         self.api_format = self.config.get(section, "api_format", fallback="openai")
         self.num_ctx    = self._getint(section, "num_ctx", 0)
 
@@ -292,30 +310,30 @@ class Orchestrator(OrchestratorActions):
     def _getint(self, section: str, key: str, fallback: int) -> int:
         try:
             return self.config.getint(section, key, fallback=fallback)
-        except ValueError as exc:
+        except (ValueError, configparser.InterpolationError):
             logger.warning(
-                "config [%s] %s is malformed (%s) — using default %r",
-                section, key, exc, fallback,
+                "config [%s] %s is malformed — using default %r",
+                section, key, fallback,
             )
             return fallback
 
     def _getfloat(self, section: str, key: str, fallback: float) -> float:
         try:
             return self.config.getfloat(section, key, fallback=fallback)
-        except ValueError as exc:
+        except (ValueError, configparser.InterpolationError):
             logger.warning(
-                "config [%s] %s is malformed (%s) — using default %r",
-                section, key, exc, fallback,
+                "config [%s] %s is malformed — using default %r",
+                section, key, fallback,
             )
             return fallback
 
     def _getboolean(self, section: str, key: str, fallback: bool) -> bool:
         try:
             return self.config.getboolean(section, key, fallback=fallback)
-        except ValueError as exc:
+        except (ValueError, configparser.InterpolationError):
             logger.warning(
-                "config [%s] %s is malformed (%s) — using default %r",
-                section, key, exc, fallback,
+                "config [%s] %s is malformed — using default %r",
+                section, key, fallback,
             )
             return fallback
 
@@ -953,7 +971,10 @@ def _validate_typed_config_values(config_path: str, base_dir: str) -> None:
         for sec in sections_to_check:
             if not probe.has_option(sec, key):
                 continue
-            value = probe.get(sec, key)
+            try:
+                value = probe.get(sec, key)
+            except configparser.InterpolationError:
+                continue  # the typed reader handles invalid values; this check is for blanks
             if value is not None and value.strip() == "":
                 rel = os.path.relpath(file_path, resolve_root)
                 violations.setdefault((sec, key), []).append(f"{rel}:{lineno} ({method}())")

@@ -1886,6 +1886,46 @@ def strip_think(text: "str | None") -> "str | None":
     return out.strip()
 
 
+_THINK_OPEN = re.compile(r"\s*<think>", re.IGNORECASE)
+_THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
+_STRUCTURED_START = re.compile(r'[\[{]|```')
+
+
+def strip_outer_think(text: "str | None") -> "str | None":
+    """Remove reasoning at the boundaries of a structured reply.
+
+    A leading wrapper that never closes has no answer. A lone closing tag
+    can end reasoning immediately before the first JSON or fence marker.
+    Once the answer starts, leave it intact for the caller's parser.
+    """
+    if not text:
+        return text
+    start = 0
+    while opening := _THINK_OPEN.match(text, start):
+        closing = _THINK_CLOSE.search(text, opening.end())
+        if closing is None:
+            return ""
+        start = closing.end()
+
+    answer = text[start:].strip()
+    boundary = _STRUCTURED_START.search(answer)
+    if boundary is not None and boundary.start():
+        prefix = answer[:boundary.start()].rstrip()
+        if prefix.lower().endswith("</think>"):
+            answer = answer[boundary.start():]
+
+    # Some providers repeat the close after the answer. Drop it only when
+    # what precedes it is a whole JSON payload or a JSON fence.
+    if answer.lower().endswith("</think>"):
+        payload = answer[:-len("</think>")].rstrip()
+        if payload.startswith("```"):
+            if _is_json(strip_json_fence(payload)):
+                return payload
+        elif payload.startswith(("{", "[")) and _is_json(payload):
+            return payload
+    return answer
+
+
 def _not_an_object_error(where: str, value, keys_desc: str) -> ValueError:
     """Build the malformed-reply ValueError for a `message` (or choice) field
     that is present but is not a JSON object.

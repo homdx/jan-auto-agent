@@ -1751,7 +1751,7 @@ def main(argv: List[str], root: Optional[str] = None, config_path: str = "agents
     if Path(config_path).exists():
         # Read agents.ini inside the try, so a non-UTF-8 file is reported, not a crash (AUTO-FIX).
         try:
-            config.read(config_path, encoding="utf-8")
+            config.read(config_path, encoding="utf-8-sig")
         except UnicodeDecodeError as exc:
             print(f"collect: {config_path} is not valid UTF-8 — {exc}")
             return 1

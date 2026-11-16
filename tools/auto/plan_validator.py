@@ -237,10 +237,10 @@ def validate_plan(
     # A broken config file falls back to defaults: this command only re-checks an existing plan (AUTO-FIX).
     if Path(config_path).exists():
         try:
-            cfg.read(config_path, encoding="utf-8")
-        except configparser.Error as exc:
+            cfg.read(config_path, encoding="utf-8-sig")
+        except (UnicodeDecodeError, configparser.Error) as exc:
             logger.warning(
-                "validate_plan: %s is malformed (%s) — proceeding with "
+                "validate_plan: %s could not be read (%s) — proceeding with "
                 "defaults for all config-driven options", config_path, exc,
             )
     raw_mode = cfg.get("auto", "task_mode", fallback="code")
