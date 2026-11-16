@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Set, Optional
 logger = logging.getLogger(__name__)
 
 from tools.agent_trace import tracer
+from tools.config_safe import safe_get_api_key
 
 from tools.file_reader import list_py_files as _list_py_files, list_source_files as _list_source_files
 from tools.block_extractor import extract_block as _extract_block_from_source
@@ -440,7 +441,7 @@ def make_search_agent(config, base_dir="."):
     return SearchAgent(
         model=config.get(section, "model", fallback=None),
         base_url=config.get(section, "base_url", fallback=None),
-        api_key=config.get(section, "api_key", fallback=""),
+        api_key=safe_get_api_key(config, section, "api_key", fallback=""),
         api_format=config.get(section, "api_format", fallback="openai"),
         timeout=_timeout,
         ssl_context=ssl_context,

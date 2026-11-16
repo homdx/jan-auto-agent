@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional
 
 from tools.collect.model import LLMSummary, ModuleRecord
+from tools.config_safe import safe_get_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -490,7 +491,7 @@ def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
     api_sec = f"api_{active}"
 
     base_url = config.get(api_sec, "base_url", fallback="http://localhost:11434")
-    api_key = config.get(api_sec, "api_key", fallback="ollama")
+    api_key = safe_get_api_key(config, api_sec, "api_key", fallback="ollama")
     model = config.get(api_sec, "model", fallback="llama3.1:8b")
     api_format = config.get(api_sec, "api_format", fallback="ollama")
     # Each typed config read degrades to its default with a warning, not a crash (BUGFIX).

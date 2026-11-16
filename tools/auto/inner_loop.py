@@ -62,7 +62,7 @@ from tools.llm_stream import reply_is_yes, reply_text
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from tools.config_safe import safe_getboolean, safe_getint
+from tools.config_safe import safe_get_api_key, safe_getboolean, safe_getint
 from tools.auto.verdict_followup import STRICT_VERDICT_RULE   # VERDICT-ASK
 
 logger = logging.getLogger(__name__)
@@ -2712,7 +2712,7 @@ def make_inner_loop(
 
     # Config reads are guarded per call, so one bad value cannot crash construction (AUTO-FIX).
     base_url   = config.get(api_section, "base_url",   fallback="http://localhost:1337/v1")
-    api_key    = config.get(api_section, "api_key",    fallback="jan")
+    api_key    = safe_get_api_key(config, api_section, "api_key", fallback="jan")
     model      = config.get(api_section, "model",      fallback="qwen2.5-14b-instruct")
     api_format = config.get(api_section, "api_format", fallback="openai")
     try:

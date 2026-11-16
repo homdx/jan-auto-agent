@@ -75,6 +75,7 @@ from pathlib import Path
 from typing import Optional
 
 from tools.agent_trace import tracer
+from tools.config_safe import safe_get_api_key
 from tools.auto.git_manager import GitError, GitManager, make_git_manager
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
 
@@ -553,7 +554,7 @@ def make_commit_on_success(
             story_bible = make_story_bible(
                 config,
                 base_url=config.get(api_sec, "base_url", fallback="http://localhost:11434"),
-                api_key=config.get(api_sec, "api_key", fallback="ollama"),
+                api_key=safe_get_api_key(config, api_sec, "api_key", fallback="ollama"),
                 model=config.get(api_sec, "model", fallback="llama3.1:8b"),
                 api_format=config.get(api_sec, "api_format", fallback="ollama"),
                 base_dir=repo_dir,

@@ -42,7 +42,7 @@ from tools.auto.run_trace import setup_run_trace
 from tools.auto.progress_display import ProgressDisplay, make_progress_display
 from tools.auto.auto_metrics import AutoMetricsStream
 from tools.auto.auto_tuner import AutoTuner, make_auto_tuner
-from tools.config_safe import safe_getboolean
+from tools.config_safe import ApiKeyInterpolationError, safe_get_api_key, safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -605,7 +605,7 @@ class AutoController:
                 _story_bible = make_story_bible(
                     cfg,
                     base_url=cfg.get(_api_sec, "base_url", fallback="http://localhost:11434"),
-                    api_key=cfg.get(_api_sec, "api_key", fallback="ollama"),
+                    api_key=safe_get_api_key(cfg, _api_sec, "api_key", fallback="ollama"),
                     model=cfg.get(_api_sec, "model", fallback="llama3.1:8b"),
                     api_format=cfg.get(_api_sec, "api_format", fallback="ollama"),
                     base_dir=self.base_dir,
@@ -1625,6 +1625,13 @@ def run_auto(
 
     try:
         return controller.run()
+    except ApiKeyInterpolationError as exc:
+        # A credential read during planning (the Architect, Gate 1, ...) is a
+        # configuration error, not a crash: name the section and key, never
+        # the credential, and exit non-zero without a traceback (round 367).
+        print(f"Error: {config_path!r}: invalid interpolation for "
+              f"[{exc.section}] {exc.option}", file=sys.stderr)
+        return 1
     except RuntimeError as exc:
         # The plan-goal safety refusal is a deliberate error: printed cleanly, without a traceback or a fatal banner (BUGFIX).
         print(f"Error: {exc}", file=sys.stderr)

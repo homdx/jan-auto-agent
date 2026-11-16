@@ -427,8 +427,12 @@ def _simple_literal_assignments(tree: ast.Module) -> dict:
 #: The shared mode-aware config helper is recognised by name; calling it is the {key}_{task_mode} convention (COLLECT-5).
 _CFG_MODE_HELPER_NAME = "_cfg_mode"
 
-#: The shared fail-open config readers are recognised by name, with the same argument layout as the mode helper (FIX-2 M3).
-_SAFE_CONFIG_HELPERS = frozenset({"safe_getint", "safe_getfloat", "safe_getboolean"})
+#: The shared config readers are recognised by name, with the same argument layout as the mode helper (FIX-2 M3).
+#: ``safe_get_api_key`` is the credential reader (round 367): it reads the key verbatim, like the numeric helpers,
+#: so a literal-section call routed through it keeps its config-map attribution.
+_SAFE_CONFIG_HELPERS = frozenset({
+    "safe_getint", "safe_getfloat", "safe_getboolean", "safe_get_api_key",
+})
 
 
 def extract_config_reads(tree: ast.Module, module_path: str) -> List[ConfigRead]:

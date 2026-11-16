@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from tools.auto.utils import atomic_write_text
+from tools.config_safe import safe_get_api_key
 
 if TYPE_CHECKING:  # avoid circular imports at runtime
     from tools.auto.controller import AutoController
@@ -85,7 +86,7 @@ def _build_plan_validator(
         section = f"api_{active}"
 
         base_url   = cfg.get(section, "base_url")
-        api_key    = cfg.get(section, "api_key",    fallback="")
+        api_key    = safe_get_api_key(cfg, section, "api_key", fallback="")
         model      = cfg.get(section, "model")
         api_fmt    = cfg.get(section, "api_format", fallback="openai")
         verify_ssl = cfg.getboolean("api", "verify_ssl", fallback=True)

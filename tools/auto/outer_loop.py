@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from tools.agent_trace import tracer
+from tools.config_safe import safe_get_api_key
 from tools.auto.state import (
     StateStore, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO,
 )
@@ -888,7 +889,7 @@ def make_outer_loop(
             active     = config.get("api", "active", fallback="local")
             section    = f"api_{active}"
             base_url   = config.get(section, "base_url")
-            api_key    = config.get(section, "api_key",    fallback="")
+            api_key    = safe_get_api_key(config, section, "api_key", fallback="")
             model      = config.get(section, "model")
             api_fmt    = config.get(section, "api_format", fallback="openai")
             verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)

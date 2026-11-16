@@ -4,7 +4,6 @@ import time
 import json
 import logging
 import configparser
-import re
 import textwrap
 from pathlib import Path
 from typing import Dict, Any, List
@@ -41,6 +40,7 @@ from tools.llm_stream import request_completion, strip_think, make_unverified_co
 # raised AttributeError out of `run_pipeline`, which catches only
 # KeyboardInterrupt and EOFError.
 from tools.llm_stream import reply_text
+from tools.config_safe import safe_get_api_key
 from tools.ui import stream_tracker
 
 # Extensions with AST or block extraction and validation; the rest are plain text.
@@ -89,23 +89,16 @@ logger = logging.getLogger(__name__)
 
 # Must stay in sync with the --config argparse default.
 _DEFAULT_CONFIG_PATH = "agents.ini"
-_API_KEY_PERCENT = re.compile(r"%%|%\([^)]+\)s|(%)")
 
 
 def _read_api_key(config: configparser.ConfigParser, section: str) -> str:
-    """Allow literal percent signs in a key while honoring INI references."""
-    try:
-        try:
-            return config.get(section, "api_key", fallback="jan")
-        except configparser.InterpolationSyntaxError:
-            raw = config.get(section, "api_key", raw=True)
-            escaped = _API_KEY_PERCENT.sub(
-                lambda match: "%%" if match[1] else match[0], raw,
-            )
-            return config.get(section, "api_key", vars={"api_key": escaped})
-    except configparser.InterpolationError:
-        # ConfigParser's own exception can embed the entire credential.
-        raise configparser.Error(f"config [{section}] api_key has invalid interpolation") from None
+    """Allow literal percent signs in a key while honoring INI references.
+
+    The behaviour lives in :func:`tools.config_safe.safe_get_api_key` so the
+    autonomous stages read a credential exactly as the interactive
+    Orchestrator does (round 367).
+    """
+    return safe_get_api_key(config, section, "api_key", fallback="jan")
 
 
 class MockFileUtilities:

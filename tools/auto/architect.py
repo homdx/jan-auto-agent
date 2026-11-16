@@ -49,7 +49,7 @@ from tools.auto.repo_ingest import RepoCluster
 from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_outer_think
-from tools.config_safe import safe_getboolean
+from tools.config_safe import safe_get_api_key, safe_getboolean
 from tools.auto.verdict_followup import STRICT_VERDICT_RULE
 from tools.ui import safe_print as _safe_print, safe_stdout_write as _safe_stdout_write
 
@@ -2354,7 +2354,7 @@ def review_clusters(
     active    = config.get("api", "active", fallback="local")
     section   = f"api_{active}"
     base_url  = config.get(section, "base_url")
-    api_key   = config.get(section, "api_key",    fallback="")
+    api_key   = safe_get_api_key(config, section, "api_key", fallback="")
     model     = config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
     verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)

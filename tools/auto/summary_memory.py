@@ -69,7 +69,7 @@ from tools.auto.utils import atomic_write_text, chars_per_token
 
 # Module-level import of LlmSettings, so type hints resolve under postponed evaluation (bugfix).
 from tools.auto.llm_profile import LlmSettings
-from tools.config_safe import safe_getboolean, safe_getfloat, safe_getint
+from tools.config_safe import safe_get_api_key, safe_getboolean, safe_getfloat, safe_getint
 
 logger = logging.getLogger(__name__)
 
@@ -866,7 +866,7 @@ def _default_llm_settings(
     api_sec = f"api_{active}"
 
     base_url   = config.get(api_sec, "base_url",   fallback="http://localhost:11434")
-    api_key    = config.get(api_sec, "api_key",    fallback="ollama")
+    api_key    = safe_get_api_key(config, api_sec, "api_key", fallback="ollama")
     model      = config.get(api_sec, "model",      fallback="llama3.1:8b")
     api_format = config.get(api_sec, "api_format", fallback="ollama")
     verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, TYPE_CHECKING
 
+from tools.config_safe import safe_get_api_key
 from tools.metrics_collector import MetricsCollector
 from tools.prompt_store import PromptStore
 from tools.auto.auto_metrics import record_gate2_result  # noqa: F401 — re-exported for back-compat
@@ -277,7 +278,7 @@ def make_auto_tuner(
         active_api = config.get("api", "active", fallback="local")
         api_section = f"api_{active_api}"
         base_url = config.get(api_section, "base_url", fallback="http://localhost:1337/v1")
-        api_key = config.get(api_section, "api_key", fallback="")
+        api_key = safe_get_api_key(config, api_section, "api_key", fallback="")
         model = config.get(api_section, "model", fallback="")
         optimizer = PromptOptimizer(model=model, base_url=base_url, api_key=api_key)
 

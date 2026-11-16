@@ -92,7 +92,7 @@ from tools.ui import safe_print as _safe_print, safe_stdout_write as _safe_stdou
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_outer_think, strip_think
-from tools.config_safe import safe_getboolean
+from tools.config_safe import safe_get_api_key, safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -3130,7 +3130,7 @@ def make_coder(config: configparser.ConfigParser, task_mode: str = "code",
     active    = config.get("api", "active", fallback="local")
     section   = f"api_{active}"
     base_url  = config.get(section, "base_url")
-    api_key   = config.get(section, "api_key",    fallback="")
+    api_key   = safe_get_api_key(config, section, "api_key", fallback="")
     model     = config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
     verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)

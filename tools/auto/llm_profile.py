@@ -29,6 +29,8 @@ import logging
 from dataclasses import dataclass, replace
 from typing import Optional
 
+from tools.config_safe import safe_get_api_key
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["LlmSettings", "resolve_llm_profile"]
@@ -177,7 +179,11 @@ def resolve_llm_profile(
 
     overrides: dict = {
         "base_url": config.get(profile_name, "base_url").rstrip("/"),
-        "api_key": config.get(profile_name, "api_key"),
+        # A profile's own credential may contain a literal `%`; read it the
+        # same way every other consumer does (round 367). A broken reference
+        # raises here, at construction, rather than sending an unresolved
+        # value to the profile's URL.
+        "api_key": safe_get_api_key(config, profile_name, "api_key", fallback=""),
         "model": config.get(profile_name, "model"),
     }
 

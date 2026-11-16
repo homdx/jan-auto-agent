@@ -101,7 +101,7 @@ from tools.llm_stream import strip_outer_think
 # `filter()`, which `pipeline.py` and `plan_validator.py` call without a guard —
 # one malformed reply ended the planning phase and lost every other candidate.
 from tools.llm_stream import reply_text
-from tools.config_safe import safe_getboolean
+from tools.config_safe import safe_get_api_key, safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -2070,7 +2070,7 @@ def filter_candidates(
     active    = active_override or config.get("api", "active", fallback="local")
     section   = f"api_{active}"
     base_url  = config.get(section, "base_url")
-    api_key   = config.get(section, "api_key",    fallback="")
+    api_key   = safe_get_api_key(config, section, "api_key", fallback="")
     model     = model_override or config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
     verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)
