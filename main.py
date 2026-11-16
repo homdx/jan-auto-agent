@@ -417,20 +417,27 @@ class Orchestrator(OrchestratorActions):
         AUDIT3-6: returns ``False`` when the query could not run at all (a target
         outside the project, a missing file, an unreadable source) so ``--once``
         can exit 1 on it; ``None`` otherwise, as before.
+
+        ROUND-366: a slash command is matched by its whole first token, so
+        ``/searching`` is not ``/search`` and ``/editor`` is not ``/edit``. A
+        slash command the pipeline does not own is refused (``False``) instead
+        of falling through to chat, so ``--once`` cannot call the model for it.
         """
         start_time = time.time()
 
+        _stripped = user_input.strip()
+        _command = _stripped.split(None, 1)[0] if _stripped else ""
         # Full-file search mode: bypass AST block-extraction entirely.
-        if user_input.strip().startswith("/search"):
-            self.run_search(user_input.strip(), base_dir)
-            return
+        if _command == "/search":
+            return self.run_search(_stripped, base_dir)
         # In-place edit mode: write the file back (with backup + diff).
-        if user_input.strip().startswith("/edit"):
-            self.run_edit(user_input.strip(), base_dir)
-            return
-
-        # Parse intent and target
+        if _command == "/edit":
+            return self.run_edit(_stripped, base_dir)
         parsed: ParsedPrompt = parse_prompt(user_input)
+        # A leading absolute file path is also a valid one-shot query.
+        if _command.startswith("/") and parsed.file_path != _command:
+            print(f"Unknown command: {_command}  —  type /help for the command list.")
+            return False
         
         if not parsed.file_path:
             self.execute_direct_chat(user_input)
@@ -1278,6 +1285,7 @@ def main():
     print(f"Commands -> Exit: '{orchestrator.exit_key}' | Reset: '{orchestrator.new_chat_key}' | Help: '/help'\n")
 
     while True:
+        user_input = None
         try:
             user_input = input("prompt> ").strip()
             if not user_input:
@@ -1290,17 +1298,23 @@ def main():
                 print("Session reset completed.")
                 continue
 
+            # ROUND-366: dispatch on the whole first whitespace-delimited token,
+            # so `/automate` is not `/auto` and `/editor` is not `/edit`. The
+            # rest of the line is still forwarded verbatim to the command's own
+            # parser, with its quoting and spacing unchanged.
+            _command = user_input.split(None, 1)[0]
+
             if user_input in ("/help", "/?", "/commands"):
                 print(HELP_TEXT)
                 continue
 
-            if user_input.startswith("/prompts"):
+            if _command == "/prompts":
                 print(orchestrator.prompt_store.get_store_summary(
                     ["validator_agent", "improvement_agent"]
                 ))
                 continue
 
-            if user_input.startswith("/rollback"):
+            if _command == "/rollback":
                 parts = user_input.split()
                 agent = parts[1] if len(parts) > 1 else "validator_agent"
                 ok = orchestrator.prompt_store.rollback(agent)
@@ -1314,7 +1328,7 @@ def main():
                 continue
 
             # AUTO-A1: /auto <goal> — launch autonomous mode from the interactive shell
-            if user_input.startswith("/auto"):
+            if _command == "/auto":
                 goal = user_input[len("/auto"):].strip()
                 if not goal:
                     print("Usage: /auto <goal>   e.g.  /auto improve current code")
@@ -1328,7 +1342,7 @@ def main():
                 continue
 
             # /collect [--check|--refresh|--rebuild|--module PATH]: the structural model; read-only to source, writes under the [collect] dir.
-            if user_input.startswith("/collect"):
+            if _command == "/collect":
                 from tools.collect.cli import CollectCliError, parse_collect_args, run as collect_run
                 from tools.collect.summarizer import make_summarizer_call_or_none, should_run_pass_b
 
@@ -1352,7 +1366,7 @@ def main():
                 continue
 
             # ── FAQ resolver ───────────────────────────────────────────────────
-            if user_input.startswith("/faq"):
+            if _command == "/faq":
                 body = user_input[len("/faq"):].strip()
 
                 # /faq --list  →  show which knowledge files are loaded
@@ -1385,7 +1399,7 @@ def main():
                 continue
 
             # KC-33: /contest forwards everything after it to tools.contest.cli.main; a bare /contest prints its help.
-            if user_input.startswith("/contest"):
+            if _command == "/contest":
                 body = user_input[len("/contest"):].strip()
                 argv = body.split() if body else ["--help"]
                 from tools.contest.cli import main as _contest_main
@@ -1399,21 +1413,20 @@ def main():
                 continue
 
             # Guard: unrecognized slash-commands should NOT be sent to the model.
-            if user_input.startswith("/") and not user_input.startswith(("/edit", "/search", "/contest")):
-                print(f"Unknown command: {user_input.split()[0]}  —  type /help for the command list.")
+            if _command.startswith("/") and _command not in ("/edit", "/search"):
+                print(f"Unknown command: {_command}  —  type /help for the command list.")
                 continue
 
-            # AUDIT3-14: one failed query is reported, not the end of the session
-            # (and of its chat history) — as --once already does.
-            try:
-                orchestrator.run_pipeline(user_input, base_dir)
-            except Exception as exc:  # noqa: BLE001 — the shell outlives one query
-                logger.exception("Pipeline failed for %r", user_input)
-                print(f"Error: {type(exc).__name__}: {exc}")
+            orchestrator.run_pipeline(user_input, base_dir)
 
         except (KeyboardInterrupt, EOFError):
             print("\nShutting down runtime session shell.")
             break
+        except Exception as exc:  # noqa: BLE001 — a failed command must not end the session
+            if user_input is None:
+                raise
+            logger.exception("Interactive command failed for %r", user_input)
+            print(f"Error: {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":

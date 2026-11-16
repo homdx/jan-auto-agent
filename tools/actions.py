@@ -189,7 +189,7 @@ def _legacy_script_score(text: str) -> int:
     return bad
 
 
-def _edit_write_encodings(target: str) -> "Tuple[str, ...]":
+def _edit_write_encodings(target: str, *, raw: bytes | None = None) -> "Tuple[str, ...]":
     """CC-16 (Part C): the encodings `/edit` may write *target* back in, most
     faithful first — decided **once, from the file's own bytes, before the
     model is asked**, so the whole run works from one decision instead of
@@ -223,14 +223,16 @@ def _edit_write_encodings(target: str) -> "Tuple[str, ...]":
     `cp1251`'s tie wins because it is this repository's own codec. A coding
     cookie in the first two lines (`# -*- coding: latin-1 -*-`) names the
     codec outright and overrides the guess.
+
+    Pass the bytes already read by the editor so the prompt and codec
+    selection use the same source. Other callers can pass just the path.
     """
-    try:
-        with open(target, "rb") as fh:
-            raw = fh.read()
-    except OSError:
-        # Unreadable here means unreadable at the write too, and run_edit
-        # already refused to read it before this point.
-        return ("utf-8",)
+    if raw is None:
+        try:
+            with open(target, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            return ("utf-8",)
 
     try:
         raw.decode("utf-8")
@@ -343,8 +345,7 @@ def _wide_bom_name(raw: bytes) -> "str | None":
     """The name of the wide encoding *raw* starts with, or ``None``.
 
     HARDEN-14 C3: the UTF-32 BOMs are tested before the UTF-16 ones, because a UTF-32 LE BOM
-    begins with the UTF-16 LE one. Fail-open by construction: an unreadable or empty file
-    has no BOM here and is read normally.
+    begins with the UTF-16 LE one.
     """
     for bom, name in _WIDE_BOMS:
         if raw.startswith(bom):
@@ -353,12 +354,11 @@ def _wide_bom_name(raw: bytes) -> "str | None":
 
 
 def _text_encoding_of(raw: bytes, encodings: "Tuple[str, ...]") -> str:
-    """The first codec of *encodings* that decodes *raw* — the codec `_read_edit_target` chose.
+    """The first codec of *encodings* that decodes *raw*.
 
     HARDEN-20 B3: the line-ending match must read the same bytes the same way, and the caller
     otherwise has no way to ask which codec that was. Fail-open: a codec name Python does not
-    know, or a list that none of it matches, yields the UTF-8 fallback `_read_edit_target`
-    falls back to, so nothing here can raise into a run.
+    know, or a list that none of it matches, yields the UTF-8 fallback.
     """
     for encoding in encodings:
         try:
@@ -372,36 +372,11 @@ def _text_encoding_of(raw: bytes, encodings: "Tuple[str, ...]") -> str:
 def _decode_lenient(raw: bytes, encoding: str) -> str:
     """*raw* in *encoding*, falling back to the lossy UTF-8 read when it no longer describes
     the bytes (a file that changed between the read and the write, or a codec name Python
-    does not know). The same two-step read `_read_edit_target` makes."""
+    does not know)."""
     try:
         return raw.decode(encoding)
     except (UnicodeDecodeError, LookupError):
         return raw.decode("utf-8", errors="replace")
-
-
-def _read_edit_target(target: str, encodings: "Tuple[str, ...]") -> str:
-    """Read *target* in the codec its own bytes say, for `/edit` to show the model (HARDEN-14 C1).
-
-    `run_edit` used to read the file with `tools.file_reader.read_file` — UTF-8, else
-    `latin-1` — while the write codec came from `_edit_write_encodings`, which puts `cp1251`
-    first. A cp1251 file was therefore *shown* to the model as `Ïðèâåò ìèð` and then written
-    back as cp1251, so an instruction in Russian about a Russian file could not be done: the
-    text the model was handed is not the text it was asked about. The Coder reads such a file
-    in its own codec (`_file_read_encoding`, HARDEN-9 C); this is the same one decision, made
-    once and taken from the same list the write walks.
-
-    Fail-open, as everywhere in this part: an undecodable file, an unreadable file or a codec
-    that no longer describes the bytes falls back to the lossy read, so `/edit` still has
-    something to work with rather than an exception into the run.
-    """
-    try:
-        with open(target, "rb") as fh:
-            raw = fh.read()
-    except OSError:
-        return ""
-    if not raw:
-        return ""
-    return _decode_lenient(raw, _text_encoding_of(raw, encodings))
 
 
 def _edit_line_ends(dest: str, content: str, encoding: "str | None" = None) -> str:
@@ -424,7 +399,7 @@ def _edit_line_ends(dest: str, content: str, encoding: "str | None" = None) -> s
     `betaalpha\\nbeta\\n`, and a source file whose last line an edit repeats (`return x`,
     `}`, `pass`, a blank line) becomes invalid.
 
-    HARDEN-20 B3: the original is decoded in *encoding*, the codec `_read_edit_target` chose
+    HARDEN-20 B3: the original is decoded in *encoding*, the codec the editor chose
     for this file, or the same codec re-derived from the file's own bytes when the caller did
     not say. A cp1251 file decoded as UTF-8 is U+FFFD text that never equals the reply's
     correctly decoded line, so every original line looked changed and the file came out flat
@@ -688,7 +663,7 @@ class OrchestratorActions:
             chunks.append(cur)
         return chunks
 
-    def run_search(self, user_input: str, base_dir: str) -> None:
+    def run_search(self, user_input: str, base_dir: str) -> "bool | None":
         """
         /search — answer a question against the WHOLE file, no AST extraction.
 
@@ -705,22 +680,27 @@ class OrchestratorActions:
         (needs_fix) is treated like a non-answer and the scan continues to the
         next chunk. If the validator itself is unreachable (_api_error), the
         candidate answer is accepted as-is rather than blocking the search.
+
+        ROUND-366: returns ``False`` when the search cannot start (bad syntax,
+        a target outside the project, a missing/non-file target, an unreadable
+        source) so ``--once`` can exit 1; ``None`` for a completed search,
+        including one that found no answer.
         """
         query, file_path = self._parse_search_command(user_input)
         if not query or not file_path:
             print("Usage: /search <query> in <file>   (or: /search <file> :: <query>)")
-            return
+            return False
 
         target = _resolve_within_base(base_dir, file_path)
         if target is None:
             print(f"[{_ts()}] Error: '{file_path}' is outside the project directory.")
-            return
+            return False
         tracer.start_run(f"/search {query} in {file_path}")
         try:
             source = read_file(target)
         except Exception as e:
             print(f"[{_ts()}] Could not read {target}: {e}")
-            return
+            return False
 
         budget = self.search_full_file_max_chars
         if len(source) <= budget:
@@ -1391,7 +1371,7 @@ class OrchestratorActions:
             }
 
     def run_edit(self, user_input: str, base_dir: str,
-                 resume_state: dict = None) -> None:
+                 resume_state: dict = None) -> "bool | None":
         """
         /edit — apply an instruction to a file AND WRITE IT BACK.
         Generates the full revised content, validates it (retry up to
@@ -1399,19 +1379,30 @@ class OrchestratorActions:
         writes the new content, and prints a unified diff.
         Issue 7: exponential back-off on API errors; checkpoint saved to
         pipeline_state.json on KeyboardInterrupt for resume on restart.
+
+        ROUND-366: returns ``False`` when the edit cannot start (bad syntax, a
+        target outside the project, a missing/non-file target, an unreadable
+        source) so ``--once`` can exit 1; ``None`` for a completed edit.
         """
         import difflib
         instruction, file_path = self._parse_edit_command(user_input)
         if not instruction or not file_path:
             print("Usage: /edit <instruction> in <file>   (or: /edit <file> :: <instruction>)")
-            return
+            return False
         target = _resolve_within_base(base_dir, file_path)
         if target is None:
             print(f"[{_ts()}] Error: '{file_path}' is outside the project directory.")
-            return
+            return False
         if not os.path.isfile(target):
             print(f"[{_ts()}] Not a file: {target}")
-            return
+            return False
+        # Use the same bytes for the encoding checks and the model's source.
+        try:
+            with open(target, "rb") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            print(f"[{_ts()}] Could not read {target}: {exc}")
+            return False
         start = time.time()
         tracer.start_run(f"/edit {instruction} in {file_path}")
 
@@ -1420,15 +1411,11 @@ class OrchestratorActions:
         # cannot find its line, the edit applies nothing, and `/edit` still printed
         # `status=approved` with a backup while the file lost its `\r`. Refused like a file
         # with undecodable bytes today — and left byte-identical.
-        try:
-            with open(target, "rb") as _fh:
-                _wide = _wide_bom_name(_fh.read())
-        except OSError:
-            _wide = None
+        _wide = _wide_bom_name(raw)
         if _wide:
             print(f"[{_ts()}] ❌ {file_path} is {_wide} — convert it to UTF-8 first; "
                   f"nothing was written.")
-            return
+            return False
 
         # ── CC-16 (Part C): the write encoding, decided once ───────────────────────
         # From the file's own bytes, before the model is asked, so the run has one
@@ -1436,13 +1423,13 @@ class OrchestratorActions:
         # spent). See `_edit_write_encodings`: a UTF-8 file is ("utf-8",), exactly
         # what fix 34 chose; a legacy file gets the codecs it can be written back
         # in, its own first and latin-1 last.
-        _edit_encodings = _edit_write_encodings(target)
+        _edit_encodings = _edit_write_encodings(target, raw=raw)
         _legacy_named = [e for e in _edit_encodings if e not in ("utf-8", "latin-1")]
         _encoding = _edit_encodings[0] if len(_edit_encodings) == 1 else ""
 
         # HARDEN-14 C1: the file is read in the codec it will be *written* back in, so the
         # model is shown the text it is asked about — not latin-1 mojibake of a cp1251 file.
-        original = _read_edit_target(target, _edit_encodings)
+        original = _decode_lenient(raw, _text_encoding_of(raw, _edit_encodings))
 
         def _refuse_unwritable(text: str) -> bool:
             """True (after saying why) when *text* fits none of the file's write

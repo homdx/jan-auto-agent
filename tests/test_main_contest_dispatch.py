@@ -312,6 +312,77 @@ class TestContestGuardAndHelp:
         assert contest.calls == []
         assert orch.pipeline_calls == []
 
+    @pytest.mark.parametrize("command", ("/automate goal", "/contestant --help",
+                                        "/editor sample.py", "/searching sample.py",
+                                        "/reload extra"))
+    def test_lookalike_commands_are_rejected(self, tmp_path, capsys, command):
+        auto = MagicMock()
+        contest = _contest_recorder()
+        with patch("tools.auto.controller.run_auto", auto):
+            orch = _repl(tmp_path, command, contest_main=contest)
+        assert f"Unknown command: {command.split()[0]}" in capsys.readouterr().out
+        auto.assert_not_called()
+        assert contest.calls == [] and orch.pipeline_calls == []
+
+    def test_auto_preserves_the_goal(self, tmp_path):
+        auto = MagicMock(return_value=0)
+        with patch("tools.auto.controller.run_auto", auto):
+            _repl(tmp_path, "/auto\treview  this project")
+        assert auto.call_args.kwargs["goal"] == "review  this project"
+
+    @pytest.mark.parametrize(("command", "handler"), [
+        ("/auto review this", "tools.auto.controller.run_auto"),
+        ("/collect --no-llm", "tools.collect.cli.run"),
+    ])
+    def test_command_error_leaves_the_session_usable(self, tmp_path, capsys, command, handler):
+        failure = OSError("cannot access the project artifact")
+        with patch(handler, side_effect=failure) as action:
+            _run_repl([command, "/help", "/exit"], tmp_path)
+        action.assert_called_once()
+        out = capsys.readouterr().out
+        assert str(failure) in out
+        assert "Available commands" in out and "Exiting lifecycle" in out
+
+    @pytest.mark.parametrize(("command", "diagnostic"), [
+        ("/edit", "Usage: /edit"),
+        ("/search", "Usage: /search"),
+        ("/edit missing.py :: update it", "missing.py"),
+        ("/search missing.py :: find it", "missing.py"),
+        ("/editor missing.py :: update it", "Unknown command: /editor"),
+        ("/searching missing.py :: find it", "Unknown command: /searching"),
+    ])
+    def test_one_shot_command_failure_exits_one(self, tmp_path, monkeypatch, capsys, command, diagnostic):
+        import main as main_mod
+
+        monkeypatch.chdir(tmp_path)
+        argv = ["main.py", "--base", str(tmp_path), "--config", str(tmp_path / "absent.ini"),
+                "--once", command]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("main.request_completion", return_value="") as chat,
+            patch("tools.actions.request_completion", return_value="") as action,
+            pytest.raises(SystemExit) as exit_info,
+        ):
+            main_mod.main()
+        assert exit_info.value.code == 1
+        assert diagnostic in capsys.readouterr().out
+        chat.assert_not_called()
+        action.assert_not_called()
+
+    def test_one_shot_accepts_an_absolute_file_target(self, tmp_path, monkeypatch, capsys):
+        import main as main_mod
+
+        monkeypatch.chdir(tmp_path)
+        source = tmp_path / "sample.py"
+        source.write_text("import math\n", encoding="utf-8")
+        argv = ["main.py", "--base", str(tmp_path), "--config", str(tmp_path / "absent.ini"),
+                "--once", str(source)]
+        with patch.object(sys, "argv", argv), pytest.raises(SystemExit) as exit_info:
+            main_mod.main()
+        assert exit_info.value.code == 0
+        output = capsys.readouterr().out
+        assert str(source) in output and "\nmath\n" in output
+
     def test_help_text_lists_contest(self):
         import main as main_mod
         assert "/contest run --ticket" in main_mod.HELP_TEXT

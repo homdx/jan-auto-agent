@@ -69,6 +69,37 @@ class Editor:
         return list(self.dir.glob(self.name + ".bak.*"))
 
 
+@pytest.mark.parametrize("during", ["open", "read"])
+def test_unreadable_source_never_reaches_the_model(monkeypatch, tmp_path, capsys, during):
+    from io import BytesIO
+
+    editor = Editor(monkeypatch, tmp_path)
+
+    class UnreadableSource(BytesIO):
+        def read(self, *args, **kwargs):
+            raise OSError("source read failed")
+
+    def source_open(path, mode):
+        assert path == str(editor.path) and mode == "rb"
+        if during == "open":
+            raise PermissionError("source open failed")
+        return UnreadableSource(editor.before)
+
+    monkeypatch.setattr(A, "open", source_open, raising=False)
+    result = editor.act.run_edit(f"/edit {editor.name} :: update it", str(tmp_path))
+    assert result is False
+    assert editor.calls == editor.validated == []
+    assert editor.saved == editor.before and editor.backups == []
+    assert f"source {during} failed" in capsys.readouterr().out
+
+
+def test_readable_empty_source_can_be_edited(monkeypatch, tmp_path):
+    revised = _file("VALUE = 1")
+    editor = Editor(monkeypatch, tmp_path, original_bytes=b"").run(reply(revised))
+    assert editor.saved == revised.encode()
+    assert [backup.read_bytes() for backup in editor.backups] == [b""]
+
+
 def reply(content: str) -> str:
     return json.dumps({"content": content})
 
