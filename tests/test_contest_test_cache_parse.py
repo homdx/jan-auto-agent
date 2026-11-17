@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from tools.contest.testcache import (
-    PytestRun, Summary, classify_with_llm, parse_pytest, progress_line, summarise,
+    PytestRun, Summary, classify_with_llm, is_well_formed, parse_pytest, progress_line, summarise,
 )
 
 DATA = Path(__file__).resolve().parent / "data" / "sandbox_pytest_commands.txt"
@@ -274,3 +274,20 @@ def test_classify_without_settings_or_command_is_none():
     """No gate model configured, or an empty command: None."""
     assert classify_with_llm("make test", None) is None
     assert classify_with_llm("", None, completion_fn=lambda s, u: "{}") is None
+
+
+@pytest.mark.parametrize("command", [
+    "pytest tests && ;", "pytest tests || ;", "pytest tests | ;", "pytest tests |& ;",
+    "pytest tests &&", "pytest tests ||", "pytest tests |", "pytest tests |&",
+    "pytest tests > ;", "pytest tests >> ;", "pytest tests < ;", "pytest tests 2> ;",
+    "pytest tests >", "pytest tests >>", "pytest tests <", "pytest tests 2>&",
+    "pytest tests && ()", "pytest tests && ⏎ ;",
+])
+def test_bash_rejects_malformed_pytest_commands(command):
+    assert not is_well_formed(command)
+
+
+def test_extended_case_patterns_are_available_for_syntax_analysis():
+    command = "case x in @(a|+(b))) echo ok;; esac"
+    assert is_well_formed(command)
+    assert not is_well_formed(command, extglob=False)

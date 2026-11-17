@@ -101,10 +101,22 @@ class TestCacheGate:
     # ── what the command is ───────────────────────────────────────────────
 
     def _runs_of(self, command: str) -> list:
-        if not testcache.is_well_formed(command):
+        if not isinstance(command, str) or not command.strip():
             return []
-        runs = testcache.parse_pytest(command)
-        if runs or self._classify is None or not _MAYBE_TESTS.search(command):
+        bash_scripts = [command]
+        runs = testcache.parse_pytest(command, bash_scripts=bash_scripts)
+        if runs:
+            if not only_pytest_and_harmless(command):
+                return []
+        elif self._classify is None or not _MAYBE_TESTS.search(command) or _SPLIT.search(command.strip()):
+            # Only a single plain command may go to the gate model.
+            return []
+        # The shell must accept the command before we use a hit, remember a
+        # miss for harvest, or consult the classifier. Bash treats a -c
+        # operand as a string in the outer command, so check it separately.
+        if not all(testcache.is_well_formed(script, extglob=False) for script in bash_scripts):
+            return []
+        if runs:
             return runs
         known, parsed = self.cache.classification(command)
         if known:
@@ -125,18 +137,7 @@ class TestCacheGate:
         """The cached one-line answer for this ask, or None to run as usual."""
         try:
             command = ((props.get("metadata") or {}).get("command")) or ""
-            if not command or not testcache.is_well_formed(command):
-                return None   # a command the shell refuses ran nothing: no cached green, no classifier
-            parsed = testcache.parse_pytest(command)
-            if parsed:
-                if not only_pytest_and_harmless(command):
-                    return None
-                runs = parsed
-            else:
-                # No pytest found: only a single plain command may go to the gate model; a chain could hide an effect.
-                if _SPLIT.search(command.strip()):
-                    return None
-                runs = self._runs_of(command)
+            runs = self._runs_of(command)
             if not runs:
                 return None
             fp = tree_fingerprint(worktree)

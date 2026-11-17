@@ -94,6 +94,44 @@ def test_a_killed_or_summaryless_run_is_not_recorded(tmp_path):
     assert gate.ask(_ask("pytest tests -q", "call_2"), wt) is None
 
 
+@pytest.mark.parametrize("command", [
+    "pytest tests && ;", "pytest tests || ;", "pytest tests | ;", "pytest tests > ;",
+    "pytest tests > @(output)", "pytest tests && true @(sample)",
+    "bash -c ' pytest tests && ; true '",
+    "bash -c ' pytest tests >'",
+    "run-tests 2>&",
+])
+def test_invalid_bash_never_hits_the_cache_or_registers_a_run(tmp_path, command):
+    wt = _repo(tmp_path / "wt")
+    asked = []
+
+    def classify(command):
+        asked.append(command)
+        return testcache.PytestRun(frozenset({"tests"}), frozenset())
+
+    hot = TestCacheGate(tmp_path / "hot.jsonl", agent="a", classify=classify)
+    cold = TestCacheGate(tmp_path / "cold.jsonl", agent="a", classify=classify)
+    assert hot.ask(_ask("pytest tests"), wt) is None
+    assert hot.harvest([_part("call_1")]) == 1
+    assert hot.ask(_ask("pytest tests", "control"), wt).startswith("cached: ")
+    assert hot.ask(_ask(command, "invalid"), wt) is None
+    assert cold.ask(_ask(command, "invalid"), wt) is None
+    assert cold.harvest([_part("invalid")]) == 0
+    assert asked == []
+
+
+@pytest.mark.parametrize("command", [
+    "pytest tests;", "pytest tests &&\n true", "pytest tests && ⏎ true",
+    'pytest "tests" > "/dev/null"', "bash -c ' pytest tests && true '",
+])
+def test_supported_bash_commands_still_use_the_cache(tmp_path, command):
+    wt = _repo(tmp_path / "wt")
+    gate = TestCacheGate(tmp_path / "c.jsonl", agent="a")
+    assert gate.ask(_ask("pytest tests"), wt) is None
+    assert gate.harvest([_part("call_1")]) == 1
+    assert gate.ask(_ask(command, "control"), wt).startswith("cached: ")
+
+
 @pytest.mark.parametrize("cmd", ["pytest tests && rm -rf build", "make test", "git push && pytest tests",
                                  "pytest tests; python3 other.py"])
 def test_a_command_with_another_effect_is_never_answered_from_the_cache(tmp_path, cmd):
@@ -126,9 +164,10 @@ def test_the_llm_fallback_only_parses_and_a_failure_runs_the_command(tmp_path):
         asked.append(cmd)
         return testcache.PytestRun(frozenset({"tests"}), frozenset())
     gate2 = TestCacheGate(tmp_path / "c2.jsonl", agent="a", classify=good)
-    gate2.ask(_ask("bash run_tests.sh"), wt)
-    gate2.ask(_ask("bash run_tests.sh", "call_2"), wt)
-    assert asked == ["bash run_tests.sh"]   # remembered: asked once
+    command = "bash run_tests.sh\n"
+    gate2.ask(_ask(command), wt)
+    gate2.ask(_ask(command, "call_2"), wt)
+    assert asked == [command]   # remembered: asked once
 
 
 def test_the_config_keys_default_off_and_refuse_a_bad_share(tmp_path):

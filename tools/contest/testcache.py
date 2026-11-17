@@ -6,6 +6,7 @@ write the same run many ways (``.smoke_tests/ .regression_tests/ tests_bugfix``,
 (``testcache_store.py``, another module) answers a repeat on an unchanged tree
 from the earlier run; this module is everything that needs no disk and no git:
 
+* :func:`is_well_formed` — Bash's parse-only syntax check;
 * :func:`parse_pytest` — every pytest invocation found in a shell command line,
   reduced to a :class:`PytestRun` (normalised roots + the flags that change
   *what runs or what is printed*), so two spellings of one run compare equal;
@@ -22,9 +23,11 @@ here raises: an unreadable command is ``[]``, an unreadable output is ``None``.
 from __future__ import annotations
 
 import json
+import os
 import posixpath
 import re
 import shlex
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -91,8 +94,6 @@ _SEP = "SEP"
 #: onto later segments.
 _OPEN = "\x00OPEN"
 _CLOSE = "\x00CLOSE"
-_CASE_ARM_END = "\x00CASE_ARM_END"
-_LITERAL_WORD = "\x00LITERAL_WORD"
 
 #: The tool killed the call; whatever pytest printed before is not an answer.
 _KILLED = "terminated command after exceeding timeout"
@@ -221,7 +222,7 @@ def _parameter_end(command: str, i: int) -> int:
     raise ValueError("unclosed parameter expansion")
 
 
-def _tokenize(command: str, *, syntax: bool = False) -> list:
+def _tokenize(command: str) -> list:
     """*command* as a flat list of words, with ``_SEP`` between simple commands.
 
     A small hand-written scanner rather than ``shlex`` alone: shlex has no
@@ -234,27 +235,22 @@ def _tokenize(command: str, *, syntax: bool = False) -> list:
     ``$(`` that is never closed is a syntax error in the shell, so it raises
     ``ValueError`` (``parse_pytest`` turns that into "no run": a command the shell
     refuses must not be answered from a cached green summary).
-
-    Syntax checks also need to distinguish case arm separators from ordinary
-    separators, and quoted words from shell keywords.
     """
     tokens: list = []
     word: list = []
-    in_word = quoted = False
+    in_word = False
     i, n = 0, len(command)
 
     def flush() -> None:
-        nonlocal in_word, quoted
+        nonlocal in_word
         if in_word:
             text = "".join(word)
-            if syntax and quoted:
-                tokens.append(_LITERAL_WORD)
-            elif not syntax and text in ("{", "}"):
+            if text in ("{", "}"):
                 tokens.append(_SEP)
             else:
                 tokens.append(text)
         word.clear()
-        in_word = quoted = False
+        in_word = False
 
     def sep() -> None:
         flush()
@@ -266,7 +262,7 @@ def _tokenize(command: str, *, syntax: bool = False) -> list:
         if ch == "\\" and i + 1 < n:
             if command[i + 1] != "\n":
                 word.append(command[i + 1])
-                in_word = quoted = True
+                in_word = True
             i += 2
             continue
         if ch == "'":
@@ -274,13 +270,13 @@ def _tokenize(command: str, *, syntax: bool = False) -> list:
             if end < 0:
                 raise ValueError("unclosed single quote")
             word.append(command[i + 1:end])
-            in_word = quoted = True
+            in_word = True
             i = end + 1
             continue
         if ch == '"':
             j = _dquote_end(command, i)
             word.append(command[i + 1:j].replace('\\"', '"'))
-            in_word = quoted = True
+            in_word = True
             i = j + 1
             continue
         if ch == "`":
@@ -310,11 +306,6 @@ def _tokenize(command: str, *, syntax: bool = False) -> list:
             end = command.find("\n", i)
             i = n if end < 0 else end
             continue
-        if syntax and command.startswith((";;", ";&"), i):
-            flush()
-            tokens.append(_CASE_ARM_END)
-            i += 3 if command.startswith(";;&", i) else 2
-            continue
         if ch in "\n;":
             sep()
             i += 1
@@ -342,175 +333,36 @@ def _tokenize(command: str, *, syntax: bool = False) -> list:
         i += 1
     flush()
     # A subshell that never closes is a syntax error too (a stray ``)`` is left alone: a ``case`` pattern has one).
-    if not syntax and tokens.count(_OPEN) > tokens.count(_CLOSE):
+    if tokens.count(_OPEN) > tokens.count(_CLOSE):
         raise ValueError("unclosed parenthesis")
     return [t for t in tokens]
 
 
-def is_well_formed(command: str) -> bool:
-    """Reject incomplete quotes, substitutions, groups and trailing shell operators.
+def is_well_formed(command: str, *, extglob: bool = True) -> bool:
+    """Check Bash syntax without running the command or loading startup files.
 
-    Such a command ran nothing, so no answer for it may come from the cache or from a classifier.
+    The standalone syntax reader accepts extended patterns in case arms
+    (AUDIT-9). The cache checks with Bash's normal options because its
+    answer must not hide a parse error from the executor.
     """
+    if not isinstance(command, str) or not command.strip() or "\x00" in command:
+        return False
+    argv = ["bash", "--noprofile", "--norc"]
+    if extglob:
+        argv += ["-O", "extglob"]
     try:
-        tokens = _tokenize(command, syntax=True)
-        visible = _shell_syntax_view(command)
-    except ValueError:
+        result = subprocess.run(
+            [*argv, "-n"],
+            input=command.replace(" ⏎ ", "\n").encode("utf-8", "surrogateescape"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C"},
+            timeout=5,
+            check=False,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return False
-    tail = visible.rstrip()
-    if re.search(r"(?:&&|\|\||\|&|\|)$", tail):
-        return False
-    if re.search(r"(?:\d*>>?|<<?|&>)$", tail):
-        return False
-    # A case arm's `)` is a pattern delimiter rather than a subshell closer;
-    # consume that delimiter while still checking groups after `esac`.
-    if not _shell_groups_well_formed(tokens):
-        return False
-    return True
-
-
-def _shell_groups_well_formed(tokens: list) -> bool:
-    """Balance shell groups and `case` arms in the tokenizer's token stream."""
-    depth = 0
-    cases: list[tuple[int, str]] = []
-    pattern_depth = 0
-    command_start = True
-    for token in tokens:
-        if cases:
-            case_depth, phase = cases[-1]
-            if phase != "body":
-                if token == _SEP:
-                    continue
-                if phase == "subject":
-                    if token in {_OPEN, _CLOSE, _CASE_ARM_END}:
-                        return False
-                    cases[-1] = (case_depth, "in")
-                elif phase == "in":
-                    if token != "in":
-                        return False
-                    cases[-1] = (case_depth, "pattern_start")
-                elif phase == "pattern_start" and token == "esac":
-                    cases.pop()
-                    command_start = False
-                elif token == _OPEN:
-                    if phase == "pattern_start":
-                        cases[-1] = (case_depth, "pattern_open")
-                    elif phase == "pattern":
-                        pattern_depth += 1
-                    else:
-                        return False
-                elif token == _CLOSE:
-                    if phase != "pattern":
-                        return False
-                    if pattern_depth:
-                        pattern_depth -= 1
-                    else:
-                        cases[-1] = (case_depth, "body")
-                        command_start = True
-                elif token == _CASE_ARM_END:
-                    return False
-                else:
-                    cases[-1] = (case_depth, "pattern")
-                continue
-            if token == _CASE_ARM_END:
-                if depth != case_depth:
-                    return False
-                cases[-1] = (case_depth, "pattern_start")
-                continue
-            if depth == case_depth:
-                if token == _CLOSE:
-                    return False
-                if command_start and token == "esac":
-                    cases.pop()
-                    command_start = False
-                    continue
-
-        if token == _CASE_ARM_END:
-            return False
-        if token in {_SEP, "{", "}"}:
-            command_start = True
-            continue
-        if token == _OPEN:
-            depth += 1
-            command_start = True
-            continue
-        if token == _CLOSE:
-            if depth == 0:
-                return False
-            depth -= 1
-            command_start = True
-            continue
-
-        if command_start and token == "case":
-            cases.append((depth, "subject"))
-            command_start = False
-            continue
-
-        command_start = command_start and token in {"if", "while", "until", "then", "do", "else", "elif", "!"}
-
-    return depth == 0 and not cases
-
-
-def _shell_syntax_view(command: str) -> str:
-    """Hide syntax inside words, keeping each operand visible to the tail check."""
-    out = list(command)
-    i, n = 0, len(command)
-    in_word = False
-    parameter_start = -1
-    parameter_depth = 0
-    while i < n:
-        ch = command[i]
-        if ch == "\\" and i + 1 < n:
-            if command[i + 1] == "\n":
-                out[i:i + 2] = "  "
-            else:
-                out[i:i + 2] = "xx"
-                in_word = True
-            i += 2
-            continue
-        if ch == "'":
-            end = command.find("'", i + 1)
-            if end < 0:
-                raise ValueError("unclosed single quote")
-        elif ch == '"':
-            end = _dquote_end(command, i)
-        elif ch == "`":
-            end = _backtick_end(command, i)
-        elif ch == "$" and command[i + 1:i + 2] == "(":
-            end = _subst_end(command, i)
-        elif command.startswith("${", i):
-            if not parameter_depth:
-                parameter_start = i
-            parameter_depth += 1
-            in_word = True
-            i += 2
-            continue
-        elif ch == "}" and parameter_depth:
-            parameter_depth -= 1
-            if not parameter_depth:
-                out[parameter_start:i + 1] = "x" * (i + 1 - parameter_start)
-            i += 1
-            continue
-        elif ch == "#" and not in_word and not parameter_depth:
-            end = command.find("\n", i)
-            end = n if end < 0 else end
-            out[i:end] = " " * (end - i)
-            i = end
-            continue
-        else:
-            if parameter_depth or (ch == "&" and ((i > 0 and command[i - 1] in "><")
-                                    or (not in_word and command[i + 1:i + 2] == ">"))):
-                in_word = True
-            else:
-                in_word = ch not in " \t\r\n;()|&"
-            i += 1
-            continue
-        out[i:end + 1] = "x" * (end + 1 - i)
-        in_word = True
-        i = end + 1
-    if parameter_depth:
-        raise ValueError("unclosed parameter expansion")
-    return "".join(out)
+    return result.returncode == 0
 
 
 def _segments(tokens: list) -> list:
@@ -786,8 +638,8 @@ def _split_env_and_wrappers(words: list) -> "tuple[int, dict, bool]":
     return i, env, unreadable
 
 
-def _runs_in_segment(words: list, depth: int, cwd: str,
-                     env: "dict | None" = None) -> "list | None":
+def _runs_in_segment(words: list, depth: int, cwd: str, env: dict,
+                     bash_scripts: list[str] | None) -> list | None:
     """The pytest runs one simple command stands for (usually 0 or 1).
 
     ``None`` when an environment assignment the parser cannot read reaches the
@@ -810,8 +662,13 @@ def _runs_in_segment(words: list, depth: int, cwd: str,
         return []
     if head in ("bash", "sh", "zsh", "dash") and depth < 3:
         # `bash -c "cd x && pytest tests"`: the string is a command line
-        if "-c" in rest and rest.index("-c") + 1 < len(rest):
-            return _parse(rest[rest.index("-c") + 1], depth + 1, cwd, env=merged)
+        if "-c" in rest:
+            script_arg = rest.index("-c") + 1
+            if script_arg < len(rest):
+                script = rest[script_arg]
+                if head == "bash" and bash_scripts is not None:
+                    bash_scripts.append(script)
+                return _parse(script, depth + 1, cwd, env=merged, bash_scripts=bash_scripts)
     return []
 
 
@@ -845,8 +702,8 @@ def _cd_dest(words: list, cwd: str) -> "str | None":
     return "" if new == "." else new
 
 
-def _parse(command: str, depth: int, cwd: str = "",
-           env: "dict | None" = None) -> list:
+def _parse(command: str, depth: int, cwd: str = "", env: dict | None = None,
+           *, bash_scripts: list[str] | None = None) -> list:
     """Every pytest invocation in *command*, in order; ``[]`` when none, or
     when a ``cd``/``pushd`` cannot be resolved (then the command is not
     cached at all — HARDEN-28 C), or when an environment assignment the
@@ -910,7 +767,7 @@ def _parse(command: str, depth: int, cwd: str = "",
                     cur_env.pop(var, None)
             words = []
             return True
-        res = _runs_in_segment(words, depth, cur, cur_env)
+        res = _runs_in_segment(words, depth, cur, cur_env, bash_scripts)
         if res is None:
             return False
         runs.extend(res)
@@ -932,20 +789,22 @@ def _parse(command: str, depth: int, cwd: str = "",
     return runs
 
 
-def parse_pytest(command: str) -> list:
+def parse_pytest(command: str, *, bash_scripts: list[str] | None = None) -> list:
     """Every pytest invocation in *command*, in order; ``[]`` when none/unreadable.
 
     Sees through ``&&``, ``||``, ``;``, ``|``, newlines, ``( … )``, ``{ …; }``,
     ``time``, ``/usr/bin/time -v``, ``nice``, ``timeout N``, ``env X=Y``,
     ``VAR=v`` prefixes, ``cd DIR &&`` (a command that is not pytest is simply
     not a run), ``python3 -m pytest``, ``pytest``, ``py.test`` and a
-    ``bash -c "…"`` string. Command substitutions are never executed or read.
+    ``bash -c "…"`` string. If provided, *bash_scripts* collects those Bash
+    operands so the cache can check their syntax separately. Command
+    substitutions are never executed or read.
     Never raises.
     """
     if not isinstance(command, str) or not command.strip() or "\x00" in command:
         return []
     try:
-        return _parse(command.replace(" ⏎ ", "\n"), 0)
+        return _parse(command.replace(" ⏎ ", "\n"), 0, bash_scripts=bash_scripts)
     except Exception:  # noqa: BLE001 — "cannot read" is [], never an exception
         return []
 
