@@ -287,6 +287,26 @@ def _cached_repo_defined_names(modules, root):
 _gates._repo_defined_names = _cached_repo_defined_names
 
 
+# SLOW-1 follow-up: `build_gates_map` citation-checks every gate entry against
+# the live scan (it re-reads and re-`ast.walk`s each module per entry, ~5 s on
+# this tree). Under the default seed it is a pure function of the live scan, so
+# it is cached under the same tree fingerprint as the scan itself: N xdist
+# workers build it once, and a run on an unchanged checkout loads it instead.
+# A call that is not the live scan (a tmp_path scan, a foreign repo, no modules)
+# or that passes its own seed is never cached.
+_real_build_gates_map = _gates.build_gates_map
+
+
+def _cached_build_gates_map(modules=None, root=None, *, seed=_gates._GATE_SEED):
+    if seed is not _gates._GATE_SEED or not _is_the_live_scan(root, modules):
+        return _real_build_gates_map(modules, root, seed=seed)
+    return list(_shared("build_gates_map",
+                        lambda: _real_build_gates_map(modules, root, seed=seed)))
+
+
+_gates.build_gates_map = _cached_build_gates_map
+
+
 # CollectModel indexes are built once per live-tree fixture; the model stays a plain dataclass.
 _live_indexes: dict = {}
 
