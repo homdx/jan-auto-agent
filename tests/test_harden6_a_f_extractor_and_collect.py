@@ -240,6 +240,9 @@ def test_b_an_unknown_name_is_still_empty():
 
 # ── C: the annotation class is bounded ───────────────────────────────────────
 
+# Measure CPU time for these synchronous complexity checks so other pytest
+# workers competing for the CPU don't use up the extractor's budget.
+
 
 def _records_source(records: int) -> str:
     return "const data = [\n" + "".join(
@@ -254,9 +257,10 @@ def test_c_twenty_thousand_characters_stay_under_a_second():
         src = _records_source(len(src) // 37 + 1)
     assert len(src) >= 20_000
     for name in ("id", "name", "type"):
-        started = time.monotonic()
+        started = time.process_time()
         extract_block(src, name, ".js")
-        assert time.monotonic() - started < 1.0, name
+        elapsed = time.process_time() - started
+        assert elapsed < 1.0, f"{name}: {elapsed:.3f}s CPU"
 
 
 def test_c_a_hundred_thousand_characters_are_not_quadratic():
@@ -266,9 +270,10 @@ def test_c_a_hundred_thousand_characters_are_not_quadratic():
     src = _records_source(3000)
     assert len(src) >= 100_000
     for name in ("id", "name", "type"):
-        started = time.monotonic()
+        started = time.process_time()
         extract_block(src, name, ".js")
-        assert time.monotonic() - started < 2.0, name
+        elapsed = time.process_time() - started
+        assert elapsed < 2.0, f"{name}: {elapsed:.3f}s CPU"
 
 
 def test_c_the_bodyless_forms_are_unchanged():
